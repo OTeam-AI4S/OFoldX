@@ -1,0 +1,124 @@
+r"""
+Token transformer for coordinate denoising.
+"""
+
+from __future__ import annotations
+
+import torch
+from oops import LayerNorm
+from torch import Tensor, nn
+
+from ..transformer import ConditionedTransformer
+
+
+class DenoisingTokenEncoder(nn.Module):
+    r"""
+    Token transformer for coordinate denoising, conditioned on a per-block pair-derived attention bias.
+
+    Projects the pair representation to per-block attention-bias logits (``pair_norms`` / ``bias_projections``)
+    and delegates to the shared [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer]
+    configured with a single adaptive norm and double-product transition. This mirrors
+    [`AtomSelfAttentionStack`][ofoldx.modules.atom.encoders.AtomSelfAttentionStack] at the token level.
+
+    Args:
+        num_blocks: Number of transformer blocks; ``0`` makes the module the identity on the tokens.
+        token_hidden_size: Width of the per-token channel carried through the transformer.
+        conditioning_size: Width of the conditioning signal driving the adaptive norm.
+        pair_size: Width of the pair representation projected to the attention bias.
+        num_attention_heads: Number of attention heads per block.
+        blocks_per_checkpoint: Number of blocks per gradient-checkpoint segment; ``None`` disables
+            checkpointing.
+        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
+            to the ``sdpa`` reference otherwise.
+
+    Examples:
+        >>> import torch
+        >>> encoder = DenoisingTokenEncoder(
+        ...     num_blocks=2,
+        ...     token_hidden_size=8,
+        ...     conditioning_size=4,
+        ...     pair_size=4,
+        ...     num_attention_heads=2,
+        ...     operator_backend="sdpa",
+        ... )
+        >>> _ = torch.manual_seed(0)
+        >>> token_hidden = torch.randn(1, 3, 8)
+        >>> conditioning = torch.randn(1, 3, 4)
+        >>> pair = torch.randn(1, 3, 3, 4)
+        >>> encoder(token_hidden, conditioning, pair).shape
+        torch.Size([1, 3, 8])
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 24,
+        token_hidden_size: int = 768,
+        conditioning_size: int = 384,
+        pair_size: int = 128,
+        num_attention_heads: int = 16,
+        blocks_per_checkpoint: int | None = None,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_norms = nn.ModuleList(LayerNorm(pair_size, bias=False) for _ in range(num_blocks))
+        self.bias_projections = nn.ModuleList(
+            nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
+        )
+        self.transformer = ConditionedTransformer(
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            hidden_size=token_hidden_size,
+            conditioning_size=conditioning_size,
+            cross_attention_mode=False,
+            transition="double",
+            blocks_per_checkpoint=blocks_per_checkpoint,
+            operator_backend=operator_backend,
+        )
+
+    def forward(
+        self,
+        token_hidden: Tensor,
+        conditioning: Tensor,
+        pair: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        r"""
+        Norm and project the pair representation into a per-block, per-head bias, then run the transformer.
+
+        Each block ``b`` maps ``pair`` through its own ``pair_norms[b]`` / ``bias_projections[b]`` to
+        ``num_attention_heads`` bias logits; these are concatenated over all ``num_blocks`` blocks into
+        `[..., N_token, N_token, num_blocks * num_attention_heads]` and sliced one block at a time inside the
+        transformer. With zero blocks the module is the identity on ``token_hidden``.
+
+        Args:
+            token_hidden: Per-token features `[..., N_token, token_hidden_size]`.
+            conditioning: Conditioning signal `[..., N_token, conditioning_size]` for the adaptive norm.
+            pair: Pair representation `[..., N_token, N_token, pair_size]` supplying the attention bias.
+            pair_mask: Optional pair mask `[..., N_token, N_token]`; ``False`` positions are excluded.
+
+        Returns:
+            Denoised token features `[..., N_token, token_hidden_size]`.
+
+        Examples:
+            >>> import torch
+            >>> encoder = DenoisingTokenEncoder(
+            ...     num_blocks=2,
+            ...     token_hidden_size=8,
+            ...     conditioning_size=4,
+            ...     pair_size=4,
+            ...     num_attention_heads=2,
+            ...     operator_backend="sdpa",
+            ... )
+            >>> _ = torch.manual_seed(0)
+            >>> token_hidden = torch.randn(1, 3, 8)
+            >>> conditioning = torch.randn(1, 3, 4)
+            >>> pair = torch.randn(1, 3, 3, 4)
+            >>> encoder(token_hidden, conditioning, pair).shape
+            torch.Size([1, 3, 8])
+        """
+        if not self.pair_norms:  # zero blocks -> identity (matches an empty transformer stack)
+            return token_hidden
+        bias = torch.cat(
+            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)], dim=-1
+        )
+        return self.transformer(token_hidden, conditioning, bias, pair_mask, to_keys=None)

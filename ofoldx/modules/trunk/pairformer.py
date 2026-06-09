@@ -1,0 +1,269 @@
+r"""
+Pairformer stack modules.
+
+The Pairformer refines a single representation and a pair representation together, with no MSA
+axis. Each block runs the pair triangle updates (multiplication + attention + transition) and,
+when a single channel is present, updates the single representation with pair-biased
+self-attention. Setting ``single_size = 0`` yields a pair-only stack.
+"""
+
+from __future__ import annotations
+
+from torch import Tensor, nn
+
+from ..attention import (
+    PairBiasedSelfAttention,
+    TriangleAttention,
+    TriangleMultiplication,
+)
+from ..functional import checkpoint_blocks
+from ..transition import RowwiseDropout, Transition
+
+
+class PairformerStack(nn.Module):
+    r"""
+    Stack of [`PairformerBlock`][ofoldx.modules.trunk.pairformer.PairformerBlock] run in sequence.
+
+    The stack applies ``num_blocks`` identical blocks under gradient checkpointing, grouped into
+    ``blocks_per_checkpoint``-sized segments. When ``single_size`` is ``0`` every block is pair-only and
+    the stack accepts (and returns) ``None`` for the single representation.
+
+    Args:
+        num_blocks: Number of Pairformer blocks in the stack.
+        single_size: Width of the single representation; ``0`` builds a pair-only stack.
+        pair_size: Width of the pair representation.
+        triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
+        triangle_attention_hidden_size: Per-head width of each triangle-attention update.
+        num_triangle_attention_heads: Number of heads in triangle attention.
+        num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
+        expansion: Feed-forward expansion factor of every transition.
+        dropout: Row-wise dropout probability applied to each pair residual.
+        blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables grouping.
+        operator_backend: Operator backend selector forwarded to every submodule.
+
+    Examples:
+        >>> import torch
+        >>> stack = PairformerStack(
+        ...     num_blocks=1, single_size=8, pair_size=4,
+        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
+        ...     num_triangle_attention_heads=2, num_pair_attention_heads=2,
+        ...     expansion=2, dropout=0.0,
+        ... ).eval()
+        >>> single, pair = torch.randn(1, 3, 8), torch.randn(1, 3, 3, 4)
+        >>> out_single, out_pair = stack(single, pair)
+        >>> out_single.shape, out_pair.shape
+        (torch.Size([1, 3, 8]), torch.Size([1, 3, 3, 4]))
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        blocks_per_checkpoint: int | None = None,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.blocks_per_checkpoint = blocks_per_checkpoint
+        self.blocks = nn.ModuleList(
+            [
+                PairformerBlock(
+                    single_size=single_size,
+                    pair_size=pair_size,
+                    triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                    triangle_attention_hidden_size=triangle_attention_hidden_size,
+                    num_triangle_attention_heads=num_triangle_attention_heads,
+                    num_pair_attention_heads=num_pair_attention_heads,
+                    expansion=expansion,
+                    dropout=dropout,
+                    operator_backend=operator_backend,
+                )
+                for _ in range(num_blocks)
+            ],
+        )
+
+    def forward(
+        self, single: Tensor | None, pair: Tensor, pair_mask: Tensor | None = None
+    ) -> tuple[Tensor | None, Tensor]:
+        r"""
+        Run every [`PairformerBlock`][ofoldx.modules.trunk.pairformer.PairformerBlock] in sequence.
+
+        Blocks are grouped into ``blocks_per_checkpoint``-sized gradient-checkpoint segments. A pair-only
+        stack (``single_size == 0``) is invoked with ``single=None`` and returns ``single`` as ``None``.
+
+        Args:
+            single: Single representation `[B, N, single_size]`, or ``None`` for a pair-only stack.
+            pair: Pair representation `[B, N, N, pair_size]`.
+            pair_mask: Optional pair validity mask `[B, N, N]`.
+
+        Returns:
+            Refined ``(single, pair)`` of shapes `[B, N, single_size]` (or ``None``) and
+            `[B, N, N, pair_size]`.
+
+        Examples:
+            >>> import torch
+            >>> stack = PairformerStack(
+            ...     num_blocks=1, single_size=0, pair_size=4,
+            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
+            ...     num_triangle_attention_heads=2, expansion=2, dropout=0.0,
+            ... ).eval()
+            >>> single, pair = stack(None, torch.randn(1, 3, 3, 4))
+            >>> single is None, pair.shape
+            (True, torch.Size([1, 3, 3, 4]))
+        """
+
+        if single is None:
+            pair_blocks = [lambda pair, block=block: block(None, pair, pair_mask=pair_mask)[1] for block in self.blocks]
+            (pair,) = checkpoint_blocks(pair_blocks, (pair,), self.blocks_per_checkpoint)
+            return None, pair
+
+        blocks = [lambda single, pair, block=block: block(single, pair, pair_mask=pair_mask) for block in self.blocks]
+        single, pair = checkpoint_blocks(blocks, (single, pair), self.blocks_per_checkpoint)
+        return single, pair
+
+
+class PairformerBlock(nn.Module):
+    r"""
+    One Pairformer block that jointly refines the single and pair representations.
+
+    The pair representation is updated by outgoing then incoming triangle multiplication, starting- then
+    ending-node triangle attention (each row-wise dropped and added back), and a pair transition. When
+    ``single_size > 0`` the single representation is then updated by pair-biased self-attention followed by
+    a single transition; ``single_size == 0`` makes the block pair-only.
+
+    Args:
+        single_size: Width of the single representation; ``0`` builds a pair-only block.
+        pair_size: Width of the pair representation.
+        triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
+        triangle_attention_hidden_size: Per-head width of each triangle-attention update.
+        num_triangle_attention_heads: Number of heads in triangle attention.
+        num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
+        expansion: Feed-forward expansion factor of every transition.
+        dropout: Row-wise dropout probability applied to each pair residual.
+        operator_backend: Operator backend selector forwarded to every submodule.
+
+    Examples:
+        >>> import torch
+        >>> block = PairformerBlock(
+        ...     single_size=8, pair_size=4,
+        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
+        ...     num_triangle_attention_heads=2, num_pair_attention_heads=2,
+        ...     expansion=2, dropout=0.0,
+        ... ).eval()
+        >>> single, pair = block(torch.randn(1, 3, 8), torch.randn(1, 3, 3, 4))
+        >>> single.shape, pair.shape
+        (torch.Size([1, 3, 8]), torch.Size([1, 3, 3, 4]))
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication_outgoing = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
+            operator_backend=operator_backend,
+        )
+        self.triangle_multiplication_incoming = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_starting_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_ending_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.pair_feed_forward = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.pair_attention: PairBiasedSelfAttention | None
+        self.single_feed_forward: Transition | None
+        if single_size > 0:
+            self.pair_attention = PairBiasedSelfAttention(
+                hidden_size=single_size,
+                pair_size=pair_size,
+                num_attention_heads=num_pair_attention_heads,
+                operator_backend=operator_backend,
+            )
+            self.single_feed_forward = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+        else:
+            self.pair_attention = None
+            self.single_feed_forward = None
+
+    def forward(
+        self, single: Tensor | None, pair: Tensor, pair_mask: Tensor | None = None
+    ) -> tuple[Tensor | None, Tensor]:
+        r"""
+        Apply one Pairformer update with residual connections.
+
+        The pair representation is refined by outgoing then incoming triangle multiplication, starting-
+        then ending-node triangle attention (each row-wise dropped and added back), and a pair transition.
+        When ``single_size > 0`` the single representation is then updated by pair-biased self-attention
+        and a single transition.
+
+        Args:
+            single: Single representation `[B, N, single_size]`. Required when ``single_size > 0``;
+                pass ``None`` for a pair-only block.
+            pair: Pair representation `[B, N, N, pair_size]`.
+            pair_mask: Optional pair validity mask `[B, N, N]`.
+
+        Returns:
+            Updated ``(single, pair)`` of shapes `[B, N, single_size]` (or ``None``) and
+            `[B, N, N, pair_size]`.
+
+        Raises:
+            ValueError: If ``single_size > 0`` but ``single`` is ``None``.
+
+        Examples:
+            >>> import torch
+            >>> block = PairformerBlock(
+            ...     single_size=0, pair_size=4,
+            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
+            ...     num_triangle_attention_heads=2, expansion=2, dropout=0.0,
+            ... ).eval()
+            >>> single, pair = block(None, torch.randn(1, 3, 3, 4))
+            >>> single is None, pair.shape
+            (True, torch.Size([1, 3, 3, 4]))
+        """
+
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
+        end_pair_mask = pair_mask.transpose(-2, -1) if pair_mask is not None else None
+        pair = pair + self.rowwise_dropout(
+            self.triangle_attention_ending_node(pair.transpose(-3, -2), pair_mask=end_pair_mask).transpose(
+                -3,
+                -2,
+            ),
+        )
+        pair = pair + self.pair_feed_forward(pair)
+        if self.pair_attention is not None and self.single_feed_forward is not None:
+            if single is None:
+                raise ValueError("single representation is required when single_size > 0")
+            single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
+            single = single + self.single_feed_forward(single)
+        return single, pair
