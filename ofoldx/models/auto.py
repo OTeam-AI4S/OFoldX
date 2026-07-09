@@ -697,6 +697,7 @@ def _ensure_default_models() -> None:
         ".boltzgen",
         ".esmfold2",
         ".ligandmpnn",
+        ".nampnn",
         ".odesign",
         ".proteinmpnn",
         ".protenix",

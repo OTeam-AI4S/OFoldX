@@ -24,6 +24,7 @@ from ..atom import (
     AttentionLayout,
     CoordinateAtomToTokenEncoder,
     LocalAtomGeometry,
+    LocalAtomWindowInfo,
     TokenToAtomDecoder,
 )
 from ..attention import DenoisingTokenEncoder
@@ -878,6 +879,7 @@ class DenoisingTokenRefiner(nn.Module):
         """
         target_prefix = tuple(inputs.denoising_single.shape[:-2])
         num_tokens = inputs.denoising_single.shape[-2]
+        reference_charges = _reference_charges_with_channel(inputs.reference_charges, inputs.reference_positions)
         denoising_single = _flatten_prefix(inputs.denoising_single, tail_dims=2)
         denoising_pair = _flatten_prefix(
             _broadcast_prefix(inputs.denoising_pair, target_prefix, tail_dims=3), tail_dims=3
@@ -891,9 +893,7 @@ class DenoisingTokenRefiner(nn.Module):
                 atom_encoder,
                 atom_features=_flatten_broadcast(inputs.atom_features, target_prefix, tail_dims=2),
                 reference_positions=_flatten_broadcast(inputs.reference_positions, target_prefix, tail_dims=2),
-                reference_charges=torch.arcsinh(
-                    _flatten_broadcast(inputs.reference_charges, target_prefix, tail_dims=2)
-                ),
+                reference_charges=torch.arcsinh(_flatten_broadcast(reference_charges, target_prefix, tail_dims=2)),
                 reference_mask=atom_mask,
                 single=_flatten_broadcast(inputs.single, target_prefix, tail_dims=2),
                 pair=denoising_pair,
@@ -905,19 +905,20 @@ class DenoisingTokenRefiner(nn.Module):
             decoder_atom_mask = atom_mask
             restore_prefix = None
         else:
+            local_geometry = _broadcast_local_geometry(inputs.local_geometry, target_prefix)
             atom_encoder_output = self._encode_atoms(
                 atom_encoder,
-                atom_features=inputs.atom_features,
-                reference_positions=inputs.reference_positions,
-                reference_charges=torch.arcsinh(inputs.reference_charges),
-                reference_mask=inputs.atom_mask,
-                single=inputs.single,
-                pair=inputs.denoising_pair,
+                atom_features=_broadcast_prefix(inputs.atom_features, target_prefix, tail_dims=2),
+                reference_positions=_broadcast_prefix(inputs.reference_positions, target_prefix, tail_dims=2),
+                reference_charges=torch.arcsinh(_broadcast_prefix(reference_charges, target_prefix, tail_dims=2)),
+                reference_mask=_broadcast_prefix(inputs.atom_mask, target_prefix, tail_dims=1),
+                single=_broadcast_prefix(inputs.single, target_prefix, tail_dims=2),
+                pair=_broadcast_prefix(inputs.denoising_pair, target_prefix, tail_dims=3),
                 noisy_coords=inputs.noisy_coords,
-                atom_mask=inputs.atom_mask,
-                atom_to_token=inputs.atom_to_token,
+                atom_mask=_broadcast_prefix(inputs.atom_mask, target_prefix, tail_dims=1),
+                atom_to_token=_broadcast_prefix(inputs.atom_to_token, target_prefix, tail_dims=1),
                 num_tokens=num_tokens,
-                local_geometry=inputs.local_geometry,
+                local_geometry=local_geometry,
             )
             decoder_atom_mask = None
             restore_prefix = target_prefix
@@ -1094,6 +1095,24 @@ class DenoisingTokenRefiner(nn.Module):
         return self.token_encoder(token_hidden, conditioning, pair)
 
 
+def _reference_charges_with_channel(reference_charges: Tensor, reference_positions: Tensor) -> Tensor:
+    r"""
+    Normalize scalar per-atom charges to `[..., N_atom, 1]`.
+
+    Some family inputs store formal charges as `[..., N_atom]`; the atom conditioner projects
+    a one-channel charge feature, so add the channel before sample-axis broadcasting.
+    """
+
+    if reference_charges.shape == reference_positions.shape[:-1]:
+        return reference_charges.unsqueeze(-1)
+    expected = (*reference_positions.shape[:-1], 1)
+    if tuple(reference_charges.shape) == expected:
+        return reference_charges
+    if reference_charges.ndim == reference_positions.ndim - 1:
+        return reference_charges.unsqueeze(-1)
+    return reference_charges
+
+
 def _broadcast_prefix(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims: int) -> Tensor:
     r"""
     Broadcast a tensor's leading (prefix) dims to ``target_prefix``, keeping the last ``tail_dims``.
@@ -1172,3 +1191,25 @@ def _flatten_broadcast(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims
     """
 
     return _flatten_prefix(_broadcast_prefix(tensor, target_prefix, tail_dims), tail_dims)
+
+
+def _broadcast_local_geometry(geometry: LocalAtomGeometry, target_prefix: tuple[int, ...]) -> LocalAtomGeometry:
+    r"""
+    Broadcast precomputed local atom geometry over denoising sample prefixes.
+
+    Local geometry is built once from reference coordinates and therefore often carries only the batch prefix,
+    while diffusion inputs may add a sample axis before the atom/window payload. Keep the window payload fixed and
+    expand only the leading prefix so the geometry, attention mask, and token-pair bias share one shape contract.
+    """
+
+    info = geometry.window_info
+    return LocalAtomGeometry(
+        distance_vectors=_broadcast_prefix(geometry.distance_vectors, target_prefix, tail_dims=4),
+        distance_mask=_broadcast_prefix(geometry.distance_mask, target_prefix, tail_dims=4),
+        window_info=LocalAtomWindowInfo(
+            attention_mask=_broadcast_prefix(info.attention_mask, target_prefix, tail_dims=3),
+            query_padding=info.query_padding,
+            key_padding_left=info.key_padding_left,
+            key_padding_right=info.key_padding_right,
+        ),
+    )

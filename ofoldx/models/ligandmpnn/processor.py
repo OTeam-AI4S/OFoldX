@@ -2,7 +2,7 @@ r"""
 LigandMPNN side-chain featurization.
 
 The LigandMPNN backbone consumes only N/CA/C/O coordinates, but the side-chain Packer
-([`packer`][ofoldx.models.ligandmpnn.packer]) is a Von Mises torsion-diffusion model that
+([`Packer`][ofoldx.models.ligandmpnn.model.Packer]) is a Von Mises torsion-diffusion model that
 reconstructs full atom14 side chains from predicted chi angles. That reconstruction needs
 AlphaFold2-style rigid torsion frames, which this module builds from backbone coordinates.
 

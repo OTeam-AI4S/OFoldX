@@ -1459,12 +1459,10 @@ class MiniTriangularUpdate(nn.Module):
 
     Args:
         pair_size: Width of the pair representation channel.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
     """
 
-    def __init__(self, pair_size: int = 128, operator_backend: str = "auto") -> None:
+    def __init__(self, pair_size: int = 128) -> None:
         super().__init__()
-        self.operator_backend = operator_backend
         self.norm_in = nn.LayerNorm(pair_size, eps=1e-5)
         self.p_in = nn.Linear(pair_size, pair_size, bias=False)
         self.g_in = nn.Linear(pair_size, pair_size, bias=False)
@@ -1521,7 +1519,7 @@ class MiniTrianglePairUpdateBlock(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.triangular = MiniTriangularUpdate(pair_size, operator_backend=operator_backend)
+        self.triangular = MiniTriangularUpdate(pair_size)
         self.transition_pair = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
@@ -1572,7 +1570,7 @@ class MiniformerBlock(nn.Module):
             num_attention_heads=num_pair_attention_heads,
             operator_backend=operator_backend,
         )
-        self.triangular = MiniTriangularUpdate(pair_size, operator_backend=operator_backend)
+        self.triangular = MiniTriangularUpdate(pair_size)
         self.transition_single = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
         self.transition_pair = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
         self.rowwise_dropout = RowwiseDropout(dropout)

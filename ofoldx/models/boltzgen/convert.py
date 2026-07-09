@@ -822,10 +822,6 @@ def convert_trunk_key(
     return []
 
 
-# ---------------------------------------------------------------------------
-# Input embedder (= AtomConditionedInputEmbedder with a single-layer atom encoder)
-# ---------------------------------------------------------------------------
-
 INPUT_EMBEDDER_CONDITIONING = {
     "atom_enc_proj_z": "atom_pair_bias_projection",
     "res_type_encoding": "residue_type_projection",
@@ -862,10 +858,6 @@ def convert_input_embedder(key: str) -> str | None:
     return key
 
 
-# ---------------------------------------------------------------------------
-# GNN layers (shared by encoder + decoder)
-# ---------------------------------------------------------------------------
-
 GNN_LAYER_RENAME = {
     "attn_weight_mlp": "attention_weight_mlp",
     "attn_value_mlp": "attention_value_mlp",
@@ -879,10 +871,6 @@ def _convert_gnn_layer(suffix: str) -> str:
     head, rest = suffix.split(".", 1)
     return f"{GNN_LAYER_RENAME.get(head, head)}.{rest}"
 
-
-# ---------------------------------------------------------------------------
-# Encoder (inverse_folding_encoder) + Decoder (structure_module)
-# ---------------------------------------------------------------------------
 
 ENCODER_TOP = {
     "linear_token_to_node": "node_input_projection",
@@ -929,10 +917,6 @@ def convert_decoder(key: str) -> str:
     head = key.split(".")[0]
     return DECODER_TOP.get(head, head) + key[len(head) :]
 
-
-# ---------------------------------------------------------------------------
-# Token distance module (BoltzGen structure-design trunk addition)
-# ---------------------------------------------------------------------------
 
 TOKEN_DISTANCE_TOP = {
     "z_norm": "norm_pair",
@@ -1180,15 +1164,30 @@ def _load_boltz_lightning_checkpoint(checkpoint_path: Path) -> Mapping[str, Any]
     except ModuleNotFoundError as error:
         if error.name != "boltzgen":
             raise
-        _install_boltzgen_unpickle_stubs()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint = _load_with_boltzgen_unpickle_stubs(checkpoint_path)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("checkpoint must be a mapping")
     return checkpoint
 
 
-def _install_boltzgen_unpickle_stubs() -> None:
-    r"""Install minimal modules/classes needed to unpickle released BoltzGen checkpoint metadata."""
+def _load_with_boltzgen_unpickle_stubs(checkpoint_path: Path) -> object:
+    r"""Load a checkpoint with temporary ``boltzgen`` validator stubs."""
+
+    modules = _boltzgen_unpickle_stub_modules()
+    previous: dict[str, types.ModuleType | None] = {name: sys.modules.get(name) for name in modules}
+    try:
+        sys.modules.update(modules)
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    finally:
+        for name, previous_module in previous.items():
+            if previous_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+
+
+def _boltzgen_unpickle_stub_modules() -> dict[str, types.ModuleType]:
+    r"""Build minimal modules/classes needed to unpickle released BoltzGen checkpoint metadata."""
 
     class DesignValidator:
         pass
@@ -1216,8 +1215,7 @@ def _install_boltzgen_unpickle_stubs() -> None:
     model_module.validation = modules["boltzgen.model.validation"]
     validation_module.design = modules["boltzgen.model.validation.design"]
     validation_module.rcsb = modules["boltzgen.model.validation.rcsb"]
-    for name, module in modules.items():
-        sys.modules.setdefault(name, module)
+    return modules
 
 
 def _build_boltzgen_target(

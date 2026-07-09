@@ -9,8 +9,7 @@ from __future__ import annotations
 
 from .config import LigandMPNNConfig, PackerConfig
 from .io import write_packed_pdb
-from .model import LigandMPNNDesignGenerator, LigandMPNNInput
-from .packer import Packer, pack_side_chains
+from .model import LigandMPNNDesignGenerator, LigandMPNNInput, Packer, pack_side_chains
 from .processor import LigandMPNNProcessor
 
 __all__ = [

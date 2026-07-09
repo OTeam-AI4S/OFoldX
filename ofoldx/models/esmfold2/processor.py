@@ -25,7 +25,7 @@ class ESMFold2Processor(ProcessorMixin):
     Build an ESMFold2 tensor batch from a protein sequence or FASTA file.
 
     This first OFoldX processor intentionally implements the protein-only path
-    used by ``infer_protein``. Full all-atom complex input processing should be
+    used by the released ESMFold2 checkpoint. Full all-atom complex input processing should be
     added as native OFoldX processing code rather than routed through an
     external runtime.
     """
@@ -96,27 +96,32 @@ PROTEIN_1TO3: dict[str, str] = {
 }
 
 ESM_PROTEIN_VOCAB: dict[str, int] = {
-    "L": 4,
-    "A": 5,
-    "G": 6,
-    "V": 7,
-    "S": 8,
+    "A": 6,
+    "C": 7,
+    "D": 8,
     "E": 9,
-    "R": 10,
-    "T": 11,
-    "I": 12,
-    "D": 13,
-    "P": 14,
-    "K": 15,
-    "Q": 16,
+    "F": 10,
+    "G": 11,
+    "H": 12,
+    "I": 13,
+    "K": 14,
+    "L": 15,
+    "M": 16,
     "N": 17,
-    "F": 18,
-    "Y": 19,
-    "M": 20,
-    "H": 21,
-    "W": 22,
-    "C": 23,
-    "X": 3,
+    "P": 18,
+    "Q": 19,
+    "R": 20,
+    "S": 21,
+    "T": 22,
+    "V": 23,
+    "W": 24,
+    "Y": 25,
+    "X": 26,
+    "Z": 27,
+    "B": 28,
+    "J": 29,
+    "U": 30,
+    "O": 31,
 }
 
 # Heavy atoms per canonical residue, in training-time order.
@@ -502,9 +507,7 @@ def prepare_protein_features(sequence: str) -> dict[str, Tensor]:
 _RES_TYPE_TO_3LETTER: dict[int, str] = {rt: three for three, rt in PROTEIN_RESIDUE_TO_RES_TYPE.items()}
 _RES_TYPE_TO_3LETTER[PROTEIN_UNK_RES_TYPE] = "UNK"
 
-# Featurization keys that ``output_to_pdb`` reads off the forward output.
-# ``infer_protein`` re-attaches them because ``forward`` does not echo them
-# back; both ESMFold2 model classes share this list.
+# Featurization keys that ``output_to_pdb`` reads off a raw tensor-output mapping.
 OUTPUT_TO_PDB_FEATURE_KEYS: tuple[str, ...] = (
     "res_type",
     "atom_to_token",
@@ -519,7 +522,7 @@ def output_to_pdb(output: dict) -> str:
     """Convert an ESMFold2 protein forward output into a PDB string.
 
     Expects ``output`` to carry the featurization keys re-attached by
-    ``infer_protein`` (``res_type``, ``atom_to_token``,
+    a raw tensor-output mapping (``res_type``, ``atom_to_token``,
     ``ref_atom_name_chars``, ``atom_attention_mask``,
     ``token_attention_mask``, ``residue_index``) alongside the predicted
     ``sample_atom_coords`` and ``plddt``. Builds a 37-atom PDB view with

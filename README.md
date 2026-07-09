@@ -92,4 +92,6 @@ python scripts/validate_hub_artifacts.py --root artifacts/hub/ofoldx-pipelines -
 - [`docs/naming.md`](docs/naming.md) — canonical vocabulary.
 - [`docs/docstrings.md`](docs/docstrings.md) — docstring & doctest convention.
 
-OFoldX is pre-alpha research software; the license is not yet determined.
+OFoldX is pre-alpha research software under the AGPL; see
+[`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md) for the compatibility and conversion
+policy.

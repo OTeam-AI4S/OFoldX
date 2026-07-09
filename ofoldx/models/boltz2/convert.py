@@ -1134,15 +1134,30 @@ def _load_boltz_lightning_checkpoint(checkpoint_path: Path) -> Mapping[str, Any]
     except ModuleNotFoundError as error:
         if error.name != "boltzgen":
             raise
-        _install_boltzgen_unpickle_stubs()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint = _load_with_boltzgen_unpickle_stubs(checkpoint_path)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("checkpoint must be a mapping")
     return checkpoint
 
 
-def _install_boltzgen_unpickle_stubs() -> None:
-    r"""Install minimal modules/classes needed to unpickle released Boltz checkpoint metadata."""
+def _load_with_boltzgen_unpickle_stubs(checkpoint_path: Path) -> object:
+    r"""Load a checkpoint with temporary ``boltzgen`` validator stubs."""
+
+    modules = _boltzgen_unpickle_stub_modules()
+    previous: dict[str, types.ModuleType | None] = {name: sys.modules.get(name) for name in modules}
+    try:
+        sys.modules.update(modules)
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    finally:
+        for name, previous_module in previous.items():
+            if previous_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+
+
+def _boltzgen_unpickle_stub_modules() -> dict[str, types.ModuleType]:
+    r"""Build minimal modules/classes needed to unpickle released Boltz checkpoint metadata."""
 
     class DesignValidator:
         pass
@@ -1170,8 +1185,7 @@ def _install_boltzgen_unpickle_stubs() -> None:
     model_module.validation = modules["boltzgen.model.validation"]
     validation_module.design = modules["boltzgen.model.validation.design"]
     validation_module.rcsb = modules["boltzgen.model.validation.rcsb"]
-    for name, module in modules.items():
-        sys.modules.setdefault(name, module)
+    return modules
 
 
 def _select_state_dict(checkpoint: Mapping[str, Any], *, state_key: str) -> tuple[Mapping[str, Any], str]:

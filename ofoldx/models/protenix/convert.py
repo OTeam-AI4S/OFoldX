@@ -110,10 +110,7 @@ def convert_protenix_checkpoint(
         translate_protenix_from_base_state(model, load_reference_state(checkpoint_path)),
         dtype,
     )
-    result = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = all(key.startswith(_CONSTRAINT_PREFIXES) for key in result.missing_keys)
-    if result.unexpected_keys or not allowed_missing:
-        raise RuntimeError(f"Protenix checkpoint load mismatch: {result}")
+    model.load_state_dict(state_dict, strict=True)
     model.save_pretrained(output_dir)
     return {
         "checkpoint": str(checkpoint_path),
@@ -125,6 +122,22 @@ def convert_protenix_checkpoint(
         "dtype": str(dtype) if dtype is not None else None,
         "dtype_counts": _dtype_counts(state_dict),
     }
+
+
+def _with_initialized_prefixes(
+    model: nn.Module,
+    state_dict: Mapping[str, Tensor],
+    prefixes: tuple[str, ...],
+) -> dict[str, Tensor]:
+    r"""
+    Fill tolerated missing keys from the model's configured initialization before strict loading.
+    """
+
+    completed = dict(state_dict)
+    for key, value in model.state_dict().items():
+        if key.startswith(prefixes) and key not in completed:
+            completed[key] = value.detach().clone()
+    return completed
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -167,27 +180,30 @@ def translate_protenix_from_base_state(
     Initialize the shared AF3/Protenix trunk from a non-constraint Protenix checkpoint.
 
     Constraint-embedder tensors are absent in the public v0.5 base checkpoint, so
-    ``constraint_embedder.*`` keys are allowed to be missing and are left at their configured
-    initialization values.
+    ``constraint_embedder.*`` keys are filled from ``model``'s configured initialization.
 
     Args:
         model: Target OFoldX model whose parameter names drive the key mapping.
         reference_state: Reference non-constraint Protenix tensor state.
 
     Returns:
-        OFoldX-keyed state dict for the shared trunk, omitting the constraint-embedder tensors.
+        OFoldX-keyed state dict that can be loaded with ``strict=True``.
 
     Examples:
         >>> state = load_reference_state("protenix_base_default_v0.5.0.pt")  # doctest: +SKIP
         >>> translated = translate_protenix_from_base_state(model, state)  # doctest: +SKIP
-        >>> model.load_state_dict(translated, strict=False)  # doctest: +SKIP
+        >>> model.load_state_dict(translated, strict=True)  # doctest: +SKIP
     """
 
-    return translate_reference_state(
+    return _with_initialized_prefixes(
         model,
-        reference_state,
-        _protenix_reference_key,
-        allow_missing_prefixes=_CONSTRAINT_PREFIXES,
+        translate_reference_state(
+            model,
+            reference_state,
+            _protenix_reference_key,
+            allow_missing_prefixes=_CONSTRAINT_PREFIXES,
+        ),
+        _CONSTRAINT_PREFIXES,
     )
 
 

@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from ...hub import publish_artifact_to_hub
+from ...hub import add_hub_upload_arguments, upload_artifact_from_args
 from .converters import deepmind, openfold
 from .converters.deepmind import (
     OFFICIAL_AF2_CODE_LICENSE,
@@ -175,14 +175,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("keep", "float32", "float16", "bfloat16"), default="keep")
     parser.add_argument("--inspect-only", action="store_true", help="Only print a checkpoint summary")
     parser.add_argument("--no-verify", action="store_true", help="Do not strict-reload the written model artifact")
-    parser.add_argument(
-        "--push-to-hub",
-        metavar="REPO_ID",
-        default=None,
-        help="Upload the converted model artifact to this Hugging Face Hub repo id after local verification",
-    )
-    parser.add_argument("--private", action="store_true", help="Create/upload the Hub repo as private")
-    parser.add_argument("--revision", default=None, help="Optional Hub revision/branch for upload")
+    add_hub_upload_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -192,7 +185,7 @@ def main(argv: list[str] | None = None) -> None:
     """
 
     args = _parse_args(argv)
-    if args.inspect_only and args.push_to_hub is not None:
+    if args.inspect_only and args.push_to_hub:
         raise SystemExit("--inspect-only and --push-to-hub cannot be combined because inspection writes no artifact")
     dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
     report = convert_alphafold2_checkpoint(
@@ -204,15 +197,13 @@ def main(argv: list[str] | None = None) -> None:
         inspect_only=args.inspect_only,
         verify_artifact=not args.no_verify,
     )
-    if args.push_to_hub is not None:
-        publish_artifact_to_hub(
-            args.output_dir,
-            repo_id=args.push_to_hub,
-            private=args.private,
-            revision=args.revision,
-            commit_message=f"Convert AlphaFold 2 {args.source} {report['model_name']}",
-        )
-        report["hub_repo_id"] = args.push_to_hub
+    upload_result = upload_artifact_from_args(
+        args.output_dir,
+        args,
+        commit_message=f"Convert AlphaFold 2 {args.source} {report['model_name']}",
+    )
+    if upload_result is not None:
+        report["hub_upload"] = str(upload_result)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

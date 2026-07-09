@@ -382,10 +382,15 @@ def _load_conversion_report(
         The populated [`PxDesignConversionReport`][ofoldx.models.pxdesign.convert.PxDesignConversionReport].
     """
 
-    load_result = model.load_state_dict(converted, strict=False)
-    missing = tuple(key for key in load_result.missing_keys if not key.startswith(allow_fresh_prefixes))
-    unexpected = tuple(load_result.unexpected_keys)
-    fresh = tuple(key for key in model.state_dict() if key.startswith(allow_fresh_prefixes) and key not in converted)
+    model_state = model.state_dict()
+    fresh = tuple(key for key in model_state if key.startswith(allow_fresh_prefixes) and key not in converted)
+    missing = tuple(sorted(set(model_state) - set(converted) - set(fresh)))
+    unexpected = tuple(sorted(set(converted) - set(model_state)))
+    if not missing and not unexpected:
+        completed = dict(converted)
+        for key in fresh:
+            completed[key] = model_state[key].detach().clone()
+        model.load_state_dict(completed, strict=True)
     expected_reference_keys = _expected_reference_keys(model)
     unexpected_reference = tuple(sorted(set(reference_state) - expected_reference_keys))
     return PxDesignConversionReport(

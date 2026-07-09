@@ -220,7 +220,7 @@ def rf_all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
     Return the RFdiffusion residue-frame kinematics constants for atom14 reconstruction.
 
     Decompresses and caches the embedded RoseTTAFold all-atom tables on first call, so subsequent calls are
-    free. The tables drive [`ComputeAllAtomCoords`][ofoldx.models.rfdiffusion.sampler.ComputeAllAtomCoords]
+    free. The tables drive [`ComputeAllAtomCoords`][ofoldx.models.rfdiffusion.model.ComputeAllAtomCoords]
     when it rebuilds sidechain atoms from backbone frames and torsion angles.
 
     Returns:

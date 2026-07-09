@@ -12,11 +12,9 @@ from .config import (
     ProtenixConstraintPocketConfig,
     ProtenixConstraintSubstructureConfig,
 )
-from .guidance import ProtenixGuidanceFeatures
 from .model import (
-    ProtenixConstraintEmbedder,
     ProtenixConstraintFeatures,
-    ProtenixConstraintSubstructureEmbedder,
+    ProtenixGuidanceFeatures,
     ProtenixInput,
     ProtenixModel,
 )
@@ -26,7 +24,6 @@ __all__ = [
     "ProtenixConfig",
     "ProtenixConstraintContactAtomConfig",
     "ProtenixConstraintContactConfig",
-    "ProtenixConstraintEmbedder",
     "ProtenixConstraintEmbedderConfig",
     "ProtenixConstraintFeatures",
     "ProtenixInput",
@@ -34,6 +31,5 @@ __all__ = [
     "ProtenixConstraintPocketConfig",
     "ProtenixProcessor",
     "ProtenixConstraintSubstructureConfig",
-    "ProtenixConstraintSubstructureEmbedder",
     "ProtenixGuidanceFeatures",
 ]

@@ -46,7 +46,7 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
     Pack side chains from a structure or LigandMPNN Packer feature mapping.
 
     Args:
-        model: LigandMPNN [`Packer`][ofoldx.models.ligandmpnn.packer.Packer] module.
+        model: LigandMPNN [`Packer`][ofoldx.models.ligandmpnn.model.Packer] module.
 
     Examples:
         >>> from ofoldx.pipelines import SideChainPackingPipeline

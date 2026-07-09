@@ -15,12 +15,11 @@ from .config import (
     Boltz2TemplateConfig,
     Boltz2TrunkConfig,
 )
-from .model import Boltz2AffinityHead, Boltz2AffinityModel, Boltz2Input, Boltz2Model
+from .model import Boltz2AffinityModel, Boltz2Input, Boltz2Model
 from .processor import Boltz2Processor
 
 __all__ = [
     "Boltz2AffinityConfig",
-    "Boltz2AffinityHead",
     "Boltz2AffinityHeadConfig",
     "Boltz2AffinityModel",
     "Boltz2Config",

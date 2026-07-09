@@ -10,9 +10,8 @@ from ..config import (
     DistogramConfig,
     TrunkConfig,
 )
-from .confidence import ConfidenceSummary, confidence_summary
 from .config import AlphaFold3Config
-from .model import AlphaFold3Input, AlphaFold3Model, AlphaFold3RecyclingState
+from .model import AlphaFold3Input, AlphaFold3Model, AlphaFold3RecyclingState, ConfidenceSummary, confidence_summary
 from .processor import AlphaFold3Processor
 
 __all__ = [

@@ -23,12 +23,6 @@ from .config import (
     RfDiffusionTopKSE3Config,
 )
 from .model import (
-    RfDiffusionDesignGenerator,
-    RfDiffusionInput,
-    RoseTTAFoldModule,
-)
-from .processor import RfDiffusionProcessor
-from .sampler import (
     ContigMap,
     Denoiser,
     Diffuser,
@@ -36,10 +30,14 @@ from .sampler import (
     IGSO3Diffuser,
     NativeRfDiffusionSampler,
     PotentialManager,
+    RfDiffusionDesignGenerator,
+    RfDiffusionInput,
+    RoseTTAFoldModule,
     SymmetryGenerator,
     coords_to_t2d,
     get_beta_schedule,
 )
+from .processor import RfDiffusionProcessor
 
 _CONVERT_EXPORTS = {
     "config_from_rfdiffusion_checkpoint",

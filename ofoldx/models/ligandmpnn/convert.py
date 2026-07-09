@@ -346,7 +346,7 @@ def convert_packer_state_dict(
 
     The Packer is the ``ligandmpnn_sc`` checkpoint family (Von Mises torsion weights), distinct from
     the sequence backbone. Load the result into
-    [`Packer`][ofoldx.models.ligandmpnn.packer.Packer].
+    [`Packer`][ofoldx.models.ligandmpnn.model.Packer].
 
     Args:
         checkpoint_or_state_dict: A checkpoint dict (with ``model_state_dict``) or a raw state dict.
@@ -688,7 +688,7 @@ def convert_ligandmpnn_packer_checkpoint(
         >>> convert_ligandmpnn_packer_checkpoint("ligandmpnn_sc_v_32_002_16.pt", "ligandmpnn-packer")  # doctest: +SKIP
     """
 
-    from .packer import Packer
+    from .model import Packer
 
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)

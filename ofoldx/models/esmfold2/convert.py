@@ -159,6 +159,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     _rename(config, "lm_num_layers", "num_language_model_layers")
     _rename(config, "lm_dropout", "language_model_dropout")
     _rename(config, "lm_mask_pct", "language_model_mask_probability")
+    config["esmc_id"] = "multimolecule/esmc-6b"
     _rename(
         config,
         "force_lm_dropout_during_inference",

@@ -143,7 +143,7 @@ class RfDiffusionDiffuserConfig(Config):
     Forward-diffusion (noising) schedule recorded in the checkpoint ``config_dict["diffuser"]``.
 
     Controls the coupled translation (Euclidean) and rotation (IGSO3) noise processes used by
-    [`Diffuser`][ofoldx.models.rfdiffusion.sampler.Diffuser]. The upstream timestep keys ``T`` and
+    [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser]. The upstream timestep keys ``T`` and
     ``partial_T`` are renamed to ``num_timesteps`` and ``partial_timesteps`` during conversion. Defaults match
     the released ``base`` checkpoint.
 
@@ -227,7 +227,7 @@ class RfDiffusionDenoiserConfig(Config):
     r"""
     Reverse-diffusion (denoising) noise schedule consumed by the sampler.
 
-    Sets the per-step noise scales the [`Denoiser`][ofoldx.models.rfdiffusion.sampler.Denoiser] injects
+    Sets the per-step noise scales the [`Denoiser`][ofoldx.models.rfdiffusion.model.Denoiser] injects
     when stepping from ``x_t`` toward ``x_0`` for CA translations and backbone frames.
 
     Attributes:
@@ -259,7 +259,7 @@ class RfDiffusionInferenceConfig(Config):
     Design-time sampler controls (I/O, symmetry, self-conditioning, and step bounds).
 
     Populated from ``config_dict["inference"]`` and overridable at call time. These knobs steer the sampling
-    loop of [`NativeRfDiffusionSampler`][ofoldx.models.rfdiffusion.sampler.NativeRfDiffusionSampler]
+    loop of [`NativeRfDiffusionSampler`][ofoldx.models.rfdiffusion.model.NativeRfDiffusionSampler]
     rather than the network weights.
 
     Attributes:
@@ -324,7 +324,7 @@ class RfDiffusionContigMapConfig(Config):
     r"""
     Contig and inpainting specification for placing motif and designed segments.
 
-    Feeds [`ContigMap`][ofoldx.models.rfdiffusion.sampler.ContigMap], which resolves these contig strings
+    Feeds [`ContigMap`][ofoldx.models.rfdiffusion.model.ContigMap], which resolves these contig strings
     into reference, output, and RF-relative residue indices. Sequence- and structure-inpainting masks may be
     given globally or per secondary-structure class.
 
@@ -377,7 +377,7 @@ class RfDiffusionPotentialsConfig(Config):
     r"""
     Guiding-potential controls that bias the reverse-diffusion trajectory.
 
-    Parsed by [`PotentialManager`][ofoldx.models.rfdiffusion.sampler.PotentialManager] into scalar
+    Parsed by [`PotentialManager`][ofoldx.models.rfdiffusion.model.PotentialManager] into scalar
     potentials whose gradients nudge CA coords toward user goals (radius of gyration, contacts, substrate
     proximity). Each potential string uses the terse upstream token form (e.g. ``"type:monomer_ROG,weight:1"``).
 
@@ -412,8 +412,8 @@ class RfDiffusionScaffoldGuidedConfig(Config):
     Secondary-structure and block-adjacency guided (fold-conditioned) sampling controls.
 
     Drives the scaffold branch of the sampler
-    ([`BlockAdjacency`][ofoldx.models.rfdiffusion.sampler.BlockAdjacency] and
-    [`Target`][ofoldx.models.rfdiffusion.sampler.Target]): sample a fold topology from precomputed
+    ([`BlockAdjacency`][ofoldx.models.rfdiffusion.model.BlockAdjacency] and
+    [`Target`][ofoldx.models.rfdiffusion.model.Target]): sample a fold topology from precomputed
     secondary-structure/adjacency tensors, optionally conditioned on a fixed target.
 
     Attributes:

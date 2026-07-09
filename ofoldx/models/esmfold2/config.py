@@ -173,7 +173,7 @@ class ESMFold2Config(Config):
     force_language_model_dropout_during_inference: bool = False
     language_model_hidden_size: int = 2560
     num_language_model_layers: int = 80
-    esmc_id: str = "biohub/ESMC-6B"
+    esmc_id: str = "multimolecule/esmc-6b"
     msa_encoder_overwrite: bool = True
 
     inputs: ESMFold2InputsEmbedderConfig = ESMFold2InputsEmbedderConfig()

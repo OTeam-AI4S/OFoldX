@@ -40,9 +40,8 @@ from ...processors.utils import (
     structure_from_input,
     tokenize_structure,
 )
-from .guidance import ProtenixGuidanceFeatures
 from .io import structure_from_protenix_json
-from .model import ProtenixConstraintFeatures, ProtenixInput
+from .model import ProtenixConstraintFeatures, ProtenixGuidanceFeatures, ProtenixInput
 
 
 @dataclass(frozen=True, slots=True)

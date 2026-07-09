@@ -40,6 +40,7 @@ from .contract import (
 from .esmfold2 import ESMFold2Config, ESMFold2Input, ESMFold2Model, ESMFold2Processor
 from .ligandmpnn import LigandMPNNConfig, LigandMPNNDesignGenerator, LigandMPNNInput
 from .mixin import ModelMixin, no_init_weights
+from .nampnn import NAMPNNConfig, NAMPNNDesignGenerator, NAMPNNInput, NAMPNNProcessor
 from .odesign import ODesignConfig, ODesignDesignConfig, ODesignDesignGenerator, ODesignInput, ODesignModel
 from .proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesignGenerator, ProteinMPNNInput
 from .protenix import (
@@ -93,6 +94,10 @@ __all__ = [
     "LigandMPNNDesignGenerator",
     "LigandMPNNInput",
     "ModelMixin",
+    "NAMPNNConfig",
+    "NAMPNNDesignGenerator",
+    "NAMPNNInput",
+    "NAMPNNProcessor",
     "ODesignConfig",
     "ODesignDesignConfig",
     "ODesignDesignGenerator",

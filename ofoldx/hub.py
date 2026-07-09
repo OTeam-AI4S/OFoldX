@@ -258,18 +258,23 @@ _UPSTREAM_METADATA = {
     },
     "esmfold2": {
         "project": "ESMFold2",
-        "summary": "Biohub ESMFold2 all-atom structure-prediction architecture converted for OFoldX.",
+        "summary": (
+            "Biohub ESMFold2 all-atom structure-prediction head converted for OFoldX. Full sequence inference uses "
+            "ESMC loaded through MultiMolecule."
+        ),
         "repository": "https://github.com/Biohub/esm",
         "paper": "Language Modeling Materializes a World Model of Protein Biology",
         "paper_url": "https://biohub.ai/papers/esm_protein.pdf",
-        "license": "MIT for the Biohub ESM package; Apache-2.0 for the Biohub Transformers model code",
+        "license": "MIT for the Biohub ESMFold2 release; AGPL-3.0-or-later for the MultiMolecule ESMC implementation",
         "training_data": (
             "The upstream ESMFold2 model card describes training on Protein Data Bank and AlphaFold DB "
-            "structures. OFoldX does not redistribute the training corpus."
+            "structures; the ESMC language model was trained on large protein-sequence corpora. OFoldX does not "
+            "redistribute the training corpora."
         ),
         "training_procedure": (
             "OFoldX converts the released Biohub ESMFold2 checkpoint into `model.safetensors` plus an "
-            "OFoldX manifest; it does not run ESMFold2 training."
+            "OFoldX manifest; it does not run ESMFold2 training. The ESMC component is loaded separately through "
+            "MultiMolecule (`multimolecule/esmc-6b` by default)."
         ),
         "citation": _ESMFOLD2_CITATION,
     },
@@ -489,7 +494,7 @@ _UPSTREAM_REFINEMENTS = {
         ),
     },
     "esmfold2": {
-        "base_model": "biohub/ESMFold2",
+        "base_model": "biohub/ESMFold2 + multimolecule/esmc-6b",
         "hub_license": "mit",
         "source_release": "https://huggingface.co/biohub/ESMFold2",
     },
@@ -821,6 +826,8 @@ def upload_folder_to_hub(
     if delete_existing:
         api.delete_repo(repo_id=repo_id, repo_type=repo_type, token=token, missing_ok=True)
     api.create_repo(repo_id=repo_id, repo_type=repo_type, private=private, token=token, exist_ok=True)
+    if tag is not None and create_pr:
+        raise ValueError("cannot create a Hub tag for a pull-request upload; merge the PR and tag the result")
     upload = api.upload_folder(
         folder_path=str(folder_path),
         repo_id=repo_id,
@@ -833,7 +840,7 @@ def upload_folder_to_hub(
         ignore_patterns=None if ignore_patterns is None else list(ignore_patterns),
     )
     if tag is not None:
-        api.create_tag(repo_id=repo_id, repo_type=repo_type, token=token, tag=tag)
+        api.create_tag(repo_id=repo_id, repo_type=repo_type, token=token, tag=tag, revision=revision)
     return upload
 
 

@@ -18,15 +18,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from chanfig import Config
-from safetensors.torch import save_file
 from torch import Tensor
 
-from ...artifacts import ARTIFACT_MANIFEST_NAME, build_artifact_manifest
 from ...hub import add_hub_upload_arguments, upload_artifact_from_args
 from ..boltz2 import convert as boltz2_convert
-from ..mixin import ModelMixin
 from .config import Boltz1Config
+from .model import Boltz1Model
 
 _DTYPES = {
     "float32": torch.float32,
@@ -321,25 +318,27 @@ def convert_boltz1_checkpoint(
 
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     raw_state = checkpoint.get("state_dict", checkpoint)
     if not isinstance(raw_state, Mapping):
         raise TypeError("checkpoint does not contain a mapping state_dict")
     converted = convert_boltz1_state_dict(raw_state, dtype=dtype, strict=strict)
 
     model_config = Boltz1Config() if config is None else Boltz1Config(config)
-    artifact_config = _artifact_config(model_config)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _artifact_manifest().json(output_dir / ARTIFACT_MANIFEST_NAME)
-    artifact_config.json(output_dir / ModelMixin.CONFIG_NAME)
-    save_file(
-        {key: value for key, value in converted.items() if isinstance(value, Tensor)},
-        str(output_dir / ModelMixin.WEIGHTS_NAME),
-    )
+    model = Boltz1Model(model_config)
+    if dtype is not None:
+        model.to(dtype=dtype)
+    tensor_state: dict[str, Tensor] = {}
+    for key, value in converted.items():
+        if not isinstance(value, Tensor):
+            raise TypeError(f"converted Boltz-1 state contains a non-tensor value at {key!r}")
+        tensor_state[key] = value
+    model.load_state_dict(tensor_state, strict=True)
+    model.save_pretrained(output_dir)
     return {
         "checkpoint": str(checkpoint_path),
         "output_dir": str(output_dir),
-        "tensor_count": len(converted),
+        "tensor_count": len(tensor_state),
         "dtype": str(dtype) if dtype is not None else None,
     }
 
@@ -698,40 +697,6 @@ def _is_ignorable_key(key: str) -> bool:
     if re.search(r"\.layers\.\d+\.output_projection\.0\.(weight|bias)$", key):
         return True
     return False
-
-
-def _artifact_config(config: Boltz1Config) -> Config:
-    r"""
-    Build the persisted ``config.json`` payload.
-
-    Args:
-        config: The Boltz-1 config to serialize.
-
-    Returns:
-        A copy of ``config`` with runtime model settings only.
-    """
-
-    artifact = config.copy()
-    artifact.pop("architecture", None)
-    return artifact
-
-
-def _artifact_manifest() -> Config:
-    r"""
-    Build the root manifest for a converted Boltz-1 model artifact.
-
-    Returns:
-        Manifest config written to ``manifest.json``.
-    """
-
-    return build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.boltz1.model.Boltz1Model",
-        architecture="boltz1",
-        task="structure_prediction",
-        files={"config": ModelMixin.CONFIG_NAME},
-        weights={"default": ModelMixin.WEIGHTS_NAME},
-    )
 
 
 if __name__ == "__main__":

@@ -15,9 +15,11 @@ Current status:
 
 The released checkpoint expects ESMC-6B language-model representations. OFoldX
 keeps that boundary explicit: callers can pass `lm_hidden_states` in
-`ESMFold2Input`, or attach a compatible frozen language model with
-`set_language_model()`. `load_esmc()` intentionally raises until OFoldX has a
-native ESMC implementation.
+`ESMFold2Input`, attach a frozen language model with `set_language_model()`, or
+call `load_esmc()` to load ESMC through MultiMolecule's `AutoTokenizer` /
+`AutoModel` surface.
 
-Full model parity still requires a native ESMC path and a same-input/same-output
-comparison against the reference release before publication.
+Full model parity is tracked as same-input/same-output comparison against the
+reference release. Folding-head parity uses the same ESMC hidden states on both
+sides; sequence-to-structure parity additionally covers the MultiMolecule ESMC
+component.

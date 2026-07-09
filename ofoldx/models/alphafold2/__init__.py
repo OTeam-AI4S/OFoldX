@@ -18,9 +18,9 @@ from .model import (
     AlphaFold2Input,
     AlphaFold2Model,
     AlphaFold2Representations,
+    AlphaFold2StructureModuleOutput,
 )
 from .processor import AlphaFold2Processor
-from .structure import AlphaFold2StructureModuleOutput
 
 __all__ = [
     "AlphaFold2Config",
