@@ -9,9 +9,7 @@ import yaml
 
 from ofoldx.artifacts import ARTIFACT_MANIFEST_NAME, build_artifact_manifest
 from ofoldx.hub import (
-    default_widget_examples,
     model_card_metadata,
-    public_architecture_name,
     publish_artifact_to_hub,
     resolve_pretrained_path,
     upload_artifact_from_args,
@@ -93,7 +91,7 @@ def test_upload_folder_to_hub_can_delete_upload_and_tag(monkeypatch: pytest.Monk
         token="token",
         revision="main",
         commit_message="publish",
-        create_pr=True,
+        create_pr=False,
         delete_existing=True,
         tag="v1",
         allow_patterns=("*.json",),
@@ -122,7 +120,7 @@ def test_upload_folder_to_hub_can_delete_upload_and_tag(monkeypatch: pytest.Monk
         "revision": "main",
         "commit_message": "publish",
         "token": "token",
-        "create_pr": True,
+        "create_pr": False,
         "allow_patterns": ["*.json"],
         "ignore_patterns": ["*.pt"],
     }
@@ -131,10 +129,34 @@ def test_upload_folder_to_hub_can_delete_upload_and_tag(monkeypatch: pytest.Monk
         "repo_type": "model",
         "token": "token",
         "tag": "v1",
+        "revision": "main",
     }
 
 
-def test_write_model_card_generates_frontmatter_and_widget(tmp_path: Path) -> None:
+def test_upload_folder_to_hub_rejects_tag_with_pull_request(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeHfApi:
+        def create_repo(self, **kwargs: object) -> None:
+            pass
+
+        def upload_folder(self, **kwargs: object) -> str:
+            return "uploaded"
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeHfApi))
+
+    # A tag cannot be created for a PR upload -- the PR revision is not yet a mergeable ref.
+    with pytest.raises(ValueError, match="cannot create a Hub tag for a pull-request upload"):
+        upload_folder_to_hub(
+            tmp_path,
+            repo_id="oteam/protein-model",
+            create_pr=True,
+            tag="v1",
+        )
+
+
+def test_write_model_card_generates_generic_card_for_bare_artifact(tmp_path: Path) -> None:
+    # A bare artifact that ships no authored card gets a compact, GENERIC card built from the manifest --
+    # library/kind/task/model-index front matter plus a load snippet. No per-model prose is synthesized: that
+    # content lives in each family's authored README, not in the shared hub module.
     build_artifact_manifest(
         kind="model",
         entrypoint="proteinlib.models.DemoModel",
@@ -153,93 +175,49 @@ def test_write_model_card_generates_frontmatter_and_widget(tmp_path: Path) -> No
     assert metadata["pipeline_tag"] == "other"
     assert metadata["task"] == "structure_prediction"
     assert metadata["model-index"] == [{"name": "protein-model", "results": []}]
-    widget = metadata["widget"]
-    assert isinstance(widget, list)
-    assert isinstance(widget[0], dict)
-    assert widget[0]["example_title"] == "Single-chain protein"
-    assert 'example_title: "Single-chain protein"' in content
-    assert "## Model Details" in content
-    assert "### Model Specification" in content
-    assert "| Entrypoint | `proteinlib.models.DemoModel` |" in content
-    assert "## Training Details" in content
-    assert "## Citation" in content
-    assert "### Pipeline Usage" in content
-    assert "### Direct Use" not in content
+    assert "widget" not in metadata  # no per-architecture widget synthesis
+    assert "# protein-model" in content
+    assert "## Usage" in content
     assert "Pipeline.from_pretrained" in content
     assert "AutoModel.from_pretrained" in content
-    assert content.index("Pipeline.from_pretrained") < content.index("AutoModel.from_pretrained")
-    assert "manifest.json" in content
 
 
-def test_write_model_card_includes_upstream_provenance_from_config(tmp_path: Path) -> None:
+def test_write_model_card_preserves_an_authored_card(tmp_path: Path) -> None:
+    # When a self-contained authored card (with YAML front matter) is already present -- the family README that
+    # save_pretrained copies in -- it IS the model card and is left untouched. The shared hub module no longer
+    # regenerates per-model front matter or body.
     build_artifact_manifest(
         kind="model",
-        entrypoint="ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator",
-        architecture="proteinmpnn",
-        task="design_generation",
-        files={"config": "config.json"},
-        weights={"default": "model.safetensors"},
+        entrypoint="proteinlib.models.DemoModel",
+        architecture="demo",
+        task="design",
     ).json(tmp_path / ARTIFACT_MANIFEST_NAME)
-    (tmp_path / "config.json").write_text('{"checkpoint_variant": "proteinmpnn_v_48_020", "k_neighbors": 48}')
-
-    card_path = write_model_card(tmp_path, repo_id="oteam/proteinmpnn-noise020")
-
-    content = card_path.read_text()
-    assert "**Upstream Project**: ProteinMPNN / LigandMPNN release" in content
-    assert "`proteinmpnn_v_48_020.pt`" in content
-    assert "| k-Neighbors | `48` |" in content
-    assert "OFoldX did not train these weights." in content
-    assert "10.1126/science.add2187" in content
-    assert "MIT for upstream ProteinMPNN and LigandMPNN code/model parameters" in content
-    assert "The Hub `license` metadata, when present, reflects the source checkpoint" in content
-
-
-def test_model_card_uses_noise_level_not_checkpoint_suffix_math(tmp_path: Path) -> None:
-    build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator",
-        architecture="proteinmpnn",
-        task="design_generation",
-        files={"config": "config.json"},
-        weights={"default": "model.safetensors"},
-    ).json(tmp_path / ARTIFACT_MANIFEST_NAME)
-    (tmp_path / "config.json").write_text(
-        '{"checkpoint_variant": "proteinmpnn_v_48_020", "k_neighbors": 48, "noise_level": 0.2}'
+    authored = (
+        "---\n"
+        "library_name: ofoldx\n"
+        "tags:\n"
+        "  - biology\n"
+        "  - protein-design\n"
+        "license: mit\n"
+        "---\n\n"
+        "# DemoDesigner\n\nHand-authored public model card.\n\n"
+        "## Citation\n\n```bibtex\n@article{demo2025, title = {Demo}}\n```\n"
     )
+    (tmp_path / "README.md").write_text(authored)
 
-    card_path = write_model_card(tmp_path, repo_id="oteam/proteinmpnn-noise020")
+    card_path = write_model_card(tmp_path, repo_id="oteam/demo", metadata={"tags": ["ignored-at-publish"]})
 
-    content = card_path.read_text()
-    assert "0.20 Angstrom" in content
-    assert "0.020" not in content
-
-
-def test_solublempnn_model_card_uses_soluble_provenance(tmp_path: Path) -> None:
-    build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator",
-        architecture="proteinmpnn",
-        task="design_generation",
-        files={"config": "config.json"},
-        weights={"default": "model.safetensors"},
-    ).json(tmp_path / ARTIFACT_MANIFEST_NAME)
-    (tmp_path / "config.json").write_text(
-        '{"checkpoint_variant": "solublempnn_v_48_020", "k_neighbors": 48, "noise_level": 0.2}'
-    )
-
-    card_path = write_model_card(tmp_path, repo_id="oteam/solublempnn-noise020")
-
-    content = card_path.read_text()
-    assert "**Upstream Project**: SolubleMPNN" in content
-    assert "Computational design of soluble and functional membrane protein analogues" in content
-    assert "10.1038/s41586-024-07601-y" in content
+    assert card_path.read_text() == authored  # verbatim; the authored card is the single source of truth
+    metadata = _read_frontmatter(card_path)
+    assert metadata["license"] == "mit"
+    assert metadata["tags"] == ["biology", "protein-design"]
 
 
 def test_model_card_metadata_merges_tags_and_can_disable_widget() -> None:
     manifest = build_artifact_manifest(
         kind="pipeline",
         entrypoint="proteinlib.pipelines.DemoPipeline",
-        task="design_generation",
+        task="design",
         components={"generator": "generator"},
     )
 
@@ -254,86 +232,20 @@ def test_model_card_metadata_merges_tags_and_can_disable_widget() -> None:
     assert "widget" not in metadata
 
 
-def test_default_widget_examples_are_static_inputs() -> None:
-    examples = default_widget_examples("structure-prediction")
-
-    assert examples
-    assert examples[0]["pipeline_tag"] == "other"
-    assert examples[0]["task"] == "structure_prediction"
-    assert "output" not in examples[0]
-
-
-def test_model_card_metadata_uses_public_architecture_aliases() -> None:
+def test_model_card_metadata_model_index_name_from_repo_id() -> None:
+    # The one repo-specific generic key: the model-index name is derived from the repo id, not any per-model table.
     manifest = build_artifact_manifest(
         kind="model",
-        entrypoint="ofoldx.models.boltzgen.model.BoltzGenIFoldGenerator",
-        architecture="boltzgen_ifold",
-        task="design_generation",
-    )
-
-    metadata = model_card_metadata(manifest)
-
-    assert public_architecture_name("boltzgen_ifold") == "boltzgen-inversefolding"
-    tags = metadata["tags"]
-    assert isinstance(tags, list)
-    assert "boltzgen-inversefolding" in tags
-    assert "boltzgen_ifold" not in tags
-    widget = metadata["widget"]
-    assert isinstance(widget, list)
-    assert isinstance(widget[0], dict)
-    assert widget[0]["example_title"] == "Inverse folding"
-
-
-def test_model_card_metadata_includes_hub_frontmatter_for_known_release() -> None:
-    manifest = build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator",
+        entrypoint="ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner",
         architecture="proteinmpnn",
-        task="design_generation",
+        task="design",
     )
 
     metadata = model_card_metadata(manifest, repo_id="oteam/solublempnn-noise020")
 
-    assert metadata["license"] == "mit"
     assert metadata["model-index"] == [{"name": "solublempnn-noise020", "results": []}]
-
-
-def test_model_card_metadata_records_alphafold2_license() -> None:
-    manifest = build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.alphafold2.model.AlphaFold2Model",
-        architecture="alphafold2",
-        task="structure_prediction",
-    )
-
-    metadata = model_card_metadata(manifest, repo_id="oteam/alphafold2")
-
-    assert metadata["license"] == "cc-by-4.0"
-    assert metadata["model-index"] == [{"name": "alphafold2", "results": []}]
-
-
-def test_model_card_metadata_includes_base_model_and_datasets_for_boltzgen() -> None:
-    manifest = build_artifact_manifest(
-        kind="model",
-        entrypoint="ofoldx.models.boltzgen.model.BoltzGenDesignGenerator",
-        architecture="boltzgen_diverse",
-        task="design_generation",
-    )
-
-    metadata = model_card_metadata(manifest, repo_id="oteam/boltzgen-diverse")
-
-    assert metadata["license"] == "mit"
-    assert metadata["base_model"] == "boltz-community/boltz-2"
-    assert metadata["datasets"] == ["boltzgen/boltzgen1_train", "boltzgen/inference-data"]
-    assert metadata["model-index"] == [{"name": "boltzgen-diverse", "results": []}]
-
-
-def test_binding_affinity_widget_uses_property_prediction_task() -> None:
-    examples = default_widget_examples("binding-affinity-prediction", architecture="boltz2_affinity")
-
-    assert examples
-    assert examples[0]["task"] == "binding_affinity_prediction"
-    assert examples[0]["example_title"] == "Protein-ligand affinity scoring"
+    assert metadata["library_name"] == "ofoldx"
+    assert metadata["task"] == "design"
 
 
 def test_publish_artifact_to_hub_writes_card_then_uploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

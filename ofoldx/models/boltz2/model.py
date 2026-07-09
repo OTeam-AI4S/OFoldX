@@ -8,19 +8,18 @@ place to inspect the model.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, cast
 
 import torch
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
+from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import condition_pair, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.embedding.fourier import FrozenFourierEmbedding
@@ -29,11 +28,12 @@ from ...modules.embedding.template import TemplateV2Embedder
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import DistogramHead
+from ...modules.representation import Pair, Single
 from ...modules.transformer import ConditionedTransformer
 from ...modules.transition import Transition
 from ...modules.trunk.msa import MsaModule
 from ...modules.trunk.pairformer import PairformerStack
-from ..contract import BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ..contract import BaseInput, StructureDesignCandidate, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
 from ..registry import BINDING_AFFINITY_MODELS, MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import Boltz2AffinityConfig, Boltz2Config
@@ -243,42 +243,91 @@ class Boltz2Model(ModelMixin):
         generator: torch.Generator | None = None,
     ) -> StructurePredictionOutput:
         r"""
-        Full inference on the unified contract: fold (trunk) -> sample (diffusion) -> score (confidence).
+        Training path: run the trunk, then a single EDM diffusion denoising step against ``target_positions``.
+
+        ``forward`` is the *training* path. It mirrors the Boltz-2 upstream training diffusion step
+        (``DiffusionModule.forward``): sample a per-example noise level, corrupt the (centred) target coords, and
+        denoise them through the score model conditioned on the trunk. The multi-step reverse-diffusion sampler
+        is the distinct *inference* path, exposed by [`fold`][ofoldx.models.boltz2.model.Boltz2Model.fold]; for
+        backward compatibility an eval-mode call (``self.training`` is ``False``) delegates to ``fold`` so
+        ``model(batch)`` keeps sampling when not training.
 
         Args:
-            batch: Typed model input.
+            batch: Typed model input; training requires ``batch.target_positions``.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of reverse-diffusion samples to draw.
-            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
-            generator: Optional PyTorch random generator for diffusion noise.
+            num_samples: Number of noised copies drawn per batch element (train), or reverse-diffusion samples
+                to draw when delegating to ``fold`` in eval mode.
+            num_sampling_steps: Optional EDM sampling-step count for the eval-mode ``fold`` delegation.
+            generator: Optional PyTorch random generator for the diffusion noise.
 
         Returns:
-            Structure-prediction output.
+            Structure-prediction output. In training mode it carries ``denoised_coords``, ``augmented_target``,
+            and ``noise_level`` for the diffusion loss alongside the distogram logits.
 
         Raises:
-            ValueError: If ``num_samples`` is not positive.
+            ValueError: If ``num_samples`` is not positive, or ``batch.target_positions`` is absent in training.
         """
 
         if num_samples < 1:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
-        output = self.predict(
-            batch,
-            recycling_steps=recycling_steps,
-            num_sampling_steps=num_sampling_steps,
-            num_samples=num_samples,
+        if not self.training:
+            return self.fold(
+                batch,
+                recycling_steps=recycling_steps,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                generator=generator,
+            )
+        if batch.target_positions is None:
+            raise ValueError("forward is the training path and requires batch.target_positions")
+        representations = self.run_trunk(batch, recycling_steps=recycling_steps)
+        return self._forward_train(batch, representations=representations, num_samples=num_samples, generator=generator)
+
+    def _forward_train(
+        self,
+        batch: Boltz2Input,
+        *,
+        representations: Boltz2Representations,
+        num_samples: int,
+        generator: torch.Generator | None,
+    ) -> StructurePredictionOutput:
+        r"""
+        Run one training step: a single grad-carrying EDM diffusion denoising step.
+
+        Args:
+            batch: Typed model input; ``target_positions`` is required.
+            representations: Trunk representations for this batch (kept attached for the loss path).
+            num_samples: Number of noised copies drawn per batch element.
+            generator: Optional PyTorch random generator for the diffusion noise.
+
+        Returns:
+            Structure-prediction output with ``denoised_coords``, ``augmented_target``, and ``noise_level``
+            attached for the diffusion loss; ``pred_coords`` carries the detached denoised coords.
+        """
+
+        assert batch.target_positions is not None
+        conditioning = self._build_diffusion_conditioning(representations, batch)
+        denoised, sigmas, augmented_target = self.structure_module.denoise(
+            batch.target_positions,
+            batch.atom_mask,
+            multiplicity=num_samples,
             generator=generator,
+            single_inputs=representations.single_inputs,
+            single_trunk=representations.single.tensor,
+            conditioning=conditioning,
+            atom_to_token=batch.atom_to_token,
+            token_mask=batch.token_mask,
         )
+        batch_size = representations.single.tensor.shape[0]
         return StructurePredictionOutput(
-            pred_coords=output.pred_coords,
-            distogram_logits=output.distogram_logits,
-            plddt_logits=output.plddt_logits,
-            pae_logits=output.pae_logits,
-            pde_logits=output.pde_logits,
-            resolved_logits=output.resolved_logits,
-            bfactor_logits=output.bfactor_logits,
+            pred_coords=_unflatten_sample_axis(denoised.detach(), batch_size, num_samples, "pred_coords"),
+            distogram_logits=representations.distogram_logits,
+            denoised_coords=_unflatten_sample_axis(denoised, batch_size, num_samples, "denoised_coords"),
+            augmented_target=_unflatten_sample_axis(augmented_target, batch_size, num_samples, "augmented_target"),
+            noise_level=sigmas,
         )
 
-    def predict(
+    def fold(
         self,
         batch: Boltz2Input,
         *,
@@ -286,9 +335,14 @@ class Boltz2Model(ModelMixin):
         num_sampling_steps: int | None = None,
         num_samples: int = 1,
         generator: torch.Generator | None = None,
-    ) -> Boltz2Output:
+    ) -> StructurePredictionOutput:
         r"""
-        Full inference: fold (trunk) -> sample coords (diffusion) -> score (confidence).
+        Inference verb: fold (trunk) -> sample coords (diffusion) -> score (confidence).
+
+        Runs the recycled trunk, the multi-step EDM reverse-diffusion sampler, and the confidence head. This is
+        the distinct *inference* path (the training path is
+        [`forward`][ofoldx.models.boltz2.model.Boltz2Model.forward]); the task facade wraps the returned raw
+        [`StructurePredictionOutput`][ofoldx.models.StructurePredictionOutput] into a result.
 
         Args:
             batch: Typed model input.
@@ -298,7 +352,7 @@ class Boltz2Model(ModelMixin):
             generator: Optional PyTorch random generator for diffusion noise.
 
         Returns:
-            Model-specific output with sampled coords and confidence logits.
+            Structure-prediction output with sampled coords, distogram logits, and confidence logits.
 
         Raises:
             ValueError: If ``num_samples`` is not positive.
@@ -307,6 +361,8 @@ class Boltz2Model(ModelMixin):
         if num_samples < 1:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         representations = self.run_trunk(batch, recycling_steps=recycling_steps)
+        single = representations.single.tensor
+        pair = representations.pair.tensor
         sample_coords_flat = self._sample_coords(
             representations,
             batch,
@@ -316,8 +372,8 @@ class Boltz2Model(ModelMixin):
         )
         confidence = self.confidence_head(
             representations.single_inputs,
-            representations.single,
-            representations.pair,
+            single,
+            pair,
             sample_coords_flat,
             residue_index=batch.residue_index,
             chain_index=batch.chain_index,
@@ -333,9 +389,9 @@ class Boltz2Model(ModelMixin):
             cyclic_period=batch.cyclic_period,
             multiplicity=num_samples,
         )
-        bfactor = self.bfactor_head(representations.single) if hasattr(self, "bfactor_head") else None
-        batch_size = representations.single.shape[0]
-        return Boltz2Output(
+        bfactor = self.bfactor_head(single) if hasattr(self, "bfactor_head") else None
+        batch_size = single.shape[0]
+        return StructurePredictionOutput(
             pred_coords=_unflatten_sample_axis(sample_coords_flat, batch_size, num_samples, "pred_coords"),
             distogram_logits=representations.distogram_logits,
             plddt_logits=_unflatten_sample_axis(confidence["plddt_logits"], batch_size, num_samples, "plddt_logits"),
@@ -446,8 +502,8 @@ class Boltz2Model(ModelMixin):
 
         return Boltz2Representations(
             single_inputs=single_inputs,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             distogram_logits=self.distogram_head(pair),
             relative_position_encoding=relative_position_encoding,
         )
@@ -526,26 +582,46 @@ class Boltz2Model(ModelMixin):
             Flattened sampled atom coords ``(B*num_samples, M, 3)``.
         """
 
-        conditioning = self.diffusion_conditioning(
-            representations.single,
-            representations.pair,
+        conditioning = self._build_diffusion_conditioning(representations, batch)
+        return self.structure_module._sample(
+            batch.atom_mask,
+            num_sampling_steps=num_sampling_steps,
+            multiplicity=num_samples,
+            generator=generator,
+            single_inputs=representations.single_inputs,
+            single_trunk=representations.single.tensor,
+            conditioning=conditioning,
+            atom_to_token=batch.atom_to_token,
+            token_mask=batch.token_mask,
+        )
+
+    def _build_diffusion_conditioning(
+        self, representations: Boltz2Representations, batch: Boltz2Input
+    ) -> dict[str, object]:
+        r"""
+        Precompute the per-call-invariant diffusion conditioning from the trunk representations.
+
+        Shared by the training denoising step ([`forward`][ofoldx.models.boltz2.model.Boltz2Model.forward]) and
+        the reverse-diffusion sampler ([`_sample_coords`][ofoldx.models.boltz2.model.Boltz2Model._sample_coords]).
+
+        Args:
+            representations: Trunk representations from
+                [`run_trunk`][ofoldx.models.boltz2.model.Boltz2Model.run_trunk].
+            batch: Typed model input.
+
+        Returns:
+            The [`DiffusionConditioning`][ofoldx.models.boltz2.model.DiffusionConditioning] output dict.
+        """
+
+        return self.diffusion_conditioning(
+            representations.single.tensor,
+            representations.pair.tensor,
             representations.relative_position_encoding,
             atom_features=batch.atom_features,
             reference_positions=batch.reference_positions,
             atom_mask=batch.atom_mask,
             reference_space_id=batch.reference_space_id,
             atom_to_token=batch.atom_to_token,
-        )
-        return self.structure_module.sample(
-            batch.atom_mask,
-            num_sampling_steps=num_sampling_steps,
-            multiplicity=num_samples,
-            generator=generator,
-            single_inputs=representations.single_inputs,
-            single_trunk=representations.single,
-            conditioning=conditioning,
-            atom_to_token=batch.atom_to_token,
-            token_mask=batch.token_mask,
         )
 
 
@@ -608,8 +684,8 @@ class Boltz2AffinityModel(Boltz2Model):
             operator_backend=self.config.trunk.operator_backend,
         )
 
-    # Affinity variant: distinct forward signature (affinity scoring), a deliberate divergence from the
-    # structure-prediction parent (reached via its own type, never substituted as Boltz2Model).
+    # The affinity variant inherits the structure-diffusion training ``forward`` from Boltz2Model (the shared
+    # denoising step trains the folding trunk); its distinct capability is affinity *scoring*, the inference verb.
     def forward(  # type: ignore[override]
         self,
         batch: Boltz2Input,
@@ -619,9 +695,60 @@ class Boltz2AffinityModel(Boltz2Model):
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> StructureDesignCandidate | StructurePredictionOutput:
         r"""
-        Predict affinity scores, optionally using caller-supplied coords.
+        Training path for the affinity variant; an eval-mode call delegates to the ``score`` verb.
+
+        In training mode this runs the inherited structure-diffusion denoising step (which trains the shared
+        folding trunk) and returns its [`StructurePredictionOutput`][ofoldx.models.StructurePredictionOutput].
+        In eval mode it delegates to [`score`][ofoldx.models.boltz2.model.Boltz2AffinityModel.score] so that
+        ``model(batch)`` keeps producing affinity scores behind the binding-affinity pipeline.
+
+        Args:
+            batch: Typed Boltz-2 input; training requires ``batch.target_positions``.
+            pred_coords: Optional caller-supplied coords forwarded to ``score`` in eval mode.
+            recycling_steps: Optional trunk recycling passes. Defaults to the config value.
+            num_samples: Number of noised copies (train) or sampled coords (eval ``score``).
+            num_sampling_steps: Optional EDM sampling steps for the eval-mode ``score`` delegation.
+            generator: Optional PyTorch random generator for diffusion noise.
+
+        Returns:
+            Affinity output (``StructureDesignCandidate``) in eval mode, or the training
+            ``StructurePredictionOutput`` in training mode.
+
+        Raises:
+            ValueError: If ``num_samples`` is not positive, or ``batch.target_positions`` is absent in training.
+        """
+
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be positive, got {num_samples}")
+        if not self.training:
+            return self.score(
+                batch,
+                pred_coords=pred_coords,
+                recycling_steps=recycling_steps,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                generator=generator,
+            )
+        if batch.target_positions is None:
+            raise ValueError("forward is the training path and requires batch.target_positions")
+        representations = self.run_trunk(batch, recycling_steps=recycling_steps)
+        return self._forward_train(batch, representations=representations, num_samples=num_samples, generator=generator)
+
+    @torch.no_grad()
+    def score(
+        self,
+        batch: Boltz2Input,
+        *,
+        pred_coords: Tensor | None = None,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructureDesignCandidate:
+        r"""
+        Inference verb: score binding affinity, optionally using caller-supplied coords.
 
         Args:
             batch: Typed Boltz-2 input. ``affinity_token_mask`` may select the ligand; otherwise ligand tokens are
@@ -636,11 +763,15 @@ class Boltz2AffinityModel(Boltz2Model):
         Returns:
             Affinity-prediction output with affinity tensors in ``scores``. Score tensors keep an explicit
             sample axis ``(B, S, 1)``.
+
+        Raises:
+            ValueError: If ``num_samples`` is not positive.
         """
 
         if num_samples < 1:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         representations = self.run_trunk(batch, recycling_steps=recycling_steps)
+        batch_size = representations.single.tensor.shape[0]
         structure_prediction = None
         if pred_coords is None:
             sample_coords_flat = self._sample_coords(
@@ -650,42 +781,24 @@ class Boltz2AffinityModel(Boltz2Model):
                 num_samples=num_samples,
                 generator=generator,
             )
-            pred_coords = _unflatten_sample_axis(
-                sample_coords_flat, representations.single.shape[0], num_samples, "pred_coords"
-            )
+            pred_coords = _unflatten_sample_axis(sample_coords_flat, batch_size, num_samples, "pred_coords")
             structure_prediction = StructurePredictionOutput(
                 pred_coords=pred_coords,
                 distogram_logits=representations.distogram_logits,
             )
         scores = self.score_affinity(representations, batch, pred_coords)
         if structure_prediction is None:
-            coords, _, _ = _flatten_sample_axis(pred_coords, representations.single.shape[0], "pred_coords")
+            coords, _, _ = _flatten_sample_axis(pred_coords, batch_size, "pred_coords")
             structure_prediction = StructurePredictionOutput(
                 pred_coords=_unflatten_sample_axis(
                     coords,
-                    representations.single.shape[0],
-                    max(coords.shape[0] // representations.single.shape[0], 1),
+                    batch_size,
+                    max(coords.shape[0] // batch_size, 1),
                     "pred_coords",
                 ),
                 distogram_logits=representations.distogram_logits,
             )
-        return DesignGeneratorOutput(structure_prediction=structure_prediction, scores=scores)
-
-    @torch.no_grad()
-    def generate(self, batch: Boltz2Input, **kwargs: Any) -> DesignGeneratorOutput:
-        r"""
-        Inference alias for affinity prediction (no-grad wrapper around ``forward``).
-
-        Args:
-            batch: Typed Boltz-2 input.
-            **kwargs: Keyword arguments forwarded to
-                [`forward`][ofoldx.models.boltz2.model.Boltz2AffinityModel.forward].
-
-        Returns:
-            Affinity-prediction output with affinity tensors in ``scores``.
-        """
-
-        return self.forward(batch, **kwargs)
+        return StructureDesignCandidate(structure_prediction=structure_prediction, scores=scores)
 
     def score_affinity(
         self,
@@ -714,7 +827,7 @@ class Boltz2AffinityModel(Boltz2Model):
             Dict of affinity score tensors keyed by name, each with an explicit sample axis.
         """
 
-        batch_size = representations.single.shape[0]
+        batch_size = representations.single.tensor.shape[0]
         coords, multiplicity, _ = _flatten_sample_axis(pred_coords, batch_size, "pred_coords")
         ligand_mask = _resolve_affinity_token_mask(batch, affinity_token_mask)
         molecule_type = batch.molecule_type
@@ -724,7 +837,7 @@ class Boltz2AffinityModel(Boltz2Model):
             receptor_mask = molecule_type == 0
         head_kwargs = {
             "single_inputs": representations.single_inputs,
-            "pair": representations.pair,
+            "pair": representations.pair.tensor,
             "pred_coords": coords,
             "token_to_rep_atom": batch.token_to_rep_atom,
             "token_mask": batch.token_mask,
@@ -1838,6 +1951,8 @@ class AtomDiffusion(nn.Module):
         step_scale: float = 1.0,
         num_sampling_steps: int = 200,
         alignment_reverse_diff: bool = True,
+        p_mean: float = -1.2,
+        p_std: float = 1.5,
     ) -> None:
         super().__init__()
         self.score_model = score_model
@@ -1852,6 +1967,84 @@ class AtomDiffusion(nn.Module):
         self.step_scale = step_scale
         self.num_sampling_steps = num_sampling_steps
         self.alignment_reverse_diff = alignment_reverse_diff
+        # EDM log-normal training noise distribution (Karras et al.); used by the training denoise step only.
+        self.p_mean = p_mean
+        self.p_std = p_std
+
+    def noise_distribution(
+        self, batch_size: int, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None = None
+    ) -> Tensor:
+        r"""
+        Draw per-example EDM training noise levels ``sigma = sigma_data * exp(P_mean + P_std * N(0, 1))``.
+
+        Args:
+            batch_size: Number of noise levels to draw (``B*multiplicity``).
+            device: Device for the sampled tensor.
+            dtype: Dtype for the sampled tensor.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            Noise levels ``(batch_size,)``.
+        """
+
+        normal = torch.randn(batch_size, device=device, dtype=dtype, generator=generator)
+        return self.sigma_data * torch.exp(self.p_mean + self.p_std * normal)
+
+    def loss_weight(self, sigma: Tensor) -> Tensor:
+        r"""
+        EDM per-example loss weight ``(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2``.
+
+        Args:
+            sigma: Per-example noise levels ``(batch_size,)``.
+
+        Returns:
+            Loss weights ``(batch_size,)``.
+        """
+
+        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2 + 1e-8)
+
+    def denoise(
+        self,
+        target_coords: Tensor,
+        atom_mask: Tensor,
+        *,
+        multiplicity: int = 1,
+        generator: torch.Generator | None = None,
+        **conditioning: object,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""
+        One training denoising step: centre the target, corrupt it, and denoise through the score model.
+
+        Mirrors the Boltz-2 upstream ``DiffusionModule.forward`` training step (EDM noising + a single
+        preconditioned denoise). The SE(3) coordinate augmentation and rigid-alignment target of the upstream
+        loss are dropped so the whole step is a graph-break-free tensor program under ``torch.compile``; the core
+        denoising objective is preserved.
+
+        Args:
+            target_coords: Experimental target atom coords ``(B, M, 3)``.
+            atom_mask: Boolean atom validity mask ``(B, M)``.
+            multiplicity: Number of noised copies drawn per batch element.
+            generator: Optional PyTorch random generator for the diffusion noise.
+            **conditioning: Score-model conditioning tensors (``single_inputs``, ``single_trunk``,
+                ``conditioning``, ``atom_to_token``, ``token_mask``).
+
+        Returns:
+            Tuple ``(denoised, sigmas, true_coords)`` of denoised coords ``(B*multiplicity, M, 3)``, sampled noise
+            levels ``(B*multiplicity,)``, and the centred target coords ``(B*multiplicity, M, 3)``.
+        """
+
+        coords = target_coords.repeat_interleave(multiplicity, 0)
+        mask = atom_mask.repeat_interleave(multiplicity, 0).unsqueeze(-1).to(coords.dtype)
+        center = (coords * mask).sum(dim=-2, keepdim=True) / (mask.sum(dim=-2, keepdim=True) + 1e-8)
+        coords = (coords - center) * mask
+        batch = coords.shape[0]
+        sigmas = self.noise_distribution(batch, device=coords.device, dtype=coords.dtype, generator=generator)
+        noise = torch.randn(coords.shape, device=coords.device, dtype=coords.dtype, generator=generator)
+        noised = coords + sigmas.reshape(batch, 1, 1) * noise
+        denoised = self.preconditioned_network_forward(
+            noised, sigmas, multiplicity=multiplicity, atom_mask=atom_mask, **conditioning
+        )
+        return denoised, sigmas, coords
 
     def preconditioned_network_forward(
         self, noised_coords: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
@@ -1873,6 +2066,10 @@ class AtomDiffusion(nn.Module):
         batch = noised_coords.shape[0]
         if not torch.is_tensor(sigma):
             sigma = torch.full((batch,), float(sigma), device=noised_coords.device, dtype=noised_coords.dtype)
+        else:
+            sigma = cast(Tensor, sigma)
+            if sigma.ndim == 0:
+                sigma = sigma.expand(batch)
         padded = cast(Tensor, sigma).reshape(batch, 1, 1)
         update = self.score_model(
             noisy_positions=self.preconditioner.c_in(padded) * noised_coords,
@@ -1909,7 +2106,7 @@ class AtomDiffusion(nn.Module):
         return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
 
     @torch.no_grad()
-    def sample(
+    def _sample(
         self,
         atom_mask: Tensor,
         *,
@@ -1919,7 +2116,7 @@ class AtomDiffusion(nn.Module):
         **conditioning: object,
     ) -> Tensor:
         r"""
-        Run reverse diffusion and return sampled atom coords.
+        Run reverse diffusion (the N-step inference sampler) and return sampled atom coords.
 
         Args:
             atom_mask: Boolean atom validity mask ``(B, M)``.
@@ -1947,8 +2144,10 @@ class AtomDiffusion(nn.Module):
 
         coords = sigmas[0] * randn()
         denoised = None
+        # `sigmas`/`gammas` are kept as 0-dim tensors (no ``.item()``): the Python loop still drives the fixed
+        # number of steps, but every per-step scalar stays a tensor so the per-step denoiser is compile-clean.
         for index in range(len(sigmas) - 1):
-            sigma_current, sigma_next, gamma = sigmas[index].item(), sigmas[index + 1].item(), gammas[index + 1].item()
+            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
             rotation = uniform_random_rotation(
                 expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
             )
@@ -1961,7 +2160,7 @@ class AtomDiffusion(nn.Module):
 
             sigma_hat = sigma_current * (1 + gamma)
             noise_var = self.noise_scale**2 * (sigma_hat**2 - sigma_current**2)
-            noisy = coords + math.sqrt(max(noise_var, 0.0)) * randn()
+            noisy = coords + torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
             denoised = self.preconditioned_network_forward(
                 noisy, sigma_hat, multiplicity=multiplicity, atom_mask=base_atom_mask, **conditioning
             )
@@ -2522,26 +2721,48 @@ def _affinity_pair_mask(ligand_mask: Tensor, receptor_mask: Tensor) -> Tensor:
     )
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class Boltz2Representations:
     r"""
     Trunk outputs consumed by the diffusion / confidence heads.
 
+    ``single`` and ``pair`` are the typed [`Single`][ofoldx.modules.representation.Single] /
+    [`Pair`][ofoldx.modules.representation.Pair] carriers at the trunk boundary; unwrap ``.tensor`` before
+    feeding the denoiser or eager tensor math.
+
     Attributes:
         single_inputs: Initial token single representations.
-        single: Final token single representations.
-        pair: Final token pair representations.
+        single: Final token single representation carrier.
+        pair: Final token pair representation carrier.
         distogram_logits: Trunk distogram logits.
         relative_position_encoding: Relative-position pair features.
     """
 
     single_inputs: Tensor
-    single: Tensor
-    pair: Tensor
+    single: Single
+    pair: Pair
     distogram_logits: Tensor
     relative_position_encoding: Tensor
 
+    def detach(self) -> Boltz2Representations:
+        r"""
+        Return a gradient-detached copy (used for no-grad rollouts scored by the confidence head).
 
+        Returns:
+            Representation container with tensor fields detached; the ``Single`` / ``Pair`` carriers are rebuilt.
+        """
+
+        return Boltz2Representations(
+            single_inputs=self.single_inputs.detach(),
+            single=Single(self.single.tensor.detach()),
+            pair=Pair(self.pair.tensor.detach()),
+            distogram_logits=self.distogram_logits.detach(),
+            relative_position_encoding=self.relative_position_encoding.detach(),
+        )
+
+
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class Boltz2Input(BaseInput):
     r"""
@@ -2644,28 +2865,6 @@ class Boltz2Input(BaseInput):
     affinity_mw: Tensor | None = None
 
 
-@dataclass(slots=True)
-class Boltz2Output:
-    r"""
-    Full inference outputs.
-
-    Sample-dependent tensors use the unified explicit sample axis ``(B, S, ...)``. Trunk-only distogram logits
-    remain ``(B, N, N, C)``.
-
-    Attributes:
-        pred_coords: Sampled atom coords.
-        distogram_logits: Pairwise distance logits.
-        plddt_logits: Per-token lDDT logits.
-        pae_logits: Pairwise aligned-error logits.
-        pde_logits: Pairwise distance-error logits.
-        resolved_logits: Per-atom resolved logits.
-        bfactor_logits: Optional B-factor logits.
-    """
-
-    pred_coords: Tensor
-    distogram_logits: Tensor
-    plddt_logits: Tensor
-    pae_logits: Tensor
-    pde_logits: Tensor
-    resolved_logits: Tensor
-    bfactor_logits: Tensor | None = None
+# Bound after Boltz2Input is defined (the mixin's keyword-tensor call path builds ``input_class(**inputs)``).
+Boltz2Model.input_class = Boltz2Input
+Boltz2AffinityModel.input_class = Boltz2Input

@@ -10,11 +10,12 @@ backends (cuEquivariance / NVIDIA) are added as a branch here, not in every call
 from __future__ import annotations
 
 import torch
-from oops import OOpsUnsupportedError
-from oops import outer_product_mean as _oops_outer_product_mean
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_outer_product_mean = oops_kernel("outer_product_mean")
 
 _SUPPORTED = ("oops", "eager")
 

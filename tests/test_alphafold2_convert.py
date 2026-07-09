@@ -368,4 +368,13 @@ def test_converter_cli_rejects_inspect_only_push_to_hub(tmp_path: Path) -> None:
     _write_npz(npz_path)
 
     with pytest.raises(SystemExit, match="cannot be combined"):
-        main([str(npz_path), str(tmp_path / "out"), "--inspect-only", "--push-to-hub", "oteam/alphafold2"])
+        main(
+            [
+                str(npz_path),
+                str(tmp_path / "out"),
+                "--inspect-only",
+                "--push-to-hub",
+                "--repo-id",
+                "oteam/alphafold2",
+            ]
+        )

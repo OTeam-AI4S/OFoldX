@@ -9,7 +9,7 @@ from typing import Literal
 
 from torch import Tensor, nn
 
-from .adaptive_norm import BoltzAdaptiveLayerNorm
+from .adaptive_norm import AdaptiveLayerNorm
 from .attention.multihead import GatedMultiheadAttention
 from .functional import checkpoint_blocks
 from .transition import ConditionedTransition
@@ -184,10 +184,10 @@ class ConditionedTransformerLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.cross_attention_mode = cross_attention_mode
-        self.conditioned_norm = BoltzAdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         if cross_attention_mode:
             # A second adaptive norm can be applied to the already-normed query for the key/value path.
-            self.key_value_norm = BoltzAdaptiveLayerNorm(hidden_size, conditioning_size)
+            self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
@@ -295,7 +295,7 @@ class ConditionedTransitionBlock(nn.Module):
     def __init__(self, hidden_size: int, conditioning_size: int, expansion: int = 2) -> None:
         super().__init__()
         inner_size = hidden_size * expansion
-        self.conditioned_norm = BoltzAdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         self.gate_value_projection = nn.Linear(hidden_size, inner_size * 2, bias=False)
         self.expand_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.output_projection = nn.Linear(inner_size, hidden_size, bias=False)

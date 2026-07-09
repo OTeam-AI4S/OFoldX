@@ -29,7 +29,14 @@ from .structure import (
     atom_molecule_type,
     atom_name_char_index,
 )
-from .utils import _STANDARD_RESIDUE_NAMES, StructuralFields, StructureInput, structure_from_input
+from .utils import (
+    _DNA_RESIDUE_NAMES,
+    _RNA_RESIDUE_NAMES,
+    _STANDARD_RESIDUE_NAMES,
+    StructuralFields,
+    StructureInput,
+    structure_from_input,
+)
 
 # Residue-token vocabulary (reference ``boltz.data.const.tokens``): index 0=``<pad>``, 1=``-`` (gap),
 # 2-22 the 20 canonical amino acids + ``UNK``, 23-27 RNA ``A G C U N``, 28-32 DNA ``DA DG DC DT DN``.
@@ -72,8 +79,6 @@ _RESIDUE_TOKEN_VOCABULARY: tuple[str, ...] = (
 _RESIDUE_TOKEN_IDS = {token: index for index, token in enumerate(_RESIDUE_TOKEN_VOCABULARY)}
 _NUM_RESIDUE_TOKENS = len(_RESIDUE_TOKEN_VOCABULARY)
 
-_RNA_RESIDUE_NAMES = frozenset({"A", "G", "C", "U"})
-_DNA_RESIDUE_NAMES = frozenset({"DA", "DG", "DC", "DT"})
 # Unknown-residue fallbacks per molecule class (reference ``unk_token``): UNK/N/DN.
 _UNK_PROTEIN_TOKEN = _RESIDUE_TOKEN_IDS["UNK"]
 _UNK_RNA_TOKEN = _RESIDUE_TOKEN_IDS["N"]

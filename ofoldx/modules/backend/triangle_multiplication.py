@@ -10,11 +10,12 @@ New backends (cuEquivariance / NVIDIA) are added as a branch here, not in the mo
 from __future__ import annotations
 
 import torch
-from oops import OOpsUnsupportedError
-from oops import triangle_multiplication as _oops_triangle_multiplication
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_triangle_multiplication = oops_kernel("triangle_multiplication")
 
 _SUPPORTED = ("oops", "eager")
 
@@ -103,11 +104,11 @@ def triangle_multiplication(
     if backend == "oops":
         if not pair.is_cuda:
             raise OOpsUnsupportedError(
-                "TriangleMultiplication backend 'oops' requires CUDA tensors; use operator_backend='sdpa'"
+                "TriangleMultiplication backend 'oops' requires CUDA tensors; use operator_backend='eager'"
             )
         if pair_mask is not None and not pair_mask.is_cuda:
             raise OOpsUnsupportedError(
-                "TriangleMultiplication backend 'oops' requires a CUDA pair_mask; use operator_backend='sdpa'"
+                "TriangleMultiplication backend 'oops' requires a CUDA pair_mask; use operator_backend='eager'"
             )
         return _oops_triangle_multiplication(
             pair,

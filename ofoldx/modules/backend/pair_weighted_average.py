@@ -10,11 +10,12 @@ backends (cuEquivariance / NVIDIA) are added as a branch here, not in every call
 from __future__ import annotations
 
 import torch
-from oops import OOpsUnsupportedError
-from oops import pair_weighted_average as _oops_pair_weighted_average
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_pair_weighted_average = oops_kernel("pair_weighted_average")
 
 _SUPPORTED = ("oops", "eager")
 

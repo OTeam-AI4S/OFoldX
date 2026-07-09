@@ -996,7 +996,7 @@ def convert_template_v1(state: dict, *, miniformer_blocks: bool = False) -> dict
 
 def convert_inverse_folding(state: dict) -> dict:
     r"""
-    Convert a whole inverse-folding checkpoint state dict onto a BoltzGenIFoldGenerator state dict.
+    Convert a whole inverse-folding checkpoint state dict onto a BoltzGenInverseFoldDesigner state dict.
 
     Routes the three top-level prefixes (``input_embedder`` / ``inverse_folding_encoder`` / ``structure_module``)
     to their sub-converters and packs the adaptive-layer-norm projections into the fused OOps parameters. A clean
@@ -1232,7 +1232,7 @@ def _build_boltzgen_target(
         BoltzGenIFoldConfig,
         BoltzGenStructureTrainedSmallConfig,
     )
-    from .model import BoltzGenDesignGenerator, BoltzGenIFoldGenerator
+    from .model import BoltzGenDesigner, BoltzGenInverseFoldDesigner
 
     if kind not in {"auto", "structure-design", "ifold"}:
         raise ValueError("kind must be 'auto', 'structure-design', or 'ifold'")
@@ -1249,7 +1249,7 @@ def _build_boltzgen_target(
     if resolved_kind == "ifold":
         if arch != "boltzgen_ifold":
             raise ValueError("--kind ifold requires --architecture boltzgen_ifold")
-        return BoltzGenIFoldGenerator(BoltzGenIFoldConfig()), convert_inverse_folding, "ifold"
+        return BoltzGenInverseFoldDesigner(BoltzGenIFoldConfig()), convert_inverse_folding, "ifold"
 
     if arch == "boltzgen_ifold":
         raise ValueError("--architecture boltzgen_ifold requires --kind ifold")
@@ -1259,7 +1259,7 @@ def _build_boltzgen_target(
         "boltzgen_adherence": BoltzGenAdherenceConfig,
         "boltzgen_structuretrained_small": BoltzGenStructureTrainedSmallConfig,
     }
-    return BoltzGenDesignGenerator(config_classes[arch]()), convert_structure_design, "structure-design"
+    return BoltzGenDesigner(config_classes[arch]()), convert_structure_design, "structure-design"
 
 
 def _select_state_dict(checkpoint: Mapping[str, Any], *, state_key: str) -> tuple[Mapping[str, Any], str]:

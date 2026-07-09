@@ -5,10 +5,9 @@ Triangle update modules for Pairformer blocks.
 from __future__ import annotations
 
 import torch
-from oops import LayerNorm
 from torch import Tensor, nn
 
-from ..backend import resolve_config_operator_backend
+from ..backend import LayerNorm, resolve_config_operator_backend
 from ..backend import triangle_multiplication as dispatch_triangle_multiplication
 from .multihead import GatedMultiheadAttention
 

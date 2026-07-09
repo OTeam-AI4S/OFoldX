@@ -1,7 +1,7 @@
 r"""
 OFoldX-native reimplementation of the PxDesign backbone diffusion generator.
 
-Defines the [`PxDesignDesignGenerator`][ofoldx.models.pxdesign.model.PxDesignDesignGenerator] entry point,
+Defines the [`PxDesignDesigner`][ofoldx.models.pxdesign.model.PxDesignDesigner] entry point,
 its condition-embedding and EDM-sampling sub-modules, and the
 [`PxDesignInput`][ofoldx.models.pxdesign.model.PxDesignInput] tensor contract that drive coordinate
 sampling from design conditioning.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -23,15 +24,16 @@ from ...modules.diffusion.sampling import CoordinateEdmSampler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
-from ..contract import BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ...modules.representation import Pair, Single
+from ..contract import BaseInput, StructureDesignCandidate, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS
+from ..registry import DESIGN_MODELS, MODELS
 from .config import PxDesignConfig
 
 
 @MODELS.register("pxdesign")
-@DESIGN_GENERATOR_MODELS.register("pxdesign")
-class PxDesignDesignGenerator(ModelMixin):
+@DESIGN_MODELS.register("pxdesign")
+class PxDesignDesigner(ModelMixin):
     r"""
     Samples design-backbone coordinates from PxDesign conditioning via AF3-style EDM diffusion.
 
@@ -49,10 +51,13 @@ class PxDesignDesignGenerator(ModelMixin):
         >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
         >>> processor = AutoProcessor.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
         >>> model = AutoModel.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
-        >>> output = model.generate(processor("design.json"))  # doctest: +SKIP
+        >>> output = model.design(processor("design.json"))  # doctest: +SKIP
     """
 
     config_class = PxDesignConfig
+    #: Typed input this model's ``forward`` consumes; enables the ``model(**inputs)`` keyword-tensor call path.
+    #: Bound after ``PxDesignInput`` is defined (below the class body) to avoid a forward reference.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: PxDesignConfig | None = None) -> None:
         config = PxDesignConfig() if config is None else config
@@ -60,6 +65,12 @@ class PxDesignDesignGenerator(ModelMixin):
         self.condition_embedder = PxDesignConditionEmbedder(config)
         self.coordinate_denoiser = self._build_coordinate_denoiser(config)
         self.coordinate_sampler = PxDesignCoordinateSampler(config)
+        self.training_noise_sampler = TrainingNoiseSampler(
+            noise_log_mean=config.diffusion_training.noise_log_mean,
+            noise_log_std=config.diffusion_training.noise_log_std,
+            sigma_data=config.denoiser.sigma_data,
+        )
+        self._diffusion_train_num_samples = config.diffusion_training.num_samples
         self.distogram_head = DistogramHead(
             pair_size=config.pair_size,
             num_bins=config.distogram.num_distogram_bins,
@@ -120,17 +131,84 @@ class PxDesignDesignGenerator(ModelMixin):
         batch: PxDesignInput,
         *,
         num_samples: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructureDesignCandidate:
+        r"""
+        Run the single-step diffusion training objective on PxDesign conditioning.
+
+        This is the TRAINING path. It encodes the design conditioning, draws an independent EDM noise level
+        per training sample, noises the (augmented) ground-truth ``target_positions`` once, and predicts the
+        clean coordinates in a single denoiser step. The design distogram logits are attached for the
+        auxiliary distogram loss. Multi-step coordinate *sampling* is the distinct inference path exposed by
+        [`design`][ofoldx.models.pxdesign.model.PxDesignDesigner.design].
+
+        The public PxDesign release ships inference-only; this objective mirrors the single-step EDM denoise
+        of the sister Protenix/ODesign diffusion trainers, which share PxDesign's denoiser and EDM sampler.
+
+        Args:
+            batch: PxDesign model input; must carry ``target_positions`` for the diffusion target.
+            num_samples: Number of noised training samples; defaults to the diffusion-training config.
+            generator: Optional random generator seeding the augmentation and noise draws.
+
+        Returns:
+            A [`StructureDesignCandidate`][ofoldx.models.contract.StructureDesignCandidate] whose structure
+            prediction carries the single-step ``denoised_coords`` (also surfaced as ``pred_coords``), the
+            ``augmented_target`` and per-sample ``noise_level`` for the EDM-weighted diffusion loss, and the
+            design distogram logits.
+
+        Raises:
+            ValueError: If ``batch.target_positions`` is ``None``.
+
+        Examples:
+            >>> model = PxDesignDesigner().train()  # doctest: +SKIP
+            >>> loss_inputs = model(batch)  # doctest: +SKIP
+        """
+
+        representations = self.encode_condition(batch)
+        num_samples = self._diffusion_train_num_samples if num_samples is None else num_samples
+        denoised_coords, augmented_target, noise_level = self._train_denoise(
+            batch,
+            representations=representations,
+            num_samples=num_samples,
+            generator=generator,
+        )
+        structure_prediction = StructurePredictionOutput(
+            pred_coords=denoised_coords,
+            distogram_logits=self.distogram_head(representations.pair.tensor),
+            denoised_coords=denoised_coords,
+            augmented_target=augmented_target,
+            noise_level=noise_level,
+        )
+        return StructureDesignCandidate(
+            structure_prediction=structure_prediction,
+            metadata={
+                "architecture": "pxdesign",
+                "backend": "native_pxdesign",
+                "checkpoint_variant": self.config.checkpoint_variant,
+                "mode": "diffusion_training",
+                "num_samples": int(denoised_coords.shape[-3]),
+            },
+        )
+
+    @torch.no_grad()
+    def design(
+        self,
+        batch: PxDesignInput,
+        *,
+        num_samples: int | None = None,
         num_sampling_steps: int | None = None,
         sample_chunk_size: int | None = None,
         initial_coords: Tensor | None = None,
         preserve_condition_coords: bool = False,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> StructureDesignCandidate:
         r"""
-        Generate atom coordinates from PxDesign conditioning.
+        Generate design-backbone coordinates from PxDesign conditioning.
 
-        Encodes the design conditioning, runs the EDM coordinate sampler to draw
-        ``num_samples`` backbone samples, and attaches the design distogram logits.
+        This is the capability verb and the DISTINCT inference path (``forward`` is the training path). It
+        encodes the design conditioning, runs the multi-step EDM coordinate sampler under ``torch.no_grad``
+        to draw ``num_samples`` backbone samples, and attaches the design distogram logits. The facade wraps
+        the returned candidate into a design result.
 
         Args:
             batch: PxDesign model input.
@@ -138,29 +216,31 @@ class PxDesignDesignGenerator(ModelMixin):
             num_sampling_steps: Number of EDM steps; defaults to the sampler config.
             sample_chunk_size: Samples per forward chunk; defaults to the sampler config.
             initial_coords: Optional starting coords `[..., N_atom, 3]` for sampling.
-            preserve_condition_coords: When ``True``, restore the fixed condition
-                atoms in the sampled coords from ``batch.condition_coords``.
+            preserve_condition_coords: When ``True``, restore the fixed condition atoms in the sampled
+                coords from ``batch.condition_coords``.
             generator: Optional random generator seeding the sampling noise.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput]
-            whose structure prediction carries the sampled ``pred_coords`` of shape
-            `[..., num_samples, N_atom, 3]` and the distogram logits, plus run metadata.
+            A [`StructureDesignCandidate`][ofoldx.models.contract.StructureDesignCandidate] whose structure
+            prediction carries the sampled ``pred_coords`` of shape `[..., num_samples, N_atom, 3]` and the
+            distogram logits, plus run metadata.
 
         Examples:
             >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
             >>> model = AutoModel.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
-            >>> output = model(AutoProcessor.from_pretrained("ofoldx/pxdesign")("design.json"))  # doctest: +SKIP
+            >>> processor = AutoProcessor.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
+            >>> output = model.design(processor("design.json"))  # doctest: +SKIP
         """
 
         representations = self.encode_condition(batch)
+        num_sampling_steps = (
+            self.config.sampler.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
+        )
         pred_coords = self._predict_coords(
             batch,
             representations=representations,
             num_samples=self.config.sampler.num_samples if num_samples is None else num_samples,
-            num_sampling_steps=(
-                self.config.sampler.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-            ),
+            num_sampling_steps=num_sampling_steps,
             sample_chunk_size=(
                 self.config.sampler.sample_chunk_size if sample_chunk_size is None else sample_chunk_size
             ),
@@ -172,70 +252,19 @@ class PxDesignDesignGenerator(ModelMixin):
 
         structure_prediction = StructurePredictionOutput(
             pred_coords=pred_coords,
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=self.distogram_head(representations.pair.tensor),
         )
-        output = DesignGeneratorOutput(
+        return StructureDesignCandidate(
             structure_prediction=structure_prediction,
             metadata={
                 "architecture": "pxdesign",
                 "backend": "native_pxdesign",
                 "checkpoint_variant": self.config.checkpoint_variant,
                 "num_samples": int(pred_coords.shape[-3]),
-                "num_sampling_steps": (
-                    self.config.sampler.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-                ),
+                "num_sampling_steps": num_sampling_steps,
                 "sequence_assignment": "not_requested",
                 "filtering": "not_requested",
             },
-        )
-        return output
-
-    @torch.no_grad()
-    def generate(
-        self,
-        batch: PxDesignInput,
-        *,
-        num_samples: int | None = None,
-        num_sampling_steps: int | None = None,
-        sample_chunk_size: int | None = None,
-        initial_coords: Tensor | None = None,
-        preserve_condition_coords: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
-        r"""
-        Generate design coordinates without tracking gradients.
-
-        Inference-time wrapper over [`forward`][ofoldx.models.pxdesign.model.PxDesignDesignGenerator.forward]
-        under ``torch.no_grad``; all arguments are forwarded unchanged.
-
-        Args:
-            batch: PxDesign model input.
-            num_samples: Number of coordinate samples; defaults to the sampler config.
-            num_sampling_steps: Number of EDM steps; defaults to the sampler config.
-            sample_chunk_size: Samples per forward chunk; defaults to the sampler config.
-            initial_coords: Optional starting coords `[..., N_atom, 3]` for sampling.
-            preserve_condition_coords: When ``True``, restore the fixed condition atoms.
-            generator: Optional random generator seeding the sampling noise.
-
-        Returns:
-            The [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput]
-            produced by ``forward``.
-
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
-            >>> processor = AutoProcessor.from_pretrained("ofoldx/pxdesign")  # doctest: +SKIP
-            >>> output = model.generate(processor("design.json"))  # doctest: +SKIP
-        """
-
-        return self.forward(
-            batch,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            sample_chunk_size=sample_chunk_size,
-            initial_coords=initial_coords,
-            preserve_condition_coords=preserve_condition_coords,
-            generator=generator,
         )
 
     @staticmethod
@@ -254,7 +283,7 @@ class PxDesignDesignGenerator(ModelMixin):
             realize it.
 
         Examples:
-            >>> caps = PxDesignDesignGenerator.official_pipeline_capabilities()
+            >>> caps = PxDesignDesigner.official_pipeline_capabilities()
             >>> caps["backbone_generation"]
             'native_pxdesign_d'
         """
@@ -285,7 +314,7 @@ class PxDesignDesignGenerator(ModelMixin):
             ValueError: If any conditioning tensor in ``batch`` has an inconsistent shape.
 
         Examples:
-            >>> model = PxDesignDesignGenerator()  # doctest: +SKIP
+            >>> model = PxDesignDesigner()  # doctest: +SKIP
             >>> representations = model.encode_condition(batch)  # doctest: +SKIP
         """
 
@@ -304,8 +333,8 @@ class PxDesignDesignGenerator(ModelMixin):
         single = token_embedding.new_zeros(*token_embedding.shape[:-1], self.config.single_size)
         return PxDesignRepresentations(
             token_embedding=token_embedding,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             relative_features=relative_features,
         )
 
@@ -347,8 +376,8 @@ class PxDesignDesignGenerator(ModelMixin):
             reference_charges=batch.reference_charges,
             atom_mask=batch.atom_mask,
             token_embedding=representations.token_embedding,
-            single=representations.single,
-            pair=representations.pair,
+            single=representations.single.tensor,
+            pair=representations.pair.tensor,
             relative_features=representations.relative_features,
             local_geometry=local_geometry,
         )
@@ -361,6 +390,85 @@ class PxDesignDesignGenerator(ModelMixin):
             initial_coords=initial_coords,
             generator=generator,
         )
+
+    def _train_denoise(
+        self,
+        batch: PxDesignInput,
+        *,
+        representations: PxDesignRepresentations,
+        num_samples: int,
+        generator: torch.Generator | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""
+        Noise the (augmented) ground-truth target once per sample and denoise in a single step.
+
+        Draws ``num_samples`` centered/augmented copies of ``batch.target_positions``, samples an
+        independent EDM noise level per sample, noises the target once, and runs one denoiser step over the
+        fixed design conditioning. This is the grad-carrying core of the training ``forward``.
+
+        Args:
+            batch: PxDesign model input; must carry ``target_positions``.
+            representations: Encoded conditioning from ``encode_condition``.
+            num_samples: Number of independent noised samples to draw.
+            generator: Optional random generator for the augmentation and noise draws.
+
+        Returns:
+            ``(denoised_coords, augmented_target, noise_level)``, each with a leading ``num_samples`` axis,
+            for the EDM-weighted coordinate loss.
+
+        Raises:
+            ValueError: If ``batch.target_positions`` is ``None``.
+        """
+
+        if batch.target_positions is None:
+            raise ValueError("diffusion training requires batch.target_positions")
+        single = representations.single.tensor
+        target = batch.target_positions.to(device=single.device, dtype=single.dtype)
+        atom_mask = batch.atom_mask.to(device=target.device)
+        # Center/augment the diffusion target over RESOLVED atoms only; materialized/absent atoms have no
+        # true coordinate. Falls back to ``atom_mask`` when no explicit target mask is provided.
+        resolved_mask = (batch.target_mask if batch.target_mask is not None else batch.atom_mask).to(
+            device=target.device
+        )
+
+        augmented_target = self.coordinate_sampler.augment_target(
+            target,
+            num_samples=num_samples,
+            atom_mask=resolved_mask,
+            generator=generator,
+        )
+        batch_shape = augmented_target.shape[:-2]
+        noise_level = self.training_noise_sampler(
+            batch_shape,
+            device=augmented_target.device,
+            dtype=augmented_target.dtype,
+            generator=generator,
+        )
+        # ``empty_like().normal_`` (not ``randn(shape)``) so a symbolic atom-count dim traces under
+        # torch.compile with dynamic shapes instead of becoming a concrete SymInt array.
+        noise = torch.empty_like(augmented_target).normal_(generator=generator)
+        noisy_coords = augmented_target + noise * noise_level[..., None, None]
+
+        local_geometry = self.coordinate_denoiser.build_local_geometry(
+            batch.reference_positions.to(device=batch.atom_features.device),
+            batch.reference_space_id,
+        )
+        context = CoordinateDenoiseContext(
+            atom_features=batch.atom_features,
+            atom_to_token=batch.atom_to_token,
+            reference_positions=batch.reference_positions,
+            reference_charges=batch.reference_charges,
+            atom_mask=atom_mask,
+            token_embedding=representations.token_embedding,
+            single=single,
+            pair=representations.pair.tensor,
+            relative_features=representations.relative_features,
+            local_geometry=local_geometry,
+        )
+        denoised_coords = self.coordinate_denoiser(
+            context.to_denoising_input(noisy_coords=noisy_coords, noise_level=noise_level)
+        )
+        return denoised_coords, augmented_target, noise_level
 
 
 class PxDesignConditionEmbedder(nn.Module):
@@ -516,6 +624,61 @@ class PxDesignConditionalTemplateEmbedder(nn.Module):
         return self.embedding(embedding_ids)
 
 
+class TrainingNoiseSampler(nn.Module):
+    r"""
+    Sample EDM training noise levels from a log-normal distribution.
+
+    Draw ``sigma = exp(noise_log_mean + noise_log_std * N(0, 1)) * sigma_data``. Each training sample gets an
+    independent noise level so the denoiser learns to denoise across the whole sigma range in a single step
+    (no reverse-sampling loop during training).
+
+    Args:
+        noise_log_mean: Mean of the underlying log-normal in log space.
+        noise_log_std: Standard deviation of the underlying log-normal in log space.
+        sigma_data: Data-scale constant the sampled sigma is multiplied by.
+    """
+
+    def __init__(self, *, noise_log_mean: float = -1.2, noise_log_std: float = 1.5, sigma_data: float = 16.0) -> None:
+        super().__init__()
+        self.noise_log_mean = noise_log_mean
+        self.noise_log_std = noise_log_std
+        self.sigma_data = sigma_data
+
+    def forward(
+        self,
+        size: tuple[int, ...] | torch.Size,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        r"""
+        Return a tensor of independent noise levels with shape ``size``.
+
+        Args:
+            size: Leading batch shape of the noise-level tensor to draw.
+            device: Optional device for the sampled tensor.
+            dtype: Optional dtype for the sampled tensor.
+            generator: Optional random generator.
+
+        Returns:
+            Positive noise levels (sigma) of shape ``size``.
+
+        Examples:
+            >>> import torch
+            >>> _ = torch.manual_seed(0)
+            >>> sampler = TrainingNoiseSampler()
+            >>> noise_level = sampler((2,))
+            >>> noise_level.shape
+            torch.Size([2])
+            >>> bool((noise_level > 0).all())
+            True
+        """
+
+        standard_normal = torch.randn(size, device=device, dtype=dtype, generator=generator)
+        return (standard_normal * self.noise_log_std + self.noise_log_mean).exp() * self.sigma_data
+
+
 class PxDesignCoordinateSampler(nn.Module):
     r"""
     PxDesign EDM sampler with the public step-index step-scale schedules.
@@ -544,6 +707,39 @@ class PxDesignCoordinateSampler(nn.Module):
         self.step_scale_max = sampler.step_scale_max
         self.step_scale_schedule = sampler.step_scale_schedule
         self.center_random_augmentation = sampler.center_random_augmentation
+
+    def augment_target(
+        self,
+        coords: Tensor,
+        *,
+        num_samples: int,
+        atom_mask: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        r"""
+        Return ``num_samples`` centered, randomly rigid-augmented copies of a training target.
+
+        Reuses the shared EDM centering/augmentation used by the sampler so single-step diffusion training
+        draws per-sample ground-truth targets the same way inference initializes coords. Honors
+        ``center_random_augmentation``: when disabled, only mask-weighted centering is applied.
+
+        Args:
+            coords: Ground-truth coords of shape `[..., N_atom, 3]`.
+            num_samples: Number of augmented copies to draw along a new sample axis.
+            atom_mask: Optional `[..., N_atom]` mask for weighted centering and output masking.
+            generator: Optional random generator for reproducible augmentation.
+
+        Returns:
+            Augmented coords of shape `[..., num_samples, N_atom, 3]`.
+        """
+
+        return CoordinateEdmSampler._center_random_augmentation(
+            coords,
+            num_samples=num_samples,
+            center_only=not self.center_random_augmentation,
+            atom_mask=atom_mask,
+            generator=generator,
+        )
 
     def forward(
         self,
@@ -906,36 +1102,43 @@ def _restore_condition_coords(batch: PxDesignInput, pred_coords: Tensor) -> Tens
     return torch.where(condition_mask.unsqueeze(-1), condition_coords, pred_coords)
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class PxDesignRepresentations:
     r"""
     Encoded PxDesign conditioning held fixed across all EDM sampling steps.
 
-    Holds the per-input conditioning tensors that stay fixed across all EDM sampling
-    steps and are passed into the coordinate denoiser context.
+    Holds the per-input conditioning tensors that stay fixed across all EDM sampling steps and are passed
+    into the coordinate denoiser context. The token single/pair states use the typed
+    [`Single`][ofoldx.modules.representation.Single] / [`Pair`][ofoldx.modules.representation.Pair] carriers
+    at this boundary (unwrapped via ``.tensor`` before the denoiser); both carriers and this dataclass are
+    pytree-registered so ``torch.compile`` traces through them without a graph break.
 
     Attributes:
         token_embedding: Per-token conditioning embedding `[..., N_token, token_feature_size]`.
-        single: Single (token) representation `[..., N_token, single_size]`,
+        single: Single (token) representation `[..., N_token, single_size]` carrier,
             zero-initialized for PxDesign.
-        pair: Pair representation `[..., N_token, N_token, pair_size]`, masked to
+        pair: Pair representation `[..., N_token, N_token, pair_size]` carrier, masked to
             valid token pairs.
         relative_features: Bucketed relative-position features shared across steps.
     """
 
     token_embedding: Tensor
-    single: Tensor
-    pair: Tensor
+    single: Single
+    pair: Pair
     relative_features: RelativePositionBuckets
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class PxDesignInput(BaseInput):
     r"""
     Batched tensor contract consumed by the native PxDesign generator.
 
     Carries the per-token/per-atom conditioning, reference-conformer geometry, restype and template features,
-    and optional design/condition annotations that drive coordinate sampling.
+    and optional design/condition annotations that drive coordinate sampling. Registered as a pytree node so
+    ``torch.compile`` traces through the batch and the ``model(**inputs)`` keyword-tensor call path can build
+    it outside the compiled graph.
 
     Attributes:
         token_mask: Valid token mask with shape ``(B, N_token)``.
@@ -975,6 +1178,10 @@ class PxDesignInput(BaseInput):
             atoms and ``False`` for design atoms (PxDesign design annotation).
         is_resolved: Optional ``(B, N_atom)`` bool marking atoms with a real
             experimental coordinate (PxDesign design annotation).
+        target_positions: Optional ground-truth atom coords ``(B, N_atom, 3)`` used as the
+            single-step diffusion training target; required by ``forward`` (training) and unused at inference.
+        target_mask: Optional ``(B, N_atom)`` mask selecting atoms with a real training coordinate for
+            masked target centering; defaults to ``atom_mask`` when absent.
     """
 
     token_mask: Tensor
@@ -1005,3 +1212,8 @@ class PxDesignInput(BaseInput):
     frame_mask: Tensor | None = None
     conditional_label: Tensor | None = None
     is_resolved: Tensor | None = None
+    target_positions: Tensor | None = None
+    target_mask: Tensor | None = None
+
+
+PxDesignDesigner.input_class = PxDesignInput

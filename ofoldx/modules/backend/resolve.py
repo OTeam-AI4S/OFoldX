@@ -19,6 +19,8 @@ from __future__ import annotations
 import functools
 from collections.abc import Iterable
 
+from ._oops import OOPS_AVAILABLE
+
 # Every backend the library knows about. A request in this set that a given operator does not
 # implement (e.g. "sdpa" for a non-attention op) falls back to that operator's public default rather
 # than erroring; only values outside this set are treated as typos and rejected.
@@ -44,9 +46,7 @@ def oops_available() -> bool:
         True
     """
 
-    try:
-        import oops  # noqa: F401
-    except ImportError:
+    if not OOPS_AVAILABLE:
         return False
     import torch
 

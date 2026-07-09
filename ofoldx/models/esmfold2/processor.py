@@ -8,11 +8,9 @@ import math
 from collections.abc import Mapping
 from os import PathLike
 
-import numpy as np
 import torch
 from torch import Tensor
 
-from ...data import residue_constants as rc
 from ...processors.mixin import ProcessorMixin
 from ...processors.registry import PROCESSORS
 from .io import normalize_protein_sequence, sequence_from_input
@@ -24,10 +22,9 @@ class ESMFold2Processor(ProcessorMixin):
     r"""
     Build an ESMFold2 tensor batch from a protein sequence or FASTA file.
 
-    This first OFoldX processor intentionally implements the protein-only path
-    used by the released ESMFold2 checkpoint. Full all-atom complex input processing should be
-    added as native OFoldX processing code rather than routed through an
-    external runtime.
+    Implements the protein-only input path used by the released ESMFold2
+    checkpoint: a single chain with no external MSA, no modifications, and no
+    covalent bonds. All-atom complex inputs are out of scope for this processor.
     """
 
     input_class = ESMFold2Input
@@ -39,14 +36,56 @@ class ESMFold2Processor(ProcessorMixin):
         features = prepare_protein_features(sequence)
         return ESMFold2Input(**features)
 
+    def source_structure(self, inputs: str | PathLike[str]):
+        r"""
+        Return the unpadded heavy-atom reference structure this processor's predicted coordinates overlay onto.
+
+        Rebuilds, from the same sequence, the per-residue heavy-atom layout the featurizer emits -- each residue's
+        atoms in [`PROTEIN_HEAVY_ATOMS`][ofoldx.models.esmfold2.processor.PROTEIN_HEAVY_ATOMS] order -- with
+        placeholder coordinates. The model predicts one coordinate per real atom in this order (its atom axis is
+        padded to a block multiple, which [`coords_to_structure`][ofoldx.data.structure.coords_to_structure] drops), so
+        overlaying the predicted coordinates onto this reference yields the folded structure. Non-sequence inputs
+        (e.g. a parsed structure) yield ``None``.
+
+        Args:
+            inputs: Protein sequence string or FASTA path.
+
+        Returns:
+            The unpadded heavy-atom reference structure, or ``None`` when ``inputs`` is not a protein sequence.
+        """
+
+        from ...data.structure import AtomRecord, ResidueKey, Structure
+
+        try:
+            sequence = normalize_protein_sequence(sequence_from_input(inputs))
+        except (OSError, ValueError, TypeError):
+            return None  # a parsed structure / unreadable path is not a sequence this processor can reference
+        atoms: list[AtomRecord] = []
+        for position, letter in enumerate(sequence, start=1):
+            residue_name = PROTEIN_1TO3.get(letter, "UNK")
+            residue = ResidueKey("A", position, "")
+            for name in PROTEIN_HEAVY_ATOMS[residue_name]:
+                # Protein heavy atoms are all single-letter C/N/O/S, matching the featurizer's element = name[0].
+                atoms.append(
+                    AtomRecord(
+                        name=name,
+                        element=name[0],
+                        residue_name=residue_name,
+                        residue=residue,
+                        x=0.0,
+                        y=0.0,
+                        z=0.0,
+                        mol_type="protein",
+                    )
+                )
+        return Structure(tuple(atoms)) if atoms else None
+
     def _processor_config(self) -> Mapping[str, object]:
         return {}
 
 
 MOL_TYPE_PROTEIN = 0
-MOL_TYPE_NONPOLYMER = 3
 PROTEIN_UNK_RES_TYPE = 22
-MSA_GAP_TOKEN_ID = 1
 
 PROTEIN_RESIDUE_TO_RES_TYPE: dict[str, int] = {
     "ALA": 2,
@@ -501,124 +540,3 @@ def prepare_protein_features(sequence: str) -> dict[str, Tensor]:
         "deletion_mean": deletion_mean,
     }
     return {k: v.unsqueeze(0) for k, v in features.items()}
-
-
-# 0-32 res_type → 3-letter name (only protein indices 2-22 are populated).
-_RES_TYPE_TO_3LETTER: dict[int, str] = {rt: three for three, rt in PROTEIN_RESIDUE_TO_RES_TYPE.items()}
-_RES_TYPE_TO_3LETTER[PROTEIN_UNK_RES_TYPE] = "UNK"
-
-# Featurization keys that ``output_to_pdb`` reads off a raw tensor-output mapping.
-OUTPUT_TO_PDB_FEATURE_KEYS: tuple[str, ...] = (
-    "res_type",
-    "atom_to_token",
-    "ref_atom_name_chars",
-    "atom_attention_mask",
-    "token_attention_mask",
-    "residue_index",
-)
-
-
-def output_to_pdb(output: dict) -> str:
-    """Convert an ESMFold2 protein forward output into a PDB string.
-
-    Expects ``output`` to carry the featurization keys re-attached by
-    a raw tensor-output mapping (``res_type``, ``atom_to_token``,
-    ``ref_atom_name_chars``, ``atom_attention_mask``,
-    ``token_attention_mask``, ``residue_index``) alongside the predicted
-    ``sample_atom_coords`` and ``plddt``. Builds a 37-atom PDB view with
-    per-atom pLDDT in the b-factor column.
-    """
-    coords = output["sample_atom_coords"]
-    if coords.dim() == 4:
-        coords = coords[:, 0]
-    coords = coords.detach().cpu().numpy()[0]
-
-    plddt = output["plddt"].detach().cpu().numpy()[0]
-    atom_to_token = output["atom_to_token"].cpu().numpy()
-    ref_chars = output["ref_atom_name_chars"].cpu().numpy()
-    res_type = output["res_type"].cpu().numpy()
-    token_mask = output["token_attention_mask"].cpu().numpy().astype(bool)
-    atom_mask_in = output["atom_attention_mask"].cpu().numpy().astype(bool)
-    residue_index_arr = output["residue_index"].cpu().numpy()
-
-    if atom_to_token.ndim == 2:
-        atom_to_token = atom_to_token[0]
-        ref_chars = ref_chars[0]
-        res_type = res_type[0]
-        token_mask = token_mask[0]
-        atom_mask_in = atom_mask_in[0]
-        residue_index_arr = residue_index_arr[0]
-
-    valid_tok = np.where(token_mask)[0]
-    n_res = valid_tok.shape[0]
-
-    restypes_with_x = [*rc.restypes, "X"]
-    restype_order_with_x = {letter: index for index, letter in enumerate(restypes_with_x)}
-    aatype = np.full(n_res, restype_order_with_x["X"], dtype=np.int64)
-    for new_i, t in enumerate(valid_tok):
-        rt = int(res_type[t])
-        three = _RES_TYPE_TO_3LETTER.get(rt)
-        if three is None or three == "UNK":
-            aatype[new_i] = restype_order_with_x["X"]
-        else:
-            one = rc.restype_3to1.get(three, "X")
-            aatype[new_i] = restype_order_with_x[one]
-
-    atom_positions = np.zeros((n_res, 37, 3), dtype=np.float32)
-    atom_mask = np.zeros((n_res, 37), dtype=np.float32)
-    b_factors = np.zeros((n_res, 37), dtype=np.float32)
-    tok_to_new = {int(t): i for i, t in enumerate(valid_tok)}
-
-    for a in range(atom_to_token.shape[0]):
-        if not atom_mask_in[a]:
-            continue
-        tok = int(atom_to_token[a])
-        if tok not in tok_to_new:
-            continue
-        new_i = tok_to_new[tok]
-        name = "".join(chr(int(c) + 32) if int(c) != 0 else " " for c in ref_chars[a]).strip()
-        idx37 = rc.atom_order.get(name)
-        if idx37 is None:
-            continue
-        atom_positions[new_i, idx37] = coords[a]
-        atom_mask[new_i, idx37] = 1.0
-        b_factors[new_i, idx37] = float(plddt[tok])
-
-    return _to_pdb(
-        aatype=aatype,
-        atom_positions=atom_positions,
-        atom_mask=atom_mask,
-        residue_index=residue_index_arr[valid_tok].astype(np.int32) + 1,
-        b_factors=b_factors,
-    )
-
-
-def _to_pdb(
-    *,
-    aatype: np.ndarray,
-    atom_positions: np.ndarray,
-    atom_mask: np.ndarray,
-    residue_index: np.ndarray,
-    b_factors: np.ndarray,
-) -> str:
-    lines: list[str] = []
-    atom_names = rc.atom_types
-    restypes = [*rc.restypes, "X"]
-    atom_serial = 1
-    for i, aa in enumerate(aatype):
-        resname = rc.restype_1to3_with_unknown.get(restypes[int(aa)], "UNK")
-        resseq = int(residue_index[i])
-        for atom_idx, atom_name in enumerate(atom_names):
-            if atom_mask[i, atom_idx] < 0.5:
-                continue
-            x, y, z = atom_positions[i, atom_idx]
-            b = b_factors[i, atom_idx]
-            element = atom_name.strip()[0] if atom_name.strip() else ""
-            lines.append(
-                f"ATOM  {atom_serial:5d} {atom_name:<4s} {resname:>3s} A{resseq:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}{1.0:6.2f}{b:6.2f}          {element:>2s}"
-            )
-            atom_serial += 1
-    lines.append("TER")
-    lines.append("END")
-    return "\n".join(lines) + "\n"

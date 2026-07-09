@@ -11,22 +11,22 @@ from chanfig import Config
 from torch import nn
 
 from ofoldx.data import AtomRecord, ResidueKey, Structure
-from ofoldx.models import AutoModel, BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ofoldx.models import AutoModel, BaseInput, SequenceDesignCandidate, StructurePredictionOutput
 from ofoldx.models.boltz2 import Boltz2AffinityConfig, Boltz2AffinityModel
 from ofoldx.models.boltzgen import (
     BoltzGenAdherenceConfig,
     BoltzGenConfig,
-    BoltzGenDesignGenerator,
+    BoltzGenDesigner,
     BoltzGenDiverseConfig,
     BoltzGenIFoldConfig,
-    BoltzGenIFoldGenerator,
+    BoltzGenInverseFoldDesigner,
     BoltzGenStructureTrainedSmallConfig,
 )
-from ofoldx.models.ligandmpnn import LigandMPNNConfig, LigandMPNNDesignGenerator, LigandMPNNProcessor
-from ofoldx.models.odesign import ODesignDesignConfig, ODesignDesignGenerator
-from ofoldx.models.proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesignGenerator, ProteinMPNNProcessor
-from ofoldx.models.pxdesign import PxDesignConfig, PxDesignDesignGenerator
-from ofoldx.models.rfdiffusion import RfDiffusionConfig, RfDiffusionDesignGenerator
+from ofoldx.models.ligandmpnn import LigandMPNNConfig, LigandMPNNDesigner, LigandMPNNProcessor
+from ofoldx.models.odesign import ODesignDesignConfig, ODesignDesigner
+from ofoldx.models.proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesigner, ProteinMPNNProcessor
+from ofoldx.models.pxdesign import PxDesignConfig, PxDesignDesigner, PxDesignInput
+from ofoldx.models.rfdiffusion import RfDiffusionConfig, RfDiffusionDesigner
 from ofoldx.pipelines import DesignPipeline, Pipeline, StructureProcessor
 from ofoldx.pipelines.auto import PIPELINE_MANIFEST_NAME
 from ofoldx.processors import AutoProcessor
@@ -43,8 +43,8 @@ class CustomInput(BaseInput):
 
 
 class DesignModel(nn.Module):
-    def generate(self, inputs: CustomInput) -> DesignGeneratorOutput:
-        return DesignGeneratorOutput(sequence_logits=inputs.value)
+    def design(self, inputs: CustomInput) -> SequenceDesignCandidate:
+        return SequenceDesignCandidate(sequence_logits=inputs.value)
 
 
 class ForwardDesignModel(nn.Module):
@@ -61,9 +61,9 @@ class BadDesignModel(nn.Module):
 
 
 class AssignmentModel(nn.Module):
-    def forward(self, inputs: BaseInput, **_: object) -> DesignGeneratorOutput:
+    def forward(self, inputs: BaseInput, **_: object) -> SequenceDesignCandidate:
         length = inputs.token_mask.shape[-1]  # type: ignore[attr-defined]
-        return DesignGeneratorOutput(sequence_tokens=torch.ones(1, length, dtype=torch.long))
+        return SequenceDesignCandidate(sequence_tokens=torch.ones(1, length, dtype=torch.long))
 
 
 class SaveableDesignModel(nn.Module):
@@ -119,8 +119,8 @@ def protein_ligand_structure() -> Structure:
     return Structure(tuple(atoms))
 
 
-def tiny_proteinmpnn_model() -> ProteinMPNNDesignGenerator:
-    return ProteinMPNNDesignGenerator(
+def tiny_proteinmpnn_model() -> ProteinMPNNDesigner:
+    return ProteinMPNNDesigner(
         ProteinMPNNConfig(
             {
                 "hidden_size": 16,
@@ -133,8 +133,8 @@ def tiny_proteinmpnn_model() -> ProteinMPNNDesignGenerator:
     )
 
 
-def tiny_ligandmpnn_model(_workdir: Path) -> LigandMPNNDesignGenerator:
-    return LigandMPNNDesignGenerator(
+def tiny_ligandmpnn_model(_workdir: Path) -> LigandMPNNDesigner:
+    return LigandMPNNDesigner(
         LigandMPNNConfig(
             {
                 "hidden_size": 16,
@@ -195,8 +195,8 @@ def tiny_alphafold_family_config() -> dict[str, object]:
     }
 
 
-def tiny_odesign_design_model(_workdir: Path) -> ODesignDesignGenerator:
-    return ODesignDesignGenerator(ODesignDesignConfig(tiny_alphafold_family_config()))
+def tiny_odesign_design_model(_workdir: Path) -> ODesignDesigner:
+    return ODesignDesigner(ODesignDesignConfig(tiny_alphafold_family_config()))
 
 
 def tiny_boltz2_config() -> dict[str, object]:
@@ -342,26 +342,24 @@ def force_tiny_boltzgen_variant(config: Any) -> Any:
     return config
 
 
-def tiny_boltzgen_model(_workdir: Path) -> BoltzGenDesignGenerator:
-    return BoltzGenDesignGenerator(BoltzGenConfig(tiny_boltzgen_config()))
+def tiny_boltzgen_model(_workdir: Path) -> BoltzGenDesigner:
+    return BoltzGenDesigner(BoltzGenConfig(tiny_boltzgen_config()))
 
 
-def tiny_boltzgen_diverse_model(_workdir: Path) -> BoltzGenDesignGenerator:
-    return BoltzGenDesignGenerator(force_tiny_boltzgen_variant(BoltzGenDiverseConfig(tiny_boltzgen_config())))
+def tiny_boltzgen_diverse_model(_workdir: Path) -> BoltzGenDesigner:
+    return BoltzGenDesigner(force_tiny_boltzgen_variant(BoltzGenDiverseConfig(tiny_boltzgen_config())))
 
 
-def tiny_boltzgen_adherence_model(_workdir: Path) -> BoltzGenDesignGenerator:
-    return BoltzGenDesignGenerator(force_tiny_boltzgen_variant(BoltzGenAdherenceConfig(tiny_boltzgen_config())))
+def tiny_boltzgen_adherence_model(_workdir: Path) -> BoltzGenDesigner:
+    return BoltzGenDesigner(force_tiny_boltzgen_variant(BoltzGenAdherenceConfig(tiny_boltzgen_config())))
 
 
-def tiny_boltzgen_structuretrained_small_model(_workdir: Path) -> BoltzGenDesignGenerator:
-    return BoltzGenDesignGenerator(
-        force_tiny_boltzgen_variant(BoltzGenStructureTrainedSmallConfig(tiny_boltzgen_config()))
-    )
+def tiny_boltzgen_structuretrained_small_model(_workdir: Path) -> BoltzGenDesigner:
+    return BoltzGenDesigner(force_tiny_boltzgen_variant(BoltzGenStructureTrainedSmallConfig(tiny_boltzgen_config())))
 
 
-def tiny_boltzgen_ifold_model(_workdir: Path) -> BoltzGenIFoldGenerator:
-    return BoltzGenIFoldGenerator(
+def tiny_boltzgen_ifold_model(_workdir: Path) -> BoltzGenInverseFoldDesigner:
+    return BoltzGenInverseFoldDesigner(
         BoltzGenIFoldConfig(
             {
                 "single_size": 16,
@@ -388,8 +386,8 @@ def tiny_boltzgen_ifold_model(_workdir: Path) -> BoltzGenIFoldGenerator:
     )
 
 
-def tiny_pxdesign_model(_workdir: Path) -> PxDesignDesignGenerator:
-    return PxDesignDesignGenerator(
+def tiny_pxdesign_model(_workdir: Path) -> PxDesignDesigner:
+    return PxDesignDesigner(
         PxDesignConfig(
             {
                 "single_size": 16,
@@ -434,7 +432,7 @@ def tiny_pxdesign_model(_workdir: Path) -> PxDesignDesignGenerator:
     )
 
 
-def tiny_rfdiffusion_model(workdir: Path) -> RfDiffusionDesignGenerator:
+def tiny_rfdiffusion_model(workdir: Path) -> RfDiffusionDesigner:
     se3 = {
         "num_layers": 1,
         "num_channels": 4,
@@ -447,7 +445,7 @@ def tiny_rfdiffusion_model(workdir: Path) -> RfDiffusionDesignGenerator:
         "l1_out_features": 2,
         "num_edge_features": 4,
     }
-    return RfDiffusionDesignGenerator(
+    return RfDiffusionDesigner(
         RfDiffusionConfig(
             {
                 "model": {
@@ -492,7 +490,7 @@ class RegisteredDesignCase:
     expects_scores: bool = False
 
 
-def tiny_proteinmpnn_model_for_case(_workdir: Path) -> ProteinMPNNDesignGenerator:
+def tiny_proteinmpnn_model_for_case(_workdir: Path) -> ProteinMPNNDesigner:
     return tiny_proteinmpnn_model()
 
 
@@ -633,7 +631,7 @@ def test_design_pipeline_rejects_invalid_inputs_and_outputs() -> None:
         pipeline(tiny_structure())
     with pytest.raises(TypeError, match="BaseInput or structure input"):
         pipeline(3)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="design generators must return"):
+    with pytest.raises(TypeError, match="design models must return"):
         DesignPipeline(BadDesignModel())(CustomInput(value=torch.ones(3)))
 
 
@@ -647,7 +645,7 @@ def test_design_pipeline_save_writes_manifest(tmp_path) -> None:
 
     manifest = Config.from_json(tmp_path / PIPELINE_MANIFEST_NAME)
     assert manifest["kind"] == "pipeline"
-    assert manifest["task"] == "design_generation"
+    assert manifest["task"] == "design"
     assert manifest["entrypoint"] == "ofoldx.pipelines.design.DesignPipeline"
     assert manifest["components"]["generator"]["path"] == "generator"
     assert manifest["components"]["processor"]["path"] == "processor"
@@ -663,9 +661,9 @@ def test_design_pipeline_e2e_runs_saved_proteinmpnn_package(tmp_path) -> None:
     output = loaded(protein_backbone_structure(), num_samples=1)
 
     assert isinstance(loaded, DesignPipeline)
-    assert isinstance(loaded.model, ProteinMPNNDesignGenerator)
+    assert isinstance(loaded.model, ProteinMPNNDesigner)
     assert isinstance(loaded.processor, ProteinMPNNProcessor)
-    assert isinstance(loaded_model, ProteinMPNNDesignGenerator)
+    assert isinstance(loaded_model, ProteinMPNNDesigner)
     assert isinstance(loaded_processor, ProteinMPNNProcessor)
     assert len(output.candidates) == 1
     candidate = output.candidates[0]
@@ -696,39 +694,70 @@ def test_design_pipeline_e2e_runs_saved_registered_packages(tmp_path, case: Regi
         assert isinstance(loaded.processor, LigandMPNNProcessor)
 
     candidate = output.candidates[0]
+    sequence_tokens = candidate.sequence_tokens
+    sequence_logits = candidate.sequence_logits
+    structure_prediction = candidate.structure_prediction
     if case.expects_sequence:
-        assert candidate.sequence_tokens is not None or candidate.sequence_logits is not None
-    if candidate.sequence_tokens is not None:
-        assert candidate.sequence_tokens.ndim >= 2
-    if candidate.sequence_logits is not None:
-        assert candidate.sequence_logits.shape[-1] > 1
+        assert sequence_tokens is not None or sequence_logits is not None
+    if sequence_tokens is not None:
+        assert sequence_tokens.ndim >= 2
+    if sequence_logits is not None:
+        assert sequence_logits.shape[-1] > 1
     if case.expects_structure:
-        assert candidate.structure_prediction is not None
-        assert candidate.structure_prediction.pred_coords.ndim >= 3
-        assert candidate.structure_prediction.pred_coords.shape[-1] == 3
+        assert structure_prediction is not None
+        assert structure_prediction.pred_coords.ndim >= 3
+        assert structure_prediction.pred_coords.shape[-1] == 3
     if case.expects_scores:
         assert candidate.scores is not None
 
 
-def test_pxdesign_pipeline_runs_sequence_assignment_and_filtering_stages(tmp_path: Path) -> None:
+def test_pxdesign_stages_assign_sequences_and_filter(tmp_path: Path) -> None:
+    # The multi-model all-atom design workflow (backbone -> ProteinMPNN sequences -> structure-predictor filter)
+    # is the generic AllAtomDesignPipeline injected with the pxdesign family's stage glue. Exercise those stage
+    # functions (which now live in the pxdesign family, not in a pipeline) directly on a generated backbone.
+    from ofoldx.models.pxdesign import assign_sequences, filter_candidates
+
     model = tiny_pxdesign_model(tmp_path)
-    pipeline = DesignPipeline(
+    processor = cast(StructureProcessor[PxDesignInput], pxdesign_processor(model.config))
+    batch = processor(protein_backbone_structure())
+    generated = model.design(batch, num_samples=1, num_sampling_steps=1)
+
+    assigned = assign_sequences(generated, batch=batch, model=AssignmentModel(), num_samples=1)
+    staged = filter_candidates(assigned, batch=batch, prediction={"quality": torch.tensor([0.7])})
+
+    assert staged.sequence_tokens is not None
+    assert staged.scores is not None
+    assert "filter_quality" in staged.scores
+    assert staged.metadata is not None
+    assert staged.metadata["sequence_assignment"]["backend"] == "native_proteinmpnn"
+    assert staged.metadata["filtering"]["backend"] == "native_structure_predictor_hook"
+
+
+def test_all_atom_design_pipeline_injects_sequence_designer(tmp_path: Path) -> None:
+    # The composite AllAtomDesignPipeline depends only on the Designer *capability*: the sequence assigner is
+    # injected as a component (never imported) and the family's assign_sequences glue is injected as the stage
+    # callable, so the generic pipeline applies sequence assignment through them with no cross-family coupling.
+    from ofoldx.models.capability import Designer
+    from ofoldx.models.pxdesign import assign_sequences, filter_candidates
+    from ofoldx.pipelines import AllAtomDesignPipeline
+
+    model = tiny_pxdesign_model(tmp_path)
+    pipeline = AllAtomDesignPipeline(
         model,
         processor=cast(StructureProcessor[BaseInput], pxdesign_processor(model.config)),
+        sequence_designer=AssignmentModel(),
+        assign_stage=assign_sequences,
+        filter_stage=filter_candidates,
     )
+    assert isinstance(pipeline, Designer)  # the composite is itself a Designer provider
 
     output = pipeline(
         protein_backbone_structure(),
         num_samples=1,
         num_sampling_steps=1,
-        sequence_assignment={"model": AssignmentModel(), "num_samples": 1},
-        filtering={"prediction": {"quality": torch.tensor([0.7])}},
+        sequence_assignment={"num_samples": 1},
     )
-
     candidate = output.candidates[0]
     assert candidate.sequence_tokens is not None
-    assert candidate.scores is not None
-    assert "filter_quality" in candidate.scores
     assert candidate.metadata is not None
     assert candidate.metadata["sequence_assignment"]["backend"] == "native_proteinmpnn"
-    assert candidate.metadata["filtering"]["backend"] == "native_structure_predictor_hook"

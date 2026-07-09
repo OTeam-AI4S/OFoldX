@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from oops import LayerNorm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
@@ -28,6 +27,7 @@ from ..atom import (
     TokenToAtomDecoder,
 )
 from ..attention import DenoisingTokenEncoder
+from ..backend import LayerNorm
 from ..diffusion.conditioning import condition_pair, condition_single
 from ..diffusion.edm import EdmPreconditioner
 from ..diffusion.types import CoordinateDenoisingInput

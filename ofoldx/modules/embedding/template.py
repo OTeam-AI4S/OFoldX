@@ -12,9 +12,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
+from ..backend import LayerNorm
 from ..trunk.msa import TrianglePairUpdateBlock
 
 

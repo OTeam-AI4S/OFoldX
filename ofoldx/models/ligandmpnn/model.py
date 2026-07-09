@@ -3,11 +3,11 @@ Message-passing graph model that scores and samples protein sequences over backb
 
 The OFoldX-native reimplementation of LigandMPNN: a message-passing graph model that scores or
 autoregressively samples protein sequences conditioned on backbone geometry and nearby ligand/context atoms.
-The public surface is [`LigandMPNNDesignGenerator`]
-[ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator] and its typed input
+The public surface is [`LigandMPNNDesigner`]
+[ofoldx.models.ligandmpnn.model.LigandMPNNDesigner] and its typed input
 [`LigandMPNNInput`][ofoldx.models.ligandmpnn.model.LigandMPNNInput]; the remaining classes are the graph
 encoder, autoregressive decoder, and the tensor helpers they share with the side-chain
-[`Packer`][ofoldx.models.ligandmpnn.model.Packer].
+[`LigandMPNNPacker`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker].
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributions as distributions
@@ -23,28 +23,29 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data import residue_constants as rc
-from ..contract import BaseInput, DesignGeneratorOutput
+from ...modules.representation import Single
+from ..contract import BaseInput, SequenceDesignCandidate, register_pytree_dataclass
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS
+from ..registry import DESIGN_MODELS, MODELS, SIDE_CHAIN_PACKING_MODELS
 from .chemical import periodic_group_period, side_chain_atom_types
-from .config import LigandMPNNConfig, PackerConfig
+from .config import LigandMPNNConfig, LigandMPNNPackerConfig
 
 
 @MODELS.register("ligandmpnn")
-@DESIGN_GENERATOR_MODELS.register("ligandmpnn")
-class LigandMPNNDesignGenerator(ModelMixin):
+@DESIGN_MODELS.register("ligandmpnn")
+class LigandMPNNDesigner(ModelMixin):
     r"""
     Message-passing model that designs and scores sequences for a protein-ligand complex
     (LigandMPNN inverse folding).
 
-    Runs the LigandMPNN encoder/decoder over a [`LigandMPNNInput`]
-    [ofoldx.models.ligandmpnn.model.LigandMPNNInput] batch through three protocols, each returning a
-    [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput]: [`score`]
-    [ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator.score] (log-likelihood of a given
-    sequence), [`single_residue_score`]
-    [ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator.single_residue_score] (one masked position
-    at a time), and [`sample`][ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator.sample]
-    (autoregressive sequence generation).
+    The training path is [`forward`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.forward]
+    (teacher-forced log-probabilities over a random decode order); inference is exposed through the house
+    capability verbs [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design] (autoregressive
+    sequence generation), [`score`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.score]
+    (log-likelihood of a given sequence), and [`single_residue_score`]
+    [ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.single_residue_score] (one masked position at a
+    time). Each verb returns a
+    [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate].
 
     Args:
         config: Model configuration; a default
@@ -54,8 +55,10 @@ class LigandMPNNDesignGenerator(ModelMixin):
         >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
         >>> processor = AutoProcessor.from_pretrained("ofoldx/ligandmpnn")  # doctest: +SKIP
         >>> model = AutoModel.from_pretrained("ofoldx/ligandmpnn")  # doctest: +SKIP
-        >>> model.sample(processor("complex.pdb"))  # doctest: +SKIP
+        >>> model.design(processor("complex.pdb"))  # doctest: +SKIP
     """
+
+    input_class: ClassVar[type[BaseInput]]
 
     config_class = LigandMPNNConfig
 
@@ -87,26 +90,47 @@ class LigandMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Score the input sequence against the backbone (delegates to [`score`][.score]).
+        Training path: teacher-forced per-token log-probabilities over a decode order.
 
-        Provided so the model is callable as a standard module; scoring is the default forward behavior.
+        Mirrors the upstream LigandMPNN training objective: encode the backbone/ligand graph once, draw a
+        decode order (random noise while ``self.training``, deterministic otherwise), and run a single
+        teacher-forced decoder pass whose gradients flow back to every weight. The returned logits are the
+        input to an external cross-entropy loss against the true sequence. This is a compile-clean,
+        symmetry-free single pass (the autoregressive sampling loop lives on the inference verb
+        [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design]).
 
         Args:
             batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            use_sequence: Whether the decoder may condition on the ground-truth sequence context.
+            use_sequence: Whether the decoder may condition on the teacher-forced sequence context.
             num_samples: Number of decode orders to evaluate; defaults to the value on ``batch``.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] with per-token
-            logits, the scored tokens, and per-sequence log-likelihood scores.
+            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with grad-carrying
+            per-token logits, the true tokens, and per-token/per-sequence log-likelihood scores.
 
         Examples:
             >>> model(batch)  # doctest: +SKIP
         """
 
-        return self.score(batch, use_sequence=use_sequence, num_samples=num_samples)
+        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False, training=self.training)
+        logits, tokens = self.backbone.teacher_forced_logits(features, use_sequence=use_sequence)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return SequenceDesignCandidate(
+            sequence_logits=logits,
+            sequence_tokens=tokens,
+            scores={
+                "log_probs": log_probs,
+                "sequence_log_likelihood": _sequence_log_likelihood(tokens, log_probs, features["mask"]),
+            },
+            metadata={
+                "architecture": "ligandmpnn",
+                "backend": "native_ligandmpnn",
+                "mode": "training",
+                "use_sequence": use_sequence,
+            },
+        )
 
     def score(
         self,
@@ -114,7 +138,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Score a given sequence with the full-context autoregressive protocol.
 
@@ -128,7 +152,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
             num_samples: Number of decode orders to evaluate; defaults to the value on ``batch``.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] whose ``scores``
+            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] whose ``scores``
             hold per-token ``log_probs`` and a ``sequence_log_likelihood``, with LigandMPNN metadata.
 
         Examples:
@@ -138,7 +162,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.score(features, use_sequence=use_sequence)
         log_probs = scored["log_probs"]
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={
@@ -160,11 +184,11 @@ class LigandMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Score each residue independently with the official single-position protocol.
 
-        Unlike [`score`][ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator.score], which decodes
+        Unlike [`score`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.score], which decodes
         the whole sequence in one order, this masks one position at a time (revealing all others when
         ``use_sequence`` is set) and reads off that position's log-probabilities. It reproduces LigandMPNN's
         per-residue "conditional probabilities" mode and is proportionally more expensive (one pass per
@@ -176,7 +200,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
             num_samples: Number of decode-order replicas to evaluate; defaults to the value on ``batch``.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] with per-residue
+            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with per-residue
             logits, ``log_probs``, and the aggregate ``sequence_log_likelihood``.
 
         Examples:
@@ -186,7 +210,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.single_residue_score(features, use_sequence=use_sequence)
         log_probs = scored["log_probs"]
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={
@@ -204,20 +228,21 @@ class LigandMPNNDesignGenerator(ModelMixin):
         )
 
     @torch.no_grad()
-    def generate(
+    def design(
         self,
         batch: LigandMPNNInput,
         *,
         temperature: float | Tensor | None = None,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Sample sequences without tracking gradients (delegates to [`sample`][.sample]).
+        Design sequences by autoregressive sampling (the house design verb, no gradient tracking).
 
-        The public generation entry point: identical to [`sample`]
-        [ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator.sample] but wrapped in
-        ``torch.no_grad`` for inference.
+        The inference entry point for generation: samples new sequences for the input backbone under
+        ``torch.no_grad``. Returns the raw typed
+        [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate]; the design facade wraps
+        it into a design output.
 
         Args:
             batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
@@ -226,30 +251,32 @@ class LigandMPNNDesignGenerator(ModelMixin):
             generator: Optional RNG for reproducible sampling.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] with sampled tokens,
+            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with sampled tokens,
             logits, and per-token log-probabilities and sampling probabilities.
 
         Examples:
-            >>> model.generate(batch, temperature=0.1)  # doctest: +SKIP
+            >>> model.design(batch, temperature=0.1)  # doctest: +SKIP
         """
 
-        return self.sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
+        return self._sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
 
-    def sample(
+    def _sample(
         self,
         batch: LigandMPNNInput,
         *,
         temperature: float | Tensor | None = None,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Autoregressively sample new sequences for the input backbone.
+        Autoregressively sample new sequences for the input backbone (internal inference core).
 
-        Decodes residues in a noise-perturbed order, sampling each token from the temperature-scaled,
-        bias-adjusted logits while honoring the design mask (fixed positions keep their input token) and any
-        symmetry residue groups (tied positions share one draw). Follows the official single-backbone batch
-        contract: the input must carry exactly one backbone, replicated ``num_samples`` times internally.
+        The gradient-tracked sampling core behind
+        [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design]. Decodes residues in a
+        noise-perturbed order, sampling each token from the temperature-scaled, bias-adjusted logits while
+        honoring the design mask (fixed positions keep their input token) and any symmetry residue groups
+        (tied positions share one draw). Follows the official single-backbone batch contract: the input must
+        carry exactly one backbone, replicated ``num_samples`` times internally.
 
         Args:
             batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
@@ -258,12 +285,12 @@ class LigandMPNNDesignGenerator(ModelMixin):
             generator: Optional RNG for reproducible sampling.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] whose
+            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] whose
             ``sequence_tokens`` are the sampled sequences and whose ``scores`` hold ``log_probs`` and
             ``sampling_probs``.
 
         Examples:
-            >>> model.sample(batch, num_samples=8)  # doctest: +SKIP
+            >>> model.design(batch, num_samples=8)  # doctest: +SKIP
         """
 
         features = self._feature_dict(
@@ -274,7 +301,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
             for_sampling=True,
         )
         sampled = self.backbone.sample(features)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=sampled["logits"],
             sequence_tokens=sampled["S"],
             scores={
@@ -289,27 +316,31 @@ class LigandMPNNDesignGenerator(ModelMixin):
             },
         )
 
-    def encode(self, batch: LigandMPNNInput | Mapping[str, Any]):  # type: ignore[override]
+    def encode(self, batch: LigandMPNNInput | Mapping[str, Any]) -> LigandMPNNRepresentations:  # type: ignore[override]
         r"""
-        Run only the encoder, returning the graph node/edge states.
+        Run only the encoder, returning the typed graph representations.
 
         Exposes the encoder output (before autoregressive decoding) for downstream consumers such as the
-        side-chain Packer or embedding extraction. Accepts either a typed input, which is featurized first,
-        or a raw pre-built feature dict.
+        side-chain LigandMPNNPacker or embedding extraction. Accepts either a typed input, which is featurized
+        first, or a raw pre-built feature dict. The per-residue node states are wrapped in the
+        [`Single`][ofoldx.modules.representation.Single] carrier at this boundary; unwrap ``single.tensor``
+        before feeding the decoder.
 
         Args:
             batch: A [`LigandMPNNInput`][ofoldx.models.ligandmpnn.model.LigandMPNNInput] or an
                 already-featurized mapping of encoder inputs.
 
         Returns:
-            Tuple ``(node_states, edge_states, neighbor_idx)`` from the backbone encoder.
+            A [`LigandMPNNRepresentations`][ofoldx.models.ligandmpnn.model.LigandMPNNRepresentations] carrying
+            the node ``single`` carrier, the sparse KNN ``edges``, and the ``neighbor_idx``.
 
         Examples:
             >>> model.encode(batch)  # doctest: +SKIP
         """
 
         features = self._feature_dict(batch, for_sampling=False) if isinstance(batch, LigandMPNNInput) else batch
-        return self.backbone.encode(features)
+        node_states, edge_states, neighbor_idx = self.backbone.encode(features)
+        return LigandMPNNRepresentations(single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx)
 
     def _feature_dict(
         self,
@@ -319,13 +350,15 @@ class LigandMPNNDesignGenerator(ModelMixin):
         temperature: float | Tensor | None = None,
         generator: torch.Generator | None = None,
         for_sampling: bool,
+        training: bool = False,
     ) -> dict[str, Any]:
         r"""
         Assemble the backbone feature dict from a typed input.
 
         Validates the input, fills in optional fields (design mask, amino-acid bias), and resolves the
         decode-order noise: an explicit ``decoding_order_noise`` is reshaped to the requested sample count,
-        otherwise fresh Gaussian noise is drawn for sampling or zeros for deterministic scoring.
+        otherwise fresh Gaussian noise is drawn for sampling (or ``training``, so the teacher-forced pass sees
+        a random decode order) and zeros for deterministic scoring.
 
         Args:
             batch: Typed LigandMPNN input to featurize.
@@ -333,6 +366,7 @@ class LigandMPNNDesignGenerator(ModelMixin):
             temperature: Sampling temperature override; ``None`` keeps the input value.
             generator: Optional RNG used when drawing decode-order noise.
             for_sampling: Whether the features are for autoregressive sampling (vs. scoring).
+            training: Whether the features drive the teacher-forced training ``forward`` (random decode order).
 
         Returns:
             Feature mapping consumed by the backbone encoder/decoder.
@@ -366,6 +400,8 @@ class LigandMPNNDesignGenerator(ModelMixin):
                 raise ValueError(f"decoding_order_noise first dimension must match num_samples ({expected})")
         elif for_sampling:
             randn = torch.randn(num_samples, residue_count, device=device, generator=generator)
+        elif training:
+            randn = torch.randn(num_samples * batch_count, residue_count, device=device, generator=generator)
         else:
             randn = torch.zeros(num_samples * batch_count, residue_count, device=device)
         features: dict[str, Any] = {
@@ -555,6 +591,69 @@ class LigandMPNNBackbone(nn.Module):
             "logits": logits,
             "log_probs": F.log_softmax(logits, dim=-1),
         }
+
+    def teacher_forced_logits(self, features: Mapping[str, Any], *, use_sequence: bool) -> tuple[Tensor, Tensor]:
+        r"""
+        Compute teacher-forced logits in one decode pass (the compile-clean training core).
+
+        The symmetry-free single pass behind
+        [`LigandMPNNDesigner.forward`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.forward]: encode the
+        graph once, wrap the node states in the [`Single`][ofoldx.modules.representation.Single] carrier at the
+        representation boundary, derive the decode order, build the causal masks, and run the decoder. It omits
+        the symmetry-group handling (only used at inference) so the whole pass stays free of data-dependent
+        Python control flow and compiles under ``torch.compile(..., fullgraph=True)``.
+
+        Args:
+            features: Feature mapping from the generator.
+            use_sequence: Whether the decoder conditions on the teacher-forced sequence context.
+
+        Returns:
+            Tuple ``(logits, tokens)``: grad-carrying per-token logits `[B*, L, vocab]` and the (replicated)
+            true tokens `[B*, L]`.
+        """
+
+        sequence = features["S"]
+        mask = features["mask"]
+        chain_mask = mask * features["chain_mask"]
+        randn = features["randn"]
+        num_samples = int(features["batch_size"])
+
+        node_states, edge_states, neighbor_idx = self.encode(features)
+        # Adopt the typed node carrier at the representation boundary, then unwrap before the decoder.
+        representations = LigandMPNNRepresentations(
+            single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx
+        )
+        node_states = representations.single.tensor
+        edge_states = representations.edges
+        neighbor_idx = representations.neighbor_idx
+
+        chain_mask_order = chain_mask if randn.shape[0] == chain_mask.shape[0] else chain_mask.repeat(num_samples, 1)
+        decode_order = torch.argsort((chain_mask_order + 0.0001) * randn.abs())
+        neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
+        mask_decode = mask.repeat(num_samples, 1)
+        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask_decode)
+
+        sequence = sequence.repeat(num_samples, 1)
+        node_states = node_states.repeat(num_samples, 1, 1)
+        edge_states = edge_states.repeat(num_samples, 1, 1, 1)
+        mask = mask.repeat(num_samples, 1)
+
+        token_states = self.token_embedding(sequence)
+        edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
+        empty_token_states = torch.zeros_like(token_states)
+        encoder_edges = cat_neighbors_nodes(empty_token_states, edge_states, neighbor_idx)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
+        forward_context = forward_mask * encoder_context
+
+        if use_sequence:
+            for layer in self.decoder_layers:
+                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
+                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+        else:
+            for layer in self.decoder_layers:
+                node_states = layer(node_states, forward_context, mask)
+
+        return self.output_projection(node_states), sequence
 
     def single_residue_score(self, features: Mapping[str, Any], *, use_sequence: bool) -> dict[str, Tensor]:
         r"""
@@ -1167,13 +1266,11 @@ class LigandBackboneFeatures(nn.Module):
 
         Returns:
             Concatenated one-hot element features `[B, L, A, 147]` (120 element + 19 group + 8 period).
-
-        Raises:
-            ValueError: If any atomic number is outside ``[0, 119]``.
         """
 
-        if atomic_numbers.min() < 0 or atomic_numbers.max() >= self.periodic_group.shape[0]:
-            raise ValueError("ligand_atom_types atomic numbers must be in [0, 119)")
+        # Note: atomic numbers must lie in [0, 119]; the range is enforced upstream in the processor / input
+        # validation rather than with a data-dependent guard here, so this stays free of a host sync and
+        # compiles under torch.compile(..., fullgraph=True).
         group = self.periodic_group[atomic_numbers]
         period = self.periodic_period[atomic_numbers]
         return torch.cat(
@@ -1841,13 +1938,40 @@ def _backbone_pair_rbf(atoms: Mapping[str, Tensor], neighbor_idx: Tensor, num_bi
     return torch.cat([_gather_pair_rbf(atoms[a], atoms[b], neighbor_idx, num_bins) for a, b in atom_pairs], dim=-1)
 
 
+@register_pytree_dataclass
+@dataclass(slots=True)
+class LigandMPNNRepresentations:
+    r"""
+    Typed encoder representations for the LigandMPNN graph.
+
+    The boundary object returned by
+    [`LigandMPNNDesigner.encode`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.encode] and built inside
+    the teacher-forced training pass. The per-residue node states are wrapped in the
+    [`Single`][ofoldx.modules.representation.Single] carrier, the same way ``Coords`` is carried on
+    ``StructurePredictionOutput``; unwrap ``single.tensor`` before feeding the decoder. The sparse k-nearest
+    neighbor ``edges`` `[B, L, K, H]` are kept as a raw pytree-leaf tensor because their ``K`` axis is not the
+    square ``(i, j)`` grid that the [`Pair`][ofoldx.modules.representation.Pair] carrier requires. The whole
+    dataclass is pytree-registered, so it flows through ``tree_map`` / ``torch.compile`` with no graph break.
+
+    Attributes:
+        single: Per-residue node states carrier `[B, L, H]`.
+        edges: Sparse per-edge states `[B, L, K, H]`.
+        neighbor_idx: Neighbor indices `[B, L, K]`.
+    """
+
+    single: Single
+    edges: Tensor
+    neighbor_idx: Tensor
+
+
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class LigandMPNNInput(BaseInput):
     r"""
     Typed tensor input for the native LigandMPNN design generator.
 
     Bundles the backbone geometry, sequence, and ligand context that
-    [`LigandMPNNDesignGenerator`][ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator] scores or
+    [`LigandMPNNDesigner`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner] scores or
     samples over. All tensors share the batch ``B`` and residue ``L`` axes; ``A`` is the per-residue
     ligand/context atom budget. Optional fields tailor generation (design mask, amino-acid bias, decode-order
     noise, symmetry ties) and default to no constraint when omitted.
@@ -1864,7 +1988,7 @@ class LigandMPNNInput(BaseInput):
         design_mask: Optional mask where one marks positions to design and zero marks fixed positions.
         amino_acid_bias: Optional per-position amino-acid logit bias with shape ``(B, L, 21)``.
         decoding_order_noise: Optional decoding-order noise with shape ``(num_samples, L)``.
-        temperature: Sampling temperature used by ``sample`` and ``generate``.
+        temperature: Sampling temperature used by ``design``.
         num_samples: Number of autoregressive samples or decode orders.
         symmetry_residue_groups: Optional groups of residue indices tied to share one sampled token.
         symmetry_weights: Optional per-residue logit weights aligned with ``symmetry_residue_groups``.
@@ -1891,11 +2015,17 @@ class LigandMPNNInput(BaseInput):
     all_atom_mask: Tensor | None = None
 
 
+# Bound after the class so the keyword-tensor call path model(**inputs) can build the typed batch
+# (LigandMPNNInput is defined below LigandMPNNDesigner).
+LigandMPNNDesigner.input_class = LigandMPNNInput
+
+
 _ATOM14 = 14
 
 
 @MODELS.register("ligandmpnn_packer")
-class Packer(ModelMixin):
+@SIDE_CHAIN_PACKING_MODELS.register("ligandmpnn_packer")
+class LigandMPNNPacker(ModelMixin):
     r"""
     Predicts side-chain chi angles as a Von Mises mixture and denoises them into atom coordinates.
 
@@ -1905,18 +2035,18 @@ class Packer(ModelMixin):
 
     Args:
         config: Side-chain packer configuration; a default
-            [`PackerConfig`][ofoldx.models.ligandmpnn.config.PackerConfig] is used when ``None``.
+            [`LigandMPNNPackerConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNPackerConfig] is used when ``None``.
     """
 
-    config_class = PackerConfig
+    config_class = LigandMPNNPackerConfig
 
-    def __init__(self, config: PackerConfig | None = None) -> None:
-        config = PackerConfig() if config is None else config
+    def __init__(self, config: LigandMPNNPackerConfig | None = None) -> None:
+        config = LigandMPNNPackerConfig() if config is None else config
         super().__init__(config)
         self.hidden_size = config.hidden_size
         self.num_mix = config.num_mix
         self.atom_context_num = config.atom_context_num
-        self.features = PackerFeatures(
+        self.features = LigandMPNNPackerFeatures(
             node_size=config.hidden_size,
             edge_size=config.hidden_size,
             num_positional_embeddings=config.num_positional_embeddings,
@@ -1969,7 +2099,7 @@ class Packer(ModelMixin):
 
     def reset_parameters(self) -> None:
         r"""
-        Re-initialize Packer weights to match the released LigandMPNN scheme.
+        Re-initialize LigandMPNNPacker weights to match the released LigandMPNN scheme.
         """
 
         for parameter in self.parameters():
@@ -1982,7 +2112,7 @@ class Packer(ModelMixin):
 
         Runs the encoder message-passing stack over the k-nearest-neighbor residue graph, then folds the
         ligand-context atom graph into each residue node. The result feeds
-        [`decode`][ofoldx.models.ligandmpnn.model.Packer.decode] via the cached ``h_V``/``h_E``/``E_idx``
+        [`decode`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker.decode] via the cached ``h_V``/``h_E``/``E_idx``
         features.
 
         Args:
@@ -2021,7 +2151,7 @@ class Packer(ModelMixin):
         Decode the Von Mises torsion mixture parameters from the encoded graph.
 
         Adds explicit atom14-atom and atom14-ligand distance features (from
-        [`features_decode`][PackerFeatures.features_decode]), runs the
+        [`features_decode`][LigandMPNNPackerFeatures.features_decode]), runs the
         decoder layers, and projects to per-chi mixture parameters. The concentration is soft-plus-clamped to
         stay positive.
 
@@ -2055,14 +2185,64 @@ class Packer(ModelMixin):
         mix_logits = torsions[:, :, :, :, 2].float()
         return mean, concentration, mix_logits
 
+    def forward(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
+        r"""
+        Training path: predict the per-chi Von Mises torsion-mixture parameters in one pass.
 
-class PackerFeatures(nn.Module):
+        Seeds random side-chain torsions into atom14 coordinates, encodes the backbone graph and ligand
+        context, then decodes the mixture parameters for the four side-chain chi angles. The parameters carry
+        gradients back to every weight, so an external negative-log-likelihood loss against the observed
+        torsions trains the packer. This is a single denoising step (compile-clean, no Python loop); the
+        inference-time N-step denoising into atom14 coordinates is the
+        [`pack`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker.pack] verb, whose loop stays Python around
+        this per-step decoder.
+
+        Args:
+            features: Feature mapping carrying backbone coords ``X`` `(B, L, 4, 3)`, sequence ``S``, validity
+                ``mask``, and the ligand context ``Y``/``Y_t``/``Y_m``.
+
+        Returns:
+            Tuple ``(mean, concentration, mix_logits)``, each `[B, L, 4, num_mix]`.
+        """
+
+        torsion_dict = _make_torsion_features(features, repack_everything=True)
+        work: dict[str, Any] = {**features, "X": torsion_dict["xyz14_noised"], "X_m": torsion_dict["xyz14_m"]}
+        node_states, edge_states, neighbor_idx = self.encode(work)
+        work["h_V"], work["h_E"], work["E_idx"] = node_states, edge_states, neighbor_idx
+        return self.decode(work)
+
+    @torch.no_grad()
+    def pack(self, features: dict[str, Any], **packer_kwargs: Any) -> dict[str, Any]:
+        r"""
+        Pack side chains: denoise random torsions into atom14 coordinates (the house pack verb).
+
+        The inference capability verb; delegates to
+        [`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains] with this packer, returning the
+        feature dict updated in place with atom14 coordinates, masks, torsion-mixture parameters, and
+        side-chain confidence features.
+
+        Args:
+            features: Mutable feature dict carrying ``X``/``S``/``mask`` (and optional ligand context).
+            **packer_kwargs: Forwarded to
+                [`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains].
+
+        Returns:
+            The feature dict updated with the packed side-chain outputs.
+
+        Examples:
+            >>> packer.pack(features)  # doctest: +SKIP
+        """
+
+        return pack_side_chains(features, self, **packer_kwargs)
+
+
+class LigandMPNNPackerFeatures(nn.Module):
     r"""
-    Turns backbone coordinates and ligand context into the graph and distance features the Packer consumes.
+    Turns backbone coordinates and ligand context into the graph and distance features the LigandMPNNPacker consumes.
 
     Builds the backbone graph, ligand-context, and side-chain atom-distance features used by the
-    Packer encoder and decoder. Mirrors the reference LigandMPNN ``ProteinFeatures`` used by the
-    Packer (note: distinct from the sequence-model feature encoder).
+    LigandMPNNPacker encoder and decoder. Mirrors the reference LigandMPNN ``ProteinFeatures`` used by the
+    LigandMPNNPacker (note: distinct from the sequence-model feature encoder).
 
     Args:
         node_size: Width of the per-node features.
@@ -2262,7 +2442,7 @@ class PackerFeatures(nn.Module):
 @torch.no_grad()
 def pack_side_chains(
     features: dict[str, Any],
-    packer: Packer,
+    packer: LigandMPNNPacker,
     *,
     num_denoising_steps: int = 3,
     num_samples: int = 10,
@@ -2270,7 +2450,7 @@ def pack_side_chains(
     num_context_atoms: int = 16,
 ) -> dict[str, Any]:
     r"""
-    Denoise random side-chain torsions into atom14 coordinates with the Packer.
+    Denoise random side-chain torsions into atom14 coordinates with the LigandMPNNPacker.
 
     Faithful port of the reference LigandMPNN ``sc_utils.pack_side_chains``. Requires the input
     ``features`` to carry ``X`` (backbone N/CA/C/O, shape ``(B, L, 4, 3)``), ``S`` (LigandMPNN
@@ -2280,7 +2460,7 @@ def pack_side_chains(
 
     Args:
         features: Mutable feature dict; updated in place and returned.
-        packer: The Packer model.
+        packer: The LigandMPNNPacker model.
         num_denoising_steps: Number of Von Mises denoising iterations.
         num_samples: Number of Von Mises samples drawn per step (best log-prob kept).
         repack_everything: Repack all side chains if ``True``; otherwise keep fixed ones.
@@ -2294,8 +2474,8 @@ def pack_side_chains(
         ValueError: If ``num_denoising_steps`` is less than 1.
 
     Examples:
-        >>> from ofoldx.models.ligandmpnn import Packer, pack_side_chains  # doctest: +SKIP
-        >>> packed = pack_side_chains(features, Packer())  # doctest: +SKIP
+        >>> from ofoldx.models.ligandmpnn import LigandMPNNPacker, pack_side_chains  # doctest: +SKIP
+        >>> packed = pack_side_chains(features, LigandMPNNPacker())  # doctest: +SKIP
     """
 
     from .processor import frames_and_literature_positions_to_atom14_pos, torsion_angles_to_frames
@@ -2426,7 +2606,7 @@ def _make_torsion_features(features: Mapping[str, Any], *, repack_everything: bo
 
 
 def _rbf_bounds(distances: Tensor, num_bins: int, lower_bound: float, upper_bound: float) -> Tensor:
-    r"""Radial basis expansion with explicit bounds (Packer uses [0, 20] for context features)."""
+    r"""Radial basis expansion with explicit bounds (LigandMPNNPacker uses [0, 20] for context features)."""
 
     centers = torch.linspace(lower_bound, upper_bound, num_bins, device=distances.device, dtype=distances.dtype)
     centers = centers.view(*((1,) * distances.ndim), num_bins)

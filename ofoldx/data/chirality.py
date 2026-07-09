@@ -5,7 +5,7 @@ Compares the chirality of a ligand -- built from its experimental coordinates an
 graph -- against the reference molecule's chiral centers, flagging inversions such as a D-sugar
 predicted as an L-sugar. Faithful port of upstream AlphaFold3 ``model/scoring/chirality.py``
 (``_find_chiral_centres``, ``_chiral_match``, ``compare_chirality``); it reuses the RDKit CCD Mol
-builder in [`rdkit_ccd`][ofoldx.data.rdkit_ccd] for reference molecules. RDKit is a declared dependency, so
+builder in [`ccd`][ofoldx.data.ccd] for reference molecules. RDKit is a declared dependency, so
 this module imports it at load; it operates on the flat [`Structure`][ofoldx.data.structure.Structure]
 atom list rather than upstream's chain-filtered structure object.
 """
@@ -123,7 +123,7 @@ def mol_from_ligand_coords(reference_mol: Chem.Mol, coords_by_atom_name: Mapping
         Molecule with an assigned 3D conformer, or ``None`` when stereochemistry cannot be assigned.
 
     Examples:
-        >>> from ofoldx.data.rdkit_ccd import mol_from_ccd_block  # doctest: +SKIP
+        >>> from ofoldx.data.ccd import mol_from_ccd_block  # doctest: +SKIP
         >>> reference = mol_from_ccd_block(ccd_blocks["NAG"])  # doctest: +SKIP
         >>> coords = {"C1": [0.0, 0.0, 0.0], "C2": [1.5, 0.0, 0.0]}  # doctest: +SKIP
         >>> mol_from_ligand_coords(reference, coords)  # doctest: +SKIP
@@ -165,7 +165,7 @@ def compare_chirality(
     Only single-residue ligands with an available reference molecule are compared; ligands that span
     multiple residues, have no reference, or whose geometry is degenerate are skipped (a warning is
     logged). Reference molecules must carry per-atom ``atom_name`` properties matching the CCD naming
-    (see [`mol_from_ccd_block`][ofoldx.data.rdkit_ccd.mol_from_ccd_block]).
+    (see [`mol_from_ccd_block`][ofoldx.data.ccd.mol_from_ccd_block]).
 
     Args:
         structure: Parsed structure whose ligand residues should be checked.

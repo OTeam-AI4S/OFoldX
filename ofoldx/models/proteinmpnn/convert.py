@@ -167,14 +167,14 @@ def convert_proteinmpnn_checkpoint(
         >>> convert_proteinmpnn_checkpoint("proteinmpnn_v_48_020.pt", "proteinmpnn")  # doctest: +SKIP
     """
 
-    from .model import ProteinMPNNDesignGenerator
+    from .model import ProteinMPNNDesigner
 
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
     checkpoint = load_proteinmpnn_checkpoint(checkpoint_path)
     config = proteinmpnn_config_from_checkpoint(checkpoint)
     config.checkpoint_variant = checkpoint_path.stem if checkpoint_variant is None else checkpoint_variant
-    model = ProteinMPNNDesignGenerator(config)
+    model = ProteinMPNNDesigner(config)
     if dtype is not None:
         model.to(dtype=dtype)
     state_dict = _cast_floating_tensors(convert_proteinmpnn_state_dict(checkpoint), dtype)

@@ -47,7 +47,6 @@ dependencies = [
   "danling>=0.4.1",
   "huggingface-hub",
   "numpy",
-  "oops",
   "rdkit",
   "safetensors",
   "scipy",
@@ -57,9 +56,13 @@ dependencies = [
 urls.homepage = "https://github.com/OTeam-AI4S/OFoldX"
 urls.issues = "https://github.com/OTeam-AI4S/OFoldX/issues"
 urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
-scripts.ofoldx-evaluate = "ofoldx.api.run:evaluate"
-scripts.ofoldx-infer = "ofoldx.api.run:infer"
-scripts.ofoldx-train = "ofoldx.api.run:train"
+scripts.oevaluate = "ofoldx.api.run:evaluate"
+scripts.ofoldx = "ofoldx.api.cli:main"
+scripts.oinfer = "ofoldx.api.run:infer"
+scripts.otrain = "ofoldx.api.run:train"
+ptional-dependencies.oops = [
+  "ooperators",
+]
 
 [tool.setuptools]
 packages.find.include = [ "ofoldx*" ]

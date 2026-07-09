@@ -11,14 +11,14 @@ eval (full reverse-diffusion sampling) branching; generic neural-network blocks 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import ClassVar, Literal, cast
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...modules.atom import AtomToTokenEncoder, LocalAtomGeometry, TokenToAtomBroadcast
+from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler, EdmScheduler
 from ...modules.embedding import (
@@ -31,8 +31,9 @@ from ...modules.embedding import (
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
+from ...modules.representation import Pair, Single
 from ...modules.trunk import MsaTrunk, PairformerStack
-from ..contract import BaseInput, StructurePredictionOutput
+from ..contract import BaseInput, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
 from ..registry import MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import AlphaFold3Config
@@ -64,6 +65,10 @@ class AlphaFold3Model(ModelMixin):
     """
 
     config_class = AlphaFold3Config
+    #: Typed input this model's ``forward`` consumes; enables the keyword-tensor ``model(**inputs)`` call path.
+    #: Bound to [`AlphaFold3Input`][ofoldx.models.alphafold3.AlphaFold3Input] at the end of this module, where
+    #: that class is defined.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: AlphaFold3Config) -> None:
         super().__init__(config)
@@ -245,17 +250,73 @@ class AlphaFold3Model(ModelMixin):
         generator: torch.Generator | None = None,
     ) -> StructurePredictionOutput:
         r"""
-        Run the model on typed input.
+        Run the training path: single-step diffusion denoising plus a no-grad confidence mini-rollout.
 
-        In training mode the diffusion module is trained with a single denoising step on
-        noised ground truth (grad), and a separate no-grad mini-rollout produces the
-        coords the confidence head scores. In eval/inference mode the full multi-step
-        EDM sampler produces the predicted coords.
+        ``forward`` is the *training* path. The diffusion module is trained with a single denoising step on
+        noised ground truth (grad), and a separate no-grad mini-rollout produces the coords the confidence
+        head scores. Inference (the full multi-step EDM reverse-diffusion sampler) lives in the
+        [`fold`][ofoldx.models.alphafold3.AlphaFold3Model.fold] capability verb; for backward compatibility
+        an eval-mode call delegates to ``fold`` so ``model(batch)`` keeps sampling when not training.
+
+        Args:
+            batch: Typed model input; training requires ``batch.target_positions``.
+            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            num_samples: Number of reverse-diffusion samples to draw when delegating to ``fold`` in eval mode.
+            num_sampling_steps: Optional EDM sampling-step count for the eval-mode ``fold`` delegation.
+            generator: Optional PyTorch random generator for diffusion noise.
+
+        Returns:
+            Structure-prediction output. In training mode it carries ``denoised_coords``,
+            ``augmented_target``, and ``noise_level`` for the diffusion loss alongside the distogram and
+            confidence logits.
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> processor = AutoProcessor.from_pretrained("oteam/alphafold3")  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("oteam/alphafold3").train()  # doctest: +SKIP
+            >>> output = model(processor("complex.cif"))  # doctest: +SKIP
+            >>> output.denoised_coords.shape  # doctest: +SKIP
+            torch.Size([1, 1, 512, 3])
+        """
+
+        if not self.training:
+            return self.fold(
+                batch,
+                recycling_steps=recycling_steps,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                generator=generator,
+            )
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if recycling_steps < 1:
+            raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
+        representations = self._run_trunk(batch, recycling_steps=recycling_steps)
+        return self._forward_train(batch, representations=representations, generator=generator)
+
+    def fold(
+        self,
+        batch: AlphaFold3Input,
+        *,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructurePredictionOutput:
+        r"""
+        Predict a structure -- the inference capability verb for AlphaFold 3 structure prediction.
+
+        Runs the recycled trunk, then the full multi-step EDM reverse-diffusion sampler to produce predicted
+        atom coords, and scores them with the confidence head. This is the distinct *inference* path (the
+        training path is [`forward`][ofoldx.models.alphafold3.AlphaFold3Model.forward]); the task facade wraps
+        the returned raw [`StructurePredictionOutput`][ofoldx.models.StructurePredictionOutput] into a result.
 
         Args:
             batch: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of reverse-diffusion samples to draw in eval/inference mode.
+            num_samples: Number of reverse-diffusion samples to draw.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             generator: Optional PyTorch random generator for diffusion noise.
 
@@ -270,7 +331,7 @@ class AlphaFold3Model(ModelMixin):
             >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
             >>> processor = AutoProcessor.from_pretrained("oteam/alphafold3")  # doctest: +SKIP
             >>> model = AutoModel.from_pretrained("oteam/alphafold3").eval()  # doctest: +SKIP
-            >>> output = model(processor("complex.cif"), num_samples=5)  # doctest: +SKIP
+            >>> output = model.fold(processor("complex.cif"), num_samples=5)  # doctest: +SKIP
             >>> output.pred_coords.shape  # doctest: +SKIP
             torch.Size([1, 5, 512, 3])
         """
@@ -279,10 +340,6 @@ class AlphaFold3Model(ModelMixin):
         if recycling_steps < 1:
             raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
         representations = self._run_trunk(batch, recycling_steps=recycling_steps)
-
-        if self.training:
-            return self._forward_train(batch, representations=representations, generator=generator)
-
         pred_coords = self._predict_coords(
             batch,
             representations=representations,
@@ -355,8 +412,8 @@ class AlphaFold3Model(ModelMixin):
         """
 
         confidence = self.confidence_head(
-            representations.single,
-            pair=representations.pair,
+            representations.single.tensor,
+            pair=representations.pair.tensor,
             token_embedding=representations.token_embedding,
             pred_coords=confidence_coords,
             token_to_rep_atom=batch.token_to_rep_atom,
@@ -365,7 +422,7 @@ class AlphaFold3Model(ModelMixin):
         )
         return StructurePredictionOutput(
             pred_coords=confidence_coords,
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=self.distogram_head(representations.pair.tensor),
             plddt_logits=confidence.plddt_logits,
             pae_logits=confidence.pae_logits,
             pde_logits=confidence.pde_logits,
@@ -452,7 +509,7 @@ class AlphaFold3Model(ModelMixin):
 
         if batch.target_positions is None:
             raise ValueError("diffusion training requires batch.target_positions")
-        target = batch.target_positions.to(dtype=representations.single.dtype)
+        target = batch.target_positions.to(dtype=representations.single.tensor.dtype)
         atom_mask = batch.atom_mask.to(device=target.device)
         # Center/augment the diffusion target over RESOLVED atoms only — materialized missing atoms
         # have no true coordinate. Equals atom_mask when nothing was materialized.
@@ -486,8 +543,8 @@ class AlphaFold3Model(ModelMixin):
             reference_charges=batch.reference_charges,
             atom_mask=atom_mask,
             token_embedding=representations.token_embedding,
-            single=representations.single,
-            pair=representations.pair,
+            single=representations.single.tensor,
+            pair=representations.pair.tensor,
             relative_features=representations.relative_features,
             local_geometry=local_geometry,
         )
@@ -549,8 +606,8 @@ class AlphaFold3Model(ModelMixin):
 
         return AlphaFold3Representations(
             token_embedding=token_embedding,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             relative_features=relative_features,
             pair_mask=pair_mask,
         )
@@ -683,8 +740,8 @@ class AlphaFold3Model(ModelMixin):
                 reference_charges=batch.reference_charges,
                 atom_mask=batch.atom_mask,
                 token_embedding=representations.token_embedding,
-                single=representations.single,
-                pair=representations.pair,
+                single=representations.single.tensor,
+                pair=representations.pair.tensor,
                 relative_features=representations.relative_features,
                 local_geometry=local_geometry,
             ),
@@ -1294,17 +1351,22 @@ class AlphaFold3Representations:
     r"""
     Intermediate AlphaFold 3 representations produced by the trunk.
 
+    The ``single`` and ``pair`` fields are typed [`Single`][ofoldx.modules.representation.Single] /
+    [`Pair`][ofoldx.modules.representation.Pair] carriers at this boundary; unwrap ``.tensor`` before
+    feeding the denoiser or confidence head. The carriers are pytree-registered, so they cross a
+    ``torch.compile`` graph without a break.
+
     Attributes:
         token_embedding: Token embedding before trunk updates.
-        single: Final token single representation.
-        pair: Final token pair representation.
+        single: Final token single representation, carried as [`Single`][ofoldx.modules.representation.Single].
+        pair: Final token pair representation, carried as [`Pair`][ofoldx.modules.representation.Pair].
         relative_features: Relative-position feature bundle used by denoising.
         pair_mask: Boolean token-pair validity mask.
     """
 
     token_embedding: torch.Tensor
-    single: torch.Tensor
-    pair: torch.Tensor
+    single: Single
+    pair: Pair
     relative_features: RelativePositionBuckets
     pair_mask: torch.Tensor
 
@@ -1318,8 +1380,8 @@ class AlphaFold3Representations:
 
         return AlphaFold3Representations(
             token_embedding=self.token_embedding.detach(),
-            single=self.single.detach(),
-            pair=self.pair.detach(),
+            single=Single(self.single.tensor.detach()),
+            pair=Pair(self.pair.tensor.detach()),
             relative_features=self.relative_features.detach(),
             pair_mask=self.pair_mask,
         )
@@ -1343,6 +1405,7 @@ class AlphaFold3RecyclingState:
     pair_mask: torch.Tensor
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class AlphaFold3Input(BaseInput):
     r"""
@@ -1407,6 +1470,11 @@ class AlphaFold3Input(BaseInput):
     msa_features: Tensor | None = None
     msa_mask: Tensor | None = None
     template_features: TemplateFeatures | None = None
+
+
+# Bind the model's typed input now that AlphaFold3Input is defined (it is declared after the model class),
+# enabling the ergonomic keyword-tensor call path ``AlphaFold3Model(**input_tensors)`` via ModelMixin.__call__.
+AlphaFold3Model.input_class = AlphaFold3Input
 
 
 @dataclass(slots=True)

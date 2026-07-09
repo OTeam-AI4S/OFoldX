@@ -8,7 +8,7 @@ from torch import nn
 
 from ofoldx.data import AtomRecord, ResidueKey, Structure
 from ofoldx.models import BaseInput
-from ofoldx.models.proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesignGenerator, ProteinMPNNProcessor
+from ofoldx.models.proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesigner, ProteinMPNNProcessor
 from ofoldx.pipelines.base import Pipeline, is_structure_input
 from ofoldx.pipelines.design import DesignPipeline
 
@@ -59,7 +59,7 @@ def test_pipeline_moves_base_input_to_model_device() -> None:
 
 
 def test_pipeline_from_pretrained_runs_bare_proteinmpnn_model_with_default_processor(tmp_path) -> None:
-    model = ProteinMPNNDesignGenerator(
+    model = ProteinMPNNDesigner(
         ProteinMPNNConfig(
             {
                 "hidden_size": 16,

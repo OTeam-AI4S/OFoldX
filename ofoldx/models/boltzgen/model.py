@@ -8,11 +8,10 @@ import math
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...modules.atom.encoders import PackedAtomAttention
@@ -20,6 +19,7 @@ from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
 from ...modules.attention import PairBiasedSelfAttention
+from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import condition_pair, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.embedding.fourier import FrozenFourierEmbedding
@@ -27,25 +27,32 @@ from ...modules.embedding.position import RelativePositionEmbedder, generate_rel
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import DistogramHead
+from ...modules.representation import Pair, Single
 from ...modules.transformer import ConditionedTransformer
 from ...modules.transition import RowwiseDropout, Transition
 from ...modules.trunk.msa import MsaModule, MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateBlock
 from ...modules.trunk.pairformer import PairformerStack
-from ..contract import BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ..contract import (
+    BaseInput,
+    SequenceDesignCandidate,
+    StructureDesignCandidate,
+    StructurePredictionOutput,
+    register_pytree_dataclass,
+)
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS
+from ..registry import DESIGN_MODELS, MODELS
 from .config import BoltzGenAffinityConfig, BoltzGenConfig, BoltzGenIFoldConfig
 
 
 @MODELS.register("boltzgen")
-@DESIGN_GENERATOR_MODELS.register("boltzgen")
+@DESIGN_MODELS.register("boltzgen")
 @MODELS.register("boltzgen_diverse")
-@DESIGN_GENERATOR_MODELS.register("boltzgen_diverse")
+@DESIGN_MODELS.register("boltzgen_diverse")
 @MODELS.register("boltzgen_adherence")
-@DESIGN_GENERATOR_MODELS.register("boltzgen_adherence")
+@DESIGN_MODELS.register("boltzgen_adherence")
 @MODELS.register("boltzgen_structuretrained_small")
-@DESIGN_GENERATOR_MODELS.register("boltzgen_structuretrained_small")
-class BoltzGenDesignGenerator(ModelMixin):
+@DESIGN_MODELS.register("boltzgen_structuretrained_small")
+class BoltzGenDesigner(ModelMixin):
     r"""
     BoltzGen structure-generating design model (``boltzgen1_diverse`` / ``boltzgen1_adherence``).
 
@@ -67,6 +74,9 @@ class BoltzGenDesignGenerator(ModelMixin):
     """
 
     config_class = BoltzGenConfig
+
+    #: Typed input this model's ``forward`` consumes (built by the keyword-tensor call path).
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(
         self,
@@ -322,14 +332,96 @@ class BoltzGenDesignGenerator(ModelMixin):
         batch: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructureDesignCandidate:
+        r"""
+        Training path: one EDM denoising step of the structure diffusion module.
+
+        Mirrors the upstream BoltzGen training diffusion step (``AtomDiffusion.forward``): run the trunk,
+        center-and-augment the experimental target coords, corrupt them at a log-normal-sampled noise level, and
+        denoise once with the EDM-preconditioned score network. The returned candidate carries the single-step
+        training tensors (``denoised_coords``, ``augmented_target``, ``noise_level``) from which the EDM-weighted
+        denoising loss is computed; the DISTINCT inference sampler is
+        [`design`][ofoldx.models.boltzgen.model.BoltzGenDesigner.design]. This is the compile-friendly grad path
+        (no ``.item()``, no data-dependent Python control flow).
+
+        Args:
+            batch: Typed model input. ``target_positions`` supplies the training target; ``coords`` is the
+                fallback when it is absent.
+            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            generator: Optional PyTorch random generator for the augmentation, noise level, and Gaussian noise.
+
+        Returns:
+            Structure-design candidate whose ``structure_prediction`` holds the single-step training tensors.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
+            >>> loss_inputs = model(AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif"))  # doctest: +SKIP
+        """
+
+        steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        representations = self.run_trunk(batch, recycling_steps=steps)
+        conditioning = self.diffusion_conditioning(
+            representations.single.tensor,
+            representations.pair.tensor,
+            representations.relative_position_encoding,
+            atom_features=batch.atom_features,
+            reference_positions=batch.reference_positions,
+            atom_mask=batch.atom_mask,
+            reference_space_id=batch.reference_space_id,
+            atom_to_token=batch.atom_to_token,
+        )
+        target = batch.coords if batch.target_positions is None else batch.target_positions
+        atom_mask = batch.atom_mask
+        augmented_target = _center_random_augmentation(target, atom_mask, generator=generator)
+        sigmas = self.structure_module.noise_distribution(
+            atom_mask.shape[0], device=augmented_target.device, dtype=augmented_target.dtype, generator=generator
+        )
+        noise = torch.randn(
+            augmented_target.shape, device=augmented_target.device, dtype=augmented_target.dtype, generator=generator
+        )
+        noised_coords = augmented_target + sigmas.reshape(-1, 1, 1) * noise
+        denoised_coords = self.structure_module.preconditioned_network_forward(
+            noised_coords,
+            sigmas,
+            multiplicity=1,
+            atom_mask=atom_mask,
+            single_inputs=representations.single_inputs,
+            single_trunk=representations.single.tensor,
+            conditioning=conditioning,
+            atom_to_token=batch.atom_to_token,
+            token_mask=batch.token_mask,
+        )
+        structure_prediction = StructurePredictionOutput(
+            pred_coords=denoised_coords,
+            distogram_logits=representations.distogram_logits,
+            bfactor_logits=self.bfactor_head(representations.single.tensor),
+            denoised_coords=denoised_coords,
+            augmented_target=augmented_target,
+            noise_level=sigmas,
+        )
+        return StructureDesignCandidate(structure_prediction=structure_prediction)
+
+    @torch.no_grad()
+    def design(
+        self,
+        batch: BoltzGenInput,
+        *,
+        recycling_steps: int | None = None,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
         step_scale: float | None = None,
         noise_scale: float | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> StructureDesignCandidate:
         r"""
-        Run BoltzGen as a structure-generating design model.
+        Inference path: reverse-diffusion structure generation (the ``design`` capability verb).
+
+        Runs the trunk once, then draws ``num_samples`` reverse-diffusion samples from the EDM sampler and
+        restores the sample axis on every produced tensor. This is the DISTINCT inference path; the training step
+        is [`forward`][ofoldx.models.boltzgen.model.BoltzGenDesigner.forward]. Returns the raw typed
+        ``StructureDesignCandidate`` (the design facade wraps it into the pipeline result).
 
         Args:
             batch: Typed model input.
@@ -349,13 +441,14 @@ class BoltzGenDesignGenerator(ModelMixin):
         Examples:
             >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
             >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-            >>> output = model(AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif"))  # doctest: +SKIP
+            >>> batch = AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif")  # doctest: +SKIP
+            >>> output = model.design(batch)  # doctest: +SKIP
         """
 
         if num_samples < 1:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        output = self.predict(
+        output = self._generate(
             batch,
             recycling_steps=steps,
             num_sampling_steps=num_sampling_steps,
@@ -376,53 +469,9 @@ class BoltzGenDesignGenerator(ModelMixin):
             pde_logits=None if output.pde_logits is None else confidence_axis(output.pde_logits),
             resolved_logits=None if output.resolved_logits is None else confidence_axis(output.resolved_logits),
         )
-        return DesignGeneratorOutput(structure_prediction=structure_prediction)
+        return StructureDesignCandidate(structure_prediction=structure_prediction)
 
-    @torch.no_grad()
-    def generate(
-        self,
-        batch: BoltzGenInput,
-        *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        generator: torch.Generator | None = None,
-        step_scale: float | None = None,
-        noise_scale: float | None = None,
-    ) -> DesignGeneratorOutput:
-        r"""
-        Generate structure-design output without tracking gradients (a ``torch.no_grad`` wrapper around ``forward``).
-
-        Args:
-            batch: Typed model input.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of reverse-diffusion samples to draw.
-            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
-            generator: Optional PyTorch random generator for diffusion noise.
-            step_scale: Optional per-call sampler step-scale override.
-            noise_scale: Optional per-call sampler noise-scale override.
-
-        Returns:
-            Design-generator output with ``structure_prediction`` populated.
-
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-            >>> batch = AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif")  # doctest: +SKIP
-            >>> output = model.generate(batch)  # doctest: +SKIP
-        """
-
-        return self.forward(
-            batch,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            generator=generator,
-            step_scale=step_scale,
-            noise_scale=noise_scale,
-        )
-
-    def predict(
+    def _generate(
         self,
         batch: BoltzGenInput,
         *,
@@ -435,6 +484,8 @@ class BoltzGenDesignGenerator(ModelMixin):
     ) -> BoltzGenStructureOutput:
         r"""
         Full structure generation: trunk -> diffusion-sampled coords -> distogram / bfactor logits.
+
+        The internal reverse-diffusion body backing the ``design`` inference verb.
 
         Args:
             batch: Typed model input.
@@ -456,8 +507,8 @@ class BoltzGenDesignGenerator(ModelMixin):
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         representations = self.run_trunk(batch, recycling_steps=recycling_steps)
         conditioning = self.diffusion_conditioning(
-            representations.single,
-            representations.pair,
+            representations.single.tensor,
+            representations.pair.tensor,
             representations.relative_position_encoding,
             atom_features=batch.atom_features,
             reference_positions=batch.reference_positions,
@@ -473,7 +524,7 @@ class BoltzGenDesignGenerator(ModelMixin):
             step_scale=step_scale,
             noise_scale=noise_scale,
             single_inputs=representations.single_inputs,
-            single_trunk=representations.single,
+            single_trunk=representations.single.tensor,
             conditioning=conditioning,
             atom_to_token=batch.atom_to_token,
             token_mask=batch.token_mask,
@@ -484,7 +535,7 @@ class BoltzGenDesignGenerator(ModelMixin):
         return BoltzGenStructureOutput(
             pred_coords=pred_coords,
             distogram_logits=representations.distogram_logits,
-            bfactor_logits=self.bfactor_head(representations.single),
+            bfactor_logits=self.bfactor_head(representations.single.tensor),
             plddt_logits=confidence.get("plddt_logits"),
             pae_logits=confidence.get("pae_logits"),
             pde_logits=confidence.get("pde_logits"),
@@ -524,8 +575,8 @@ class BoltzGenDesignGenerator(ModelMixin):
             raise RuntimeError("confidence head is disabled; set use_confidence_head=True to enable scoring")
         return self.confidence_head(
             representations.single_inputs,
-            representations.single,
-            representations.pair,
+            representations.single.tensor,
+            representations.pair.tensor,
             pred_coords,
             residue_index=batch.residue_index,
             chain_index=batch.chain_index,
@@ -586,7 +637,7 @@ class BoltzGenDesignGenerator(ModelMixin):
             receptor_mask = batch.molecule_type == 0
         head_kwargs = {
             "single_inputs": representations.single_inputs,
-            "pair": representations.pair,
+            "pair": representations.pair.tensor,
             "pred_coords": pred_coords,
             "token_to_rep_atom": batch.token_to_rep_atom,
             "token_mask": batch.token_mask,
@@ -737,16 +788,16 @@ class BoltzGenDesignGenerator(ModelMixin):
 
         return BoltzGenRepresentations(
             single_inputs=single_inputs,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             relative_position_encoding=relative_position_encoding,
             distogram_logits=self.distogram_head(pair),
         )
 
 
 @MODELS.register("boltzgen_ifold")
-@DESIGN_GENERATOR_MODELS.register("boltzgen_ifold")
-class BoltzGenIFoldGenerator(ModelMixin):
+@DESIGN_MODELS.register("boltzgen_ifold")
+class BoltzGenInverseFoldDesigner(ModelMixin):
     r"""
     BoltzGen inverse-folding model for structure-conditioned sequence design.
 
@@ -760,10 +811,12 @@ class BoltzGenIFoldGenerator(ModelMixin):
         >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
         >>> model = AutoModel.from_pretrained("oteam/boltzgen-inversefolding")  # doctest: +SKIP
         >>> processor = AutoProcessor.from_pretrained("oteam/boltzgen-inversefolding")  # doctest: +SKIP
-        >>> output = model.generate(processor("bb.cif"))  # doctest: +SKIP
+        >>> output = model.design(processor("bb.cif"))  # doctest: +SKIP
     """
 
     config_class = BoltzGenIFoldConfig
+    #: Typed input this model's ``forward`` consumes (built by the keyword-tensor call path).
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: BoltzGenIFoldConfig | None = None) -> None:
         config = config or BoltzGenIFoldConfig()
@@ -814,7 +867,7 @@ class BoltzGenIFoldGenerator(ModelMixin):
         self.input_embedder.reset_parameters()
         _init_boltzgen_final_weights(self)
 
-    def forward(self, batch: BoltzGenInput) -> DesignGeneratorOutput:
+    def forward(self, batch: BoltzGenInput) -> SequenceDesignCandidate:
         r"""
         Return per-token residue-type logits for structure-conditioned sequence design.
 
@@ -840,18 +893,18 @@ class BoltzGenIFoldGenerator(ModelMixin):
             chain_type=batch.chain_type,
         )
         edge_index, valid_mask, node, edge = self.encoder(batch, single_inputs=single_inputs)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=self.decoder(node, edge, edge_index, valid_mask, batch),
         )
 
     @torch.no_grad()
-    def generate(
+    def design(
         self,
         batch: BoltzGenInput,
         *,
         temperature: float | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Autoregressively design residue tokens from the conditioned structure.
 
@@ -888,7 +941,7 @@ class BoltzGenIFoldGenerator(ModelMixin):
             temperature=temperature,
             generator=generator,
         )
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=output.logits,
             sequence_tokens=output.residue_type.argmax(dim=-1),
         )
@@ -2335,6 +2388,8 @@ class AtomDiffusion(nn.Module):
         time_dilation: float = 2.667,
         time_dilation_start: float = 0.6,
         time_dilation_end: float = 0.8,
+        p_mean: float = -1.2,
+        p_std: float = 1.5,
     ) -> None:
         super().__init__()
         self.score_model = score_model
@@ -2347,6 +2402,8 @@ class AtomDiffusion(nn.Module):
         self.min_churn = min_churn
         self.noise_scale = noise_scale
         self.step_scale = step_scale
+        self.p_mean = p_mean
+        self.p_std = p_std
         self.num_sampling_steps = num_sampling_steps
         self.alignment_reverse_diff = alignment_reverse_diff
         self.sampling_schedule = sampling_schedule
@@ -2381,6 +2438,47 @@ class AtomDiffusion(nn.Module):
             **conditioning,
         )
         return self.preconditioner.c_skip(padded) * noised_coords + self.preconditioner.c_out(padded) * update
+
+    def noise_distribution(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        r"""
+        Draw per-sample EDM training noise levels from the ``sigma_data``-scaled log-normal.
+
+        Mirrors the upstream BoltzGen ``AtomDiffusion.noise_distribution``:
+        ``sigma = sigma_data * exp(P_mean + P_std * z)`` with ``z ~ N(0, 1)``. Returned as a tensor (never
+        ``.item()``-ed) so the value feeds tensor math end to end.
+
+        Args:
+            batch_size: Number of noise levels to draw.
+            device: Device for the returned tensor.
+            dtype: Floating dtype for the returned tensor.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            Noise levels ``(batch_size,)``.
+        """
+
+        noise = torch.randn((batch_size,), device=device, dtype=dtype, generator=generator)
+        return self.sigma_data * (self.p_mean + self.p_std * noise).exp()
+
+    def loss_weight(self, sigma: Tensor) -> Tensor:
+        r"""
+        EDM denoising-loss weighting ``(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2`` for each noise level.
+
+        Args:
+            sigma: Per-sample noise levels.
+
+        Returns:
+            Per-sample loss weights of the same shape as ``sigma``.
+        """
+
+        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
 
     def sample_schedule_af3(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
         r"""
@@ -2535,6 +2633,37 @@ def _dilate_time(ts: Tensor, *, start: float, end: float, dilation: float) -> Te
         lower_third,
         torch.where(ts < lower_prime + x_prime, middle_third, upper_third),
     )
+
+
+def _center_random_augmentation(
+    coords: Tensor, atom_mask: Tensor, *, s_trans: float = 1.0, generator: torch.Generator | None = None
+) -> Tensor:
+    r"""
+    Center coords on the masked centroid and apply a Haar-uniform rotation plus Gaussian translation.
+
+    Mirrors the upstream BoltzGen training augmentation (``center_random_augmentation``, Algorithm 19): the
+    coordinate-frame augmentation applied to the diffusion target before noising. Fully tensor-valued (no
+    ``.item()``) so it stays inside the compiled training graph.
+
+    Args:
+        coords: Atom coords ``(B, N_atom, 3)``.
+        atom_mask: Boolean atom validity mask ``(B, N_atom)``.
+        s_trans: Standard deviation of the random per-structure translation.
+        generator: Optional PyTorch random generator.
+
+    Returns:
+        Augmented coords ``(B, N_atom, 3)``.
+    """
+
+    mask = atom_mask.unsqueeze(-1).to(coords.dtype)
+    centroid = (coords * mask).sum(dim=-2, keepdim=True) / mask.sum(dim=-2, keepdim=True).clamp(min=1.0)
+    centered = coords - centroid
+    rotation = uniform_random_rotation(coords.shape[0], device=coords.device, dtype=coords.dtype, generator=generator)
+    rotated = torch.einsum("bmd,bds->bms", centered, rotation)
+    translation = (
+        torch.randn(coords.shape[0], 1, 3, device=coords.device, dtype=coords.dtype, generator=generator) * s_trans
+    )
+    return rotated + translation
 
 
 class BFactorHead(nn.Module):
@@ -4349,26 +4478,33 @@ def _sample_axis(coords: Tensor, *, batch_size: int, num_samples: int) -> Tensor
     )
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class BoltzGenRepresentations:
     r"""
     Trunk outputs consumed by BoltzGen diffusion and heads.
 
+    The ``single``/``pair`` trunk states are held in the typed
+    [`Single`][ofoldx.modules.representation.Single] / [`Pair`][ofoldx.modules.representation.Pair] carriers at
+    this boundary (the same way [`Coords`][ofoldx.modules.representation.Coords] wraps predicted coordinates);
+    unwrap ``.tensor`` before feeding the denoiser or eager tensor math.
+
     Attributes:
         single_inputs: Initial token single representations.
-        single: Final token single representations.
-        pair: Final token pair representations.
+        single: Final token single representation carrier.
+        pair: Final token pair representation carrier.
         relative_position_encoding: Relative-position pair features.
         distogram_logits: Trunk distogram logits.
     """
 
     single_inputs: Tensor
-    single: Tensor
-    pair: Tensor
+    single: Single
+    pair: Pair
     relative_position_encoding: Tensor
     distogram_logits: Tensor
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class BoltzGenInput(BaseInput):
     r"""
@@ -4528,3 +4664,9 @@ class InverseFoldingSample:
     logits: Tensor
     residue_type: Tensor
     valid_mask: Tensor
+
+
+# Bind the typed input for the keyword-tensor call path (``model(**inputs)``); assigned here because
+# ``BoltzGenInput`` is defined after the model classes.
+BoltzGenDesigner.input_class = BoltzGenInput
+BoltzGenInverseFoldDesigner.input_class = BoltzGenInput

@@ -259,7 +259,7 @@ def convert_rfdiffusion_checkpoint(
 
     Writes ``config.json``, ``model.safetensors``, and a ``conversion_report.json`` describing the run. When
     ``strict_load_check`` is set, the freshly-written artifact is strict-loaded through
-    [`RfDiffusionDesignGenerator`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignGenerator] to prove the
+    [`RfDiffusionDesigner`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner] to prove the
     key space matches the model before returning.
 
     Args:
@@ -390,9 +390,9 @@ def _artifact_manifest() -> Config:
 
     return build_artifact_manifest(
         kind="model",
-        entrypoint="ofoldx.models.rfdiffusion.model.RfDiffusionDesignGenerator",
+        entrypoint="ofoldx.models.rfdiffusion.model.RfDiffusionDesigner",
         architecture="rfdiffusion",
-        task="design_generation",
+        task="design",
         files={"config": ModelMixin.CONFIG_NAME},
         weights={"default": ModelMixin.WEIGHTS_NAME},
     )
@@ -409,10 +409,10 @@ def _strict_load_check(output_dir: Path) -> dict[str, Any]:
         A dict with ``strict``, ``ok``, and ``error`` describing the outcome.
     """
 
-    from .model import RfDiffusionDesignGenerator
+    from .model import RfDiffusionDesigner
 
     try:
-        RfDiffusionDesignGenerator.from_pretrained(output_dir, strict=True)
+        RfDiffusionDesigner.from_pretrained(output_dir, strict=True)
     except Exception as error:
         return {"strict": True, "ok": False, "error": f"{type(error).__name__}: {error}"}
     return {"strict": True, "ok": True, "error": None}

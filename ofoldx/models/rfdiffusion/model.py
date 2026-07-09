@@ -16,19 +16,20 @@ from collections import namedtuple
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from oops import se3_basis, segment_softmax_csr, segment_sum_csr, weighted_tensor_product
 from opt_einsum import contract as einsum
 from scipy.spatial.transform import Rotation
 from torch import Tensor, nn
 
-from ..contract import BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ...modules.backend import oops_kernel
+from ...modules.representation import Pair, Single
+from ..contract import AllAtomDesignCandidate, BaseInput, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS
+from ..registry import DESIGN_MODELS, MODELS
 from .chemical import (
     AA3_TO_1,
     ATOM14_NAMES,
@@ -40,10 +41,17 @@ from .chemical import (
 )
 from .config import RfDiffusionConfig
 
+# SE(3)-equivariant kernels only OOps provides (no eager reference yet); binding them through
+# oops_kernel keeps ``import ofoldx`` working without OOps and defers the error to actual rfdiffusion use.
+se3_basis = oops_kernel("se3_basis")
+segment_softmax_csr = oops_kernel("segment_softmax_csr")
+segment_sum_csr = oops_kernel("segment_sum_csr")
+weighted_tensor_product = oops_kernel("weighted_tensor_product")
+
 
 @MODELS.register("rfdiffusion")
-@DESIGN_GENERATOR_MODELS.register("rfdiffusion")
-class RfDiffusionDesignGenerator(ModelMixin):
+@DESIGN_MODELS.register("rfdiffusion")
+class RfDiffusionDesigner(ModelMixin):
     r"""
     Denoising-diffusion model that generates novel protein backbones from a noised structure (RfDiffusion).
 
@@ -67,6 +75,9 @@ class RfDiffusionDesignGenerator(ModelMixin):
     """
 
     config_class = RfDiffusionConfig
+    # Bound to ``RfDiffusionInput`` at module load (below its definition); enables the keyword-tensor
+    # ``model(**inputs)`` construction path on ``ModelMixin.__call__``.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: RfDiffusionConfig | None = None) -> None:
         config = RfDiffusionConfig() if config is None else config
@@ -107,31 +118,107 @@ class RfDiffusionDesignGenerator(ModelMixin):
         num_sampling_steps: int | None = None,
         diffusion_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> AllAtomDesignCandidate:
         r"""
-        Generate backbone-design candidates by running the diffusion sampler.
+        Run the model on a typed input: the training denoising step or the inference sampler.
 
-        Runs ``num_samples`` independent trajectories and stacks their coords, sequence tokens, and pLDDT
-        scores into a design output. ``recycling_steps`` is accepted for API symmetry with structure
-        predictors but is unused (RfDiffusion has no recycling loop).
+        ``forward`` is the training entry point. In ``training`` mode it runs a single grad-enabled
+        denoising step on a noised structure and returns a candidate whose inner
+        [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] carries the
+        ``denoised_coords`` / ``augmented_target`` / ``noise_level`` a diffusion loss consumes, plus a
+        ready-to-optimize ``loss`` in ``scores``. In eval mode it delegates to the reverse-diffusion sampler,
+        matching the [`design`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.design] verb -- so the
+        positional ``model(batch)`` call keeps producing backbone designs under ``eval()``.
+
+        Args:
+            batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
+            recycling_steps: Unused; accepted for interface compatibility.
+            num_samples: Number of independent design trajectories (eval mode only).
+            num_sampling_steps: Number of denoising steps to run, capped at the diffuser's timestep count.
+            diffusion_steps: Override for the diffuser's total timestep count.
+            generator: Optional RNG for reproducible noising/sampling.
+
+        Returns:
+            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate]: stacked design
+            coords/tokens in eval mode, or the single-step training candidate in training mode.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("oteam/rfdiffusion").eval()  # doctest: +SKIP
+            >>> output = model(processor("target.pdb"), num_samples=2)  # doctest: +SKIP
+        """
+
+        if self.training:
+            return self._forward_train(
+                batch,
+                num_sampling_steps=num_sampling_steps,
+                diffusion_steps=diffusion_steps,
+                generator=generator,
+            )
+        return self._design(
+            batch,
+            recycling_steps=recycling_steps,
+            num_samples=num_samples,
+            num_sampling_steps=num_sampling_steps,
+            diffusion_steps=diffusion_steps,
+            generator=generator,
+        )
+
+    @torch.no_grad()
+    def design(
+        self,
+        batch: RfDiffusionInput,
+        *,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        diffusion_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AllAtomDesignCandidate:
+        r"""
+        Generate backbone-design candidates (the inference capability verb).
+
+        Runs ``num_samples`` independent reverse-diffusion trajectories under [torch.no_grad][] and stacks
+        their coords, sequence tokens, and pLDDT into one candidate. This is the distinct inference path;
+        [`forward`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.forward] is the training path.
+        ``recycling_steps`` is accepted for API symmetry but unused (RfDiffusion has no recycling loop).
 
         Args:
             batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
             recycling_steps: Unused; accepted for interface compatibility.
             num_samples: Number of independent design trajectories to sample.
-            num_sampling_steps: Number of denoising steps to run, capped at the diffuser's timestep count.
+            num_sampling_steps: Number of denoising steps to run.
             diffusion_steps: Override for the diffuser's total timestep count.
             generator: Optional RNG for reproducible sampling.
 
         Returns:
-            A [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] carrying stacked
+            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate] carrying stacked
             ``pred_coords`` and ``sequence_tokens``, optional pLDDT scores, and per-sample metadata.
 
         Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("oteam/rfdiffusion")  # doctest: +SKIP
-            >>> output = model(processor("target.pdb"), num_samples=2)  # doctest: +SKIP
+            >>> output = model.design(batch, num_samples=2)  # doctest: +SKIP
         """
+
+        return self._design(
+            batch,
+            recycling_steps=recycling_steps,
+            num_samples=num_samples,
+            num_sampling_steps=num_sampling_steps,
+            diffusion_steps=diffusion_steps,
+            generator=generator,
+        )
+
+    def _design(
+        self,
+        batch: RfDiffusionInput,
+        *,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        diffusion_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AllAtomDesignCandidate:
+        r"""Run the reverse-diffusion sampler for ``num_samples`` trajectories and assemble the candidate."""
 
         del recycling_steps
         sampler = self._sampler()
@@ -155,7 +242,7 @@ class RfDiffusionDesignGenerator(ModelMixin):
             "num_samples": num_samples,
             "samples": [result.metadata for result in results],
         }
-        return DesignGeneratorOutput(
+        return AllAtomDesignCandidate(
             sequence_tokens=sequence_tokens,
             structure_prediction=StructurePredictionOutput(
                 pred_coords=coords,
@@ -165,50 +252,99 @@ class RfDiffusionDesignGenerator(ModelMixin):
             metadata=metadata,
         )
 
-    @torch.no_grad()
-    def generate(
+    def _forward_train(
         self,
         batch: RfDiffusionInput,
         *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
         num_sampling_steps: int | None = None,
         diffusion_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> AllAtomDesignCandidate:
         r"""
-        Generate design output with gradients disabled.
+        Single grad-enabled denoising step for training.
 
-        Convenience wrapper that calls
-        [`forward`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignGenerator.forward] under
-        [torch.no_grad][], for inference where autograd is unnecessary.
+        RFdiffusion was released inference-only (no upstream training loop), so this is a grad-correct
+        single-step denoiser grounded in the model's real denoise output: the noised structure ``x_t`` and
+        its network features are built with the native sampler featurization under [torch.no_grad][] (data
+        prep, not part of the differentiable graph), then the RoseTTAFold network denoises ``x_t`` with grad
+        enabled. The loss is the mean-squared error between the predicted backbone and the diffusion target
+        ``x_0`` plus an amino-acid cross-entropy term, so gradients reach the trunk, the SE(3) frames, and the
+        readout heads. The network's single/pair activations are wrapped in the typed
+        [`RfDiffusionRepresentations`][ofoldx.models.rfdiffusion.model.RfDiffusionRepresentations] carriers at
+        the boundary and unwrapped before eager tensor math.
 
         Args:
             batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
-            recycling_steps: Unused; accepted for interface compatibility.
-            num_samples: Number of independent design trajectories to sample.
-            num_sampling_steps: Number of denoising steps to run.
+            num_sampling_steps: Timestep to noise/denoise at; capped at the diffuser's timestep count.
             diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible sampling.
+            generator: Optional RNG for reproducible noising.
 
         Returns:
-            The same [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput] that
-            ``forward`` produces.
-
-        Examples:
-            >>> output = model.generate(batch, num_samples=2)  # doctest: +SKIP
+            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate] whose inner
+            [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] carries
+            ``denoised_coords`` / ``augmented_target`` / ``noise_level``, with the scalar ``loss`` (and its
+            detached ``coord_loss`` / ``aa_loss`` parts) in ``scores``.
         """
 
-        return self.forward(
-            batch,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            diffusion_steps=diffusion_steps,
-            generator=generator,
+        sampler = self._sampler()
+        device = sampler.device
+        with torch.no_grad():
+            state = sampler.sample_init(batch, diffusion_steps=diffusion_steps, generator=generator)
+            t = state.t_step_input if num_sampling_steps is None else min(int(num_sampling_steps), state.t_step_input)
+            features = sampler.preprocess(state, state.seq_t, state.noisy_coords, t)
+            pdb_index = features.pdb_index
+            if state.symmetry is not None:
+                pdb_index, state.chain_idx = state.symmetry.res_idx_procesing(res_idx=pdb_index)
+
+        output = self.network(  # type: ignore[misc,operator]
+            features.msa_masked,
+            features.msa_full,
+            features.seq_in,
+            features.noisy_coords_in,
+            pdb_index,
+            template_1d=features.template_1d,
+            template_2d=features.template_2d,
+            template_coords=features.template_coords,
+            alpha_t=features.alpha_t,
+            msa_prev=None,
+            pair_prev=None,
+            state_prev=None,
+            t=torch.tensor(t, device=device),
+            motif_mask=state.diffusion_mask.to(device),
+            cyclic_reses=state.cyclic_reses,
+        )
+        # typed carriers at the trunk boundary; unwrap ``.tensor`` before eager tensor math
+        representations = RfDiffusionRepresentations(single=Single(output[0]), pair=Pair(output[1]))
+        pred_coords_raw, _alpha, _plddt = coerce_network_prediction(output)
+        pred_backbone = normalize_backbone_prediction(pred_coords_raw, state.noisy_coords)  # [1, L, 3, 3]
+
+        target_source = state.clean_coords if state.clean_coords is not None else state.noisy_coords
+        target_backbone = target_source[:, :3].to(pred_backbone).unsqueeze(0)  # [1, L, 3, 3]
+        finite = torch.isfinite(target_backbone)
+        target_backbone = torch.where(finite, target_backbone, pred_backbone.detach())
+        coord_loss = F.mse_loss(pred_backbone, target_backbone)
+
+        aa_logits = output[5]  # [B, L, vocab]
+        seq_target = features.seq_in.argmax(dim=-1).clamp_max(aa_logits.shape[-1] - 1)  # [1, L]
+        aa_loss = F.cross_entropy(aa_logits.transpose(1, 2), seq_target)
+        loss = coord_loss + aa_loss
+
+        structure = StructurePredictionOutput(
+            pred_coords=pred_backbone,
+            distogram_logits=representations.pair.tensor.new_zeros(0),
+            denoised_coords=pred_backbone,
+            augmented_target=target_backbone,
+            noise_level=torch.tensor(float(t), device=device),
+        )
+        return AllAtomDesignCandidate(
+            sequence_logits=aa_logits,
+            sequence_tokens=seq_target.squeeze(0),
+            structure_prediction=structure,
+            scores={"loss": loss, "coord_loss": coord_loss.detach(), "aa_loss": aa_loss.detach()},
+            metadata={"architecture": "rfdiffusion", "mode": "train", "timestep": int(t)},
         )
 
-    def sample(
+    def _sample(
         self,
         batch: RfDiffusionInput,
         *,
@@ -221,8 +357,8 @@ class RfDiffusionDesignGenerator(ModelMixin):
         r"""
         Sample designs and return only the stacked backbone coords.
 
-        Like [`forward`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignGenerator.forward] but returns a
-        bare coord tensor rather than a full output object.
+        Internal helper behind [`design`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.design] for
+        callers that want a bare coord tensor rather than a full candidate object.
 
         Args:
             batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
@@ -234,9 +370,6 @@ class RfDiffusionDesignGenerator(ModelMixin):
 
         Returns:
             Stacked design coords of shape `[num_samples, L, 14, 3]`.
-
-        Examples:
-            >>> coords = model.sample(batch, num_samples=2)  # doctest: +SKIP
         """
 
         del recycling_steps
@@ -554,13 +687,17 @@ class PositionalEncoding2D(nn.Module):
             for batch_index in range(idx.shape[0]):
                 for chain_id in torch.unique(chain_ids[batch_index]):
                     is_cyclic_chain = cyclic_residues[batch_index] & (chain_ids[batch_index] == chain_id)
-                    cycle_length = int(is_cyclic_chain.sum().item())
-                    if cycle_length < 2:
-                        continue
+                    # keep the cycle length a 0-dim tensor so the forward path never calls ``.item()``
+                    cycle_length = is_cyclic_chain.sum()
+                    is_cycle = cycle_length >= 2
                     same_cycle = is_cyclic_chain[:, None] & is_cyclic_chain[None, :]
                     seqsep_slice = seqsep[batch_index]
-                    seqsep_slice[same_cycle & (seqsep_slice > cycle_length // 2)] -= cycle_length
-                    seqsep_slice[same_cycle & (seqsep_slice < -cycle_length // 2)] += cycle_length
+                    half = cycle_length // 2
+                    wrap_hi = is_cycle & same_cycle & (seqsep_slice > half)
+                    wrap_lo = is_cycle & same_cycle & (seqsep_slice < -half)
+                    seqsep_slice = torch.where(wrap_hi, seqsep_slice - cycle_length, seqsep_slice)
+                    seqsep_slice = torch.where(wrap_lo, seqsep_slice + cycle_length, seqsep_slice)
+                    seqsep[batch_index] = seqsep_slice
 
         relpos = torch.bucketize(seqsep, boundaries).long()
         return self.drop(pair + self.emb(relpos))
@@ -2676,10 +2813,12 @@ class AttentionSE3(nn.Module):
         query_heads = query_tensor.reshape(query_tensor.shape[0], self.num_heads, -1)
 
         edge_weights = (key_heads * query_heads[graph.dst]).sum(dim=-1) / np.sqrt(self.key_fiber.num_features)
-        edge_weights = segment_softmax_csr(edge_weights, graph.row_offsets)[..., None, None]
+        edge_weights = cast(Tensor, segment_softmax_csr(edge_weights, graph.row_offsets))[..., None, None]
 
         value_heads = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
-        feat_out = segment_sum_csr(edge_weights * value_heads, graph.row_offsets, num_segments=graph.num_nodes)
+        feat_out = cast(
+            Tensor, segment_sum_csr(edge_weights * value_heads, graph.row_offsets, num_segments=graph.num_nodes)
+        )
         feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])
         return unfuse_features(feat_out, self.value_fiber.degrees)
 
@@ -2874,7 +3013,10 @@ class SE3Transformer(nn.Module):
             The per-degree output node features.
         """
 
-        basis = basis or se3_basis(graph.rel_pos, max_degree=self.max_degree, use_pad_trick=False, fully_fused=False)
+        basis = basis or cast(
+            "dict[str, Tensor]",
+            se3_basis(graph.rel_pos, max_degree=self.max_degree, use_pad_trick=False, fully_fused=False),
+        )
         edge_feats = get_populated_edge_features(graph.rel_pos, edge_feats)
         return self.graph_modules(node_feats, edge_feats, graph=graph, basis=basis)
 
@@ -3137,21 +3279,20 @@ class ExpResolvedNetwork(nn.Module):
 
 def find_breaks(ix: np.ndarray, thresh: int = 35) -> np.ndarray:
     r"""
-        Return the positions where the residue index jumps by more than ``thresh`` (chain breaks).
+    Return the positions where the residue index jumps by more than ``thresh`` (chain breaks).
 
-        Args:
-            ix: 1D residue-index array.
-            thresh: Minimum forward jump that counts as a chain break.
+    Args:
+        ix: 1D residue-index array.
+        thresh: Minimum forward jump that counts as a chain break.
 
-        Returns:
-            A 1D array of break positions (indices into ``ix``).
+    Returns:
+        A 1D array of break positions (indices into ``ix``).
 
-        Examples:
-            >>> import numpy as np
-    from scipy.spatial.transform import Rotation
-            >>> from ofoldx.models.rfdiffusion.model import find_breaks
-            >>> find_breaks(np.array([1, 2, 3, 100, 101])).tolist()
-            [3]
+    Examples:
+        >>> import numpy as np
+        >>> from ofoldx.models.rfdiffusion.model import find_breaks
+        >>> find_breaks(np.array([1, 2, 3, 100, 101])).tolist()
+        [3]
     """
 
     return np.where(np.diff(ix) > thresh)[0] + 1
@@ -3433,6 +3574,30 @@ def make_topk_graph(
     return graph, graph.edge_feats
 
 
+@register_pytree_dataclass
+@dataclass(slots=True)
+class RfDiffusionRepresentations:
+    r"""
+    Trunk representations produced by one RoseTTAFold denoising pass.
+
+    Wraps the network's first-MSA-row (single) and pair activations in the typed
+    [`Single`][ofoldx.modules.representation.Single] and [`Pair`][ofoldx.modules.representation.Pair]
+    carriers at the model boundary, the same way [`Coords`][ofoldx.modules.representation.Coords] is used on
+    [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]. The carriers are
+    pytree-registered, so this dataclass introduces no graph break; unwrap ``.tensor`` before feeding eager
+    tensor math or the denoiser.
+
+    Attributes:
+        single: First-MSA-row activations ``[B, L, msa_size]`` as a
+            [`Single`][ofoldx.modules.representation.Single] carrier.
+        pair: Pair activations ``[B, L, L, pair_size]`` as a [`Pair`][ofoldx.modules.representation.Pair] carrier.
+    """
+
+    single: Single
+    pair: Pair
+
+
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class RfDiffusionInput(BaseInput):
     r"""
@@ -3471,6 +3636,11 @@ class RfDiffusionInput(BaseInput):
     inpaint_seq: list[str] | None = None
     inpaint_str: list[str] | None = None
     provide_seq: list[str] | None = None
+
+
+# ``RfDiffusionInput`` is defined after ``RfDiffusionDesigner``; bind the keyword-tensor construction target
+# now that the type exists so ``model(**inputs)`` builds it on ``ModelMixin.__call__``.
+RfDiffusionDesigner.input_class = RfDiffusionInput
 
 
 class NativeRfDiffusionSampler:
@@ -3537,7 +3707,7 @@ class NativeRfDiffusionSampler:
         if self.network is None:
             raise RuntimeError(
                 "RFdiffusion sampler/features are available, but no native RFdiffusion network is attached. "
-                "Set RfDiffusionDesignGenerator.network to a module with the official inference signature."
+                "Set RfDiffusionDesigner.network to a module with the official inference signature."
             )
         state = self.sample_init(batch, diffusion_steps=diffusion_steps, generator=generator)
         start_t = state.t_step_input if num_sampling_steps is None else min(int(num_sampling_steps), state.t_step_input)
@@ -3649,6 +3819,7 @@ class NativeRfDiffusionSampler:
             seq_t[mask_seq.squeeze(0)] = seq_orig[mask_seq.squeeze(0)]
         seq_t[~mask_seq.squeeze(0)] = MASK_TOKEN
         seq_t_oh = one_hot_sequence(seq_t)
+        clean_coords = mapped_coords.detach().clone()
         fa_stack, _true_coords = diffuser.diffuse_pose(
             mapped_coords,
             seq_t_oh.clone(),
@@ -3688,6 +3859,7 @@ class NativeRfDiffusionSampler:
             potential_manager=potential_manager,
             symmetry=symmetry,
             cyclic_reses=cyclic_reses,
+            clean_coords=clean_coords,
         )
 
     def sample_step(
@@ -7977,6 +8149,8 @@ class RfDiffusionSampleState:
         target_adj: Optional target block-adjacency tensor.
         target_pdb: Optional fixed-target feature dict.
         prev_pred: Previous-step prediction for self-conditioning.
+        clean_coords: Un-noised mapped coords ``[L, A, 3]`` (the diffusion ``x_0``); the denoising target for
+            the training forward. ``None`` outside the base initializer.
     """
 
     noisy_coords: Tensor
@@ -8000,6 +8174,7 @@ class RfDiffusionSampleState:
     target_adj: Tensor | None = None
     target_pdb: dict[str, Any] | None = None
     prev_pred: Tensor | None = None
+    clean_coords: Tensor | None = None
 
 
 @dataclass(slots=True)

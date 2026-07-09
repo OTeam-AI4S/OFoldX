@@ -15,7 +15,7 @@ and [`DESIGN_PRINCIPLES.md`](../../DESIGN_PRINCIPLES.md) for the full contract.
 ## Contents
 
 - `structure.py` — the flat in-memory `Structure`, `AtomRecord`, and `ResidueKey` objects.
-- `ccd.py`, `rdkit_ccd.py` — Chemical Component Dictionary lookup (`CcdProvider`, `ReferenceComponent`) and the RDKit CIF/pickle providers that build reference molecules.
+- `ccd.py` — Chemical Component Dictionary lookup (`CcdProvider`, `ReferenceComponent`), the RDKit CIF/pickle providers that build reference molecules, and the CIF -> Mol construction they share.
 - `residue_constants.py` — vendored AlphaFold2 amino-acid geometry tables for side-chain torsion frames.
 - `bonds.py` — covalent-bond length validation and intra-/inter-chain bond classification.
 - `chirality.py` — ligand chirality comparison against reference molecules (inversion detection).

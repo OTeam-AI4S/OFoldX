@@ -1,8 +1,8 @@
 r"""
 LigandMPNN side-chain featurization.
 
-The LigandMPNN backbone consumes only N/CA/C/O coordinates, but the side-chain Packer
-([`Packer`][ofoldx.models.ligandmpnn.model.Packer]) is a Von Mises torsion-diffusion model that
+The LigandMPNN backbone consumes only N/CA/C/O coordinates, but the side-chain LigandMPNNPacker
+([`LigandMPNNPacker`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker]) is a Von Mises torsion-diffusion model that
 reconstructs full atom14 side chains from predicted chi angles. That reconstruction needs
 AlphaFold2-style rigid torsion frames, which this module builds from backbone coordinates.
 
@@ -27,6 +27,7 @@ from ...data import residue_constants as rc
 from ...processors.mixin import ProcessorMixin
 from ...processors.registry import PROCESSORS
 from ...processors.utils import StructureInput, structure_from_input
+from ...results_registry import register_sequence_decoder
 from .model import LigandMPNNInput
 
 if TYPE_CHECKING:
@@ -163,7 +164,7 @@ class Frame:
     Rigid frame stored as a rotation matrix and a translation.
 
     A minimal rotation-matrix analogue of the OpenFold ``Rigid`` transform, exposing only the
-    operations the Packer needs. Batched over any number of leading dimensions.
+    operations the LigandMPNNPacker needs. Batched over any number of leading dimensions.
 
     Args:
         rotation: Rotation matrices with shape ``(*, 3, 3)``.
@@ -400,7 +401,7 @@ def atom37_to_torsion_angles(aatype: Tensor, all_atom_positions: Tensor, all_ato
     Compute the seven backbone/side-chain torsion angles as sin/cos pairs.
 
     Compact reimplementation of OpenFold ``atom37_to_torsion_angles`` restricted to what the
-    Packer consumes: the sin/cos torsion tensor and its validity mask.
+    LigandMPNNPacker consumes: the sin/cos torsion tensor and its validity mask.
 
     Args:
         aatype: AF2 restype integers with shape ``(B, L)``.
@@ -551,7 +552,7 @@ def structure_to_packer_features(
     device: str | torch.device = "cpu",
 ) -> dict[str, Tensor]:
     r"""
-    Featurize an OFoldX [`Structure`][ofoldx.data.structure.Structure] for the Packer.
+    Featurize an OFoldX [`Structure`][ofoldx.data.structure.Structure] for the LigandMPNNPacker.
 
     Extracts per-residue backbone coordinates (N/CA/C/O), the atom37 side-chain coordinates and
     mask, sequence tokens, and residue/chain indices. This is the OFoldX-native replacement
@@ -591,7 +592,7 @@ def structure_to_packer_features(
 
     order = [key for key in order if "CA" in residue_coords[key]]
     if not order:
-        raise ValueError("structure has no protein CA atoms to featurize for the Packer")
+        raise ValueError("structure has no protein CA atoms to featurize for the LigandMPNNPacker")
 
     length = len(order)
     xyz_37 = np.zeros([length, 37, 3], dtype=np.float32)
@@ -629,3 +630,11 @@ def structure_to_packer_features(
         "chain_labels": _to(chain_labels, torch.long),
         "chain_letters": chain_letters,
     }
+
+
+def _decode_ligandmpnn_sequence(tokens):
+    r"""Decode LigandMPNN token ids into a one-letter amino-acid string."""
+    return "".join(_MPNN_ALPHABET[int(token)] for token in tokens)
+
+
+register_sequence_decoder("ligandmpnn", _decode_ligandmpnn_sequence)

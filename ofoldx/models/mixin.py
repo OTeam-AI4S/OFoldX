@@ -10,6 +10,8 @@ parameter initialization, and ``save_pretrained`` / ``from_pretrained`` / ``push
 from __future__ import annotations
 
 import importlib
+import inspect
+import shutil
 import warnings
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -19,7 +21,6 @@ from tempfile import TemporaryDirectory
 from typing import Any, ClassVar, Iterator, Mapping, Protocol, Sequence, TypeVar, cast
 
 from chanfig import Config
-from oops import LayerNorm
 from safetensors.torch import load_file, save_file
 from torch import nn
 
@@ -31,8 +32,15 @@ from ..artifacts import (
     entrypoint,
     read_artifact_manifest,
 )
-from ..hub import pretrained_allow_patterns, publish_artifact_to_hub, remote_code_import_path, resolve_pretrained_path
+from ..hub import (
+    MODEL_CARD_NAME,
+    pretrained_allow_patterns,
+    publish_artifact_to_hub,
+    remote_code_import_path,
+    resolve_pretrained_path,
+)
 from ..processors.registry import architecture_from_config, architecture_from_config_class
+from .contract import BaseInput
 from .registry import set_architecture
 
 T = TypeVar("T", bound="ModelMixin")
@@ -108,10 +116,44 @@ class ModelMixin(nn.Module):
     CONFIG_NAME: ClassVar[str] = "config.json"
     WEIGHTS_NAME: ClassVar[str] = "model.safetensors"
     config_class: ClassVar[type[Config]]
+    #: The typed [`BaseInput`][ofoldx.models.contract.BaseInput] subclass this model's ``forward`` consumes.
+    #: Subclasses set it so the keyword-tensor call path ``model(**inputs)`` can build the batch; models that
+    #: only accept a pre-built positional batch may leave it unset.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
+
+    def __call__(self, *inputs: Any, **kwargs: Any) -> Any:
+        r"""
+        Dispatch a call to ``forward``, adding a keyword-tensor construction path.
+
+        Two invocation forms are supported:
+
+        - **Positional batch** -- ``model(batch, **forward_kwargs)`` behaves exactly like a plain
+          ``nn.Module`` call: the pre-built [`BaseInput`][ofoldx.models.contract.BaseInput] and any forward
+          control kwargs go straight through ``nn.Module.__call__`` to ``forward`` unchanged.
+        - **Keyword tensors** -- ``model(**inputs)`` (no positional argument) builds
+          ``self.input_class(**inputs)`` and forwards the resulting batch positionally. The typed input is
+          constructed *outside* ``forward``, so the construction never enters a compiled graph.
+
+        The keyword path is only taken when the model declares an
+        [`input_class`][ofoldx.models.mixin.ModelMixin.input_class] and the caller passes keyword arguments
+        with no positional argument; otherwise the plain ``nn.Module`` path runs.
+
+        Args:
+            *inputs: A single pre-built positional batch, or nothing when using the keyword-tensor path.
+            **kwargs: Forward control kwargs (positional-batch form) or the input tensor fields (keyword form).
+
+        Returns:
+            Whatever the model's ``forward`` returns (the raw typed ``*Output``).
+        """
+
+        input_class = getattr(type(self), "input_class", None)
+        if not inputs and kwargs and input_class is not None:
+            return super().__call__(input_class(**kwargs))
+        return super().__call__(*inputs, **kwargs)
 
     def post_init(self) -> None:
         r"""
@@ -162,7 +204,7 @@ class ModelMixin(nn.Module):
             nn.init.trunc_normal_(module.weight, mean=0.0, std=initializer_range)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.LayerNorm, LayerNorm)):
+        elif isinstance(module, nn.LayerNorm):
             if module.weight is not None:
                 nn.init.ones_(module.weight)
             if module.bias is not None:
@@ -206,6 +248,36 @@ class ModelMixin(nn.Module):
         self._manifest_for_save(variant).json(save_directory / ARTIFACT_MANIFEST_NAME)
         self._config_for_save().json(save_directory / self.CONFIG_NAME)
         save_file(dict(self.state_dict()), str(save_directory / self._weights_name(variant)))
+        self._copy_family_card(save_directory)
+
+    def _copy_family_card(self, save_directory: Path) -> None:
+        r"""
+        Copy this model family's ``README.md`` model card into the saved artifact, when one ships with the family.
+
+        The card is the family's single public-facing source of truth (frontmatter + provenance + citation); it
+        travels with the artifact so [`ofoldx.hub.write_model_card`][ofoldx.hub.write_model_card] preserves it at
+        publish time instead of the shared hub module holding per-model metadata. A family with no ``README.md``
+        (or a dynamically/remote-loaded class with no source file) is simply skipped.
+        """
+
+        source = type(self)._family_card_path()
+        if source is None:
+            return
+        destination = save_directory / MODEL_CARD_NAME
+        if source.resolve() == destination.resolve():
+            return
+        shutil.copyfile(source, destination)
+
+    @classmethod
+    def _family_card_path(cls) -> Path | None:
+        r"""Return the family ``README.md`` next to this model's module, or ``None`` when unavailable."""
+
+        try:
+            module_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            return None
+        card = Path(module_file).parent / MODEL_CARD_NAME
+        return card if card.is_file() else None
 
     def push_to_hub(
         self,
@@ -222,7 +294,6 @@ class ModelMixin(nn.Module):
         model_card: bool = True,
         model_card_metadata: Mapping[str, object] | None = None,
         widget_examples: Sequence[Mapping[str, object]] | None = None,
-        card_body: str | None = None,
         variant: str | None = None,
     ) -> Any:
         r"""
@@ -245,7 +316,6 @@ class ModelMixin(nn.Module):
             model_card: If ``True``, write/update ``README.md`` with Hub card metadata.
             model_card_metadata: Extra model-card front matter values.
             widget_examples: Optional widget examples. ``None`` uses task defaults.
-            card_body: Optional Markdown body for the generated model card.
             variant: Optional weight filename variant to save and upload.
 
         Returns:
@@ -273,7 +343,6 @@ class ModelMixin(nn.Module):
                 model_card=model_card,
                 model_card_metadata=model_card_metadata,
                 widget_examples=widget_examples,
-                card_body=card_body,
             )
 
     @classmethod
@@ -343,20 +412,7 @@ class ModelMixin(nn.Module):
         if not pretrained_path.is_dir():
             raise NotADirectoryError(f"pretrained model path must be a directory: {pretrained_path}")
 
-        manifest = read_artifact_manifest(pretrained_path)
-        kind = artifact_kind(manifest)
-        if kind == "pipeline":
-            pretrained_path = artifact_component_path(
-                pretrained_path,
-                manifest,
-                "scorer",
-                "generator",
-                "predictor",
-                "packer",
-            )
-            manifest = read_artifact_manifest(pretrained_path, expected_kind="model")
-        elif kind != "model":
-            raise ValueError(f"manifest.json kind {kind!r} is not 'model'")
+        pretrained_path, manifest = _resolve_model_artifact(pretrained_path)
         with remote_code_import_path(pretrained_path, trust_remote_code=trust_remote_code):
             model_cls = cls._model_class_from_manifest(manifest)
             config_path = pretrained_path / _manifest_file(manifest, "config")
@@ -548,6 +604,43 @@ def _resolve_model_class(class_name: str) -> type[ModelMixin]:
     return target
 
 
+def _resolve_model_artifact(pretrained_path: Path) -> tuple[Path, Config]:
+    r"""
+    Read an artifact manifest and descend into its model component when it is a pipeline.
+
+    A ``model`` artifact resolves to itself; a ``pipeline`` artifact resolves to the directory and manifest of
+    its single model component (the scorer, generator, predictor, or packer). Shared by
+    [`ModelMixin.from_pretrained`][ofoldx.models.mixin.ModelMixin.from_pretrained] and
+    [`AutoConfig.from_pretrained`][ofoldx.models.auto.AutoConfig.from_pretrained] so both resolve a component
+    the same way.
+
+    Args:
+        pretrained_path: Resolved local artifact directory.
+
+    Returns:
+        The model-kind ``(path, manifest)`` pair, descended into the pipeline component when applicable.
+
+    Raises:
+        ValueError: If the manifest ``kind`` is neither ``"model"`` nor ``"pipeline"``.
+    """
+
+    manifest = read_artifact_manifest(pretrained_path)
+    kind = artifact_kind(manifest)
+    if kind == "pipeline":
+        pretrained_path = artifact_component_path(
+            pretrained_path,
+            manifest,
+            "scorer",
+            "generator",
+            "predictor",
+            "packer",
+        )
+        manifest = read_artifact_manifest(pretrained_path, expected_kind="model")
+    elif kind != "model":
+        raise ValueError(f"manifest.json kind {kind!r} is not 'model'")
+    return pretrained_path, manifest
+
+
 def _manifest_architecture(manifest: Config) -> str:
     r"""
     Return the architecture declared by a model manifest.
@@ -629,6 +722,9 @@ def _task_for_model(model_cls: type[ModelMixin], architecture: str) -> str | Non
     r"""
     Return the registered task for ``model_cls`` when it is known.
 
+    Every task derives its facade the same way -- a sweep over the per-task model registries -- so a model's
+    task is wherever its architecture is registered, with no per-model special-casing.
+
     Args:
         model_cls: Model class being saved.
         architecture: Canonical architecture key.
@@ -637,15 +733,18 @@ def _task_for_model(model_cls: type[ModelMixin], architecture: str) -> str | Non
         A canonical task name, or ``None`` when the model has no task-level facade yet.
     """
 
-    from .registry import BINDING_AFFINITY_MODELS, DESIGN_GENERATOR_MODELS, STRUCTURE_PREDICTION_MODELS
-
-    if architecture == "ligandmpnn_packer":
-        return "side_chain_packing"
+    from .registry import (
+        BINDING_AFFINITY_MODELS,
+        DESIGN_MODELS,
+        SIDE_CHAIN_PACKING_MODELS,
+        STRUCTURE_PREDICTION_MODELS,
+    )
 
     registries = (
         ("structure_prediction", STRUCTURE_PREDICTION_MODELS),
-        ("design_generation", DESIGN_GENERATOR_MODELS),
-        ("binding_affinity_prediction", BINDING_AFFINITY_MODELS),
+        ("design", DESIGN_MODELS),
+        ("binding_affinity", BINDING_AFFINITY_MODELS),
+        ("side_chain_packing", SIDE_CHAIN_PACKING_MODELS),
     )
     for task, registry in registries:
         try:

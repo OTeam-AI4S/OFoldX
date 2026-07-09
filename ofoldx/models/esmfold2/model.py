@@ -8,10 +8,12 @@ Quickstart::
     batch = processor("MQIFVKTLTGKT...").to("cuda")
     model = ESMFold2Model(ESMFold2Config()).cuda().eval()
     model.load_esmc()
-    output = model(batch, num_diffusion_samples=1)
+    output = model.fold(batch, num_diffusion_samples=1)
 
-The released head consumes ESMC hidden states for full-quality inference. OFoldX
-loads ESMC through MultiMolecule's ``AutoTokenizer`` / ``AutoModel`` surface.
+``fold`` is the inference verb (trunk + diffusion sampler + confidence). The bare
+``model(batch)`` call is the single-step diffusion-denoising *training* path. The
+released head consumes ESMC hidden states for full-quality inference; OFoldX loads
+ESMC through MultiMolecule's ``AutoTokenizer`` / ``AutoModel`` surface.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import random
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import torch
@@ -30,10 +32,63 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from ..contract import BaseInput, StructurePredictionOutput
+from ...modules.representation import Pair, Single
+from ..contract import BaseInput, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
 from ..registry import MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import ESMFold2Config
+
+
+@register_pytree_dataclass
+@dataclass(slots=True, kw_only=True)
+class ESMFold2Input(BaseInput):
+    r"""Tensor contract consumed by the released ESMFold2 architecture.
+
+    ``label_atom_coords`` is the optional clean all-atom target consumed by the
+    single-step diffusion training [`forward`][ofoldx.models.esmfold2.ESMFold2Model.forward];
+    when absent, training denoises the reference conformer ``ref_pos``.
+    """
+
+    token_index: Tensor
+    residue_index: Tensor
+    asym_id: Tensor
+    sym_id: Tensor
+    entity_id: Tensor
+    mol_type: Tensor
+    res_type: Tensor
+    token_bonds: Tensor
+    token_attention_mask: Tensor
+    ref_pos: Tensor
+    ref_element: Tensor
+    ref_charge: Tensor
+    ref_atom_name_chars: Tensor
+    ref_space_uid: Tensor
+    atom_attention_mask: Tensor
+    atom_to_token: Tensor
+    distogram_atom_idx: Tensor
+    deletion_mean: Tensor | None = None
+    msa: Tensor | None = None
+    has_deletion: Tensor | None = None
+    deletion_value: Tensor | None = None
+    msa_attention_mask: Tensor | None = None
+    input_ids: Tensor | None = None
+    lm_hidden_states: Tensor | None = None
+    label_atom_coords: Tensor | None = None
+
+
+@register_pytree_dataclass
+@dataclass(slots=True)
+class ESMFold2Representations:
+    r"""Typed single/pair trunk representations at the ESMFold2 boundary.
+
+    The trunk emits its single (``s_inputs``) and pair (``z``) streams through
+    the shared [`Single`][ofoldx.modules.representation.Single] /
+    [`Pair`][ofoldx.modules.representation.Pair] carriers; consumers unwrap
+    ``.tensor`` before feeding the diffusion denoiser.
+    """
+
+    single: Single
+    pair: Pair
 
 
 @MODELS.register("esmfold2")
@@ -44,7 +99,9 @@ class ESMFold2Model(ModelMixin):
     This is the standard released ESMFold2 architecture (uses a linear-
     recurrent trunk, internally referred to as "parcae").
 
-    Forward kwargs that callers commonly override:
+    [`forward`][ofoldx.models.esmfold2.ESMFold2Model.forward] is the single-step
+    diffusion-denoising training path; [`fold`][ofoldx.models.esmfold2.ESMFold2Model.fold]
+    is the inference verb. ``fold`` kwargs that callers commonly override:
 
     * ``num_loops`` (default ``config.num_loops``): trunk refinement
       loops.
@@ -62,6 +119,7 @@ class ESMFold2Model(ModelMixin):
     """
 
     config_class = ESMFold2Config
+    input_class: ClassVar[type[BaseInput]] = ESMFold2Input
     _keys_to_ignore_on_load_unexpected = [r"\._extra_state$"]
 
     def __init__(self, config: ESMFold2Config) -> None:
@@ -180,8 +238,6 @@ class ESMFold2Model(ModelMixin):
 
         torch._dynamo.config.cache_size_limit = 512  # type: ignore[attr-defined]
         torch._dynamo.config.accumulated_cache_size_limit = 512  # type: ignore[attr-defined]
-        # capture_scalar_outputs avoids graph breaks at .item() in atom-attention path.
-        torch._dynamo.config.capture_scalar_outputs = True  # type: ignore[attr-defined]
 
         if dynamic is None:
             dynamic = mode == "dynamic_seqlen"
@@ -331,9 +387,9 @@ class ESMFold2Model(ModelMixin):
 
         return z
 
-    @torch.inference_mode()
-    def _forward_tensors(
+    def _encode_inputs_and_trunk(
         self,
+        *,
         token_index: Tensor,
         residue_index: Tensor,
         asym_id: Tensor,
@@ -350,7 +406,6 @@ class ESMFold2Model(ModelMixin):
         ref_space_uid: Tensor,
         atom_attention_mask: Tensor,
         atom_to_token: Tensor,
-        distogram_atom_idx: Tensor,
         deletion_mean: Tensor | None = None,
         msa: Tensor | None = None,
         has_deletion: Tensor | None = None,
@@ -359,22 +414,23 @@ class ESMFold2Model(ModelMixin):
         input_ids: Tensor | None = None,
         lm_hidden_states: Tensor | None = None,
         num_loops: int | None = None,
-        num_diffusion_samples: int | None = None,
-        num_sampling_steps: int | None = None,
         language_model_mask_probability: float | None = None,
         msa_max_depth: int = 1024,
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
-        **kwargs,
-    ) -> dict[str, Tensor]:
+    ) -> tuple[ESMFold2Representations, dict[str, Tensor]]:
+        r"""Run the shared trunk and emit typed single/pair representations.
+
+        Both the training [`forward`][ofoldx.models.esmfold2.ESMFold2Model.forward] and the inference
+        [`fold`][ofoldx.models.esmfold2.ESMFold2Model.fold] verb consume this: it returns the
+        single (``s_inputs``) / pair (``z``) trunk streams wrapped in the shared carriers, plus the
+        auxiliary reference features and the teacher-forced distogram logits.
+        """
+
         tok_mask = token_attention_mask
         atm_mask = atom_attention_mask
-        disto_idx = distogram_atom_idx
 
         n_loops: int = num_loops if num_loops is not None else self.config.num_loops
-        n_samples: int = (
-            num_diffusion_samples if num_diffusion_samples is not None else self.config.num_diffusion_samples
-        )
         total_steps = max(1, n_loops + 1)
 
         if res_type.dim() == 2:
@@ -497,6 +553,100 @@ class ESMFold2Model(ModelMixin):
 
         distogram_logits = self.distogram_head(z + z.transpose(-2, -3))
 
+        reps = ESMFold2Representations(single=Single(x_inputs), pair=Pair(z))
+        aux: dict[str, Tensor] = {
+            "relative_position_encoding": relative_position_encoding,
+            "token_bonds_encoding": token_bonds_encoding,
+            "ref_element_oh": ref_element_oh,
+            "ref_atom_name_chars_oh": ref_atom_name_chars_oh,
+            "atom_to_token": atom_to_token,
+            "distogram_logits": distogram_logits,
+        }
+        return reps, aux
+
+    @torch.inference_mode()
+    def _fold_tensors(
+        self,
+        token_index: Tensor,
+        residue_index: Tensor,
+        asym_id: Tensor,
+        sym_id: Tensor,
+        entity_id: Tensor,
+        mol_type: Tensor,
+        res_type: Tensor,
+        token_bonds: Tensor,
+        token_attention_mask: Tensor,
+        ref_pos: Tensor,
+        ref_element: Tensor,
+        ref_charge: Tensor,
+        ref_atom_name_chars: Tensor,
+        ref_space_uid: Tensor,
+        atom_attention_mask: Tensor,
+        atom_to_token: Tensor,
+        distogram_atom_idx: Tensor,
+        deletion_mean: Tensor | None = None,
+        msa: Tensor | None = None,
+        has_deletion: Tensor | None = None,
+        deletion_value: Tensor | None = None,
+        msa_attention_mask: Tensor | None = None,
+        input_ids: Tensor | None = None,
+        lm_hidden_states: Tensor | None = None,
+        num_loops: int | None = None,
+        num_diffusion_samples: int | None = None,
+        num_sampling_steps: int | None = None,
+        language_model_mask_probability: float | None = None,
+        msa_max_depth: int = 1024,
+        msa_column_mask_rate: float = 0.1,
+        msa_subsample_at_inference: bool = True,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        tok_mask = token_attention_mask
+        atm_mask = atom_attention_mask
+        disto_idx = distogram_atom_idx
+        n_samples: int = (
+            num_diffusion_samples if num_diffusion_samples is not None else self.config.num_diffusion_samples
+        )
+
+        reps, aux = self._encode_inputs_and_trunk(
+            token_index=token_index,
+            residue_index=residue_index,
+            asym_id=asym_id,
+            sym_id=sym_id,
+            entity_id=entity_id,
+            mol_type=mol_type,
+            res_type=res_type,
+            token_bonds=token_bonds,
+            token_attention_mask=token_attention_mask,
+            ref_pos=ref_pos,
+            ref_element=ref_element,
+            ref_charge=ref_charge,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            atom_attention_mask=atom_attention_mask,
+            atom_to_token=atom_to_token,
+            deletion_mean=deletion_mean,
+            msa=msa,
+            has_deletion=has_deletion,
+            deletion_value=deletion_value,
+            msa_attention_mask=msa_attention_mask,
+            input_ids=input_ids,
+            lm_hidden_states=lm_hidden_states,
+            num_loops=num_loops,
+            language_model_mask_probability=language_model_mask_probability,
+            msa_max_depth=msa_max_depth,
+            msa_column_mask_rate=msa_column_mask_rate,
+            msa_subsample_at_inference=msa_subsample_at_inference,
+        )
+        # Unwrap the typed carriers before the eager diffusion sampler.
+        x_inputs = reps.single.tensor
+        z = reps.pair.tensor
+        relative_position_encoding = aux["relative_position_encoding"]
+        token_bonds_encoding = aux["token_bonds_encoding"]
+        ref_element_oh = aux["ref_element_oh"]
+        ref_atom_name_chars_oh = aux["ref_atom_name_chars_oh"]
+        atom_to_token = aux["atom_to_token"]
+        distogram_logits = aux["distogram_logits"]
+
         structure_output = self.structure_head.sample(
             z_trunk=z,
             s_inputs=x_inputs,
@@ -546,9 +696,10 @@ class ESMFold2Model(ModelMixin):
         output["entity_id"] = entity_id
         return output
 
-    def forward(
+    def fold(
         self,
         batch: ESMFold2Input,
+        /,
         *,
         num_loops: int | None = None,
         num_diffusion_samples: int | None = None,
@@ -558,10 +709,15 @@ class ESMFold2Model(ModelMixin):
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
     ) -> StructurePredictionOutput:
-        r"""Run ESMFold2 on the typed OFoldX input contract."""
+        r"""Predict all-atom structure from the typed OFoldX input contract (the inference verb).
+
+        This is the distinct inference path: it runs the trunk, then the multi-step diffusion sampler
+        and confidence head under ``inference_mode``. The training path is
+        [`forward`][ofoldx.models.esmfold2.ESMFold2Model.forward].
+        """
 
         n_samples = num_diffusion_samples if num_diffusion_samples is not None else self.config.num_diffusion_samples
-        raw = self._forward_tensors(
+        raw = self._fold_tensors(
             token_index=batch.token_index,
             residue_index=batch.residue_index,
             asym_id=batch.asym_id,
@@ -602,6 +758,120 @@ class ESMFold2Model(ModelMixin):
             pae_logits=_unflatten_optional_sample_axis(raw.get("pae_logits"), batch_size, n_samples),
             pde_logits=_unflatten_optional_sample_axis(raw.get("pde_logits"), batch_size, n_samples),
             resolved_logits=_unflatten_optional_sample_axis(raw.get("resolved_logits"), batch_size, n_samples),
+        )
+
+    def forward(
+        self,
+        batch: ESMFold2Input,
+        *,
+        noise_level: Tensor | None = None,
+        num_loops: int | None = None,
+        language_model_mask_probability: float | None = None,
+        msa_max_depth: int = 1024,
+        msa_column_mask_rate: float = 0.1,
+        msa_subsample_at_inference: bool = True,
+    ) -> StructurePredictionOutput:
+        r"""Single-step diffusion-denoising training pass (the training path).
+
+        Runs the teacher-forced trunk, augments the clean all-atom target
+        (``batch.label_atom_coords`` when present, otherwise the reference conformer ``batch.ref_pos``)
+        with a random rotation/translation, corrupts it at a log-normally sampled noise level, and runs a
+        single [`DiffusionModule`][ofoldx.models.esmfold2.model.DiffusionModule] denoising step. The
+        returned ``denoised_coords`` / ``augmented_target`` / ``noise_level`` feed the EDM diffusion loss
+        and ``distogram_logits`` feeds the teacher-forced distogram loss; ``pred_coords`` carries the
+        detached denoised coords for downstream confidence. Inference uses
+        [`fold`][ofoldx.models.esmfold2.ESMFold2Model.fold].
+        """
+
+        reps, aux = self._encode_inputs_and_trunk(
+            token_index=batch.token_index,
+            residue_index=batch.residue_index,
+            asym_id=batch.asym_id,
+            sym_id=batch.sym_id,
+            entity_id=batch.entity_id,
+            mol_type=batch.mol_type,
+            res_type=batch.res_type,
+            token_bonds=batch.token_bonds,
+            token_attention_mask=batch.token_attention_mask,
+            ref_pos=batch.ref_pos,
+            ref_element=batch.ref_element,
+            ref_charge=batch.ref_charge,
+            ref_atom_name_chars=batch.ref_atom_name_chars,
+            ref_space_uid=batch.ref_space_uid,
+            atom_attention_mask=batch.atom_attention_mask,
+            atom_to_token=batch.atom_to_token,
+            deletion_mean=batch.deletion_mean,
+            msa=batch.msa,
+            has_deletion=batch.has_deletion,
+            deletion_value=batch.deletion_value,
+            msa_attention_mask=batch.msa_attention_mask,
+            input_ids=batch.input_ids,
+            lm_hidden_states=batch.lm_hidden_states,
+            num_loops=num_loops,
+            language_model_mask_probability=language_model_mask_probability,
+            msa_max_depth=msa_max_depth,
+            msa_column_mask_rate=msa_column_mask_rate,
+            msa_subsample_at_inference=msa_subsample_at_inference,
+        )
+        # Unwrap the typed carriers before the diffusion denoiser.
+        x_inputs = reps.single.tensor
+        z = reps.pair.tensor
+        atom_to_token = aux["atom_to_token"]
+
+        head = self.structure_head
+        sigma_data = head.sigma_data
+        atom_mask = batch.atom_attention_mask.float()
+
+        # Clean all-atom target: explicit training label, else the reference conformer.
+        x0 = batch.label_atom_coords if batch.label_atom_coords is not None else batch.ref_pos
+        x0 = x0.to(dtype=torch.float32)
+        # Algorithm 19: centre + random rotation/translation of the target.
+        augmented_target, _ = head._center_random_augmentation(x0, atom_mask)
+
+        batch_size = x0.shape[0]
+        if noise_level is None:
+            log_mean = self.config.structure_head.train_noise_log_mean
+            log_std = self.config.structure_head.train_noise_log_std
+            noise = torch.randn(batch_size, device=x0.device, dtype=torch.float32)
+            t_hat = sigma_data * torch.exp(log_mean + log_std * noise)
+        else:
+            t_hat = noise_level.to(device=x0.device, dtype=torch.float32).reshape(-1)
+            if t_hat.numel() == 1:
+                t_hat = t_hat.expand(batch_size)
+
+        x_noisy = augmented_target + t_hat[:, None, None] * torch.randn_like(augmented_target)
+
+        dm_out = head.diffusion_module(
+            x_noisy=x_noisy,
+            t_hat=t_hat,
+            ref_pos=batch.ref_pos,
+            ref_charge=batch.ref_charge,
+            ref_mask=batch.atom_attention_mask,
+            ref_element=aux["ref_element_oh"],
+            ref_atom_name_chars=aux["ref_atom_name_chars_oh"],
+            ref_space_uid=batch.ref_space_uid,
+            tok_idx=atom_to_token,
+            s_inputs=x_inputs,
+            s_trunk=None,
+            z_trunk=z,
+            relative_position_encoding=aux["relative_position_encoding"],
+            asym_id=batch.asym_id,
+            residue_index=batch.residue_index,
+            entity_id=batch.entity_id,
+            token_index=batch.token_index,
+            sym_id=batch.sym_id,
+            token_attention_mask=batch.token_attention_mask,
+            num_diffusion_samples=1,
+        )
+        denoised = dm_out["x_denoised"]
+        assert denoised is not None
+
+        return StructurePredictionOutput(
+            pred_coords=_unflatten_sample_axis(denoised.detach(), batch_size, 1),
+            distogram_logits=aux["distogram_logits"],
+            denoised_coords=denoised,
+            augmented_target=augmented_target,
+            noise_level=t_hat,
         )
 
 
@@ -1197,11 +1467,15 @@ class ESMFold2AtomEncoder(nn.Module):
         num_diffusion_samples: int = 1,
         return_intermediates: bool = False,
         inference_cache: dict | None = None,
+        num_tokens: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, tuple, list[Tensor]]:
         """Returns (a, q, c, attention_params, intermediates).
 
         ``inference_cache`` caches step-invariant tensors (c_base, 3D RoPE,
-        attention indices, n_tokens) across diffusion steps.
+        attention indices, n_tokens) across diffusion steps. ``num_tokens`` supplies
+        the token-axis width from a caller-known shape so the scatter target size is a
+        static Python int (compile-safe); when ``None`` it falls back to the data-dependent
+        ``atom_to_token`` maximum used by the eager sampling path.
         """
         B, N = ref_pos.shape[:2]
 
@@ -1227,7 +1501,7 @@ class ESMFold2AtomEncoder(nn.Module):
             mask_exp = atom_attention_mask.repeat_interleave(num_diffusion_samples, 0)
             indices = torch.nonzero(mask_exp.flatten(), as_tuple=False).flatten()
             attention_params = (cos, sin, indices)
-            n_tokens = int(atom_to_token.max().item()) + 1
+            n_tokens = num_tokens if num_tokens is not None else int(atom_to_token.max().item()) + 1
             if layer_cache is not None:
                 layer_cache["c_base"] = c_base
                 layer_cache["attention_params"] = attention_params
@@ -1767,6 +2041,7 @@ class DiffusionModule(nn.Module):
             num_diffusion_samples=num_diffusion_samples,
             return_intermediates=return_atom_repr,
             inference_cache=inference_cache,
+            num_tokens=s_inputs.shape[1],
         )
 
         # Step 4: add conditioned s
@@ -2154,6 +2429,7 @@ class InputsEmbedder(nn.Module):
             ref_element=ref_element,
             ref_atom_name_chars=ref_atom_name_chars,
             atom_to_token=atom_to_token,
+            num_tokens=aatype.shape[1],
         )
         return torch.cat([a, aatype, profile, deletion_mean.unsqueeze(-1)], dim=-1)
 
@@ -3072,33 +3348,3 @@ class MSAEncoder(nn.Module):
         for block in self.blocks:
             m, x_pair = block(m, x_pair, msa_attention_mask, pair_attention_mask)
         return x_pair
-
-
-@dataclass(slots=True)
-class ESMFold2Input(BaseInput):
-    r"""Tensor contract consumed by the released ESMFold2 architecture."""
-
-    token_index: Tensor
-    residue_index: Tensor
-    asym_id: Tensor
-    sym_id: Tensor
-    entity_id: Tensor
-    mol_type: Tensor
-    res_type: Tensor
-    token_bonds: Tensor
-    token_attention_mask: Tensor
-    ref_pos: Tensor
-    ref_element: Tensor
-    ref_charge: Tensor
-    ref_atom_name_chars: Tensor
-    ref_space_uid: Tensor
-    atom_attention_mask: Tensor
-    atom_to_token: Tensor
-    distogram_atom_idx: Tensor
-    deletion_mean: Tensor | None = None
-    msa: Tensor | None = None
-    has_deletion: Tensor | None = None
-    deletion_value: Tensor | None = None
-    msa_attention_mask: Tensor | None = None
-    input_ids: Tensor | None = None
-    lm_hidden_states: Tensor | None = None

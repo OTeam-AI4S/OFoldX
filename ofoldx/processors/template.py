@@ -5,10 +5,10 @@ Ports the AlphaFold3 template pipeline (``data/templates.py`` ``Hit``/``_filter_
 the ``data/template_realign.py`` realignment) into OFoldX: turn ``hmmsearch`` hits against a PDB
 sequence database into a date-filtered, deduplicated, max-hits-capped set of templates for a query MSA.
 The hit-parsing, filtering, and realignment logic is faithful; the search step delegates to the
-[`Hmmsearch`][ofoldx.processors.msa_tools.Hmmsearch] wrapper.
+[`Hmmsearch`][ofoldx.processors.msa.search.Hmmsearch] wrapper.
 
 EXTERNAL DEPENDENCIES (REQUIRED, NOT bundled):
-  * HMMER binaries -- ``hmmsearch`` and ``hmmbuild`` (see [`msa_tools`][ofoldx.processors.msa_tools]).
+  * HMMER binaries -- ``hmmsearch`` and ``hmmbuild`` (see [`msa.search`][ofoldx.processors.msa.search]).
   * A PDB sequence database (FASTA) to search for template hits.
   * A PDB mmCIF structure store (directory of ``<pdb_id>.cif``) with release dates, to realign hits and
     read their coordinates.
@@ -24,7 +24,7 @@ import datetime
 import re
 from collections.abc import Iterable, Sequence
 
-from .msa_tools import Hmmsearch, MsaToolError
+from .msa.search import Hmmsearch, MsaToolError
 
 # Stockholm/a3m hit descriptions embed the source PDB id and chain, e.g. ``6xyz_A/12-98``.
 _HIT_NAME = re.compile(r"(?P<pdb_id>[0-9a-zA-Z]{4})_(?P<chain_id>[0-9a-zA-Z]+)")

@@ -20,7 +20,6 @@ MSA parsing/featurization, template search — belong here. See
 - `mixin.py` — `ProcessorMixin`, the Hugging Face-style pretrained save/load round-trip.
 - `structure.py` — `StructureProcessor`, the shared structure-to-fields featurizer.
 - `residue_token.py` — `ResidueTokenStructureProcessor`, the residue-token single-sequence input contract.
-- `msa.py` — parse precomputed a3m/CSV alignments (`parse_a3m`, `parse_csv`) and featurize them (`featurize_msa`).
-- `msa_tools.py` — HMMER wrappers (`Jackhmmer`, `Nhmmer`, `Hmmbuild`, `Hmmsearch`, `Hmmalign`) for MSA generation.
+- `msa/` — the MSA package: `search.py` _generates_ an alignment (HMMER wrappers `Jackhmmer`, `Nhmmer`, `Hmmbuild`, `Hmmsearch`, `Hmmalign`), and `encode.py` _consumes_ one — parse precomputed a3m/CSV alignments (`parse_a3m`, `parse_csv`) and encode them (`encode_msa`).
 - `template.py` — structural-template search, hit parsing, and date/max-hits filtering.
 - `utils.py` — shared structure I/O, `StructuralFields`/`StructureToken`, and the `ProcessorOutput` protocol.

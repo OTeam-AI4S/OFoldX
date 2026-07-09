@@ -289,6 +289,33 @@ class StructureProcessor(ProcessorMixin):
             target_mask=fields.target_mask.unsqueeze(0),
         )
 
+    def source_structure(self, inputs: StructureInput) -> Structure | None:
+        r"""
+        Return the atom-ordered reference structure that this processor's predicted coordinates overlay onto.
+
+        A structure processor emits one predicted coordinate per atom of the (optionally atom-materialized) input
+        structure, in that atom order, so the reference for
+        [`coords_to_structure`][ofoldx.data.structure.coords_to_structure]
+        is exactly that structure -- materialized the same way ``__call__`` materializes it, so the atom counts
+        line up. Inputs that are not a structure/path (e.g. a bare sequence) have no such reference and yield
+        ``None``.
+
+        Args:
+            inputs: Parsed structure object or structure file path.
+
+        Returns:
+            The atom-ordered reference structure, or ``None`` for non-structure inputs.
+        """
+
+        try:
+            structure = structure_from_input(inputs)
+        except (OSError, ValueError, TypeError):
+            return None  # a bare sequence / unreadable path is not a structure this processor can reference
+        if self.materialize_missing_atoms:
+            ccd = self._ccd if self._ccd is not None else default_ccd_provider()
+            structure, _ = materialize_missing_atoms(structure, ccd)
+        return structure
+
     def _atom_names(self, structure: Structure) -> list[str]:
         r"""
         Return the atom names used for the name-char feature (ligand-renamed when enabled).
@@ -808,7 +835,7 @@ def _token_bonds(
     return matrix
 
 
-def _atom_distance(atom_a: object, atom_b: object) -> float:
+def _atom_distance(atom_a: AtomRecord, atom_b: AtomRecord) -> float:
     r"""
     Return the Euclidean distance in Angstrom between two atom records.
 
@@ -820,14 +847,7 @@ def _atom_distance(atom_a: object, atom_b: object) -> float:
         Distance between the two atoms.
     """
 
-    return float(
-        (
-            (atom_a.x - atom_b.x) ** 2  # type: ignore[attr-defined]
-            + (atom_a.y - atom_b.y) ** 2  # type: ignore[attr-defined]
-            + (atom_a.z - atom_b.z) ** 2  # type: ignore[attr-defined]
-        )
-        ** 0.5
-    )
+    return float(((atom_a.x - atom_b.x) ** 2 + (atom_a.y - atom_b.y) ** 2 + (atom_a.z - atom_b.z) ** 2) ** 0.5)
 
 
 def materialize_missing_atoms(structure: Structure, ccd: CcdProvider) -> tuple[Structure, np.ndarray]:

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from biotite.structure import AtomArray
+
     from ofoldx.data.structure import AtomRecord, Structure
 
 
@@ -144,6 +146,114 @@ def read_mmcif(path: str | PathLike[str]) -> Structure:
             ),
         )
     return Structure(tuple(atoms), bonds=_inter_residue_bonds(atom_array, index_map, residues))
+
+
+def write_structure(structure: Structure, path: str | PathLike[str], *, format: str = "auto") -> None:
+    r"""
+    Write a biomolecular structure to a PDB or mmCIF file.
+
+    Inverse of [`read_structure`][ofoldx.io.structure.read_structure]: serializes the structure's atoms
+    (and, for mmCIF, its explicit inter-residue bonds) to disk.
+
+    Args:
+        structure: Structure to serialize.
+        path: Output file path.
+        format: Output format. ``"auto"`` infers from the suffix; supported explicit values are ``"pdb"``,
+            ``"cif"``, and ``"mmcif"``.
+
+    Raises:
+        ValueError: If ``format`` or the inferred suffix is unsupported.
+
+    Examples:
+        >>> write_structure(structure, "prediction.cif")  # doctest: +SKIP
+    """
+
+    path = Path(path)
+    structure_format = path.suffix.lower().lstrip(".") if format == "auto" else format.lower()
+    if structure_format == "pdb":
+        write_pdb(structure, path)
+        return
+    if structure_format in {"cif", "mmcif"}:
+        write_mmcif(structure, path)
+        return
+    raise ValueError(f"unsupported structure format: {structure_format!r}")
+
+
+def write_pdb(structure: Structure, path: str | PathLike[str]) -> None:
+    r"""
+    Write a structure as ATOM/HETATM records to a PDB file.
+
+    Args:
+        structure: Structure to serialize.
+        path: Output PDB file path.
+
+    Examples:
+        >>> write_pdb(structure, "prediction.pdb")  # doctest: +SKIP
+    """
+
+    from biotite.structure.io.pdb import PDBFile
+
+    pdb_file = PDBFile()
+    pdb_file.set_structure(_structure_to_atom_array(structure))
+    pdb_file.write(str(path))
+
+
+def write_mmcif(structure: Structure, path: str | PathLike[str]) -> None:
+    r"""
+    Write a structure to an mmCIF file.
+
+    Serializes atoms and coordinates. Explicit inter-residue bonds are not currently written (the
+    installed biotite emits only intra-residue bonds), so a bonded structure round-trips its atoms but
+    not its ``bonds``.
+
+    Args:
+        structure: Structure to serialize.
+        path: Output mmCIF file path.
+
+    Examples:
+        >>> write_mmcif(structure, "prediction.cif")  # doctest: +SKIP
+    """
+
+    from biotite.structure.io import pdbx
+
+    cif = pdbx.CIFFile()
+    pdbx.set_structure(cif, _structure_to_atom_array(structure))
+    cif.write(str(path))
+
+
+def _structure_to_atom_array(structure: Structure) -> AtomArray:
+    r"""
+    Build a biotite ``AtomArray`` from a [`Structure`][ofoldx.data.structure.Structure].
+
+    Copies coords and per-atom annotations (chain, residue number/insertion code, residue name, atom name,
+    element, hetero flag, formal charge) plus default full occupancy and zero B-factor. The derived
+    ``mol_type`` classification and explicit inter-residue bonds are not written; ``mol_type`` is re-derived
+    on read.
+
+    Args:
+        structure: Structure to convert.
+
+    Returns:
+        A biotite ``AtomArray`` mirroring the structure's atoms.
+    """
+
+    import numpy as np
+    from biotite.structure import AtomArray
+
+    atoms = structure.atoms
+    array = AtomArray(len(atoms))
+    array.coord = np.array([(atom.x, atom.y, atom.z) for atom in atoms], dtype=np.float32)
+    array.chain_id = np.array([atom.residue.chain_id for atom in atoms])
+    array.res_id = np.array([atom.residue.residue_number for atom in atoms])
+    array.ins_code = np.array([atom.residue.insertion_code for atom in atoms])
+    array.res_name = np.array([atom.residue_name for atom in atoms])
+    array.atom_name = np.array([atom.name for atom in atoms])
+    array.element = np.array([atom.element for atom in atoms])
+    array.hetero = np.array([atom.hetero for atom in atoms])
+    array.set_annotation("charge", np.array([int(round(atom.charge)) for atom in atoms]))
+    array.set_annotation("occupancy", np.ones(len(atoms), dtype=np.float32))
+    array.set_annotation("b_factor", np.zeros(len(atoms), dtype=np.float32))
+    return array
 
 
 def _pdb_model_number(line: str) -> int:

@@ -114,5 +114,6 @@ class ModelConfigRegistry(ConfigRegistry):
 MODEL_CONFIGS = ModelConfigRegistry()
 MODELS = Registry()
 STRUCTURE_PREDICTION_MODELS = Registry()
-DESIGN_GENERATOR_MODELS = Registry()
+DESIGN_MODELS = Registry()
 BINDING_AFFINITY_MODELS = Registry()
+SIDE_CHAIN_PACKING_MODELS = Registry()

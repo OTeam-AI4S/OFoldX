@@ -2,7 +2,7 @@ r"""
 AlphaFold2 residue constants for side-chain torsion-frame reconstruction.
 
 Provenance: the amino-acid geometry tables (``chi_angles_atoms``, ``chi_angles_mask``,
-``chi_pi_periodic``, ``rigid_group_atom_positions``, atom orderings, and the atom14 name
+``rigid_group_atom_positions``, atom orderings, and the atom14 name
 table) are copied verbatim from AlphaFold2 / OpenFold ``residue_constants.py`` (DeepMind /
 AlQuraishi Lab, Apache-2.0). Only the subset needed to build the LigandMPNN side-chain
 Packer's torsion frames is vendored here; the stereochemical-bond tables and their
@@ -82,31 +82,6 @@ chi_angles_mask = [
     [1.0, 1.0, 0.0, 0.0],  # TRP
     [1.0, 1.0, 0.0, 0.0],  # TYR
     [1.0, 0.0, 0.0, 0.0],  # VAL
-]
-
-
-chi_pi_periodic = [
-    [0.0, 0.0, 0.0, 0.0],  # ALA
-    [0.0, 0.0, 0.0, 0.0],  # ARG
-    [0.0, 0.0, 0.0, 0.0],  # ASN
-    [0.0, 1.0, 0.0, 0.0],  # ASP
-    [0.0, 0.0, 0.0, 0.0],  # CYS
-    [0.0, 0.0, 0.0, 0.0],  # GLN
-    [0.0, 0.0, 1.0, 0.0],  # GLU
-    [0.0, 0.0, 0.0, 0.0],  # GLY
-    [0.0, 0.0, 0.0, 0.0],  # HIS
-    [0.0, 0.0, 0.0, 0.0],  # ILE
-    [0.0, 0.0, 0.0, 0.0],  # LEU
-    [0.0, 0.0, 0.0, 0.0],  # LYS
-    [0.0, 0.0, 0.0, 0.0],  # MET
-    [0.0, 1.0, 0.0, 0.0],  # PHE
-    [0.0, 0.0, 0.0, 0.0],  # PRO
-    [0.0, 0.0, 0.0, 0.0],  # SER
-    [0.0, 0.0, 0.0, 0.0],  # THR
-    [0.0, 0.0, 0.0, 0.0],  # TRP
-    [0.0, 1.0, 0.0, 0.0],  # TYR
-    [0.0, 0.0, 0.0, 0.0],  # VAL
-    [0.0, 0.0, 0.0, 0.0],  # UNK
 ]
 
 

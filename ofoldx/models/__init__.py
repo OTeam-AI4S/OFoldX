@@ -10,47 +10,44 @@ from __future__ import annotations
 
 from .alphafold2 import AlphaFold2Config, AlphaFold2Input, AlphaFold2Model
 from .alphafold3 import AlphaFold3Config, AlphaFold3Input, AlphaFold3Model
-from .auto import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForBindingAffinityPrediction,
-    AutoModelForDesignGeneration,
-    AutoModelForStructurePrediction,
-)
+from .auto import AutoConfig, AutoModel
 from .boltz1 import Boltz1Config, Boltz1Input, Boltz1Model, Boltz1Output
 from .boltz2 import Boltz2AffinityConfig, Boltz2AffinityModel, Boltz2Config, Boltz2Input, Boltz2Model
 from .boltzgen import (
     BoltzGenAdherenceConfig,
     BoltzGenConfig,
-    BoltzGenDesignGenerator,
+    BoltzGenDesigner,
     BoltzGenDiverseConfig,
     BoltzGenIFoldConfig,
-    BoltzGenIFoldGenerator,
     BoltzGenInput,
+    BoltzGenInverseFoldDesigner,
     BoltzGenStructureTrainedSmallConfig,
 )
 from .contract import (
+    AllAtomDesignCandidate,
     BaseInput,
-    BindingAffinityPredictionOutput,
+    BindingAffinityOutput,
     DesignCandidate,
-    DesignGeneratorOutput,
     DesignOutput,
+    SequenceDesignCandidate,
+    StructureDesignCandidate,
     StructurePredictionOutput,
+    register_pytree_dataclass,
 )
 from .esmfold2 import ESMFold2Config, ESMFold2Input, ESMFold2Model, ESMFold2Processor
-from .ligandmpnn import LigandMPNNConfig, LigandMPNNDesignGenerator, LigandMPNNInput
+from .ligandmpnn import LigandMPNNConfig, LigandMPNNDesigner, LigandMPNNInput
 from .mixin import ModelMixin, no_init_weights
-from .nampnn import NAMPNNConfig, NAMPNNDesignGenerator, NAMPNNInput, NAMPNNProcessor
-from .odesign import ODesignConfig, ODesignDesignConfig, ODesignDesignGenerator, ODesignInput, ODesignModel
-from .proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesignGenerator, ProteinMPNNInput
+from .nampnn import NAMPNNConfig, NAMPNNDesigner, NAMPNNInput, NAMPNNProcessor
+from .odesign import ODesignConfig, ODesignDesignConfig, ODesignDesigner, ODesignInput, ODesignModel
+from .proteinmpnn import ProteinMPNNConfig, ProteinMPNNDesigner, ProteinMPNNInput
 from .protenix import (
     ProtenixConfig,
     ProtenixConstraintFeatures,
     ProtenixInput,
     ProtenixModel,
 )
-from .pxdesign import PxDesignConfig, PxDesignDesignGenerator, PxDesignInput
-from .rfdiffusion import RfDiffusionConfig, RfDiffusionDesignGenerator, RfDiffusionInput
+from .pxdesign import PxDesignConfig, PxDesignDesigner, PxDesignInput
+from .rfdiffusion import RfDiffusionConfig, RfDiffusionDesigner, RfDiffusionInput
 
 __all__ = [
     "AlphaFold2Config",
@@ -61,11 +58,8 @@ __all__ = [
     "AlphaFold3Model",
     "AutoConfig",
     "AutoModel",
-    "AutoModelForBindingAffinityPrediction",
-    "AutoModelForDesignGeneration",
-    "AutoModelForStructurePrediction",
     "BaseInput",
-    "BindingAffinityPredictionOutput",
+    "BindingAffinityOutput",
     "Boltz1Config",
     "Boltz1Input",
     "Boltz1Model",
@@ -77,45 +71,48 @@ __all__ = [
     "Boltz2Model",
     "BoltzGenAdherenceConfig",
     "BoltzGenConfig",
-    "BoltzGenDesignGenerator",
+    "BoltzGenDesigner",
     "BoltzGenDiverseConfig",
     "BoltzGenIFoldConfig",
-    "BoltzGenIFoldGenerator",
+    "BoltzGenInverseFoldDesigner",
     "BoltzGenInput",
     "BoltzGenStructureTrainedSmallConfig",
+    "AllAtomDesignCandidate",
     "DesignCandidate",
-    "DesignGeneratorOutput",
     "DesignOutput",
+    "SequenceDesignCandidate",
+    "StructureDesignCandidate",
     "ESMFold2Config",
     "ESMFold2Input",
     "ESMFold2Model",
     "ESMFold2Processor",
     "LigandMPNNConfig",
-    "LigandMPNNDesignGenerator",
+    "LigandMPNNDesigner",
     "LigandMPNNInput",
     "ModelMixin",
     "NAMPNNConfig",
-    "NAMPNNDesignGenerator",
+    "NAMPNNDesigner",
     "NAMPNNInput",
     "NAMPNNProcessor",
     "ODesignConfig",
     "ODesignDesignConfig",
-    "ODesignDesignGenerator",
+    "ODesignDesigner",
     "ODesignInput",
     "ODesignModel",
     "ProteinMPNNConfig",
-    "ProteinMPNNDesignGenerator",
+    "ProteinMPNNDesigner",
     "ProteinMPNNInput",
     "ProtenixConfig",
     "ProtenixConstraintFeatures",
     "ProtenixInput",
     "ProtenixModel",
     "PxDesignConfig",
-    "PxDesignDesignGenerator",
+    "PxDesignDesigner",
     "PxDesignInput",
     "RfDiffusionConfig",
-    "RfDiffusionDesignGenerator",
+    "RfDiffusionDesigner",
     "RfDiffusionInput",
     "StructurePredictionOutput",
     "no_init_weights",
+    "register_pytree_dataclass",
 ]

@@ -17,6 +17,7 @@ from .config import (
 from .model import (
     AlphaFold2Input,
     AlphaFold2Model,
+    AlphaFold2Output,
     AlphaFold2Representations,
     AlphaFold2StructureModuleOutput,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "AlphaFold2InputEmbeddingConfig",
     "AlphaFold2Input",
     "AlphaFold2Model",
+    "AlphaFold2Output",
     "AlphaFold2Processor",
     "AlphaFold2RecyclingConfig",
     "AlphaFold2Representations",

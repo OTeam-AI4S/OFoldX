@@ -13,13 +13,22 @@ from __future__ import annotations
 
 from .base import Pipeline, StructureProcessor
 from .binding_affinity import BindingAffinityInput, BindingAffinityPipeline
-from .design import DesignInput, DesignPipeline
+from .design import (
+    AllAtomDesignPipeline,
+    BackboneDesignPipeline,
+    DesignInput,
+    DesignPipeline,
+    SequenceDesignPipeline,
+)
 from .side_chain_packing import SideChainPackingInput, SideChainPackingPipeline
 from .structure_prediction import StructurePredictionInput, StructurePredictionPipeline
 
 __all__ = [
+    "AllAtomDesignPipeline",
+    "BackboneDesignPipeline",
     "DesignInput",
     "DesignPipeline",
+    "SequenceDesignPipeline",
     "BindingAffinityInput",
     "BindingAffinityPipeline",
     "Pipeline",

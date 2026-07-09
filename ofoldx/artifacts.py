@@ -100,14 +100,6 @@ def build_artifact_manifest(
     return manifest
 
 
-def has_artifact_manifest(path: str | PathLike[str]) -> bool:
-    """
-    Return whether ``path`` directly contains ``manifest.json``.
-    """
-
-    return (Path(path) / ARTIFACT_MANIFEST_NAME).is_file()
-
-
 def read_artifact_manifest(path: str | PathLike[str], *, expected_kind: str | None = None) -> Config:
     """
     Read and validate the root ``manifest.json`` under an artifact directory.

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from ofoldx.io import read_mmcif, read_pdb
+from ofoldx.data.structure import AtomRecord, ResidueKey, Structure
+from ofoldx.io import read_mmcif, read_pdb, write_mmcif, write_structure
 
 ATOM_SITE_COLUMNS = (
     "group_PDB",
@@ -187,3 +188,46 @@ def test_empty_structure_raises(write, name, reader, text):
     # A hydrogen-only input counts as empty once H is filtered.
     with pytest.raises(ValueError, match="at least one atom"):
         reader(write(name, text))
+
+
+def _protein_structure() -> Structure:
+    r"""A tiny two-residue, two-chain protein structure with one inter-residue bond."""
+
+    atoms = (
+        AtomRecord("N", "N", "ALA", ResidueKey("A", 1), 1.0, 2.0, 3.0),
+        AtomRecord("CA", "C", "ALA", ResidueKey("A", 1), 1.5, 2.5, 3.5),
+        AtomRecord("C", "C", "ALA", ResidueKey("A", 1), 2.0, 3.0, 4.0),
+        AtomRecord("N", "N", "GLY", ResidueKey("B", 2), 5.0, 6.0, 7.0),
+    )
+    return Structure(atoms, bonds=((2, 3),))
+
+
+@pytest.mark.parametrize("suffix", ["pdb", "cif"])
+def test_write_read_round_trip(tmp_path, suffix):
+    # write_structure -> read_* recovers atom identity and coordinates for both formats.
+    structure = _protein_structure()
+    path = tmp_path / f"structure.{suffix}"
+    write_structure(structure, path)
+    loaded = read_mmcif(path) if suffix == "cif" else read_pdb(path)
+    assert [atom.name for atom in loaded.atoms] == [atom.name for atom in structure.atoms]
+    assert [atom.element for atom in loaded.atoms] == [atom.element for atom in structure.atoms]
+    assert [atom.residue for atom in loaded.atoms] == [atom.residue for atom in structure.atoms]
+    for loaded_atom, original in zip(loaded.atoms, structure.atoms):
+        assert (loaded_atom.x, loaded_atom.y, loaded_atom.z) == pytest.approx(
+            (original.x, original.y, original.z), abs=1e-3
+        )
+
+
+def test_write_mmcif_currently_drops_inter_residue_bonds(tmp_path):
+    # Known limitation: the installed biotite does not emit struct_conn, so inter-residue bonds are not
+    # written; atoms still round-trip. If a future biotite writes them, this test flags the revisit.
+    path = tmp_path / "bonded.cif"
+    write_mmcif(_protein_structure(), path)
+    reloaded = read_mmcif(path)
+    assert len(reloaded.atoms) == 4
+    assert reloaded.bonds == ()
+
+
+def test_write_structure_rejects_unknown_format(tmp_path):
+    with pytest.raises(ValueError, match="unsupported structure format"):
+        write_structure(_protein_structure(), tmp_path / "structure.xyz")

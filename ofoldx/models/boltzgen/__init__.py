@@ -3,8 +3,8 @@ BoltzGen design-generator models.
 
 Public surface of the BoltzGen family: the structure-generating and inverse-folding generators, their
 configurations, and the structure processor. See
-[`BoltzGenDesignGenerator`][ofoldx.models.boltzgen.model.BoltzGenDesignGenerator] and
-[`BoltzGenIFoldGenerator`][ofoldx.models.boltzgen.model.BoltzGenIFoldGenerator] for the model entry points.
+[`BoltzGenDesigner`][ofoldx.models.boltzgen.model.BoltzGenDesigner] and
+[`BoltzGenInverseFoldDesigner`][ofoldx.models.boltzgen.model.BoltzGenInverseFoldDesigner] for the model entry points.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .config import (
     BoltzGenTemplateConfig,
     BoltzGenTrunkConfig,
 )
-from .model import BoltzGenDesignGenerator, BoltzGenIFoldGenerator, BoltzGenInput
+from .model import BoltzGenDesigner, BoltzGenInput, BoltzGenInverseFoldDesigner
 from .processor import BoltzGenProcessor
 
 __all__ = [
@@ -36,11 +36,11 @@ __all__ = [
     "BoltzGenDiverseConfig",
     "BoltzGenStructureDesignConfig",
     "BoltzGenStructureTrainedSmallConfig",
-    "BoltzGenDesignGenerator",
+    "BoltzGenDesigner",
     "BoltzGenDiffusionConfig",
     "BoltzGenIFoldConfig",
     "BoltzGenIFoldModuleConfig",
-    "BoltzGenIFoldGenerator",
+    "BoltzGenInverseFoldDesigner",
     "BoltzGenInput",
     "BoltzGenInputEmbedderConfig",
     "BoltzGenProcessor",

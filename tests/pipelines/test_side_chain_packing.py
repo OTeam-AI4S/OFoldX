@@ -7,7 +7,7 @@ from chanfig import Config
 
 from ofoldx.data import AtomRecord, ResidueKey, Structure
 from ofoldx.models import AutoModel
-from ofoldx.models.ligandmpnn import Packer, PackerConfig
+from ofoldx.models.ligandmpnn import LigandMPNNPacker, LigandMPNNPackerConfig
 from ofoldx.pipelines import Pipeline, SideChainPackingPipeline
 from ofoldx.pipelines.auto import PIPELINE_MANIFEST_NAME
 
@@ -28,9 +28,9 @@ def protein_backbone_structure() -> Structure:
     return Structure(tuple(atoms))
 
 
-def tiny_packer() -> Packer:
-    return Packer(
-        PackerConfig(
+def tiny_packer() -> LigandMPNNPacker:
+    return LigandMPNNPacker(
+        LigandMPNNPackerConfig(
             {
                 "hidden_size": 16,
                 "num_encoder_layers": 1,
@@ -69,8 +69,8 @@ def test_side_chain_packing_pipeline_round_trips_package(tmp_path: Path) -> None
     assert manifest["entrypoint"] == "ofoldx.pipelines.side_chain_packing.SideChainPackingPipeline"
     assert manifest["components"]["packer"]["path"] == "packer"
     assert isinstance(loaded, SideChainPackingPipeline)
-    assert isinstance(loaded.model, Packer)
-    assert isinstance(loaded_model, Packer)
+    assert isinstance(loaded.model, LigandMPNNPacker)
+    assert isinstance(loaded_model, LigandMPNNPacker)
     assert output["X"].shape[-2:] == (14, 3)
 
 

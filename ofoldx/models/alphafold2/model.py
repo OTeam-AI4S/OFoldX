@@ -9,19 +9,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...data import residue_constants
 from ...modules.attention import GatedMultiheadAttention
+from ...modules.backend import LayerNorm
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
 from ...modules.head.frames import gather_atoms_by_index
+from ...modules.representation import Pair, Single
 from ...modules.transition import RowwiseDropout
 from ...modules.trunk import EvoformerStack
 from ...modules.trunk.evoformer import (
@@ -29,7 +30,7 @@ from ...modules.trunk.evoformer import (
     TriangleAttention,
     TriangleMultiplication,
 )
-from ..contract import BaseInput, StructurePredictionOutput
+from ..contract import BaseInput, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
 from ..registry import MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import AlphaFold2Config
@@ -47,6 +48,9 @@ class AlphaFold2Model(ModelMixin):
     """
 
     config_class = AlphaFold2Config
+    #: Typed input built by the keyword-tensor call path; assigned to
+    #: [`AlphaFold2Input`][ofoldx.models.alphafold2.AlphaFold2Input] below its definition.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: AlphaFold2Config) -> None:
         super().__init__(config)
@@ -219,12 +223,106 @@ class AlphaFold2Model(ModelMixin):
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> StructurePredictionOutput:
+    ) -> AlphaFold2Output | StructurePredictionOutput:
         r"""
-        Run AF2 recycling, structure generation, and output heads.
+        Training path: run AF2 recycling, structure generation, and every output head.
+
+        ``forward`` is the *training* path. It returns an
+        [`AlphaFold2Output`][ofoldx.models.alphafold2.AlphaFold2Output] carrying the raw
+        per-token logits and structure trajectory a loss consumes (distogram, masked-MSA,
+        pLDDT, PAE, experimentally-resolved, plus the FAPE frame trajectory and side-chain
+        angles). Gradients flow through the final recycle only, mirroring the AlphaFold 2
+        recycling schedule. Inference (confidence packaging and the sample axis) lives in
+        [`fold`][ofoldx.models.alphafold2.AlphaFold2Model.fold]; for backward compatibility
+        an eval-mode call delegates to ``fold`` so ``model(batch)`` keeps predicting a
+        structure when not training.
 
         ``recycling_steps`` counts extra recycles after the first representation
         pass, so ``3`` runs four representation/structure iterations.
+
+        Args:
+            batch: Typed AlphaFold 2 input.
+            recycling_steps: Extra recycles after the first pass; ``None`` uses the config value.
+            num_samples: Sample-axis size when delegating to ``fold`` in eval mode.
+            num_sampling_steps: Ignored; accepted for the eval-mode ``fold`` delegation signature.
+            generator: Ignored; accepted for the eval-mode ``fold`` delegation signature.
+
+        Returns:
+            An [`AlphaFold2Output`][ofoldx.models.alphafold2.AlphaFold2Output] in training mode,
+            or a [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]
+            from the ``fold`` delegation in eval mode.
+        """
+
+        if not self.training:
+            return self.fold(
+                batch,
+                recycling_steps=recycling_steps,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                generator=generator,
+            )
+        del num_samples, num_sampling_steps, generator
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if recycling_steps < 0:
+            raise ValueError(f"recycling_steps must be non-negative, got {recycling_steps}")
+
+        representations, structure = self._run_recycling(batch, recycling_steps=recycling_steps)
+        single = representations.single.tensor
+        pair = representations.pair.tensor
+        pae_logits = None if self.predicted_aligned_error_head is None else self.predicted_aligned_error_head(pair)
+        return AlphaFold2Output(
+            single=representations.single,
+            pair=representations.pair,
+            frames=structure.traj,
+            final_atom_positions=structure.final_atom_positions,
+            final_atom_mask=structure.final_atom_mask,
+            sidechain_angles=structure.sidechain_angles,
+            sidechain_unnormalized_angles=structure.sidechain_unnormalized_angles,
+            distogram_logits=self.distogram_head(pair),
+            masked_msa_logits=self.masked_msa_head(representations.msa),
+            plddt_logits=self.predicted_lddt_head(structure.structure_module),
+            pae_logits=pae_logits,
+            resolved_logits=self.experimentally_resolved_head(single),
+        )
+
+    @torch.no_grad()
+    def fold(
+        self,
+        batch: AlphaFold2Input,
+        *,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructurePredictionOutput:
+        r"""
+        Inference path: predict a structure and confidence for ``batch``.
+
+        Runs the same recycling trunk as `forward` under ``no_grad``, maps the
+        atom37 output onto the input atom layout, and packages the result into a
+        [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]
+        carrying an explicit ``num_samples`` axis. AlphaFold 2 is deterministic, so
+        ``num_sampling_steps`` and ``generator`` are accepted for a uniform
+        structure-prediction verb signature but do not affect the output.
+
+        Args:
+            batch: Typed AlphaFold 2 input.
+            recycling_steps: Extra recycles after the first pass; ``None`` uses the config value.
+            num_samples: Size of the broadcast sample axis on every returned tensor.
+            num_sampling_steps: Ignored (AF2 is single-pass); accepted for signature parity.
+            generator: Ignored (AF2 is deterministic); accepted for signature parity.
+
+        Returns:
+            Structure-prediction output with a ``num_samples`` sample axis.
+
+        Raises:
+            ValueError: If ``recycling_steps`` is negative or ``num_samples`` is not positive.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> processor = AutoProcessor.from_pretrained("ofoldx/alphafold2")  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("ofoldx/alphafold2")  # doctest: +SKIP
+            >>> output = model.fold(processor("complex.cif"))  # doctest: +SKIP
         """
 
         del num_sampling_steps, generator
@@ -235,6 +333,8 @@ class AlphaFold2Model(ModelMixin):
             raise ValueError(f"num_samples must be positive, got {num_samples}")
 
         representations, structure = self._run_recycling(batch, recycling_steps=recycling_steps)
+        single = representations.single.tensor
+        pair = representations.pair.tensor
         atom_positions = _gather_input_atom_positions(structure.final_atom_positions, batch)
         pred_coords = atom_positions.unsqueeze(-3).expand(
             *atom_positions.shape[:-2],
@@ -250,18 +350,18 @@ class AlphaFold2Model(ModelMixin):
             pae_logits = None
         else:
             pae_logits = self._expand_sample_axis(
-                self.predicted_aligned_error_head(representations.pair),
+                self.predicted_aligned_error_head(pair),
                 num_samples=num_samples,
                 event_ndim=2,
             ).contiguous()
         resolved_logits = self._expand_sample_axis(
-            self.experimentally_resolved_head(representations.single),
+            self.experimentally_resolved_head(single),
             num_samples=num_samples,
             event_ndim=1,
         )
         return StructurePredictionOutput(
             pred_coords=pred_coords.contiguous(),
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=self.distogram_head(pair),
             plddt_logits=plddt_logits.contiguous(),
             pae_logits=pae_logits,
             resolved_logits=resolved_logits.contiguous(),
@@ -280,7 +380,7 @@ class AlphaFold2Model(ModelMixin):
             grad_enabled = torch.is_grad_enabled() and (not self.training or cycle == recycling_steps)
             with torch.set_grad_enabled(grad_enabled):
                 representations = self._embed_and_refine(batch, recycling=recycling)
-                structure = self.structure_module(representations.single, representations.pair, batch)
+                structure = self.structure_module(representations.single.tensor, representations.pair.tensor, batch)
                 representations.structure_module = structure.structure_module
             final_representations = representations
             final_structure = structure
@@ -288,7 +388,7 @@ class AlphaFold2Model(ModelMixin):
                 recycling = AlphaFold2RecyclingInput(
                     prev_pos=structure.final_atom_positions.detach(),
                     prev_msa_first_row=representations.msa_first_row.detach(),
-                    prev_pair=representations.pair.detach(),
+                    prev_pair=representations.pair.tensor.detach(),
                 )
         if final_representations is None or final_structure is None:
             raise RuntimeError("AF2 recycling produced no output")
@@ -337,7 +437,12 @@ class AlphaFold2Model(ModelMixin):
         )
         msa_first_row = msa.select(dim=-3, index=0)
         single = self.single_activations(msa_first_row)
-        return AlphaFold2Representations(msa=msa, single=single, pair=pair, msa_first_row=msa_first_row)
+        return AlphaFold2Representations(
+            msa=msa,
+            single=Single(single),
+            pair=Pair(pair),
+            msa_first_row=msa_first_row,
+        )
 
     def _initial_recycling(self, batch: AlphaFold2Input) -> AlphaFold2RecyclingInput:
         token_shape = batch.token_mask.shape
@@ -1793,6 +1898,7 @@ def _pseudo_beta_from_atom37(atom37_positions: Tensor, batch: AlphaFold2Input) -
     return atom37_positions.gather(-2, gather_index).squeeze(-2)
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class AlphaFold2Input(BaseInput):
     r"""
@@ -1873,14 +1979,61 @@ class AlphaFold2EmbeddedInputs:
     pair_mask: Tensor
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class AlphaFold2Representations:
     r"""
     Representation bundle emitted by the Evoformer stack.
+
+    ``single`` and ``pair`` are typed [`Single`][ofoldx.modules.representation.Single] /
+    [`Pair`][ofoldx.modules.representation.Pair] carriers at this boundary; unwrap
+    ``.tensor`` before feeding the structure module or output heads. Both carriers are
+    pytree-registered, so this bundle flattens without a graph break under ``torch.compile``.
     """
 
     msa: Tensor
-    single: Tensor
-    pair: Tensor
+    single: Single
+    pair: Pair
     msa_first_row: Tensor
     structure_module: Tensor | None = None
+
+    def detach(self) -> AlphaFold2Representations:
+        r"""
+        Return a copy with every tensor (including the ``Single`` / ``Pair`` carriers) detached.
+        """
+
+        return AlphaFold2Representations(
+            msa=self.msa.detach(),
+            single=Single(self.single.tensor.detach()),
+            pair=Pair(self.pair.tensor.detach()),
+            msa_first_row=self.msa_first_row.detach(),
+            structure_module=None if self.structure_module is None else self.structure_module.detach(),
+        )
+
+
+@register_pytree_dataclass
+@dataclass(slots=True)
+class AlphaFold2Output:
+    r"""
+    Training output of [`AlphaFold2Model.forward`][ofoldx.models.alphafold2.AlphaFold2Model.forward].
+
+    Bundles the raw per-token logits and structure trajectory a loss consumes. ``single``
+    and ``pair`` are typed carriers at the boundary; ``frames`` is the ``[num_layer, ...]``
+    quaternion-affine trajectory used for FAPE supervision.
+    """
+
+    single: Single
+    pair: Pair
+    frames: Tensor
+    final_atom_positions: Tensor
+    final_atom_mask: Tensor
+    sidechain_angles: Tensor
+    sidechain_unnormalized_angles: Tensor
+    distogram_logits: Tensor
+    masked_msa_logits: Tensor
+    plddt_logits: Tensor
+    pae_logits: Tensor | None
+    resolved_logits: Tensor
+
+
+AlphaFold2Model.input_class = AlphaFold2Input

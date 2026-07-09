@@ -17,7 +17,7 @@ def train() -> Any:
 
     Builds a [`Config`][ofoldx.runners.Config] from the command line (falling back to the
     ``config`` default), constructs the matching runner from the [`RUNNERS`][ofoldx.runners]
-    registry, and drives its training loop. This is the ``ofoldx-train`` console entry point.
+    registry, and drives its training loop. This is the ``otrain`` console entry point.
 
     Returns:
         Whatever the selected runner's ``train`` method returns (typically the final training
@@ -42,7 +42,7 @@ def evaluate() -> Any:
 
     Parses a [`Config`][ofoldx.runners.Config] from the command line, builds the matching
     runner from the [`RUNNERS`][ofoldx.runners] registry, and runs a single evaluation pass
-    over the configured dataset. This is the ``ofoldx-evaluate`` console entry point.
+    over the configured dataset. This is the ``oevaluate`` console entry point.
 
     Returns:
         The evaluation result produced by the selected runner's ``evaluate`` method (typically a
@@ -69,7 +69,7 @@ def infer() -> Any:
     Parses a [`Config`][ofoldx.runners.Config] from the command line, builds the matching
     runner from the [`RUNNERS`][ofoldx.runners] registry, and runs its inference pipeline.
     When the runner returns a list of prediction batches their count is echoed to stdout. This is
-    the ``ofoldx-infer`` console entry point.
+    the ``oinfer`` console entry point.
 
     Returns:
         The inference result produced by the selected runner's ``infer`` method, commonly a list

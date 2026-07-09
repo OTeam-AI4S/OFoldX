@@ -4,11 +4,10 @@ Transition blocks and the companion row-wise dropout used in trunk/atom blocks.
 
 from __future__ import annotations
 
-from oops import LayerNorm
 from torch import Tensor, nn
 
-from .adaptive_norm import BoltzAdaptiveLayerNorm
-from .backend import resolve_config_operator_backend
+from .adaptive_norm import AdaptiveLayerNorm
+from .backend import LayerNorm, resolve_config_operator_backend
 from .backend import transition as dispatch_transition
 
 
@@ -158,7 +157,7 @@ class ConditionedTransition(nn.Module):
     ) -> None:
         super().__init__()
         expanded_size = expansion * hidden_size
-        self.conditioned_norm = BoltzAdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)

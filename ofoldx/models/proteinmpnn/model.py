@@ -7,31 +7,77 @@ from __future__ import annotations
 import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..contract import BaseInput, DesignGeneratorOutput
+from ...modules.message_passing import (
+    ProteinDecoderLayer,
+    ProteinEncoderLayer,
+    RelativePositionEncoding,
+    cat_neighbors_nodes,
+    gather_edges,
+    gather_nodes,
+)
+from ...modules.representation import Single
+from ..contract import BaseInput, SequenceDesignCandidate, register_pytree_dataclass
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS
+from ..registry import DESIGN_MODELS, MODELS
 from .config import ProteinMPNNConfig
 
 
+@register_pytree_dataclass
+@dataclass(slots=True)
+class ProteinMPNNRepresentations:
+    r"""
+    Encoder output at the ProteinMPNN message-passing boundary.
+
+    Wraps the encoded node states in the typed [`Single`][ofoldx.modules.representation.Single] carrier -- the
+    ProteinMPNN analogue of a trunk single representation -- so the encode boundary is axis-typed the same way
+    [`StructurePredictionOutput.coords`][ofoldx.models.contract.StructurePredictionOutput] wraps predicted
+    coordinates. The decoder consumes raw tensors, so callers unwrap ``single.tensor`` before the autoregressive
+    decode step.
+
+    ProteinMPNN has no dense ``token_i x token_j`` pair representation: its edges live on a sparse
+    ``k``-nearest-neighbor graph with shape ``(B, L, K, hidden)`` (``K != L``), which does not satisfy the
+    [`Pair`][ofoldx.modules.representation.Pair] carrier's equal ``i``/``j`` axis contract. The graph edges and
+    neighbor index therefore ride along as raw tensors rather than a mislabelled ``Pair``.
+
+    The dataclass is registered as a ``torch.utils._pytree`` node (via the ``Single`` carrier and
+    [`register_pytree_dataclass`][ofoldx.models.contract.register_pytree_dataclass]), so ``torch.compile`` traces
+    straight through it with no graph break.
+
+    Attributes:
+        single: Encoded node states ``(B, L, hidden)`` as a ``Single`` carrier.
+        edges: Encoded edge states over the neighbor graph ``(B, L, K, hidden)``.
+        neighbor_idx: Neighbor index ``(B, L, K)``.
+    """
+
+    single: Single
+    edges: Tensor
+    neighbor_idx: Tensor
+
+
 @MODELS.register("proteinmpnn")
-@DESIGN_GENERATOR_MODELS.register("proteinmpnn")
-class ProteinMPNNDesignGenerator(ModelMixin):
+@DESIGN_MODELS.register("proteinmpnn")
+class ProteinMPNNDesigner(ModelMixin):
     r"""
     Message-passing model that designs and scores sequences for a fixed protein backbone
     (ProteinMPNN inverse folding).
 
     Runs the ProteinMPNN encoder/decoder over the backbone coordinates in a
     [`ProteinMPNNInput`][ofoldx.models.proteinmpnn.model.ProteinMPNNInput] and returns a
-    [`DesignGeneratorOutput`][ofoldx.models.contract.DesignGeneratorOutput]. The high-level methods cover
-    scoring (``score``, ``single_residue_score``), autoregressive design (``sample``/``generate``,
-    ``tied_sample``), and per-residue probabilities (``conditional_probs``, ``unconditional_probs``); numerics
-    match the released reference so converted checkpoints reproduce upstream results.
+    [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate].
+
+    ``forward`` is the **training** path: it runs the teacher-forced encoder/decoder (upstream
+    ``ProteinMPNN.forward``) and returns per-residue ``log_probs`` a sequence-recovery loss is taken over, with
+    gradients flowing through the whole message-passing stack. ``design`` is the **inference** capability verb: it
+    autoregressively samples sequences under ``torch.no_grad`` (dispatching to the tied-position decoder when the
+    input carries ``tied_positions``). The scoring verbs (``score``, ``single_residue_score``,
+    ``conditional_probs``, ``unconditional_probs``) evaluate a given sequence; numerics match the released
+    reference so converted checkpoints reproduce upstream results.
 
     Args:
         config: Architecture configuration. Defaults to a fresh
@@ -42,10 +88,13 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         >>> processor = AutoProcessor.from_pretrained("proteinmpnn")  # doctest: +SKIP
         >>> model = AutoModel.from_pretrained("proteinmpnn")  # doctest: +SKIP
         >>> batch = processor("complex.pdb")  # doctest: +SKIP
-        >>> output = model.sample(batch, temperature=0.1)  # doctest: +SKIP
+        >>> output = model.design(batch, temperature=0.1)  # doctest: +SKIP
     """
 
     config_class = ProteinMPNNConfig
+    #: Typed input built by the keyword-tensor call path ``model(**inputs)``; assigned at module load once
+    #: ``ProteinMPNNInput`` is defined (see the bottom of this module).
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: ProteinMPNNConfig | None = None) -> None:
         config = ProteinMPNNConfig() if config is None else config
@@ -64,7 +113,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         biases and 1-D parameters untouched, exactly as the reference does for freshly-created models.
 
         Examples:
-            >>> model = ProteinMPNNDesignGenerator()  # doctest: +SKIP
+            >>> model = ProteinMPNNDesigner()  # doctest: +SKIP
             >>> model.reset_parameters()  # doctest: +SKIP
         """
 
@@ -78,26 +127,32 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Score an input sequence against the backbone (delegates to ``score``).
+        Training forward: teacher-forced sequence-recovery logits over the backbone (upstream ``ProteinMPNN.forward``).
 
-        Provided so the model is callable; identical to
-        [`score`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator.score].
+        Runs the encoder once and the autoregressive decoder over a noised decode order with the true sequence
+        teacher-forced, returning per-residue ``log_probs`` a cross-entropy sequence-recovery loss is taken over.
+        Gradients flow through the entire message-passing stack, so this is the model's training entry point;
+        [`design`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner.design] is the distinct ``torch.no_grad``
+        inference path. The computation is identical to
+        [`score`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner.score] (teacher-forced logits are the same
+        tensors used for scoring); ``forward`` simply leaves autograd enabled.
 
         Args:
-            batch: Typed ProteinMPNN input carrying backbone coords and the sequence to score.
-            use_sequence: Whether to condition on the input sequence identities; ``False`` scores from backbone
+            batch: Typed ProteinMPNN input carrying backbone coords and the true sequence to recover.
+            use_sequence: Whether to teacher-force on the input sequence identities; ``False`` trains from backbone
                 context alone.
             num_samples: Number of decode orders to average over; ``None`` uses the batch default.
 
         Returns:
-            A design output whose ``scores`` hold per-residue ``log_probs`` and the sequence log-likelihood.
+            A design output whose ``scores`` hold per-residue ``log_probs`` `[B, L, 21]` and the per-sequence
+            ``sequence_log_likelihood`` (negate and mean-reduce for the training loss).
 
         Examples:
             >>> output = model(batch)  # doctest: +SKIP
-            >>> output.scores["sequence_log_likelihood"].shape  # doctest: +SKIP
-            torch.Size([1])
+            >>> loss = -output.scores["sequence_log_likelihood"].mean()  # doctest: +SKIP
+            >>> loss.backward()  # doctest: +SKIP
         """
 
         return self.score(batch, use_sequence=use_sequence, num_samples=num_samples)
@@ -108,7 +163,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Score a sequence against the backbone with the standard one-pass decoder.
 
@@ -134,7 +189,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.score(features, use_sequence=use_sequence)
         log_probs = scored["log_probs"]
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={
@@ -155,7 +210,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         *,
         use_sequence: bool = True,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Score each residue with the official single-position decoding protocol.
 
@@ -181,7 +236,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.single_residue_score(features, use_sequence=use_sequence)
         log_probs = scored["log_probs"]
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={
@@ -198,20 +253,22 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         )
 
     @torch.no_grad()
-    def generate(
+    def design(
         self,
         batch: ProteinMPNNInput,
         *,
         temperature: float | Tensor | None = None,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Generate designed sequences under ``torch.no_grad`` (delegates to ``sample``).
+        Design sequences for the backbone by autoregressive sampling under ``torch.no_grad`` (inference verb).
 
-        The public inference entry point; identical to
-        [`sample`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator.sample] but wrapped so no
-        autograd graph is built.
+        The house design capability verb and the model's distinct inference path (``forward`` is the training
+        path). Draws each position from ``softmax((logits + bias) / temperature)`` in the noised decode order,
+        honoring the full conditioning surface (fixed positions, per-residue bias, PSSM, omit-AA); native symmetric
+        residue groups are decoded jointly when present. When the input carries ``tied_positions`` the tied-position
+        decoder is used so each tied group shares one sampled amino acid (upstream ``tied_sample``).
 
         Args:
             batch: Typed ProteinMPNN input for a single backbone (batch axis size one).
@@ -223,27 +280,30 @@ class ProteinMPNNDesignGenerator(ModelMixin):
             A design output with sampled tokens/logits and ``scores`` holding ``log_probs`` and ``sampling_probs``.
 
         Examples:
-            >>> output = model.generate(batch, temperature=0.1, num_samples=8)  # doctest: +SKIP
+            >>> output = model.design(batch, temperature=0.1, num_samples=8)  # doctest: +SKIP
             >>> output.sequence_tokens.shape  # doctest: +SKIP
             torch.Size([8, 9])
         """
 
-        return self.sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
+        if batch.tied_positions:
+            return self._tied_sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
+        return self._sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
 
-    def sample(
+    def _sample(
         self,
         batch: ProteinMPNNInput,
         *,
         temperature: float | Tensor | None = None,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Autoregressively sample sequences for the backbone (upstream ``ProteinMPNN.sample``).
+        Independent-position autoregressive sampler backing ``design`` (upstream ``ProteinMPNN.sample``).
 
         Draws each position from ``softmax((logits + bias) / temperature)`` in the noised decode order, honoring
         the full conditioning surface (fixed positions, per-residue bias, PSSM, omit-AA). Symmetric residue groups
-        are decoded jointly when present.
+        are decoded jointly when present. Private: callers reach it through
+        [`design`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner.design].
 
         Args:
             batch: Typed ProteinMPNN input for a single backbone (batch axis size one).
@@ -254,11 +314,6 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         Returns:
             A design output with sampled tokens/logits and ``scores`` holding ``log_probs`` `[num_samples, L, 21]`
             and per-position ``sampling_probs``.
-
-        Examples:
-            >>> output = model.sample(batch, temperature=0.1, num_samples=8)  # doctest: +SKIP
-            >>> output.sequence_tokens.shape  # doctest: +SKIP
-            torch.Size([8, 9])
         """
 
         features = self._feature_dict(
@@ -269,7 +324,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
             for_sampling=True,
         )
         sampled = self.backbone.sample(features)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=sampled["logits"],
             sequence_tokens=sampled["S"],
             scores={
@@ -283,20 +338,21 @@ class ProteinMPNNDesignGenerator(ModelMixin):
             },
         )
 
-    def tied_sample(
+    def _tied_sample(
         self,
         batch: ProteinMPNNInput,
         *,
         temperature: float | Tensor | None = None,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
-        Symmetric (tied-position) autoregressive sampling matching the upstream ``tied_sample`` path.
+        Tied-position autoregressive sampler backing ``design`` (upstream ``ProteinMPNN.tied_sample``).
 
         Positions in a tied group share one sampled amino acid, drawn from the ``tied_beta``-weighted mean of the
         member logits with the conditioning surface applied once per group. Tied groups come from
-        ``batch.tied_positions``.
+        ``batch.tied_positions``. Private: callers reach it through
+        [`design`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner.design].
 
         Args:
             batch: Typed ProteinMPNN input carrying ``tied_positions`` (and optional ``tied_weights``).
@@ -307,11 +363,6 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         Returns:
             A design output with sampled tokens/logits and ``scores`` holding ``log_probs`` and ``sampling_probs``,
             with tied group members sharing identical values.
-
-        Examples:
-            >>> output = model.tied_sample(batch, temperature=0.1)  # doctest: +SKIP
-            >>> output.sequence_tokens.shape  # doctest: +SKIP
-            torch.Size([1, 9])
         """
 
         features = self._feature_dict(
@@ -322,7 +373,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
             for_sampling=True,
         )
         sampled = self.backbone.tied_sample(features)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=sampled["logits"],
             sequence_tokens=sampled["S"],
             scores={
@@ -343,7 +394,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         *,
         backbone_only: bool = False,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         Per-residue conditional amino-acid log-probabilities given the rest of the context.
 
@@ -367,7 +418,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
 
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.conditional_probs(features, backbone_only=backbone_only)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={"log_probs": scored["log_probs"]},
@@ -384,7 +435,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
         batch: ProteinMPNNInput,
         *,
         num_samples: int | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> SequenceDesignCandidate:
         r"""
         One-pass unconditional amino-acid log-probabilities from backbone context alone.
 
@@ -406,7 +457,7 @@ class ProteinMPNNDesignGenerator(ModelMixin):
 
         features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
         scored = self.backbone.unconditional_probs(features)
-        return DesignGeneratorOutput(
+        return SequenceDesignCandidate(
             sequence_logits=scored["logits"],
             sequence_tokens=scored["S"],
             scores={"log_probs": scored["log_probs"]},
@@ -535,7 +586,7 @@ class ProteinMPNNBackbone(nn.Module):
 
     Holds the geometric feature encoder, the node/edge embeddings, the encoder and decoder layer stacks, and the
     output projection. Exposes the tensor-level implementation of every protocol
-    ([`ProteinMPNNDesignGenerator`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesignGenerator] wraps these in
+    ([`ProteinMPNNDesigner`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner] wraps these in
     typed inputs/outputs); each method takes the feature dict produced by ``_feature_dict`` and returns a mapping of
     result tensors.
 
@@ -601,6 +652,19 @@ class ProteinMPNNBackbone(nn.Module):
             node_states, edge_states = layer(node_states, edge_states, neighbor_idx, mask, attend_mask)
         return node_states, edge_states, neighbor_idx
 
+    @staticmethod
+    def _representations(node_states: Tensor, edge_states: Tensor, neighbor_idx: Tensor) -> ProteinMPNNRepresentations:
+        r"""
+        Wrap the raw encoder tuple in the typed
+        [`ProteinMPNNRepresentations`][ofoldx.models.proteinmpnn.model.ProteinMPNNRepresentations] boundary.
+
+        Puts the node states behind the [`Single`][ofoldx.modules.representation.Single] carrier while the sparse
+        neighbor-graph edges ride along as raw tensors (ProteinMPNN has no square ``token_i x token_j`` pair). The
+        carrier is pytree-registered, so this introduces no ``torch.compile`` graph break.
+        """
+
+        return ProteinMPNNRepresentations(single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx)
+
     def score(self, features: Mapping[str, Any], *, use_sequence: bool) -> dict[str, Tensor]:
         r"""
         Tensor-level standard scoring pass (upstream ``ProteinMPNN.forward``).
@@ -625,7 +689,12 @@ class ProteinMPNNBackbone(nn.Module):
         batch, length = sequence.shape
         device = sequence.device
 
-        node_states, edge_states, neighbor_idx = self.encode(features)
+        # Typed carrier at the encode boundary: node states are the ProteinMPNN single representation. The decoder
+        # consumes raw tensors, so unwrap ``.single.tensor`` before the autoregressive decode below.
+        representations = self._representations(*self.encode(features))
+        node_states = representations.single.tensor
+        edge_states = representations.edges
+        neighbor_idx = representations.neighbor_idx
         chain_mask_order = chain_mask if randn.shape[0] == chain_mask.shape[0] else chain_mask.repeat(num_samples, 1)
         decode_order = torch.argsort((chain_mask_order + 0.0001) * randn.abs())
         symmetry_groups = features["symmetry_residues"]
@@ -1380,220 +1449,6 @@ class ProteinBackboneFeatures(nn.Module):
         return self.edge_norm(self.edge_projection(edge_input)), neighbor_idx
 
 
-class ProteinEncoderLayer(nn.Module):
-    r"""
-    One ProteinMPNN encoder layer: neighbor-message node update, feed-forward, then edge update.
-
-    Aggregates messages from each residue's neighbors (scaled by ``scale``) with residual LayerNorm updates, applies
-    a position-wise feed-forward block, and finally refreshes the edge states from the updated node states.
-
-    Args:
-        hidden_size: Node and edge hidden width.
-        edge_input_size: Combined neighbor-context width fed to the message MLPs.
-        dropout: Dropout probability on the message and feed-forward paths.
-        scale: Divisor applied to the summed neighbor messages (upstream neighbor-count normalizer).
-    """
-
-    def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
-        super().__init__()
-        self.scale = scale
-        self.node_message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.node_dropout = nn.Dropout(dropout)
-        self.node_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = FeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
-        self.edge_message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.edge_dropout = nn.Dropout(dropout)
-        self.edge_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        node_mask: Tensor | None,
-        attend_mask: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        r"""
-        Update node and edge states from one round of neighbor message passing.
-
-        Args:
-            node_states: Node states `[B, L, hidden_size]`.
-            edge_states: Edge states `[B, L, K, hidden_size]`.
-            neighbor_idx: Neighbor index `[B, L, K]`.
-            node_mask: Optional valid-residue mask `[B, L]` zeroing padded nodes.
-            attend_mask: Optional edge attend mask `[B, L, K]` zeroing messages from invalid neighbors.
-
-        Returns:
-            Updated ``(node_states, edge_states)`` with the same shapes as the inputs.
-        """
-
-        neighbor_states = cat_neighbors_nodes(node_states, edge_states, neighbor_idx)
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, neighbor_states.shape[-2], -1)
-        node_message = self.node_message(torch.cat((source_states, neighbor_states), dim=-1))
-        if attend_mask is not None:
-            node_message = node_message * attend_mask.unsqueeze(-1)
-        node_states = self.node_norm(node_states + self.node_dropout(node_message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
-        if node_mask is not None:
-            node_states = node_states * node_mask.unsqueeze(-1)
-
-        neighbor_states = cat_neighbors_nodes(node_states, edge_states, neighbor_idx)
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, neighbor_states.shape[-2], -1)
-        edge_message = self.edge_message(torch.cat((source_states, neighbor_states), dim=-1))
-        edge_states = self.edge_norm(edge_states + self.edge_dropout(edge_message))
-        return node_states, edge_states
-
-
-class ProteinDecoderLayer(nn.Module):
-    r"""
-    One ProteinMPNN decoder layer: masked neighbor-message node update then feed-forward.
-
-    Consumes the caller-assembled autoregressive edge context (backward decoder context plus forward encoder
-    context), aggregates neighbor messages with a residual LayerNorm update, and applies a feed-forward block.
-
-    Args:
-        hidden_size: Node hidden width.
-        edge_input_size: Combined edge-context width fed to the message MLP.
-        dropout: Dropout probability on the message and feed-forward paths.
-        scale: Divisor applied to the summed neighbor messages.
-    """
-
-    def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
-        super().__init__()
-        self.scale = scale
-        self.message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.message_dropout = nn.Dropout(dropout)
-        self.message_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = FeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self,
-        node_states: Tensor,
-        edge_context: Tensor,
-        node_mask: Tensor | None = None,
-        attend_mask: Tensor | None = None,
-    ) -> Tensor:
-        r"""
-        Update node states from the autoregressive edge context.
-
-        Args:
-            node_states: Node states `[B, L, hidden_size]`.
-            edge_context: Assembled per-neighbor context `[B, L, K, edge_input_size]`.
-            node_mask: Optional valid-residue mask `[B, L]` zeroing padded nodes.
-            attend_mask: Optional per-neighbor mask zeroing disallowed messages.
-
-        Returns:
-            Updated node states `[B, L, hidden_size]`.
-        """
-
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, edge_context.shape[-2], -1)
-        message = self.message(torch.cat((source_states, edge_context), dim=-1))
-        if attend_mask is not None:
-            message = message * attend_mask.unsqueeze(-1)
-        node_states = self.message_norm(node_states + self.message_dropout(message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
-        if node_mask is not None:
-            node_states = node_states * node_mask.unsqueeze(-1)
-        return node_states
-
-
-class MessageMLP(nn.Module):
-    r"""
-    Three-layer GELU message network used to compute neighbor messages.
-
-    Args:
-        input_size: Width of the concatenated source/neighbor context input.
-        hidden_size: Width of the two hidden layers and the message output.
-    """
-
-    def __init__(self, input_size: int, hidden_size: int) -> None:
-        super().__init__()
-        self.input = nn.Linear(input_size, hidden_size)
-        self.middle = nn.Linear(hidden_size, hidden_size)
-        self.output = nn.Linear(hidden_size, hidden_size)
-        self.activation = nn.GELU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        r"""
-        Apply the three-layer GELU MLP to a message context tensor.
-
-        Args:
-            x: Message context `[..., input_size]`.
-
-        Returns:
-            The message `[..., hidden_size]`.
-        """
-
-        return self.output(self.activation(self.middle(self.activation(self.input(x)))))
-
-
-class FeedForward(nn.Module):
-    r"""
-    Position-wise two-layer GELU feed-forward block.
-
-    Args:
-        hidden_size: Input and output width.
-        intermediate_size: Width of the expanded hidden layer.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        super().__init__()
-        self.input = nn.Linear(hidden_size, intermediate_size)
-        self.output = nn.Linear(intermediate_size, hidden_size)
-        self.activation = nn.GELU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        r"""
-        Apply the feed-forward block.
-
-        Args:
-            x: Input `[..., hidden_size]`.
-
-        Returns:
-            Output `[..., hidden_size]`.
-        """
-
-        return self.output(self.activation(self.input(x)))
-
-
-class RelativePositionEncoding(nn.Module):
-    r"""
-    Encode the signed residue offset between edge endpoints, with a distinct inter-chain bucket.
-
-    Clamps the offset into ``[-max_relative_feature, max_relative_feature]`` (one-hot bucketed), routes cross-chain
-    pairs to a dedicated bucket, and linearly projects to the positional-embedding width.
-
-    Args:
-        num_embeddings: Output width of the positional embedding.
-        max_relative_feature: Maximum absolute residue offset represented before clamping.
-    """
-
-    def __init__(self, num_embeddings: int, max_relative_feature: int = 32) -> None:
-        super().__init__()
-        self.max_relative_feature = max_relative_feature
-        self.linear = nn.Linear(2 * max_relative_feature + 2, num_embeddings)
-
-    def forward(self, offset: Tensor, same_chain: Tensor) -> Tensor:
-        r"""
-        Embed per-edge residue offsets, using the inter-chain bucket where ``same_chain`` is zero.
-
-        Args:
-            offset: Signed residue-index offsets `[B, L, K]`.
-            same_chain: Binary same-chain indicator `[B, L, K]`.
-
-        Returns:
-            Positional embeddings `[B, L, K, num_embeddings]`.
-        """
-
-        clipped = torch.clamp(offset + self.max_relative_feature, 0, 2 * self.max_relative_feature)
-        bucket = clipped * same_chain + (1 - same_chain) * (2 * self.max_relative_feature + 1)
-        return self.linear(F.one_hot(bucket, 2 * self.max_relative_feature + 2).to(dtype=self.linear.weight.dtype))
-
-
 def _randn_like(tensor: Tensor, generator: torch.Generator | None) -> Tensor:
     r"""
     Draw standard-normal noise shaped like ``tensor``, using ``generator`` when given.
@@ -2035,78 +1890,6 @@ def _rbf(distances: Tensor, num_bins: int) -> Tensor:
     return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
 
 
-def gather_edges(edges: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Select each residue's edge features to its neighbors from a dense `[B, L, L, C]` edge tensor.
-
-    Args:
-        edges: Dense pairwise edge features `[B, L, L, C]`.
-        neighbor_idx: Neighbor index `[B, L, K]` with values in ``[0, L)``.
-
-    Returns:
-        Neighbor edge features `[B, L, K, C]`.
-
-    Examples:
-        >>> import torch
-        >>> edges = torch.arange(18.0).reshape(1, 3, 3, 2)
-        >>> neighbor_idx = torch.tensor([[[1, 2], [0, 2], [0, 1]]])
-        >>> gather_edges(edges, neighbor_idx).shape
-        torch.Size([1, 3, 2, 2])
-    """
-
-    neighbors = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, edges.shape[-1])
-    return torch.gather(edges, 2, neighbors)
-
-
-def gather_nodes(nodes: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Gather neighbor node features for every residue.
-
-    Args:
-        nodes: Node features `[B, L, C]`.
-        neighbor_idx: Neighbor index `[B, L, K]` with values in ``[0, L)``.
-
-    Returns:
-        Neighbor node features `[B, L, K, C]`.
-
-    Examples:
-        >>> import torch
-        >>> nodes = torch.arange(6.0).reshape(1, 3, 2)
-        >>> neighbor_idx = torch.tensor([[[1, 2], [0, 2], [0, 1]]])
-        >>> gather_nodes(nodes, neighbor_idx).shape
-        torch.Size([1, 3, 2, 2])
-    """
-
-    flat_idx = neighbor_idx.reshape(neighbor_idx.shape[0], -1)
-    flat_idx = flat_idx.unsqueeze(-1).expand(-1, -1, nodes.shape[-1])
-    gathered = torch.gather(nodes, 1, flat_idx)
-    return gathered.view(*neighbor_idx.shape, nodes.shape[-1])
-
-
-def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Concatenate gathered neighbor node states onto per-neighbor edge/context states.
-
-    Args:
-        node_states: Node states `[B, L, C_n]` to gather over neighbors.
-        neighbor_states: Existing per-neighbor states `[B, L, K, C_e]`.
-        neighbor_idx: Neighbor index `[B, L, K]` with values in ``[0, L)``.
-
-    Returns:
-        Concatenated per-neighbor context `[B, L, K, C_e + C_n]`.
-
-    Examples:
-        >>> import torch
-        >>> nodes = torch.arange(6.0).reshape(1, 3, 2)
-        >>> neighbor_states = torch.zeros(1, 3, 2, 2)
-        >>> neighbor_idx = torch.tensor([[[1, 2], [0, 2], [0, 1]]])
-        >>> cat_neighbors_nodes(nodes, neighbor_states, neighbor_idx).shape
-        torch.Size([1, 3, 2, 4])
-    """
-
-    return torch.cat((neighbor_states, gather_nodes(node_states, neighbor_idx)), dim=-1)
-
-
 def _gather_pair_rbf(source: Tensor, target: Tensor, neighbor_idx: Tensor, num_bins: int) -> Tensor:
     r"""
     RBF-encode the distance from each residue's ``source`` atom to its neighbors' ``target`` atom.
@@ -2170,6 +1953,7 @@ def _backbone_pair_rbf(atoms: Mapping[str, Tensor], neighbor_idx: Tensor, num_bi
     return torch.cat([_gather_pair_rbf(atoms[a], atoms[b], neighbor_idx, num_bins) for a, b in atom_pairs], dim=-1)
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class ProteinMPNNInput(BaseInput):
     r"""
@@ -2227,3 +2011,8 @@ class ProteinMPNNInput(BaseInput):
     pssm_log_odds_flag: bool = False
     pssm_bias_flag: bool = False
     bias_by_residue: Tensor | None = None
+
+
+# ProteinMPNNInput is defined after ProteinMPNNDesigner, so bind the keyword-tensor call path's input class here
+# (see ModelMixin.__call__, which builds ``self.input_class(**kwargs)`` for ``model(**inputs)``).
+ProteinMPNNDesigner.input_class = ProteinMPNNInput

@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import ClassVar, Literal, cast
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...modules.atom import AtomToTokenEncoder, LocalAtomGeometry, TokenToAtomBroadcast
+from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler, EdmScheduler
 from ...modules.embedding import (
@@ -31,10 +31,11 @@ from ...modules.embedding import (
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
+from ...modules.representation import Pair, Single
 from ...modules.trunk import MsaTrunk, PairformerStack
-from ..contract import BaseInput, DesignGeneratorOutput, StructurePredictionOutput
+from ..contract import BaseInput, StructureDesignCandidate, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
-from ..registry import DESIGN_GENERATOR_MODELS, MODELS, STRUCTURE_PREDICTION_MODELS
+from ..registry import DESIGN_MODELS, MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import ODesignConfig, ODesignDesignConfig
 
 
@@ -62,6 +63,9 @@ class ODesignModel(ModelMixin):
     """
 
     config_class = ODesignConfig
+    #: Typed input this model's ``forward`` consumes; enables the ``model(**tensors)`` keyword call path.
+    #: Bound to [`ODesignInput`][] at module load (assigned after the dataclass is defined, below).
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: ODesignConfig) -> None:
         super().__init__(config)
@@ -231,32 +235,74 @@ class ODesignModel(ModelMixin):
         batch: ODesignInput,
         *,
         recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StructurePredictionOutput:
+        r"""
+        Run one training step (the TRAINING path).
+
+        ``forward`` is the training path: it runs the recycling trunk, trains the diffusion denoiser with a
+        single denoising step on noised ground truth (with grad), and attaches the denoised coords, augmented
+        target, and per-sample noise level for the EDM-weighted coordinate loss. A separate no-grad EDM
+        mini-rollout supplies the coords the confidence head scores. Use
+        [`fold`][ofoldx.models.odesign.model.ODesignModel.fold] for inference-time multi-step sampling.
+
+        Args:
+            batch: Typed model input; must carry ``target_positions`` for the diffusion loss.
+            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            generator: Optional PyTorch random generator for augmentation and diffusion noise.
+
+        Returns:
+            Structure-prediction output with ``denoised_coords``, ``augmented_target``, and ``noise_level``
+            populated for the diffusion loss, plus token bond-type logits when that head is enabled.
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive, or ``batch.target_positions`` is ``None``.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> processor = AutoProcessor.from_pretrained("ofoldx/odesign")  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("ofoldx/odesign").train()  # doctest: +SKIP
+            >>> output = model(processor("complex.cif"))  # doctest: +SKIP
+        """
+
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if recycling_steps < 1:
+            raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
+        representations = self._run_trunk(batch, recycling_steps=recycling_steps)
+        return self._forward_train(batch, representations=representations, generator=generator)
+
+    @torch.no_grad()
+    def fold(
+        self,
+        batch: ODesignInput,
+        *,
+        recycling_steps: int | None = None,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         num_model_seeds: int | None = None,
         generator: torch.Generator | None = None,
     ) -> StructurePredictionOutput:
         r"""
-        Run the model on typed input.
+        Predict all-atom structure with the multi-step EDM sampler (the house verb for structure prediction).
 
-        In training mode the diffusion module is trained with a single denoising step on
-        noised ground truth (grad), and a separate no-grad mini-rollout produces the
-        coords the confidence head scores. In eval/inference mode the full multi-step
-        EDM sampler produces the predicted coords.
+        ``fold`` is the DISTINCT inference path: it runs the recycling trunk and the full reverse-diffusion
+        sampler (optionally ensembled over several model seeds) under ``torch.no_grad``, and returns the raw
+        typed [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] (the pipeline
+        wraps it into a result). ``forward`` remains the training path.
 
         Args:
             batch: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of reverse-diffusion samples to draw in eval/inference mode.
+            num_samples: Number of reverse-diffusion samples to draw.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
-            num_model_seeds: Optional number of independent model seeds to ensemble in eval/inference mode.
-                Each seed reruns the trunk and diffusion sampler and its outputs are stacked along a leading
-                seed axis. Defaults to the config value; ``1`` keeps the single-seed output shape unchanged.
+            num_model_seeds: Optional number of independent model seeds to ensemble. Each seed reruns the trunk
+                and diffusion sampler and its outputs are stacked along a leading seed axis. Defaults to the
+                config value; ``1`` keeps the single-seed output shape unchanged.
             generator: Optional PyTorch random generator for diffusion noise.
 
         Returns:
-            Structure-prediction output, including token bond-type logits when that head is enabled.
-            With more than one model seed the tensor fields carry a leading ``num_model_seeds`` axis.
+            Structure-prediction output, including token bond-type logits when that head is enabled. With more
+            than one model seed the tensor fields carry a leading ``num_model_seeds`` axis.
 
         Raises:
             ValueError: If ``recycling_steps`` or ``num_model_seeds`` is not positive.
@@ -265,17 +311,12 @@ class ODesignModel(ModelMixin):
             >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
             >>> processor = AutoProcessor.from_pretrained("ofoldx/odesign")  # doctest: +SKIP
             >>> model = AutoModel.from_pretrained("ofoldx/odesign").eval()  # doctest: +SKIP
-            >>> output = model(processor("complex.cif"), num_samples=1)  # doctest: +SKIP
+            >>> output = model.fold(processor("complex.cif"), num_samples=1)  # doctest: +SKIP
         """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
-
-        if self.training:
-            representations = self._run_trunk(batch, recycling_steps=recycling_steps)
-            return self._forward_train(batch, representations=representations, generator=generator)
-
         num_model_seeds = self._num_model_seeds if num_model_seeds is None else num_model_seeds
         if num_model_seeds < 1:
             raise ValueError(f"num_model_seeds must be positive, got {num_model_seeds}")
@@ -433,8 +474,8 @@ class ODesignModel(ModelMixin):
         """
 
         confidence = self.confidence_head(
-            representations.single,
-            pair=representations.pair,
+            representations.single.tensor,
+            pair=representations.pair.tensor,
             token_embedding=representations.token_embedding,
             pred_coords=confidence_coords,
             token_to_rep_atom=batch.token_to_rep_atom,
@@ -443,14 +484,14 @@ class ODesignModel(ModelMixin):
         )
         output = StructurePredictionOutput(
             pred_coords=confidence_coords,
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=self.distogram_head(representations.pair.tensor),
             plddt_logits=confidence.plddt_logits,
             pae_logits=confidence.pae_logits,
             pde_logits=confidence.pde_logits,
             resolved_logits=confidence.resolved_logits,
         )
         if self.token_bond_type_head is not None:
-            output.token_bond_type_logits = self.token_bond_type_head(representations.pair)
+            output.token_bond_type_logits = self.token_bond_type_head(representations.pair.tensor)
         return output
 
     def _train_denoise(
@@ -480,7 +521,7 @@ class ODesignModel(ModelMixin):
 
         if batch.target_positions is None:
             raise ValueError("diffusion training requires batch.target_positions")
-        target = batch.target_positions.to(dtype=representations.single.dtype)
+        target = batch.target_positions.to(dtype=representations.single.tensor.dtype)
         atom_mask = batch.atom_mask.to(device=target.device)
         # Center/augment the diffusion target over RESOLVED atoms only — materialized missing atoms
         # have no true coordinate. Equals atom_mask when nothing was materialized.
@@ -514,8 +555,8 @@ class ODesignModel(ModelMixin):
             reference_charges=batch.reference_charges,
             atom_mask=atom_mask,
             token_embedding=representations.token_embedding,
-            single=representations.single,
-            pair=representations.pair,
+            single=representations.single.tensor,
+            pair=representations.pair.tensor,
             relative_features=representations.relative_features,
             local_geometry=local_geometry,
         )
@@ -581,8 +622,8 @@ class ODesignModel(ModelMixin):
 
         return ODesignRepresentations(
             token_embedding=token_embedding,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             relative_features=relative_features,
             pair_mask=pair_mask,
         )
@@ -719,8 +760,8 @@ class ODesignModel(ModelMixin):
                 reference_charges=batch.reference_charges,
                 atom_mask=batch.atom_mask,
                 token_embedding=representations.token_embedding,
-                single=representations.single,
-                pair=representations.pair,
+                single=representations.single.tensor,
+                pair=representations.pair.tensor,
                 relative_features=representations.relative_features,
                 local_geometry=local_geometry,
             ),
@@ -772,13 +813,13 @@ class ODesignModel(ModelMixin):
 
 
 @MODELS.register("odesign_design")
-@DESIGN_GENERATOR_MODELS.register("odesign_design")
-class ODesignDesignGenerator(ODesignModel):
+@DESIGN_MODELS.register("odesign_design")
+class ODesignDesigner(ODesignModel):
     r"""
     ODesign all-atom structure generator for design workflows.
 
     The current ODesign implementation does not include a sequence decoder. This entry point exposes the
-    existing structure-generation path through [`DesignGeneratorOutput`][], with the generated structure nested
+    existing structure-generation path through [`StructureDesignCandidate`][], with the generated structure nested
     under ``structure_prediction`` and sequence fields left unset.
 
     Args:
@@ -790,9 +831,11 @@ class ODesignDesignGenerator(ODesignModel):
     def __init__(self, config: ODesignDesignConfig | None = None) -> None:
         super().__init__(ODesignDesignConfig() if config is None else config)
 
-    # Design-generator variant: emits DesignGeneratorOutput, a deliberately different contract from
-    # the structure-prediction parent (callers reach it via its own type, never as ODesignModel).
-    def forward(  # type: ignore[override]
+    # Design-generator variant: ``design`` emits StructureDesignCandidate, a deliberately different contract
+    # from the structure-prediction parent (callers reach it via its own type, never as ODesignModel).
+    # ``forward`` stays the inherited TRAINING path; ``design`` is the DISTINCT inference verb.
+    @torch.no_grad()
+    def design(
         self,
         batch: ODesignInput,
         *,
@@ -801,9 +844,14 @@ class ODesignDesignGenerator(ODesignModel):
         num_sampling_steps: int | None = None,
         num_model_seeds: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
+    ) -> StructureDesignCandidate:
         r"""
         Generate structure candidates and normalize them into the design-generator output contract.
+
+        ``design`` is the house verb for design (the inference path): it runs the eval structure-prediction
+        path under ``torch.no_grad`` and nests the result under ``structure_prediction``, returning the raw
+        typed [`StructureDesignCandidate`][ofoldx.models.contract.StructureDesignCandidate] (the pipeline
+        wraps it into a design output). ``forward`` remains the inherited training path.
 
         Args:
             batch: Typed ODesign input.
@@ -820,6 +868,12 @@ class ODesignDesignGenerator(ODesignModel):
 
         Raises:
             ValueError: If ``recycling_steps``, ``num_samples``, or ``num_model_seeds`` is not positive.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> processor = AutoProcessor.from_pretrained("ofoldx/odesign_design")  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained("ofoldx/odesign_design")  # doctest: +SKIP
+            >>> output = model.design(processor("complex.cif"))  # doctest: +SKIP
         """
 
         structure_prediction = self._predict_structure_for_design(
@@ -830,54 +884,7 @@ class ODesignDesignGenerator(ODesignModel):
             num_model_seeds=num_model_seeds,
             generator=generator,
         )
-        return DesignGeneratorOutput(structure_prediction=structure_prediction)
-
-    @torch.no_grad()
-    def generate(
-        self,
-        batch: ODesignInput,
-        *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        num_model_seeds: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> DesignGeneratorOutput:
-        r"""
-        Generate design output without tracking gradients.
-
-        Thin ``@torch.no_grad()`` wrapper over `forward` for inference-time generation.
-
-        Args:
-            batch: Typed ODesign input.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of reverse-diffusion samples to draw.
-            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
-            num_model_seeds: Optional number of independent model seeds to ensemble. Defaults to the config
-                value; ``1`` keeps the single-seed output shape unchanged.
-            generator: Optional PyTorch random generator for diffusion noise.
-
-        Returns:
-            Design-generator output with ``structure_prediction`` populated.
-
-        Raises:
-            ValueError: If ``recycling_steps``, ``num_samples``, or ``num_model_seeds`` is not positive.
-
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> processor = AutoProcessor.from_pretrained("ofoldx/odesign_design")  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("ofoldx/odesign_design")  # doctest: +SKIP
-            >>> output = model.generate(processor("complex.cif"))  # doctest: +SKIP
-        """
-
-        return self.forward(
-            batch,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            num_model_seeds=num_model_seeds,
-            generator=generator,
-        )
+        return StructureDesignCandidate(structure_prediction=structure_prediction)
 
     def _predict_structure_for_design(
         self,
@@ -1638,22 +1645,28 @@ def _stack_outputs(outputs: list[StructurePredictionOutput]) -> StructurePredict
     return StructurePredictionOutput(**merged)  # type: ignore[arg-type]
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class ODesignRepresentations:
     r"""
     Intermediate representations produced by the trunk.
 
+    The ``single`` and ``pair`` fields carry the typed [`Single`][ofoldx.modules.representation.Single] /
+    [`Pair`][ofoldx.modules.representation.Pair] carriers at this boundary (the same way ``Coords`` is used
+    on the output types); unwrap ``.tensor`` before feeding the denoiser or the eager tensor heads. The
+    carriers are pytree-registered, so this container flattens without a graph break under ``torch.compile``.
+
     Attributes:
         token_embedding: Token embedding before trunk updates.
-        single: Final token single representation.
-        pair: Final token pair representation.
+        single: Final token single representation (a ``Single`` carrier).
+        pair: Final token pair representation (a ``Pair`` carrier).
         relative_features: Relative-position feature bundle used by denoising.
         pair_mask: Boolean token-pair validity mask.
     """
 
     token_embedding: torch.Tensor
-    single: torch.Tensor
-    pair: torch.Tensor
+    single: Single
+    pair: Pair
     relative_features: RelativePositionBuckets
     pair_mask: torch.Tensor
 
@@ -1667,8 +1680,8 @@ class ODesignRepresentations:
 
         return ODesignRepresentations(
             token_embedding=self.token_embedding.detach(),
-            single=self.single.detach(),
-            pair=self.pair.detach(),
+            single=Single(self.single.tensor.detach()),
+            pair=Pair(self.pair.tensor.detach()),
             relative_features=self.relative_features.detach(),
             pair_mask=self.pair_mask,
         )
@@ -1692,6 +1705,7 @@ class ODesignRecyclingState:
     pair_mask: torch.Tensor
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class ODesignInput(BaseInput):
     r"""
@@ -1777,3 +1791,8 @@ class ConfidenceOutput:
     pae_logits: Tensor
     pde_logits: Tensor
     resolved_logits: Tensor
+
+
+# ``ODesignInput`` is defined below the model classes, so bind the class-level ``input_class`` here (once the
+# dataclass exists). ``ODesignDesigner`` inherits it, enabling the ``model(**tensors)`` keyword call path.
+ODesignModel.input_class = ODesignInput

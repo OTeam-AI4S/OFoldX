@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ..attention import TriangleAttention, TriangleMultiplication
+from ..backend import LayerNorm
 from ..backend import outer_product_mean as dispatch_outer_product_mean
 from ..backend import pair_weighted_average as dispatch_pair_weighted_average
 from ..backend import resolve_config_operator_backend

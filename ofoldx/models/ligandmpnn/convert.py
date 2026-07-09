@@ -4,7 +4,7 @@ LigandMPNN checkpoint conversion helpers.
 Translate the released LigandMPNN ``.pt`` checkpoints into OFoldX-native config objects and state dicts.
 Per the naming guidelines, upstream tensor names live only here: the key maps rewrite the terse official
 names (``W_e``, ``features.embeddings.linear``, ...) into the house vocabulary used by the model body, and the
-sequence backbone (``ligandmpnn``) and the side-chain Packer (``ligandmpnn_sc``) are kept strictly apart.
+sequence backbone (``ligandmpnn``) and the side-chain LigandMPNNPacker (``ligandmpnn_sc``) are kept strictly apart.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import torch
 from torch import Tensor, nn
 
 from ...hub import add_hub_upload_arguments, upload_artifact_from_args
-from .config import LigandMPNNConfig, PackerConfig
+from .config import LigandMPNNConfig, LigandMPNNPackerConfig
 
 _DTYPES = {
     "float32": torch.float32,
@@ -47,7 +47,7 @@ def config_from_ligandmpnn_checkpoint(
         A [`LigandMPNNConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNConfig] matching the checkpoint.
 
     Raises:
-        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain Packer rather than a sequence model.
+        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain LigandMPNNPacker rather than a sequence model.
 
     Examples:
         >>> from ofoldx.models.ligandmpnn.convert import config_from_ligandmpnn_checkpoint
@@ -60,7 +60,9 @@ def config_from_ligandmpnn_checkpoint(
 
     state_dict = checkpoint.get("model_state_dict", {})
     if isinstance(state_dict, Mapping) and _looks_like_side_chain_packer(state_dict):
-        raise ValueError("ligandmpnn_sc checkpoints are side-chain Packer weights, not LigandMPNN sequence weights")
+        raise ValueError(
+            "ligandmpnn_sc checkpoints are side-chain LigandMPNNPacker weights, not LigandMPNN sequence weights"
+        )
     return LigandMPNNConfig(
         {
             "architecture": "ligandmpnn",
@@ -76,19 +78,19 @@ def config_from_packer_checkpoint(
     checkpoint: Mapping[str, Any],
     *,
     checkpoint_variant: str | None = None,
-) -> PackerConfig:
+) -> LigandMPNNPackerConfig:
     r"""
-    Build a native config from an official ``ligandmpnn_sc`` side-chain Packer checkpoint.
+    Build a native config from an official ``ligandmpnn_sc`` side-chain LigandMPNNPacker checkpoint.
 
     Args:
         checkpoint: An official checkpoint dictionary (as saved by ``torch.save``).
         checkpoint_variant: Optional label recorded on the config to identify the source checkpoint.
 
     Returns:
-        A [`PackerConfig`][ofoldx.models.ligandmpnn.config.PackerConfig] matching the checkpoint.
+        A [`LigandMPNNPackerConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNPackerConfig] matching the checkpoint.
 
     Raises:
-        ValueError: If the checkpoint does not look like side-chain Packer weights.
+        ValueError: If the checkpoint does not look like side-chain LigandMPNNPacker weights.
 
     Examples:
         >>> config = config_from_packer_checkpoint({"model_state_dict": {"W_torsions.weight": object()}})
@@ -98,8 +100,8 @@ def config_from_packer_checkpoint(
 
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     if not isinstance(state_dict, Mapping) or not _looks_like_side_chain_packer(state_dict):
-        raise ValueError("checkpoint is not a ligandmpnn_sc side-chain Packer checkpoint")
-    return PackerConfig(
+        raise ValueError("checkpoint is not a ligandmpnn_sc side-chain LigandMPNNPacker checkpoint")
+    return LigandMPNNPackerConfig(
         {
             "architecture": "ligandmpnn_packer",
             "checkpoint_variant": checkpoint_variant,
@@ -139,7 +141,7 @@ def convert_ligandmpnn_state_dict(
 
     Raises:
         TypeError: If the input is neither a state dict nor a mapping with ``model_state_dict``.
-        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain Packer rather than a sequence model.
+        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain LigandMPNNPacker rather than a sequence model.
         KeyError: If a checkpoint tensor name is not recognized.
         RuntimeError: If ``model`` is given and the converted keys are not strict-loadable.
     """
@@ -148,7 +150,9 @@ def convert_ligandmpnn_state_dict(
     if not isinstance(state_dict, Mapping):
         raise TypeError("checkpoint must be a state dict or contain a model_state_dict mapping")
     if _looks_like_side_chain_packer(state_dict):
-        raise ValueError("ligandmpnn_sc checkpoints are side-chain Packer weights, not LigandMPNN sequence weights")
+        raise ValueError(
+            "ligandmpnn_sc checkpoints are side-chain LigandMPNNPacker weights, not LigandMPNN sequence weights"
+        )
 
     converted: dict[str, Tensor] = {}
     for key, value in state_dict.items():
@@ -238,13 +242,13 @@ def convert_original_state_dict_key(key: str) -> str:
 
 
 def _looks_like_side_chain_packer(state_dict: Mapping[str, Any]) -> bool:
-    r"""Return whether a state dict carries the ``ligandmpnn_sc`` Packer-only tensor names.
+    r"""Return whether a state dict carries the ``ligandmpnn_sc`` LigandMPNNPacker-only tensor names.
 
     Args:
         state_dict: A raw checkpoint state dict.
 
     Returns:
-        ``True`` if any Packer-exclusive key (torsion / side-chain / enc-edge) is present.
+        ``True`` if any LigandMPNNPacker-exclusive key (torsion / side-chain / enc-edge) is present.
     """
 
     return any(key.startswith("features.enc_edge_embedding.") for key in state_dict) or any(
@@ -342,19 +346,19 @@ def convert_packer_state_dict(
     model: nn.Module | None = None,
 ) -> dict[str, Tensor]:
     r"""
-    Convert an official LigandMPNN side-chain Packer checkpoint to native OFoldX keys.
+    Convert an official LigandMPNN side-chain LigandMPNNPacker checkpoint to native OFoldX keys.
 
-    The Packer is the ``ligandmpnn_sc`` checkpoint family (Von Mises torsion weights), distinct from
+    The LigandMPNNPacker is the ``ligandmpnn_sc`` checkpoint family (Von Mises torsion weights), distinct from
     the sequence backbone. Load the result into
-    [`Packer`][ofoldx.models.ligandmpnn.model.Packer].
+    [`LigandMPNNPacker`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker].
 
     Args:
         checkpoint_or_state_dict: A checkpoint dict (with ``model_state_dict``) or a raw state dict.
         dtype: Optional dtype to cast floating-point tensors to.
-        model: Optional Packer instance; when given, the converted keys are validated strict-loadable.
+        model: Optional LigandMPNNPacker instance; when given, the converted keys are validated strict-loadable.
 
     Returns:
-        State dict with OFoldX Packer tensor names.
+        State dict with OFoldX LigandMPNNPacker tensor names.
 
     Raises:
         TypeError: If the input is neither a state dict nor a mapping with ``model_state_dict``.
@@ -377,16 +381,16 @@ def convert_packer_state_dict(
 
 
 def _convert_packer_key(key: str) -> str:
-    r"""Translate one official Packer tensor name to the native OFoldX name.
+    r"""Translate one official LigandMPNNPacker tensor name to the native OFoldX name.
 
     Args:
-        key: An official ``ligandmpnn_sc`` Packer tensor name.
+        key: An official ``ligandmpnn_sc`` LigandMPNNPacker tensor name.
 
     Returns:
-        The corresponding native Packer tensor name.
+        The corresponding native LigandMPNNPacker tensor name.
 
     Raises:
-        KeyError: If the key matches no known Packer layer-group or top-level pattern.
+        KeyError: If the key matches no known LigandMPNNPacker layer-group or top-level pattern.
     """
 
     for prefix, (target, sublayer) in _PACKER_LAYER_GROUPS.items():
@@ -396,11 +400,11 @@ def _convert_packer_key(key: str) -> str:
             for original, replacement in sublayer.items():
                 if remainder.startswith(original + "."):
                     return f"{target}.{parts[1]}.{replacement}{remainder[len(original):]}"
-            raise KeyError(f"unrecognized Packer sublayer key: {key}")
+            raise KeyError(f"unrecognized LigandMPNNPacker sublayer key: {key}")
     for original, replacement in _PACKER_TOP_LEVEL.items():
         if key in (f"{original}.weight", f"{original}.bias"):
             return replacement + key[len(original) :]
-    raise KeyError(f"unrecognized Packer checkpoint key: {key}")
+    raise KeyError(f"unrecognized LigandMPNNPacker checkpoint key: {key}")
 
 
 def _convert_encoder_key(key: str) -> str:
@@ -540,7 +544,7 @@ def load_official_ligandmpnn_checkpoint(
 
     Reads the checkpoint from disk, derives the config from its metadata, and converts the tensor keys. The
     file stem is used as the default ``checkpoint_variant`` label. This is the convenience entry point for
-    materializing a released checkpoint; the returned state dict loads into ``LigandMPNNDesignGenerator``.
+    materializing a released checkpoint; the returned state dict loads into ``LigandMPNNDesigner``.
 
     Args:
         checkpoint_path: Path to the official ``.pt`` checkpoint.
@@ -551,7 +555,7 @@ def load_official_ligandmpnn_checkpoint(
         Tuple ``(config, state_dict)`` with an OFoldX config and native-keyed weights.
 
     Raises:
-        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain Packer rather than a sequence model.
+        ValueError: If the checkpoint is a ``ligandmpnn_sc`` side-chain LigandMPNNPacker rather than a sequence model.
         KeyError: If a checkpoint tensor name is not recognized.
 
     Examples:
@@ -573,9 +577,9 @@ def load_official_ligandmpnn_packer_checkpoint(
     *,
     map_location: str | torch.device = "cpu",
     checkpoint_variant: str | None = None,
-) -> tuple[PackerConfig, dict[str, Tensor]]:
+) -> tuple[LigandMPNNPackerConfig, dict[str, Tensor]]:
     r"""
-    Load an official ``ligandmpnn_sc`` side-chain Packer checkpoint into an OFoldX config and weights.
+    Load an official ``ligandmpnn_sc`` side-chain LigandMPNNPacker checkpoint into an OFoldX config and weights.
 
     Args:
         checkpoint_path: Path to the official ``ligandmpnn_sc_v_*.pt`` checkpoint.
@@ -583,10 +587,10 @@ def load_official_ligandmpnn_packer_checkpoint(
         checkpoint_variant: Optional variant label; defaults to the checkpoint file stem.
 
     Returns:
-        Tuple ``(config, state_dict)`` with a Packer config and native-keyed weights.
+        Tuple ``(config, state_dict)`` with a LigandMPNNPacker config and native-keyed weights.
 
     Raises:
-        ValueError: If the checkpoint is not a side-chain Packer checkpoint.
+        ValueError: If the checkpoint is not a side-chain LigandMPNNPacker checkpoint.
 
     Examples:
         >>> load_official_ligandmpnn_packer_checkpoint("ligandmpnn_sc_v_32_002_16.pt")  # doctest: +SKIP
@@ -633,7 +637,7 @@ def convert_ligandmpnn_checkpoint(
         >>> convert_ligandmpnn_checkpoint("ligandmpnn_sc_v_32_002_16.pt", "ligandmpnn-packer")  # doctest: +SKIP
     """
 
-    from .model import LigandMPNNDesignGenerator
+    from .model import LigandMPNNDesigner
 
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
@@ -648,7 +652,7 @@ def convert_ligandmpnn_checkpoint(
             checkpoint_variant=checkpoint_variant,
         )
     config = config_from_ligandmpnn_checkpoint(checkpoint, checkpoint_variant=variant)
-    model = LigandMPNNDesignGenerator(config)
+    model = LigandMPNNDesigner(config)
     if dtype is not None:
         model.to(dtype=dtype)
     state_dict = convert_ligandmpnn_state_dict(checkpoint, dtype=dtype)
@@ -673,7 +677,7 @@ def convert_ligandmpnn_packer_checkpoint(
     checkpoint_variant: str | None = None,
 ) -> dict[str, Any]:
     r"""
-    Convert an official ``ligandmpnn_sc`` side-chain Packer checkpoint into a pretrained artifact.
+    Convert an official ``ligandmpnn_sc`` side-chain LigandMPNNPacker checkpoint into a pretrained artifact.
 
     Args:
         checkpoint_path: Path to an official ``ligandmpnn_sc_v_*.pt`` checkpoint.
@@ -688,14 +692,14 @@ def convert_ligandmpnn_packer_checkpoint(
         >>> convert_ligandmpnn_packer_checkpoint("ligandmpnn_sc_v_32_002_16.pt", "ligandmpnn-packer")  # doctest: +SKIP
     """
 
-    from .model import Packer
+    from .model import LigandMPNNPacker
 
     checkpoint_path = Path(checkpoint_path)
     output_dir = Path(output_dir)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     variant = checkpoint_path.stem if checkpoint_variant is None else checkpoint_variant
     config = config_from_packer_checkpoint(checkpoint, checkpoint_variant=variant)
-    model = Packer(config)
+    model = LigandMPNNPacker(config)
     if dtype is not None:
         model.to(dtype=dtype)
     state_dict = convert_packer_state_dict(checkpoint, dtype=dtype)
@@ -722,9 +726,9 @@ def _resolve_checkpoint_kind(checkpoint: Mapping[str, Any], requested: str) -> s
     if requested == "auto":
         return "packer" if is_packer else "sequence"
     if requested == "packer" and not is_packer:
-        raise ValueError("checkpoint_kind='packer' requires ligandmpnn_sc side-chain Packer weights")
+        raise ValueError("checkpoint_kind='packer' requires ligandmpnn_sc side-chain LigandMPNNPacker weights")
     if requested == "sequence" and is_packer:
-        raise ValueError("checkpoint_kind='sequence' cannot convert ligandmpnn_sc side-chain Packer weights")
+        raise ValueError("checkpoint_kind='sequence' cannot convert ligandmpnn_sc side-chain LigandMPNNPacker weights")
     return requested
 
 

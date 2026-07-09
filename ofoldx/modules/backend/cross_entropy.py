@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from oops import OOpsUnsupportedError
-from oops import cross_entropy as _oops_cross_entropy
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_cross_entropy = oops_kernel("cross_entropy")
 
 _SUPPORTED = ("oops", "eager")
 _INTEGER_LABEL_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)

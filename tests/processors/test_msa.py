@@ -8,7 +8,7 @@ import torch
 from ofoldx.processors.msa import (
     ParsedMsa,
     attach_msa,
-    featurize_msa,
+    encode_msa,
     parse_a3m,
     parse_csv,
     parse_msa,
@@ -82,7 +82,7 @@ def test_featurize_math() -> None:
         deletions=((0, 0, 0), (0, 2, 0)),
     )
     query = torch.tensor([_MET, _LYS, _VAL])
-    feats = featurize_msa(query, torch.tensor([0, 0, 0]), {0: parsed})
+    feats = encode_msa(query, torch.tensor([0, 0, 0]), {0: parsed})
 
     assert feats["msa"].shape == (1, 2, 3) and feats["msa"].dtype == torch.long
     assert feats["msa_profile"].shape == (1, 3, 33)
@@ -100,7 +100,7 @@ def test_featurize_multichain_and_missing() -> None:
 
     chain_a = ParsedMsa(token_ids=((_MET, _LYS), (_VAL, _LYS)), deletions=((0, 0), (0, 0)))
     query = torch.tensor([_MET, _LYS, _VAL])  # tokens 0,1 = chain 0; token 2 = chain 1 (no MSA)
-    feats = featurize_msa(query, torch.tensor([0, 0, 1]), {0: chain_a})
+    feats = encode_msa(query, torch.tensor([0, 0, 1]), {0: chain_a})
 
     assert feats["msa"].shape == (1, 2, 3)
     assert feats["msa"][0, 1].tolist() == [_VAL, _LYS, _GAP]  # chain-1 column gap-filled in row 1
@@ -110,7 +110,7 @@ def test_featurize_multichain_and_missing() -> None:
 def test_featurize_length_mismatch_raises() -> None:
     parsed = ParsedMsa(token_ids=((_MET, _LYS),), deletions=((0, 0),))
     with pytest.raises(ValueError, match="columns"):
-        featurize_msa(torch.tensor([_MET, _LYS, _VAL]), torch.tensor([0, 0, 0]), {0: parsed})
+        encode_msa(torch.tensor([_MET, _LYS, _VAL]), torch.tensor([0, 0, 0]), {0: parsed})
 
 
 def test_attach_msa_uses_input_query(tmp_path) -> None:

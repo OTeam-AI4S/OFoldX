@@ -5,9 +5,9 @@ Token transformer for coordinate denoising.
 from __future__ import annotations
 
 import torch
-from oops import LayerNorm
 from torch import Tensor, nn
 
+from ..backend import LayerNorm
 from ..transformer import ConditionedTransformer
 
 

@@ -1,424 +1,34 @@
 r"""
-PxDesign end-to-end inference runner.
+PxDesign multi-model design stages.
 
-Orchestrates the PxDesign design pipeline outside the model: load JSON design inputs, featurize them with the
-PxDesign processor, run batched multi-sample backbone generation, and dump each sample to disk. This is the
-infrastructure ring that the native model deliberately does not carry -- the model owns only the forward /
-``generate`` pass, while input prep lives in the processor/io layers and this runner owns the loop and IO.
-
-The multi-model design stages -- native ProteinMPNN sequence assignment and structure-predictor-based filtering
--- also live here rather than in the model: they compose sibling models (ProteinMPNN, a structure predictor),
-and runners are the ring allowed to import other models. After backbone generation the runner applies
-[`assign_sequences`][] then [`filter_candidates`][] when configured, in that order, each gated on its config.
-
-Distributed (multi-GPU) inference is intentionally out of scope here (lower priority): upstream chunks
-``num_samples`` across ranks with a ``DistributedSampler`` and gathers per-rank dumps. The single-process
-runner below covers batch / multi-sample generation and data dumping; see [`PxDesignInferenceRunner.run`][]
-for the ``num_samples`` chunking hook where rank splitting would attach.
+The pxdesign-specific transform that turns generated backbones into all-atom candidates: assign sequences with
+native ProteinMPNN ([`assign_sequences`][ofoldx.models.pxdesign.stages.assign_sequences]) and filter with a native
+structure predictor ([`filter_candidates`][ofoldx.models.pxdesign.stages.filter_candidates]). These are the family
+glue an [`AllAtomDesignPipeline`][ofoldx.pipelines.design.AllAtomDesignPipeline] injects as its stage callables --
+the generic pipeline stays family-agnostic; the impedance-matching between PxDesign's token layout and a sibling
+Designer / Folder lives here in the family (single file), never in the shared pipeline.
 """
 
 from __future__ import annotations
 
-import json
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from os import PathLike
-from pathlib import Path
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
 from torch import Tensor
 
-from ..models.contract import DesignGeneratorOutput, StructurePredictionOutput
-from ..models.pxdesign.io import DesignInput, read_pxdesign_json, write_structure
-from ..models.pxdesign.model import PxDesignDesignGenerator, PxDesignInput
-from ..models.pxdesign.processor import PxDesignProcessor
-
-
-@dataclass(slots=True)
-class PxDesignDumpResult:
-    r"""
-    Record of the files written for one design input.
-
-    Attributes:
-        name: Sample name used for the output subdirectory.
-        structure_paths: Written structure files, one per generated sample.
-        metadata_path: Written run metadata JSON.
-    """
-
-    name: str
-    structure_paths: list[Path]
-    metadata_path: Path
-
-
-@dataclass(slots=True)
-class PxDesignInferenceRunner:
-    r"""
-    Run PxDesign backbone generation end-to-end over one or more JSON design inputs.
-
-    Attributes:
-        model: A native [`PxDesignDesignGenerator`][ofoldx.models.pxdesign.model.PxDesignDesignGenerator].
-        processor: PxDesign featurization processor. Built from the model config when omitted.
-        output_dir: Root directory for dumped structures and metadata.
-        num_samples: Backbone samples per input. Defaults to the model sampler config.
-        num_sampling_steps: Diffusion steps per sample. Defaults to the model sampler config.
-        sample_chunk_size: Samples generated per diffusion pass. Defaults to the model sampler config.
-        output_format: Output structure format (``"cif"`` / ``"mmcif"`` / ``"pdb"``).
-        device: Optional device to run generation on.
-        preserve_condition_coords: If ``True``, restore fixed condition atom coords into the outputs.
-        sequence_assignment: Optional native ProteinMPNN sequence-assignment stage config. A mapping of
-            [`assign_sequences`][] keyword arguments, ``True`` for the default stage, or ``None`` to skip.
-        filtering: Optional native structure-predictor filtering stage config. A mapping of
-            [`filter_candidates`][] keyword arguments, ``True`` for the default stage, or ``None`` to skip.
-
-    Examples:
-        >>> runner = PxDesignInferenceRunner(model, output_dir="out", num_samples=4)  # doctest: +SKIP
-        >>> runner.run(["design.json"])  # doctest: +SKIP
-        [PxDesignDumpResult(name='design', ...)]
-    """
-
-    model: PxDesignDesignGenerator
-    processor: PxDesignProcessor | None = None
-    output_dir: str | PathLike[str] = "pxdesign_outputs"
-    num_samples: int | None = None
-    num_sampling_steps: int | None = None
-    sample_chunk_size: int | None = None
-    output_format: str = "cif"
-    device: torch.device | str | None = None
-    preserve_condition_coords: bool = True
-    sequence_assignment: Mapping[str, Any] | bool | None = None
-    filtering: Mapping[str, Any] | bool | None = None
-    _processor: PxDesignProcessor = field(init=False)
-
-    def __post_init__(self) -> None:
-        if self.processor is not None:
-            self._processor = self.processor
-        else:
-            self._processor = PxDesignProcessor.from_config(self.model.config)
-        if self.device is not None:
-            self.model = self.model.to(self.device)
-
-    def run(
-        self,
-        inputs: Iterable[str | PathLike[str] | Mapping[str, Any] | DesignInput],
-        *,
-        generator: torch.Generator | None = None,
-    ) -> list[PxDesignDumpResult]:
-        r"""
-        Featurize, generate, and dump every design input.
-
-        Args:
-            inputs: JSON file paths, decoded JSON sample dicts, or [`DesignInput`][] objects.
-            generator: Optional torch RNG for reproducible sampling.
-
-        Returns:
-            One [`PxDesignDumpResult`][] per input, in input order.
-
-        Examples:
-            >>> runner = build_pxdesign_inference_runner(model)  # doctest: +SKIP
-            >>> results = runner.run(["design_a.json", "design_b.json"])  # doctest: +SKIP
-            >>> results[0].structure_paths  # doctest: +SKIP
-            [PosixPath('pxdesign_outputs/design_a/design_a_sample_0.cif')]
-        """
-
-        results: list[PxDesignDumpResult] = []
-        for index, raw in enumerate(inputs):
-            design_input = self._as_design_input(raw)
-            results.append(self._run_one(design_input, index=index, generator=generator))
-        return results
-
-    @torch.inference_mode()
-    def _run_one(
-        self,
-        design_input: DesignInput,
-        *,
-        index: int,
-        generator: torch.Generator | None,
-    ) -> PxDesignDumpResult:
-        r"""
-        Featurize, generate, run the design stages, and dump one design input.
-
-        Args:
-            design_input: A single decoded PxDesign design specification.
-            index: Position in the input sequence, used to name unnamed inputs.
-            generator: Optional torch RNG threaded into generation and the sequence-assignment stage.
-
-        Returns:
-            The dump record for this input.
-        """
-
-        batch = self._processor(design_input)
-        if self.device is not None:
-            batch = batch.to(self.device)
-        output = self.model.generate(
-            batch,
-            num_samples=self.num_samples,
-            num_sampling_steps=self.num_sampling_steps,
-            sample_chunk_size=self.sample_chunk_size,
-            preserve_condition_coords=self.preserve_condition_coords,
-            generator=generator,
-        )
-        output = self._apply_design_stages(output, batch=batch, generator=generator)
-        pred_coords = _require_pred_coords(output)
-        name = design_input.name or f"design_{index:04d}"
-        return self._dump(name, design_input, batch, pred_coords, metadata=output.metadata)
-
-    def _apply_design_stages(
-        self,
-        output: DesignGeneratorOutput,
-        *,
-        batch: PxDesignInput,
-        generator: torch.Generator | None,
-    ) -> DesignGeneratorOutput:
-        r"""
-        Apply native sequence assignment then filtering to a backbone output.
-
-        Reproduces the exact order and gating the model's ``forward`` used to run internally: assign sequences
-        first (defaulting ``generator`` into its kwargs), then filter candidates, each stage gated on its config.
-
-        Args:
-            output: Backbone-generation output to post-process.
-            batch: Original PxDesign conditioning batch passed to both stages.
-            generator: Optional torch RNG defaulted into the sequence-assignment kwargs.
-
-        Returns:
-            The output with the configured stages applied, unchanged when both stages are disabled.
-        """
-
-        sequence_assignment_config = _stage_config("sequence_assignment", self.sequence_assignment)
-        filtering_config = _stage_config("filtering", self.filtering)
-        if sequence_assignment_config is not None:
-            assignment_kwargs = dict(sequence_assignment_config)
-            assignment_kwargs.setdefault("generator", generator)
-            output = assign_sequences(output, batch=batch, **assignment_kwargs)
-        if filtering_config is not None:
-            output = filter_candidates(output, batch=batch, **dict(filtering_config))
-        return output
-
-    def _dump(
-        self,
-        name: str,
-        design_input: DesignInput,
-        batch: PxDesignInput,
-        pred_coords: Tensor,
-        *,
-        metadata: Mapping[str, Any] | None,
-    ) -> PxDesignDumpResult:
-        r"""
-        Write each generated sample to a structure file plus a run-metadata JSON.
-
-        Args:
-            name: Output subdirectory name and structure-file stem.
-            design_input: Source design carrying the template structure to write coords into.
-            batch: Conditioning batch, mined for token counts recorded in the metadata.
-            pred_coords: Predicted coords `[..., num_samples, N_atom, 3]` for this input.
-            metadata: Optional model-side metadata merged into the run-metadata JSON.
-
-        Returns:
-            The dump record listing the written structure files and metadata path.
-        """
-
-        sample_dir = Path(self.output_dir) / name
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        samples = _as_sample_batch(pred_coords)  # [num_samples, N_atom, 3]
-        plddt = _token_plddt(batch)
-        structure = design_input.structure
-
-        structure_paths: list[Path] = []
-        for sample_index in range(samples.shape[0]):
-            coords = samples[sample_index].detach().to("cpu", dtype=torch.float32)
-            coords_list: list[tuple[float, float, float]] = [
-                (float(row[0]), float(row[1]), float(row[2])) for row in coords.tolist()
-            ]
-            path = sample_dir / f"{name}_sample_{sample_index}.{self.output_format}"
-            write_structure(structure, coords_list, path, plddt=plddt, format=self.output_format)
-            structure_paths.append(path)
-
-        metadata_path = sample_dir / f"{name}_metadata.json"
-        payload = {
-            "name": name,
-            "num_samples": int(samples.shape[0]),
-            "num_atoms": int(samples.shape[1]),
-            "num_tokens": int(batch.token_mask.sum().item()),
-            "num_design_tokens": _optional_sum(batch.design_token_mask),
-            "num_condition_tokens": _optional_sum(batch.condition_token_mask),
-            "structure_files": [path.name for path in structure_paths],
-            "model_metadata": _jsonable(metadata),
-        }
-        metadata_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        return PxDesignDumpResult(name=name, structure_paths=structure_paths, metadata_path=metadata_path)
-
-    def _as_design_input(self, raw: str | PathLike[str] | Mapping[str, Any] | DesignInput) -> DesignInput:
-        r"""
-        Coerce a raw input into a [`DesignInput`][], parsing JSON paths/dicts as needed.
-
-        Args:
-            raw: An existing [`DesignInput`][], a JSON file path, or a decoded JSON sample dict.
-
-        Returns:
-            The corresponding [`DesignInput`][], reusing the processor's CCD when parsing.
-        """
-
-        if isinstance(raw, DesignInput):
-            return raw
-        ccd = getattr(self._processor, "_ccd", None)
-        return read_pxdesign_json(raw, ccd=ccd)
-
-
-def build_pxdesign_inference_runner(
-    model: PxDesignDesignGenerator,
-    **kwargs: Any,
-) -> PxDesignInferenceRunner:
-    r"""
-    Build a [`PxDesignInferenceRunner`][] for a native PxDesign model.
-
-    Args:
-        model: Native PxDesign design generator.
-        **kwargs: Forwarded to [`PxDesignInferenceRunner`][] (``output_dir``, ``num_samples``, ``device``, …).
-
-    Returns:
-        A configured [`PxDesignInferenceRunner`][].
-
-    Examples:
-        >>> runner = build_pxdesign_inference_runner(model, num_samples=8)  # doctest: +SKIP
-        >>> runner.run(["design.json"])  # doctest: +SKIP
-    """
-
-    return PxDesignInferenceRunner(model=model, **kwargs)
-
-
-def _require_pred_coords(output: Any) -> Tensor:
-    r"""
-    Return the predicted coords from a generation output, or raise if absent.
-
-    Args:
-        output: A generation output expected to carry ``structure_prediction.pred_coords``.
-
-    Returns:
-        The predicted coordinate tensor.
-
-    Raises:
-        ValueError: If the output has no structure prediction or no predicted coords.
-    """
-
-    structure_prediction = getattr(output, "structure_prediction", None)
-    if structure_prediction is None or getattr(structure_prediction, "pred_coords", None) is None:
-        raise ValueError("PxDesign generation did not return predicted coordinates")
-    return structure_prediction.pred_coords
-
-
-def _as_sample_batch(pred_coords: Tensor) -> Tensor:
-    r"""
-    Collapse leading batch dims and return ``[num_samples, N_atom, 3]``.
-
-    ``pred_coords`` is ``[..., num_samples, N_atom, 3]``; inference runs one input at a time with batch size 1,
-    so any leading dims before the sample axis are squeezed.
-
-    Args:
-        pred_coords: Predicted coords `[..., num_samples, N_atom, 3]`, or `[N_atom, 3]` for a single sample.
-
-    Returns:
-        Coords reshaped to `[num_samples, N_atom, 3]`.
-
-    Examples:
-        >>> import torch
-        >>> _as_sample_batch(torch.zeros(4, 3)).shape
-        torch.Size([1, 4, 3])
-        >>> _as_sample_batch(torch.zeros(1, 2, 4, 3)).shape
-        torch.Size([2, 4, 3])
-    """
-
-    coords = pred_coords
-    while coords.dim() > 3:
-        coords = coords[0]
-    if coords.dim() == 2:  # single sample without a sample axis
-        coords = coords.unsqueeze(0)
-    return coords
-
-
-def _token_plddt(batch: PxDesignInput) -> list[float] | None:
-    r"""
-    Extract a flat per-token pLDDT list from a batch, or ``None`` when absent.
-
-    Args:
-        batch: PxDesign conditioning batch that may carry a ``plddt`` tensor.
-
-    Returns:
-        A flat Python list of pLDDT floats, or ``None`` when the batch has no pLDDT.
-    """
-
-    plddt = getattr(batch, "plddt", None)
-    if plddt is None:
-        return None
-    values = plddt.detach().to("cpu", dtype=torch.float32).reshape(-1)
-    return [float(value) for value in values.tolist()]
-
-
-def _optional_sum(mask: Tensor | None) -> int | None:
-    r"""
-    Sum a boolean/int mask to a Python int, passing ``None`` through.
-
-    Args:
-        mask: A mask tensor to count, or ``None``.
-
-    Returns:
-        The integer sum, or ``None`` when ``mask`` is ``None``.
-
-    Examples:
-        >>> import torch
-        >>> _optional_sum(torch.tensor([1, 0, 1, 1]))
-        3
-        >>> _optional_sum(None) is None
-        True
-    """
-
-    if mask is None:
-        return None
-    return int(mask.sum().item())
-
-
-def _jsonable(value: Any) -> Any:
-    r"""
-    Recursively coerce a value into JSON-serializable primitives.
-
-    Tensors become nested lists, mappings become string-keyed dicts, sequences become lists, scalars pass
-    through, and anything else is stringified. Used to make model metadata safe to dump.
-
-    Args:
-        value: Any value to coerce.
-
-    Returns:
-        A JSON-serializable view of ``value``.
-
-    Examples:
-        >>> import torch
-        >>> _jsonable({"a": torch.tensor([1, 2]), "b": (1, "x"), "c": None})
-        {'a': [1, 2], 'b': [1, 'x'], 'c': None}
-    """
-
-    if value is None:
-        return None
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Tensor):
-        return value.detach().cpu().tolist()
-    if isinstance(value, Sequence):
-        return [_jsonable(item) for item in value]
-    return str(value)
-
-
-# ---------------------------------------------------------------------------
-# PxDesign pipeline stages (moved out of the model): native ProteinMPNN sequence
-# assignment and structure-predictor filtering. Runners sit above models and may
-# import sibling models; the model itself must not.
-# ---------------------------------------------------------------------------
+from ..contract import (
+    AllAtomDesignCandidate,
+    DesignCandidate,
+    SequenceDesignCandidate,
+    StructurePredictionOutput,
+)
+from .model import PxDesignInput
 
 
 def assign_sequences(
-    candidates: DesignGeneratorOutput | StructurePredictionOutput | Tensor,
+    candidates: DesignCandidate | StructurePredictionOutput | Tensor,
     *,
     batch: PxDesignInput,
     model: Any | None = None,
@@ -428,7 +38,7 @@ def assign_sequences(
     num_samples: int | None = None,
     amino_acid_bias: Tensor | None = None,
     generator: torch.Generator | None = None,
-) -> DesignGeneratorOutput:
+) -> DesignCandidate:
     r"""
     Assign sequences to PxDesign backbone candidates with native ProteinMPNN.
 
@@ -451,7 +61,7 @@ def assign_sequences(
         ValueError: If ``candidates`` carry no backbone coords, or neither a model nor a pretrained path is given.
 
     Examples:
-        >>> from ofoldx.runners.pxdesign import assign_sequences  # doctest: +SKIP
+        >>> from ofoldx.models.pxdesign import assign_sequences  # doctest: +SKIP
         >>> assigned = assign_sequences(candidates, batch=batch, mpnn_model=mpnn)  # doctest: +SKIP
         >>> assigned.sequence_tokens.shape  # doctest: +SKIP
         torch.Size([1, 128])
@@ -477,7 +87,7 @@ def assign_sequences(
 
 
 def filter_candidates(
-    candidates: DesignGeneratorOutput | StructurePredictionOutput | Tensor,
+    candidates: DesignCandidate | StructurePredictionOutput | Tensor,
     *,
     batch: PxDesignInput | None = None,
     predictor: Any | None = None,
@@ -490,7 +100,7 @@ def filter_candidates(
     input_builder: Callable[..., Any] | None = None,
     score_fn: Callable[..., Mapping[str, Tensor]] | None = None,
     thresholds: Mapping[str, Any] | None = None,
-) -> DesignGeneratorOutput:
+) -> DesignCandidate:
     r"""
     Score PxDesign candidates with a native structure-predictor hook.
 
@@ -523,7 +133,7 @@ def filter_candidates(
         TypeError: If the resolved predictor is neither callable nor exposes ``generate``.
 
     Examples:
-        >>> from ofoldx.runners.pxdesign import filter_candidates  # doctest: +SKIP
+        >>> from ofoldx.models.pxdesign import filter_candidates  # doctest: +SKIP
         >>> scored = filter_candidates(
         ...     candidates, batch=batch, predictor=af3, thresholds={"filter_mean_plddt": 0.7}
         ... )  # doctest: +SKIP
@@ -563,7 +173,7 @@ def filter_candidates(
         "scores": tuple(filter_scores),
         "thresholds": None if thresholds is None else dict(thresholds),
     }
-    return DesignGeneratorOutput(
+    return AllAtomDesignCandidate(
         sequence_logits=output.sequence_logits,
         sequence_tokens=output.sequence_tokens,
         structure_prediction=output.structure_prediction,
@@ -572,79 +182,50 @@ def filter_candidates(
     )
 
 
-def _stage_config(name: str, config: Mapping[str, Any] | bool | None) -> dict[str, Any] | None:
-    r"""
-    Normalize a design-stage config into an explicit kwargs dict or ``None`` (skip).
-
-    ``None`` and ``False`` disable the stage; ``True`` enables it with defaults; a mapping is copied to a
-    plain dict of keyword arguments.
-
-    Args:
-        name: Stage name, used to phrase the error on an unsupported type.
-        config: The raw stage config: mapping, bool, or ``None``.
-
-    Returns:
-        A kwargs dict when the stage is enabled, or ``None`` to skip it.
-
-    Raises:
-        TypeError: If ``config`` is an unsupported type for a known stage name.
-        ValueError: If ``name`` is not a recognized stage.
-
-    Examples:
-        >>> _stage_config("filtering", None) is None
-        True
-        >>> _stage_config("filtering", True)
-        {}
-        >>> _stage_config("filtering", False) is None
-        True
-        >>> _stage_config("sequence_assignment", {"num_samples": 2})
-        {'num_samples': 2}
-    """
-
-    if config is None:
-        return None
-    if isinstance(config, bool):
-        return {} if config else None
-    if isinstance(config, Mapping):
-        return dict(config)
-    if name in {"sequence_assignment", "filtering"}:
-        raise TypeError(f"{name} must be a mapping, bool, or None")
-    raise ValueError(f"unknown PxDesign external stage: {name!r}")
-
-
 def _as_design_output(
-    candidates: DesignGeneratorOutput | StructurePredictionOutput | Tensor,
+    candidates: DesignCandidate | StructurePredictionOutput | Tensor,
     *,
     batch: PxDesignInput | None,
-) -> DesignGeneratorOutput:
+) -> AllAtomDesignCandidate:
     r"""
-    Wrap raw candidates into a [`DesignGeneratorOutput`][].
+    Normalize raw candidates into an [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate].
 
-    Passes a [`DesignGeneratorOutput`][] through, wraps a bare [`StructurePredictionOutput`][], and
-    lifts a raw coord tensor into a structure prediction with a placeholder distogram sized from ``batch``.
+    The composite mixes sequence and structure across stages, so it works on the joint
+    [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate] (all fields present, unset ones
+    ``None``): a [`DesignCandidate`][ofoldx.models.contract.DesignCandidate] of any mode is lifted into one, a bare
+    [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] becomes its structure, and a raw
+    coord tensor is wrapped in a structure prediction with a placeholder distogram sized from ``batch``.
 
     Args:
-        candidates: A generator output, a structure-prediction output, or a raw coord tensor.
+        candidates: A design candidate, a structure-prediction output, or a raw coord tensor.
         batch: Optional conditioning batch used to size the placeholder distogram for tensor inputs.
 
     Returns:
-        The candidates as a [`DesignGeneratorOutput`][].
+        The candidates as an [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate].
 
     Raises:
         TypeError: If ``candidates`` is none of the supported types.
     """
 
-    if isinstance(candidates, DesignGeneratorOutput):
+    if isinstance(candidates, AllAtomDesignCandidate):
         return candidates
+    if isinstance(candidates, DesignCandidate):
+        return AllAtomDesignCandidate(
+            sequence_logits=candidates.sequence_logits,
+            sequence_tokens=candidates.sequence_tokens,
+            structure_prediction=candidates.structure_prediction,
+            scores=candidates.scores,
+            metadata=candidates.metadata,
+        )
     if isinstance(candidates, StructurePredictionOutput):
-        return DesignGeneratorOutput(structure_prediction=candidates)
+        return AllAtomDesignCandidate(structure_prediction=candidates)
     if torch.is_tensor(candidates):
         if batch is None:
             distogram_logits = candidates.new_zeros(())
         else:
             num_tokens = batch.token_mask.shape[-1]
             distogram_logits = candidates.new_zeros(*batch.token_mask.shape, num_tokens, 1)
-        return DesignGeneratorOutput(
+        return AllAtomDesignCandidate(
             structure_prediction=StructurePredictionOutput(
                 pred_coords=candidates,
                 distogram_logits=distogram_logits,
@@ -683,9 +264,9 @@ def _resolve_proteinmpnn_model(
     if resolved is not None:
         return resolved
     if pretrained_path is not None:
-        from ..models.proteinmpnn import ProteinMPNNDesignGenerator
+        from ..proteinmpnn import ProteinMPNNDesigner
 
-        return ProteinMPNNDesignGenerator.from_pretrained(pretrained_path)
+        return ProteinMPNNDesigner.from_pretrained(pretrained_path)
     raise ValueError(
         "PxDesign sequence_assignment requires a loaded ProteinMPNN model/callable via "
         "sequence_assignment={'model': model} or an OFoldX checkpoint path via "
@@ -723,9 +304,9 @@ def _resolve_structure_predictor(
     if resolved is not None:
         return resolved
     if pretrained_path is not None:
-        from ..models.auto import AutoModelForStructurePrediction
+        from ..auto import AutoModel
 
-        return AutoModelForStructurePrediction.from_pretrained(pretrained_path)
+        return AutoModel.from_pretrained(pretrained_path)
     raise ValueError(
         "PxDesign filtering requires a structure predictor/callable via filtering={'predictor': model}, "
         "a direct prediction via filtering={'prediction': output}, or an OFoldX checkpoint path via "
@@ -734,7 +315,7 @@ def _resolve_structure_predictor(
 
 
 def _assign_sequences_with_model(
-    output: DesignGeneratorOutput,
+    output: DesignCandidate,
     *,
     batch: PxDesignInput,
     sequence_model: Any,
@@ -742,7 +323,7 @@ def _assign_sequences_with_model(
     num_samples: int | None,
     amino_acid_bias: Tensor | None,
     generator: torch.Generator | None,
-) -> DesignGeneratorOutput:
+) -> DesignCandidate:
     r"""
     Run ProteinMPNN over every flattened backbone candidate and scatter the results back.
 
@@ -834,7 +415,7 @@ def _assign_sequences_with_model(
         "candidate_shape": tuple(int(value) for value in original_candidate_shape),
         "num_sequence_samples": int(num_samples or 1),
     }
-    return DesignGeneratorOutput(
+    return AllAtomDesignCandidate(
         sequence_logits=sequence_logits,
         sequence_tokens=sequence_tokens,
         structure_prediction=structure_with_sequences,
@@ -941,7 +522,7 @@ def _proteinmpnn_input_from_pxdesign(
         dtype=coords.dtype,
     )
 
-    from ..models.proteinmpnn import ProteinMPNNInput
+    from ..proteinmpnn import ProteinMPNNInput
 
     return (
         ProteinMPNNInput(
@@ -964,9 +545,9 @@ def _run_proteinmpnn_model(
     temperature: float | Tensor | None,
     num_samples: int | None,
     generator: torch.Generator | None,
-) -> DesignGeneratorOutput:
+) -> DesignCandidate:
     r"""
-    Invoke a ProteinMPNN model/callable and normalize its output to a [`DesignGeneratorOutput`][].
+    Invoke a ProteinMPNN model/callable and normalize its output to a [`DesignCandidate`][].
 
     Prefers a ``generate`` method; otherwise calls the model directly (retrying without kwargs on a
     ``TypeError``) and adapts a returned mapping's ``logits``/``S`` keys into the output fields.
@@ -979,7 +560,7 @@ def _run_proteinmpnn_model(
         generator: Optional torch RNG, dropped when ``None``.
 
     Returns:
-        The ProteinMPNN result as a [`DesignGeneratorOutput`][].
+        The ProteinMPNN result as a [`DesignCandidate`][].
 
     Raises:
         TypeError: If the model neither exposes ``generate`` nor is callable.
@@ -987,14 +568,15 @@ def _run_proteinmpnn_model(
 
     kwargs = {"temperature": temperature, "num_samples": num_samples, "generator": generator}
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
-    if hasattr(sequence_model, "generate"):
-        return sequence_model.generate(mpnn_input, **kwargs)
+    designer = getattr(sequence_model, "design", None)
+    if callable(designer):
+        return designer(mpnn_input, **kwargs)
     if callable(sequence_model):
         try:
             result = sequence_model(mpnn_input, **kwargs)
         except TypeError:
             result = sequence_model(mpnn_input)
-        if isinstance(result, DesignGeneratorOutput):
+        if isinstance(result, DesignCandidate):
             return result
         if isinstance(result, Mapping):
             sequence_logits = result.get("sequence_logits")
@@ -1003,7 +585,7 @@ def _run_proteinmpnn_model(
             sequence_tokens = result.get("sequence_tokens")
             if sequence_tokens is None:
                 sequence_tokens = result.get("S")
-            return DesignGeneratorOutput(
+            return SequenceDesignCandidate(
                 sequence_logits=sequence_logits,
                 sequence_tokens=sequence_tokens,
                 scores={key: value for key, value in result.items() if torch.is_tensor(value)},
@@ -1012,7 +594,7 @@ def _run_proteinmpnn_model(
 
 
 def _scatter_mpnn_output(
-    mpnn_output: DesignGeneratorOutput,
+    mpnn_output: DesignCandidate,
     *,
     batch: PxDesignInput,
     batch_index: int,
@@ -1152,7 +734,7 @@ def _repeat_structure_prediction_for_sequences(
 
 def _run_structure_predictor(
     predictor: Any,
-    output: DesignGeneratorOutput,
+    output: DesignCandidate,
     *,
     batch: PxDesignInput | None,
     predictor_input: Any | None,
@@ -1184,8 +766,9 @@ def _run_structure_predictor(
         except TypeError:
             predictor_input = input_builder(output)
     if predictor_input is not None:
-        if hasattr(predictor, "generate"):
-            return predictor.generate(predictor_input)
+        folder = getattr(predictor, "fold", None)
+        if callable(folder):
+            return folder(predictor_input)
         return predictor(predictor_input)
     if callable(predictor):
         try:
@@ -1216,7 +799,7 @@ def _filter_key(key: str) -> str:
 
 
 def _filter_scores(
-    output: DesignGeneratorOutput,
+    output: DesignCandidate,
     predictor_output: Any,
     *,
     batch: PxDesignInput | None,
@@ -1252,7 +835,7 @@ def _filter_scores(
     prediction = _prediction_structure_output(predictor_output)
     filter_scores: dict[str, Tensor] = {}
     scores: Mapping[str, Any] | None = None
-    if isinstance(predictor_output, DesignGeneratorOutput):
+    if isinstance(predictor_output, DesignCandidate):
         scores = predictor_output.scores
     elif isinstance(predictor_output, Mapping):
         scores = predictor_output
@@ -1280,7 +863,7 @@ def _filter_scores(
     if not filter_scores:
         raise ValueError(
             "PxDesign filtering predictor returned no usable tensor scores. Return a StructurePredictionOutput, "
-            "a DesignGeneratorOutput with scores, a tensor mapping, or pass filtering={'score_fn': callable}."
+            "a DesignCandidate with scores, a tensor mapping, or pass filtering={'score_fn': callable}."
         )
     return filter_scores
 
@@ -1289,7 +872,7 @@ def _prediction_structure_output(predictor_output: Any) -> StructurePredictionOu
     r"""
     Extract a [`StructurePredictionOutput`][] from a predictor output, or ``None``.
 
-    Unwraps a [`DesignGeneratorOutput`][], passes a structure output through, and builds one from a mapping
+    Unwraps a [`DesignCandidate`][], passes a structure output through, and builds one from a mapping
     carrying ``pred_coords`` (supplying a placeholder distogram when absent).
 
     Args:
@@ -1301,7 +884,7 @@ def _prediction_structure_output(predictor_output: Any) -> StructurePredictionOu
 
     if isinstance(predictor_output, StructurePredictionOutput):
         return predictor_output
-    if isinstance(predictor_output, DesignGeneratorOutput):
+    if isinstance(predictor_output, DesignCandidate):
         return predictor_output.structure_prediction
     if isinstance(predictor_output, Mapping):
         pred_coords = predictor_output.get("pred_coords")
@@ -1693,10 +1276,4 @@ def _selected_amino_acid_bias(
     return selected_bias.unsqueeze(0)
 
 
-__all__ = [
-    "PxDesignDumpResult",
-    "PxDesignInferenceRunner",
-    "assign_sequences",
-    "build_pxdesign_inference_runner",
-    "filter_candidates",
-]
+__all__ = ["assign_sequences", "filter_candidates"]

@@ -4,7 +4,7 @@ import io
 
 import pytest
 
-from ofoldx.processors.msa_tools import (
+from ofoldx.processors.msa.search import (
     Jackhmmer,
     MsaToolError,
     Nhmmer,

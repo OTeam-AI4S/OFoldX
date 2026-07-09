@@ -182,6 +182,33 @@ class PxDesignSamplerConfig(Config):
     center_random_augmentation: bool = True
 
 
+class PxDesignDiffusionTrainingConfig(Config):
+    r"""
+    Configuration of the single-step diffusion training objective.
+
+    The public PxDesign release ships inference-only; OFoldX grounds the training ``forward`` in the same
+    single-step EDM denoise the sister Protenix/ODesign models use. Per training sample an independent
+    log-normal noise level is drawn, the (augmented) ground truth is noised once, and the denoiser predicts
+    the clean coords in a single step. These knobs parameterize that objective.
+
+    Attributes:
+        num_samples: Number of independent noised target samples drawn per input during training.
+        noise_log_mean: Mean of the underlying log-normal training noise distribution in log space.
+        noise_log_std: Standard deviation of the underlying log-normal training noise in log space.
+
+    Examples:
+        >>> config = PxDesignDiffusionTrainingConfig()
+        >>> config.num_samples
+        1
+        >>> config.noise_log_mean
+        -1.2
+    """
+
+    num_samples: int = 1
+    noise_log_mean: float = -1.2
+    noise_log_std: float = 1.5
+
+
 class PxDesignDistogramConfig(Config):
     r"""
     Configuration of the PxDesign distogram head.
@@ -231,6 +258,7 @@ class PxDesignConfig(Config):
         conditional_template: Sub-configuration of the conditional-template pair embedding.
         denoiser: Sub-configuration of the coordinate denoiser.
         sampler: Sub-configuration of the EDM coordinate sampler.
+        diffusion_training: Sub-configuration of the single-step diffusion training objective.
         distogram: Sub-configuration of the distogram head.
 
     Examples:
@@ -241,8 +269,8 @@ class PxDesignConfig(Config):
         384
         >>> config.condition_embedder.vocab_size
         36
-        >>> from ofoldx.models.pxdesign.model import PxDesignDesignGenerator
-        >>> model = PxDesignDesignGenerator(config)  # doctest: +SKIP
+        >>> from ofoldx.models.pxdesign.model import PxDesignDesigner
+        >>> model = PxDesignDesigner(config)  # doctest: +SKIP
     """
 
     architecture: str = "pxdesign"
@@ -260,4 +288,5 @@ class PxDesignConfig(Config):
     conditional_template: PxDesignTemplateConfig = PxDesignTemplateConfig()
     denoiser: PxDesignDenoiserConfig = PxDesignDenoiserConfig()
     sampler: PxDesignSamplerConfig = PxDesignSamplerConfig()
+    diffusion_training: PxDesignDiffusionTrainingConfig = PxDesignDiffusionTrainingConfig()
     distogram: PxDesignDistogramConfig = PxDesignDistogramConfig()

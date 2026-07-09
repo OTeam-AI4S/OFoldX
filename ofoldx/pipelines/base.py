@@ -9,8 +9,9 @@ and the input predicate that decides when a raw structure must first be run thro
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
+from tempfile import TemporaryDirectory
 from typing import Any, Generic, Protocol, TypeGuard, TypeVar, cast
 
 import torch
@@ -18,7 +19,12 @@ from torch import nn
 
 from ..artifacts import artifact_task, read_artifact_manifest
 from ..data.structure import Structure
-from ..hub import pretrained_allow_patterns, remote_code_import_path, resolve_pretrained_path
+from ..hub import (
+    pretrained_allow_patterns,
+    publish_artifact_to_hub,
+    remote_code_import_path,
+    resolve_pretrained_path,
+)
 from ..models.contract import BaseInput
 from ..processors.utils import StructureInput
 from .auto import (
@@ -217,6 +223,66 @@ class Pipeline(Generic[InputT, OutputT]):
             ),
         )
 
+    def push_to_hub(
+        self,
+        repo_id: str,
+        *,
+        repo_type: str = "model",
+        private: bool | None = None,
+        token: str | bool | None = None,
+        revision: str | None = None,
+        commit_message: str | None = None,
+        create_pr: bool = False,
+        delete_existing: bool = False,
+        tag: str | None = None,
+        model_card: bool = True,
+        model_card_metadata: Mapping[str, object] | None = None,
+        widget_examples: Sequence[Mapping[str, object]] | None = None,
+        variant: str | None = None,
+    ) -> Any:
+        r"""
+        Save this pipeline package and upload it to the Hugging Face Hub.
+
+        Args:
+            repo_id: Destination Hugging Face Hub repository id.
+            repo_type: Hub repository type.
+            private: Optional privacy setting used when creating the repository.
+            token: Optional Hugging Face authentication token.
+            revision: Optional target branch for the upload.
+            commit_message: Optional commit message for the upload.
+            create_pr: If ``True``, upload changes through a Hub pull request.
+            delete_existing: If ``True``, delete an existing destination repo before recreating it.
+            tag: Optional Hub tag to create after uploading.
+            model_card: If ``True``, write/update ``README.md`` with Hub card metadata.
+            model_card_metadata: Extra model-card front matter values.
+            widget_examples: Optional widget examples. ``None`` uses task defaults.
+            variant: Optional model weight variant suffix.
+
+        Returns:
+            The object returned by ``huggingface_hub.HfApi.upload_folder``.
+
+        Examples:
+            >>> pipeline.push_to_hub("oteam/my-pipeline")  # doctest: +SKIP
+        """
+
+        with TemporaryDirectory() as tmpdir:
+            self.save_pretrained(tmpdir, variant=variant)
+            return publish_artifact_to_hub(
+                tmpdir,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                private=private,
+                token=token,
+                revision=revision,
+                commit_message=commit_message,
+                create_pr=create_pr,
+                delete_existing=delete_existing,
+                tag=tag,
+                model_card=model_card,
+                model_card_metadata=model_card_metadata,
+                widget_examples=widget_examples,
+            )
+
     @property
     def device(self) -> torch.device:
         r"""
@@ -261,6 +327,16 @@ class Pipeline(Generic[InputT, OutputT]):
 
         raise NotImplementedError(f"{type(self).__name__} must implement __call__")
 
+    def save_pretrained(self, save_directory: str | PathLike[str], *, variant: str | None = None) -> None:
+        r"""
+        Save this pipeline as a package directory.
+
+        Concrete task pipelines implement the component layout (a ``manifest.json`` plus model/processor
+        subdirectories); the shared [`push_to_hub`][ofoldx.pipelines.base.Pipeline.push_to_hub] calls this.
+        """
+
+        raise NotImplementedError(f"{type(self).__name__} must implement save_pretrained")
+
 
 def _load_plain_model_pipeline(
     pretrained_model_name_or_path: str | PathLike[str],
@@ -302,7 +378,7 @@ def _load_plain_model_pipeline(
 
     from ..models import AutoConfig
     from ..models.registry import (
-        DESIGN_GENERATOR_MODELS,
+        DESIGN_MODELS,
         STRUCTURE_PREDICTION_MODELS,
         architecture_from_config,
     )
@@ -319,7 +395,7 @@ def _load_plain_model_pipeline(
     manifest = read_artifact_manifest(pretrained_path, expected_kind="model")
     task = artifact_task(manifest)
     architecture = architecture_from_config(config)
-    if task == "binding_affinity_prediction":
+    if task == "binding_affinity":
         load_kwargs = dict(kwargs)
         if load_kwargs.get("processor") is None:
             load_kwargs["processor"] = _load_plain_model_processor(
@@ -367,7 +443,7 @@ def _load_plain_model_pipeline(
             ),
             trust_remote_code=trust_remote_code,
         )
-    if architecture in DESIGN_GENERATOR_MODELS:
+    if architecture in DESIGN_MODELS:
         return DesignPipeline.from_pretrained(
             pretrained_model_name_or_path,
             repo_type=repo_type,

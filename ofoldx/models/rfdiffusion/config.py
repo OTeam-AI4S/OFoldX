@@ -481,7 +481,7 @@ class RfDiffusionConfig(Config):
     inference controls, contigs, PPI, potentials, scaffold guidance, and logging). The groups mirror the
     released RosettaCommons checkpoint ``config_dict`` so converted artifacts preserve training-time model,
     diffuser, and preprocessing settings. Building
-    [`RfDiffusionDesignGenerator`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignGenerator] with the
+    [`RfDiffusionDesigner`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner] with the
     defaults reproduces the reference ``base`` architecture.
 
     Args:
@@ -520,7 +520,7 @@ class RfDiffusionConfig(Config):
         'rfdiffusion'
         >>> config.diffuser.num_timesteps
         50
-        >>> model = RfDiffusionDesignGenerator(config)  # doctest: +SKIP
+        >>> model = RfDiffusionDesigner(config)  # doctest: +SKIP
     """
 
     architecture: str = "rfdiffusion"

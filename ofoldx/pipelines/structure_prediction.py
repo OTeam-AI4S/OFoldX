@@ -8,10 +8,8 @@ type. Unlike the design pipeline there is no output coercion: the model contract
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any, TypeAlias, cast
 
 import torch
@@ -19,9 +17,9 @@ from chanfig import Config
 from typing_extensions import Self
 
 from ..data.structure import Structure
-from ..hub import pretrained_allow_patterns, publish_artifact_to_hub, resolve_pretrained_path
+from ..hub import pretrained_allow_patterns, resolve_pretrained_path
 from ..models import (
-    AutoModelForStructurePrediction,
+    AutoModel,
     BaseInput,
     StructurePredictionOutput,
 )
@@ -89,7 +87,7 @@ class StructurePredictionPipeline(Pipeline[_ModelBatch, StructurePredictionOutpu
             cast(StructureProcessor[_ModelBatch], AutoProcessor.from_config(config)) if processor is None else processor
         )
         return cls(
-            AutoModelForStructurePrediction.from_config(config),
+            AutoModel.from_config(config),
             processor=selected_processor,
         )
 
@@ -177,7 +175,7 @@ class StructurePredictionPipeline(Pipeline[_ModelBatch, StructurePredictionOutpu
             model_path = package_path
             processor_path = package_path
         if model is None:
-            model = AutoModelForStructurePrediction.from_pretrained(
+            model = AutoModel.from_pretrained(
                 model_path,
                 strict=strict,
                 weights_device=weights_device,
@@ -229,69 +227,6 @@ class StructurePredictionPipeline(Pipeline[_ModelBatch, StructurePredictionOutpu
             architecture=component_architecture(self.model),
         ).json(save_directory / PIPELINE_MANIFEST_NAME)
 
-    def push_to_hub(
-        self,
-        repo_id: str,
-        *,
-        repo_type: str = "model",
-        private: bool | None = None,
-        token: str | bool | None = None,
-        revision: str | None = None,
-        commit_message: str | None = None,
-        create_pr: bool = False,
-        delete_existing: bool = False,
-        tag: str | None = None,
-        model_card: bool = True,
-        model_card_metadata: Mapping[str, object] | None = None,
-        widget_examples: Sequence[Mapping[str, object]] | None = None,
-        card_body: str | None = None,
-        variant: str | None = None,
-    ) -> Any:
-        r"""
-        Save this pipeline package and upload it to the Hugging Face Hub.
-
-        Args:
-            repo_id: Destination Hugging Face Hub repository id.
-            repo_type: Hub repository type.
-            private: Optional privacy setting used when creating the repository.
-            token: Optional Hugging Face authentication token.
-            revision: Optional target branch for the upload.
-            commit_message: Optional commit message for the upload.
-            create_pr: If ``True``, upload changes through a Hub pull request.
-            delete_existing: If ``True``, delete an existing destination repo before recreating it.
-            tag: Optional Hub tag to create after uploading.
-            model_card: If ``True``, write/update ``README.md`` with Hub card metadata.
-            model_card_metadata: Extra model-card front matter values.
-            widget_examples: Optional widget examples. ``None`` uses task defaults.
-            card_body: Optional Markdown body for the generated model card.
-            variant: Optional model weight variant suffix.
-
-        Returns:
-            The object returned by ``huggingface_hub.HfApi.upload_folder``.
-
-        Examples:
-            >>> pipeline.push_to_hub("oteam/my-structure-pipeline")  # doctest: +SKIP
-        """
-
-        with TemporaryDirectory() as tmpdir:
-            self.save_pretrained(tmpdir, variant=variant)
-            return publish_artifact_to_hub(
-                tmpdir,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                private=private,
-                token=token,
-                revision=revision,
-                commit_message=commit_message,
-                create_pr=create_pr,
-                delete_existing=delete_existing,
-                tag=tag,
-                model_card=model_card,
-                model_card_metadata=model_card_metadata,
-                widget_examples=widget_examples,
-                card_body=card_body,
-            )
-
     @torch.inference_mode()
     def __call__(self, inputs: StructurePredictionInput, **model_kwargs: Any) -> StructurePredictionOutput:
         r"""
@@ -318,12 +253,34 @@ class StructurePredictionPipeline(Pipeline[_ModelBatch, StructurePredictionOutpu
         """
 
         batch = self._prepare(inputs)
-        output = self.model(self._move_to_model(batch), **model_kwargs)
+        model_input = self._move_to_model(batch)
+        folder = getattr(self.model, "fold", None)
+        if callable(folder):
+            output = folder(model_input, **model_kwargs)
+        else:
+            output = self.model(model_input, **model_kwargs)
         if not isinstance(output, StructurePredictionOutput):
             raise TypeError(
                 f"structure-prediction models must return StructurePredictionOutput, got {type(output).__name__}"
             )
         return output
+
+    def fold(self, inputs: StructurePredictionInput, **model_kwargs: Any) -> StructurePredictionOutput:
+        r"""
+        Predict a structure -- the house verb for structure prediction, equivalent to calling the pipeline.
+
+        Args:
+            inputs: Typed model input, parsed structure, or structure file path.
+            **model_kwargs: Extra keyword arguments forwarded to the model forward pass.
+
+        Returns:
+            Predicted structure output for the input.
+
+        Examples:
+            >>> pipeline.fold("complex.cif")  # doctest: +SKIP
+        """
+
+        return self(inputs, **model_kwargs)
 
     def _prepare(self, inputs: StructurePredictionInput) -> _ModelBatch:
         r"""

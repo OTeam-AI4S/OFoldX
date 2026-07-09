@@ -55,8 +55,9 @@ def test_geometry() -> None:
     assert geometry.distance_mask.shape == (1, 3, 2, 4, 1)
     assert geometry.window_info.attention_mask.shape == (1, 3, 2, 4)
 
-    # Hand-derived displacement d[i, q, k] = position[key atom] - position[query atom] per window.
-    expected_vectors = torch.tensor(
+    # Hand-derived key-minus-query displacements per window. The builder returns the AF3/Protenix-convention
+    # query-minus-key (matching the dense encode_atom_pair path), i.e. the negation of this table.
+    key_minus_query = torch.tensor(
         [
             [
                 [
@@ -74,7 +75,7 @@ def test_geometry() -> None:
             ]
         ]
     )
-    torch.testing.assert_close(geometry.distance_vectors, expected_vectors)
+    torch.testing.assert_close(geometry.distance_vectors, -key_minus_query)
 
     # A pair is same-space iff space_id[query atom] == space_id[key atom]; padded atoms read as space id 0.
     expected_mask = torch.tensor(

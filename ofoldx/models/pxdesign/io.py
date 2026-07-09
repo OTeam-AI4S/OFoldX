@@ -34,7 +34,8 @@ import numpy as np
 
 from ...data.ccd import CcdProvider, ReferenceComponent, default_ccd_provider, heavy_atom_names
 from ...data.residue_constants import dna_1to3, restype_1to3_with_unknown, rna_1to3
-from ...data.structure import AtomRecord, ResidueKey, Structure, index_to_chain_id
+from ...data.structure import AtomRecord, ResidueKey, Structure
+from ...data.utils import index_to_chain_id
 from ...io.structure import read_structure
 
 _MOL_TYPE_BY_ENTITY: dict[str, str] = {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ofoldx.data.rdkit_ccd import (
+from ofoldx.data.ccd import (
     MolFromCcdError,
     ensure_conformer,
     mol_from_ccd_block,

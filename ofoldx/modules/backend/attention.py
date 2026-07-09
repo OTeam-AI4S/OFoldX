@@ -11,16 +11,17 @@ NVIDIA) add a branch in [`gated_multihead_attention`][] plus any helper they nee
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
-from oops import OOpsUnsupportedError
-from oops import gated_pair_bias_attention as _oops_gated_pair_bias_attention
-from oops import pair_bias_attention as _oops_pair_bias_attention
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_gated_pair_bias_attention = oops_kernel("gated_pair_bias_attention")
+_oops_pair_bias_attention = oops_kernel("pair_bias_attention")
 
 if TYPE_CHECKING:
     from ..attention.multihead import MultiheadAttentionProjection
@@ -254,7 +255,7 @@ def _oops_attention_pair_bias(
         output_weight=projection.output_projection.weight,
         scale=1.0,
     )
-    return output.reshape(*query.shape[:-2], query_length, projection.hidden_size)
+    return cast(Tensor, output).reshape(*query.shape[:-2], query_length, projection.hidden_size)
 
 
 def _oops_attention(
@@ -306,7 +307,7 @@ def _oops_attention(
         device=query_projection.device,
     )
     output = _oops_pair_bias_attention(query_flat, key_flat, value_flat, mask=mask, pair_bias=pair_bias, scale=1.0)
-    return output.reshape(*prefix_shape, num_heads, query_length, head_dim)
+    return cast(Tensor, output).reshape(*prefix_shape, num_heads, query_length, head_dim)
 
 
 def _oops_pair_bias(

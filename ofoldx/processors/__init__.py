@@ -17,8 +17,7 @@ from __future__ import annotations
 
 from .auto import AutoProcessor
 from .mixin import ProcessorMixin
-from .msa import ParsedMsa, attach_msa, featurize_msa, parse_a3m, parse_csv, parse_msa
-from .msa_tools import (
+from .msa import (
     Hmmalign,
     Hmmbuild,
     Hmmsearch,
@@ -27,6 +26,12 @@ from .msa_tools import (
     MsaToolError,
     MsaToolResult,
     Nhmmer,
+    ParsedMsa,
+    attach_msa,
+    encode_msa,
+    parse_a3m,
+    parse_csv,
+    parse_msa,
     run_msa_tools,
 )
 from .registry import PROCESSORS
@@ -37,7 +42,7 @@ from .utils import StructuralFields, StructureInput, StructureToken, structure_f
 __all__ = [
     "attach_msa",
     "AutoProcessor",
-    "featurize_msa",
+    "encode_msa",
     "filter_hits",
     "Hmmalign",
     "Hmmbuild",

@@ -66,7 +66,7 @@ def test_pipeline_manifest_rejects_malformed_values(tmp_path) -> None:
             build_pipeline_manifest(
                 "ofoldx.pipelines.design.DesignPipeline",
                 {},
-                task="design_generation",
+                task="design",
             ),
             StructurePredictionPipeline,
         )

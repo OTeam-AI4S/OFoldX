@@ -85,9 +85,11 @@ def encode_atom_pair(
     pair = module.distance_vector_projection(distance_vectors) * distance_term_mask
     pair = pair + module.inverse_distance_projection(inverse_distance) * inverse_term_mask
     pair = pair + module.distance_mask_projection(valid_mask)
+    # Add the per-atom single terms before prefix-matching so the fully-formed pair (which shares the pair axes
+    # of distance_vectors, no sample axis) is reshaped once to align with a possibly sample-prefixed pair_bias.
+    pair = pair + module.left_atom_projection(query_single) + module.right_atom_projection(key_single)
     if pair_bias is not None:
         pair = _match_prefix(pair, pair_bias, prefix_ndim=prefix_ndim) + pair_bias
-    pair = pair + module.left_atom_projection(query_single) + module.right_atom_projection(key_single)
     return pair + module.feed_forward(pair)
 
 

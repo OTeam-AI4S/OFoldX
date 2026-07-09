@@ -8,10 +8,9 @@ reusing the design-output normalization machinery.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any, cast
 
 import torch
@@ -19,12 +18,12 @@ from chanfig import Config
 from typing_extensions import Self
 
 from ..data.structure import Structure
-from ..hub import pretrained_allow_patterns, publish_artifact_to_hub, resolve_pretrained_path
+from ..hub import pretrained_allow_patterns, resolve_pretrained_path
 from ..models import (
-    AutoModelForBindingAffinityPrediction,
+    AutoModel,
     BaseInput,
-    BindingAffinityPredictionOutput,
-    DesignGeneratorOutput,
+    BindingAffinityOutput,
+    DesignCandidate,
 )
 from ..processors import AutoProcessor
 from .auto import (
@@ -45,7 +44,7 @@ _ModelBatch = BaseInput
 BindingAffinityInput = _ModelBatch | Structure | str | PathLike[str]
 
 
-class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityPredictionOutput]):
+class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityOutput]):
     r"""
     Run a protein-ligand binding-affinity scorer behind a task-specific pipeline boundary.
     """
@@ -63,7 +62,7 @@ class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityPredictionOut
             cast(StructureProcessor[_ModelBatch], AutoProcessor.from_config(config)) if processor is None else processor
         )
         return cls(
-            AutoModelForBindingAffinityPrediction.from_config(config),
+            AutoModel.from_config(config),
             processor=selected_processor,
         )
 
@@ -113,14 +112,14 @@ class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityPredictionOut
         if has_pipeline_manifest(package_path):
             manifest = read_pipeline_manifest(package_path)
             validate_pipeline_class(manifest, cls)
-            validate_pipeline_task(manifest, "binding_affinity_prediction")
+            validate_pipeline_task(manifest, "binding_affinity")
             model_path = component_path(package_path, manifest, "scorer")
             processor_path = component_path(package_path, manifest, "processor")
         else:
             model_path = package_path
             processor_path = package_path
         if model is None:
-            model = AutoModelForBindingAffinityPrediction.from_pretrained(
+            model = AutoModel.from_pretrained(
                 model_path,
                 strict=strict,
                 weights_device=weights_device,
@@ -149,65 +148,34 @@ class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityPredictionOut
         build_pipeline_manifest(
             f"{type(self).__module__}.{type(self).__qualname__}",
             {"scorer": "scorer", "processor": "processor"},
-            task="binding_affinity_prediction",
+            task="binding_affinity",
             architecture=component_architecture(self.model),
         ).json(save_directory / PIPELINE_MANIFEST_NAME)
 
-    def push_to_hub(
-        self,
-        repo_id: str,
-        *,
-        repo_type: str = "model",
-        private: bool | None = None,
-        token: str | bool | None = None,
-        revision: str | None = None,
-        commit_message: str | None = None,
-        create_pr: bool = False,
-        delete_existing: bool = False,
-        tag: str | None = None,
-        model_card: bool = True,
-        model_card_metadata: Mapping[str, object] | None = None,
-        widget_examples: Sequence[Mapping[str, object]] | None = None,
-        card_body: str | None = None,
-        variant: str | None = None,
-    ) -> Any:
-        r"""
-        Save this pipeline package and upload it to the Hugging Face Hub.
-        """
-
-        with TemporaryDirectory() as tmpdir:
-            self.save_pretrained(tmpdir, variant=variant)
-            return publish_artifact_to_hub(
-                tmpdir,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                private=private,
-                token=token,
-                revision=revision,
-                commit_message=commit_message,
-                create_pr=create_pr,
-                delete_existing=delete_existing,
-                tag=tag,
-                model_card=model_card,
-                model_card_metadata=model_card_metadata,
-                widget_examples=widget_examples,
-                card_body=card_body,
-            )
-
     @torch.inference_mode()
-    def __call__(self, inputs: BindingAffinityInput, **model_kwargs: Any) -> BindingAffinityPredictionOutput:
+    def __call__(self, inputs: BindingAffinityInput, **model_kwargs: Any) -> BindingAffinityOutput:
         r"""
         Score one protein-ligand complex for binding affinity.
         """
 
         batch = self._prepare(inputs)
         model_input = self._move_to_model(batch)
-        generate = getattr(self.model, "generate", None)
-        if callable(generate):
-            raw_output = generate(model_input, **model_kwargs)
+        scorer = getattr(self.model, "score", None)
+        if callable(scorer):
+            raw_output = scorer(model_input, **model_kwargs)
         else:
             raw_output = self.model(model_input, **model_kwargs)
         return _to_binding_affinity_output(raw_output, required_score=self.REQUIRED_SCORE)
+
+    def score(self, inputs: BindingAffinityInput, **model_kwargs: Any) -> BindingAffinityOutput:
+        r"""
+        Score a protein-ligand complex -- the house verb for affinity, equivalent to calling the pipeline.
+
+        Examples:
+            >>> pipeline.score("complex.cif")  # doctest: +SKIP
+        """
+
+        return self(inputs, **model_kwargs)
 
     def _prepare(self, inputs: BindingAffinityInput) -> _ModelBatch:
         if is_structure_input(inputs):
@@ -221,16 +189,16 @@ class BindingAffinityPipeline(Pipeline[_ModelBatch, BindingAffinityPredictionOut
         return inputs
 
 
-def _to_binding_affinity_output(output: object, *, required_score: str) -> BindingAffinityPredictionOutput:
-    if isinstance(output, BindingAffinityPredictionOutput):
+def _to_binding_affinity_output(output: object, *, required_score: str) -> BindingAffinityOutput:
+    if isinstance(output, BindingAffinityOutput):
         if required_score not in output.scores:
             raise ValueError(f"binding-affinity output scores must contain {required_score!r}")
         return output
-    if isinstance(output, DesignGeneratorOutput):
+    if isinstance(output, DesignCandidate):
         scores = dict(output.scores or {})
         if required_score not in scores:
             raise ValueError(f"binding-affinity models must return a {required_score!r} score")
-        return BindingAffinityPredictionOutput(
+        return BindingAffinityOutput(
             affinity_pred_value=scores[required_score],
             scores=scores,
             structure_prediction=output.structure_prediction,
@@ -240,8 +208,8 @@ def _to_binding_affinity_output(output: object, *, required_score: str) -> Bindi
         scores = {key: value for key, value in output.items() if isinstance(value, torch.Tensor)}
         if required_score not in scores:
             raise ValueError(f"binding-affinity mapping outputs must contain {required_score!r}")
-        return BindingAffinityPredictionOutput(affinity_pred_value=scores[required_score], scores=scores)
+        return BindingAffinityOutput(affinity_pred_value=scores[required_score], scores=scores)
     raise TypeError(
-        "binding-affinity models must return BindingAffinityPredictionOutput, DesignGeneratorOutput, or a tensor "
+        "binding-affinity models must return BindingAffinityOutput, a DesignCandidate, or a tensor "
         f"mapping, got {type(output).__name__}"
     )

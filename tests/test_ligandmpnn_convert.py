@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from ofoldx.models import AutoModel
-from ofoldx.models.ligandmpnn import Packer, PackerConfig
+from ofoldx.models.ligandmpnn import LigandMPNNPacker, LigandMPNNPackerConfig
 from ofoldx.models.ligandmpnn.convert import (
     _PACKER_LAYER_GROUPS,
     _PACKER_TOP_LEVEL,
@@ -15,7 +15,7 @@ from ofoldx.models.ligandmpnn.convert import (
 
 
 def test_convert_ligandmpnn_checkpoint_auto_routes_side_chain_packer(tmp_path: Path) -> None:
-    config = PackerConfig(
+    config = LigandMPNNPackerConfig(
         {
             "hidden_size": 16,
             "num_encoder_layers": 1,
@@ -26,7 +26,7 @@ def test_convert_ligandmpnn_checkpoint_auto_routes_side_chain_packer(tmp_path: P
             "num_positional_embeddings": 4,
         }
     )
-    source_model = Packer(config)
+    source_model = LigandMPNNPacker(config)
     checkpoint_path = tmp_path / "ligandmpnn_sc_tiny.pt"
     torch.save(
         {
@@ -45,7 +45,7 @@ def test_convert_ligandmpnn_checkpoint_auto_routes_side_chain_packer(tmp_path: P
     assert report["architecture"] == "ligandmpnn_packer"
     assert report["checkpoint_variant"] == "ligandmpnn_sc_tiny"
     assert report["tensor_count"] == len(source_model.state_dict())
-    assert isinstance(loaded, Packer)
+    assert isinstance(loaded, LigandMPNNPacker)
     assert loaded.config.architecture == "ligandmpnn_packer"
     assert loaded.config.k_neighbors == 4
     assert loaded.config.atom_context_num == 2
@@ -57,7 +57,7 @@ def test_convert_ligandmpnn_checkpoint_auto_routes_side_chain_packer(tmp_path: P
         convert_ligandmpnn_checkpoint(checkpoint_path, tmp_path / "wrong-kind", checkpoint_kind="sequence")
 
 
-def _official_packer_state_dict(model: Packer) -> dict[str, torch.Tensor]:
+def _official_packer_state_dict(model: LigandMPNNPacker) -> dict[str, torch.Tensor]:
     return {_native_to_official_packer_key(key): tensor.clone() for key, tensor in model.state_dict().items()}
 
 
@@ -74,7 +74,7 @@ def _native_to_official_packer_key(key: str) -> str:
         for native_prefix, official_prefix in inverse_sublayers:
             if remainder.startswith(native_prefix + "."):
                 return f"{official_group}.{layer}.{official_prefix}{remainder[len(native_prefix):]}"
-        raise AssertionError(f"unmapped Packer layer key: {key}")
+        raise AssertionError(f"unmapped LigandMPNNPacker layer key: {key}")
 
     inverse_top_level = sorted(
         ((native_prefix, official_prefix) for official_prefix, native_prefix in _PACKER_TOP_LEVEL.items()),
@@ -84,4 +84,4 @@ def _native_to_official_packer_key(key: str) -> str:
     for native_prefix, official_prefix in inverse_top_level:
         if key in (f"{native_prefix}.weight", f"{native_prefix}.bias"):
             return official_prefix + key[len(native_prefix) :]
-    raise AssertionError(f"unmapped Packer key: {key}")
+    raise AssertionError(f"unmapped LigandMPNNPacker key: {key}")

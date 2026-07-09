@@ -417,7 +417,7 @@ class BoltzGenConfig(Config):
     r"""
     BoltzGen structure-generating design-model configuration.
 
-    Top-level configuration for [`BoltzGenDesignGenerator`][ofoldx.models.boltzgen.model.BoltzGenDesignGenerator].
+    Top-level configuration for [`BoltzGenDesigner`][ofoldx.models.boltzgen.model.BoltzGenDesigner].
     Carries the shared representation widths and trunk/diffusion knobs plus the design-specific submodule configs
     (input embedder, template, token distance) and opt-in scoring heads. The registered subclasses select the
     published BoltzGen-1 artifacts.
@@ -470,7 +470,7 @@ class BoltzGenConfig(Config):
         'boltzgen'
         >>> config.single_size
         384
-        >>> model = BoltzGenDesignGenerator(config)  # doctest: +SKIP
+        >>> model = BoltzGenDesigner(config)  # doctest: +SKIP
     """
 
     architecture: str = "boltzgen"
@@ -607,8 +607,8 @@ class BoltzGenIFoldConfig(BoltzGenConfig):
     r"""
     BoltzGen inverse-folding design-generator configuration.
 
-    Configuration for [`BoltzGenIFoldGenerator`][ofoldx.models.boltzgen.model.BoltzGenIFoldGenerator]. Inherits
-    every field of [`BoltzGenConfig`][ofoldx.models.boltzgen.config.BoltzGenConfig] (the ``ifold`` sub-config
+    Configuration for [`BoltzGenInverseFoldDesigner`][ofoldx.models.boltzgen.model.BoltzGenInverseFoldDesigner].
+    Inherits every field of [`BoltzGenConfig`][ofoldx.models.boltzgen.config.BoltzGenConfig] (the ``ifold`` sub-config
     carries the encoder/decoder settings) and resets the input embedder to the base variant without design
     conditioning.
 

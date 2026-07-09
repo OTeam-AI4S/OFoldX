@@ -34,12 +34,9 @@ class ESMFold2MSAEncoderConfig(Config):
 
 
 class ESMFold2ParcaeConfig(Config):
-    r"""Linear-recurrent diffusion-loop scheduler config."""
+    r"""Linear-recurrent trunk ("parcae") config."""
 
     enabled: bool = True
-    poisson_mean: float = 3.0
-    min_steps: int = 1
-    max_steps: int | None = 6
     num_coda_blocks: int = 2
 
 

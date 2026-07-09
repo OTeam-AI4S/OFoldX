@@ -2,8 +2,8 @@ r"""
 Packed side-chain PDB output for the LigandMPNN family.
 
 OFoldX-native replacement for the reference LigandMPNN ``write_full_PDB``: emit a plain PDB from the
-side-chain Packer's atom14 output ([`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains])
-without a ProDy dependency. This is LigandMPNN-specific output (it consumes the Packer's atom14 tensors and
+side-chain LigandMPNNPacker's atom14 output ([`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains])
+without a ProDy dependency. This is LigandMPNN-specific output (it consumes the LigandMPNNPacker's atom14 tensors and
 the LigandMPNN sequence alphabet), so it lives with the model family rather than in the shared ``io`` package.
 """
 

@@ -1,17 +1,16 @@
 r"""
 OFoldX public API.
+
+Tier 0 -- verbs: [`fold`][ofoldx.fold] / [`design`][ofoldx.design] / [`score`][ofoldx.score] /
+[`pack`][ofoldx.pack], plus [`pipeline`][ofoldx.pipeline] to load a task pipeline.
+Tier 2 -- builders: [`AutoModel`][ofoldx.AutoModel] / [`AutoConfig`][ofoldx.AutoConfig] /
+[`AutoProcessor`][ofoldx.AutoProcessor]. Training lives in [`ofoldx.training`][ofoldx.training].
 """
 
 from __future__ import annotations
 
 from ._version import __version__, version
-from .models import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForBindingAffinityPrediction,
-    AutoModelForDesignGeneration,
-    AutoModelForStructurePrediction,
-)
+from .models import AutoConfig, AutoModel
 from .pipelines import (
     BindingAffinityPipeline,
     DesignPipeline,
@@ -20,22 +19,23 @@ from .pipelines import (
     StructurePredictionPipeline,
 )
 from .processors import AutoProcessor
-from .runners import Config, Runner
+from .tasks import design, fold, pack, pipeline, register_default_model, score
 
 __all__ = [
     "AutoConfig",
     "AutoModel",
-    "AutoModelForBindingAffinityPrediction",
-    "AutoModelForDesignGeneration",
-    "AutoModelForStructurePrediction",
     "AutoProcessor",
     "BindingAffinityPipeline",
-    "Config",
     "DesignPipeline",
     "Pipeline",
-    "Runner",
     "SideChainPackingPipeline",
     "StructurePredictionPipeline",
     "__version__",
+    "design",
+    "fold",
+    "pack",
+    "pipeline",
+    "register_default_model",
+    "score",
     "version",
 ]

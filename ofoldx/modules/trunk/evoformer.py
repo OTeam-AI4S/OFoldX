@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ..attention import GatedMultiheadAttention
+from ..backend import LayerNorm
 from ..functional import checkpoint_blocks
 from ..transition import RowwiseDropout
 

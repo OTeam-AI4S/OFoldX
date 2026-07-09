@@ -15,13 +15,14 @@ import math
 
 import torch
 import torch.nn.functional as F
-from oops import OOpsUnsupportedError
-from oops import atom_to_token_mean as _oops_atom_to_token_mean
-from oops import token_pair_to_atom_window_gather as _oops_token_pair_to_atom_window_gather
-from oops import token_to_atom_broadcast as _oops_token_to_atom_broadcast
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_atom_to_token_mean = oops_kernel("atom_to_token_mean")
+_oops_token_pair_to_atom_window_gather = oops_kernel("token_pair_to_atom_window_gather")
+_oops_token_to_atom_broadcast = oops_kernel("token_to_atom_broadcast")
 
 _SUPPORTED = ("oops", "eager")
 

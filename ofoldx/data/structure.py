@@ -123,28 +123,3 @@ class Structure:
                 residues.append(atom.residue)
                 seen.add(atom.residue)
         return tuple(residues)
-
-
-def index_to_chain_id(index: int) -> str:
-    r"""
-    Convert a one-based index to a spreadsheet-style chain label (``1 -> A``, ``27 -> AA``).
-
-    The shared chain-label utility used by the family JSON parsers to auto-assign chain ids, matching
-    upstream ``data.utils.int_to_letters``.
-
-    Args:
-        index: One-based chain index.
-
-    Returns:
-        Uppercase-letter chain label.
-
-    Examples:
-        >>> index_to_chain_id(1), index_to_chain_id(27), index_to_chain_id(703)
-        ('A', 'AA', 'AAA')
-    """
-
-    label = ""
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        label = chr(65 + remainder) + label
-    return label

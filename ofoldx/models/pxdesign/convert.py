@@ -22,7 +22,7 @@ from ...hub import add_hub_upload_arguments, upload_artifact_from_args
 from ..alphafold3.convert import _alphafold3_reference_key, translate_reference_state
 from ..mixin import no_init_weights
 from .config import PxDesignConfig
-from .model import PxDesignDesignGenerator
+from .model import PxDesignDesigner
 
 OFFICIAL_PXDESIGN_CHECKPOINT_URLS = {
     "pxdesign_v0.1.0": "https://pxdesign.tos-cn-beijing.volces.com/release_model/pxdesign_v0.1.0.pt",
@@ -211,7 +211,7 @@ def convert_pxdesign_state_dict(
     reference_state = _extract_reference_state(checkpoint_or_state_dict)
     if model is None:
         with no_init_weights():
-            model = PxDesignDesignGenerator(PxDesignConfig() if config is None else config)
+            model = PxDesignDesigner(PxDesignConfig() if config is None else config)
     converted = translate_reference_state(
         model,
         reference_state,
@@ -257,7 +257,7 @@ def inspect_pxdesign_conversion(
     reference_state = _extract_reference_state(checkpoint_or_state_dict)
     if model is None:
         with no_init_weights():
-            model = PxDesignDesignGenerator(PxDesignConfig() if config is None else config)
+            model = PxDesignDesigner(PxDesignConfig() if config is None else config)
     converted = convert_pxdesign_state_dict(
         checkpoint_or_state_dict,
         model=model,
@@ -282,7 +282,7 @@ def convert_pxdesign_checkpoint(
     dtype: torch.dtype | None = None,
     strict: bool = False,
     checkpoint_variant: str | None = None,
-) -> PxDesignDesignGenerator:
+) -> PxDesignDesigner:
     r"""
     Convert an official PxDesign checkpoint into a single-file OFoldX pretrained directory.
 
@@ -298,7 +298,7 @@ def convert_pxdesign_checkpoint(
         checkpoint_variant: Variant tag; defaults to the checkpoint file stem.
 
     Returns:
-        The converted [`PxDesignDesignGenerator`][ofoldx.models.pxdesign.model.PxDesignDesignGenerator],
+        The converted [`PxDesignDesigner`][ofoldx.models.pxdesign.model.PxDesignDesigner],
         already saved to ``output_dir``.
 
     Raises:
@@ -314,7 +314,7 @@ def convert_pxdesign_checkpoint(
         checkpoint,
         checkpoint_variant=checkpoint_variant if checkpoint_variant is not None else checkpoint_path.stem,
     )
-    model = PxDesignDesignGenerator(config)
+    model = PxDesignDesigner(config)
     state_dict = convert_pxdesign_state_dict(
         checkpoint,
         model=model,

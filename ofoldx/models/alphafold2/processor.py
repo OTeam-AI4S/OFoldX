@@ -35,8 +35,8 @@ class AlphaFold2Processor(StructureProcessor):
 
     Args:
         protein_only: Reject non-protein structures by default, matching official
-            AlphaFold 2 monomer/pTM scope. Set to ``False`` only for the temporary
-            shared scaffold or tests that intentionally exercise non-protein tokens.
+            AlphaFold 2 monomer/pTM scope. Set to ``False`` for the shared
+            structure-token scaffold or tests that intentionally exercise non-protein tokens.
         **kwargs: Shared [`StructureProcessor`][ofoldx.processors.structure.StructureProcessor]
             constructor arguments.
 

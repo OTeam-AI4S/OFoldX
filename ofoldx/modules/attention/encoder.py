@@ -4,9 +4,9 @@ Encoder modules built from self-attention blocks.
 
 from __future__ import annotations
 
-from oops import LayerNorm
 from torch import Tensor, nn
 
+from ..backend import LayerNorm
 from .multihead import GatedMultiheadAttention
 
 

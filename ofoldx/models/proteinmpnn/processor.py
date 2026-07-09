@@ -21,6 +21,7 @@ from ...io import read_structure
 from ...processors.mixin import ProcessorMixin
 from ...processors.registry import PROCESSORS
 from ...processors.utils import StructureInput, structure_from_input
+from ...results_registry import register_sequence_decoder
 from .model import ProteinMPNNInput
 
 # ProteinMPNN residue alphabet: index order used by the released checkpoints (``X`` is the unknown/gap token).
@@ -391,3 +392,6 @@ def sequences_from_tokens(tokens: Iterable[int]) -> str:
     """
 
     return "".join(PROTEINMPNN_ALPHABET[int(token)] for token in tokens)
+
+
+register_sequence_decoder("proteinmpnn", sequences_from_tokens)

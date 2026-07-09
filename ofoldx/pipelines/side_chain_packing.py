@@ -1,17 +1,17 @@
 r"""
 Side-chain packing task pipeline.
 
-Wraps the LigandMPNN Packer behind the same save/load/push boundary as the other OFoldX pipelines. The pipeline
-accepts a parsed structure, a structure path, or a precomputed feature mapping and returns the feature mapping updated
-with packed atom14 coordinates, masks, torsion-mixture parameters, and side-chain confidence features.
+Wraps the LigandMPNN LigandMPNNPacker behind the same save/load/push boundary as the other OFoldX pipelines.
+The pipeline accepts a parsed structure, a structure path, or a precomputed feature mapping and returns the
+feature mapping updated with packed atom14 coordinates, masks, torsion-mixture parameters, and side-chain
+confidence features.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping
 from os import PathLike
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -19,9 +19,9 @@ from torch import Tensor
 from typing_extensions import Self
 
 from ..data.structure import Structure
-from ..hub import pretrained_allow_patterns, publish_artifact_to_hub, resolve_pretrained_path
+from ..hub import pretrained_allow_patterns, resolve_pretrained_path
 from ..models import AutoModel
-from ..models.ligandmpnn import Packer, pack_side_chains
+from ..models.ligandmpnn import LigandMPNNPacker, pack_side_chains
 from ..models.ligandmpnn.processor import structure_to_packer_features
 from ..processors.utils import structure_from_input
 from .auto import (
@@ -43,10 +43,10 @@ SideChainPackingInput = Mapping[str, Any] | Structure | str | PathLike[str]
 
 class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
     r"""
-    Pack side chains from a structure or LigandMPNN Packer feature mapping.
+    Pack side chains from a structure or LigandMPNN LigandMPNNPacker feature mapping.
 
     Args:
-        model: LigandMPNN [`Packer`][ofoldx.models.ligandmpnn.model.Packer] module.
+        model: LigandMPNN [`LigandMPNNPacker`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker] module.
 
     Examples:
         >>> from ofoldx.pipelines import SideChainPackingPipeline
@@ -55,16 +55,16 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
         >>> packed["X"].shape  # doctest: +SKIP
     """
 
-    def __init__(self, model: Packer) -> None:
+    def __init__(self, model: LigandMPNNPacker) -> None:
         super().__init__(model)
-        self.model: Packer
+        self.model: LigandMPNNPacker
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_pipeline_name_or_path: str | PathLike[str],
         *,
-        model: Packer | None = None,
+        model: LigandMPNNPacker | None = None,
         strict: bool = True,
         weights_device: str = "cpu",
         variant: str | None = None,
@@ -78,11 +78,11 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
         **kwargs: Any,
     ) -> Self:
         r"""
-        Load a side-chain packing pipeline package or a bare Packer model artifact.
+        Load a side-chain packing pipeline package or a bare LigandMPNNPacker model artifact.
 
         Args:
             pretrained_pipeline_name_or_path: Local pipeline package/model artifact or Hub repo id.
-            model: Optional preloaded Packer override.
+            model: Optional preloaded LigandMPNNPacker override.
             strict: Whether checkpoint tensors must exactly match model parameters.
             weights_device: Device used while materializing safetensors weights.
             variant: Optional model weight variant suffix.
@@ -135,8 +135,10 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
                 config_overrides=model_config_overrides,
                 trust_remote_code=trust_remote_code,
             )
-            if not isinstance(loaded_model, Packer):
-                raise TypeError(f"side-chain packing pipeline requires Packer, got {type(loaded_model).__name__}")
+            if not isinstance(loaded_model, LigandMPNNPacker):
+                raise TypeError(
+                    f"side-chain packing pipeline requires LigandMPNNPacker, got {type(loaded_model).__name__}"
+                )
             model = loaded_model
         return cls(model)
 
@@ -144,7 +146,7 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
         r"""
         Save a full side-chain packing pipeline package.
 
-        The package stores the Packer under ``packer/`` and writes a root pipeline manifest.
+        The package stores the LigandMPNNPacker under ``packer/`` and writes a root pipeline manifest.
         """
 
         save_directory = Path(save_directory)
@@ -157,47 +159,6 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
             architecture=component_architecture(self.model),
         ).json(save_directory / PIPELINE_MANIFEST_NAME)
 
-    def push_to_hub(
-        self,
-        repo_id: str,
-        *,
-        repo_type: str = "model",
-        private: bool | None = None,
-        token: str | bool | None = None,
-        revision: str | None = None,
-        commit_message: str | None = None,
-        create_pr: bool = False,
-        delete_existing: bool = False,
-        tag: str | None = None,
-        model_card: bool = True,
-        model_card_metadata: Mapping[str, object] | None = None,
-        widget_examples: Sequence[Mapping[str, object]] | None = None,
-        card_body: str | None = None,
-        variant: str | None = None,
-    ) -> Any:
-        r"""
-        Save this pipeline package and upload it to the Hugging Face Hub.
-        """
-
-        with TemporaryDirectory() as tmpdir:
-            self.save_pretrained(tmpdir, variant=variant)
-            return publish_artifact_to_hub(
-                tmpdir,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                private=private,
-                token=token,
-                revision=revision,
-                commit_message=commit_message,
-                create_pr=create_pr,
-                delete_existing=delete_existing,
-                tag=tag,
-                model_card=model_card,
-                model_card_metadata=model_card_metadata,
-                widget_examples=widget_examples,
-                card_body=card_body,
-            )
-
     @torch.inference_mode()
     def __call__(self, inputs: SideChainPackingInput, **packer_kwargs: Any) -> dict[str, Any]:
         r"""
@@ -207,6 +168,16 @@ class SideChainPackingPipeline(Pipeline[Any, dict[str, Any]]):
         features = self._prepare(inputs)
         packed = pack_side_chains(_move_feature_mapping(features, self.device), self.model, **packer_kwargs)
         return packed
+
+    def pack(self, inputs: SideChainPackingInput, **packer_kwargs: Any) -> dict[str, Any]:
+        r"""
+        Pack side chains -- the house verb for side-chain packing, equivalent to calling the pipeline.
+
+        Examples:
+            >>> pipeline.pack("backbone.cif")  # doctest: +SKIP
+        """
+
+        return self(inputs, **packer_kwargs)
 
     def _prepare(self, inputs: SideChainPackingInput) -> dict[str, Any]:
         if is_structure_input(inputs):

@@ -7,9 +7,9 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 
-class BoltzAdaptiveLayerNorm(nn.Module):
+class AdaptiveLayerNorm(nn.Module):
     r"""
-    Boltz-style AdaLN: affine-free hidden norm, conditioning norm, sigmoid scale, and bias shift.
+    Config-driven AdaLN: affine-free hidden norm, conditioning norm, sigmoid scale, and bias shift.
 
     The submodule names intentionally match the previous fused ``oops.AdaptiveLayerNorm`` layout used by the
     checkpoint converters: ``conditioning_norm``, ``gate_projection``, and ``shift_projection``.

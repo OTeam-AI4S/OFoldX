@@ -8,14 +8,14 @@ their configs, the typed input dataclass, and the structure processor.
 from __future__ import annotations
 
 from .config import ODesignConfig, ODesignConstraintConfig, ODesignDesignConfig, ODesignPairwiseConfig
-from .model import ODesignDesignGenerator, ODesignInput, ODesignModel
+from .model import ODesignDesigner, ODesignInput, ODesignModel
 from .processor import ODesignProcessor
 
 __all__ = [
     "ODesignConfig",
     "ODesignConstraintConfig",
     "ODesignDesignConfig",
-    "ODesignDesignGenerator",
+    "ODesignDesigner",
     "ODesignInput",
     "ODesignModel",
     "ODesignPairwiseConfig",

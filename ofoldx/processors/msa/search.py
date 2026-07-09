@@ -4,7 +4,7 @@ HMMER tool wrappers for MSA generation.
 Ports the AlphaFold3 tool-driven MSA path (``data/tools/{jackhmmer,nhmmer,hmmbuild,hmmsearch,hmmalign}.py``
 and the ``data/pipeline.py`` orchestration) so a query sequence can be aligned against genetic databases
 into an a3m alignment. This is the generation counterpart to the precomputed-a3m path in
-[`msa`][ofoldx.processors.msa] (which featurizes an existing alignment).
+[`encode`][ofoldx.processors.msa.encode] (which encodes an existing alignment).
 
 EXTERNAL DEPENDENCIES (REQUIRED for this path, NOT bundled with OFoldX):
   * HMMER binaries -- ``jackhmmer``, ``nhmmer``, ``hmmbuild``, ``hmmsearch``, ``hmmalign`` (install the
@@ -45,7 +45,6 @@ class MsaToolResult:
         target_sequence: Query sequence the tool was run on.
         e_value: Reporting E-value used to filter hits.
         a3m: Alignment in a3m format.
-        tblout: Optional per-hit tabular output (used when merging sharded-database results).
 
     Examples:
         >>> result = MsaToolResult(target_sequence="MKT", e_value=1e-3, a3m=">query\nMKT\n")
@@ -56,7 +55,6 @@ class MsaToolResult:
     target_sequence: str
     e_value: float
     a3m: str
-    tblout: str | None = None
 
 
 class MsaTool(Protocol):
@@ -64,7 +62,7 @@ class MsaTool(Protocol):
     Interface for MSA tools that align a query sequence against a database.
 
     Implementations run an external aligner and return the query's a3m alignment via
-    [`query`][ofoldx.processors.msa_tools.MsaTool.query].
+    [`query`][ofoldx.processors.msa.search.MsaTool.query].
     """
 
     def query(self, target_sequence: str) -> MsaToolResult:
@@ -587,28 +585,14 @@ def convert_stockholm_to_a3m(stockholm: IO[str], max_sequences: int | None = Non
         return ""
 
     query_sequence = next(iter(sequences.values()))
-    keep_columns = [index for index, residue in enumerate(query_sequence) if residue not in {"-", "."}]
+    keep_columns = {index for index, residue in enumerate(query_sequence) if residue not in {"-", "."}}
     chunks: list[str] = []
     for name, sequence in sequences.items():
         a3m_residues: list[str] = []
         for index, residue in enumerate(sequence):
-            if index in _column_set(keep_columns):
+            if index in keep_columns:
                 a3m_residues.append(residue.upper())
             elif residue not in {"-", "."}:
                 a3m_residues.append(residue.lower())
         chunks.append(f">{name}\n{''.join(a3m_residues)}")
     return "\n".join(chunks)
-
-
-def _column_set(columns: Sequence[int]) -> set[int]:
-    r"""
-    Return the kept-column indices as a set for O(1) membership tests.
-
-    Args:
-        columns: Column indices to keep.
-
-    Returns:
-        The columns as a set.
-    """
-
-    return set(columns)

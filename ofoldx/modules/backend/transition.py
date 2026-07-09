@@ -10,11 +10,12 @@ inputs plus their requested ``operator_backend`` and stay backend-agnostic. New 
 from __future__ import annotations
 
 import torch.nn.functional as F
-from oops import OOpsUnsupportedError
-from oops import transition as _oops_transition
 from torch import Tensor
 
+from ._oops import OOpsUnsupportedError, oops_kernel
 from .resolve import resolve_tensor_operator_backend
+
+_oops_transition = oops_kernel("transition")
 
 _SUPPORTED = ("oops", "eager")
 

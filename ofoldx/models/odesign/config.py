@@ -137,8 +137,8 @@ class ODesignDesignConfig(ODesignConfig):
         'odesign_design'
         >>> config.token_feature_size
         453
-        >>> from ofoldx.models.odesign.model import ODesignDesignGenerator
-        >>> model = ODesignDesignGenerator(config)  # doctest: +SKIP
+        >>> from ofoldx.models.odesign.model import ODesignDesigner
+        >>> model = ODesignDesigner(config)  # doctest: +SKIP
     """
 
     architecture: str = "odesign_design"

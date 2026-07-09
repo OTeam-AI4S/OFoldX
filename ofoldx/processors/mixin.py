@@ -77,7 +77,6 @@ class ProcessorMixin:
         model_card: bool = True,
         model_card_metadata: Mapping[str, object] | None = None,
         widget_examples: Sequence[Mapping[str, object]] | None = None,
-        card_body: str | None = None,
     ) -> Any:
         r"""
         Save this processor artifact and upload it to the Hugging Face Hub.
@@ -95,7 +94,6 @@ class ProcessorMixin:
             model_card: If ``True``, write/update ``README.md`` with Hub card metadata.
             model_card_metadata: Extra model-card front matter values.
             widget_examples: Optional widget examples. ``None`` uses task defaults.
-            card_body: Optional Markdown body for the generated model card.
 
         Returns:
             The object returned by ``huggingface_hub.HfApi.upload_folder``.
@@ -120,7 +118,6 @@ class ProcessorMixin:
                 model_card=model_card,
                 model_card_metadata=model_card_metadata,
                 widget_examples=widget_examples,
-                card_body=card_body,
             )
 
     @classmethod

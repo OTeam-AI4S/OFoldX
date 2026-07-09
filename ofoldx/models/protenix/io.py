@@ -26,7 +26,8 @@ from typing import Any
 
 from ...data.ccd import CcdProvider, default_ccd_provider, heavy_atom_names
 from ...data.residue_constants import dna_1to3, restype_1to3_with_unknown, rna_1to3
-from ...data.structure import AtomRecord, ResidueKey, Structure, index_to_chain_id
+from ...data.structure import AtomRecord, ResidueKey, Structure
+from ...data.utils import index_to_chain_id
 
 # Entity-key to molecule type, mirroring upstream ``entity_type_mapping_dict``.
 _POLYMER_KEYS = frozenset({"proteinChain", "dnaSequence", "rnaSequence"})

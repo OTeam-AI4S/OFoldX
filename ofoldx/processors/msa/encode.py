@@ -1,9 +1,9 @@
 r"""
-MSA parsing and featurization.
+MSA parsing and encoding.
 
 Ports the Boltz precomputed-MSA data path (``boltz.data.parse.a3m`` / ``parse.csv`` and the MSA half of
 ``boltz.data.feature.featurizerv2.process_msa_features``) into OFoldX's residue-token contract. Parsers
-turn a3m/CSV alignment files into per-chain token rows plus run-length deletions; [`featurize_msa`][]
+turn a3m/CSV alignment files into per-chain token rows plus run-length deletions; [`encode_msa`][]
 turns those, aligned to the processed tokens, into the ``msa`` / ``has_deletion`` / ``deletion_value`` /
 ``msa_paired`` / ``msa_mask`` / ``msa_profile`` / ``deletion_mean`` tensors the Boltz-1/Boltz-2 trunks consume.
 
@@ -27,7 +27,7 @@ from typing import TypeVar
 import torch
 from torch import Tensor
 
-from .residue_token import _NUM_RESIDUE_TOKENS, _RESIDUE_TOKEN_IDS
+from ..residue_token import _NUM_RESIDUE_TOKENS, _RESIDUE_TOKEN_IDS
 
 _ModelInput = TypeVar("_ModelInput")
 
@@ -177,7 +177,7 @@ def parse_csv(path: str | PathLike[str], *, max_sequences: int | None = None) ->
     return _rows_to_msa(rows, max_sequences=max_sequences)
 
 
-def featurize_msa(
+def encode_msa(
     query_token_ids: Tensor,
     chain_index: Tensor,
     chain_msas: dict[int, ParsedMsa],
@@ -210,7 +210,7 @@ def featurize_msa(
         >>> query = torch.tensor([2, 6, 5])
         >>> chain = torch.tensor([0, 0, 0])
         >>> msas = {0: ParsedMsa(token_ids=((2, 6, 5), (2, 1, 5)), deletions=((0, 0, 0), (1, 0, 0)))}
-        >>> features = featurize_msa(query, chain, msas)
+        >>> features = encode_msa(query, chain, msas)
         >>> features["msa"].shape
         torch.Size([1, 2, 3])
         >>> features["msa"][0].tolist()
@@ -323,7 +323,7 @@ def attach_msa(
 
     query_token_ids = model_input.residue_type[0].argmax(dim=-1)  # type: ignore[attr-defined]
     chain_index = model_input.chain_index[0]  # type: ignore[attr-defined]
-    features = featurize_msa(query_token_ids, chain_index, chain_msas, max_sequences=max_sequences)
+    features = encode_msa(query_token_ids, chain_index, chain_msas, max_sequences=max_sequences)
     return replace(model_input, **features)  # type: ignore[type-var]
 
 

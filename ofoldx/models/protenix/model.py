@@ -8,14 +8,14 @@ import functools
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
 from ...modules.atom import AtomToTokenEncoder, LocalAtomGeometry, TokenToAtomBroadcast
+from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler, EdmScheduler
 from ...modules.embedding import (
@@ -28,8 +28,9 @@ from ...modules.embedding import (
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
+from ...modules.representation import Pair, Single
 from ...modules.trunk import MsaTrunk, PairformerStack
-from ..contract import BaseInput, StructurePredictionOutput
+from ..contract import BaseInput, StructurePredictionOutput, register_pytree_dataclass
 from ..mixin import ModelMixin
 from ..registry import MODELS, STRUCTURE_PREDICTION_MODELS
 from .config import (
@@ -68,6 +69,8 @@ class ProtenixModel(ModelMixin):
     """
 
     config_class = ProtenixConfig
+    #: Typed batch this model's training ``forward`` and inference ``fold`` consume; enables ``model(**tensors)``.
+    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: ProtenixConfig) -> None:
         super().__init__(config)
@@ -235,51 +238,107 @@ class ProtenixModel(ModelMixin):
         guidance_config: Mapping[str, Any] | None = None,
     ) -> StructurePredictionOutput:
         r"""
-        Run the Protenix model on a typed input batch.
+        Run the Protenix diffusion training step on a typed input batch.
 
-        Runs the recycling trunk, then branches on training mode: training returns the diffusion
-        training targets alongside a rolled-out confidence prediction; inference runs the EDM sampling
-        loop (optionally with Protenix training-free guidance) followed by the distogram and
-        confidence heads.
+        ``forward`` is the *training* path: it runs the recycling trunk, draws a single EDM noise level
+        and denoises the augmented target once (the differentiable diffusion signal), and attaches a
+        no-grad confidence rollout for the confidence heads. Inference (the multi-step EDM sampler plus
+        optional Protenix training-free guidance) lives in the
+        [`fold`][ofoldx.models.protenix.model.ProtenixModel.fold] capability verb; for backward
+        compatibility an eval-mode call delegates to ``fold`` so ``model(batch)`` keeps sampling when
+        not training.
+
+        Args:
+            batch: Typed input tensors (atom/token features, masks, indices, and optional constraint,
+                template, and MSA features); training requires ``batch.target_positions``.
+            recycling_steps: Number of trunk recycling cycles; defaults to the config value.
+            num_samples: Number of reverse-diffusion samples to draw when delegating to ``fold`` in eval.
+            num_sampling_steps: EDM sampling-step count for the eval-mode ``fold`` delegation.
+            generator: Optional RNG for reproducible noise/augmentation draws.
+            guidance_config: Optional Protenix training-free-guidance config for the eval-mode ``fold``
+                delegation; ignored in training.
+
+        Returns:
+            A [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]. In training
+            it carries the rolled-out coordinates and distogram/confidence logits plus the attached
+            diffusion targets (``denoised_coords``, ``augmented_target``, ``noise_level``).
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive, or (in training) ``batch.target_positions``
+                is ``None``.
+
+        Examples:
+            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
+            >>> name = "oteam/protenix-base"  # doctest: +SKIP
+            >>> model = AutoModel.from_pretrained(name).train()  # doctest: +SKIP
+            >>> batch = AutoProcessor.from_pretrained(name)("complex.cif")  # doctest: +SKIP
+            >>> loss = model(batch).denoised_coords.square().mean()  # doctest: +SKIP
+        """
+
+        if not self.training:
+            return self.fold(
+                batch,
+                recycling_steps=recycling_steps,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                generator=generator,
+                guidance_config=guidance_config,
+            )
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if recycling_steps < 1:
+            raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
+        representations = self._run_trunk(batch, recycling_steps=recycling_steps)
+        return self._forward_train(batch, representations=representations, generator=generator)
+
+    def fold(
+        self,
+        batch: ProtenixInput,
+        *,
+        recycling_steps: int | None = None,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+        guidance_config: Mapping[str, Any] | None = None,
+    ) -> StructurePredictionOutput:
+        r"""
+        Predict a structure -- the Protenix inference verb.
+
+        Runs the recycling trunk, the EDM sampling loop (optionally with Protenix training-free
+        guidance), and the distogram and confidence heads. This is the DISTINCT inference path;
+        [`forward`][ofoldx.models.protenix.model.ProtenixModel.forward] is the training path. The
+        returned raw [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]
+        is wrapped into a task result by the facade.
 
         Args:
             batch: Typed input tensors (atom/token features, masks, indices, and optional constraint,
                 template, MSA, and guidance features).
             recycling_steps: Number of trunk recycling cycles; defaults to the config value.
-            num_samples: Number of coordinate samples to draw at inference.
+            num_samples: Number of coordinate samples to draw.
             num_sampling_steps: Number of EDM sampling steps; defaults to the config value.
-            generator: Optional RNG for reproducible noise/augmentation draws.
+            generator: Optional RNG for reproducible sampling.
             guidance_config: Optional Protenix training-free-guidance config; guidance is applied only
-                when its ``enable`` flag is set (inference only).
+                when its ``enable`` flag is set.
 
         Returns:
             A [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] with
-            predicted coordinates, distogram logits, and confidence (pLDDT/PAE/PDE/resolved) logits;
-            training additionally attaches the denoised coordinates, augmented target, and noise level.
+            predicted coordinates, distogram logits, and confidence (pLDDT/PAE/PDE/resolved) logits.
 
         Raises:
-            ValueError: If guidance is requested during training, or if ``recycling_steps`` is not
-                positive.
+            ValueError: If ``recycling_steps`` is not positive.
 
         Examples:
             >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
             >>> name = "oteam/protenix-base"  # doctest: +SKIP
             >>> model = AutoModel.from_pretrained(name).eval()  # doctest: +SKIP
             >>> batch = AutoProcessor.from_pretrained(name)("complex.cif")  # doctest: +SKIP
-            >>> output = model(batch, num_samples=1)  # doctest: +SKIP
+            >>> output = model.fold(batch, num_samples=1)  # doctest: +SKIP
         """
 
         tfg_config = parse_tfg_config(guidance_config)
-        if self.training and tfg_config.enable:
-            raise ValueError("Protenix TFG guidance is an inference-time sampler feature")
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError(f"recycling_steps must be positive for this model, got {recycling_steps}")
         representations = self._run_trunk(batch, recycling_steps=recycling_steps)
-
-        if self.training:
-            return self._forward_train(batch, representations=representations, generator=generator)
-
         pred_coords = self._predict_coords(
             batch,
             representations=representations,
@@ -349,8 +408,8 @@ class ProtenixModel(ModelMixin):
         """
 
         confidence = self.confidence_head(
-            representations.single,
-            pair=representations.pair,
+            representations.single.tensor,
+            pair=representations.pair.tensor,
             token_embedding=representations.token_embedding,
             pred_coords=confidence_coords,
             token_to_rep_atom=batch.token_to_rep_atom,
@@ -359,7 +418,7 @@ class ProtenixModel(ModelMixin):
         )
         return StructurePredictionOutput(
             pred_coords=confidence_coords,
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=self.distogram_head(representations.pair.tensor),
             plddt_logits=confidence.plddt_logits,
             pae_logits=confidence.pae_logits,
             pde_logits=confidence.pde_logits,
@@ -392,7 +451,7 @@ class ProtenixModel(ModelMixin):
 
         if batch.target_positions is None:
             raise ValueError("diffusion training requires batch.target_positions")
-        target = batch.target_positions.to(dtype=representations.single.dtype)
+        target = batch.target_positions.to(dtype=representations.single.tensor.dtype)
         atom_mask = batch.atom_mask.to(device=target.device)
         resolved_mask = (batch.target_mask if batch.target_mask is not None else batch.atom_mask).to(
             device=target.device
@@ -422,8 +481,8 @@ class ProtenixModel(ModelMixin):
             reference_charges=batch.reference_charges,
             atom_mask=atom_mask,
             token_embedding=representations.token_embedding,
-            single=representations.single,
-            pair=representations.pair,
+            single=representations.single.tensor,
+            pair=representations.pair.tensor,
             relative_features=representations.relative_features,
             local_geometry=local_geometry,
         )
@@ -485,8 +544,8 @@ class ProtenixModel(ModelMixin):
 
         return ProtenixRepresentations(
             token_embedding=token_embedding,
-            single=single,
-            pair=pair,
+            single=Single(single),
+            pair=Pair(pair),
             relative_features=relative_features,
             pair_mask=pair_mask,
         )
@@ -634,8 +693,8 @@ class ProtenixModel(ModelMixin):
             reference_charges=batch.reference_charges,
             atom_mask=batch.atom_mask,
             token_embedding=representations.token_embedding,
-            single=representations.single,
-            pair=representations.pair,
+            single=representations.single.tensor,
+            pair=representations.pair.tensor,
             relative_features=representations.relative_features,
             local_geometry=local_geometry,
         )
@@ -1753,22 +1812,28 @@ def _move_tensor(
     return tensor.to(device=device, dtype=cast_dtype, non_blocking=non_blocking, copy=copy)
 
 
+@register_pytree_dataclass
 @dataclass(slots=True)
 class ProtenixRepresentations:
     r"""
     Trunk representations produced by [`ProtenixModel`][].
 
+    The ``single`` and ``pair`` fields are typed [`Single`][ofoldx.modules.representation.Single] and
+    [`Pair`][ofoldx.modules.representation.Pair] carriers at this boundary; unwrap ``.tensor`` before
+    feeding the denoiser or eager tensor math. The carriers are pytree-registered, so the bundle traces
+    through ``torch.compile`` without a graph break.
+
     Attributes:
         token_embedding: Token input embedding ``[..., N_token, token_feature_size]``.
-        single: Trunk single representation ``[..., N_token, single_size]``.
-        pair: Trunk pair representation ``[..., N_token, N_token, pair_size]``.
+        single: Trunk single representation carrier ``[..., N_token, single_size]``.
+        pair: Trunk pair representation carrier ``[..., N_token, N_token, pair_size]``.
         relative_features: Bucketed relative-position features reused by the denoiser.
         pair_mask: Token-pair validity mask ``[..., N_token, N_token]``.
     """
 
     token_embedding: Tensor
-    single: Tensor
-    pair: Tensor
+    single: Single
+    pair: Pair
     relative_features: RelativePositionBuckets
     pair_mask: Tensor
 
@@ -1784,8 +1849,8 @@ class ProtenixRepresentations:
 
         return type(self)(
             token_embedding=self.token_embedding.detach(),
-            single=self.single.detach(),
-            pair=self.pair.detach(),
+            single=Single(self.single.tensor.detach()),
+            pair=Pair(self.pair.tensor.detach()),
             relative_features=self.relative_features.detach(),
             pair_mask=self.pair_mask.detach(),
         )
@@ -1901,6 +1966,7 @@ class ProtenixConstraintFeatures:
         }
 
 
+@register_pytree_dataclass
 @dataclass(slots=True, kw_only=True)
 class ProtenixInput(BaseInput):
     r"""
@@ -1979,6 +2045,10 @@ class ProtenixInput(BaseInput):
     msa_features: Tensor | None = None
     msa_mask: Tensor | None = None
     template_features: TemplateFeatures | None = None
+
+
+#: Bind the typed batch after its definition so ``model(**tensors)`` can build it (see ``ModelMixin.__call__``).
+ProtenixModel.input_class = ProtenixInput
 
 
 @dataclass(slots=True)

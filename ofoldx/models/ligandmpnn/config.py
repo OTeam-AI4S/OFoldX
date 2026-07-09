@@ -15,7 +15,7 @@ class LigandMPNNConfig(Config):
     Configuration for the OFoldX-native LigandMPNN design generator.
 
     Stores the knobs that define a
-    [`LigandMPNNDesignGenerator`][ofoldx.models.ligandmpnn.model.LigandMPNNDesignGenerator]: the
+    [`LigandMPNNDesigner`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner]: the
     message-passing widths, encoder/decoder depths, graph connectivity, and the ligand-context budget.
     Instantiating with the defaults yields the released LigandMPNN sequence checkpoint family: 32 protein
     graph neighbors and 25 ligand context atoms per residue. ``checkpoint_variant`` stays ``None`` unless a
@@ -44,8 +44,8 @@ class LigandMPNNConfig(Config):
         'ligandmpnn'
         >>> config.k_neighbors
         32
-        >>> from ofoldx.models.ligandmpnn.model import LigandMPNNDesignGenerator
-        >>> model = LigandMPNNDesignGenerator(config)  # doctest: +SKIP
+        >>> from ofoldx.models.ligandmpnn.model import LigandMPNNDesigner
+        >>> model = LigandMPNNDesigner(config)  # doctest: +SKIP
     """
 
     architecture: str = "ligandmpnn"
@@ -65,11 +65,11 @@ class LigandMPNNConfig(Config):
 
 
 @MODEL_CONFIGS.register("ligandmpnn_packer")
-class PackerConfig(Config):
+class LigandMPNNPackerConfig(Config):
     r"""
-    Configuration for the LigandMPNN side-chain Packer.
+    Configuration for the LigandMPNN side-chain LigandMPNNPacker.
 
-    The Packer is the standalone ``ligandmpnn_sc`` architecture: it consumes backbone, sequence, and
+    The LigandMPNNPacker is the standalone ``ligandmpnn_sc`` architecture: it consumes backbone, sequence, and
     context features and predicts side-chain torsion mixtures. It is intentionally separate from
     [`LigandMPNNConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNConfig], because the released sequence
     model and side-chain packer checkpoints have different tensor sets and different artifact entrypoints.
@@ -91,7 +91,7 @@ class PackerConfig(Config):
         upper_bound: Upper distance bound for context RBFs.
 
     Examples:
-        >>> config = PackerConfig()
+        >>> config = LigandMPNNPackerConfig()
         >>> config.architecture
         'ligandmpnn_packer'
         >>> config.atom_context_num

@@ -5,9 +5,11 @@ Shared fixtures for OFoldX tests.
 from __future__ import annotations
 
 import os
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -22,6 +24,43 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ofoldx.models import AlphaFold3Input  # noqa: E402
+
+# The seed every test starts from. Arbitrary but fixed: the point is that a test's numeric behaviour is
+# independent of how many random draws the preceding tests consumed, not that this value is special.
+_GLOBAL_RNG_SEED = 0
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_rng():
+    r"""
+    Give every test the same, order-independent global RNG state.
+
+    Several tests build ``nn.Module``s (random-initialised ``Linear`` weights, etc.) or draw samples from
+    the *global* generators without seeding first, and torch's default generator is seeded from OS entropy
+    at process start. Left alone, the state entering such a test depends on how many draws the earlier
+    tests happened to consume, so the same suite passes or fails run to run (and in different collection
+    subsets). This autouse fixture snapshots the global RNG state, reseeds every global generator to a
+    fixed value before the test, and restores the snapshot afterwards -- so no test can leak RNG state
+    into the next one, and unseeded tests become deterministic. Tests that call ``torch.manual_seed`` (or
+    use a local ``torch.Generator``) still fully control their own randomness.
+
+    The suite runs on CPU, so only the CPU generators are handled; GPU RNG plumbing can be added if a
+    CUDA test box is introduced.
+    """
+
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+
+    random.seed(_GLOBAL_RNG_SEED)
+    np.random.seed(_GLOBAL_RNG_SEED)
+    torch.manual_seed(_GLOBAL_RNG_SEED)
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
 
 
 def _atom_token_fields(atom_to_token: torch.Tensor, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

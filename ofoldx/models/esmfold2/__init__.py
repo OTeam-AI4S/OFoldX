@@ -17,7 +17,7 @@ from .config import (
     ESMFold2StructureHeadConfig,
 )
 from .io import normalize_protein_sequence, sequence_from_input
-from .model import ESMFold2Input, ESMFold2Model
+from .model import ESMFold2Input, ESMFold2Model, ESMFold2Representations
 from .processor import ESMFold2Processor
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "ESMFold2Model",
     "ESMFold2ParcaeConfig",
     "ESMFold2Processor",
+    "ESMFold2Representations",
     "ESMFold2StructureHeadConfig",
     "normalize_protein_sequence",
     "sequence_from_input",

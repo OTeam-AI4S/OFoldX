@@ -67,7 +67,7 @@ def build_pipeline_manifest(
     Args:
         class_name: Fully-qualified pipeline class name.
         components: Mapping from component name to relative directory inside the package.
-        task: Task served by this package, such as ``"structure_prediction"`` or ``"design_generation"``.
+        task: Task served by this package, such as ``"structure_prediction"`` or ``"design"``.
         architecture: Optional model architecture served by the pipeline package.
 
     Returns:
@@ -77,12 +77,12 @@ def build_pipeline_manifest(
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {"generator": "generator"},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
         >>> manifest["entrypoint"]
         'ofoldx.pipelines.design.DesignPipeline'
         >>> manifest["task"]
-        'design_generation'
+        'design'
         >>> manifest["components"]["generator"]["path"]
         'generator'
     """
@@ -153,12 +153,12 @@ def pipeline_task(manifest: Config) -> str:
 
     Examples:
         >>> manifest = build_pipeline_manifest(
-        ...     "ofoldx.pipelines.design.DesignPipeline",
+        ...     "ofoldx.pipelines.structure_prediction.StructurePredictionPipeline",
         ...     {},
-        ...     task="design-generation",
+        ...     task="structure-prediction",
         ... )
         >>> pipeline_task(manifest)
-        'design_generation'
+        'structure_prediction'
     """
 
     task = artifact_task(manifest)
@@ -182,9 +182,9 @@ def validate_pipeline_task(manifest: Config, expected_task: str) -> None:
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
-        >>> validate_pipeline_task(manifest, "design-generation") is None
+        >>> validate_pipeline_task(manifest, "design") is None
         True
         >>> validate_pipeline_task(manifest, "structure_prediction")  # doctest: +IGNORE_EXCEPTION_DETAIL
         Traceback (most recent call last):
@@ -213,7 +213,7 @@ def validate_pipeline_class(manifest: Config, pipeline_cls: type[object]) -> Non
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
         >>> validate_pipeline_class(manifest, DesignPipeline) is None
         True
@@ -250,7 +250,7 @@ def pipeline_entrypoint(manifest: Config) -> str:
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
         >>> pipeline_entrypoint(manifest)
         'ofoldx.pipelines.design.DesignPipeline'
@@ -277,7 +277,7 @@ def resolve_pipeline_class(manifest: Config) -> type[object]:
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
         >>> resolve_pipeline_class(manifest).__name__
         'DesignPipeline'
@@ -310,7 +310,7 @@ def component_path(package_path: Path, manifest: Config, name: str) -> Path:
         >>> manifest = build_pipeline_manifest(
         ...     "ofoldx.pipelines.design.DesignPipeline",
         ...     {"generator": "generator"},
-        ...     task="design_generation",
+        ...     task="design",
         ... )
         >>> component_path(Path("/tmp/pkg"), manifest, "generator")
         PosixPath('/tmp/pkg/generator')

@@ -14,9 +14,9 @@ from typing import Literal
 
 import torch
 import torch.nn.functional as F
-from oops import LayerNorm
 from torch import Tensor, nn
 
+from ..backend import LayerNorm
 from ..transformer import ConditionedTransformer, TransitionKind
 from .context import AtomContext, AtomToTokenOutput
 from .pair_encoding import encode_atom_pair
