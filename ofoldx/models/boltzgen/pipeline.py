@@ -17,25 +17,34 @@ fold verb. boltz2 has since landed ``Boltz2Model.fold`` + ``Boltz2Processor`` (g
 pair) in parallel, so the folding stage is now wireable by injecting them. ``do_refold=True``
 without an injected fold Model+Processor still raises a clear error.
 
-FLAG (node4, parity-untested): the tensor->Structure decode, the designed-backbone ->
-inverse-fold re-lowering, and the predicted-sequence remap are best-effort and not
-numerically verified in this environment (no torch/numpy). The sequence-into-system remap
-(mutating residue identities of the designed system) is left owner/node4-gated; the decoded
-candidate carries the designed/refolded ``Structure`` and the predicted sequence as a
-``Metric`` axis rather than mutating the canonical system.
+Predicted-sequence remap (implemented, validated): released BoltzGen WRITES the designed
+sequence back into the output structure — ``DesignWriter.write_on_batch_end`` (inverse_fold)
+sets ``sample["ccd"][design_mask] = argmax(res_type)`` (via ``const.tokens`` id->name) before
+``Structure.from_feat`` + ``add_side_chains``. :func:`_remap_designed_sequence` reproduces this:
+the inverse-fold argmax residue identities are written into the output ``Structure`` at the
+design positions (backbone coords carried, designed side chains added at the origin marked
+present, per released ``add_side_chains``), so the candidate ``Structure`` carries the DESIGNED
+sequence and the refold folds it. Validated exact vs the released ``const.tokens`` / ``convert_ccd``
+id->name remap. The per-residue NLL remains exposed as a ``Metric`` axis.
+
+FLAG (node4, parity-untested): the tensor->Structure decode and the designed-backbone ->
+inverse-fold re-lowering are best-effort and not numerically verified end to end (the ifold
+re-lowering of a de-novo ``UNK`` backbone still needs generated-residue reference coordinates,
+a separate node4 concern from the remap).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from os import PathLike
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
 from typing_extensions import Self
 
-from ...data.molecular import ComponentReference
+from ...data.components import get_component
+from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...pipelines._generator import resolve_generator
 from ...results import Metric, Score
@@ -166,10 +175,15 @@ class BoltzGenPipeline:
             generator=generator,
         )
 
+        # Released design→inverse-fold hand-off: the generated (design) positions the design step
+        # marked drive the inverse-fold ``design_mask`` (released reads it from the design step's
+        # metadata) and, through it, the predicted-sequence remap in ``_analyze``.
+        design_references = _design_references(design_batch)
+
         candidates: list[BoltzGenCandidate] = []
         for sample_index in range(num_designs):
             backbone = _decode_structure(design_batch, design_output.pred_coords[0, sample_index])
-            ifold_batch = self.ifold_processor(backbone)
+            ifold_batch = self.ifold_processor(backbone, design=design_references)
             ifold_output = self.ifold_model.design(ifold_batch, temperature=temperature, generator=generator)
             candidate = self._analyze(
                 backbone=backbone,
@@ -222,11 +236,13 @@ class BoltzGenPipeline:
         do_affinity: bool,
         generator: torch.Generator | None,
     ) -> BoltzGenCandidate:
-        r"""Assemble one candidate: attach the inverse-fold sequence metric and composed scores.
+        r"""Assemble one candidate: remap the designed sequence, attach the NLL metric and scores.
 
-        FLAG (node4): the predicted-sequence remap into the canonical system is owner-gated;
-        the candidate keeps the designed/refolded backbone and carries the predicted per-residue
-        NLL as a ``Metric``. Refold and affinity Scores are read off the composed boltz2 results.
+        Faithful to released BoltzGen (``DesignWriter.write_on_batch_end`` with ``inverse_fold``):
+        the inverse-fold ``argmax`` residue identities are written back into the output Structure at
+        the design positions (see :func:`_remap_designed_sequence`), so the candidate carries the
+        DESIGNED sequence in its ``Structure`` (not UNK/GLY placeholders) and the refold stage folds
+        that designed sequence. The per-residue NLL is additionally exposed as a ``Metric`` axis.
         """
 
         layout = ifold_batch.layout
@@ -246,10 +262,13 @@ class BoltzGenPipeline:
                 unit="nats",
             )
 
-        structure = backbone
+        # Released remap: write the inverse-fold argmax residue identities into the output Structure
+        # at the design positions, so the candidate carries the DESIGNED sequence (not placeholders)
+        # and the refold folds it.
+        structure = _remap_designed_sequence(backbone, ifold_batch, ifold_output)
         if do_refold:
             assert self.fold is not None and self.fold_processor is not None
-            fold_batch = self.fold_processor(backbone)
+            fold_batch = self.fold_processor(structure)
             fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)
             prediction = fold_result.predictions[0]
             structure = prediction.structure
@@ -309,3 +328,149 @@ def _fixed_backbone_structure(input: object) -> Structure:
     if isinstance(input, Structure):
         return input
     raise TypeError("inverse_fold requires a fixed backbone Structure or structure path")
+
+
+# Model token id -> canonical component id, matching the released ``const.tokens`` ordering
+# (0 ``<pad>``, 1 ``-``, 2..21 ALA..VAL, 22 UNK, 23..27 A/G/C/U/N, 28..32 DA/DG/DC/DT/DN) and the
+# BoltzGenProcessor residue-type vocabulary. This is the inverse of the released remap's
+# ``const.tokens[argmax(res_type)]`` id->name lookup.
+_DESIGN_TOKEN_TO_COMPONENT: dict[int, str] = dict(
+    enumerate(
+        (
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+            "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+            "UNK", "A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN",
+        ),
+        start=2,
+    )
+)  # fmt: skip
+
+
+def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference, ...]:
+    r"""The concrete design (generated) residue references the design step marked.
+
+    Read off ``design_batch.design_mask`` over ``layout.output_residues``; only concrete
+    :class:`~ofoldx.data.molecular.ComponentReference` rows are returned (a symbolic generated row
+    from a not-yet-materialized assembly is skipped — the decode path always materializes first).
+    """
+
+    layout = design_batch.layout
+    mask = design_batch.design_mask
+    if layout is None or mask is None:
+        return ()
+    flags = mask[0].bool().tolist()
+    return tuple(
+        reference
+        for reference, flag in zip(layout.output_residues, flags)
+        if flag and isinstance(reference, tuple)
+    )
+
+
+def _remap_designed_sequence(
+    backbone: Structure,
+    ifold_batch: BoltzGenIFoldInput,
+    ifold_output: object,
+) -> Structure:
+    r"""Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
+
+    Faithful port of the released ``DesignWriter`` inverse-fold remap
+    (``sample["ccd"][design_mask] = argmax(res_type)`` then ``Structure.from_feat`` +
+    ``Structure.add_side_chains``): at every design token, the argmax token id is mapped to its
+    canonical component (``const.tokens`` id->name) and written into the output system's residue
+    identity; backbone ``{N, CA, C, O}`` coordinates are carried from the sampled backbone and the
+    designed residue's remaining heavy atoms are added as origin (zero-coordinate) sites marked
+    present — the exact dummy side-chain convention of released ``add_side_chains``. Non-design
+    residues (fixed context) are carried verbatim. Returns ``backbone`` unchanged when there is no
+    design mask (nothing to remap).
+    """
+
+    layout = ifold_batch.layout
+    tokens = getattr(ifold_output, "tokens", None)
+    design_mask = ifold_batch.design_mask
+    if layout is None or tokens is None or design_mask is None:
+        return backbone
+
+    token_ids = tokens[0].long().tolist()
+    flags = design_mask[0].bool().tolist()
+    designed: dict[ComponentReference, str] = {}
+    for token_index, reference in enumerate(layout.output_residues):
+        if not flags[token_index]:
+            continue
+        name = _DESIGN_TOKEN_TO_COMPONENT.get(token_ids[token_index])
+        if name is not None:
+            designed[reference] = name
+    if not designed:
+        return backbone
+    return _write_designed_structure(backbone, designed)
+
+
+def _write_designed_structure(backbone: Structure, designed: dict[ComponentReference, str]) -> Structure:
+    r"""Rebuild ``backbone`` with the designed component identities and dummy designed side chains."""
+
+    system = backbone.system
+    design_positions = set(designed)
+
+    # Rebuild entities per instance so each designed residue's identity is independent (the shared
+    # entity a de-novo chain rides on is minted per chain, so this only ever splits genuinely shared
+    # entities the redesign touches).
+    new_entities: dict[str, PolymerSequence | object] = {}
+    new_instances: dict[str, str] = {}
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            components = list(entity.components)
+            changed = False
+            for index in range(len(components)):
+                name = designed.get((instance_id, index))
+                if name is not None:
+                    components[index] = get_component(name)
+                    changed = True
+            if changed:
+                new_entity_id = f"{entity_id}__designed_{instance_id}"
+                new_entities[new_entity_id] = PolymerSequence(entity.polymer_type, tuple(components))
+                new_instances[instance_id] = new_entity_id
+                continue
+        new_entities.setdefault(entity_id, entity)
+        new_instances[instance_id] = entity_id
+
+    def _resolves(candidate_system: MolecularSystem, site: AtomSite) -> bool:
+        try:
+            candidate_system.atom(site)
+        except (KeyError, IndexError):
+            return False
+        return True
+
+    bondless = MolecularSystem(cast(dict, new_entities), new_instances)
+    kept_bonds = frozenset(
+        bond for bond in system.bonds if _resolves(bondless, bond.site_a) and _resolves(bondless, bond.site_b)
+    )
+    new_system = MolecularSystem(cast(dict, new_entities), new_instances, kept_bonds)
+
+    old_coordinates = {
+        site: (backbone.coordinates[index], bool(backbone.coordinate_mask[index]))
+        for index, site in enumerate(backbone.sites)
+    }
+    backbone_atoms = {"N", "CA", "C", "O"}
+    sites: list[AtomSite] = []
+    coordinates: list[np.ndarray] = []
+    coordinate_mask: list[bool] = []
+    for site, atom in new_system.iter_atoms():
+        if atom.element == "H":
+            continue
+        reference = (site.instance_id, site.component_index)
+        if reference in design_positions and site.atom_id not in backbone_atoms:
+            # Released ``add_side_chains``: designed side-chain atoms are added at the origin and
+            # marked present (the designed sequence is realized; side-chain coords are not predicted).
+            coordinate, present = np.zeros(3, dtype=np.float32), True
+        else:
+            coordinate, present = old_coordinates.get(site, (np.zeros(3, dtype=np.float32), False))
+        sites.append(site)
+        coordinates.append(np.asarray(coordinate, dtype=np.float32))
+        coordinate_mask.append(present)
+
+    return Structure(
+        system=new_system,
+        sites=tuple(sites),
+        coordinates=np.asarray(coordinates, dtype=np.float32).reshape(len(sites), 3),
+        coordinate_mask=np.asarray(coordinate_mask, dtype=np.bool_),
+    )
