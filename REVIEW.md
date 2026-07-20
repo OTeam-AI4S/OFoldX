@@ -1161,6 +1161,7 @@ Freeze-blockers (must be resolved before any §3.3 freeze):
 Preserved factual/migration findings: the stale callers are `io/structure.py` plus six processors invoking a pre-dict API (`system.entity()`, `system.components`, `EntityInstance`, `AtomSite(inst, atom_id, monomer_index)`, `entity.monomers`, `iter_bonds()`). The migration is not a rename: iterating a bare dict yields KEYS (silently always-False `isinstance` at `esmfold2:200`, `odesign:200,946`, `io:1663`, `pxdesign:537,589`); `AtomSite` is a transpose to `(instance_id, component_index, atom_id)`; `component_index` is a required non-`None` int (so `is None` polymer/nonpolymer tests are always-False); `system.component(ref)` takes `(instance_id, component_index)`; there is no system-level component table; `Molecule` has no `.atoms`/`.reference_coordinates`; `EntityInstance` is gone; `SystemBond.provenance → .origin`. Two consumers stay separately blocked on reopened facets: `odesign` cyclic closure (`processor.py:662-693`, reads removed `PolymerAttachment.order/.aromatic` and synthesizes cyclic `SystemBond`s) and `protenix` SMILES-origin routing (`processor.py:615`, committed `Molecule` has no `provenance`).
 
 <!-- proposed 2026-07-16 via §3.5.1 freeze-drafting investigation; OWNER VERDICT 2026-07-16: ACCEPTED (carrier only) -->
+<!-- PARTIALLY SUPERSEDED 2026-07-20: the six-field carrier freeze below stands unchanged, but its "does NOT authorize the codec/writer" and "stays in the reopened §3.5 Structure I/O contract" carve-out was RATIFIED — the implemented read/exchange-write/LossReport surface is now frozen as DESIGN §3.5.3. See "Owner review — §3.5 Structure I/O contract ratification" at the end of this file. Only the codec `instances` ordered-entry-array (§3.4.1) stays open. -->
 ## Owner review — §3.5.1 Structure value carrier
 
 **Verdict: ACCEPTED (carrier only).** The six-field `Structure` (`system`, `sites`, `coordinates`, `coordinate_mask`, `occupancy`, `residue_numbers`) plus `ResidueNumber(number: int, insertion_code: str = "")` carrier is frozen in DESIGN §3.5.1 exactly as committed in `ofoldx/data/structure.py`. This covers ONLY the carrier: the writer policy (label/auth column selection, B-factor/altloc placeholders, one-based fallback), the exact codec JSON shape, the "author when present, else label" rule, and "nonpolymer extra entries are harmless" are removed from DESIGN and stay in the reopened §3.5 Structure I/O contract. This freeze does NOT authorize implementing the codec (`encode_structure`/`decode_structure`) or the writer.
@@ -1594,3 +1595,46 @@ that does not exist today.
   OFoldX defect).
 - **boltzgen `structuretrained_small` / MembraneMpnn / ligandmpnn side-chain-packer** — **no runnable path**
   (contract-level: different arch / deferred / bounded-reopened vertical), not defects.
+
+<!-- proposed 2026-07-20 via §3.5 Structure I/O ratification investigation; OWNER VERDICT 2026-07-20: ACCEPTED (freeze the implemented I/O surface; scope only the codec instances-ordering facet open) -->
+## Owner review — §3.5 Structure I/O contract ratification
+
+**Verdict: ACCEPTED.** The Structure I/O surface that was implemented and public-exported after the 2026-07-16 §3.5.1
+carrier freeze (`ofoldx/io/__init__.py` exports `read_structure`/`read_structures`/`write_structure`/`LossReport`;
+`ofoldx/io/structure.py` PDB+mmCIF parsers, altloc selection/expansion, mmCIF exchange writer, source bonds;
+`ofoldx/data/_codec.py` structure payload) is ratified. The freeze boundary moves to ACCEPT it: DESIGN §3.5 is now
+**Status: frozen**, and a new **§3.5.3 "Structure I/O: read, exchange write, and loss reporting"** freezes the
+implemented behavior. The §3.5.1 six-field carrier text is unchanged; its "does NOT authorize the codec/writer" and
+"stays reopened §3.5" carve-outs are replaced by frozen §3.5.3 resolutions.
+
+Resolved-to-implementation (each formerly-reopened question):
+
+- **Source-atom identity / source-category derivation** — the parser retains both label and author namespaces per row
+  (`_rows_from_atom_array`, mmCIF read with `use_author_fields=False`); the canonical grouping axis is label chain +
+  label residue number. Polymer/non-polymer partition is the importer-internal component-ID classifier
+  `_component_polymer_type` (audited protein/nucleic sets; `D*` → dna), NOT source `_entity_poly`/ATOM-HETATM. This is
+  the §3.5.2 format-local fallback and stays non-public. `residue_numbers` is populated for polymer occurrences only,
+  value = author number when present else label number; numberless polymer rows and all non-polymers contribute no key.
+- **Altloc / model / assembly** — `read_structure` materializes one model + one residue-consistent altloc
+  (`highest_occupancy` default / `first`); `read_structures` expands the Cartesian product of per-residue altloc labels
+  into a tuple of Structures. `assembly_id` → Biotite `get_assembly`; symmetry copies (`sym_id`) become distinct
+  instances (`chain_id#symmetry_id`). `atom_layout` (`observed`/`complete_heavy`/`complete_all`) is the read-time site
+  materialization, `complete_all` materializing component hydrogens.
+- **mmCIF numbering-axis** — the writer emits both namespaces: label axis is synthesized dense (`label_asym_id` =
+  instance id, `label_seq_id` = `component_index+1` for polymers / `.` for non-polymers), author axis carries source
+  numbering (`auth_seq_id` = `residue_numbers` value else `component_index+1`). Single conformer/model, placeholder
+  `B_iso_or_equiv`/`label_alt_id` = `.` (§3.5.1 removed the B carrier). Custom `ofoldx_*` columns + an `ofoldx_structure`
+  JSON category give an exact canonical round-trip via `_decode_canonical_mmcif`.
+- **LossReport** — `LossReport(dropped_fields: tuple[str,...], rewritten_fields: tuple[str,...])`. mmCIF is always
+  lossless (empty report). PDB is guarded: `_pdb_loss_report` emits a fixed sorted token vocabulary and
+  `write_structure` raises unless `allow_lossy=True`; field-range overflow raises outright.
+- **Codec JSON shape** — `encode_structure`/`decode_structure` structure/site/`residue_numbers`/array-reference shape
+  is frozen.
+
+**Legitimately scoped-open (the ONE remaining item):** the codec's system-ordering/persistence facet — `encode_system`
+serializes `instances` as a plain JSON object and the writer's recursive `json.dumps(..., sort_keys=True)`
+(`io/structure.py:_write_mmcif`) reorders its keys, so instance declaration order is not preserved across an
+`_ofoldx_structure` round-trip. This is the already-recorded §3.4.1 "Open questions" / §3.3 freeze-blocker
+(REVIEW.md:1153): serialize `instances` as an ordered `(instance_id, entity_id)` entry array read back in order. It
+bounds instance ordinals inside the decoded system only, not the read/exchange-write/LossReport surface frozen in
+§3.5.3.

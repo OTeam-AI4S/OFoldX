@@ -1032,32 +1032,42 @@ Stays reopened:
 
 ### 3.5 Structures and source identities
 
-Status: falsified — the stored `atom_layout`, complete-chemistry requirement, and
-I/O rules below depend on the rejected molecular model. Source identity remains a
-real requirement, but this subsection is not an accepted Structure or I/O contract.
+Status: frozen — the earlier `atom_layout`/complete-chemistry/round-trip design was
+falsified and is gone, and the Structure and Structure I/O contract that replaced it is
+now accepted per the owner review. It matches the committed `ofoldx/data/structure.py`,
+`ofoldx/data/_codec.py`, and `ofoldx/io/structure.py`. §3.5.1 freezes the bounded
+`Structure` value carrier; §3.5.2 freezes the import-classification and heavy-atom
+data-model boundary; §3.5.3 freezes the read/exchange-write/loss-report I/O surface
+(`read_structure`, `read_structures`, `write_structure`, `LossReport`, the PDB and mmCIF
+parsers, altloc/model/assembly materialization, the mmCIF exchange writer, and the
+importer's source-category derivation). Together they resolve the source-atom-identity,
+microheterogeneity, altloc, assembly, partial-observation, site-materialization, and
+lossy-write questions the falsified design left open.
 
-The rejected design is not retained inline as normative-looking history. The next
-Tik must begin from real PDB/mmCIF round-trip consumers and the evidenced need for
-an explicit `entities`/`instances` relation. Its exact contract remains reopened.
-The next Tik must settle source atom identity,
-microheterogeneity, altloc policy, assembly materialization, partial observations,
-site materialization, and explicit lossy-write reporting before publishing a
-Structure I/O contract. Git history preserves the discarded proposal.
+The single remaining open sub-point is not an I/O question. It is the codec's
+system-ordering/persistence facet — whether `MolecularSystem.instances` serializes as an
+ordered `(instance_id, entity_id)` entry array rather than a plain JSON object whose keys
+the exchange writer's recursive `json.dumps(..., sort_keys=True)` reorders (§3.4.1, "Open
+questions"). That facet governs only instance *declaration order* carried through the
+`_ofoldx_structure` payload, not the read/exchange-write/`LossReport` surface frozen in
+§3.5.3. Git history preserves the discarded proposal.
 
 #### 3.5.1 One canonical coordinate realization
 
 Status: frozen — the committed `ofoldx/data/structure.py` carrier (the six-field
-`Structure` plus `ResidueNumber`) is accepted per the owner review. The freeze covers ONLY
-this bounded value carrier. It is supported by PDBx atom-site identity, ModelCIF model and
+`Structure` plus `ResidueNumber`) is accepted per the owner review. This subsection freezes
+that bounded value carrier. It is supported by PDBx atom-site identity, ModelCIF model and
 QA ownership, AlphaFold 3 ligand-template occupancy, and the decoded coordinate outputs of
-AF2, AF3, ESMFold2, Protenix, Boltz, RFdiffusion, ODesign, and LigandMPNN. This freeze
-does NOT authorize implementing the codec (`encode_structure`/`decode_structure`) or any
-exchange writer: the exact codec JSON shape depends on a system ordering/persistence
-contract not yet correctly frozen, and the writer's numbering-axis selection belongs to
-reopened §3.5. It freezes neither parsing, exchange-identity writing,
-altloc/model/assembly materialization, lossy-write reporting, nor the importer's
-source-category derivation — those stay the reopened §3.5 Structure I/O contract (see
-"Stays reopened" below).
+AF2, AF3, ESMFold2, Protenix, Boltz, RFdiffusion, ODesign, and LigandMPNN. The codec
+(`encode_structure`/`decode_structure`) and the exchange writer that consume this carrier
+are now frozen as well: the structure-payload JSON shape and the mmCIF numbering-axis
+selection are settled in §3.5.3, and parsing, exchange-identity writing,
+altloc/model/assembly materialization, lossy-write reporting, and the importer's
+source-category derivation are frozen there too. The one facet that stays open is the
+codec's *system-ordering* persistence — the `MolecularSystem.instances` ordered-entry-array
+shape owned by §3.4.1 — which fixes instance declaration order but changes neither this
+carrier nor the §3.5.3 read/write/`LossReport` surface (see "Frozen by §3.5.3; one facet
+stays open" below).
 
 A Structure is one coordinate realization of one already-materialized
 MolecularSystem. The one bounded source fact required by released MPNN families is
@@ -1097,7 +1107,8 @@ missing coordinates have no distinct canonical meaning.
 `residue_numbers` maps exact polymer component occurrences to their source integer
 number and insertion code. `ResidueNumber.number` means only the integer
 residue-number axis a specific producer chose for a specific path; the general
-mmCIF label-vs-auth axis decision is NOT settled here and stays in reopened §3.5.
+mmCIF label-vs-auth axis decision is not this carrier's to make and is settled by the
+importer in §3.5.3 (author number when present, else label).
 It belongs to Structure because two instances of one entity may carry different
 source numbering; coordinate-free chemistry does not. `None` means that no
 source-number facts are supplied and does not mean numbering starts at one. A
@@ -1154,35 +1165,37 @@ released-family *input* consumer:
 |---|---|
 | `atom_layout` | `sites` + `coordinate_mask` already state materialization; a mask-false row and an omitted row have no distinct canonical meaning. The `observed`/`complete_heavy`/`complete_all` knob is an I/O element-filter choice, not a carrier fact. |
 | `b_factor` | No audited family consumes a B-factor **input**. AF3/Boltz/Protenix use the B column only as an *export encoding* for predicted confidence; ModelCIF owns separate QA categories. Confidence stays a Result Score or Metric — it is not a canonical B-factor merely because a PDB or mmCIF exporter encodes it in that column. |
-| `altloc_ids` | One source altloc realization becomes one Structure; altloc identity belongs to the reopened §3.5 I/O, not the coordinate carrier. |
+| `altloc_ids` | One source altloc realization becomes one Structure; altloc materialization belongs to the §3.5.3 I/O reader (`read_structure` selects one residue-consistent altloc; `read_structures` expands the combinations), not the coordinate carrier. |
 | `source_identities: tuple[SourceAtomIdentity, ...]` **and the `SourceAtomIdentity` class** | The broad per-atom label/auth asym/seq/comp/atom/group bag is rejected. The one independently evidenced source fact is instance-local residue numbering, now carried by `residue_numbers`; `ComponentReference` already names the instance. |
 
 One source file may contain several models, altloc realizations, or assemblies.
-Materializing those values and retaining exchange identities belong to the
-reopened Structure I/O contract. They do not turn one canonical Structure into an
-ensemble or a source-file container.
+Materializing those values and retaining exchange identities belong to the §3.5.3
+Structure I/O contract, not to this carrier. They do not turn one canonical Structure
+into an ensemble or a source-file container.
 
-Stays reopened (bounding this frozen carrier): the importer source-category derivation
-(which rows and fields populate `residue_numbers`, the label-vs-auth namespace choice,
-and the obligation to guarantee a non-`None` integer `number` for every populated polymer
-`ComponentReference` by omitting or rejecting numberless rows); full source-identity
-provenance (label-vs-auth asym/seq separation, `label_entity_id`, atom-name aliases,
-`ATOM`/`HETATM` category, and all nonpolymer/ligand source identity and numbering);
-exchange writing and lossy reporting (the `_ofoldx_structure` JSON-in-mmCIF payload,
-`_decode_canonical_mmcif`, `LossReport` semantics, and any byte- or source-exact PDBx or
-PDB round-trip, never a frozen guarantee); altloc/microheterogeneity expansion into
-multiple Structures and the B-factor/confidence export column; the `atom_layout`
-site-materialization modes (`observed`/`complete_heavy`/`complete_all`) as an I/O
-read-time choice; assembly and model materialization; non-integer `auth_seq_id` and any
-future general `ResidueId(asym_id, sequence_id, insertion_code)` value (currently
-rejected); and per-family path lowering.
+Frozen by §3.5.3; one facet stays open. The questions this list previously deferred are
+now resolved by the §3.5.3 I/O contract: the importer source-category derivation (which
+rows populate `residue_numbers`, the author-else-label axis, and the numberless-row rule);
+altloc, model, and assembly materialization; the `atom_layout` read-time
+site-materialization modes; and exchange writing plus `LossReport` reporting (the
+`_ofoldx_structure` JSON-in-mmCIF payload, `_decode_canonical_mmcif`, and the placeholder
+B/altloc export columns). What stays deliberately out of scope is unchanged: no byte- or
+source-exact PDBx/PDB round-trip is ever guaranteed (only the `_ofoldx_structure` payload
+round-trips canonically); a broad per-atom source-identity provenance bag stays rejected
+(the removed `SourceAtomIdentity` above); non-integer `auth_seq_id` and any general
+`ResidueId(asym_id, sequence_id, insertion_code)` value stay rejected; and per-family path
+lowering stays with each family. The single genuinely-open item is the codec's
+system-ordering/persistence facet — serializing `MolecularSystem.instances` as an ordered
+`(instance_id, entity_id)` entry array so the exchange writer's recursive `sort_keys=True`
+cannot erase instance declaration order (§3.4.1, "Open questions"). It bounds instance
+ordinals inside the decoded system, not the §3.5.3 read/write/`LossReport` surface.
 
 #### 3.5.2 Import classification and heavy-atom realization
 
 Status: frozen — the committed `molecular.py` `iter_atoms()` predicate, the released
 family I/O paths, and the REVIEW.md owner review freeze the data-model boundary:
 heavy-atom realization is an inline element filter, and polymer classification on import
-is producer/source-driven. The exact source parser categories stay reopened in §3.5.
+is producer/source-driven. The exact source parser categories are frozen in §3.5.3.
 
 Heavy-atom realization is an inline element filter, not an API. There is no
 `MolecularSystem.sites(include_hydrogens=…)` and no `atom_layout`-driven eager site
@@ -1211,11 +1224,135 @@ boundary is only that `ChemicalComponent` carries no polymer-membership fact and
 importer. The codec serializes `PolymerSequence.polymer_type` but emits and requires
 no `ChemicalComponent.polymer_types` key.
 
-Stays reopened: the exact source categories an importer consults (mmCIF
-`_entity_poly`/`label_seq_id`/`*_scheme` vs. PDB `ATOM`/`HETATM`) — only the data-model
-boundary is frozen here; the classification logic itself lands with the reopened §3.5 I/O
-contract. Any `polymer_type` recovery heuristic for a bare PDB without `_entity_poly`
-stays importer-internal and non-public, never a reusable public helper.
+Frozen in §3.5.3: the exact source categories an importer consults (mmCIF
+`label_asym_id`/`label_seq_id`/`label_entity_id`/`*_scheme` vs. PDB `ATOM`/`HETATM`) — the
+data-model boundary is frozen here, and the concrete classification logic is frozen with
+the §3.5.3 I/O contract. Any `polymer_type` recovery heuristic for a bare PDB without a
+producer declaration stays importer-internal and non-public
+(`io/structure.py:_component_polymer_type`), never a reusable public helper.
+
+#### 3.5.3 Structure I/O: read, exchange write, and loss reporting
+
+Status: frozen — the committed `ofoldx/io/structure.py` (`read_structure`,
+`read_structures`, `write_structure`, `LossReport`, the PDB/mmCIF parsers, altloc
+selection/expansion, the mmCIF exchange writer, and the source-category derivation) and the
+`ofoldx/data/_codec.py` structure-payload shape are accepted per the owner review. The
+public surface exported from `ofoldx/io/__init__.py` is `read_structure`,
+`read_structures`, `write_structure`, and `LossReport`. Format is chosen by suffix: `.pdb`
+is PDB, `.cif`/`.mmcif` are mmCIF (`_FORMATS`); any other suffix is rejected. Reading and
+writing go through Biotite; the domain values are the §3.5.1 `Structure` over the §3.4.1
+`MolecularSystem`. This resolves each question §3.5.1 previously left reopened, as follows.
+
+**Source-atom identity on read.** A parser lowers each source atom record to an internal
+`_AtomRow` that retains both the label and the author namespace separately
+(`_rows_from_atom_array`): `label_asym_id`/`label_seq_id`/`label_entity_id` and
+`auth_asym_id`/`auth_seq_id`/`auth_comp_id`/`auth_atom_id`, plus element, formal charge,
+occupancy, altloc, insertion code, assembly symmetry ID, and the raw atom serial. mmCIF is
+read with `use_author_fields=False`, so the label namespace is primary and the author
+fields are captured as extra columns; PDB has one namespace, mirrored into both. The
+canonical grouping axis is the label chain (`label_asym_id`, else Biotite `chain_id`, else
+`"_"`) and the label residue number (`label_seq_id`, else Biotite `res_id`). This bounded
+capture is not a general per-atom provenance bag: it feeds grouping, `residue_numbers`, and
+bond endpoint resolution only, consistent with §3.5.1's rejection of `SourceAtomIdentity`.
+
+**Source-category derivation.** The importer partitions each chain into at most one polymer
+occurrence-run plus its nonpolymer occurrences using the importer-internal,
+component-ID-keyed classifier `_component_polymer_type`: an audited protein component is
+`protein`, an audited nucleic component is `dna` when its ID starts with `D` else `rna`,
+and everything else is a non-polymer. This is the §3.5.2 format-local fallback (no producer
+`_entity_poly` declaration is consulted), and it stays non-public. A chain's polymer run
+becomes one `PolymerSequence` instance (entity ID `polymer_{label_entity_id}` for mmCIF,
+`polymer_{chain_id}` otherwise); each remaining residue becomes a single-component
+`Molecule`, except mmCIF branched entities (`pdbx_entity_branch_list`/`_branch_link`/
+`pdbx_branch_scheme`), which reassemble into one multi-component `Molecule` with its
+declared cross-component bonds and leaving-atom removals (`_read_mmcif_branch_entities`).
+Groups are emitted in first-source-row order; equal entity definitions under one source
+entity ID are shared and conflicting ones are rejected (`_reuse_entity`). `residue_numbers`
+is populated for polymer occurrences only: the value is the author residue number when
+present, else the label number (`ResidueNumber(number, insertion_code)`); a numberless
+polymer row contributes no key, and non-polymer occurrences never contribute one. Every
+selected row's element (and, when the source states it, formal charge) is checked against
+its resolved canonical atom, so identity disagreement fails loudly rather than silently
+mislabeling.
+
+**Altloc, model, and assembly materialization.** `read_structure(model=1, altloc=…)`
+materializes exactly one model and one residue-consistent alternate-location choice:
+`highest_occupancy` (default) picks, per residue, the altloc label with the greatest
+summed occupancy; `first` picks the first-seen label (`_select_altloc`). `read_structures`
+instead expands every residue-consistent combination as the Cartesian product over each
+residue's altloc labels, returning a tuple of `Structure` values (`_expand_altlocs`); with
+no altlocs it returns the single realization. Both refuse a source with no atoms for the
+requested model/assembly. `assembly_id` selects a Biotite assembly; symmetry copies carry a
+distinct `sym_id`, which becomes a distinct instance (`chain_id#symmetry_id`), so an
+assembly materializes its copies as separate instances rather than collapsing them.
+
+**Site materialization (`atom_layout`).** `observed` (default) uses exactly the selected
+source rows as the site axis. `complete_heavy` uses every non-hydrogen atom of the resolved
+system, and `complete_all` uses every atom after materializing component hydrogens
+(`_materialize_component_hydrogens`); rows with no source coordinate are mask-false. This is
+the §3.5.2 read-time element/completeness choice realized over `iter_atoms()`, not a carrier
+field or a system-level API.
+
+**Source bonds.** Inter-residue source bonds are read and overlaid onto the intrinsic
+component/polymer topology (`_read_source_bonds`): PDB `CONECT` records (multiplicity →
+bond order, `_read_pdb_bonds`) and mmCIF `struct_conn` `covale`/`disulf` links in the
+`1_555` frame, resolved through either the label or the author endpoint key
+(`_read_mmcif_bonds`). A source bond that merely restates intrinsic topology is dropped;
+one that conflicts with it is rejected; endpoints absent from the selected assembly/model
+fail. Bonds are stored with `origin="source"`.
+
+**Exchange write — numbering-axis selection.** mmCIF is the lossless exchange format.
+`_write_mmcif` emits one `atom_site` loop carrying both namespaces plus canonical identity
+columns. The label axis is a synthesized dense axis: `label_asym_id` is the (deduplicated)
+instance ID, `label_seq_id` is `component_index + 1` for polymer atoms and `.` for
+non-polymer atoms, and `label_entity_id` is the entity ID. The author axis carries source
+numbering where known: `auth_asym_id` mirrors `label_asym_id`, and `auth_seq_id` is the
+`residue_numbers` value for that occurrence, falling back to `component_index + 1` when
+none is supplied; `pdbx_PDB_ins_code` is the stored insertion code or `?`. Every row is a
+single conformer of a single model (`label_alt_id` = `.`, `pdbx_PDB_model_num` = 1), and
+`B_iso_or_equiv` is the placeholder `.` — §3.5.1 removed the B-factor carrier, so no
+confidence is exported in that column. Four custom columns
+(`ofoldx_instance_id`/`ofoldx_component_index`/`ofoldx_atom_id`/`ofoldx_coordinate_mask`)
+carry the exact canonical `AtomSite` identity and the coordinate mask, and a sibling
+`ofoldx_structure` category carries the full codec payload as one JSON string; source bonds
+plus derived topology are written to `struct_conn` with both endpoint namespaces
+(`_output_bonds`). On read-back, `_parse_mmcif` detects the `ofoldx_structure` category
+(then requires model 1 and no assembly), and `_decode_canonical_mmcif` rebuilds the arrays
+from the `atom_site` columns keyed by the payload's array-reference names, decodes the
+system, and verifies that every `atom_site` row's canonical identity and element match the
+payload — so an OFoldX-written mmCIF round-trips exactly, while an ordinary PDBx/PDB file
+round-trips only up to the loss the writer reports.
+
+**Lossy-write reporting.** `LossReport(dropped_fields: tuple[str, ...],
+rewritten_fields: tuple[str, ...])` is the machine-readable loss record. `write_structure`
+returns `None` unless `allow_lossy=True`, in which case it returns the report. mmCIF is
+always lossless (it returns an empty `LossReport`). PDB is guarded: `_pdb_loss_report`
+computes the dropped/rewritten field tokens, and when any are present and `allow_lossy` is
+false the write raises with the sorted token set rather than silently degrading. The PDB
+tokens are a fixed, sorted vocabulary derived from the committed carrier and dict-based
+system — e.g. `system.instances`, `system.polymer_sequence`, `system.bonds`,
+`system.bond_origins`, `system.bond_semantics`, `system.nonpolymer_graph`,
+`system.nonstandard_components`, `system.formal_charge`, `system.atom_ids`,
+`system.component_ids`, `system.instance_ids`, `structure.coordinate_mask`,
+`structure.coordinates`, `structure.occupancy`, `structure.author_residue_ids`, and
+`structure.insertion_codes` — and PDB field-range overflows (serial, coordinate, chain
+count, atom-name collisions) raise outright.
+
+**Codec structure-payload shape (frozen) and the one open facet.** `encode_structure`
+returns `({"kind":"structure", "system": …, "sites":[{instance_id, component_index,
+atom_id}…], "coordinates": ref, "coordinate_mask": ref, "occupancy": ref | null,
+"residue_numbers": [{instance_id, component_index, number, insertion_code}…] | null},
+arrays)`; the coordinate/mask/occupancy arrays are referenced by name and stored beside the
+payload (in mmCIF, as the `atom_site` columns), and `decode_structure` is its exact
+inverse. That structure/site/`residue_numbers`/array-reference shape is frozen. The one
+part not frozen here is inherited from §3.4.1: `encode_system` currently serializes
+`instances` as a plain JSON object, and the exchange writer's recursive
+`json.dumps(payload, sort_keys=True, …)` (`ofoldx/io/structure.py:_write_mmcif`) reorders
+its keys, so instance declaration order is not preserved across an `_ofoldx_structure`
+round-trip. Freezing that — serializing `instances` as an ordered `(instance_id,
+entity_id)` entry array read back in order — is the sole remaining open sub-point (§3.4.1,
+"Open questions"). It changes only instance ordinals inside the decoded system; the read,
+exchange-write, and `LossReport` surface above is frozen independent of it.
 
 ### 3.6 Evidence
 
