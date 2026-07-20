@@ -319,7 +319,7 @@ class Boltz2Config(Config):
     fourier_embedding_size: int = 256
     relative_position_size: int = 139
     num_bond_types: int = 7  # token_bonds_type: Embedding(len(bond_types) + 1 = 7, pair_size)
-    recycling_steps: int = 3
+    recycling_steps: int = 4
 
     use_templates: bool = True
     predict_bfactor: bool = True
@@ -356,7 +356,7 @@ class Boltz2AffinityConfig(Boltz2Config):
 
     use_templates: bool = False
     predict_bfactor: bool = False
-    recycling_steps: int = 5
+    recycling_steps: int = 6
 
     affinity1: Boltz2AffinityHeadConfig = Boltz2AffinityHeadConfig({"num_pairformer_blocks": 8})
     affinity2: Boltz2AffinityHeadConfig = Boltz2AffinityHeadConfig({"num_pairformer_blocks": 4})

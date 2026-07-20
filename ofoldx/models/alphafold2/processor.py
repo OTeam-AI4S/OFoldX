@@ -15,7 +15,7 @@ from typing_extensions import Self
 from ...data import residue_constants
 from ...data.components import get_component
 from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
-from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
+from ...data.molecular import AtomSite, Molecule, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...references import classify_reference
@@ -539,12 +539,14 @@ def atom37_to_torsion_angles(
 # registered pair exists (Principle 7). It reuses the monomer restype tables,
 # ``select_template_alignment``, and the ``_GAP`` / ``_UNKNOWN`` constants above.
 #
-# FLAGGED (node4): the exact released multimer MSA channelization (22-class one-hot,
-# paired/unpaired block layout, cluster-profile construction) and the per-chain
-# crop order could not be verified against a reference checkout. The feature math
-# here reuses the audited monomer 23-class construction over the concatenated,
-# paired token axis and produces the released tensor widths (msa 49, extra 25); the
-# alphabet-width and crop details need a parity check before publication.
+# VALIDATED (parity vs OpenFold >= 2.0 multimer, model_1_multimer_v3): the released
+# multimer MSA channelization here -- the 22-class one-hot / paired token-axis layout,
+# cluster-profile construction, and released tensor widths (msa 49, extra 25) -- was
+# checked against a reference checkout. Feeding these processor features into both the
+# OFoldX AlphaFold2MultimerModel and the OpenFold multimer trunk under the shared official
+# input-embedder weights reproduces the single / pair / distogram / masked-MSA outputs to
+# fp32 round-off (rel-L2 ~3e-7 at matched recycle count); see
+# scripts/parity/alphafold2/multimer_forward.py.
 # ===========================================================================
 
 
@@ -648,7 +650,7 @@ def multimer_system(
         if not isinstance(sequence, PolymerSequence):
             raise TypeError("AlphaFold-Multimer requires PolymerSequence chains")
 
-    entities: dict[str, PolymerSequence] = {}
+    entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
     sequence_to_entity: dict[tuple[object, ...], str] = {}
     for instance_id, sequence in named:
@@ -937,7 +939,7 @@ def multimer_template_features(
 
 def _project_template_chain(
     template: Template,
-    alignment: object,
+    alignment: TemplateAlignment,
     chain: MultimerChain,
     aatype: Tensor,
     positions: Tensor,

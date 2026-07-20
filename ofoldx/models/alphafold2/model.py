@@ -225,8 +225,8 @@ class AlphaFold2Model(nn.Module):
         """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if type(recycling_steps) is not int or recycling_steps < 0:
-            raise ValueError("recycling_steps must be a non-negative integer")
+        if type(recycling_steps) is not int or recycling_steps < 1:
+            raise ValueError("recycling_steps must be a positive integer")
 
         msa, single, pair, structure, realized = self._run_recycling(
             batch, recycling_steps=recycling_steps, generator=generator
@@ -355,10 +355,10 @@ class AlphaFold2Model(nn.Module):
             base_realized = self._realize_msa(batch, generator=generator)
         prev_pos, prev_msa_first_row, prev_pair = self._initial_recycling(batch)
         cycle_batch = batch
-        for cycle in range(recycling_steps + 1):
+        for cycle in range(recycling_steps):
             if needs_realize:
                 cycle_batch = self._realize_msa(batch, generator=generator) if resample else base_realized
-            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps
+            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
                 msa, single, pair, msa_first_row = self._embed_and_refine(
                     cycle_batch,
@@ -367,7 +367,7 @@ class AlphaFold2Model(nn.Module):
                     prev_pair=prev_pair,
                 )
                 structure = self.structure_module(single, pair, cycle_batch)
-            if cycle != recycling_steps:
+            if cycle != recycling_steps - 1:
                 prev_pos = structure.final_atom_positions.detach()
                 prev_msa_first_row = msa_first_row.detach()
                 prev_pair = pair.detach()

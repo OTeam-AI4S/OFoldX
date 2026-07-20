@@ -278,7 +278,7 @@ class AlphaFold2Config(Config):
     heads: AlphaFold2HeadsConfig = AlphaFold2HeadsConfig()
     msa: AlphaFold2MSAConfig = AlphaFold2MSAConfig()
 
-    recycling_steps: int = 3
+    recycling_steps: int = 4
 
 
 class AlphaFold2ProcessorConfig(Config):
@@ -464,7 +464,7 @@ class AlphaFold2MultimerConfig(Config):
     heads: AlphaFold2MultimerHeadsConfig = AlphaFold2MultimerHeadsConfig()
     msa: AlphaFold2MultimerMSAConfig = AlphaFold2MultimerMSAConfig()
 
-    recycling_steps: int = 3
+    recycling_steps: int = 4
     num_ensembles: int = 1
 
 

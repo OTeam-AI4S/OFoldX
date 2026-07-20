@@ -284,7 +284,7 @@ class Boltz1Model(nn.Module):
 
         Args:
             batch: The Boltz-1 input batch; training requires ``batch.target_positions``.
-            recycling_steps: Number of extra trunk recycles; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
             num_samples: Number of independently noised training samples to draw per input.
             generator: Optional RNG for reproducible augmentation and noise.
 
@@ -345,7 +345,7 @@ class Boltz1Model(nn.Module):
                 [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] produced by ``Boltz1Processor``.
             num_samples: Number of reverse-diffusion samples to draw.
             generator: Optional RNG for reproducible sampling noise; resolved once at the Pipeline boundary.
-            recycling_steps: Number of extra trunk recycles; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
             num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
             use_potentials: Whether to enable Boltz-1x physical-potential steering.
             steering_args: Optional overrides merged onto the configured steering flags.
@@ -390,7 +390,7 @@ class Boltz1Model(nn.Module):
 
         Args:
             batch: One lowered Boltz-1 input batch.
-            recycling_steps: Number of extra trunk recycles; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
 
         Returns:
             A [`Boltz1Embeddings`][ofoldx.models.boltz1.model.Boltz1Embeddings] with the trunk ``single``
@@ -422,7 +422,7 @@ class Boltz1Model(nn.Module):
 
         Args:
             batch: The Boltz-1 input batch.
-            recycling_steps: Number of extra trunk recycles; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
             num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
             num_samples: Number of reverse-diffusion samples to draw per input.
             generator: Optional RNG for reproducible sampling noise.
@@ -506,14 +506,16 @@ class Boltz1Model(nn.Module):
         """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if type(recycling_steps) is not int or recycling_steps < 1:
+            raise ValueError("recycling_steps must be a positive integer")
         single_inputs, single_init, pair_init, relative_position_encoding = self._initial_representations(batch)
         token_mask = batch.token_mask
         pair_mask = pair_mask_from_token_mask(token_mask)
 
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
-        for cycle in range(recycling_steps + 1):
-            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps
+        for cycle in range(recycling_steps):
+            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))

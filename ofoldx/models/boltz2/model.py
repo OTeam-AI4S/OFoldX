@@ -331,7 +331,7 @@ class Boltz2Model(nn.Module):
                 [`Boltz2Layout`][ofoldx.models.boltz2.model.Boltz2Layout] produced by ``Boltz2Processor``.
             num_samples: Number of reverse-diffusion samples to draw.
             generator: Optional RNG for reproducible sampling noise; resolved once at the Pipeline boundary.
-            recycling_steps: Number of extra trunk recycles; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
             num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
 
         Returns:
@@ -436,8 +436,8 @@ class Boltz2Model(nn.Module):
 
         Args:
             batch: Typed model input.
-            recycling_steps: Number of extra recycling passes; defaults to the configured value. The trunk runs
-                ``recycling_steps + 1`` times.
+            recycling_steps: Total number of trunk passes; defaults to the configured value. The trunk runs
+                ``recycling_steps`` times.
 
         Returns:
             Trunk representations and distogram logits.
@@ -451,9 +451,9 @@ class Boltz2Model(nn.Module):
 
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
-        # Boltz runs recycling_steps + 1 trunk passes.
-        for cycle in range(recycling_steps + 1):
-            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps
+        # Boltz runs recycling_steps trunk passes.
+        for cycle in range(recycling_steps):
+            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
@@ -682,8 +682,8 @@ class Boltz2AffinityModel(Boltz2Model):
 
         if type(num_samples) is not int or num_samples <= 0:
             raise ValueError("num_samples must be a positive integer")
-        if recycling_steps is not None and (type(recycling_steps) is not int or recycling_steps < 0):
-            raise ValueError("recycling_steps must be a non-negative integer or None")
+        if recycling_steps is not None and (type(recycling_steps) is not int or recycling_steps < 1):
+            raise ValueError("recycling_steps must be a positive integer or None")
         if num_sampling_steps is not None and (type(num_sampling_steps) is not int or num_sampling_steps <= 0):
             raise ValueError("num_sampling_steps must be a positive integer or None")
         if batch.token_mask.shape[0] != 1:

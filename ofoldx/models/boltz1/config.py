@@ -212,7 +212,7 @@ class Boltz1Config(Config):
         num_distogram_bins: Number of bins for the trunk distogram head.
         fourier_embedding_size: Width of the frozen Fourier noise embedding.
         relative_position_size: Width of the relative-position feature fed to the position embedder.
-        recycling_steps: Number of extra trunk recycles run after the initial pass.
+        recycling_steps: Total number of trunk passes.
         no_msa: When ``True``, build the model without the MSA module.
         input_embedder: Nested input-embedder configuration.
         trunk: Nested representation-trunk configuration.
@@ -234,7 +234,7 @@ class Boltz1Config(Config):
     num_distogram_bins: int = 64
     fourier_embedding_size: int = 256
     relative_position_size: int = 139
-    recycling_steps: int = 3
+    recycling_steps: int = 4
     no_msa: bool = False
 
     input_embedder: Boltz1InputEmbedderConfig = Boltz1InputEmbedderConfig()
