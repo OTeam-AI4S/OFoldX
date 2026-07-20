@@ -611,7 +611,7 @@ def _materialize_placement(
             used_entity_ids.add(entity_id)
         polymer_instances[instance_id] = entity_id
 
-        for placement_id, segment, start, length in segment_offsets:
+        for placement_id, _segment, start, length in segment_offsets:
             occurrences = tuple((instance_id, start + offset) for offset in range(length))
             generated_residues.update(occurrences)
             placement_map.setdefault(group, {})[placement_id] = occurrences
@@ -1178,7 +1178,7 @@ def _token_indices(system, token_sites, token_residues, token_entities):
     entity = []
     symmetry = []
     residue = []
-    for group, reference, definition in zip(token_sites, token_residues, token_entities):
+    for group, reference, _definition in zip(token_sites, token_residues, token_entities):
         instance_id = reference[0] if reference is not None else group[0].instance_id
         chain.append(chain_by_instance[instance_id])
         entity.append(entity_index_by_id[system.instances[instance_id]])

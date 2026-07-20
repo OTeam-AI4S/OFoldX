@@ -26,8 +26,17 @@ def convert_nampnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Ten
 def convert_nampnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
 ) -> None:
-    r"""Convert one released NA-MPNN checkpoint and save its paired Pipeline."""
+    r"""Convert one released NA-MPNN checkpoint and save its paired Pipeline.
+
+    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
+    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
+    and nothing is published without an explicit ``repo_id``.
+    """
 
     from .model import NaMpnnModel
     from .pipeline import NaMpnnPipeline
@@ -50,7 +59,12 @@ def convert_nampnn_checkpoint(
     )
     model = NaMpnnModel(config)
     model.load_state_dict(convert_nampnn_state_dict(state_dict), strict=True, assign=True)
-    NaMpnnPipeline(model=model, processor=NaMpnnProcessor()).save(output_dir)
+    NaMpnnPipeline(model=model, processor=NaMpnnProcessor()).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
 
 
 def _convert_key(key: str) -> str:
@@ -132,8 +146,21 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    convert_nampnn_checkpoint(args.checkpoint, args.output_dir)
+    convert_nampnn_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
 
 
 if __name__ == "__main__":

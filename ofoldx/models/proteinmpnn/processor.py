@@ -583,7 +583,7 @@ class ProteinMpnnProcessor:
             for component_id in row_component_ids
         ]
 
-        valid_by_reference = {reference: valid for reference, valid in zip(row_references, row_valid)}
+        valid_by_reference = dict(zip(row_references, row_valid))
         if positions is None:
             selected_references = {reference for reference, valid in zip(row_references, row_valid) if valid}
         else:

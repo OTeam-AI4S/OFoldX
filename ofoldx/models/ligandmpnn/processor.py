@@ -500,7 +500,7 @@ class LigandMpnnProcessor:
     ) -> list[bool]:
         r"""Resolve the designable rows from the shared ``positions`` selection meaning."""
 
-        valid_by_reference = {reference: valid for reference, valid in zip(row_references, row_valid)}
+        valid_by_reference = dict(zip(row_references, row_valid))
         if positions is None:
             selected = {reference for reference, valid in zip(row_references, row_valid) if valid}
         else:

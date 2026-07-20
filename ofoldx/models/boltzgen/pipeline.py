@@ -53,6 +53,7 @@ from .model import (
     BoltzGenCandidate,
     BoltzGenIFoldInput,
     BoltzGenIFoldModel,
+    BoltzGenIFoldOutput,
     BoltzGenInput,
     BoltzGenModel,
     BoltzGenResidueConstraint,
@@ -242,7 +243,7 @@ class BoltzGenPipeline(_CompositePipeline):
         *,
         backbone: Structure,
         ifold_batch: BoltzGenIFoldInput,
-        ifold_output: object,
+        ifold_output: BoltzGenIFoldOutput,
         do_refold: bool,
         do_affinity: bool,
         generator: torch.Generator | None,
@@ -261,9 +262,9 @@ class BoltzGenPipeline(_CompositePipeline):
         scores: dict[str, Score] = {}
         metrics: dict[str, Metric] = {}
 
-        logits = getattr(ifold_output, "logits")
+        logits = ifold_output.logits
         log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-        tokens = getattr(ifold_output, "tokens")
+        tokens = ifold_output.tokens
         axis = tuple(layout.output_residues)
         if tokens is not None:
             per_residue_nll = -log_probs.gather(-1, tokens[0].long().unsqueeze(-1)).squeeze(-1)

@@ -345,7 +345,7 @@ def read_pdb(
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
     protein_component_indices: dict[tuple[str, int, str], int] = {}
-    for chain_id, occurrences in protein_occurrences.items():
+    for occurrences in protein_occurrences.values():
         for component_index, occurrence in enumerate(occurrences):
             protein_component_indices[occurrence] = component_index
 

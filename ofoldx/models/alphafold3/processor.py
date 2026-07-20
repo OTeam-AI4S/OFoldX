@@ -27,7 +27,7 @@ from typing_extensions import Self
 
 from ...data.ccd import resolve_ccd_component
 from ...data.components import get_component
-from ...data.evidence import MSA, MSACollection, Template
+from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -127,7 +127,7 @@ _MSA_RESTYPE = {
     }.items()
 }
 _MSA_RESTYPE["-"] = _GAP
-_ELEMENTS = (
+_ELEMENTS = (  # noqa: SIM905  # periodic-table literal reads better as a whitespace-split string
     "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn "
     "Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La "
     "Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po "
@@ -907,13 +907,13 @@ def _template_features(
 
 
 def _alignment_targets(
-    alignment: object,
+    alignment: TemplateAlignment,
     target_component: int,
     instance_residue: dict[tuple[str, int], int],
     entity_residue: dict[tuple[str, int], list[int]],
 ) -> list[int]:
-    target_instance_id = cast("str | None", getattr(alignment, "target_instance_id"))
-    target_entity_id = cast(str, getattr(alignment, "target_entity_id"))
+    target_instance_id = alignment.target_instance_id
+    target_entity_id = alignment.target_entity_id
     if target_instance_id is not None:
         token_index = instance_residue.get((target_instance_id, target_component))
         return [] if token_index is None else [token_index]

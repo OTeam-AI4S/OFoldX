@@ -5,7 +5,7 @@ Run under the real-weight environment:
 
     /data/miniforge3/envs/zyc/bin/python scripts/parity/nampnn.py
 
-    PYTHONPATH=/data/node4/home/zhiyuan/ofoldx
+    PYTHONPATH=/home/z/ofoldx
     TRITON_CACHE_DIR=/tmp/claude-2667/triton
 
 The script covers, for both released checkpoints, the folded encoder/decoder
@@ -57,7 +57,7 @@ from ofoldx.models.nampnn.model import MIXED_POLYMER_TOKEN_BY_COMPONENT  # noqa:
 from ofoldx.models.nampnn.model import NaMpnnInput  # noqa: E402
 from ofoldx.modules.mpnn import _decoding_order_to_ranks  # noqa: E402
 
-_REFERENCE = Path("/data/node4/home/zhiyuan/reference/NA-MPNN")
+_REFERENCE = Path("/data/users/z/reference/NA-MPNN")
 _ATOM_NAMES = (
     "N",
     "CA",

@@ -77,6 +77,12 @@ def _resolve_hub_repository(
     return _ResolvedRepository(snapshot, repo_id, commit)
 
 
+# Sentinel default for :func:`_upload_repository`'s ``delete_patterns``: mirror the local
+# repository onto the remote (delete every remote file absent locally). A caller that passes
+# ``delete_patterns=None`` explicitly opts out and keeps the append-only upload behavior.
+_MIRROR_REPOSITORY: tuple[str, ...] = ("*",)
+
+
 def _upload_repository(
     directory: str | PathLike[str],
     repo_id: str,
@@ -86,6 +92,7 @@ def _upload_repository(
     revision: str | None = None,
     commit_message: str | None = None,
     allow_patterns: Sequence[str] | None = None,
+    delete_patterns: Sequence[str] | None = _MIRROR_REPOSITORY,
 ) -> object:
     r"""Upload one local model repository to a Hub repo, creating it if absent.
 
@@ -95,6 +102,16 @@ def _upload_repository(
     ``repo_id``. Nothing is uploaded unless a caller passes an explicit ``repo_id``;
     authentication comes only from the caller's ``token`` or the ambient Hugging Face
     credential. No organization, repository, or token is assumed here.
+
+    Re-publishing is mirror-safe by default: ``delete_patterns`` defaults to mirroring the
+    local repository onto ``repo_id`` so a re-publish deletes remote files that are absent
+    locally (an orphaned ``pipeline.json``, a stale ``model.safetensors.index.json``, or old
+    weight shards) instead of leaving them to misroute the loader. ``upload_folder`` never
+    deletes a remote file that this upload also writes (deletions are deduplicated against the
+    additions) and always preserves ``.gitattributes``. When ``allow_patterns`` restricts the
+    upload to a subset, the default mirror is narrowed to that same allowlist so files the
+    caller deliberately withheld are never deleted. Pass ``delete_patterns=None`` to disable
+    deletion entirely (append-only), or an explicit pattern sequence to scope it.
     """
 
     from huggingface_hub import HfApi
@@ -105,6 +122,12 @@ def _upload_repository(
     if not repo_id:
         raise ValueError("uploading a model repository requires an explicit repo id")
 
+    resolved_allow = None if allow_patterns is None else list(allow_patterns)
+    if delete_patterns is _MIRROR_REPOSITORY and resolved_allow is not None:
+        resolved_delete: list[str] | None = resolved_allow
+    else:
+        resolved_delete = None if delete_patterns is None else list(delete_patterns)
+
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
     return api.upload_folder(
@@ -113,7 +136,8 @@ def _upload_repository(
         folder_path=str(folder),
         revision=revision,
         commit_message=commit_message,
-        allow_patterns=None if allow_patterns is None else list(allow_patterns),
+        allow_patterns=resolved_allow,
+        delete_patterns=resolved_delete,
     )
 
 

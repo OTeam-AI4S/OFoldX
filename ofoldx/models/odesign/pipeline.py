@@ -74,10 +74,10 @@ def _has_atom_context(system: MolecularSystem) -> bool:
     upstream refines this to a per-chain strict 8 Å test.)
     """
 
-    for entity in system.entities.values():
-        if not (isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"):
-            return True
-    return False
+    return any(
+        not (isinstance(entity, PolymerSequence) and entity.polymer_type == "protein")
+        for entity in system.entities.values()
+    )
 
 
 def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str, Score]:

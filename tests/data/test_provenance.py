@@ -15,7 +15,7 @@ import pytest
 @pytest.mark.xfail(
     reason="§3.3 reopened: Molecule/component provenance (incl. exact SMILES parser "
     "provenance) was removed; Molecule deliberately has no provenance field",
-    strict=False,
+    strict=True,
     raises=ImportError,
 )
 def test_smiles_import_records_exact_parser_provenance() -> None:
@@ -26,7 +26,7 @@ def test_smiles_import_records_exact_parser_provenance() -> None:
 @pytest.mark.xfail(
     reason="§3.3 reopened: component/molecule provenance identity was removed; value "
     "identity now rests on the plain chemical-graph fields alone",
-    strict=False,
+    strict=True,
     raises=ImportError,
 )
 def test_reference_and_provenance_are_ordinary_component_value_identity() -> None:
@@ -37,7 +37,7 @@ def test_reference_and_provenance_are_ordinary_component_value_identity() -> Non
 @pytest.mark.xfail(
     reason="§3.3 reopened: ChemicalProvenance/ChemicalTransform and their validation were "
     "removed; the provenance/conditions facet stays reopened",
-    strict=False,
+    strict=True,
     raises=ImportError,
 )
 def test_provenance_rejects_unearned_bags_and_invalid_mappings() -> None:
@@ -48,7 +48,7 @@ def test_provenance_rejects_unearned_bags_and_invalid_mappings() -> None:
 @pytest.mark.xfail(
     reason="§3.4 reopened: SystemBond.origin is now a plain field with no provenance and no "
     "non-user-origin provenance requirement; the BondOrigin/provenance domain is reopened",
-    strict=False,
+    strict=True,
     raises=AttributeError,
 )
 def test_bond_origin_is_semantic_and_non_user_origin_requires_provenance() -> None:
@@ -63,7 +63,7 @@ def test_bond_origin_is_semantic_and_non_user_origin_requires_provenance() -> No
     reason="§3.5.1 reopened: the private _StructureSource/_SourceAtomIdentity mapping was "
     "removed; residue_numbers carries the one retained source fact and the broad source "
     "identity bag stays reopened in §3.5",
-    strict=False,
+    strict=True,
     raises=ImportError,
 )
 def test_private_structure_source_mapping_is_validated_and_not_semantic_identity() -> None:

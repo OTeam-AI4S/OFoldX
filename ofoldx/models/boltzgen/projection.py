@@ -173,10 +173,3 @@ def to_design_mask(
                 res_design_mask.append(designed)
                 per_row_group.append(group)
     return res_design_mask, per_row_group
-
-
-__all__ = [
-    "DesignMaskResidue",
-    "from_design_mask",
-    "to_design_mask",
-]

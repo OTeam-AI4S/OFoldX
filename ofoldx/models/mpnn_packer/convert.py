@@ -124,13 +124,24 @@ def _convert_packer_key(key: str) -> str:
 def convert_mpnn_packer_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
 ) -> None:
     r"""
     Convert an official ``ligandmpnn_sc`` checkpoint into a standard packer repository.
 
+    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
+    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
+    and nothing is published without an explicit ``repo_id``.
+
     Args:
         checkpoint_path: Path to an official ``ligandmpnn_sc_v_*.pt`` checkpoint.
         output_dir: New repository directory to write.
+        repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
+        token: Optional Hugging Face token authenticating the ``repo_id`` upload.
+        private: Create the ``repo_id`` repository as private when it does not yet exist.
 
     Examples:
         >>> convert_mpnn_packer_checkpoint(  # doctest: +SKIP
@@ -155,4 +166,9 @@ def convert_mpnn_packer_checkpoint(
     state_dict = convert_mpnn_packer_state_dict(checkpoint["model_state_dict"])
     model.load_state_dict(state_dict, strict=True)
     processor = MpnnPackerProcessor(MpnnPackerProcessorConfig(atom_context_num=config.atom_context_num))
-    MpnnPackerPipeline(model=model, processor=processor).save(output_dir)
+    MpnnPackerPipeline(model=model, processor=processor).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )

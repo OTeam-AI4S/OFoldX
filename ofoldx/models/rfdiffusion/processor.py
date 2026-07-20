@@ -131,15 +131,14 @@ class RFdiffusionProcessor:
 
         if msa is not None:
             raise ValueError("RFdiffusion does not consume MSA evidence")
-        if length is not None:
-            if (
-                type(length) is not tuple
-                or len(length) != 2
-                or any(type(bound) is not int for bound in length)
-                or any(bound < 0 for bound in length)
-                or length[0] > length[1]
-            ):
-                raise ValueError("length must be a (min, max) tuple of non-negative ints with min <= max")
+        if length is not None and (
+            type(length) is not tuple
+            or len(length) != 2
+            or any(type(bound) is not int for bound in length)
+            or any(bound < 0 for bound in length)
+            or length[0] > length[1]
+        ):
+            raise ValueError("length must be a (min, max) tuple of non-negative ints with min <= max")
         template_values = tuple(templates)
         if len(template_values) > 1:
             raise ValueError("RFdiffusion accepts at most one fold-conditioning Template")

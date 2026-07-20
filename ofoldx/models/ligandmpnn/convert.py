@@ -239,6 +239,10 @@ def ligandmpnn_processor_config_from_checkpoint(
 def convert_ligandmpnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
 ) -> None:
     r"""
     Convert a released LigandMPNN checkpoint into a standard Pipeline repository.
@@ -248,9 +252,16 @@ def convert_ligandmpnn_checkpoint(
     config, and saves the paired concrete [`LigandMpnnPipeline`]
     [ofoldx.models.ligandmpnn.pipeline.LigandMpnnPipeline] artifact under the exact ``ofoldx.ligandmpnn`` ID.
 
+    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
+    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
+    and nothing is published without an explicit ``repo_id``.
+
     Args:
         checkpoint_path: Path to a released ``ligandmpnn_v_*.pt`` sequence checkpoint.
         output_dir: New repository directory to write.
+        repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
+        token: Optional Hugging Face token authenticating the ``repo_id`` upload.
+        private: Create the ``repo_id`` repository as private when it does not yet exist.
 
     Examples:
         >>> convert_ligandmpnn_checkpoint("ligandmpnn_v_32_010_25.pt", "ligandmpnn")  # doctest: +SKIP
@@ -268,4 +279,9 @@ def convert_ligandmpnn_checkpoint(
         assign=True,
     )
     processor = LigandMpnnProcessor(ligandmpnn_processor_config_from_checkpoint(checkpoint))
-    LigandMpnnPipeline(model=model, processor=processor).save(output_dir)
+    LigandMpnnPipeline(model=model, processor=processor).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )

@@ -159,10 +159,3 @@ class SymbolicBond:
             stereo=self.stereo,
             origin="user",
         )
-
-
-__all__ = [
-    "SymbolicBond",
-    "SymbolicBondSite",
-    "resolve_bond_site",
-]

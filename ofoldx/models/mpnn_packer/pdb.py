@@ -78,13 +78,11 @@ def write_pdb(
 
     lines: list[str] = []
     serialized_reference_by_key: dict[tuple[str, int, str], ComponentReference] = {}
-    serial = 0
-    for site_index in record_indices:
+    for serial, site_index in enumerate(record_indices, start=1):
         site = structure.sites[site_index]
         reference = (site.instance_id, site.component_index)
         component = system.component(reference)
 
-        serial += 1
         serial_field = f"{encode_hybrid36(serial, 5):>5}"
         entity = system.entities[system.instances[site.instance_id]]
         record = "ATOM" if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein" else "HETATM"

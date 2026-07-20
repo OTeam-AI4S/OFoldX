@@ -3,7 +3,7 @@ r"""DeepMind AlphaFold 3 parity and public-surface acceptance harness.
 
 This is the DeepMind AlphaFold 3 identity (distinct from the Protenix graph). The
 native surface mirrors the wired :mod:`scripts.parity.protenix` sibling; the
-cross-environment capture mirrors :mod:`scripts.parity.alphafold2`, because the
+cross-environment capture mirrors :mod:`scripts.parity.alphafold2_public_output`, because the
 AlphaFold 3 reference is DeepMind's JAX / Haiku implementation rather than a
 PyTorch checkout and can only run inside its own conda environment.
 

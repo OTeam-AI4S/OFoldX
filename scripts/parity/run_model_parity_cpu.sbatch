@@ -14,7 +14,7 @@ COMMON_CANDIDATES=(
   "${OFOLDX_ROOT:-}/scripts/parity/common.sh"
   "${SLURM_SUBMIT_DIR:-}/scripts/parity/common.sh"
   "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-  "/data/node4/home/zhiyuan/ofoldx/scripts/parity/common.sh"
+  "/home/z/ofoldx/scripts/parity/common.sh"
 )
 for common in "${COMMON_CANDIDATES[@]}"; do
   if [[ -f "$common" ]]; then

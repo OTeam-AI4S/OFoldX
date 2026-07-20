@@ -2,6 +2,7 @@ r"""Canonical PDB/mmCIF I/O over :mod:`ofoldx.data` domain values."""
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import os
@@ -202,10 +203,8 @@ def _prepare_read(
 
     component_table: dict[str, ChemicalComponent] = {}
     for component_id in {row.component_id for row in parsed.rows}:
-        try:
+        with contextlib.suppress(KeyError):
             component_table[component_id] = get_component(component_id)
-        except KeyError:
-            pass
     if components is not None:
         supplied = dict(components)
         for component_id, component in supplied.items():
@@ -1638,7 +1637,7 @@ def _pdb_atoms(structure: Structure) -> tuple[tuple[_PdbAtom, ...], set[str], se
         raise ValueError("PDB supports at most 62 distinct one-character chain IDs")
     chain_by_instance: dict[str, str] = {}
     used_chains: set[str] = set()
-    for instance_id, sites in instance_sites.items():
+    for instance_id in instance_sites:
         preferred = instance_id
         if len(preferred) == 1 and preferred not in used_chains and preferred.isalnum():
             chain = preferred

@@ -1960,9 +1960,3 @@ def _normalize_msa(
         paired_sequences=(projected[0],),
         paired_deletion_counts=np.zeros((1, width), dtype=np.uint32),
     )
-
-
-__all__ = [
-    "BoltzGenIFoldProcessor",
-    "BoltzGenProcessor",
-]
