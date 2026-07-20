@@ -6,9 +6,8 @@ import math
 import pickle
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from functools import cache
-from importlib.resources import files
 from operator import index as integer_index
+from os import PathLike
 from pathlib import Path
 from typing import Literal, cast
 
@@ -75,6 +74,19 @@ from .config import RFdiffusionConfig
 # ``AtomSite | SymbolicAtomSite``); a residue-granularity endpoint is
 # :data:`~ofoldx.data.conditions.ResidueEndpoint` (``ComponentReference | str | SymbolicResidueSite``).
 
+# Fixed dimensions of the released RFdiffusion IGSO(3) lookup table (num_sigma x num_omega). The
+# released table is un-regenerable numerical noise, so it is baked into ``model.safetensors`` as
+# persistent float64 buffers rather than recomputed; these shapes size those buffers.
+_IGSO3_NUM_SIGMA = 500
+_IGSO3_NUM_OMEGA = 1000
+_IGSO3_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("cdf", (_IGSO3_NUM_SIGMA, _IGSO3_NUM_OMEGA)),
+    ("score_norm", (_IGSO3_NUM_SIGMA, _IGSO3_NUM_OMEGA)),
+    ("exp_score_norms", (_IGSO3_NUM_SIGMA,)),
+    ("discrete_omega", (_IGSO3_NUM_OMEGA,)),
+    ("discrete_sigma", (_IGSO3_NUM_SIGMA,)),
+)
+
 
 class RFdiffusionModel(nn.Module):
     r"""The released RFdiffusion RoseTTAFold denoiser and design sampler.
@@ -117,7 +129,18 @@ class RFdiffusionModel(nn.Module):
         self.sidechain_input = preprocess.sidechain_input
         self.structure_self_conditioning = preprocess.structure_self_conditioning
         self.allatom = ComputeAllAtomCoords()
+        # The released IGSO(3) schedule table travels with the checkpoint as persistent float64
+        # buffers (baked into ``model.safetensors`` at convert time, restored by strict
+        # ``load_state_dict``) instead of vendored package data. ``design`` threads them into the
+        # sampler so the exact released table is used verbatim, without any disk read.
+        for name, shape in _IGSO3_FIELDS:
+            self.register_buffer(f"igso3_{name}", torch.zeros(shape, dtype=torch.float64), persistent=True)
         self.set_backend("auto")
+
+    def _igso3_schedule(self) -> dict[str, np.ndarray]:
+        r"""Return the model-baked IGSO(3) lookup table as the sampler's schedule dict."""
+
+        return {name: getattr(self, f"igso3_{name}").detach().cpu().numpy() for name, _ in _IGSO3_FIELDS}
 
     def set_backend(self, backend: str) -> Self:
         r"""Select the operator backend used by the RFdiffusion SE(3) path."""
@@ -263,6 +286,7 @@ class RFdiffusionModel(nn.Module):
             self.config,
             network=self.network,
             allatom=self.allatom,
+            igso3_schedule=self._igso3_schedule(),
             final_step=final_step,
             partial_steps=partial_steps,
             noise_scale_ca=noise_scale_ca,
@@ -295,22 +319,26 @@ class RFdiffusionModel(nn.Module):
         return _select_backend(self.backend, tensor)
 
 
-@cache
-def rfdiffusion_schedule() -> dict[str, np.ndarray]:
-    r"""Load the exact released RFdiffusion IGSO(3) lookup table.
+def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str, np.ndarray]:
+    r"""Load the exact released RFdiffusion IGSO(3) lookup table from a convert-time source.
 
-    The safe NumPy archive is derived from
-    ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl``
-    at RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9``.
-    The source SHA-256 is ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``;
-    the packaged archive SHA-256 is ``89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8``.
-    The table is redistributed under RFdiffusion's BSD 3-Clause license.
+    This is a convert-stage loader only: the released table is baked into ``model.safetensors`` as
+    the model's persistent ``igso3_*`` buffers, so nothing reads it at inference time. ``source``
+    defaults to the untracked ``rfdiffusion_schedule.npz`` beside this module; a ``.pkl`` source is
+    read as an original RFdiffusion IGSO(3) cache pickle and any other suffix as the safe NumPy
+    archive. The reference archive is derived from
+    ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl`` at
+    RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9`` (source
+    SHA-256 ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``) and is
+    redistributed under RFdiffusion's BSD 3-Clause license.
     """
 
-    with (
-        files(__package__).joinpath("rfdiffusion_schedule.npz").open("rb") as file,
-        np.load(file, allow_pickle=False) as values,
-    ):
+    path = Path(__file__).with_name("rfdiffusion_schedule.npz") if source is None else Path(source)
+    if path.suffix == ".pkl":
+        with path.open("rb") as handle:
+            values = pickle.load(handle)
+        return {name: np.asarray(array) for name, array in values.items()}
+    with np.load(path, allow_pickle=False) as values:
         return {name: values[name] for name in values.files}
 
 
@@ -3869,6 +3897,7 @@ class RFdiffusionSampler:
         config: Persistent checkpoint architecture and diffusion process.
         network: The RoseTTAFold denoiser called at each reverse step.
         allatom: The Model-owned atom-coordinate reconstruction module.
+        igso3_schedule: The model-baked IGSO(3) lookup table used verbatim for the released schedule.
         final_step: Last reverse timestep.
         partial_steps: Optional partial-diffusion starting timestep.
         noise_scale_ca: Initial CA-translation noise scale at the first reverse step.
@@ -3889,6 +3918,7 @@ class RFdiffusionSampler:
         *,
         network: nn.Module,
         allatom: ComputeAllAtomCoords,
+        igso3_schedule: dict[str, np.ndarray] | None = None,
         final_step: int = 1,
         partial_steps: int | None = None,
         noise_scale_ca: float = 1.0,
@@ -3917,6 +3947,7 @@ class RFdiffusionSampler:
         self.config = config
         self.network = network
         self.allatom = allatom
+        self.igso3_schedule = igso3_schedule
         self.final_step = final_step
         self.partial_steps = partial_steps
         self.noise_scale_ca = float(noise_scale_ca)
@@ -4302,6 +4333,7 @@ class RFdiffusionSampler:
             truncation_level=self.igso3_truncation_level,
             igso3_num_omega=self.igso3_num_omega,
             igso3_num_sigma=self.igso3_num_sigma,
+            igso3_schedule=self.igso3_schedule,
         )
         self.diffuser = diffuser
         return diffuser
@@ -4502,6 +4534,7 @@ class IGSO3Diffuser:
         num_sigma: Number of discretized sigma levels.
         schedule: Sigma-schedule shape (`"linear"` or `"exponential"`).
         truncation_level: Number of power-series terms used in the density evaluation.
+        igso3_schedule: Model-baked IGSO(3) table returned verbatim for the released schedule.
 
     Raises:
         ValueError: If ``schedule`` is not `"linear"` or `"exponential"`.
@@ -4520,9 +4553,11 @@ class IGSO3Diffuser:
         num_sigma: int = 500,
         schedule: str = "linear",
         truncation_level: int = 2000,
+        igso3_schedule: dict[str, np.ndarray] | None = None,
     ) -> None:
         self.num_timesteps = integer_index(num_timesteps)
         self.schedule = schedule
+        self.igso3_schedule = igso3_schedule
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
@@ -4778,10 +4813,11 @@ class IGSO3Diffuser:
         return torch.einsum("...ij,...jk->...ik", perturb, R_t_t)
 
     def _calc_igso3_vals(self) -> dict[str, np.ndarray]:
-        r"""Load the cached IGSO3 lookup tables, computing and caching them on a miss."""
+        r"""Return the model-baked IGSO3 table for the released schedule, else load/compute a cache."""
 
         if (
-            self.num_timesteps == 50
+            self.igso3_schedule is not None
+            and self.num_timesteps == 50
             and self.num_omega == 1000
             and self.num_sigma == 500
             and self.truncation_level == 2000
@@ -4790,7 +4826,7 @@ class IGSO3Diffuser:
             and self.min_b == 1.5
             and self.max_b == 2.5
         ):
-            return rfdiffusion_schedule()
+            return self.igso3_schedule
         cache_file = self._cache_file()
         if cache_file is not None and cache_file.exists():
             with cache_file.open("rb") as handle:
@@ -4863,6 +4899,7 @@ class Diffuser:
         truncation_level: Number of IGSO3 series terms.
         igso3_num_omega: Number of IGSO3 discretized angles.
         igso3_num_sigma: Number of IGSO3 discretized sigma levels.
+        igso3_schedule: Model-baked IGSO(3) table used verbatim for the released schedule.
 
     Raises:
         ValueError: If ``so3_type`` is not `"igso3"` or ``partial_timesteps`` is out of range.
@@ -4888,6 +4925,7 @@ class Diffuser:
         truncation_level: int = 2000,
         igso3_num_omega: int = 1000,
         igso3_num_sigma: int = 500,
+        igso3_schedule: dict[str, np.ndarray] | None = None,
     ) -> None:
         if so3_type != "igso3":
             raise ValueError(f"unsupported SO(3) diffuser {so3_type!r}")
@@ -4911,6 +4949,7 @@ class Diffuser:
             truncation_level=truncation_level,
             num_omega=igso3_num_omega,
             num_sigma=igso3_num_sigma,
+            igso3_schedule=igso3_schedule,
         )
         self.eucl_diffuser = EuclideanDiffuser(
             self.num_timesteps,

@@ -13,7 +13,7 @@ from torch import Tensor
 
 from ...artifacts import save_model
 from .config import RFdiffusionConfig
-from .model import RFdiffusionModel
+from .model import RFdiffusionModel, rfdiffusion_schedule
 
 _DTYPES = {
     "float32": torch.float32,
@@ -131,14 +131,23 @@ def convert_rfdiffusion_checkpoint(
     checkpoint: str | PathLike[str],
     *,
     dtype: torch.dtype | None = None,
+    schedule_source: str | PathLike[str] | None = None,
 ) -> RFdiffusionModel:
-    r"""Return one native Model loaded strictly from an official checkpoint."""
+    r"""Return one native Model loaded strictly from an official checkpoint.
+
+    The released IGSO(3) schedule table is copied verbatim from ``schedule_source`` (an ``.npz`` or
+    original RFdiffusion ``.pkl``; the untracked ``rfdiffusion_schedule.npz`` beside the module by
+    default) into the model's persistent ``igso3_*`` float64 buffers, so it ships baked into
+    ``model.safetensors`` rather than as vendored package data.
+    """
 
     loaded = load_rfdiffusion_checkpoint(checkpoint)
     config = rfdiffusion_config_from_checkpoint(loaded)
     with torch.device("meta"):
         model = RFdiffusionModel(config)
     state = convert_rfdiffusion_state_dict(loaded["model_state_dict"], dtype=dtype)
+    for name, array in rfdiffusion_schedule(schedule_source).items():
+        state[f"igso3_{name}"] = torch.as_tensor(array, dtype=torch.float64)
     model.load_state_dict(state, strict=True, assign=True)
     return model
 
@@ -148,6 +157,7 @@ def save_rfdiffusion_checkpoint(
     output_dir: str | PathLike[str],
     *,
     dtype: torch.dtype | None = None,
+    schedule_source: str | PathLike[str] | None = None,
     repo_id: str | None = None,
     token: str | None = None,
     private: bool = False,
@@ -172,7 +182,7 @@ def save_rfdiffusion_checkpoint(
     from .pipeline import RFdiffusionPipeline
     from .processor import RFdiffusionProcessor
 
-    model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype)
+    model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype, schedule_source=schedule_source)
     destination = Path(output_dir).expanduser()
     save_model(destination, model=model, processor=RFdiffusionProcessor())
     chanfig.NestedDict({"pipeline": PIPELINES.id_for(RFdiffusionPipeline)}).dump(destination / "pipeline.json")
@@ -188,6 +198,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
     parser.add_argument(
+        "--schedule-source",
+        type=Path,
+        default=None,
+        help="IGSO(3) schedule source (.npz or original RFdiffusion .pkl); "
+        "defaults to rfdiffusion_schedule.npz beside the module",
+    )
+    parser.add_argument(
         "--repo-id",
         default=None,
         help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
@@ -199,6 +216,7 @@ def main(argv: list[str] | None = None) -> None:
         args.checkpoint,
         args.output_dir,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        schedule_source=args.schedule_source,
         repo_id=args.repo_id,
         token=args.token,
         private=args.private,
