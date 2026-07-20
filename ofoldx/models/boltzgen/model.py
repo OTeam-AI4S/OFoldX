@@ -3556,7 +3556,10 @@ class BroadcastGaussianSmearing(nn.Module):
         offset = torch.linspace(start, stop, num_gaussians)
         # Match the BoltzGen reference: derive the RBF width from the float32 ``offset`` spacing, not the float64
         # analytic spacing (see GaussianSmearing above) so the distance features are bit-faithful to upstream.
-        self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
+        # Compute the spacing on a real CPU tensor so construction under ``torch.device("meta")`` (the
+        # converter / hub load mode) does not call ``.item()`` on an unmaterialized meta tensor.
+        spacing = torch.linspace(start, stop, num_gaussians, device="cpu")
+        self.coeff = -0.5 / (spacing[1] - spacing[0]).item() ** 2
         self.register_buffer("offset", offset)
 
     def forward(self, distance: Tensor) -> Tensor:
@@ -3589,7 +3592,10 @@ class GaussianSmearing(nn.Module):
         # Derive the RBF width from the float32 ``offset`` spacing (matching the BoltzGen reference) rather than
         # the float64 analytic spacing: for non-float32-representable spacings (e.g. 20/15) the two differ by
         # ~6e-8 relative, and that discrepancy amplifies through the 6-layer encoder to ~1e-3 in the logits.
-        self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
+        # Compute the spacing on a real CPU tensor so construction under ``torch.device("meta")`` (the
+        # converter / hub load mode) does not call ``.item()`` on an unmaterialized meta tensor.
+        spacing = torch.linspace(start, stop, num_gaussians, device="cpu")
+        self.coeff = -0.5 / (spacing[1] - spacing[0]).item() ** 2
         self.register_buffer("offset", offset)
 
     def forward(self, distances: Tensor) -> Tensor:

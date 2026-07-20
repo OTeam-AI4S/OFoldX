@@ -32,14 +32,16 @@ entry, and `PxDesignPipeline` (a normal `_PairedPipeline`) is repository-saveabl
 
 The **PXDesign suite** is the released composition pipeline: PXDesign-d backbones →
 ProteinMPNN sequencing → AF2-IG (initial-guess) evaluation → optional Protenix evaluation →
-success bucketing → rank/filter. Per §6.4 `PxDesignSuitePipeline` is a **live-only
-composition with no single owning Model and no checkpoint**: it is not a `_PairedPipeline`,
-adds no registration, and writes no `pipeline.json` model-repo artifact. It is reconstructed
-at runtime from the registered `ofoldx.pxdesign` + `ofoldx.proteinmpnn` +
-`ofoldx.alphafold2` (AF2-IG, pending) + `ofoldx.protenix` repositories.
+success bucketing → rank/filter. Per §6.4 it is a **live-only composition with no single
+owning Model and no checkpoint**: it would not be a `_PairedPipeline`, add no registration,
+and write no `pipeline.json` model-repo artifact, being reconstructed at runtime from the
+registered `ofoldx.pxdesign` + `ofoldx.proteinmpnn` + `ofoldx.alphafold2` (AF2-IG, pending)
++ `ofoldx.protenix` repositories.
 
-Two blockers keep the suite from running end to end today and are surfaced as explicit
-`NotImplementedError`s rather than fabricated:
+Two blockers keep the suite from running end to end today, so — per Principle 13, where a
+public reexport IS a publication surface — the suite composition pipeline is intentionally
+**not published**: it is absent from `ofoldx.models.pxdesign` entirely until both land,
+rather than shipping a class whose only behavior is to raise. The blockers are:
 
 - **AF2-IG.** The released evaluation stage is AF2 *initial-guess multimer* (seed the
   designed backbone into the recycling `prev_pos` channel and read interface metrics

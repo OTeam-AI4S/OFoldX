@@ -22,7 +22,7 @@ from .model import (
     PxDesignResult,
     PxDesignSampler,
 )
-from .pipeline import PxDesignPipeline, PxDesignSuitePipeline
+from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
 # `standard_tasks` stays () (§6.1, mirroring rfdiffusion): the root pair must NOT be wrapped by
@@ -31,8 +31,10 @@ from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 # its `design` returns the family-owned `PxDesignResult` (§5.3) over its own `PlacementSpec`/
 # `Hotspot` conditions. Publication (Principle 13) is therefore the concrete `PxDesignPipeline`
 # registered below — exactly as `PxDesignPipeline` mirrors `ProteinMpnnPipeline` (pipeline.py).
-# The `PxDesignSuitePipeline` composition stays UNregistered: it is dependency-gated on the
-# AF2-IG fold entry point and the un-vendored `pxdbench` submodule (honest deferred gap).
+# The suite *composition* pipeline (backbone -> ProteinMPNN -> AF2-IG / Protenix -> `pxdbench`
+# ranking) is intentionally ABSENT from this surface (Principle 13: reexport IS publication): it
+# is dependency-gated on the AF2-IG fold entry point and the un-vendored `pxdbench` submodule, so
+# it stays unpublished until those land rather than shipping a placeholder that only raises.
 _register_model(
     "ofoldx.pxdesign",
     model=PxDesignModel,

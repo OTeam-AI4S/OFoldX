@@ -98,6 +98,14 @@ _RESTYPE_INDEX = {
 }
 _STANDARD_POLYMER_COMPONENTS = frozenset(_RESTYPE_INDEX) - {"-", "-P", "-N", "-L"}
 
+# The released ODesign generation surface realizes a de-novo polymer GeneratedSegment as a run
+# of placeholder components of the segment's polymer type (protein -> UNK, rna -> N, dna -> DN).
+# There is NO honest de-novo *ligand* realization: the released path emits placeholder ``-L`` atom
+# rows with fake bonds and binary NONE/ANY bond-type logits, not a real chemical graph. A generated
+# ligand segment therefore has no entry here and is GATED at the realization boundary below
+# (GAP-1; a de-novo molecule has no PlacementValue). Existing/fixed ligand context is unaffected.
+_GENERATED_COMPONENT_ID = {"protein": "UNK", "rna": "N", "dna": "DN"}
+
 # MSA cells are UPPERCASE one-letter symbols (or the ``-`` gap), not ChemicalComponent IDs. These
 # project each polymer type's one-letter symbols onto their ``_RESTYPE_INDEX`` token, reproducing the
 # pre-migration component-id lowering: a standard symbol resolves to its residue token, ``-`` to the
@@ -564,7 +572,20 @@ def _materialize_placement(
                 part_polymer_type = part.polymer_type
                 start = len(components)
                 length = part.max_length
-                component_id = {"protein": "UNK", "rna": "N", "dna": "DN"}[part_polymer_type]
+                if part_polymer_type not in _GENERATED_COMPONENT_ID:
+                    # GAP-1 gate: a de-novo ligand segment (odesign
+                    # ``{"chain_type": "ligand", "sequence": "N-N"}`` = num_atoms) has no truthful
+                    # released realization — the released path yields placeholder ``-L`` atom rows,
+                    # fake bonds, and binary NONE/ANY bond logits, not a real chemical graph. Refuse
+                    # it here rather than silently emitting fake chemistry. Protein/nucleic de-novo
+                    # generation and fixed-ligand context are unaffected.
+                    raise NotImplementedError(
+                        "de-novo ligand design is not supported: the released ODesign path realizes "
+                        "a generated ligand segment as placeholder -L atom rows with fake bonds and "
+                        "binary NONE/ANY bond-type logits, not a real chemical graph; only protein/"
+                        f"nucleic de-novo generation is supported (got polymer_type {part_polymer_type!r})"
+                    )
+                component_id = _GENERATED_COMPONENT_ID[part_polymer_type]
                 components.extend([get_component(component_id)] * length)
                 generated_component_ids.add(component_id)
                 segment_offsets.append((placement_id, part, start, length))

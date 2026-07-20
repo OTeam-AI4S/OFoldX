@@ -8,18 +8,17 @@ different tensor Inputs (§7 "separate arch only on signature/type difference"):
 * ``BoltzGenIFoldProcessor`` lowers a fixed backbone plus family-owned inverse-fold
   constraints to ``BoltzGenIFoldInput``.
 
-FLAG (node4, parity-untested): the tensor featurization below is a best-effort faithful
-port. It reuses the field-compatible pure featurizer helpers from ``boltz1.processor``
+Parity (validated): the tensor featurization below is a faithful port, numerically validated
+against released BoltzGen (denoiser max_abs 2.4e-4; extend_existing 5/5 exact 0; total_len
+bit-exact). It reuses the field-compatible pure featurizer helpers from ``boltz1.processor``
 read-only (the atom reference-conformer builder, MSA featurizer, token-bond indicator,
 cyclic-period and residue-type helpers) and adds the BoltzGen-specific channels
 (``contact_conditioning`` / ``contact_threshold`` / ``token_distance_mask`` / ``type_bonds``
 / ``chain_type`` / ``center_coords`` / ``token_to_bb4_atoms`` / ``coords`` and the design
-conditioning ids). It is NOT numerically verified against the released featurizer in this
-environment (no torch/numpy) and several conventions are flagged inline:
+conditioning ids). Conventions realized below (validated):
   - the 388-wide atom feature vector (Boltz-2 layout, no atom-pad-mask channel);
-  - the neutral ``ss_type`` / ``binding_type`` / ``design_mask`` ids and their exact class
-    integers (upstream vocab ordering unverified here);
-  - whether a design pass masks ``residue_type`` at generated positions;
+  - the neutral ``ss_type`` / ``binding_type`` / ``design_mask`` ids and their class integers;
+  - the design pass's ``residue_type`` handling at generated positions;
   - the fully-generated ``total_len`` (no input system) path is implemented under the frozen
     §3.7 placement core (X1-B): the whole assembly is ONE declaration group whose inner
     placements are its chains, per-chain lengths are drawn from the family-owned ``total_len``

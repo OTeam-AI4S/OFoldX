@@ -1,21 +1,22 @@
 r"""OFoldX's biological operation boundary for the released BoltzGen design pipeline.
 
-``BoltzGenPipeline`` binds the two family Model/Processor pairs and the composed boltz2
+``BoltzGenPipeline`` binds the two family Model/Processor pairs and the optionally composed
 fold / affinity stages into the released multi-stage flow
 (``design -> inverse_folding -> folding -> affinity -> analysis/filter``, upstream
 ``cli/boltzgen.py`` ``step_names``) and returns the family-owned ``BoltzGenResult``. It is
 not a base class and shares no runtime request object with any other family (mirroring
 ``Boltz1Pipeline``).
 
-§4 composition (read-only): the folding and affinity stages compose with the boltz2 family
-by read-only import (locked: reference, do not edit boltz2). ``fold`` / ``affinity`` and
-their Processors are **injected optional dependencies** typed against boltz2 names; BoltzGen
-never adds a verb to boltz2.
+§4 composition (neutral hub): the folding and affinity stages compose against the GENERIC
+OFoldX fold / score interface (:class:`_FoldModel` ``.fold(batch) -> FoldResult`` /
+:class:`_ScoreModel` ``.score(batch) -> ScoreResult``), so ANY OFoldX fold/score family
+(af2/af3/boltz1/boltz2/esmfold2/protenix) can be injected — not just boltz2. ``fold`` /
+``affinity`` and their Processors are **injected optional dependencies** typed against these
+Protocols; BoltzGen never adds a verb to the composed family.
 
-FLAG (composition, partially resolved): the earlier BLOCKING flag was that boltz2 exposed no
-fold verb. boltz2 has since landed ``Boltz2Model.fold`` + ``Boltz2Processor`` (generic fold
-pair) in parallel, so the folding stage is now wireable by injecting them. ``do_refold=True``
-without an injected fold Model+Processor still raises a clear error.
+Composition IS the switch: the refold stage runs iff a fold Model+Processor is composed in
+and the affinity stage runs iff a score Model+Processor is composed in. There are no
+``do_refold`` / ``do_affinity`` mode flags.
 
 Predicted-sequence remap (implemented, validated): released BoltzGen WRITES the designed
 sequence back into the output structure — ``DesignWriter.write_on_batch_end`` (inverse_fold)
@@ -37,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from os import PathLike
-from typing import TYPE_CHECKING, cast
+from typing import Protocol, cast
 
 import numpy as np
 import torch
@@ -48,7 +49,7 @@ from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Pol
 from ...data.structure import Structure
 from ...pipelines._composite import _CompositePair, _CompositePipeline
 from ...pipelines._generator import resolve_generator
-from ...results import Metric, Score
+from ...results import FoldResult, Metric, Score, ScoreResult
 from .model import (
     BoltzGenCandidate,
     BoltzGenIFoldInput,
@@ -62,9 +63,35 @@ from .model import (
 )
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
 
-if TYPE_CHECKING:
-    # Read-only boltz2 composition types (never edited by this family).
-    from ..boltz2 import Boltz2AffinityModel, Boltz2AffinityProcessor, Boltz2Model, Boltz2Processor
+
+class _FoldModel(Protocol):
+    r"""Generic fold-capable OFoldX Model: any family exposing ``.fold(batch) -> FoldResult``.
+
+    BoltzGen composes the folding stage against this structural interface rather than a single
+    family, so any OFoldX fold model (af2/af3/boltz1/boltz2/esmfold2/protenix) can be injected.
+    """
+
+    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
+
+    def fold(
+        self, batch: object, *, num_samples: int = ..., generator: torch.Generator | None = ...
+    ) -> FoldResult: ...
+
+
+class _ScoreModel(Protocol):
+    r"""Generic score-capable OFoldX Model: any family exposing ``.score(batch) -> ScoreResult``."""
+
+    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
+
+    def score(self, batch: object, *, generator: torch.Generator | None = ...) -> ScoreResult: ...
+
+
+class _Processor(Protocol):
+    r"""Generic OFoldX Processor: a device-placeable callable lowering an input to a batch."""
+
+    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
+
+    def __call__(self, input: object, /) -> object: ...
 
 
 class BoltzGenPipeline(_CompositePipeline):
@@ -75,15 +102,15 @@ class BoltzGenPipeline(_CompositePipeline):
         design_processor: Its lowering Processor.
         ifold_model: The inverse-folding designer.
         ifold_processor: Its lowering Processor.
-        fold: Optional injected boltz2 fold Model (read-only composition).
-        fold_processor: Optional injected boltz2 fold Processor.
-        affinity: Optional injected boltz2 affinity Model (read-only composition).
-        affinity_processor: Optional injected boltz2 affinity Processor.
+        fold: Optional injected fold-capable Model (any OFoldX ``.fold`` family; refold runs iff present).
+        fold_processor: Optional injected fold Processor paired with ``fold``.
+        affinity: Optional injected score-capable Model (any OFoldX ``.score`` family; affinity runs iff present).
+        affinity_processor: Optional injected affinity Processor paired with ``affinity``.
     """
 
     # DESIGN §7.4/§7.3 pair-layout: the structure-design pair owns the runnable root, the
-    # inverse-fold pair lives at ``ifold/``, and the read-only boltz2 fold/affinity stages are
-    # optional sub-pairs — written and reloaded only when they were injected.
+    # inverse-fold pair lives at ``ifold/``, and the composed fold/affinity stages are optional
+    # sub-pairs (``required=False``) — written and reloaded only when they were injected.
     _PAIR_LAYOUT = (
         _CompositePair("", "design_model", "design_processor"),
         _CompositePair("ifold", "ifold_model", "ifold_processor"),
@@ -98,10 +125,10 @@ class BoltzGenPipeline(_CompositePipeline):
         design_processor: BoltzGenProcessor,
         ifold_model: BoltzGenIFoldModel,
         ifold_processor: BoltzGenIFoldProcessor,
-        fold: Boltz2Model | None = None,
-        fold_processor: Boltz2Processor | None = None,
-        affinity: Boltz2AffinityModel | None = None,
-        affinity_processor: Boltz2AffinityProcessor | None = None,
+        fold: _FoldModel | None = None,
+        fold_processor: _Processor | None = None,
+        affinity: _ScoreModel | None = None,
+        affinity_processor: _Processor | None = None,
     ) -> None:
         self.design_model = design_model
         self.design_processor = design_processor
@@ -130,12 +157,9 @@ class BoltzGenPipeline(_CompositePipeline):
         *,
         total_len: int | None = None,
         conditions: Sequence[BoltzGenSchema] = (),
-        protocol: str = "protein-anything",
         num_designs: int = 1,
         num_sampling_steps: int | None = None,
         temperature: float | None = None,
-        do_refold: bool = True,
-        do_affinity: bool = False,
         ranking: str | Sequence[tuple[str, float]] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
@@ -143,21 +167,18 @@ class BoltzGenPipeline(_CompositePipeline):
         r"""Run the released multi-stage design flow and return a ``BoltzGenResult``.
 
         Stage order (upstream ``step_names``): (1) design lowering + structure sampling,
-        (2) inverse folding on the sampled backbone, (3) optional boltz2 refold, (4)
-        optional boltz2 affinity, (5) analysis decode into ``BoltzGenCandidate`` s.
+        (2) inverse folding on the sampled backbone, (3) refold, (4) affinity, (5) analysis
+        decode into ``BoltzGenCandidate`` s. The refold and affinity stages are run when a
+        fold / affinity model is composed in (``self.fold`` / ``self.affinity`` is not ``None``) —
+        composition is the switch; there are no mode flags.
 
         Args:
             input: Optional target/context system, structure, or path.
             total_len: Family-owned whole-assembly token count (owner-gated when it mints rows).
             conditions: Family-owned §3.7.2 schema records.
-            protocol: Upstream default-override protocol name (``cli/boltzgen.py``); selects which
-                Scores exist and which thresholds gate. FLAG: only recorded here; the per-protocol
-                override table is left for node4.
             num_designs: Number of structure samples to draw.
             num_sampling_steps: Optional EDM sampling steps.
             temperature: Optional inverse-fold sampling temperature.
-            do_refold: Whether to run the boltz2 refold stage (requires injected fold Model+Processor).
-            do_affinity: Whether to run the boltz2 affinity stage (requires injected affinity Model+Processor).
             ranking: Optional single Score name or weighted key; not frozen into the Result.
             seed: Optional integer seed (mutually exclusive with ``generator``).
             generator: Optional RNG for reproducible sampling.
@@ -166,17 +187,6 @@ class BoltzGenPipeline(_CompositePipeline):
             One ``BoltzGenResult`` with one candidate per drawn design.
         """
 
-        if do_refold and (self.fold is None or self.fold_processor is None):
-            raise RuntimeError(
-                "do_refold=True requires an injected boltz2 fold Model and Processor "
-                "(BoltzGenPipeline.fold / .fold_processor); the folding stage composes with boltz2 "
-                "read-only and cannot run without them"
-            )
-        if do_affinity and (self.affinity is None or self.affinity_processor is None):
-            raise RuntimeError(
-                "do_affinity=True requires an injected boltz2 affinity Model and Processor "
-                "(BoltzGenPipeline.affinity / .affinity_processor)"
-            )
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
 
         design_batch = self.design_processor(input, total_len=total_len, conditions=tuple(conditions))
@@ -201,8 +211,6 @@ class BoltzGenPipeline(_CompositePipeline):
                 backbone=backbone,
                 ifold_batch=ifold_batch,
                 ifold_output=ifold_output,
-                do_refold=do_refold,
-                do_affinity=do_affinity,
                 generator=generator,
             )
             candidates.append(candidate)
@@ -231,8 +239,6 @@ class BoltzGenPipeline(_CompositePipeline):
                     backbone=backbone,
                     ifold_batch=ifold_batch,
                     ifold_output=ifold_output,
-                    do_refold=False,
-                    do_affinity=False,
                     generator=generator,
                 )
             )
@@ -244,8 +250,6 @@ class BoltzGenPipeline(_CompositePipeline):
         backbone: Structure,
         ifold_batch: BoltzGenIFoldInput,
         ifold_output: BoltzGenIFoldOutput,
-        do_refold: bool,
-        do_affinity: bool,
         generator: torch.Generator | None,
     ) -> BoltzGenCandidate:
         r"""Assemble one candidate: remap the designed sequence, attach the NLL metric and scores.
@@ -278,8 +282,9 @@ class BoltzGenPipeline(_CompositePipeline):
         # at the design positions, so the candidate carries the DESIGNED sequence (not placeholders)
         # and the refold folds it.
         structure = _remap_designed_sequence(backbone, ifold_batch, ifold_output)
-        if do_refold:
-            assert self.fold is not None and self.fold_processor is not None
+        # Composition IS the switch: refold runs iff a fold Model+Processor is composed in, affinity
+        # runs iff a score Model+Processor is composed in. No mode flags.
+        if self.fold is not None and self.fold_processor is not None:
             fold_batch = self.fold_processor(structure)
             fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)
             prediction = fold_result.predictions[0]
@@ -288,8 +293,7 @@ class BoltzGenPipeline(_CompositePipeline):
                 if name in prediction.scores:
                     scores[name] = prediction.scores[name]
 
-        if do_affinity:
-            assert self.affinity is not None and self.affinity_processor is not None
+        if self.affinity is not None and self.affinity_processor is not None:
             affinity_batch = self.affinity_processor(structure)
             affinity_result = self.affinity.score(affinity_batch, generator=generator)
             if "affinity_pred_value" in affinity_result.scores:
