@@ -67,6 +67,12 @@ _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
 _PROTEIN_UNKNOWN = 22
 _MSA_GAP = 1
 
+# Binder-design mask token: framework/fixed positions carry their amino-acid letter, mutable
+# design positions carry '#' (binder_design.py L86). Chothia is the numbering scheme the
+# released antibody path annotates CDRs under (binder_design.py L392, L406).
+_MUTABLE_TOKEN = "#"
+_ANTIBODY_CDR_SCHEME = "chothia"
+
 
 class ESMFold2Processor:
     r"""Lower complete canonical ESMFold2 inputs without changing their chemistry."""
@@ -728,3 +734,84 @@ def esmc_tensors(
         torch.tensor(token_to_esmc, dtype=torch.long),
         torch.tensor(token_has_esmc, dtype=torch.bool),
     )
+
+
+# ---- Antibody input preparation: CDR annotation (abnumber / ANARCI, Chothia) ----
+#
+# The design mask for an antibody Fv is per-input data: ANARCI numbers the Fv under Chothia and
+# the CDR-H1/H2/H3 + L1/L2/L3 loops become the mutable design positions while framework stays
+# fixed. This is the antibody input-preparation step (it produces the ``binder_prompt`` design
+# mask consumed by ``ESMFold2Pipeline.design``); the design verb never annotates CDRs itself.
+# Faithful port of binder_design.py L386-L420.
+
+
+def _load_abnumber() -> tuple:
+    r"""Import abnumber's ``Chain`` and ``_anarci_align`` or raise an actionable error."""
+
+    try:
+        from abnumber import Chain
+        from abnumber.common import _anarci_align
+    except ModuleNotFoundError as error:  # pragma: no cover - environment dependent
+        raise ModuleNotFoundError(
+            "antibody CDR annotation needs 'abnumber' (with the 'anarci' + 'hmmer' backend). "
+            "Install abnumber and ANARCI to prepare or score antibody Fv binders."
+        ) from error
+    return Chain, _anarci_align
+
+
+def is_antibody_sequence(sequence: str) -> bool:
+    r"""Return ``True`` when ANARCI recognises ``sequence`` as antibody variable domain(s).
+
+    Mirrors the released detection (binder_design.py L386-L397): mutable ``'#'`` marks are
+    substituted with alanine before numbering, and every detected domain must be a heavy
+    (``H``) or light (``K``/``L``) variable domain.
+    """
+
+    _, _anarci_align = _load_abnumber()
+    resolved = sequence.replace(_MUTABLE_TOKEN, "A")
+    result = _anarci_align(sequences=[resolved], scheme=_ANTIBODY_CDR_SCHEME, allowed_species=None)[0]
+    if not result:
+        return False
+    valid_chain_types = {"H", "K", "L"}
+    return all(chain_type in valid_chain_types for _, chain_type, *_ in result)
+
+
+def antibody_cdr_indices(sequence: str) -> list[int]:
+    r"""0-based indices of every Chothia CDR residue (H1/H2/H3, L1/L2/L3) in an Fv ``sequence``.
+
+    Faithful port of the released ``_cdr_indices`` (binder_design.py L400-L420): ANARCI splits
+    the Fv into its variable domains, the heavy domain is ordered first, and each domain's
+    ``cdr1/cdr2/cdr3`` loops are located back in the input sequence. These indices are the
+    CDR-only design positions (framework fixed) and the CDR ipTM-proxy scoring rows.
+    """
+
+    Chain, _anarci_align = _load_abnumber()
+    result = _anarci_align(sequences=[sequence], scheme=_ANTIBODY_CDR_SCHEME, allowed_species=None)[0]
+    chains = [Chain("".join(result[i][0].values()), scheme=_ANTIBODY_CDR_SCHEME) for i in range(len(result))]
+    if len(chains) == 2 and not chains[0].is_heavy_chain():
+        chains.reverse()
+    indices: list[int] = []
+    for chain in chains:
+        for cdr in (chain.cdr1_seq, chain.cdr2_seq, chain.cdr3_seq):
+            start = sequence.find(cdr)
+            if start < 0:
+                raise ValueError(f"Chothia CDR {cdr!r} was numbered but not found in the Fv sequence")
+            indices.extend(range(start, start + len(cdr)))
+    return indices
+
+
+def antibody_cdr_prompt(fv_sequence: str) -> str:
+    r"""Build a CDR-only design mask (as a ``binder_prompt``) from a full antibody Fv sequence.
+
+    The antibody input-preparation step: ANARCI annotates the Chothia CDRs and the returned
+    prompt fixes every framework residue to its input amino acid while marking every CDR
+    position with the mutable ``'#'`` token (the released antibody-framework mask,
+    binder_design.py L110/L204). The prompt is the per-input design mask —
+    [`ESMFold2Pipeline.design`][ofoldx.models.esmfold2.pipeline.ESMFold2Pipeline.design] then
+    optimises exactly the marked CDR positions with no antibody-specific branch. Construct the
+    bound model from a config carrying ``language_model_weight=0.05`` to complete the released
+    antibody-framework setup (general binders keep the ``0.15`` default).
+    """
+
+    cdr_indices = set(antibody_cdr_indices(fv_sequence))
+    return "".join(_MUTABLE_TOKEN if i in cdr_indices else residue for i, residue in enumerate(fv_sequence))

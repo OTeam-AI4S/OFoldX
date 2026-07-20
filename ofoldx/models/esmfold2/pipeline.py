@@ -45,7 +45,7 @@ from .model import (
     _experimental_seed_context,
     compute_esmc_masked_lm_logits,
 )
-from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor
+from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor, antibody_cdr_indices
 
 # 20-dim design amino-acid space, ordered ALA..VAL (residue-type ids 2..21 minus 2), the
 # offset the experimental trunk one-hot uses; ``F.pad(design, (2, 11))`` lifts it to the
@@ -65,15 +65,14 @@ _LOSS_WEIGHTS = {"intra_contact": 0.5, "inter_contact": 0.5, "glob": 0.2}
 _LEARNING_RATE = 0.1
 _TEMPERATURE_MIN = 1e-2
 
-# Algorithm 14 ESMC pseudo-perplexity sequence-regulariser constants (binder_design.py
-# L96-L98, L764, L948-L950). The released design objective adds a masked-LM sequence prior
-# to the structure objective; ``_LM_LOSS_WEIGHT`` is the released non-antibody gradient
-# weighting (the antibody framework path uses 0.05, unused here — single-chain protein
-# targets take the general-binder weight).
+# Algorithm 14 ESMC pseudo-perplexity sequence-regulariser mask sampling constants
+# (binder_design.py L96-L98, L764). The gradient weight blending this masked-LM sequence prior
+# into the structure objective is not here: it is the fixed released hyperparameter
+# ``ESMFold2ExperimentalConfig.language_model_weight`` (0.15 general binder / 0.05 antibody
+# framework), read by ``design`` at construction, never selected at runtime.
 _ESMC_MASK_FRACTION = 0.15
 _LM_MASK_PASSES = 4
 _LM_LOSS_CHUNK = 128
-_LM_LOSS_WEIGHT = 0.15
 
 
 @cache
@@ -319,6 +318,32 @@ def _distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, bi
     return float(max(0.0, min(1.0, 1.0 - mean_entropy / math.log(51))))
 
 
+def cdr_distogram_iptm_proxy(
+    distogram_logits: torch.Tensor, target_length: int, binder_sequence: str
+) -> float:
+    r"""Algorithm 15 CDR restriction — entropy-of-binding ipTM proxy over the CDR rows only.
+
+    A structure-derived antibody score: it restricts the binder→target binding-confidence
+    entropy of a designed ``target|Fv`` distogram to the Chothia CDR rows of ``binder_sequence``
+    (abnumber annotation), the paratope loops that contact the antigen chain (rows
+    ``0:target_length``). Returns the same ``[0, 1]`` confidence as ``_distogram_iptm_proxy``.
+    Provenance: binder_design.py L461-L468.
+    """
+
+    if distogram_logits.ndim == 4:
+        distogram_logits = distogram_logits[0]
+    bin_distance = _get_mid_points(distogram_logits.device)
+    cdr_indices = antibody_cdr_indices(binder_sequence)
+    cdr_rows = [target_length + i for i in cdr_indices]
+    cdr_to_target = _binding_confidence_entropy(
+        distogram_logits[cdr_rows, :target_length, :], bin_distance, cutoff=22.0
+    )
+    sorted_entropies, _ = torch.sort(cdr_to_target.reshape(-1))
+    k = min(len(cdr_indices), sorted_entropies.numel())
+    mean_entropy = float(sorted_entropies[:k].mean())
+    return float(max(0.0, min(1.0, 1.0 - mean_entropy / math.log(51))))
+
+
 def _normalized_gradient(grad: torch.Tensor, gradient_mask: torch.Tensor) -> torch.Tensor:
     r"""Per-sample length-normalised gradient over the mutable positions (binder_design.py L815)."""
 
@@ -468,9 +493,20 @@ class ESMFold2Pipeline:
 
         When the bound model carries an attached ESMC masked-LM head (``load_esmc`` given an
         ``EsmCForMaskedLM``), the released ESMC pseudo-perplexity sequence regulariser
-        (Algorithm 14) is added to the structure objective at the released non-antibody
-        weighting, so the total objective matches released. With only a bare ESMC trunk
+        (Algorithm 14) is added to the structure objective at the fixed released gradient
+        weight ``ESMFold2ExperimentalConfig.language_model_weight`` (a construction-time
+        hyperparameter, read here, never selected at runtime). With only a bare ESMC trunk
         attached the design falls back to the structure-only objective.
+
+        The design is mode-agnostic: it optimises exactly the mutable ``'#'`` positions of
+        ``binder_prompt`` (the design mask) and never inspects what kind of binder it is. A
+        de-novo single-chain binder (every position mutable) and a CDR-only antibody Fv
+        (framework fixed, CDR loops mutable) are the same call — they differ only in the
+        input-level design mask and in the ``language_model_weight`` the bound model was
+        constructed with (``0.15`` general binder, ``0.05`` antibody framework). Build an
+        antibody CDR mask from a full Fv with
+        [`antibody_cdr_prompt`][ofoldx.models.esmfold2.processor.antibody_cdr_prompt] and pass
+        it as ``binder_prompt``.
         """
 
         if not isinstance(self.model, ESMFold2ExperimentalModel):
@@ -490,6 +526,10 @@ class ESMFold2Pipeline:
             raise ValueError("binder_prompt length must equal binder_length")
 
         model = self.model
+        # The Algorithm 14 sequence-prior weight is the fixed released hyperparameter carried by
+        # the construction-time config (0.15 general binder / 0.05 antibody framework); design
+        # reads it and never selects it from the input's nature.
+        language_model_weight = model.config.language_model_weight
         model.eval().requires_grad_(False)
         device = model.z_init_1.weight.device
         processor = self.processor
@@ -542,7 +582,8 @@ class ESMFold2Pipeline:
                     step_seed = None if seed is None else int(seed) + step
                     plm_loss = _esmc_pseudo_perplexity_nll(model, design_lm, score_mask, seed=step_seed)
                     plm_grad = torch.autograd.grad(plm_loss.mean(), logits)[0]
-                    combined_grad = combined_grad + _LM_LOSS_WEIGHT * _normalized_gradient(plm_grad, gradient_mask)
+                    plm_term = _normalized_gradient(plm_grad, gradient_mask)
+                    combined_grad = combined_grad + language_model_weight * plm_term
 
                 logits.grad = combined_grad
                 for group in optimizer.param_groups:
@@ -554,7 +595,9 @@ class ESMFold2Pipeline:
                     best_proxy = proxy
                     best_sequence = binder_sequence
 
-            candidates.append(self._refold(processor, model, target_sequence, best_sequence, target_length, seed))
+            candidates.append(
+                self._refold(processor, model, target_sequence, best_sequence, target_length, seed)
+            )
 
         return ESMFold2DesignResult(candidates=tuple(candidates))
 

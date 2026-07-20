@@ -3827,7 +3827,12 @@ class ESMFold2ExperimentalModel(nn.Module):
 
         self.structure_head = DiffusionStructureHead(config)
         self.distogram_head = nn.Linear(pair_size, config.structure_head.distogram_bins, bias=True)
-        self.confidence_head = ESMFold2ExperimentalConfidenceHead(config)
+        # Distogram-only scaling critics disable the confidence head (config-driven presence,
+        # matching the checkpoint's ``confidence_head.enabled``); the module is then absent so
+        # the head state dict strict-loads and confidence outputs are unavailable.
+        self.confidence_head: ESMFold2ExperimentalConfidenceHead | None = (
+            ESMFold2ExperimentalConfidenceHead(config) if config.confidence_head.enabled else None
+        )
 
         msa_cfg = config.msa_encoder
         self.msa_encoder: ESMFold2ExperimentalMSAEncoder | None = None
@@ -3898,7 +3903,8 @@ class ESMFold2ExperimentalModel(nn.Module):
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self.folding_trunk.set_chunk_size(chunk_size)
-        self.confidence_head.set_chunk_size(chunk_size)
+        if self.confidence_head is not None:
+            self.confidence_head.set_chunk_size(chunk_size)
         if self.msa_encoder is not None:
             self.msa_encoder.set_chunk_size(chunk_size)
 
@@ -4131,6 +4137,11 @@ class ESMFold2ExperimentalModel(nn.Module):
             output["sample_atom_coords"] = sample_coords
 
             if calculate_confidence:
+                if self.confidence_head is None:
+                    raise ValueError(
+                        "this experimental checkpoint has no confidence head "
+                        "(confidence_head.enabled=false); calculate_confidence is unavailable"
+                    )
                 confidence_output = self.confidence_head(
                     s_inputs=x_inputs.detach(),
                     z=z.detach().float(),

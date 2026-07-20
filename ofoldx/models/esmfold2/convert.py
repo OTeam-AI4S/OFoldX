@@ -282,6 +282,13 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
     config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
 
+    # ESMC trunk width/depth the folding head projects from (``LanguageModelPairEncoder``
+    # base_z_linear/base_z_combine): read from the checkpoint so the smaller scaling-study
+    # trunks strict-load. The 6B checkpoints ship 2560/80 (the defaults); the 300M/600M
+    # scaling critics ship 960/30 and 1152/36.
+    config.esmc.hidden_size = raw_config.get("lm_d_model", config.esmc.hidden_size)
+    config.esmc.num_hidden_layers = raw_config.get("lm_num_layers", config.esmc.num_hidden_layers)
+
     inputs = raw_config["inputs"]
     atom_encoder = inputs["atom_encoder"]
     config.inputs.input_size = inputs["d_inputs"]
@@ -326,6 +333,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
 
     confidence = raw_config["confidence_head"]
     ch = config.confidence_head
+    ch.enabled = confidence.get("enabled", True)
     ch.distogram_bins = confidence["distogram_bins"]
     ch.min_dist = confidence["min_dist"]
     ch.max_dist = confidence["max_dist"]

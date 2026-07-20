@@ -165,8 +165,14 @@ class ESMFold2ExperimentalConfidenceHeadConfig(Config):
     (no PDE head, no resolved head) and a 128-bin coarse-distogram pair embedding
     over a 2.0-52.0 angstrom range. Provenance: Biohub transformers
     ``modeling_esmfold2_experimental.ConfidenceHead``.
+
+    ``enabled`` reflects whether the checkpoint ships a confidence head. The design/inversion
+    and hero-critic checkpoints train it (``True``); the scaling-study critics are distogram-
+    only and disable it (``confidence_head.enabled == false`` in their config.json), so the
+    module is absent from their state dict and confidence outputs are unavailable.
     """
 
+    enabled: bool = True
     num_plddt_bins: int = 50
     num_pae_bins: int = 64
     min_dist: float = 2.0
@@ -200,6 +206,14 @@ class ESMFold2ExperimentalConfig(Config):
     disable_msa_features: bool = True
     language_model_dropout: float = 0.0
     force_language_model_dropout: bool = False
+
+    # Algorithm 14 ESMC pseudo-perplexity sequence-regulariser gradient weight
+    # (binder_design.py L948-L950): the fixed released hyperparameter blending the masked-LM
+    # sequence prior into the structure objective during binder design. The released default
+    # 0.15 is the general de-novo-binder weight; construct an antibody-framework design (fixed
+    # framework, mutable CDR loops) with 0.05 so the structure objective dominates the short
+    # CDR loops. ``ESMFold2Pipeline.design`` reads this value and never selects it at runtime.
+    language_model_weight: float = 0.15
 
     esmc: ESMFold2ESMCConfig = ESMFold2ESMCConfig()
     inputs: ESMFold2InputsEmbedderConfig = ESMFold2InputsEmbedderConfig()

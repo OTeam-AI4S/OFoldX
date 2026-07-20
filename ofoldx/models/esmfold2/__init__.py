@@ -36,8 +36,14 @@ from .model import (
     LanguageModelPairEncoder,
     MSAEncoder,
 )
-from .pipeline import ESMFold2Pipeline
-from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor
+from .pipeline import ESMFold2Pipeline, cdr_distogram_iptm_proxy
+from .processor import (
+    ESMFold2ExperimentalProcessor,
+    ESMFold2Processor,
+    antibody_cdr_indices,
+    antibody_cdr_prompt,
+    is_antibody_sequence,
+)
 
 _register_model(
     "ofoldx.esmfold2",
