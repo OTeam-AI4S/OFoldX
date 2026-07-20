@@ -70,7 +70,7 @@ The upstream AlphaFold 3 publication describes training on biomolecular structur
 
 ### Training Procedure
 
-OFoldX can strict-load local official AlphaFold 3 parameter archives into a native model in memory. It does not persist a repository until the family has a complete Processor, and official DeepMind AlphaFold 3 parameters are not uploaded by the converter.
+OFoldX can strict-load local official AlphaFold 3 parameter archives into a native model and persist a standard `model.json` / `processor.json` / safetensors repository via the converter. Because the official DeepMind AlphaFold 3 parameters are not redistributable (RED), any Hub upload defaults to private and a public upload is refused; the converter never uploads the parameters without an explicit private `repo_id`.
 
 ## Citation
 

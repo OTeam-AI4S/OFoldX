@@ -72,8 +72,9 @@ def convert_official_alphafold3_checkpoint(
     r"""
     Convert official DeepMind AlphaFold 3 parameters into a strict-loaded native model.
 
-    Persistence is deferred until AlphaFold 3 has a complete Processor and can call
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
+    This is the in-memory parameter reader. Persistence to a standard repository (and any
+    private-safe Hub upload) is owned by
+    [`convert_alphafold3_checkpoint`][ofoldx.models.alphafold3.convert.convert_alphafold3_checkpoint].
     """
 
     from ..config import AlphaFold3Config
@@ -116,7 +117,10 @@ def translate_official_alphafold3_state(
             converted = -converted
         if dtype is not None and converted.is_floating_point():
             converted = converted.to(dtype=dtype)
-        translated[model_key] = converted
+        # Per-block refs slice the official stacked buffers as views, so several converted
+        # keys can alias one storage. Give every tensor its own contiguous storage; otherwise
+        # ``safetensors`` refuses to persist the aliased state dict (no name covers the buffer).
+        translated[model_key] = converted.detach().clone(memory_format=torch.contiguous_format)
 
     unexpected = sorted(set(official_state) - used_official_keys - _UNUSED_OFFICIAL_KEYS)
     if unexpected:
