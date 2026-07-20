@@ -44,17 +44,15 @@ class DatasetConfig(chanfig.Config):
     r"""One split's raw-structure source plus per-call Processor arguments.
 
     ``source`` names the raw structures (a directory, glob, or manifest file of
-    mmCIF/PDB paths). ``format`` optionally forces a reader. Any extra keys become
-    keyword arguments to the family Processor's ``__call__`` (e.g. ``msa=``,
-    ``templates=``) so the same lowering path inference uses drives training.
+    mmCIF/PDB paths). Any extra keys become keyword arguments to the family
+    Processor's ``__call__`` (e.g. ``msa=``, ``templates=``) so the same lowering
+    path inference uses drives training.
     """
 
     source: str | None = None
-    format: str | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.source = None
-        self.format = None
         super().__init__(*args, **kwargs)
 
 

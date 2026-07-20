@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from os import PathLike
 from typing import Any, Literal, TypeAlias
 
+import chanfig
 import torch
 
 from ..data.conditions import AllowedResidueIdentities, TiedResidueIdentities
@@ -18,12 +19,11 @@ from ..hub import (
     _load_registered_model,
     _load_registered_processor,
     _model_config,
-    _read_json,
     _resolve_hub_repository,
     _resolve_repository,
 )
 from ..pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
-from ..pipelines.registry import _pipeline_class
+from ..pipelines.registry import PIPELINES
 
 FoldInput: TypeAlias = str | PathLike[str] | PolymerSequence | MolecularSystem | Structure
 DesignInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str]
@@ -57,7 +57,7 @@ def pipeline(
     marker = metadata_repository.path / "pipeline.json"
     has_marker = marker.exists()
     if has_marker:
-        marker_values = _read_json(marker)
+        marker_values = chanfig.NestedDict.load(marker)
         if not isinstance(marker_values, dict):
             raise TypeError("pipeline.json must contain a JSON object")
         if set(marker_values) != {"pipeline"}:
@@ -65,7 +65,7 @@ def pipeline(
         pipeline_id = marker_values["pipeline"]
         if not isinstance(pipeline_id, str):
             raise TypeError("pipeline.json pipeline must be a string")
-        selected_pipeline_class = _pipeline_class(pipeline_id)
+        selected_pipeline_class = PIPELINES.lookup(pipeline_id)
         if not callable(getattr(selected_pipeline_class, task, None)):
             raise ValueError(f"pipeline {pipeline_id!r} does not support {task}")
         if getattr(selected_pipeline_class, "_PAIR_LAYOUT", None) is not None:

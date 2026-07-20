@@ -15,10 +15,10 @@ import torch
 from torch import Tensor, nn
 
 from ...models.proteinmpnn.model import smoothed_loss
-from ..registry import register_objective
+from ..registry import OBJECTIVES
 
 
-@register_objective("mpnn")
+@OBJECTIVES.register("mpnn")
 class MpnnObjective:
     r"""Label-smoothed cross-entropy of the recovered sequence, masked-meaned.
 

@@ -14,7 +14,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from ..registry import register_objective
+from ..registry import OBJECTIVES
 
 
 def edm_weight(sigma: Tensor, sigma_data: float) -> Tensor:
@@ -40,7 +40,7 @@ def edm_weight(sigma: Tensor, sigma_data: float) -> Tensor:
     return (sigma**2 + sigma_data**2) / ((sigma * sigma_data) ** 2 + 1e-8)
 
 
-@register_objective("diffusion")
+@OBJECTIVES.register("diffusion")
 class DiffusionObjective:
     r"""EDM-weighted mean-squared denoising error over valid atoms.
 

@@ -30,7 +30,7 @@ Boltz-1 pattern). Bit-exact OpenFold parity signoff is tracked separately in
 
 from __future__ import annotations
 
-from ..registry import register_model as _register_model
+from ..registry import MODELS
 from .config import (
     AlphaFold2Config,
     AlphaFold2EvoformerConfig,
@@ -61,13 +61,13 @@ from .model import (
 )
 from .processor import AlphaFold2MultimerProcessor, AlphaFold2Processor
 
-_register_model(
+MODELS.register(
     "ofoldx.alphafold2",
     model=AlphaFold2Model,
     processor=AlphaFold2Processor,
     standard_tasks=("fold",),
 )
-_register_model(
+MODELS.register(
     "ofoldx.alphafold2_multimer",
     model=AlphaFold2MultimerModel,
     processor=AlphaFold2MultimerProcessor,

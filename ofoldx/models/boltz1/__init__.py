@@ -2,7 +2,7 @@ r"""Boltz-1 structure-prediction model, its canonical Processor, and its registr
 
 from __future__ import annotations
 
-from ..registry import register_model as _register_model
+from ..registry import MODELS
 from .config import (
     Boltz1ConfidenceConfig,
     Boltz1Config,
@@ -26,7 +26,7 @@ from .processor import Boltz1Processor
 # One registration story: the family resolves through the generic standard fold Pipeline for the common
 # ``fold`` case. The concrete ``Boltz1Pipeline`` (family-owned pocket + Boltz-1x steering) is exported here
 # but is not registered under this ID until the concrete-Pipeline registry route freezes (DESIGN Section 7.2).
-_register_model(
+MODELS.register(
     "ofoldx.boltz1",
     model=Boltz1Model,
     processor=Boltz1Processor,

@@ -17,18 +17,18 @@ ordinary pair format and carry no marker of their own (§7.3).
 
 from __future__ import annotations
 
-import json
 import shutil
 from os import PathLike
 from pathlib import Path
 from typing import NamedTuple
 
+import chanfig
 import torch
 from torch import nn
 
 from ..artifacts import save_model
 from ..hub import _ResolvedRepository, _load_model, _load_processor, _resolve_repository
-from .registry import _PIPELINE_IDS
+from .registry import PIPELINES
 
 
 class _CompositePair(NamedTuple):
@@ -101,7 +101,7 @@ class _CompositePipeline:
         uploader the single-pair writer uses.
         """
 
-        pipeline_id = _PIPELINE_IDS.get(type(self))
+        pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is None:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
 
@@ -136,8 +136,7 @@ class _CompositePipeline:
                 max_shard_size=max_shard_size,
             )
 
-        marker = json.dumps({"pipeline": pipeline_id}, indent=2, sort_keys=True) + "\n"
-        (destination / "pipeline.json").write_text(marker, encoding="utf-8")
+        chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
 
         if repo_id is not None:
             from ..hub import _upload_repository

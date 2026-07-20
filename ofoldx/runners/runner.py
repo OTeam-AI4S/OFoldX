@@ -5,7 +5,7 @@ Construction is config-only (DESIGN §10.3): the Runner takes a
 datasets, objective, and collate from it, then hands optimizer / scheduler /
 dataloader / checkpoint building to danling. Family Models stay
 inference-and-forward-only; the training loss is produced by the resolved
-:class:`~ofoldx.runners.objectives.base.Objective`, never by the Model.
+objective (see :mod:`ofoldx.runners.objectives`), never by the Model.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ import torch
 from danling.runners.utils import RunnerMode
 from torch import Tensor, nn
 
+from .collate import collate
 from .config import RunnerConfig
-from .registry import RUNNERS, build_collate, build_objective
+from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
 
 
 @RUNNERS.register("ofoldx", default=True)
@@ -33,11 +34,19 @@ class Runner(dl.Runner):
         if not isinstance(config, RunnerConfig):
             config = RunnerConfig(config)
         super().__init__(config)
-        self._architecture: str = ""
-        self._processor: Any = None
+        self._architecture = ""
         self.model = self.build_model()
-        self.objective = build_objective(self._architecture, self.config)
-        self.collate_fn = build_collate(self._architecture, self.config)
+        from .objectives import diffusion, mpnn  # noqa: F401 — register the built-in objectives
+
+        name = self.config.objective or ARCHITECTURE_OBJECTIVES.get(self._architecture)
+        if name is None:
+            raise ValueError(
+                f"no training objective is defined for architecture {self._architecture!r}; "
+                f"set `objective` explicitly or use an architecture with a registered objective "
+                f"({', '.join(sorted(set(ARCHITECTURE_OBJECTIVES.values())))})"
+            )
+        self.objective = OBJECTIVES.build(type=name)
+        self.collate_fn = collate
         self.datasets.update(self.build_datasets())
 
     # -- construction --------------------------------------------------------
@@ -50,10 +59,10 @@ class Runner(dl.Runner):
         plus the remaining ``config.model`` keys (typed-config overrides).
         """
 
-        from ..models.registry import _registration
+        from ..models.registry import MODELS
 
         model_config = self.config.model
-        registration = _registration(model_config.name)
+        registration = MODELS.lookup(model_config.name)
         self._architecture = registration.id
         if model_config.pretrained:
             from ..auto import AutoModel
@@ -63,36 +72,23 @@ class Runner(dl.Runner):
         typed_config = registration.model_config(**overrides) if overrides else registration.model_config()
         return registration.model(typed_config)
 
-    def build_processor(self) -> Any:
-        r"""Build the family Processor that lowers raw structures into Model inputs."""
-
-        if self._processor is None:
-            from ..models.registry import _registration
-
-            model_config = self.config.model
-            if model_config.pretrained:
-                from ..auto import AutoProcessor
-
-                self._processor = AutoProcessor(model_config.pretrained)
-            else:
-                self._processor = _registration(model_config.name).processor()
-        return self._processor
-
     def build_datasets(self) -> dict[str, Any]:
         r"""Build one :class:`~ofoldx.runners.dataset.StructureDataset` per configured split."""
 
+        from ..models.registry import MODELS
         from .dataset import StructureDataset
 
-        processor = self.build_processor()
+        model_config = self.config.model
+        if model_config.pretrained:
+            from ..auto import AutoProcessor
+
+            processor = AutoProcessor(model_config.pretrained)
+        else:
+            processor = MODELS.lookup(model_config.name).processor()
         datasets: dict[str, Any] = {}
         for split, spec in self.config.data.items():
-            processor_kwargs = {key: value for key, value in spec.items() if key not in ("source", "format")}
-            datasets[split] = StructureDataset(
-                spec.source,
-                processor,
-                format=spec.format,
-                processor_kwargs=processor_kwargs,
-            )
+            processor_kwargs = {key: value for key, value in spec.items() if key != "source"}
+            datasets[split] = StructureDataset(spec.source, processor, processor_kwargs=processor_kwargs)
         return datasets
 
     # -- batch movement ------------------------------------------------------

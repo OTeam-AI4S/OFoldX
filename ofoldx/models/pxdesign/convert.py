@@ -9,6 +9,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, TypeAlias
 
+import chanfig
 import torch
 from torch import Tensor, nn
 
@@ -83,31 +84,34 @@ def save_pxdesign_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert a PxDesign checkpoint and write a standard OFoldX repository.
+    r"""Convert a PxDesign checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
-    it with the family :class:`PxDesignProcessor`, and writes a self-contained ``model.json`` /
-    ``processor.json`` / safetensors repository via
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The root pair keeps
-    ``standard_tasks=()`` (§6.1, mirroring rfdiffusion): it persists and round-trips, but is a terminal
-    de-novo designer that is not wrapped by the generic standard ``design`` route.
+    it with the family :class:`PxDesignProcessor`, and writes ``model.json`` / ``processor.json`` /
+    safetensors via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair
+    keeps ``standard_tasks=()`` (§6.1, mirroring rfdiffusion), so a
+    ``pipeline.json = {"pipeline": "ofoldx.pxdesign"}`` marker is written to route
+    ``pipeline("design", model=dir)`` to :class:`PxDesignPipeline` — which returns the family-owned
+    coordinate-producing ``PxDesignResult`` — rather than the generic standard ``design`` route.
 
-    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
-    organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
+    included. No organization or token is assumed and nothing is published without an explicit
+    ``repo_id``.
     """
 
+    from ...pipelines.registry import PIPELINES
+    from .pipeline import PxDesignPipeline
     from .processor import PxDesignProcessor
 
     model = convert_pxdesign_checkpoint(checkpoint_path, map_location=map_location, dtype=dtype)
-    save_model(
-        output_dir,
-        model=model,
-        processor=PxDesignProcessor(),
-        repo_id=repo_id,
-        token=token,
-        private=private,
-    )
+    destination = Path(output_dir).expanduser()
+    save_model(destination, model=model, processor=PxDesignProcessor())
+    chanfig.NestedDict({"pipeline": PIPELINES.id_for(PxDesignPipeline)}).dump(destination / "pipeline.json")
+    if repo_id is not None:
+        from ...hub import _upload_repository
+
+        _upload_repository(destination, repo_id, token=token, private=private)
 
 
 def main(argv: list[str] | None = None) -> None:

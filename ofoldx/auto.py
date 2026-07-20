@@ -14,7 +14,7 @@ from .hub import (
     _load_processor,
     _resolve_repository,
 )
-from .models.registry import _registration_for_model_config
+from .models.registry import MODELS
 
 
 class AutoModel:
@@ -31,7 +31,7 @@ class AutoModel:
         if not isinstance(pretrained_or_config, str | PathLike):
             if revision is not None:
                 raise ValueError("revision is valid only when AutoModel loads a model repository")
-            registration = _registration_for_model_config(pretrained_or_config)
+            registration = MODELS.for_config(pretrained_or_config)
             model = registration.model(pretrained_or_config)
             if device is not None or dtype is not None:
                 model.to(device=device, dtype=dtype)

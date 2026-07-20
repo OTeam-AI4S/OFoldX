@@ -3,11 +3,11 @@ r"""Convert official RFdiffusion checkpoints to native OFoldX Models."""
 from __future__ import annotations
 
 import argparse
-import json
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
 
+import chanfig
 import torch
 from torch import Tensor
 
@@ -168,15 +168,14 @@ def save_rfdiffusion_checkpoint(
     ``repo_id``.
     """
 
-    from ...pipelines.registry import _PIPELINE_IDS
+    from ...pipelines.registry import PIPELINES
     from .pipeline import RFdiffusionPipeline
     from .processor import RFdiffusionProcessor
 
     model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype)
     destination = Path(output_dir).expanduser()
     save_model(destination, model=model, processor=RFdiffusionProcessor())
-    marker = json.dumps({"pipeline": _PIPELINE_IDS[RFdiffusionPipeline]}, indent=2, sort_keys=True) + "\n"
-    (destination / "pipeline.json").write_text(marker, encoding="utf-8")
+    chanfig.NestedDict({"pipeline": PIPELINES.id_for(RFdiffusionPipeline)}).dump(destination / "pipeline.json")
     if repo_id is not None:
         from ...hub import _upload_repository
 

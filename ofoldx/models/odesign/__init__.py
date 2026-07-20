@@ -2,8 +2,8 @@ r"""OFoldX implementation of the released ODesign core architecture."""
 
 from __future__ import annotations
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import (
     ODesignConfig,
     ODesignConstraintConfig,
@@ -51,13 +51,13 @@ from .processor import ODesignProcessor
 # (§4.11.1) — ``ofoldx/odesign-base-prot-flex`` and ``ofoldx/odesign-base-prot-rigid``, whose
 # ``model.json`` both name ``ofoldx.odesign`` and whose ``processor.json`` differ only in
 # ``receptor_mode`` — NOT two registered arch pairs.
-_register_model(
+MODELS.register(
     "ofoldx.odesign",
     model=ODesignModel,
     processor=ODesignProcessor,
     standard_tasks=(),
 )
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.odesign",
     pipeline=ODesignPipeline,
 )

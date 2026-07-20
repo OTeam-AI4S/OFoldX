@@ -2,8 +2,8 @@ r"""BoltzGen structure-design and inverse-folding family, its Processors, Pipeli
 
 from __future__ import annotations
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import (
     BoltzGenConfig,
     BoltzGenDiffusionConfig,
@@ -55,19 +55,19 @@ from .projection import DesignMaskResidue, from_design_mask, to_design_mask
 # ``fold/`` / ``affinity/`` stages are optional sub-pairs (declared in its ``_PAIR_LAYOUT``). It is
 # registered below, so a marked repository's ``design`` routes through the factory's multi-pair
 # loader (``from_repository``) instead of the one-pair ``(model, processor)`` call.
-_register_model(
+MODELS.register(
     "ofoldx.boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
     standard_tasks=(),
 )
-_register_model(
+MODELS.register(
     "ofoldx.boltzgen_ifold",
     model=BoltzGenIFoldModel,
     processor=BoltzGenIFoldProcessor,
     standard_tasks=(),
 )
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.boltzgen",
     pipeline=BoltzGenPipeline,
 )

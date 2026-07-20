@@ -2,8 +2,8 @@ r"""OFoldX-native implementation of the released RFdiffusion architecture."""
 
 from __future__ import annotations
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import RFdiffusionConfig, RFdiffusionProcessorConfig
 from .model import (
     ComputeAllAtomCoords,
@@ -16,7 +16,7 @@ from .model import (
 from .pipeline import RFdiffusionPipeline
 from .processor import RFdiffusionProcessor
 
-_register_model(
+MODELS.register(
     "ofoldx.rfdiffusion",
     model=RFdiffusionModel,
     processor=RFdiffusionProcessor,
@@ -30,7 +30,7 @@ _register_model(
 # checkpoint shipping `pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}` routes `design` to it and
 # receives the family-owned Result (see `api/tasks.py`). Publication is wired now (Principle 13): the
 # validated combined-length + hotspot `design` verb has a working Pipeline + Result carrier.
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.rfdiffusion",
     pipeline=RFdiffusionPipeline,
 )

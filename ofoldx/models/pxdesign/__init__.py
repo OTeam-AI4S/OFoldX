@@ -2,8 +2,8 @@ r"""Public tensor-level API of the PxDesign family."""
 
 from __future__ import annotations
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import (
     PxDesignConditionEmbedderConfig,
     PxDesignConfig,
@@ -35,13 +35,13 @@ from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 # ranking) is intentionally ABSENT from this surface (Principle 13: reexport IS publication): it
 # is dependency-gated on the AF2-IG fold entry point and the un-vendored `pxdbench` submodule, so
 # it stays unpublished until those land rather than shipping a placeholder that only raises.
-_register_model(
+MODELS.register(
     "ofoldx.pxdesign",
     model=PxDesignModel,
     processor=PxDesignProcessor,
     standard_tasks=(),
 )
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.pxdesign",
     pipeline=PxDesignPipeline,
 )

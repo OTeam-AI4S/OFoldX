@@ -9,6 +9,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any
 
+import chanfig
 import torch
 from multimolecule import EsmCModel
 from safetensors.torch import load_file
@@ -411,7 +412,7 @@ def save_experimental_esmfold2_checkpoint(
     included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.
     """
 
-    from ...pipelines.registry import _PIPELINE_IDS
+    from ...pipelines.registry import PIPELINES
     from .pipeline import ESMFold2Pipeline
 
     model = load_experimental_esmfold2(
@@ -429,8 +430,7 @@ def save_experimental_esmfold2_checkpoint(
         model=model,
         processor=ESMFold2ExperimentalProcessor(model.config),
     )
-    marker = json.dumps({"pipeline": _PIPELINE_IDS[ESMFold2Pipeline]}, indent=2, sort_keys=True) + "\n"
-    (destination / "pipeline.json").write_text(marker, encoding="utf-8")
+    chanfig.NestedDict({"pipeline": PIPELINES.id_for(ESMFold2Pipeline)}).dump(destination / "pipeline.json")
     if repo_id is not None:
         from ...hub import _upload_repository
 

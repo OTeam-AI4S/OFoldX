@@ -1,13 +1,7 @@
 r"""Training objectives — the loss reducers, keyed by objective name.
 
-The built-in objectives (and any family-specific collate) register themselves
-into the registries in :mod:`ofoldx.runners.registry` when their module is
-imported; :func:`~ofoldx.runners.registry.build_objective` /
-:func:`~ofoldx.runners.registry.build_collate` import them on demand, so this
-package stays light enough for ``registry`` to import :class:`Objective` without
-a cycle.
+An objective is a callable ``(model, batch) -> (output, loss)`` registered into
+:data:`ofoldx.runners.registry.OBJECTIVES` when its module is imported. The Model's
+forward returns predictions or unreduced loss primitives; the objective reduces one
+batch to a scalar (the loss lives here, never in the Model).
 """
-
-from .base import Objective
-
-__all__ = ["Objective"]

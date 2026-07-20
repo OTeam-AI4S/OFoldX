@@ -8,7 +8,7 @@ from pathlib import Path
 
 from torch import nn
 
-from .models.registry import _registration_for_pair
+from .models.registry import MODELS
 
 
 def save_model(
@@ -33,7 +33,7 @@ def save_model(
 
     from huggingface_hub import save_torch_state_dict
 
-    registration = _registration_for_pair(model, processor)
+    registration = MODELS.for_pair(model, processor)
     model_values = dict(model.config)  # type: ignore[attr-defined]
     if "architecture" in model_values:
         raise ValueError("Model config must not contain architecture")

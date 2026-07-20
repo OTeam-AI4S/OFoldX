@@ -2,8 +2,8 @@ r"""Boltz-2 folding and two-stage affinity family, its Processors, Pipeline, and
 
 from __future__ import annotations
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .chemistry import standardize_boltz2_affinity_smiles
 from .config import (
     Boltz2AffinityConfig,
@@ -29,19 +29,19 @@ from .processor import Boltz2AffinityProcessor, Boltz2Processor
 # ``_PAIR_LAYOUT``, and carries the shared ``save`` / ``from_repository`` (``ofoldx/pipelines/_composite.py``).
 # It is registered below, so a marked repository's ``score`` routes through the factory's multi-pair loader
 # (``api/tasks.py`` dispatches to ``from_repository``) instead of the one-pair ``(model, processor)`` call.
-_register_model(
+MODELS.register(
     "ofoldx.boltz2",
     model=Boltz2Model,
     processor=Boltz2Processor,
     standard_tasks=("fold",),
 )
-_register_model(
+MODELS.register(
     "ofoldx.boltz2_affinity",
     model=Boltz2AffinityModel,
     processor=Boltz2AffinityProcessor,
     standard_tasks=(),
 )
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.boltz2_affinity",
     pipeline=Boltz2AffinityPipeline,
 )

@@ -29,6 +29,7 @@ from ...data.placement import (
     validate_placement,
 )
 from ...data.structure import Structure
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.transfer import (
@@ -276,6 +277,7 @@ class BoltzGenModel(nn.Module):
             elif isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,
@@ -628,6 +630,7 @@ class BoltzGenIFoldModel(nn.Module):
             elif isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,

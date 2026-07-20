@@ -2,4 +2,4 @@ r"""Public model-registration namespace."""
 
 from __future__ import annotations
 
-from .registry import register_model
+from .registry import MODELS

@@ -4,8 +4,7 @@ Each dataset item is a family Input dataclass whose tensor fields carry a leadin
 singleton batch axis (as the Processors emit). The generic :func:`collate`
 concatenates matching fields along that axis, padding variable-length axes so a
 heterogeneous batch (different sequence / atom counts) becomes one rectangular
-Input. Families whose Input needs bespoke padding register an override with
-:func:`ofoldx.runners.registry.register_collate`.
+Input.
 """
 
 from __future__ import annotations

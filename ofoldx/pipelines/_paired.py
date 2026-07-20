@@ -2,16 +2,16 @@ r"""Shared implementation for direct Model–Processor pair Pipelines."""
 
 from __future__ import annotations
 
-import json
 from os import PathLike
 from pathlib import Path
 
+import chanfig
 import torch
 from torch import nn
 from typing_extensions import Self
 
 from ..artifacts import save_model
-from .registry import _PIPELINE_IDS
+from .registry import PIPELINES
 
 
 class _PairedPipeline:
@@ -54,10 +54,9 @@ class _PairedPipeline:
             processor=self.processor,
             max_shard_size=max_shard_size,
         )
-        pipeline_id = _PIPELINE_IDS.get(type(self))
+        pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is not None:
-            marker = json.dumps({"pipeline": pipeline_id}, indent=2, sort_keys=True) + "\n"
-            (Path(directory).expanduser() / "pipeline.json").write_text(marker, encoding="utf-8")
+            chanfig.NestedDict({"pipeline": pipeline_id}).dump(Path(directory).expanduser() / "pipeline.json")
         if repo_id is not None:
             from ..hub import _upload_repository
 

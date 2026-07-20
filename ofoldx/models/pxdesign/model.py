@@ -14,6 +14,7 @@ from typing_extensions import Self
 from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import AtomToTokenEncoder, TokenPairToLocalAtomPairBroadcast, TokenToAtomBroadcast
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.denoiser import CoordinateDenoiser
@@ -78,6 +79,7 @@ class PxDesignModel(nn.Module):
             if isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     GatedMultiheadAttention,
                     TokenPairToLocalAtomPairBroadcast,
                     TokenToAtomBroadcast,

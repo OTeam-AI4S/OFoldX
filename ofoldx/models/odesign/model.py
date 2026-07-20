@@ -35,6 +35,7 @@ from ...data.placement import (
 from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
     LocalAtomGeometry,
@@ -159,6 +160,7 @@ class ODesignModel(nn.Module):
             if isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     GatedMultiheadAttention,
                     MsaPairWeightedAveraging,
                     OuterProductMean,
@@ -843,7 +845,7 @@ class ODesignDesignResult:
 # over the promoted :data:`~ofoldx.data.bonds.SymbolicBondSite` endpoint union) and the
 # target-conditioning core (the distance-free :class:`~ofoldx.data.conditions.Hotspot` label
 # and the strictly-larger geometric :class:`~ofoldx.data.conditions.Contact`) are frozen and
-# shared. This family imports them rather than re-declaring the placeholders it used to own
+# shared. This family imports them rather than redeclaring the placeholders it used to own
 # (the deleted ``DesiredCovalentLink(site_a, site_b)`` two-atom record and the two-sided
 # ``Contact`` that conflated the learned hotspot label with the §B verification cutoff).
 #

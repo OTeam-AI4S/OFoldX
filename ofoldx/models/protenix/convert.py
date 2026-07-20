@@ -11,6 +11,7 @@ from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+import chanfig
 import torch
 from torch import Tensor, nn
 
@@ -600,7 +601,7 @@ def save_protenix_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert a Protenix checkpoint and write a standard OFoldX repository.
+    r"""Convert a Protenix checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
@@ -609,26 +610,37 @@ def save_protenix_checkpoint(
     Processor, and writes a self-contained ``model.json`` / ``processor.json`` / safetensors repository
     via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
 
-    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
-    organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    The default pair routes through the generic standard ``fold`` route (no marker). The constraint
+    pair additionally writes a ``pipeline.json = {"pipeline": "ofoldx.protenix_constraint"}`` marker so
+    ``pipeline("fold", model=dir)`` routes to :class:`ProtenixConstraintPipeline`, whose ``fold``
+    accepts and forwards the released ``atom_contacts`` / ``token_contacts`` / ``pocket`` channels that
+    the generic ``FoldPipeline`` cannot.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
+    included. No organization or token is assumed and nothing is published without an explicit
+    ``repo_id``.
     """
 
     from .model import ProtenixConstraintModel
     from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
     model = convert_protenix_checkpoint(checkpoint_path, dtype=dtype)
+    destination = Path(output_dir).expanduser()
     if isinstance(model, ProtenixConstraintModel):
         processor: object = ProtenixConstraintProcessor()
     else:
         processor = ProtenixProcessor()
-    save_model(
-        output_dir,
-        model=model,
-        processor=processor,
-        repo_id=repo_id,
-        token=token,
-        private=private,
-    )
+    save_model(destination, model=model, processor=processor)
+    if isinstance(model, ProtenixConstraintModel):
+        from ...pipelines.registry import PIPELINES
+        from .pipeline import ProtenixConstraintPipeline
+
+        pipeline_id = PIPELINES.id_for(ProtenixConstraintPipeline)
+        chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
+    if repo_id is not None:
+        from ...hub import _upload_repository
+
+        _upload_repository(destination, repo_id, token=token, private=private)
 
 
 def main(argv: list[str] | None = None) -> None:

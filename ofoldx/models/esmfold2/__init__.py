@@ -1,7 +1,7 @@
 r"""ESMFold2 architecture, processor, tensor contracts, and scientific modules."""
 
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import (
     ESMFold2AtomAttentionConfig,
     ESMFold2ConfidenceHeadConfig,
@@ -46,7 +46,7 @@ from .processor import (
     is_antibody_sequence,
 )
 
-_register_model(
+MODELS.register(
     "ofoldx.esmfold2",
     model=ESMFold2Model,
     processor=ESMFold2Processor,
@@ -59,7 +59,7 @@ _register_model(
 # `ofoldx.alphafold2` / `ofoldx.alphafold2_multimer` and `ofoldx.protenix` /
 # `ofoldx.protenix_constraint`. It carries no standard task: its published surface is the
 # family-owned binder-design verb `ESMFold2Pipeline.design`, not a shared standard task.
-_register_model(
+MODELS.register(
     "ofoldx.esmfold2_experimental",
     model=ESMFold2ExperimentalModel,
     processor=ESMFold2ExperimentalProcessor,
@@ -74,7 +74,7 @@ _register_model(
 # here (a single class-owned pair, so the factory takes the one-pair (model, processor) call — no
 # ``_PAIR_LAYOUT``). The released fold repos stay marker-less and route through the generic standard
 # ``fold`` Pipeline (``standard_tasks={"fold"}``) exactly as before.
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.esmfold2",
     pipeline=ESMFold2Pipeline,
 )

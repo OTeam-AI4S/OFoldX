@@ -27,6 +27,7 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
     LocalAtomGeometry,
@@ -216,6 +217,7 @@ class AlphaFold3Model(nn.Module):
             if isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     GatedMultiheadAttention,
                     MsaPairWeightedAveraging,
                     OuterProductMean,

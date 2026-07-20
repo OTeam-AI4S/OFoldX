@@ -6,19 +6,18 @@ repository schema, architecture dispatch, Model/Processor pairing, and construct
 
 from __future__ import annotations
 
-import json
-import math
 from collections.abc import Sequence
 from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 
+import chanfig
 import torch
 from torch import nn
 
 from .models.registry import (
-    _ModelRegistration,
-    _registration,
+    MODELS,
+    ModelRegistration,
 )
 from .references import classify_reference
 
@@ -191,18 +190,18 @@ def _hydrate_weights(repository: _ResolvedRepository) -> _ResolvedRepository:
     return hydrated
 
 
-def _model_values(path: Path) -> tuple[_ModelRegistration, dict[str, object]]:
-    values = _read_json(path / "model.json")
+def _model_values(path: Path) -> tuple[ModelRegistration, dict[str, object]]:
+    values = chanfig.NestedDict.load(path / "model.json")
     if not isinstance(values, dict):
         raise TypeError("model.json must contain a JSON object")
     architecture = values.pop("architecture", None)
     if not isinstance(architecture, str):
         raise TypeError("model.json architecture must be a string")
-    registered = _registration(architecture)
+    registered = MODELS.lookup(architecture)
     return registered, values
 
 
-def _model_config(path: Path) -> tuple[_ModelRegistration, object]:
+def _model_config(path: Path) -> tuple[ModelRegistration, object]:
     registered, values = _model_values(path)
     return registered, registered.model_config(values)
 
@@ -225,7 +224,7 @@ def _load_model(
 
 def _load_registered_model(
     repository: _ResolvedRepository,
-    registration: _ModelRegistration,
+    registration: ModelRegistration,
     config: object,
     *,
     device: torch.device | str | None = None,
@@ -261,9 +260,38 @@ def _load_registered_model(
     model.load_state_dict(state_dict, strict=True, assign=True)
     del state_dict
     if device is not None or dtype is not None:
+        meta_parameters = [name for name, parameter in model.named_parameters() if parameter.is_meta]
+        if meta_parameters:
+            raise RuntimeError(f"parameters remain on the meta device after loading: {', '.join(meta_parameters)}")
+        _materialize_meta_buffers(model, device)
         model.to(device=device, dtype=dtype)
     model.eval()
     return model
+
+
+def _materialize_meta_buffers(model: nn.Module, device: torch.device | str | None) -> None:
+    r"""Move buffers still on the meta device onto a real device before a ``.to`` conversion.
+
+    ``load_state_dict(assign=True)`` swaps in the state_dict tensors but leaves any buffer that
+    is absent from the state_dict on the meta device -- notably non-persistent buffers such as
+    rotary ``inv_freq``. ``.to`` cannot copy a tensor off the meta device, so replace each
+    meta-resident buffer with an empty placeholder on the target device first; these buffers are
+    recomputed and re-registered at forward time, so their placeholder values are irrelevant.
+    Reassigning ``_buffers`` in place preserves each buffer's persistent flag (dtype conversion
+    is deferred to the caller's ``.to``).
+    """
+
+    if device is not None:
+        buffer_device = torch.device(device)
+    else:
+        buffer_device = next(
+            (parameter.device for parameter in model.parameters() if not parameter.is_meta),
+            torch.device("cpu"),
+        )
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None and buffer.is_meta:
+                module._buffers[name] = torch.empty_like(buffer, device=buffer_device)
 
 
 def _load_processor(
@@ -283,7 +311,7 @@ def _load_processor(
 
 def _load_registered_processor(
     repository: _ResolvedRepository,
-    registration: _ModelRegistration,
+    registration: ModelRegistration,
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
@@ -295,7 +323,7 @@ def _load_registered_processor(
             raise ValueError("processor.json must be absent for a config-less Processor")
         return registration.processor(device=device, dtype=dtype)
 
-    values = _read_json(config_path)
+    values = chanfig.NestedDict.load(config_path)
     if not isinstance(values, dict):
         raise TypeError("processor.json must contain a JSON object")
     if "architecture" in values:
@@ -303,36 +331,10 @@ def _load_registered_processor(
     return registration.processor(config_class(values), device=device, dtype=dtype)
 
 
-def _read_json(path: Path) -> object:
-    def parse_float(value: str) -> float:
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError(f"{path.name} contains out-of-range JSON number {value}")
-        return number
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"{path.name} contains non-finite JSON value {value}")
-
-    def object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        values: dict[str, object] = {}
-        for key, value in pairs:
-            if key in values:
-                raise ValueError(f"{path.name} contains duplicate JSON key {key!r}")
-            values[key] = value
-        return values
-
-    return json.loads(
-        path.read_text(encoding="utf-8"),
-        parse_constant=reject_constant,
-        parse_float=parse_float,
-        object_pairs_hook=object_from_pairs,
-    )
-
-
 def _weight_map(path: Path) -> dict[str, str]:
     r"""Read indexed weight ownership and reject paths outside the repository."""
 
-    index = _read_json(path)
+    index = chanfig.FlatDict.load(path)
     if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
         raise TypeError("model.safetensors.index.json weight_map must be a JSON object")
 

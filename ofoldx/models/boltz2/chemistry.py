@@ -47,6 +47,5 @@ def standardize_boltz2_affinity_smiles(
 
     return Molecule.from_smiles(
         standardized_smiles,
-        entity_id=entity_id,
         atom_ids=tuple(atom_ids),
     )

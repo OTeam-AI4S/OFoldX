@@ -25,6 +25,7 @@ from typing_extensions import Self
 
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.structure import Structure
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.transfer import TokenPairToLocalAtomPairBroadcast, TokenToAtomBroadcast, dense_mean_to_tokens
@@ -251,6 +252,7 @@ class Boltz1Model(nn.Module):
             elif isinstance(
                 module,
                 (
+                    AdaptiveLayerNorm,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,

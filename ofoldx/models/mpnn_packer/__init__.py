@@ -3,21 +3,21 @@ r"""OFoldX implementation of the released MpnnPacker."""
 from __future__ import annotations
 
 from ...io import read_pdb
-from ...pipelines.registry import register_pipeline as _register_pipeline
-from ..registry import register_model as _register_model
+from ...pipelines.registry import PIPELINES
+from ..registry import MODELS
 from .config import MpnnPackerConfig, MpnnPackerProcessorConfig
 from .model import MpnnPackerFeatures, MpnnPackerInput, MpnnPackerModel, MpnnPackerOutput, MpnnPackerSamplingOutput
 from .pdb import write_pdb
 from .pipeline import MpnnPackerPipeline
 from .processor import MpnnPackerProcessor
 
-_register_model(
+MODELS.register(
     "ofoldx.mpnn_packer",
     model=MpnnPackerModel,
     processor=MpnnPackerProcessor,
     standard_tasks=(),
 )
-_register_pipeline(
+PIPELINES.register(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
 )
