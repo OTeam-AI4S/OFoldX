@@ -516,7 +516,7 @@ class BoltzGenModel(nn.Module):
         )
         relative_position_encoding = self.relative_position_embedder(relative_features)
         pair_init = pair_init + relative_position_encoding
-        pair_init = pair_init + self.token_bond_projection(batch.token_bonds.unsqueeze(-1).to(pair_init.dtype))
+        pair_init = pair_init + self.token_bond_projection(batch.token_bonds.to(pair_init.dtype))
         pair_init = pair_init + self.token_bond_type_embedding(batch.type_bonds.long())
         pair_init = pair_init + self.contact_conditioning(
             batch.contact_conditioning.to(pair_init.dtype), batch.contact_threshold.to(pair_init.dtype)
@@ -3766,7 +3766,7 @@ class BoltzGenInput:
         residue_type: Query residue type one-hot features.
         msa_profile: Single-sequence MSA profile features.
         deletion_mean: Per-token deletion mean features.
-        token_bonds: Token-level covalent adjacency.
+        token_bonds: Token-level covalent adjacency ``(B, N, N, 1)`` (trailing singleton per the released featurizer).
         type_bonds: Token-level bond type ids.
         contact_conditioning: Pairwise contact-conditioning class one-hot features.
         contact_threshold: Pairwise contact threshold values.

@@ -61,6 +61,8 @@ from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Mol
 from ...data.structure import Structure
 from ...io.structure import read_structure
 from .model import (
+    CANONICAL_TOKENS,
+    NUM_CANONICAL_TOKENS,
     BoltzGenBinding,
     BoltzGenContact,
     BoltzGenCovalentBond,
@@ -1314,20 +1316,23 @@ def _aa_constraint_mask(
     token_index_by_residue: dict[tuple[str, int], int],
     token_count: int,
 ) -> Tensor:
-    r"""Realize per-residue AA constraints into the ``[N, 33]`` allowed-residue mask.
+    r"""Realize per-residue AA constraints into the ``[N, 20]`` canonical-AA block mask.
 
-    FLAG: the ``[N, 33]`` restype axis matches ``vocab_size``; the per-code column
-    mapping reuses ``_residue_type`` for protein codes. Non-protein / modified codes are
-    left for node4.
+    Matches the released ``parse_residue_constraints`` contract: a ``[N, 20]`` mask over the 20
+    canonical amino acids (``CANONICAL_TOKENS`` order) where ``0`` is allowed and ``1`` disallowed;
+    the default is all-zero (unconstrained). ``BoltzGenIFoldModel._build_constraint_logit_mask``
+    consumes it as ``> 0`` -> ``-1e6`` additive logit bias. Each ``allowed`` whitelist blocks every
+    canonical AA except the listed codes, accumulated with ``max`` so overlapping constraints
+    intersect (only AAs allowed by every covering constraint survive).
     """
 
-    mask = torch.ones(token_count, 33, dtype=torch.bool)
+    mask = torch.zeros(token_count, NUM_CANONICAL_TOKENS, dtype=torch.float32)
     for constraint in aa_constraints:
         token = _component_reference_to_token(constraint.position, token_index_by_residue)
-        allowed = torch.zeros(33, dtype=torch.bool)
+        block = torch.ones(NUM_CANONICAL_TOKENS, dtype=torch.float32)
         for code in constraint.allowed:
-            allowed[_residue_type(code, "protein")] = True
-        mask[token] = allowed
+            block[CANONICAL_TOKENS.index(code)] = 0.0
+        mask[token] = torch.maximum(mask[token], block)
     return mask
 
 
@@ -1620,7 +1625,12 @@ def _token_bond_indicator(
     site_to_token: dict[AtomSite, int],
     token_count: int,
 ) -> Tensor:
-    r"""Build the symmetric inter-token bond indicator ``[N, N]`` consumed by ``token_bond_projection``."""
+    r"""Build the symmetric inter-token bond indicator ``[N, N, 1]`` consumed by ``token_bond_projection``.
+
+    The trailing singleton mirrors the released featurizer (``bonds = bonds.unsqueeze(-1)``): the design
+    trunk feeds it straight into ``nn.Linear(1, ...)`` and the inverse-fold ``build_knn_graph`` indexes
+    ``token_bonds[..., 0]`` (released ``inverse_fold`` asserts ``shape[-1] == 1``).
+    """
 
     token_bonds = torch.zeros(token_count, token_count)
 
@@ -1642,7 +1652,7 @@ def _token_bond_indicator(
             )
     for bond in system.bonds:
         add(bond.site_a, bond.site_b)
-    return token_bonds
+    return token_bonds.unsqueeze(-1)
 
 
 def _msa_features(
