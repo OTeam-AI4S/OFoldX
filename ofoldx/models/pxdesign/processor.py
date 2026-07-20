@@ -592,7 +592,7 @@ def _hotspots(
     (the whole binder). Each named residue must be a materialized target
     ``ComponentReference`` — a ``(instance_id, component_index)`` tuple present in the selected,
     tokenized target — so a generated-binder endpoint (a bare ``placement_id`` / a
-    :class:`~ofoldx.data.SymbolicResidueSite` / a :class:`~ofoldx.data.SymbolicAtomSite`) is
+    :class:`~ofoldx.data.SymbolicResidueSite` / a :class:`~ofoldx.data.placement.SymbolicAtomSite`) is
     rejected: PXDesign hotspots its target, not its binder. This mirrors the previous
     two-sided ``Contact`` lowering (which required one all-existing target side); the cutoff
     it validated-then-ignored is gone with the record.

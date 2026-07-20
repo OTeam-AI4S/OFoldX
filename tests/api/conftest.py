@@ -1,7 +1,8 @@
 r"""Fixtures for the public task-API surface (registry, pipelines, repository round-trip).
 
-The registrations these tests exercise live in *module-global* dicts
-(``ofoldx.models.registry._MODELS`` and ``ofoldx.pipelines.registry._PIPELINES``). A test that
+The registrations these tests exercise live in the registry objects
+(``ofoldx.models.registry.MODELS`` and ``ofoldx.pipelines.registry.PIPELINES``, both ``dict``
+subclasses). A test that
 registers a synthetic architecture would otherwise leak it into every later test in the process, so
 ``_isolate_registries`` snapshots and restores those dicts around each test -- exactly the pattern the
 suite already uses for the global RNG in ``tests/conftest.py``.
@@ -29,11 +30,11 @@ def _isolate_registries():
     from ofoldx.pipelines import registry as pipeline_registry
 
     tables = (
-        model_registry._MODELS,
-        model_registry._MODELS_BY_CONFIG,
-        model_registry._MODELS_BY_PAIR,
-        pipeline_registry._PIPELINES,
-        pipeline_registry._PIPELINE_IDS,
+        model_registry.MODELS,
+        model_registry.MODELS.by_config,
+        model_registry.MODELS.by_pair,
+        pipeline_registry.PIPELINES,
+        pipeline_registry.PIPELINES.ids,
     )
     snapshots = [dict(table) for table in tables]
     try:

@@ -2,8 +2,6 @@ r"""Persistent configuration for the ODesign architecture and its Processor."""
 
 from __future__ import annotations
 
-from typing import Literal
-
 from chanfig import Config
 
 
@@ -89,4 +87,4 @@ class ODesignProcessorConfig(Config):
     per-atom ``ReferenceCoordinates`` path in ``processor.py``.
     """
 
-    receptor_mode: Literal["rigid", "flex"] = "flex"
+    receptor_mode: str = "flex"  # "rigid" | "flex" (str, not Literal: chanfig validates fields via isinstance)

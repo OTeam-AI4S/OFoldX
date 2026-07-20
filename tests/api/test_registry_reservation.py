@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from ofoldx.models.registry import _registration, register_model
-from ofoldx.pipelines.registry import _pipeline_class, register_pipeline
+from ofoldx.models.registry import MODELS
+from ofoldx.pipelines.registry import PIPELINES
 
 
 def test_model_registry_rejects_non_owner_under_builtin_id(tiny_classes):
@@ -23,13 +23,13 @@ def test_model_registry_rejects_non_owner_under_builtin_id(tiny_classes):
     _, TinyProcessor, TinyModel = tiny_classes()
 
     with pytest.raises(ValueError, match="reserved built-in id"):
-        register_model("ofoldx.alphafold3", model=TinyModel, processor=TinyProcessor)
+        MODELS.register("ofoldx.alphafold3", model=TinyModel, processor=TinyProcessor)
 
 
 def test_model_registry_resolves_official_owner():
     r"""The official owner package resolves its reserved built-in id."""
 
-    registration = _registration("ofoldx.alphafold3")
+    registration = MODELS.lookup("ofoldx.alphafold3")
 
     assert registration.id == "ofoldx.alphafold3"
     assert registration.model.__module__.startswith("ofoldx.models.alphafold3")
@@ -40,9 +40,9 @@ def test_model_registry_accepts_new_third_party_id(tiny_classes):
 
     _, TinyProcessor, TinyModel = tiny_classes()
 
-    register_model("thirdparty.tiny", model=TinyModel, processor=TinyProcessor, standard_tasks={"fold"})
+    MODELS.register("thirdparty.tiny", model=TinyModel, processor=TinyProcessor, standard_tasks={"fold"})
 
-    resolved = _registration("thirdparty.tiny")
+    resolved = MODELS.lookup("thirdparty.tiny")
     assert resolved.model is TinyModel
     assert resolved.processor is TinyProcessor
 
@@ -54,13 +54,13 @@ def test_pipeline_registry_rejects_non_owner_under_builtin_id():
         pass
 
     with pytest.raises(ValueError, match="reserved built-in id"):
-        register_pipeline("ofoldx.proteinmpnn", pipeline=ThirdPartyPipeline)
+        PIPELINES.register("ofoldx.proteinmpnn", pipeline=ThirdPartyPipeline)
 
 
 def test_pipeline_registry_resolves_official_owner():
     r"""The official owner package resolves its reserved built-in pipeline id."""
 
-    pipeline = _pipeline_class("ofoldx.proteinmpnn")
+    pipeline = PIPELINES.lookup("ofoldx.proteinmpnn")
 
     assert pipeline.__module__.startswith("ofoldx.models.proteinmpnn")
 
@@ -71,9 +71,9 @@ def test_pipeline_registry_accepts_new_third_party_id():
     class ThirdPartyPipeline:
         pass
 
-    register_pipeline("thirdparty.tiny", pipeline=ThirdPartyPipeline)
+    PIPELINES.register("thirdparty.tiny", pipeline=ThirdPartyPipeline)
 
-    assert _pipeline_class("thirdparty.tiny") is ThirdPartyPipeline
+    assert PIPELINES.lookup("thirdparty.tiny") is ThirdPartyPipeline
 
 
 @pytest.mark.parametrize(
@@ -87,7 +87,7 @@ def test_pipeline_registry_accepts_new_third_party_id():
 def test_multipair_pipeline_id_routes_to_owner(pipeline_id, owner_module):
     r"""Each DESIGN §7.4 multi-pair id resolves to its owner concrete Pipeline and declares a layout."""
 
-    resolved = _pipeline_class(pipeline_id)
+    resolved = PIPELINES.lookup(pipeline_id)
 
     assert resolved.__module__.startswith(owner_module)
     # The class-level pair-layout is the signal the factory uses to route to from_repository.
@@ -106,4 +106,4 @@ def test_multipair_pipeline_id_rejects_non_owner_squatter(pipeline_id):
         pass
 
     with pytest.raises(ValueError, match="reserved built-in id"):
-        register_pipeline(pipeline_id, pipeline=ThirdPartyPipeline)
+        PIPELINES.register(pipeline_id, pipeline=ThirdPartyPipeline)
