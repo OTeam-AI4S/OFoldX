@@ -53,7 +53,7 @@ from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ofoldx import AutoModel, AutoProcessor
+from ofoldx import AutoModel, AutoProcessor  # noqa: E402
 from ofoldx import pipeline as load_pipeline  # noqa: E402
 from ofoldx.data.conditions import (  # noqa: E402
     AllowedResidueIdentities,

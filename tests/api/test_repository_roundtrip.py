@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 import torch
 
 from ofoldx.api import pipeline as load_pipeline

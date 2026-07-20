@@ -562,7 +562,7 @@ def reference_dump(
     features = {
         key: np.asarray(value)
         for key, value in batch.items()
-        if hasattr(value, "dtype") and getattr(value, "dtype").kind in "fiub"
+        if hasattr(value, "dtype") and value.dtype.kind in "fiub"
     }
     metadata = {**_metadata(sequence=sequence, model_name=model_name, seed=seed), "feature_source": feature_source}
     payload = {
@@ -810,7 +810,7 @@ def reference_ext_dump(
     features = {
         key: np.asarray(value)
         for key, value in batch.items()
-        if hasattr(value, "dtype") and getattr(value, "dtype").kind in "fiub"
+        if hasattr(value, "dtype") and value.dtype.kind in "fiub"
     }
     metadata = {**_metadata(sequence=sequence, model_name=model_name, seed=seed), "feature_source": feature_source}
     payload = {
@@ -1193,7 +1193,7 @@ def ext_compare(
     # reduction-order noise -- near-unit cosine AND a small relative L2.
     passing_cosine = 0.999
     passing_relative_l2 = 5e-3
-    for name, metrics in comparisons.items():
+    for _name, metrics in comparisons.items():
         metrics["passed"] = bool(
             metrics.get("cosine", 0.0) >= passing_cosine
             and metrics.get("relative_l2", float("inf")) <= passing_relative_l2

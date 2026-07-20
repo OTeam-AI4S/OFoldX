@@ -8,6 +8,7 @@ the encoder/decoder GNN layers use the clean MLP/transition renames. Strict-load
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
@@ -18,6 +19,13 @@ import torch
 
 from .config import BoltzGenConfig, BoltzGenIFoldConfig
 from .model import BoltzGenIFoldModel, BoltzGenModel
+from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 # --------------------------------------------------------------------------------------
 # Boltz checkpoint-name conversion helpers, duplicated verbatim into this family so BoltzGen
@@ -396,7 +404,9 @@ def _split_fused(key: str, tensor: Any) -> list[tuple[str, object]] | None:
         return None
     block, left, right = _FUSED_SPLIT[key]
     half = tensor.shape[0] // 2
-    return [(f"{block}.{left}.weight", tensor[:half]), (f"{block}.{right}.weight", tensor[half:])]
+    # Clone each half so it owns its storage: bare slices are views into the fused tensor's
+    # storage (neither covers it), which safetensors refuses to serialize on save (persistence).
+    return [(f"{block}.{left}.weight", tensor[:half].clone()), (f"{block}.{right}.weight", tensor[half:].clone())]
 
 
 def convert_pairformer_layer(key: str, tensor: object) -> list[tuple[str, object]]:
@@ -1175,3 +1185,75 @@ def _cast_floating_tensors(
         key: value.to(dtype=dtype) if dtype is not None and value.is_floating_point() else value
         for key, value in state_dict.items()
     }
+
+
+def save_boltzgen_pipeline(
+    design_checkpoint_path: str | PathLike[str],
+    ifold_checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    design_config: BoltzGenConfig | None = None,
+    ifold_config: BoltzGenIFoldConfig | None = None,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert the BoltzGen design + inverse-fold checkpoints and write the composite repository.
+
+    The released BoltzGen design deliverable is a DESIGN §7.4 multi-pair :class:`BoltzGenPipeline`:
+    the structure-design pair (``ofoldx.boltzgen``, ``standard_tasks=()``) owns the runnable root and
+    the inverse-folding pair lives at the fixed ``ifold/`` sub-directory. Neither registered pair
+    routes as a lone standard task, so this writes the aggregate repository — both required pairs and
+    the one-field ``pipeline.json`` marker — via ``BoltzGenPipeline.save`` so ``pipeline(..., model=dir)``
+    routes it back through the multi-pair loader. The optional read-only boltz2 ``fold/`` / ``affinity/``
+    stages are injected at load time and are not vendored here.
+
+    Both designer Processors are config-less, so only ``model.json`` + safetensors are written per pair.
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the composite repository.
+    """
+
+    from .pipeline import BoltzGenPipeline
+
+    design_model = convert_boltzgen_checkpoint(design_checkpoint_path, config=design_config, dtype=dtype)
+    ifold_model = convert_boltzgen_ifold_checkpoint(ifold_checkpoint_path, config=ifold_config, dtype=dtype)
+    BoltzGenPipeline(
+        design_model=design_model,
+        design_processor=BoltzGenProcessor(),
+        ifold_model=ifold_model,
+        ifold_processor=BoltzGenIFoldProcessor(),
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("design_checkpoint", type=Path, help="released BoltzGen structure-design .ckpt")
+    parser.add_argument("ifold_checkpoint", type=Path, help="released BoltzGen inverse-folding .ckpt")
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    save_boltzgen_pipeline(
+        args.design_checkpoint,
+        args.ifold_checkpoint,
+        args.output_dir,
+        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
+if __name__ == "__main__":
+    main()

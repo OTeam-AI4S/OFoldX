@@ -2,14 +2,24 @@ r"""Convert official RFdiffusion checkpoints to native OFoldX Models."""
 
 from __future__ import annotations
 
+import argparse
+import json
 from collections.abc import Mapping
 from os import PathLike
+from pathlib import Path
 
 import torch
 from torch import Tensor
 
+from ...artifacts import save_model
 from .config import RFdiffusionConfig
 from .model import RFdiffusionModel
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 _NETWORK_RENAMES = {
     "n_extra_block": "num_extra_blocks",
@@ -131,3 +141,70 @@ def convert_rfdiffusion_checkpoint(
     state = convert_rfdiffusion_state_dict(loaded["model_state_dict"], dtype=dtype)
     model.load_state_dict(state, strict=True, assign=True)
     return model
+
+
+def save_rfdiffusion_checkpoint(
+    checkpoint: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert an RFdiffusion checkpoint and write a routable OFoldX repository.
+
+    Strict-loads the checkpoint via
+    [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
+    pairs it with the family :class:`RFdiffusionProcessor`, and writes ``model.json`` /
+    ``processor.json`` / safetensors via
+    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair keeps
+    ``standard_tasks=()`` (§6.1), so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
+    is written to route ``pipeline("design", model=dir)`` to :class:`RFdiffusionPipeline` rather than
+    the generic standard ``design`` route.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
+    included. No organization or token is assumed and nothing is published without an explicit
+    ``repo_id``.
+    """
+
+    from ...pipelines.registry import _PIPELINE_IDS
+    from .pipeline import RFdiffusionPipeline
+    from .processor import RFdiffusionProcessor
+
+    model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype)
+    destination = Path(output_dir).expanduser()
+    save_model(destination, model=model, processor=RFdiffusionProcessor())
+    marker = json.dumps({"pipeline": _PIPELINE_IDS[RFdiffusionPipeline]}, indent=2, sort_keys=True) + "\n"
+    (destination / "pipeline.json").write_text(marker, encoding="utf-8")
+    if repo_id is not None:
+        from ...hub import _upload_repository
+
+        _upload_repository(destination, repo_id, token=token, private=private)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", type=Path, help="official RFdiffusion checkpoint (e.g. Base_ckpt.pt)")
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    save_rfdiffusion_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
+if __name__ == "__main__":
+    main()

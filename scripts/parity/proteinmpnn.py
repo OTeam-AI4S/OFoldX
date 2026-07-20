@@ -27,7 +27,7 @@ from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ofoldx import AutoModel, AutoProcessor
+from ofoldx import AutoModel, AutoProcessor  # noqa: E402
 from ofoldx import pipeline as load_pipeline  # noqa: E402
 from ofoldx.data.conditions import (  # noqa: E402
     AllowedResidueIdentities,
@@ -1367,7 +1367,7 @@ def _tied_weight_checks(
         pdb,
         positions=members,
         conditions=conditions,
-        tied_weights={member: 1.0 for member in members},
+        tied_weights=dict.fromkeys(members, 1.0),
     )
     groups = tied_groups_from_ids(default_input.tied_group_ids)[0]
     _check(
@@ -1689,8 +1689,9 @@ def _public_vertical_checks(
         f"{label}: direct Pipeline preserves its pair",
         direct_pipeline.model is model and direct_pipeline.processor is processor,
     )
-    expected_vocabulary = tuple(
-        "ALA CYS ASP GLU PHE GLY HIS ILE LYS LEU MET ASN PRO GLN ARG SER THR VAL TRP TYR".split()
+    expected_vocabulary = (
+        "ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU",
+        "MET", "ASN", "PRO", "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR",
     )
     _check(
         f"{label}: exact vocabulary and output width",

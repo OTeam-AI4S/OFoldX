@@ -61,12 +61,10 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
-    device = torch.device(args.device)
     n = args.n
     dtype = torch.float64  # high precision to expose any formula mismatch
 
-    from ofoldx.data import residue_constants
-    from ofoldx.models.alphafold2.model import AlphaFold2MultimerInput, _template_backbone_unit_vector
+    from ofoldx.models.alphafold2.model import _template_backbone_unit_vector
     from ofoldx.models.alphafold2.processor import _template_backbone_frame, _template_pseudo_beta
 
     # Random template coordinates and aatype
@@ -87,7 +85,6 @@ def main() -> None:
     uv_nx, bbmask_nx = _template_backbone_unit_vector(b)  # [1,1,n,n,3], [1,1,n]
 
     # --- OpenFold side ---
-    from openfold.data import data_transforms
     from openfold.utils import all_atom_multimer, geometry
 
     atom_pos = geometry.Vec3Array.from_array(positions.to(torch.float32))  # [1,n]

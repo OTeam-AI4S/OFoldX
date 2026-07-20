@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import sys
 
 
 def main() -> None:
@@ -103,18 +102,18 @@ def main() -> None:
         fam_us[bucket(name)] += us
 
     print(f"events_scanned={n_events}")
-    print(f"total_gpu_kernel_ms={total_kernel_us/1e3:.1f}")
+    print(f"total_gpu_kernel_ms={total_kernel_us / 1e3:.1f}")
     print("\n=== GPU time by family (% of kernel time) ===")
     for fam, us in sorted(fam_us.items(), key=lambda x: -x[1]):
-        print(f"  {fam:22s} {us/1e3:10.1f} ms  {100*us/max(total_kernel_us,1):5.1f}%")
+        print(f"  {fam:22s} {us / 1e3:10.1f} ms  {100 * us / max(total_kernel_us, 1):5.1f}%")
 
     print(f"\n=== top {args.top} GPU kernels by total self time ===")
     for name, us in sorted(kernel_us.items(), key=lambda x: -x[1])[: args.top]:
-        print(f"  {us/1e3:10.1f} ms  x{kernel_calls[name]:<7d} {name[:90]}")
+        print(f"  {us / 1e3:10.1f} ms  x{kernel_calls[name]:<7d} {name[:90]}")
 
     print(f"\n=== top {args.top} CPU ops by total self host time ===")
     for name, us in sorted(cpu_us.items(), key=lambda x: -x[1])[: args.top]:
-        print(f"  {us/1e3:10.1f} ms  x{cpu_calls[name]:<7d} {name[:90]}")
+        print(f"  {us / 1e3:10.1f} ms  x{cpu_calls[name]:<7d} {name[:90]}")
 
 
 if __name__ == "__main__":

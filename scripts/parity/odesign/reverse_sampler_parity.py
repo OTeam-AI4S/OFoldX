@@ -39,12 +39,12 @@ match the reference (as in ``forward_parity``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 # Importing the forward-parity module runs its flash_attn / chanfig import shims and
@@ -373,10 +373,8 @@ def run_ofoldx_sampler(
             )
     finally:
         ofoldx_sampling.uniform_random_rotation = original_uniform
-        try:
+        with contextlib.suppress(AttributeError):
             del sampler._reverse_augmentation
-        except AttributeError:
-            pass
 
     # OFoldX carries a leading batch axis: [1, N_sample, N_atom, 3] -> [N_sample, N_atom, 3].
     return coordinates.detach().float().cpu().squeeze(0)

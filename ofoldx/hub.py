@@ -77,10 +77,26 @@ def _resolve_hub_repository(
     return _ResolvedRepository(snapshot, repo_id, commit)
 
 
-# Sentinel default for :func:`_upload_repository`'s ``delete_patterns``: mirror the local
-# repository onto the remote (delete every remote file absent locally). A caller that passes
+# Sentinel default for :func:`_upload_repository`'s ``delete_patterns``: mirror only the
+# repository-managed files onto the remote — the ordinary pair/marker artifacts (``model.json``,
+# ``processor.json``, ``pipeline.json``, the safetensors weights and their index), at the root and
+# in any composite sub-directory. Deletion is scoped to exactly these names so a re-publish prunes
+# stale managed files (an orphaned ``pipeline.json``, a leftover shard index, old weight shards)
+# without ever touching a remote README / model card the local repository does not manage. Matching
+# is ``fnmatchcase`` where ``*`` also spans ``/`` (huggingface_hub), so ``*.safetensors`` covers both
+# root and sub-directory weights (single and sharded); the JSON markers list their root and nested
+# (``*/name``) forms explicitly to avoid over-matching unmanaged files. A caller that passes
 # ``delete_patterns=None`` explicitly opts out and keeps the append-only upload behavior.
-_MIRROR_REPOSITORY: tuple[str, ...] = ("*",)
+_MIRROR_REPOSITORY: tuple[str, ...] = (
+    "*.safetensors",
+    "*.safetensors.index.json",
+    "model.json",
+    "*/model.json",
+    "processor.json",
+    "*/processor.json",
+    "pipeline.json",
+    "*/pipeline.json",
+)
 
 
 def _upload_repository(
@@ -103,10 +119,12 @@ def _upload_repository(
     authentication comes only from the caller's ``token`` or the ambient Hugging Face
     credential. No organization, repository, or token is assumed here.
 
-    Re-publishing is mirror-safe by default: ``delete_patterns`` defaults to mirroring the
-    local repository onto ``repo_id`` so a re-publish deletes remote files that are absent
-    locally (an orphaned ``pipeline.json``, a stale ``model.safetensors.index.json``, or old
-    weight shards) instead of leaving them to misroute the loader. ``upload_folder`` never
+    Re-publishing is mirror-safe by default: ``delete_patterns`` defaults to mirroring only the
+    repository-managed files (see :data:`_MIRROR_REPOSITORY`) onto ``repo_id`` so a re-publish
+    deletes managed remote files that are absent locally (an orphaned ``pipeline.json``, a stale
+    ``model.safetensors.index.json``, or old weight shards) instead of leaving them to misroute the
+    loader. The mirror is scoped to those managed names, so a remote README / model card that the
+    local ``save`` does not write is never deleted by a clean re-upload. ``upload_folder`` never
     deletes a remote file that this upload also writes (deletions are deduplicated against the
     additions) and always preserves ``.gitattributes``. When ``allow_patterns`` restricts the
     upload to a subset, the default mirror is narrowed to that same allowlist so files the

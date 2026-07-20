@@ -1,5 +1,6 @@
 r"""ESMFold2 architecture, processor, tensor contracts, and scientific modules."""
 
+from ...pipelines.registry import register_pipeline as _register_pipeline
 from ..registry import register_model as _register_model
 from .config import (
     ESMFold2AtomAttentionConfig,
@@ -63,4 +64,17 @@ _register_model(
     model=ESMFold2ExperimentalModel,
     processor=ESMFold2ExperimentalProcessor,
     standard_tasks=(),
+)
+
+# One concrete Pipeline binds either architecture's pair and owns both released biological verbs:
+# ``fold`` (the released ``ESMFold2Model`` pair) and the family-owned ``design`` binder-inversion verb
+# (the experimental ``ESMFold2ExperimentalModel`` pair). Registering it closes the design
+# repository->task loop: an ``ofoldx.esmfold2_experimental`` repo carrying the
+# ``pipeline.json = {"pipeline": "ofoldx.esmfold2"}`` marker routes ``pipeline("design", model=dir)``
+# here (a single class-owned pair, so the factory takes the one-pair (model, processor) call — no
+# ``_PAIR_LAYOUT``). The released fold repos stay marker-less and route through the generic standard
+# ``fold`` Pipeline (``standard_tasks={"fold"}``) exactly as before.
+_register_pipeline(
+    "ofoldx.esmfold2",
+    pipeline=ESMFold2Pipeline,
 )

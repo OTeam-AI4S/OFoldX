@@ -403,19 +403,19 @@ def adversarial(tokens, deletions, profile, dt, aatype) -> dict[str, Any]:
     # (6) per-recycle resampling: consecutive draws off one advancing generator differ, reproducibly
     def two_recycles(seed: int) -> tuple[str, str]:
         g = torch.Generator(device=device).manual_seed(seed)
-        kw = dict(
-            max_msa_clusters=MAX_MSA,
-            max_extra_msa=MAX_EXTRA,
-            msa_cluster_features=True,
-            gap_agreement_weight=GAP_W,
-            masked_msa_enabled=True,
-            uniform_prob=UNIFORM,
-            profile_prob=PROFILE,
-            same_prob=SAME,
-            replace_fraction=REPLACE,
-            device=device,
-            dtype=torch.float32,
-        )
+        kw = {
+            "max_msa_clusters": MAX_MSA,
+            "max_extra_msa": MAX_EXTRA,
+            "msa_cluster_features": True,
+            "gap_agreement_weight": GAP_W,
+            "masked_msa_enabled": True,
+            "uniform_prob": UNIFORM,
+            "profile_prob": PROFILE,
+            "same_prob": SAME,
+            "replace_fraction": REPLACE,
+            "device": device,
+            "dtype": torch.float32,
+        }
         r0 = signature(*realize_msa_features(tokens, deletions, profile, generator=g, **kw))
         r1 = signature(*realize_msa_features(tokens, deletions, profile, generator=g, **kw))
         return r0, r1

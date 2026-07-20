@@ -18,7 +18,7 @@ from ...artifacts import save_model
 from ...references import classify_reference
 from .config import ESMFold2Config, ESMFold2ESMCConfig, ESMFold2ExperimentalConfig, ESMFold2ProcessorConfig
 from .model import ESMFold2ExperimentalModel, ESMFold2Model
-from .processor import ESMFold2Processor
+from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor
 
 _DEFAULT_ESMC_REPOSITORY = "multimolecule/esmc-6b"
 _BIOHUB_UNUSED_STATE_KEYS = (
@@ -384,6 +384,59 @@ def load_experimental_esmfold2(
     return model
 
 
+def save_experimental_esmfold2_checkpoint(
+    checkpoint_or_repo: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    config_path: str | PathLike[str] | None = None,
+    dtype: torch.dtype | None = None,
+    cache_dir: str | PathLike[str] | None = None,
+    local_files_only: bool = False,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert an experimental (binder-inversion) ESMFold2 head and write a routable repository.
+
+    Strict-loads the ``type="experimental"`` recurrent head via
+    [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
+    ``esmc=None`` — so the saved ``state_dict`` is exactly the experimental head (the frozen ESMC child
+    is attached separately at run time) — pairs it with the :class:`ESMFold2ExperimentalProcessor`, and
+    writes ``model.json`` / ``processor.json`` / safetensors via
+    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The experimental pair keeps
+    ``standard_tasks=()``, so a ``pipeline.json = {"pipeline": "ofoldx.esmfold2"}`` marker is written to
+    route ``pipeline("design", model=dir)`` to :class:`ESMFold2Pipeline.design`.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
+    included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    """
+
+    from ...pipelines.registry import _PIPELINE_IDS
+    from .pipeline import ESMFold2Pipeline
+
+    model = load_experimental_esmfold2(
+        checkpoint_or_repo,
+        esmc=None,
+        config_path=config_path,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
+    if dtype is not None:
+        model.to(dtype=dtype)
+    destination = Path(output_dir).expanduser()
+    save_model(
+        destination,
+        model=model,
+        processor=ESMFold2ExperimentalProcessor(model.config),
+    )
+    marker = json.dumps({"pipeline": _PIPELINE_IDS[ESMFold2Pipeline]}, indent=2, sort_keys=True) + "\n"
+    (destination / "pipeline.json").write_text(marker, encoding="utf-8")
+    if repo_id is not None:
+        from ...hub import _upload_repository
+
+        _upload_repository(destination, repo_id, token=token, private=private)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint_or_repo", help="Head checkpoint or Hub repo, e.g. biohub/ESMFold2")
@@ -400,13 +453,33 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help="convert the type='experimental' recurrent binder-inversion head (design pipeline); "
+        "saves the head only, the frozen ESMC child is attached at run time",
+    )
     args = parser.parse_args(argv)
+    dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
+    if args.experimental:
+        save_experimental_esmfold2_checkpoint(
+            args.checkpoint_or_repo,
+            args.output_dir,
+            config_path=args.config,
+            dtype=dtype,
+            cache_dir=args.cache_dir,
+            local_files_only=args.local_files_only,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+        return
     convert_esmfold2_checkpoint(
         args.checkpoint_or_repo,
         args.output_dir,
         esmc_source=args.esmc,
         config_path=args.config,
-        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        dtype=dtype,
         cache_dir=args.cache_dir,
         local_files_only=args.local_files_only,
         repo_id=args.repo_id,

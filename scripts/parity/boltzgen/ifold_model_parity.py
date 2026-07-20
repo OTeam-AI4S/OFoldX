@@ -48,7 +48,8 @@ def main() -> None:
     missing, unexpected = model.load_state_dict(converted, strict=True)
     dropped = len(state) - len(converted)
     print(
-        f"  whole-ckpt: {len(state)} params, {dropped} tied-dropped, missing={len(missing)} unexpected={len(unexpected)}"
+        f"  whole-ckpt: {len(state)} params, {dropped} tied-dropped, "
+        f"missing={len(missing)} unexpected={len(unexpected)}"
     )
     assert not missing and not unexpected, f"missing={missing}\nunexpected={unexpected}"
 

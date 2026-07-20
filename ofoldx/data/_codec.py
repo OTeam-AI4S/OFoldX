@@ -36,7 +36,12 @@ def encode_system(system: MolecularSystem) -> dict[str, object]:
             entity_id: _encode_entity(entity)
             for entity_id, entity in sorted(system.entities.items(), key=lambda item: item[0])
         },
-        "instances": dict(system.instances),
+        # Instance DECLARATION ORDER is observable (MolecularSystem.iter_atoms and
+        # iter_bonds walk ``instances`` in insertion order).  A JSON object would be
+        # reordered by ``json.dumps(sort_keys=True)`` on the mmCIF write path, so encode
+        # ``instances`` as an ORDERED array of [instance_id, entity_id] pairs that
+        # sort_keys cannot scramble.
+        "instances": [[instance_id, entity_id] for instance_id, entity_id in system.instances.items()],
         "bonds": [_encode_system_bond(bond) for bond in sorted(system.bonds, key=_system_bond_key)],
     }
 
@@ -51,13 +56,30 @@ def decode_system(value: object) -> MolecularSystem:
     if data["kind"] != "molecular_system":
         raise ValueError("MolecularSystem kind must be 'molecular_system'")
     entities = _expect_object(data["entities"], "MolecularSystem.entities")
-    instances = _expect_object(data["instances"], "MolecularSystem.instances")
+    instances = _decode_instances(data["instances"])
     bonds = _expect_list(data["bonds"], "MolecularSystem.bonds")
     return MolecularSystem(
         entities={entity_id: _decode_entity(body) for entity_id, body in entities.items()},
-        instances=dict(instances),  # type: ignore[arg-type]
+        instances=instances,
         bonds=frozenset(_decode_system_bond(item) for item in bonds),
     )
+
+
+def _decode_instances(value: object) -> dict[str, str]:
+    # ``instances`` is an ORDERED array of [instance_id, entity_id] pairs; rebuild the
+    # mapping preserving declaration order (dict keeps insertion order in py3.7+).
+    instances: dict[str, str] = {}
+    for item in _expect_list(value, "MolecularSystem.instances"):
+        pair = _expect_list(item, "MolecularSystem.instances entry")
+        if len(pair) != 2:
+            raise ValueError("MolecularSystem.instances entry must have two elements")
+        instance_id, entity_id = pair
+        if type(instance_id) is not str or type(entity_id) is not str:
+            raise TypeError("MolecularSystem.instances entry must be [str, str]")
+        if instance_id in instances:
+            raise ValueError(f"MolecularSystem.instances has a duplicate instance {instance_id!r}")
+        instances[instance_id] = entity_id
+    return instances
 
 
 def encode_structure(

@@ -8,6 +8,7 @@ _PIPELINES: dict[str, type] = {}
 _PIPELINE_IDS: dict[type, str] = {}
 
 _BUILTIN_PIPELINE_MODULES = {
+    "ofoldx.esmfold2": "ofoldx.models.esmfold2",
     "ofoldx.ligandmpnn": "ofoldx.models.ligandmpnn",
     "ofoldx.mpnn_packer": "ofoldx.models.mpnn_packer",
     "ofoldx.nampnn": "ofoldx.models.nampnn",

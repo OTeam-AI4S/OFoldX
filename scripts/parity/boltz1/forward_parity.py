@@ -380,7 +380,7 @@ def main() -> None:
 
     reference: dict[str, Tensor] | None = None
     if dumped is not None:
-        reference = {name: tensor for name, tensor in dumped["outputs"].items()}
+        reference = dict(dumped["outputs"])
     elif args.reference_root is not None:
         if str(args.reference_root / "src") not in sys.path:
             sys.path.insert(0, str(args.reference_root / "src"))

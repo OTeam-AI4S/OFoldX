@@ -11,6 +11,7 @@ is localized instead of comparing chaotically-amplified 3-recycle outputs.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -96,10 +97,8 @@ def main() -> None:
     cfg.globals.use_deepspeed_evo_attention = False
     cfg.globals.use_memory_efficient_kernel = False
     cfg.globals.offload_inference = False
-    try:
+    with contextlib.suppress(Exception):
         cfg.model.recycle_early_stop_tolerance = -1.0
-    except Exception:
-        pass
     of_batch = _openfold_multimer_batch(batch, 0, device, data_transforms)
     of_model = AlphaFold(cfg).eval()
     import_jax_weights_(of_model, str(args.npz), version=args.model_name)

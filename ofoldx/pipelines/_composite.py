@@ -18,6 +18,7 @@ ordinary pair format and carry no marker of their own (§7.3).
 from __future__ import annotations
 
 import json
+import shutil
 from os import PathLike
 from pathlib import Path
 from typing import NamedTuple
@@ -105,12 +106,27 @@ class _CompositePipeline:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
 
         destination = Path(directory).expanduser()
+
+        # Resolve every slot's source first so a missing required pair aborts the save
+        # before the destination is mutated.
+        plan: list[tuple[_CompositePair, tuple[nn.Module, object] | None]] = []
         for pair in self._PAIR_LAYOUT:
             source = self._composite_pair_source(pair)
+            if source is None and pair.required:
+                location = pair.subdirectory or "root"
+                raise ValueError(f"cannot save {type(self).__name__}: required {location} pair is missing")
+            plan.append((pair, source))
+
+        for pair, source in plan:
             if source is None:
-                if pair.required:
-                    location = pair.subdirectory or "root"
-                    raise ValueError(f"cannot save {type(self).__name__}: required {location} pair is missing")
+                # This optional slot is absent from the current Pipeline. Clear any
+                # sub-directory a previous save left there so the saved repository holds
+                # exactly the pairs present now (a stale sub-dir would otherwise reload as
+                # a phantom pair). The root pair (empty subdirectory) is always written.
+                if pair.subdirectory:
+                    stale = destination / pair.subdirectory
+                    if stale.is_dir():
+                        shutil.rmtree(stale)
                 continue
             model, processor = source
             save_model(

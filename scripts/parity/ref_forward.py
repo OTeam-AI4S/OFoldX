@@ -910,13 +910,13 @@ def compare_outputs(
             # Relative agreement over the real block (magnitude-invariant parity metric).
             rel = _relative_agreement(expected, actual, real_mask, torch=torch)
             entry.update(rel)
-            entry["rel_pass"] = bool(rel["rel_l2"] <= rel_threshold)
+            entry["rel_pass"] = rel["rel_l2"] <= rel_threshold
 
             # Coordinates: Kabsch-superposed RMSD is the structural metric.
             if name == "coordinate":
                 rmsd = _kabsch_rmsd(expected, actual, torch=torch)
                 entry.update(rmsd)
-                entry["rmsd_pass"] = bool(rmsd["rmsd_min"] <= rmsd_threshold)
+                entry["rmsd_pass"] = rmsd["rmsd_min"] <= rmsd_threshold
 
             # The RNG-independent parity verdict is taken over the recycled trunk reps (single/pair):
             # they are a pure function of the recycled trunk and carry no sampling noise. Logits and

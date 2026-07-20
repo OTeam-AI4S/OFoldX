@@ -32,9 +32,15 @@ def subset(state: dict, prefix: str) -> dict:
 
 def build_feats() -> dict:
     g = torch.Generator().manual_seed(1)
-    rand = lambda *s: torch.randn(*s, generator=g)
-    randint = lambda hi, *s: torch.randint(0, hi, s, generator=g)
-    onehot = lambda hi, *s: torch.nn.functional.one_hot(randint(hi, *s), hi).float()
+
+    def rand(*s):
+        return torch.randn(*s, generator=g)
+
+    def randint(hi, *s):
+        return torch.randint(0, hi, s, generator=g)
+
+    def onehot(hi, *s):
+        return torch.nn.functional.one_hot(randint(hi, *s), hi).float()
     return {
         "res_type": onehot(NUM_TOKENS, B, N),
         "profile": rand(B, N, NUM_TOKENS).softmax(-1),

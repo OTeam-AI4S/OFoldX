@@ -179,9 +179,13 @@ def main() -> None:
         ref_den = ref_ad.preconditioned_network_forward(
             noisy,
             5.0,
-            network_condition_kwargs=dict(
-                s_inputs=s_inputs, s_trunk=s_trunk, feats=feats, diffusion_conditioning=ref_dc, multiplicity=1
-            ),
+            network_condition_kwargs={
+                "s_inputs": s_inputs,
+                "s_trunk": s_trunk,
+                "feats": feats,
+                "diffusion_conditioning": ref_dc,
+                "multiplicity": 1,
+            },
         )
         my_den = my_ad.preconditioned_network_forward(
             noisy,

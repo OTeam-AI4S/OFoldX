@@ -74,27 +74,27 @@ def main() -> None:
 
     from ofoldx.models.boltzgen.model import GraphAttentionLayer, GraphAttentionLayerNoEdge
 
-    enc_cfg = dict(
-        node_dim=128,
-        pair_dim=128,
-        hidden_dim=128,
-        dropout=0.0,
-        softmax_dropout=0.0,
-        transformation_scale_factor=1.0,
-        num_heads=4,
-    )
+    enc_cfg = {
+        "node_dim": 128,
+        "pair_dim": 128,
+        "hidden_dim": 128,
+        "dropout": 0.0,
+        "softmax_dropout": 0.0,
+        "transformation_scale_factor": 1.0,
+        "num_heads": 4,
+    }
     # The reference decoder is sized with pair_dim=128 (attn_weight_mlp -> node*2+pair = 384) but is FED a
     # 256-dim edge state z; cat[s_dst(128), z(256)] = 384 matches. The OFoldX layer expresses this directly
     # as edge_dim=256 (weight from node+edge = 384, value from edge = 256).
-    dec_cfg = dict(
-        node_dim=128,
-        pair_dim=128,
-        hidden_dim=128,
-        dropout=0.0,
-        softmax_dropout=0.0,
-        transformation_scale_factor=1.0,
-        num_heads=4,
-    )
+    dec_cfg = {
+        "node_dim": 128,
+        "pair_dim": 128,
+        "hidden_dim": 128,
+        "dropout": 0.0,
+        "softmax_dropout": 0.0,
+        "transformation_scale_factor": 1.0,
+        "num_heads": 4,
+    }
     cases: list[tuple[Any, ...]] = [
         (
             "encoder MLPAttnGNN",

@@ -213,7 +213,7 @@ def main() -> None:
             selected.append(pdb_id)
             downloaded += 1
             print(f"{len(selected):4d}/{args.count} {pdb_id} -> {destination}", flush=True)
-        except (HTTPError, URLError, TimeoutError, OSError) as error:
+        except (HTTPError, URLError, OSError) as error:
             failed.append(pdb_id)
             print(f"failed {pdb_id}: {error}", flush=True)
 
@@ -296,7 +296,7 @@ def download_cif(pdb_id: str, destination: Path, *, timeout: float, retries: int
             with urlopen(url, timeout=timeout) as response:
                 destination.write_bytes(response.read())
             return
-        except (HTTPError, URLError, TimeoutError, OSError) as error:
+        except (HTTPError, URLError, OSError) as error:
             last_error = error
             if attempt + 1 < retries:
                 time.sleep(2**attempt)
@@ -349,9 +349,12 @@ def parse_chem_comp_atoms(lines: list[str]) -> tuple[dict[str, set[str]], dict[s
                 comp_id = _clean_cif_value(values[comp_index]).upper()
                 atom_id = _clean_cif_value(values[atom_index])
                 atom_names.setdefault(comp_id, set()).add(atom_id)
-                if leaving_index >= 0 and len(values) > leaving_index:
-                    if _clean_cif_value(values[leaving_index]).upper() == "Y":
-                        leaving_atoms.setdefault(comp_id, set()).add(atom_id)
+                if (
+                    leaving_index >= 0
+                    and len(values) > leaving_index
+                    and _clean_cif_value(values[leaving_index]).upper() == "Y"
+                ):
+                    leaving_atoms.setdefault(comp_id, set()).add(atom_id)
         index = data_stop
     return atom_names, leaving_atoms
 

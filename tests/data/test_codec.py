@@ -79,7 +79,9 @@ def test_system_codec_is_deterministic_known_type_json() -> None:
     assert molecule["kind"] == "molecule"
     assert set(molecule) == {"kind", "components", "bonds"}
     assert [component["component_id"] for component in molecule["components"]] == ["LFT", "RGT"]
-    assert first["instances"] == {"A": "target", "L": "ligand"}
+    # instances encode as an ORDERED [instance_id, entity_id] array so sort_keys cannot
+    # scramble declaration order on the mmCIF write path.
+    assert first["instances"] == [["A", "target"], ["L", "ligand"]]
     for bond in first["bonds"]:  # type: ignore[union-attr]
         for endpoint in (bond["site_a"], bond["site_b"]):
             assert set(endpoint) == {"instance_id", "component_index", "atom_id"}

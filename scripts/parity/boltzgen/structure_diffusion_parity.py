@@ -407,13 +407,13 @@ def main() -> None:
         noised,
         sigma,
         training=False,
-        network_condition_kwargs=dict(
-            multiplicity=1,
-            s_inputs=inp["s_inputs"],
-            s_trunk=inp["s_trunk"],
-            feats=inp["feats_ref"],
-            diffusion_conditioning=ref_cond,
-        ),
+        network_condition_kwargs={
+            "multiplicity": 1,
+            "s_inputs": inp["s_inputs"],
+            "s_trunk": inp["s_trunk"],
+            "feats": inp["feats_ref"],
+            "diffusion_conditioning": ref_cond,
+        },
     )
     fwd_abs = (ado_denoised - ref_denoised).abs().max().item()
     fwd_rel = fwd_abs / max(ref_denoised.abs().max().item(), 1e-9)

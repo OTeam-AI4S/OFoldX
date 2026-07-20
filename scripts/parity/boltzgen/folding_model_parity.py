@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
-
 from ofoldx.models.boltzgen.config import BoltzGenConfig
 from ofoldx.models.boltzgen.convert import convert_structure_design
 from ofoldx.models.boltzgen.model import BoltzGenModel

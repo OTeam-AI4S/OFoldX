@@ -991,7 +991,10 @@ def _controls(
         generator=torch.Generator().manual_seed(decode_seed),
     ).decoding_ranks
     protein_rows = batch.protein_mask[0]
-    protein_first = bool(protein_first_ranks[0][protein_rows].max() < protein_first_ranks[0][~protein_rows].min())
+    # SIM901: bool() converts the torch scalar-tensor comparison to a plain Python bool (not redundant).
+    protein_first = bool(  # noqa: SIM901
+        protein_first_ranks[0][protein_rows].max() < protein_first_ranks[0][~protein_rows].min()
+    )
     decode_checks = {
         "conditional_log_probabilities": _numerical_check(
             float((decode_expected - decode_actual).abs().max()),

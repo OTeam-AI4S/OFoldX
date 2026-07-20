@@ -464,8 +464,8 @@ def _compare(
     atol: float,
     rtol: float,
 ) -> dict[str, dict[str, Any]]:
-    reference = {k: v for k, v in reference.items()}
-    actual = {k: v for k, v in actual.items()}
+    reference = dict(reference)
+    actual = dict(actual)
     for name in set(reference) & set(actual):
         reference[name], actual[name] = _align(reference[name], actual[name])
     comparisons: dict[str, dict[str, Any]] = {}

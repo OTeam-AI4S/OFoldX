@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 import re
 from collections.abc import Callable, Mapping
+from os import PathLike
 from pathlib import Path
 from typing import Literal, TypeAlias
 
 import torch
 from torch import Tensor, nn
 
-from ...artifacts import save_model
 from .config import ODesignConfig, ODesignProcessorConfig
 from .model import ODesignModel
 from .processor import ODesignProcessor
@@ -166,10 +166,28 @@ def _infer_receptor_mode(checkpoint_path: str | Path) -> Literal["rigid", "flex"
     return "rigid" if has_rigid else "flex"
 
 
+def convert_odesign_model(
+    checkpoint_path: str | Path,
+    *,
+    dtype: torch.dtype | None = None,
+    config: ODesignConfig | None = None,
+) -> ODesignModel:
+    r"""Strict-load one released ODesign backbone checkpoint into a native :class:`ODesignModel`."""
+
+    model = ODesignModel(ODesignConfig() if config is None else config)
+    if dtype is not None:
+        model.to(dtype=dtype)
+    translated = translate_odesign_state(model, load_reference_state(checkpoint_path))
+    model.load_state_dict(translated, strict=True)
+    return model
+
+
 def convert_odesign_checkpoint(
     checkpoint_path: str | Path,
     output_dir: str | Path,
     *,
+    protein_designer: str | PathLike[str],
+    ligand_designer: str | PathLike[str],
     dtype: torch.dtype | None = None,
     config: ODesignConfig | None = None,
     receptor_mode: Literal["rigid", "flex"] | None = None,
@@ -177,29 +195,43 @@ def convert_odesign_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Strictly convert a checkpoint and write ``model.json`` + ``processor.json`` + safetensors.
+    r"""Convert the ODesign backbone checkpoint and write the aggregate composite repository.
 
-    ``receptor_mode`` selects the released flex/rigid conditioning written into
-    ``processor.json`` (§4.11.2/§4.11.8). It is inferred from the checkpoint filename when not
-    given; the graph, state-dict translation, and ``_protenix_convert`` reuse are identical
-    for both — only the persisted Processor config value differs.
+    The released ODesign protein deliverable is a DESIGN §7.4 multi-pair :class:`ODesignPipeline`
+    (§4.11.6): the ODesign backbone pair owns the runnable root, and the OInvFold sequence step is the
+    *separately registered, read-only* ProteinMPNN / LigandMPNN Pipelines bound at the fixed
+    ``protein_designer/`` and ``ligand_designer/`` sub-directories. The backbone pair alone keeps
+    ``standard_tasks=()`` and cannot route as a lone standard task, so this writes the AGGREGATE
+    repository — every class-owned pair plus the one-field ``pipeline.json = {"pipeline": "ofoldx.odesign"}``
+    marker — via ``ODesignPipeline.save`` so ``pipeline("design", model=dir)`` routes it back through the
+    multi-pair loader.
 
-    Saving is local-only by default. When ``repo_id`` is given, the converted repository is
-    also uploaded to that Hub repo via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model];
-    no organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    ``protein_designer`` / ``ligand_designer`` are references (local repositories or Hub ids) to the
+    already-converted OInvFold sequence-designer repositories; each is loaded read-only through the
+    public repository factory (``pipeline("design", model=ref)``) and re-vendored into the ODesign
+    repository — the sequence network is never re-converted here.
+
+    ``receptor_mode`` selects the released flex/rigid conditioning written into the root pair's
+    ``processor.json`` (§4.11.2/§4.11.8); it is inferred from the checkpoint filename when not given.
+
+    Saving is local-only by default. When ``repo_id`` is given the fully written composite repository is
+    also uploaded to that Hub repo; no organization or token is assumed and nothing is published without
+    an explicit ``repo_id``.
     """
+
+    from ...api import pipeline as _load_pipeline
+    from .pipeline import ODesignPipeline
 
     if receptor_mode is None:
         receptor_mode = _infer_receptor_mode(checkpoint_path)
-    model = ODesignModel(ODesignConfig() if config is None else config)
-    if dtype is not None:
-        model.to(dtype=dtype)
-    translated = translate_odesign_state(model, load_reference_state(checkpoint_path))
-    model.load_state_dict(translated, strict=True)
-    save_model(
-        output_dir,
+    model = convert_odesign_model(checkpoint_path, dtype=dtype, config=config)
+    ODesignPipeline(
         model=model,
         processor=ODesignProcessor(ODesignProcessorConfig(receptor_mode=receptor_mode)),
+        protein_designer=_load_pipeline("design", model=protein_designer),
+        ligand_designer=_load_pipeline("design", model=ligand_designer),
+    ).save(
+        output_dir,
         repo_id=repo_id,
         token=token,
         private=private,
@@ -240,8 +272,22 @@ def odesign_reference_key(model_key: str) -> ReferenceKey:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help="released ODesign backbone checkpoint (e.g. odesign_base_prot_flex.pt)",
+    )
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--protein-designer",
+        required=True,
+        help="converted ProteinMPNN sequence-designer repository (local dir or Hub id)",
+    )
+    parser.add_argument(
+        "--ligand-designer",
+        required=True,
+        help="converted LigandMPNN sequence-designer repository (local dir or Hub id)",
+    )
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
     parser.add_argument(
         "--receptor-mode",
@@ -261,6 +307,8 @@ def main(argv: list[str] | None = None) -> None:
     convert_odesign_checkpoint(
         args.checkpoint,
         args.output_dir,
+        protein_designer=args.protein_designer,
+        ligand_designer=args.ligand_designer,
         dtype=dtype,
         receptor_mode=args.receptor_mode,
         repo_id=args.repo_id,

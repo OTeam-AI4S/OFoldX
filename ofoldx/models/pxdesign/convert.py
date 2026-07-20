@@ -2,6 +2,7 @@ r"""Strict translation of the official PxDesign v0.1 checkpoint."""
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Callable, Mapping
 from os import PathLike
@@ -11,8 +12,15 @@ from typing import Any, TypeAlias
 import torch
 from torch import Tensor, nn
 
+from ...artifacts import save_model
 from .config import PxDesignConfig
 from .model import PxDesignModel
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 ReferenceKey: TypeAlias = str | tuple[str, ...]
 ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
@@ -63,6 +71,66 @@ def convert_pxdesign_checkpoint(
     model.load_state_dict(state_dict, strict=True, assign=True)
     model.eval()
     return model
+
+
+def save_pxdesign_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    map_location: str | torch.device = "cpu",
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert a PxDesign checkpoint and write a standard OFoldX repository.
+
+    Strict-loads the checkpoint via
+    [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
+    it with the family :class:`PxDesignProcessor`, and writes a self-contained ``model.json`` /
+    ``processor.json`` / safetensors repository via
+    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The root pair keeps
+    ``standard_tasks=()`` (§6.1, mirroring rfdiffusion): it persists and round-trips, but is a terminal
+    de-novo designer that is not wrapped by the generic standard ``design`` route.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
+    organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    """
+
+    from .processor import PxDesignProcessor
+
+    model = convert_pxdesign_checkpoint(checkpoint_path, map_location=map_location, dtype=dtype)
+    save_model(
+        output_dir,
+        model=model,
+        processor=PxDesignProcessor(),
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", type=Path, help="released PxDesign checkpoint (e.g. pxdesign_v0.1.0.pt)")
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    save_pxdesign_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
 
 
 def _extract_reference_state(checkpoint_or_state_dict: Mapping[str, Any]) -> dict[str, Tensor]:
@@ -597,3 +665,7 @@ def _replace_many(key: str, replacements: Mapping[str, str]) -> str:
     for source, target in replacements.items():
         key = key.replace(source, target)
     return key
+
+
+if __name__ == "__main__":
+    main()

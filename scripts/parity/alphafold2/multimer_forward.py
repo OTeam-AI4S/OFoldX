@@ -24,8 +24,8 @@ deterministic forward never selects the memory-efficient kernel.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
-import math
 import random
 import sys
 import types
@@ -258,10 +258,8 @@ def run_reference(
     config.globals.use_memory_efficient_kernel = False
     config.globals.offload_inference = False
     # Never early-stop: OFoldX always runs the full recycle count, so the reference must too.
-    try:
+    with contextlib.suppress(Exception):
         config.model.recycle_early_stop_tolerance = -1.0
-    except Exception:
-        pass
 
     of_batch = _openfold_multimer_batch(batch, recycling_steps, device, data_transforms)
 

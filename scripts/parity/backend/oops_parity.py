@@ -37,7 +37,6 @@ Run (on a GPU node)::
 
 from __future__ import annotations
 
-import math
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -167,20 +166,20 @@ def case_triangle_multiplication(dtype: torch.dtype, *, outgoing: bool, masked: 
     mask = None
     if masked:
         mask = (torch.rand(batch, tokens, tokens, generator=gen, device="cuda") > 0.2).to(dtype)
-    kwargs = dict(
-        outgoing=outgoing,
-        norm_input_weight=randn(pair_size, gen=gen, dtype=dtype),
-        norm_input_bias=randn(pair_size, gen=gen, dtype=dtype),
-        left_value_weight=randn(hidden, pair_size, gen=gen, dtype=dtype),
-        left_gate_weight=randn(hidden, pair_size, gen=gen, dtype=dtype),
-        right_value_weight=randn(hidden, pair_size, gen=gen, dtype=dtype),
-        right_gate_weight=randn(hidden, pair_size, gen=gen, dtype=dtype),
-        norm_output_weight=randn(hidden, gen=gen, dtype=dtype),
-        norm_output_bias=randn(hidden, gen=gen, dtype=dtype),
-        output_weight=randn(pair_size, hidden, gen=gen, dtype=dtype),
-        output_gate_weight=randn(pair_size, pair_size, gen=gen, dtype=dtype),
-        eps=1e-5,
-    )
+    kwargs = {
+        "outgoing": outgoing,
+        "norm_input_weight": randn(pair_size, gen=gen, dtype=dtype),
+        "norm_input_bias": randn(pair_size, gen=gen, dtype=dtype),
+        "left_value_weight": randn(hidden, pair_size, gen=gen, dtype=dtype),
+        "left_gate_weight": randn(hidden, pair_size, gen=gen, dtype=dtype),
+        "right_value_weight": randn(hidden, pair_size, gen=gen, dtype=dtype),
+        "right_gate_weight": randn(hidden, pair_size, gen=gen, dtype=dtype),
+        "norm_output_weight": randn(hidden, gen=gen, dtype=dtype),
+        "norm_output_bias": randn(hidden, gen=gen, dtype=dtype),
+        "output_weight": randn(pair_size, hidden, gen=gen, dtype=dtype),
+        "output_gate_weight": randn(pair_size, pair_size, gen=gen, dtype=dtype),
+        "eps": 1e-5,
+    }
     oops = triangle_multiplication(pair, mask, operator_backend="oops", **kwargs)
     eager = triangle_multiplication(pair, mask, operator_backend="eager", **kwargs)
     return oops, eager
@@ -193,17 +192,17 @@ def case_outer_product_mean(dtype: torch.dtype, *, divide_before: bool, masked: 
     mask = None
     if masked:
         mask = (torch.rand(batch, depth, tokens, generator=gen, device="cuda") > 0.2).to(dtype)
-    kwargs = dict(
-        norm_weight=randn(msa_size, gen=gen, dtype=dtype),
-        norm_bias=randn(msa_size, gen=gen, dtype=dtype),
-        proj_left_weight=randn(proj, msa_size, gen=gen, dtype=dtype),
-        proj_right_weight=randn(proj, msa_size, gen=gen, dtype=dtype),
-        proj_out_weight=randn(pair_size, proj * proj, gen=gen, dtype=dtype),
-        proj_out_bias=randn(pair_size, gen=gen, dtype=dtype),
-        norm_eps=1e-5,
-        denom_eps=1e-3,
-        divide_before_projection=divide_before,
-    )
+    kwargs = {
+        "norm_weight": randn(msa_size, gen=gen, dtype=dtype),
+        "norm_bias": randn(msa_size, gen=gen, dtype=dtype),
+        "proj_left_weight": randn(proj, msa_size, gen=gen, dtype=dtype),
+        "proj_right_weight": randn(proj, msa_size, gen=gen, dtype=dtype),
+        "proj_out_weight": randn(pair_size, proj * proj, gen=gen, dtype=dtype),
+        "proj_out_bias": randn(pair_size, gen=gen, dtype=dtype),
+        "norm_eps": 1e-5,
+        "denom_eps": 1e-3,
+        "divide_before_projection": divide_before,
+    }
     oops = outer_product_mean(msa, mask, operator_backend="oops", **kwargs)
     eager = outer_product_mean(msa, mask, operator_backend="eager", **kwargs)
     return oops, eager
@@ -217,18 +216,18 @@ def _pwa_inputs(gen: torch.Generator, dtype: torch.dtype, *, masked: bool):
     mask = None
     if masked:
         mask = (torch.rand(batch, tokens, tokens, generator=gen, device="cuda") > 0.2).to(dtype)
-    weights = dict(
-        norm_msa_weight=randn(msa_size, gen=gen, dtype=dtype),
-        norm_msa_bias=randn(msa_size, gen=gen, dtype=dtype),
-        norm_pair_weight=randn(pair_size, gen=gen, dtype=dtype),
-        norm_pair_bias=randn(pair_size, gen=gen, dtype=dtype),
-        value_weight=randn(num_heads * head_dim, msa_size, gen=gen, dtype=dtype),
-        gate_weight=randn(num_heads * head_dim, msa_size, gen=gen, dtype=dtype),
-        pair_logits_weight=randn(num_heads, pair_size, gen=gen, dtype=dtype),
-        output_weight=randn(msa_size, num_heads * head_dim, gen=gen, dtype=dtype),
-        num_heads=num_heads,
-        head_dim=head_dim,
-    )
+    weights = {
+        "norm_msa_weight": randn(msa_size, gen=gen, dtype=dtype),
+        "norm_msa_bias": randn(msa_size, gen=gen, dtype=dtype),
+        "norm_pair_weight": randn(pair_size, gen=gen, dtype=dtype),
+        "norm_pair_bias": randn(pair_size, gen=gen, dtype=dtype),
+        "value_weight": randn(num_heads * head_dim, msa_size, gen=gen, dtype=dtype),
+        "gate_weight": randn(num_heads * head_dim, msa_size, gen=gen, dtype=dtype),
+        "pair_logits_weight": randn(num_heads, pair_size, gen=gen, dtype=dtype),
+        "output_weight": randn(msa_size, num_heads * head_dim, gen=gen, dtype=dtype),
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+    }
     return msa, pair, mask, weights
 
 
@@ -268,14 +267,14 @@ def case_transition(dtype: torch.dtype):
     gen = _generator(404)
     batch, tokens, hidden, inter = 2, 64, 128, 256
     hidden_in = randn(batch, tokens, hidden, gen=gen, dtype=dtype)
-    kwargs = dict(
-        norm_weight=randn(hidden, gen=gen, dtype=dtype),
-        norm_bias=randn(hidden, gen=gen, dtype=dtype),
-        gate_weight=randn(inter, hidden, gen=gen, dtype=dtype),
-        up_weight=randn(inter, hidden, gen=gen, dtype=dtype),
-        down_weight=randn(hidden, inter, gen=gen, dtype=dtype),
-        eps=1e-5,
-    )
+    kwargs = {
+        "norm_weight": randn(hidden, gen=gen, dtype=dtype),
+        "norm_bias": randn(hidden, gen=gen, dtype=dtype),
+        "gate_weight": randn(inter, hidden, gen=gen, dtype=dtype),
+        "up_weight": randn(inter, hidden, gen=gen, dtype=dtype),
+        "down_weight": randn(hidden, inter, gen=gen, dtype=dtype),
+        "eps": 1e-5,
+    }
     oops = transition(hidden_in, operator_backend="oops", **kwargs)
     eager = transition(hidden_in, operator_backend="eager", **kwargs)
     return oops, eager
@@ -319,12 +318,12 @@ def case_attention(dtype: torch.dtype, *, gating: bool, masked: bool):
         mask = torch.rand(batch, tokens, tokens, generator=gen, device="cuda") > 0.2
         # Guarantee every query keeps at least its diagonal key so no softmax row is fully masked.
         mask = mask | torch.eye(tokens, dtype=torch.bool, device="cuda")
-    common = dict(
-        biases=[pair_bias],
-        attention_mask=mask,
-        projection=proj,
-        torch_backend="eager",
-    )
+    common = {
+        "biases": [pair_bias],
+        "attention_mask": mask,
+        "projection": proj,
+        "torch_backend": "eager",
+    }
     oops = gated_multihead_attention(query, None, None, operator_backend="oops", **common)
     eager = gated_multihead_attention(query, None, None, operator_backend="eager", **common)
     return oops, eager

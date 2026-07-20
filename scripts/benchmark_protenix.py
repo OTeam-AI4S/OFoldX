@@ -271,12 +271,7 @@ def configure_precision(precision: str, device: torch.device) -> None:
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
-    elif precision == "tf32":
-        torch.set_float32_matmul_precision("high")
-        if device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-    elif precision == "bf16":
+    elif precision in ("tf32", "bf16"):
         torch.set_float32_matmul_precision("high")
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True

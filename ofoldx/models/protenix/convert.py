@@ -4,19 +4,29 @@ Protenix checkpoint converter.
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Callable, Mapping
+from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 from torch import Tensor, nn
 
+from ...artifacts import save_model
+
 if TYPE_CHECKING:
     from .model import ProtenixModel
 
 ReferenceKey: TypeAlias = str | tuple[str, ...]
 ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def load_reference_state(checkpoint_path: str | Any, *, map_location: str | Any = "cpu") -> dict[str, Tensor]:
@@ -581,7 +591,78 @@ def convert_protenix_checkpoint(
     return model
 
 
+def save_protenix_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert a Protenix checkpoint and write a standard OFoldX repository.
+
+    Strict-loads the checkpoint via
+    [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
+    auto-selects the default :class:`ProtenixModel` or the constraint
+    :class:`ProtenixConstraintModel` from the checkpoint tensors — pairs it with the matching family
+    Processor, and writes a self-contained ``model.json`` / ``processor.json`` / safetensors repository
+    via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
+    organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    """
+
+    from .model import ProtenixConstraintModel
+    from .processor import ProtenixConstraintProcessor, ProtenixProcessor
+
+    model = convert_protenix_checkpoint(checkpoint_path, dtype=dtype)
+    if isinstance(model, ProtenixConstraintModel):
+        processor: object = ProtenixConstraintProcessor()
+    else:
+        processor = ProtenixProcessor()
+    save_model(
+        output_dir,
+        model=model,
+        processor=processor,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help="released Protenix base checkpoint (e.g. protenix_base_default_v0.5.0.pt)",
+    )
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    save_protenix_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
 def _protenix_reference_key(model_key: str) -> ReferenceKey:
     if model_key.startswith("constraint_embedder."):
         return model_key
     return _alphafold3_reference_key(model_key)
+
+
+if __name__ == "__main__":
+    main()

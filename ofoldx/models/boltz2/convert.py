@@ -14,6 +14,7 @@ first.
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
@@ -22,8 +23,16 @@ from typing import Any, cast
 
 import torch
 
+from ...artifacts import save_model
 from .config import Boltz2AffinityConfig, Boltz2Config
 from .model import Boltz2AffinityModel, Boltz2Model
+from .processor import Boltz2AffinityProcessor, Boltz2Processor
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 # --- Boltz checkpoint-name conversion helpers (duplicated verbatim from the shared Boltz
 # --- converter so boltz2 is self-contained and imports no cross-family models-root module).
@@ -396,7 +405,9 @@ def _split_fused(key: str, tensor: Any) -> list[tuple[str, object]] | None:
         return None
     block, left, right = _FUSED_SPLIT[key]
     half = tensor.shape[0] // 2
-    return [(f"{block}.{left}.weight", tensor[:half]), (f"{block}.{right}.weight", tensor[half:])]
+    # Clone each half so it owns its storage: bare slices are views into the fused tensor's
+    # storage (neither covers it), which safetensors refuses to serialize on save (persistence).
+    return [(f"{block}.{left}.weight", tensor[:half].clone()), (f"{block}.{right}.weight", tensor[half:].clone())]
 
 
 def convert_pairformer_layer(key: str, tensor: object) -> list[tuple[str, object]]:
@@ -1034,3 +1045,135 @@ def _cast_floating_tensors(
         key: value.to(dtype=dtype) if dtype is not None and value.is_floating_point() else value
         for key, value in state_dict.items()
     }
+
+
+def save_boltz2_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    config: Boltz2Config | None = None,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert a Boltz-2 structure-prediction checkpoint and write a standard OFoldX repository.
+
+    Strict-loads the checkpoint via
+    [`convert_boltz2_checkpoint`][ofoldx.models.boltz2.convert.convert_boltz2_checkpoint], pairs the
+    model with the config-less :class:`Boltz2Processor`, and writes a self-contained ``model.json`` /
+    safetensors repository via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. This is
+    the standard ``fold`` pair (``ofoldx.boltz2``); the Processor carries no config, so no
+    ``processor.json`` is written.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
+    organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    """
+
+    model = convert_boltz2_checkpoint(checkpoint_path, config=config, dtype=dtype)
+    save_model(
+        output_dir,
+        model=model,
+        processor=Boltz2Processor(),
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def save_boltz2_affinity_checkpoint(
+    affinity_checkpoint_path: str | PathLike[str],
+    structure_checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    affinity_config: Boltz2AffinityConfig | None = None,
+    structure_config: Boltz2Config | None = None,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert the Boltz-2 affinity + structure checkpoints and write the composite repository.
+
+    The affinity deliverable is a DESIGN §7.4 multi-pair :class:`Boltz2AffinityPipeline`: the affinity
+    head (``ofoldx.boltz2_affinity``, ``standard_tasks=()``) runs only after a structure/confidence
+    pass, so it cannot route as a lone standard pair. This writes the aggregate repository — the
+    affinity pair at the root, the structure/confidence pair (:class:`Boltz2Model` /
+    :class:`Boltz2Processor`) at the fixed ``structure/`` sub-directory, and the one-field
+    ``pipeline.json`` marker — via ``Boltz2AffinityPipeline.save`` so ``pipeline(..., model=dir)``
+    routes it back through the multi-pair loader.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the composite repository.
+    """
+
+    from .pipeline import Boltz2AffinityPipeline
+
+    affinity_model = convert_boltz2_affinity_checkpoint(
+        affinity_checkpoint_path,
+        config=affinity_config,
+        dtype=dtype,
+    )
+    structure_model = convert_boltz2_checkpoint(
+        structure_checkpoint_path,
+        config=structure_config,
+        dtype=dtype,
+    )
+    Boltz2AffinityPipeline(
+        model=affinity_model,
+        processor=Boltz2AffinityProcessor(),
+        structure_model=structure_model,
+        structure_processor=Boltz2Processor(),
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fold = subparsers.add_parser("fold", help="convert the Boltz-2 structure/confidence checkpoint")
+    fold.add_argument("checkpoint", type=Path, help="released Boltz-2 fold .ckpt")
+    fold.add_argument("output_dir", type=Path)
+    fold.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    fold.add_argument("--repo-id", default=None, help="optional Hub repo id; local-only when omitted")
+    fold.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    fold.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+
+    affinity = subparsers.add_parser("affinity", help="convert the Boltz-2 affinity + structure checkpoints")
+    affinity.add_argument("affinity_checkpoint", type=Path, help="released Boltz-2 affinity .ckpt")
+    affinity.add_argument("structure_checkpoint", type=Path, help="released Boltz-2 structure/confidence .ckpt")
+    affinity.add_argument("output_dir", type=Path)
+    affinity.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    affinity.add_argument("--repo-id", default=None, help="optional Hub repo id; local-only when omitted")
+    affinity.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    affinity.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+
+    args = parser.parse_args(argv)
+    dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
+    if args.command == "fold":
+        save_boltz2_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+    else:
+        save_boltz2_affinity_checkpoint(
+            args.affinity_checkpoint,
+            args.structure_checkpoint,
+            args.output_dir,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+
+
+if __name__ == "__main__":
+    main()

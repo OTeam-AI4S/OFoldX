@@ -9,6 +9,7 @@ parameter names.
 
 from __future__ import annotations
 
+import argparse
 import re
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
@@ -18,8 +19,16 @@ from typing import Any, cast
 import torch
 from torch import Tensor
 
+from ...artifacts import save_model
 from .config import Boltz1Config
 from .model import Boltz1Model
+from .processor import Boltz1Processor
+
+_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 _TIED_OUTPUT_PROJECTION = re.compile(
     r"(?:\.diffusion_transformer\.layers\.\d+|\.token_transformer(?:_layers\.0)?\.layers\.\d+)"
@@ -362,7 +371,9 @@ def _convert_score_atom_encoder_key(key: str, tensor: object) -> list[tuple[str,
     if atom_key is not None:
         if atom_key.startswith("atom_attention_encoder.noisy_position_projection."):
             if key == "r_to_q_trans.weight":
-                tensor = cast(Tensor, tensor)[:, :3]
+                # Clone the 3-column slice so it owns its storage; a bare view would not cover the
+                # source weight's storage and safetensors refuses to serialize it on save (persistence).
+                tensor = cast(Tensor, tensor)[:, :3].clone()
             return [("structure_module.score_model." + atom_key, tensor)]
         return [("diffusion_conditioning." + atom_key, tensor)]
     routed = _convert_transformer_layer_key(
@@ -708,7 +719,9 @@ def _split_fused(key: str, tensor: Any) -> list[tuple[str, object]] | None:
         return None
     block, left, right = _FUSED_SPLIT[key]
     half = tensor.shape[0] // 2
-    return [(f"{block}.{left}.weight", tensor[:half]), (f"{block}.{right}.weight", tensor[half:])]
+    # Clone each half so it owns its storage: bare slices are views into the fused tensor's
+    # storage (neither covers it), which safetensors refuses to serialize on save (persistence).
+    return [(f"{block}.{left}.weight", tensor[:half].clone()), (f"{block}.{right}.weight", tensor[half:].clone())]
 
 
 def convert_pairformer_layer(key: str, tensor: object) -> list[tuple[str, object]]:
@@ -953,3 +966,65 @@ def reprefix(key: str, old_prefix: str, new_prefix: str, sub: Converter) -> str 
 
     converted = apply_converter(key[len(old_prefix) :], sub)
     return None if converted is None else new_prefix + converted
+
+
+def save_boltz1_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    config: Boltz1Config | None = None,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert a Boltz-1 ``.ckpt`` and write a standard OFoldX repository.
+
+    Strict-loads the checkpoint via
+    [`convert_boltz1_checkpoint`][ofoldx.models.boltz1.convert.convert_boltz1_checkpoint], pairs
+    the model with the config-less :class:`Boltz1Processor`, and writes a self-contained
+    ``model.json`` / safetensors repository via
+    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The Processor carries no config,
+    so no ``processor.json`` is written.
+
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository to
+    that Hub repo. No organization or token is assumed and nothing is published without an explicit
+    ``repo_id``.
+    """
+
+    model = convert_boltz1_checkpoint(checkpoint_path, config=config, dtype=dtype)
+    save_model(
+        output_dir,
+        model=model,
+        processor=Boltz1Processor(),
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", type=Path, help="original Boltz-1 .ckpt (e.g. boltz1_conf.ckpt)")
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    save_boltz1_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
+if __name__ == "__main__":
+    main()

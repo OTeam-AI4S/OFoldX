@@ -34,8 +34,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.parity.boltz2.forward_parity import B, M, N, build_feats, subset
-from scripts.parity.paths import reference_root, weight_path
+# E402: these imports require REPO_ROOT (inserted above) to be on sys.path first.
+from scripts.parity.boltz2.forward_parity import B, M, N, build_feats, subset  # noqa: E402
+from scripts.parity.paths import reference_root, weight_path  # noqa: E402
 
 REFERENCE_SRC = reference_root("boltz") / "src"
 if str(REFERENCE_SRC) not in sys.path:

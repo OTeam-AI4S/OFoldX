@@ -121,7 +121,6 @@ def main() -> None:
     from protenix.model.modules.embedders import RelativePositionEncoding
     from protenix.model.protenix import update_input_feature_dict
 
-    from ofoldx.models.pxdesign import PxDesignConfig
     from ofoldx.models.pxdesign.convert import (
         _extract_reference_state,
         _pxdesign_reference_key,
@@ -136,7 +135,6 @@ def main() -> None:
     reference_state = _extract_reference_state(checkpoint)
 
     # ---- 1. STRICT LOAD -----------------------------------------------------------------
-    config = PxDesignConfig()
     native = convert_pxdesign_checkpoint(args.checkpoint).to(torch.float32)
     native.set_backend("torch")
     native.eval()
@@ -241,7 +239,7 @@ def main() -> None:
         "upstream_unconsumed": len(unconsumed),
         "upstream_unconsumed_detail": unconsumed[:40],
         "upstream_multiplexed": multiplexed,
-        "per_op_class_max_abs": {k: v for k, v in sorted(per_class.items())},
+        "per_op_class_max_abs": dict(sorted(per_class.items())),
     }
 
     # ---- 3. DENOISER FORWARD PARITY -----------------------------------------------------

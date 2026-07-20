@@ -137,19 +137,19 @@ def _synthetic_features(device):
     # so a faithful RNA row carries a shared nucleic token in that span.
     tokens += [int(torch.randint(21, 25, (1,))) for _ in range(rna_rows)]
     sequence_tokens = torch.tensor([tokens], dtype=torch.long)
-    return dict(
-        atom_coordinates=coordinates.to(device),
-        atom_mask=atom_mask.to(device),
-        valid_mask=valid.to(device).bool(),
-        residue_indices=residue_indices.to(device),
-        chain_indices=chain_indices.to(device),
-        protein_mask=protein_mask.to(device).bool(),
-        dna_mask=dna_mask.to(device).bool(),
-        rna_mask=rna_mask.to(device).bool(),
-        polymer_type_ids=polymer_type_ids.to(device),
-        sequence_tokens=sequence_tokens.to(device),
-        length=length,
-    )
+    return {
+        "atom_coordinates": coordinates.to(device),
+        "atom_mask": atom_mask.to(device),
+        "valid_mask": valid.to(device).bool(),
+        "residue_indices": residue_indices.to(device),
+        "chain_indices": chain_indices.to(device),
+        "protein_mask": protein_mask.to(device).bool(),
+        "dna_mask": dna_mask.to(device).bool(),
+        "rna_mask": rna_mask.to(device).bool(),
+        "polymer_type_ids": polymer_type_ids.to(device),
+        "sequence_tokens": sequence_tokens.to(device),
+        "length": length,
+    }
 
 
 def _native_input(features) -> NaMpnnInput:

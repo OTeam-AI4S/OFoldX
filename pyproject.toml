@@ -91,6 +91,12 @@ profile = "black"
 [tool.mypy]
 ignore_missing_imports = true
 python_version = "3.10"
+# The parity probes under scripts/parity/<family>/ reuse basenames (confidence_parity,
+# forward_parity, ...) across families. Each family dir is a package (its __init__.py),
+# so the modules are family-qualified (boltz1.confidence_parity vs boltz2.confidence_parity).
+# Disable namespace-package discovery so mypy does not ALSO map scripts/parity/*.py under a
+# second "scripts.parity.*" root ("source file found twice").
+namespace_packages = false
 
 [tool.pytest]
 ini_options.addopts = "--import-mode=importlib --doctest-modules --cov=ofoldx"

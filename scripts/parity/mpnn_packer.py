@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - older biotite layout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ofoldx import AutoModel, AutoProcessor
+from ofoldx import AutoModel, AutoProcessor  # noqa: E402
 from ofoldx import pipeline as load_pipeline  # noqa: E402
 from ofoldx.data import is_water_component  # noqa: E402
 from ofoldx.data import residue_constants as rc  # noqa: E402
@@ -343,7 +343,7 @@ def assert_pdb_writer(prediction: PackPrediction) -> None:
         ligand_component = ChemicalComponent("LIG", (ChemicalAtom("C1", "C"),), None)
         ligand = Molecule((ligand_component,))
         water = Molecule((ChemicalComponent("HOH", (ChemicalAtom("O", "O"),), None),))
-        capacity_instances = {chain: "ligand" for chain in nonblank_chains}
+        capacity_instances = dict.fromkeys(nonblank_chains, "ligand")
         capacity_instances["omitted_water"] = "water"
         capacity_instances["all_false"] = "ligand"
         capacity_instances["assigned_blank"] = "ligand"
@@ -755,7 +755,7 @@ def main() -> None:
 
     sys.path.insert(0, str(reference))
     # This inspected upstream OpenFold copy still imports NumPy's removed alias.
-    setattr(np, "int", int)
+    np.int = int
     from data_utils import featurize, parse_PDB
     from sc_utils import Packer, make_torsion_features, pack_side_chains
 
