@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 build/
 dist/
+*.out
 *.egg-info/
 */_version.py
 
@@ -96,7 +97,6 @@ StyleCopReport.xml
 *.obj
 *.iobj
 *.pch
-*.pdb
 *.ipdb
 *.pgc
 *.pgd
@@ -454,3 +454,5 @@ FodyWeavers.xsd
 
 # debug files
 **/*debug*
+OOps/
+artifacts/

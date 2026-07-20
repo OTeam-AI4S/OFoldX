@@ -28,8 +28,3 @@ def test_edm_coefficients(preconditioner: EdmPreconditioner, update: float) -> N
     c_skip = 16.0**2 / norm**2
     c_out = 2.0 * 16.0 / norm
     torch.testing.assert_close(combined, torch.full_like(coords, c_skip + c_out * update))
-
-
-def test_broadcast_noise_level_rejects_incompatible_batch_shape() -> None:
-    with pytest.raises(ValueError):
-        EdmPreconditioner(16.0).broadcast_noise_level(torch.ones(1, 2, 3, 4, 5), torch.ones(2, 3))

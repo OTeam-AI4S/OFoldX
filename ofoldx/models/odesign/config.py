@@ -1,75 +1,50 @@
-r"""
-ODesign model configuration classes.
-
-Defines the ODesign structure-prediction config and its design-generator variant, together with the two
-ODesign-specific sub-config blocks (pairwise design heads and the constraint-distogram embedder). The two
-top-level configs are registered under their architecture keys in [`MODEL_CONFIGS`][ofoldx.models.registry].
-"""
+r"""Persistent configuration for the ODesign architecture and its Processor."""
 
 from __future__ import annotations
 
+from typing import Literal
+
 from chanfig import Config
 
-from ..config import StructurePredictionConfig
-from ..registry import MODEL_CONFIGS
+
+class ODesignTrunkConfig(Config):
+    r"""Pairformer and MSA dimensions that determine the released graph."""
+
+    num_pairformer_blocks: int = 48
+    num_msa_blocks: int = 4
+    pairformer_dropout: float = 0.25
+    msa_dropout: float = 0.15
+    pair_dropout: float = 0.25
+
+
+class ODesignDenoiserConfig(Config):
+    r"""All-atom EDM denoiser dimensions."""
+
+    sigma_data: float = 16.0
+    atom_hidden_size: int = 128
+    atom_pair_hidden_size: int = 16
+    token_hidden_size: int = 768
+    num_token_encoder_blocks: int = 24
+    num_token_encoder_attention_heads: int = 16
+    num_atom_encoder_blocks: int = 3
+    num_atom_encoder_attention_heads: int = 4
+    num_atom_decoder_blocks: int = 3
+    num_atom_decoder_attention_heads: int = 4
+    num_query_atoms: int = 32
+    num_key_atoms: int = 128
 
 
 class ODesignPairwiseConfig(Config):
-    r"""
-    Configuration for ODesign's pairwise (token-pair) design heads.
+    r"""Distogram and bond-reconstruction head dimensions."""
 
-    Controls the token bond-type reconstruction head that predicts per-token-pair covalent bond categories
-    from the pair representation.
-
-    Attributes:
-        bond_reconstruction: Whether to build the token bond-type head. When ``False`` no pairwise design head
-            is instantiated (default ``True``).
-        num_bond_types: Number of bond-type classes the head predicts (default ``2``).
-        hidden_size: Width of the head's hidden classifier layer (default ``128``).
-
-    Examples:
-        >>> config = ODesignPairwiseConfig()
-        >>> config.bond_reconstruction
-        True
-        >>> config.num_bond_types
-        2
-    """
-
-    bond_reconstruction: bool = True
+    num_distogram_bins: int = 64
+    bond_hidden_size: int = 128
     num_bond_types: int = 2
-    hidden_size: int = 128
 
 
 class ODesignConstraintConfig(Config):
-    r"""
-    Configuration for ODesign's constraint-distogram embedder.
+    r"""Observed condition-geometry embedder dimensions."""
 
-    Mirrors upstream ``constraint_distogram_embedder`` (Algorithm 16 template path). When ``enabled`` the
-    model builds a [`ConstraintTemplateEmbedder`][ofoldx.models.odesign.model.ConstraintTemplateEmbedder]
-    and folds any ``constraint_distogram`` passed on the input into the pair representation each recycling
-    cycle. Disabled by default so the base parameter count is unchanged; set ``enabled=True`` to condition
-    generation on distance constraints.
-
-    Attributes:
-        enabled: Whether to build the constraint embedder and consume ``constraint_distogram`` (default
-            ``False``, leaving the base model unchanged).
-        num_blocks: Number of pair-only Pairformer blocks in the embedder (default ``2``).
-        hidden_size: Width of the embedder's internal pair channel (default ``64``).
-        num_bins: Number of distance bins the raw constraint distances are one-hot encoded into (default
-            ``39``).
-        min_distance: Lower edge of the binned distance range, in angstroms (default ``3.25``).
-        max_distance: Upper edge of the binned distance range, in angstroms (default ``50.75``).
-        dropout: Dropout probability inside the embedder's Pairformer stack (default ``0.25``).
-
-    Examples:
-        >>> config = ODesignConstraintConfig()
-        >>> config.enabled
-        False
-        >>> config.num_bins
-        39
-    """
-
-    enabled: bool = False
     num_blocks: int = 2
     hidden_size: int = 64
     num_bins: int = 39
@@ -78,67 +53,40 @@ class ODesignConstraintConfig(Config):
     dropout: float = 0.25
 
 
-@MODEL_CONFIGS.register("odesign")
-class ODesignConfig(StructurePredictionConfig):
-    r"""
-    Configuration for the ODesign structure-prediction model.
+class ODesignConfig(Config):
+    r"""Exact construction parameters for the released ODesign core graph.
 
-    ODesign keeps the structure-prediction trunk and diffusion geometry, but uses the ODesign token schema:
-    restype(35) + profile(32) + deletion_mean(1) + is_hotspot_residue(1), giving 453 token channels. It
-    inherits every shared trunk/diffusion/confidence knob from
-    [`StructurePredictionConfig`][ofoldx.models.config.StructurePredictionConfig] and overrides only the
-    ODesign-specific token/atom feature widths, recycling depth, and design heads.
-
-    Attributes:
-        architecture: Registry key selecting this architecture (`"odesign"`).
-        token_feature_size: Width of the ODesign per-token input feature vector (default ``453``).
-        atom_feature_size: Width of the per-atom input feature vector (default ``386``).
-        recycling_steps: Number of recycling passes through the trunk (default ``10``).
-        num_model_seeds: Number of independent model seeds ensembled at inference (default ``1``).
-        pairwise: Configuration of the pairwise design heads.
-        constraint: Configuration of the constraint-distogram embedder.
-
-    Examples:
-        >>> config = ODesignConfig()
-        >>> config.architecture
-        'odesign'
-        >>> config.token_feature_size
-        453
-        >>> from ofoldx.models.odesign.model import ODesignModel
-        >>> model = ODesignModel(config)  # doctest: +SKIP
+    Runtime placement, operator selection, Hub transport, and training policy are
+    deliberately absent.  ``rigid`` and ``flex`` repositories differ in weights and
+    conditioning inputs, not in this graph or its state-dict contract.
     """
 
-    architecture: str = "odesign"
     token_feature_size: int = 453
     atom_feature_size: int = 386
+    single_size: int = 384
+    pair_size: int = 128
+    relative_position_size: int = 139
     recycling_steps: int = 10
-    num_model_seeds: int = 1
+    trunk: ODesignTrunkConfig = ODesignTrunkConfig()
+    denoiser: ODesignDenoiserConfig = ODesignDenoiserConfig()
     pairwise: ODesignPairwiseConfig = ODesignPairwiseConfig()
     constraint: ODesignConstraintConfig = ODesignConstraintConfig()
 
 
-@MODEL_CONFIGS.register("odesign_design")
-class ODesignDesignConfig(ODesignConfig):
-    r"""
-    Configuration for the ODesign design-generator variant.
+class ODesignProcessorConfig(Config):
+    r"""Persistent configuration for canonical ODesign lowering.
 
-    This design entry point currently shares the ODesign structure trunk and heads, returning generated
-    structure predictions through the design-generator contract. Sequence generation can be added behind this
-    distinct architecture without changing the structure-prediction ``odesign`` registration. It inherits
-    every field from [`ODesignConfig`][ofoldx.models.odesign.config.ODesignConfig] and only overrides the
-    registry key.
-
-    Attributes:
-        architecture: Registry key selecting this architecture (`"odesign_design"`).
-
-    Examples:
-        >>> config = ODesignDesignConfig()
-        >>> config.architecture
-        'odesign_design'
-        >>> config.token_feature_size
-        453
-        >>> from ofoldx.models.odesign.model import ODesignDesigner
-        >>> model = ODesignDesigner(config)  # doctest: +SKIP
+    ``receptor_mode`` (§4.11.1/§4.11.2) selects the released flex/rigid receptor
+    conditioning. It is the *only* thing that differs between the two released protein
+    repositories ``ofoldx/odesign-base-prot-flex`` and ``ofoldx/odesign-base-prot-rigid``:
+    the graph, the ``ODesignConfig``, the ``__call__`` signature, and the
+    ``ODesignInput``/``ODesignOutput`` types are byte-identical, so under §7 ("separate
+    arch only on a signature/type difference") this is one architecture + config, not two
+    registered architecture pairs. ``"rigid"`` marks every existing (non-generated)
+    receptor heavy atom as a hard fixed coordinate (the released ``diffusion`` condition,
+    receptor held rigid); ``"flex"`` regenerates receptor coordinates and pins only atoms
+    named by an explicit hard ``ReferenceCoordinates``. This is additive over the working
+    per-atom ``ReferenceCoordinates`` path in ``processor.py``.
     """
 
-    architecture: str = "odesign_design"
+    receptor_mode: Literal["rigid", "flex"] = "flex"

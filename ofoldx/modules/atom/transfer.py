@@ -20,22 +20,19 @@ def scatter_mean_to_tokens(
     atom_to_token: Tensor,
     num_tokens: int,
     atom_mask: Tensor | None = None,
-    count_eps: float = 0.0,
     operator_backend: str = "auto",
 ) -> Tensor:
     r"""
     Mean-pool per-atom features to tokens by scattering on the atom->token index.
 
-    ``count_eps`` selects the per-token-count denominator guard: ``0`` clamps the count to ``1``, while a positive
-    value adds that epsilon before division. Either way empty tokens stay zero. An optional ``atom_mask`` zeroes
-    padded atoms before the mean; arbitrary leading dimensions are supported by ``_expand_atom_axis``.
+    Empty tokens stay zero. An optional ``atom_mask`` zeroes padded atoms before the mean;
+    arbitrary leading dimensions are supported by ``_expand_atom_axis``.
 
     Args:
         atom_hidden: ``[..., N_atom, C]`` atom features.
         atom_to_token: ``[..., N_atom]`` token index for each atom.
         num_tokens: Number of output tokens.
         atom_mask: Optional ``[..., N_atom]`` valid-atom mask.
-        count_eps: Optional denominator epsilon used after the mean.
         operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
 
     Returns:
@@ -50,13 +47,11 @@ def scatter_mean_to_tokens(
         >>> out.squeeze(-1).tolist()
         [[2.0, 6.0]]
     """
-    atom_to_token = _expand_atom_axis(
-        atom_to_token.to(device=atom_hidden.device, dtype=torch.long), tuple(atom_hidden.shape[:-2])
-    )
+    atom_to_token = _expand_atom_axis(atom_to_token, tuple(atom_hidden.shape[:-2]))
     if atom_mask is not None:
-        atom_mask = _expand_atom_axis(atom_mask.to(device=atom_hidden.device), tuple(atom_hidden.shape[:-2]))
+        atom_mask = _expand_atom_axis(atom_mask, tuple(atom_hidden.shape[:-2]))
 
-    token_hidden = dispatch_atom_to_token_mean(
+    return dispatch_atom_to_token_mean(
         atom_hidden,
         atom_to_token,
         num_tokens=num_tokens,
@@ -64,10 +59,6 @@ def scatter_mean_to_tokens(
         eps=1.0,
         operator_backend=operator_backend,
     )
-    if count_eps:
-        counts = _atom_token_counts(atom_hidden, atom_to_token, num_tokens=num_tokens, atom_mask=atom_mask)
-        token_hidden = token_hidden * counts / (counts + count_eps)
-    return token_hidden
 
 
 def dense_mean_to_tokens(
@@ -87,13 +78,10 @@ def dense_mean_to_tokens(
 
     prefix = tuple(atom_hidden.shape[:-2])
     num_atoms, hidden_size = atom_hidden.shape[-2:]
-    atom_to_token = _expand_atom_axis(
-        atom_to_token.to(device=atom_hidden.device, dtype=torch.long),
-        prefix,
-    )
+    atom_to_token = _expand_atom_axis(atom_to_token, prefix)
     weights = F.one_hot(atom_to_token, num_classes=num_tokens).to(dtype=atom_hidden.dtype)
     if atom_mask is not None:
-        atom_mask = _expand_atom_axis(atom_mask.to(device=atom_hidden.device, dtype=atom_hidden.dtype), prefix)
+        atom_mask = _expand_atom_axis(atom_mask.to(dtype=atom_hidden.dtype), prefix)
         weights = weights * atom_mask.unsqueeze(-1)
 
     weights = weights / (weights.sum(dim=-2, keepdim=True) + count_eps)
@@ -150,9 +138,7 @@ class TokenToAtomBroadcast(nn.Module):
             torch.Size([1, 4, 1])
         """
 
-        atom_to_token = _expand_atom_axis(
-            atom_to_token.to(device=token_hidden.device, dtype=torch.long), tuple(token_hidden.shape[:-2])
-        )
+        atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_hidden.shape[:-2]))
         return dispatch_token_to_atom_broadcast(token_hidden, atom_to_token, operator_backend=self.operator_backend)
 
 
@@ -196,10 +182,7 @@ class TokenPairToAtomPairBroadcast(nn.Module):
             torch.Size([1, 4, 4, 1])
         """
 
-        atom_to_token = _expand_atom_axis(
-            atom_to_token.to(device=token_pair.device, dtype=torch.long),
-            tuple(token_pair.shape[:-3]),
-        )
+        atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_pair.shape[:-3]))
         prefix = tuple(token_pair.shape[:-3])
         num_tokens = token_pair.shape[-3]
         num_atoms = atom_to_token.shape[-1]
@@ -246,13 +229,15 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
 
-    def forward(self, token_pair: Tensor, atom_to_token: Tensor) -> Tensor:
+    def forward(self, token_pair: Tensor, atom_to_token: Tensor, num_valid_atoms: int | None = None) -> Tensor:
         r"""
         Broadcast token-pair features to local atom-pair windows.
 
         Args:
             token_pair: ``[..., N_token, N_token, C]`` token-pair features.
             atom_to_token: ``[..., N_atom]`` token index for each atom.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window so the
+                pair-bias windows line up with the attention key gather. Unset keeps the legacy padded window.
 
         Returns:
             ``[..., N_window, num_query_atoms, num_key_atoms, C]`` local atom-pair features.
@@ -267,10 +252,7 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
             torch.Size([1, 2, 2, 4, 1])
         """
 
-        atom_to_token = _expand_atom_axis(
-            atom_to_token.to(device=token_pair.device, dtype=torch.long),
-            tuple(token_pair.shape[:-3]),
-        )
+        atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_pair.shape[:-3]))
         shared_atom_to_token = _shared_atom_to_token(atom_to_token)
         if shared_atom_to_token is not None:
             return dispatch_token_pair_to_atom_window_gather(
@@ -279,9 +261,10 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
                 n_queries=self.windowing.num_query_atoms,
                 n_keys=self.windowing.num_key_atoms,
                 operator_backend=self.operator_backend,
+                num_valid_atoms=num_valid_atoms,
             )
 
-        token_windows = self.windowing(atom_to_token.unsqueeze(-1))
+        token_windows = self.windowing(atom_to_token.unsqueeze(-1), num_valid_atoms)
         query_token_index = token_windows.query.squeeze(-1)
         key_token_index = token_windows.key.squeeze(-1)
 
@@ -329,35 +312,6 @@ def _expand_atom_axis(tensor: Tensor, target_prefix: tuple[int, ...]) -> Tensor:
         view_shape = (*source_prefix, *((1,) * (len(target_prefix) - len(source_prefix))), num_atoms)
         tensor = tensor.reshape(view_shape)
     return torch.broadcast_to(tensor, target_shape)
-
-
-def _atom_token_counts(
-    atom_hidden: Tensor,
-    atom_to_token: Tensor,
-    *,
-    num_tokens: int,
-    atom_mask: Tensor | None,
-) -> Tensor:
-    r"""
-    Count how many (optionally masked) atoms scatter into each token.
-
-    Args:
-        atom_hidden: ``[..., N_atom, C]`` atom features; only its shape/dtype/device are used.
-        atom_to_token: ``[..., N_atom]`` token index for each atom.
-        num_tokens: Number of output tokens.
-        atom_mask: Optional ``[..., N_atom]`` valid-atom mask; masked atoms are not counted.
-
-    Returns:
-        ``[..., N_token, 1]`` per-token atom counts, used as the mean denominator guard.
-    """
-    num_atoms = atom_hidden.shape[-2]
-    flat_token_index = atom_to_token.reshape(-1, num_atoms)
-    count_values = atom_hidden.new_ones(*atom_hidden.shape[:-1], 1)
-    if atom_mask is not None:
-        count_values = count_values * atom_mask.unsqueeze(-1).to(dtype=atom_hidden.dtype)
-    counts = atom_hidden.new_zeros(flat_token_index.shape[0], num_tokens, 1)
-    counts.scatter_add_(1, flat_token_index.unsqueeze(-1), count_values.reshape(-1, num_atoms, 1))
-    return counts.reshape(*atom_hidden.shape[:-2], num_tokens, 1)
 
 
 def _shared_atom_to_token(atom_to_token: Tensor) -> Tensor | None:

@@ -14,11 +14,7 @@ first.
 
 from __future__ import annotations
 
-import argparse
-import json
 import re
-import sys
-import types
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from pathlib import Path
@@ -26,18 +22,23 @@ from typing import Any, cast
 
 import torch
 
-from ...hub import add_hub_upload_arguments, upload_artifact_from_args
+from .config import Boltz2AffinityConfig, Boltz2Config
+from .model import Boltz2AffinityModel, Boltz2Model
 
+# --- Boltz checkpoint-name conversion helpers (duplicated verbatim from the shared Boltz
+# --- converter so boltz2 is self-contained and imports no cross-family models-root module).
 Rule = tuple[re.Pattern[str], str | None]
-# A converter maps one Boltz key to its OFoldX name, or to ``None`` to drop it. It is either an
-# ordered rule list or a callable (used for nested-prefix routing).
 Converter = list[Rule] | Callable[[str], "str | None"]
-_DTYPES = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
-_STATE_KEYS = ("state_dict", "model_state_dict", "model")
+_TIED_OUTPUT_PROJECTION = re.compile(
+    r"(?:\.diffusion_transformer\.layers\.\d+|\.token_transformer(?:_layers\.0)?\.layers\.\d+)"
+    r"\.(?:transition\.)?output_projection\.0\.(?:weight|bias)$"
+)
+
+
+def is_tied_output_projection(key: str) -> bool:
+    r"""Return whether ``key`` is a released Boltz checkpoint's tied projection duplicate."""
+
+    return _TIED_OUTPUT_PROJECTION.search(key) is not None
 
 
 def _rules(pairs: Iterable[tuple[str, str | None]]) -> list[Rule]:
@@ -711,8 +712,7 @@ def reprefix(key: str, old_prefix: str, new_prefix: str, sub: Converter) -> str 
 
 def reprefix_indexed(key: str, old_prefix: str, new_prefix: str, sub: Converter) -> str | None:
     r"""
-    Like [`reprefix`][ofoldx.models.boltz2.convert.reprefix] but preserves a ``<index>.`` segment that follows
-    the prefix.
+    Like ``reprefix`` but preserves a ``<index>.`` segment that follows the prefix.
 
     Args:
         key: The full key beginning with ``old_prefix`` followed by an ``<index>.`` segment.
@@ -729,95 +729,9 @@ def reprefix_indexed(key: str, old_prefix: str, new_prefix: str, sub: Converter)
     return None if converted is None else f"{new_prefix}{index}.{converted}"
 
 
-def convert_subset(subset: dict[str, object], converter: Converter) -> dict[str, object]:
-    r"""
-    Apply ``converter`` to every key of ``subset``, dropping keys mapped to ``None``.
-
-    Args:
-        subset: A ``{key: tensor}`` sub-dict of a Boltz state dict.
-        converter: Converter applied to each key.
-
-    Returns:
-        A new dict keyed by the converted names, with dropped keys omitted.
-
-    Examples:
-        >>> import re
-        >>> convert_subset({"distogram.weight": 1}, [(re.compile(r"^distogram\."), "linear.")])
-        {'linear.weight': 1}
-    """
-
-    converted: dict[str, object] = {}
-    for key, value in subset.items():
-        new_key = apply_converter(key, converter)
-        if new_key is not None:
-            converted[new_key] = value
-    return converted
+_AFFINITY_PREFIXES = ("affinity_module1.", "affinity_module2.")
 
 
-def convert_subset_tensors(
-    subset: dict[str, object], converter: Callable[[str, Any], list[tuple[str, object]]]
-) -> dict[str, object]:
-    r"""
-    Apply a tensor-aware converter ``(key, tensor) -> [(key, tensor), ...]`` to ``subset``.
-
-    Used by subsystems that split or otherwise reshape weights (e.g. the fused triangle-multiplication
-    projections), where one source key can map to several targets.
-
-    Args:
-        subset: A ``{key: tensor}`` sub-dict of a Boltz state dict.
-        converter: A tensor-aware converter mapping one ``(key, tensor)`` to a list of output pairs.
-
-    Returns:
-        A new dict keyed by the converted names (one source key may contribute several entries).
-    """
-
-    converted: dict[str, object] = {}
-    for key, value in subset.items():
-        for new_key, new_value in converter(key, value):
-            converted[new_key] = new_value
-    return converted
-
-
-_ADAPTIVE_NORM_MODULES = ("conditioned_norm", "key_value_norm")
-
-
-def _adaptive_norm_base(key: str, projection: str, param: str) -> str | None:
-    r"""
-    Return the module base of an AdaLN scale/shift key, or ``None`` if ``key`` is not such a key.
-
-    Args:
-        key: A converted state-dict key.
-        projection: The projection name to match (``"gate_projection"`` or ``"shift_projection"``).
-        param: The parameter suffix to match (``"weight"`` or ``"bias"``).
-
-    Returns:
-        The key prefix up to and including the adaptive-norm module (so ``base + tail`` reconstructs ``key``),
-        or ``None`` when ``key`` does not end in the given adaptive-norm projection/param.
-    """
-
-    tail = f"{projection}.{param}"
-    for module in _ADAPTIVE_NORM_MODULES:
-        suffix = f"{module}.{tail}"
-        if key == suffix or key.endswith("." + suffix):
-            return key[: -len(tail)]
-    return None
-
-
-def pack_adaptive_layer_norm_state(state_dict: dict[str, object]) -> dict[str, object]:
-    r"""
-    Keep converted AdaLN scale/shift projections in the explicit Boltz layout.
-
-    Args:
-        state_dict: A converted state dict carrying split ``gate_projection`` / ``shift_projection`` AdaLN entries.
-
-    Returns:
-        A shallow copy of ``state_dict``.
-    """
-
-    return dict(state_dict)
-
-
-# Boltz ConfidenceModule -> OFoldX ConfidenceHead (clean names).
 CONFIDENCE_FLAT_RULES: list[Rule] = _rules(
     [
         (r"^dist_bin_pairwise_embed\.", "distance_embedding."),
@@ -945,7 +859,7 @@ def convert_affinity_head(key: str, tensor: object) -> list[tuple[str, object]]:
     return [(new, tensor)] if new is not None else []
 
 
-def convert_affinity_modules(state_dict: dict[str, object]) -> dict[str, object]:
+def convert_affinity_modules(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     r"""
     Convert upstream affinity head weights into ``Boltz2AffinityModel`` module names.
 
@@ -956,12 +870,15 @@ def convert_affinity_modules(state_dict: dict[str, object]) -> dict[str, object]
         Converted affinity head tensors under ``affinity_module*``.
     """
 
-    converted: dict[str, object] = {}
+    converted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        for module in ("affinity_module1", "affinity_module2", "affinity_module"):
+        for module in ("affinity_module1", "affinity_module2"):
             prefix = module + "."
             if key.startswith(prefix):
-                for new_key, new_value in convert_affinity_head(key[len(prefix) :], value):
+                entries = convert_affinity_head(key[len(prefix) :], value)
+                if not entries:
+                    raise KeyError(f"unmapped affinity checkpoint key: {key}")
+                for new_key, new_value in entries:
                     converted[f"{module}.{new_key}"] = new_value
                 break
     return converted
@@ -1036,15 +953,17 @@ def convert_trunk_key(key: str, tensor: object) -> list[tuple[str, object]]:
     return []
 
 
-def convert_trunk(state_dict: dict[str, object]) -> dict[str, object]:
+def convert_trunk(state_dict: Mapping[str, torch.Tensor], *, allow_affinity: bool = False) -> dict[str, torch.Tensor]:
     r"""
-    Convert a full Boltz-2 ``state_dict`` to the ``Boltz2Model`` trunk param tree (non-trunk dropped).
+    Convert a full Boltz-2 ``state_dict`` to the ``Boltz2Model`` parameter tree.
 
     Applies [`convert_trunk_key`][ofoldx.models.boltz2.convert.convert_trunk_key] to every entry, then packs
-    the AdaLN scale/shift projections so the result ``strict``-loads into the OFoldX modules.
+    the AdaLN scale/shift projections so the result ``strict``-loads into the OFoldX modules. Unknown keys fail;
+    ``allow_affinity`` skips only the two exact affinity-module prefixes handled by the affinity converter.
 
     Args:
         state_dict: A full Boltz-2 checkpoint ``state_dict``.
+        allow_affinity: Whether the released affinity-module prefixes may be routed by a separate converter.
 
     Returns:
         The converted trunk ``state_dict`` under the ``Boltz2Model`` param names.
@@ -1056,166 +975,53 @@ def convert_trunk(state_dict: dict[str, object]) -> dict[str, object]:
         >>> model.load_state_dict(converted, strict=True)  # doctest: +SKIP
     """
 
-    converted: dict[str, object] = {}
+    converted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        for new_key, new_value in convert_trunk_key(key, value):
+        entries = convert_trunk_key(key, value)
+        if not entries:
+            if is_tied_output_projection(key):
+                continue
+            if allow_affinity and key.startswith(_AFFINITY_PREFIXES):
+                continue
+            raise KeyError(f"unmapped Boltz-2 checkpoint key: {key}")
+        for new_key, new_value in entries:
             converted[new_key] = new_value
-    return pack_adaptive_layer_norm_state(converted)
+    return converted
 
 
 def convert_boltz2_checkpoint(
     checkpoint_path: str | PathLike[str],
-    output_dir: str | PathLike[str],
     *,
-    architecture: str = "boltz2",
-    state_key: str = "auto",
+    config: Boltz2Config | None = None,
     dtype: torch.dtype | None = None,
-) -> dict[str, Any]:
-    r"""
-    Convert a public Boltz-2 checkpoint into a pretrained OFoldX artifact directory.
+) -> Boltz2Model:
+    r"""Convert a released Boltz-2 structure-prediction checkpoint."""
 
-    Args:
-        checkpoint_path: Path to ``boltz2_conf.ckpt``.
-        output_dir: Directory to write ``manifest.json``, ``config.json``, and ``model.safetensors``.
-        architecture: Target architecture: ``"boltz2"`` or ``"boltz2_affinity"``.
-        state_key: Checkpoint state-dict key: ``"auto"``, ``"state_dict"``, ``"model_state_dict"``,
-            ``"model"``, or ``"root"``.
-        dtype: Optional floating-point dtype for persisted weights.
-
-    Returns:
-        JSON-serializable conversion report.
-
-    Examples:
-        >>> convert_boltz2_checkpoint("boltz2_conf.ckpt", "boltz2")  # doctest: +SKIP
-    """
-
-    from .config import Boltz2AffinityConfig, Boltz2Config
-    from .model import Boltz2AffinityModel, Boltz2Model
-
-    checkpoint_path = Path(checkpoint_path)
-    output_dir = Path(output_dir)
-    checkpoint = _load_boltz_lightning_checkpoint(checkpoint_path)
-    raw_state, selected_state_key = _select_state_dict(checkpoint, state_key=state_key)
-    if architecture == "boltz2":
-        model = Boltz2Model(Boltz2Config())
-        converted_raw = convert_trunk(dict(raw_state))
-    elif architecture == "boltz2_affinity":
-        model = Boltz2AffinityModel(Boltz2AffinityConfig())
-        converted_raw = convert_trunk(dict(raw_state))
-        converted_raw.update(convert_affinity_modules(dict(raw_state)))
-    else:
-        raise ValueError(f"unsupported Boltz-2 architecture: {architecture!r}")
-    converted = _cast_floating_tensors(_tensor_state_dict(converted_raw), dtype)
-    if dtype is not None:
-        model.to(dtype=dtype)
-    model.load_state_dict(converted, strict=True)
-    model.save_pretrained(output_dir)
-    return {
-        "checkpoint": str(checkpoint_path),
-        "output_dir": str(output_dir),
-        "architecture": model.config.architecture,
-        "state_key": selected_state_key,
-        "tensor_count": len(converted),
-        "dtype": str(dtype) if dtype is not None else None,
-        "dtype_counts": _dtype_counts(converted),
-    }
+    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    converted = _cast_floating_tensors(convert_trunk(checkpoint["state_dict"]), dtype)
+    with torch.device("meta"):
+        model = Boltz2Model(config)
+    model.load_state_dict(converted, strict=True, assign=True)
+    return model
 
 
-def _load_boltz_lightning_checkpoint(checkpoint_path: Path) -> Mapping[str, Any]:
-    r"""
-    Load Boltz Lightning checkpoints without requiring the original ``boltzgen`` package.
+def convert_boltz2_affinity_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    *,
+    config: Boltz2AffinityConfig | None = None,
+    dtype: torch.dtype | None = None,
+) -> Boltz2AffinityModel:
+    r"""Convert the released two-head Boltz-2 affinity checkpoint."""
 
-    Some released checkpoints pickle validator objects from ``boltzgen.model.validation`` next to the tensor
-    ``state_dict``. OFoldX only consumes the tensors, so this loader stubs those metadata classes when needed.
-    """
-
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except ModuleNotFoundError as error:
-        if error.name != "boltzgen":
-            raise
-        checkpoint = _load_with_boltzgen_unpickle_stubs(checkpoint_path)
-    if not isinstance(checkpoint, Mapping):
-        raise TypeError("checkpoint must be a mapping")
-    return checkpoint
-
-
-def _load_with_boltzgen_unpickle_stubs(checkpoint_path: Path) -> object:
-    r"""Load a checkpoint with temporary ``boltzgen`` validator stubs."""
-
-    modules = _boltzgen_unpickle_stub_modules()
-    previous: dict[str, types.ModuleType | None] = {name: sys.modules.get(name) for name in modules}
-    try:
-        sys.modules.update(modules)
-        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    finally:
-        for name, previous_module in previous.items():
-            if previous_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous_module
-
-
-def _boltzgen_unpickle_stub_modules() -> dict[str, types.ModuleType]:
-    r"""Build minimal modules/classes needed to unpickle released Boltz checkpoint metadata."""
-
-    class DesignValidator:
-        pass
-
-    class RCSBValidator:
-        pass
-
-    DesignValidator.__module__ = "boltzgen.model.validation.design"
-    RCSBValidator.__module__ = "boltzgen.model.validation.rcsb"
-    modules = {
-        "boltzgen": types.ModuleType("boltzgen"),
-        "boltzgen.model": types.ModuleType("boltzgen.model"),
-        "boltzgen.model.validation": types.ModuleType("boltzgen.model.validation"),
-        "boltzgen.model.validation.design": types.ModuleType("boltzgen.model.validation.design"),
-        "boltzgen.model.validation.rcsb": types.ModuleType("boltzgen.model.validation.rcsb"),
-    }
-    design_module = cast(Any, modules["boltzgen.model.validation.design"])
-    rcsb_module = cast(Any, modules["boltzgen.model.validation.rcsb"])
-    root_module = cast(Any, modules["boltzgen"])
-    model_module = cast(Any, modules["boltzgen.model"])
-    validation_module = cast(Any, modules["boltzgen.model.validation"])
-    design_module.DesignValidator = DesignValidator
-    rcsb_module.RCSBValidator = RCSBValidator
-    root_module.model = modules["boltzgen.model"]
-    model_module.validation = modules["boltzgen.model.validation"]
-    validation_module.design = modules["boltzgen.model.validation.design"]
-    validation_module.rcsb = modules["boltzgen.model.validation.rcsb"]
-    return modules
-
-
-def _select_state_dict(checkpoint: Mapping[str, Any], *, state_key: str) -> tuple[Mapping[str, Any], str]:
-    r"""Locate the tensor state dict within a checkpoint mapping."""
-
-    if state_key == "auto":
-        for key in _STATE_KEYS:
-            value = checkpoint.get(key)
-            if isinstance(value, Mapping):
-                return value, key
-        if _looks_like_state_dict(checkpoint):
-            return checkpoint, "root"
-    if state_key == "root" and _looks_like_state_dict(checkpoint):
-        return checkpoint, "root"
-    value = checkpoint.get(state_key)
-    if isinstance(value, Mapping):
-        return value, state_key
-    raise TypeError(f"checkpoint does not contain tensor state dict {state_key!r}")
-
-
-def _looks_like_state_dict(value: Mapping[str, Any]) -> bool:
-    r"""Return whether ``value`` looks like a raw tensor state dict."""
-
-    return bool(value) and any(isinstance(key, str) and torch.is_tensor(tensor) for key, tensor in value.items())
-
-
-def _tensor_state_dict(state_dict: Mapping[str, object]) -> dict[str, torch.Tensor]:
-    r"""Keep only tensor-valued entries from ``state_dict``."""
-
-    return {key: value for key, value in state_dict.items() if isinstance(key, str) and torch.is_tensor(value)}
+    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    state = checkpoint["state_dict"]
+    converted = convert_trunk(state, allow_affinity=True)
+    converted.update(convert_affinity_modules(state))
+    converted = _cast_floating_tensors(converted, dtype)
+    with torch.device("meta"):
+        model = Boltz2AffinityModel(config)
+    model.load_state_dict(converted, strict=True, assign=True)
+    return model
 
 
 def _cast_floating_tensors(
@@ -1228,64 +1034,3 @@ def _cast_floating_tensors(
         key: value.to(dtype=dtype) if dtype is not None and value.is_floating_point() else value
         for key, value in state_dict.items()
     }
-
-
-def _dtype_counts(state_dict: Mapping[str, torch.Tensor]) -> dict[str, int]:
-    r"""Return a sorted count of tensors per dtype name in ``state_dict``."""
-
-    counts: dict[str, int] = {}
-    for tensor in state_dict.values():
-        name = str(tensor.dtype).removeprefix("torch.")
-        counts[name] = counts.get(name, 0) + 1
-    return dict(sorted(counts.items()))
-
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    r"""Parse command-line arguments for Boltz-2 checkpoint conversion."""
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path, help="Path to a public Boltz-2 .ckpt checkpoint")
-    parser.add_argument("output_dir", type=Path, help="Output pretrained directory")
-    parser.add_argument(
-        "--architecture",
-        choices=("boltz2", "boltz2_affinity"),
-        default="boltz2",
-        help="Target OFoldX architecture to save.",
-    )
-    parser.add_argument(
-        "--state-key", default="auto", help="Checkpoint state key: auto, state_dict, model_state_dict, model, or root"
-    )
-    parser.add_argument("--dtype", choices=("keep", "float32", "float16", "bfloat16"), default="keep")
-    add_hub_upload_arguments(parser)
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    r"""
-    Command-line entry point for Boltz-2 checkpoint conversion.
-
-    Examples:
-        >>> main(["boltz2_conf.ckpt", "out/boltz2"])  # doctest: +SKIP
-    """
-
-    args = _parse_args(argv)
-    dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
-    report = convert_boltz2_checkpoint(
-        args.checkpoint,
-        args.output_dir,
-        architecture=args.architecture,
-        state_key=args.state_key,
-        dtype=dtype,
-    )
-    print(json.dumps(report, indent=2, sort_keys=True))
-    upload_result = upload_artifact_from_args(
-        args.output_dir,
-        args,
-        commit_message="Upload converted Boltz-2 checkpoint",
-    )
-    if upload_result is not None:
-        print(f"hub_upload: {upload_result}")
-
-
-if __name__ == "__main__":
-    main()

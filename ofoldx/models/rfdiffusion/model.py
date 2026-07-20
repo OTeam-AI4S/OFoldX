@@ -1,405 +1,508 @@
-r"""
-RfDiffusion design model.
-"""
+r"""RFdiffusion denoiser, sampler, and public scientific modules."""
 
 from __future__ import annotations
 
-import contextlib
-import functools as fn
-import glob
 import math
-import os
 import pickle
-import random
-import string
-from collections import namedtuple
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from functools import cache
+from importlib.resources import files
+from operator import index as integer_index
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Literal, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from opt_einsum import contract as einsum
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
-from torch import Tensor, nn
+from torch import Tensor, einsum, nn
+from typing_extensions import Self
 
-from ...modules.backend import oops_kernel
-from ...modules.representation import Pair, Single
-from ..contract import AllAtomDesignCandidate, BaseInput, StructurePredictionOutput, register_pytree_dataclass
-from ..mixin import ModelMixin
-from ..registry import DESIGN_MODELS, MODELS
-from .chemical import (
-    AA3_TO_1,
+# The family-owned RFdiffusion spatial/placement condition records (RFdiffusionPlacements,
+# Coordination, Distance, RadiusOfGyration, ReferenceCoordinates, SecondaryStructure,
+# SubstrateInteraction, and PointGroupSymmetry) are defined below
+# in this module (folded in from the former .conditions submodule). The frozen §3.7 placement
+# records and constraint bond they build on are imported from .data.bonds / .data.placement.
+from ...data.bonds import SymbolicBond
+from ...data.components import get_component
+
+# AllowedResidueIdentities / Contact / Hotspot stay shared: the frozen §3.7.1 identity record and
+# the frozen §3.7.4 constraint records.
+from ...data.conditions import AllowedResidueIdentities, Contact, Hotspot
+from ...data.evidence import Template
+from ...data.molecular import (
+    AtomSite,
+    ChemicalComponent,
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+    SystemBond,
+)
+from ...data.placement import (
+    ExistingSpan,
+    GeneratedSegment,
+    InstanceIdAllocator,
+    PlacementMap,
+)
+from ...data.placement import PlacementSpec as PlacementMapping
+from ...data.placement import SymbolicAtomSite, SymbolicResidueSite
+from ...data.structure import Structure
+from ...modules.backend._rfdiffusion import (
+    _select_backend,
+    se3_basis,
+    segment_softmax_csr,
+    segment_sum_csr,
+    weighted_tensor_product,
+)
+from ...results import Metric, Score
+from .chemistry import (
     ATOM14_NAMES,
     CHI_ATOM_NAMES,
     INIT_CRDS,
     MASK_TOKEN,
     NUM2AA,
+    residue_token,
     rf_all_atom_kinematics,
 )
-from .config import RfDiffusionConfig
+from .config import RFdiffusionConfig
 
-# SE(3)-equivariant kernels only OOps provides (no eager reference yet); binding them through
-# oops_kernel keeps ``import ofoldx`` working without OOps and defers the error to actual rfdiffusion use.
-se3_basis = oops_kernel("se3_basis")
-segment_softmax_csr = oops_kernel("segment_softmax_csr")
-segment_sum_csr = oops_kernel("segment_sum_csr")
-weighted_tensor_product = oops_kernel("weighted_tensor_product")
+# The duplicated family string aliases ``ResidueReference`` / ``AtomReference`` are dropped in
+# favor of the frozen reference vocabulary: an atom-granularity endpoint is
+# :data:`~ofoldx.data.bonds.SymbolicBondSite` (== :data:`~ofoldx.data.conditions.AtomEndpoint`,
+# ``AtomSite | SymbolicAtomSite``); a residue-granularity endpoint is
+# :data:`~ofoldx.data.conditions.ResidueEndpoint` (``ComponentReference | str | SymbolicResidueSite``).
 
 
-@MODELS.register("rfdiffusion")
-@DESIGN_MODELS.register("rfdiffusion")
-class RfDiffusionDesigner(ModelMixin):
-    r"""
-    Denoising-diffusion model that generates novel protein backbones from a noised structure (RfDiffusion).
+# --------------------------------------------------------------------------------------
+# Placement condition envelope (FROZEN §3.7 placement core carried with the family-owned
+# ``chain_lengths`` length argument).
+# --------------------------------------------------------------------------------------
 
-    Public entry point for the RfDiffusion architecture. Holds the RoseTTAFold network
-    ([`RoseTTAFoldModule`][ofoldx.models.rfdiffusion.model.RoseTTAFoldModule]) as its ``network``
-    submodule and drives the diffusion sampling loop through
-    [`NativeRfDiffusionSampler`][ofoldx.models.rfdiffusion.model.NativeRfDiffusionSampler]. Given a
-    tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput], it denoises one or
-    more backbone designs.
 
-    Args:
-        config: Model configuration; defaults to a fresh
-            [`RfDiffusionConfig`][ofoldx.models.rfdiffusion.config.RfDiffusionConfig] (the reference
-            ``base`` architecture) when omitted.
+@dataclass(frozen=True)
+class RFdiffusionPlacements:
+    r"""One RFdiffusion generation topology: the frozen placement core plus its lengths.
 
-    Examples:
-        >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-        >>> processor = AutoProcessor.from_pretrained("oteam/rfdiffusion")  # doctest: +SKIP
-        >>> model = AutoModel.from_pretrained("oteam/rfdiffusion")  # doctest: +SKIP
-        >>> output = model(processor("target.pdb"))  # doctest: +SKIP
+    ``placements`` is the frozen §3.7 core ``PlacementSpec`` mapping
+    (``declaration_group -> placement_id -> PlacementValue``); its inner ``placement_id``
+    keys are globally unique and carry identity. ``chain_lengths`` is the RFdiffusion
+    family-owned per-group combined-length argument (aligned to the declaration-group
+    order of ``placements``); it stays on this family envelope, NEVER on the shared core
+    (which carries no length field). ``intent`` is always ``"hard"`` for RFdiffusion.
     """
 
-    config_class = RfDiffusionConfig
-    # Bound to ``RfDiffusionInput`` at module load (below its definition); enables the keyword-tensor
-    # ``model(**inputs)`` construction path on ``ModelMixin.__call__``.
-    input_class: ClassVar[type[BaseInput]]
+    placements: PlacementMapping
+    chain_lengths: tuple[int | None, ...] | None = None
+    intent: Literal["hard", "soft"] = "hard"
 
-    def __init__(self, config: RfDiffusionConfig | None = None) -> None:
-        config = RfDiffusionConfig() if config is None else config
-        super().__init__(config)
-        model, preprocess = config.model, config.preprocess
+
+# --------------------------------------------------------------------------------------
+# Family-owned spatial / placement conditions (DESIGN 3.7.2, family-owned & investigated).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReferenceCoordinates:
+    r"""Fixed backbone coordinates for a set of existing atoms (consumed as ``hard``)."""
+
+    sites: tuple[AtomSite, ...]
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class Coordination:
+    r"""A smooth ``1 / (1 + x**6)`` coordination-number potential between two sides."""
+
+    side_a: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
+    side_b: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
+    center_angstrom: float
+    scale_angstrom: float
+    direction: Literal["maximize", "minimize"]
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class Distance:
+    r"""A tolerance-padded ``[lower, upper]`` distance interval between two atoms."""
+
+    site_a: AtomSite | SymbolicAtomSite
+    site_b: AtomSite | SymbolicAtomSite
+    lower_angstrom: float
+    upper_angstrom: float
+    tolerance_angstrom: float = 0.0
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class RadiusOfGyration:
+    r"""A compactness potential over a set of residue centroids."""
+
+    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    upper_angstrom: float
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class SubstrateInteraction:
+    r"""The released nearest-substrate attraction and clearance potential.
+
+    ``repulsion_cutoff_angstrom`` is the released ``rep_r_0`` clearance radius; the
+    non-default ``rep_r_min=0`` all-pairs branch is a separate control (see the family
+    README) and is not represented by this default meaning.
+    """
+
+    residues: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    substrate_atoms: tuple[AtomSite | SymbolicAtomSite, ...]
+    center_angstrom: float
+    scale_angstrom: float
+    attraction_strength: float
+    repulsion_slope: float
+    repulsion_cutoff_angstrom: float = 5.0
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+# RFdiffusion's requested covalent bond (e.g. terminal peptide cyclization) IS the frozen §3.7.4
+# ``SymbolicBond``; the family declares no separate record and no compatibility alias (DESIGN §10.2
+# forbids preserving prototype names through aliases). The processor still collapses a terminal
+# N->C ``SymbolicBond`` to ``cyclic_mask`` (behavior unchanged), and RFdiffusion always consumes it
+# as ``hard`` (the frozen ``SymbolicBond`` carries no ``intent`` field, matching that fixed meaning).
+
+
+@dataclass(frozen=True)
+class PointGroupSymmetry:
+    r"""A point-group symmetry over equal-length residue units (consumed as ``hard``)."""
+
+    units: tuple[tuple[ComponentReference | str | SymbolicResidueSite, ...], ...]
+    kind: str
+    order: int | None
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class SecondaryStructure:
+    r"""A per-target secondary-structure label; requires a fold-conditioned checkpoint."""
+
+    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    kind: str
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(eq=False)
+class RFdiffusionDesignCandidate:
+    r"""One coordinate-producing RFdiffusion generation sample and its aligned values.
+
+    Each candidate owns the complete decoded backbone ``Structure`` (which owns its
+    ``MolecularSystem`` via ``Structure.system``). Generated residue identity is CCD ``UNK``;
+    the Structure contains only the backbone sites RFdiffusion produced. The variable placement
+    length across candidates is the coordinate-producing, variable-topology property that
+    forbids reuse of the shared ``DesignCandidate``. Standalone -- no base class.
+
+    ``placement_map`` is the frozen §3.7 realized output surface for this sample
+    (``declaration_group -> placement_id -> realized OUTPUT occurrences``, W6 caveat a): after
+    the variable generated lengths are sampled, RFdiffusion adopts the shared grouped
+    ``placement_map`` as its per-candidate output identity (the same surface the other three
+    families carry) rather than the FLAT pre-sample ``output_residues`` layout. It is
+    losslessly reconstructed from that flat layout at decode time and exhaustively partitions
+    every realized backbone residue; ``ComponentReference[0]`` values are this candidate's
+    ``Structure.system`` instance ids. Empty only when there is no placement (no molecular
+    input and no ``RFdiffusionPlacements``).
+    """
+
+    structure: Structure
+    placement_map: PlacementMap = field(default_factory=dict)
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class RFdiffusionResult:
+    r"""One generation-ordered collection of coordinate-producing RFdiffusion designs.
+
+    Tuple position is sample identity for one generation context; there is no auxiliary index
+    field, and no input/context/placement-map/provenance field is carried.
+    """
+
+    candidates: tuple[RFdiffusionDesignCandidate, ...]
+
+    def best(self, score: str) -> RFdiffusionDesignCandidate:
+        r"""Return the earliest best candidate under one explicit score.
+
+        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the score's
+        ``preferred`` direction must be consistently ``"higher"`` or ``"lower"``; unit and scope
+        must match across every candidate; a NaN value or an undefined direction raises at
+        ranking time; infinity is rankable; and the earliest candidate wins a tie.
+        """
+
+        scores = tuple(candidate.scores[score] for candidate in self.candidates)
+        directions = {value.preferred for value in scores}
+        if directions not in ({"higher"}, {"lower"}):
+            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+        if len({value.unit for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical unit")
+        if len({value.scope for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical scope")
+        if any(math.isnan(value.value) for value in scores):
+            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+        if directions == {"higher"}:
+            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+@cache
+def rfdiffusion_schedule() -> dict[str, np.ndarray]:
+    r"""Load the exact released RFdiffusion IGSO(3) lookup table.
+
+    The safe NumPy archive is derived from
+    ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl``
+    at RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9``.
+    The source SHA-256 is ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``;
+    the packaged archive SHA-256 is ``89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8``.
+    The table is redistributed under RFdiffusion's BSD 3-Clause license.
+    """
+
+    with (
+        files(__package__).joinpath("rfdiffusion_schedule.npz").open("rb") as file,
+        np.load(file, allow_pickle=False) as values,
+    ):
+        return {name: values[name] for name in values.files}
+
+
+class RFdiffusionModel(nn.Module):
+    r"""The released RFdiffusion RoseTTAFold denoiser and design sampler.
+
+    ``forward`` always means one differentiable denoising pass.  ``design`` is the
+    explicit reverse-diffusion task method and returns canonical Structures.
+    """
+
+    config_class = RFdiffusionConfig
+
+    def __init__(self, config: RFdiffusionConfig | None = None) -> None:
+        config = RFdiffusionConfig() if config is None else config
+        super().__init__()
+        self.config = config
+        network, preprocess = config.network, config.preprocess
         self.network = RoseTTAFoldModule(
-            num_extra_blocks=int(model.num_extra_blocks),
-            num_main_blocks=int(model.num_main_blocks),
-            num_refinement_blocks=int(model.num_refinement_blocks),
-            msa_size=int(model.msa_size),
-            full_msa_size=int(model.full_msa_size),
-            pair_size=int(model.pair_size),
-            template_size=int(model.template_size),
-            num_msa_attention_heads=int(model.num_msa_attention_heads),
-            num_pair_attention_heads=int(model.num_pair_attention_heads),
-            num_template_attention_heads=int(model.num_template_attention_heads),
-            hidden_size=int(model.hidden_size),
-            template_hidden_size=int(model.template_hidden_size),
-            dropout=float(model.dropout),
-            template_1d_size=int(preprocess.template_1d_size),
-            template_2d_size=int(preprocess.template_2d_size),
-            freeze_track_motif=bool(model.freeze_track_motif),
-            se3_param_full=dict(model.se3_param_full),
-            se3_param_topk=dict(model.se3_param_topk),
-            vocab_size=int(model.vocab_size),
+            num_extra_blocks=network.num_extra_blocks,
+            num_main_blocks=network.num_main_blocks,
+            num_refinement_blocks=network.num_refinement_blocks,
+            msa_size=network.msa_size,
+            full_msa_size=network.full_msa_size,
+            pair_size=network.pair_size,
+            template_size=network.template_size,
+            num_msa_attention_heads=network.num_msa_attention_heads,
+            num_pair_attention_heads=network.num_pair_attention_heads,
+            num_template_attention_heads=network.num_template_attention_heads,
+            hidden_size=network.hidden_size,
+            template_hidden_size=network.template_hidden_size,
+            dropout=network.dropout,
+            template_1d_size=preprocess.template_1d_size,
+            template_2d_size=preprocess.template_2d_size,
+            freeze_track_motif=network.freeze_track_motif,
+            se3_param_full=network.se3_param_full,
+            se3_param_topk=network.se3_param_topk,
+            vocab_size=network.vocab_size,
         )
-        self.post_init()
+        self.num_timesteps = config.diffuser.num_timesteps
+        self.template_1d_size = preprocess.template_1d_size
+        self.template_2d_size = preprocess.template_2d_size
+        self.sidechain_input = preprocess.sidechain_input
+        self.structure_self_conditioning = preprocess.structure_self_conditioning
+        self.allatom = ComputeAllAtomCoords()
+        self.set_backend("auto")
 
-    def _init_module_weights(self, module: nn.Module) -> None:
-        return None
+    def set_backend(self, backend: str) -> Self:
+        r"""Select the operator backend used by the RFdiffusion SE(3) path."""
 
-    def forward(
-        self,
-        batch: RfDiffusionInput,
-        *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> AllAtomDesignCandidate:
-        r"""
-        Run the model on a typed input: the training denoising step or the inference sampler.
+        if backend not in {"auto", "torch", "oops"}:
+            raise ValueError("backend must be exactly one of: auto, torch, oops")
+        self.backend = backend
+        for module in self.modules():
+            if isinstance(module, VersatileConvSE3 | ConvSE3 | AttentionSE3 | SE3Transformer):
+                module.backend = backend
+        return self
 
-        ``forward`` is the training entry point. In ``training`` mode it runs a single grad-enabled
-        denoising step on a noised structure and returns a candidate whose inner
-        [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] carries the
-        ``denoised_coords`` / ``augmented_target`` / ``noise_level`` a diffusion loss consumes, plus a
-        ready-to-optimize ``loss`` in ``scores``. In eval mode it delegates to the reverse-diffusion sampler,
-        matching the [`design`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.design] verb -- so the
-        positional ``model(batch)`` call keeps producing backbone designs under ``eval()``.
+    def forward(self, batch: RFdiffusionInput) -> RFdiffusionOutput:
+        r"""Run one ordinary differentiable denoising pass."""
 
-        Args:
-            batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
-            recycling_steps: Unused; accepted for interface compatibility.
-            num_samples: Number of independent design trajectories (eval mode only).
-            num_sampling_steps: Number of denoising steps to run, capped at the diffuser's timestep count.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible noising/sampling.
-
-        Returns:
-            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate]: stacked design
-            coords/tokens in eval mode, or the single-step training candidate in training mode.
-
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("oteam/rfdiffusion").eval()  # doctest: +SKIP
-            >>> output = model(processor("target.pdb"), num_samples=2)  # doctest: +SKIP
-        """
-
-        if self.training:
-            return self._forward_train(
-                batch,
-                num_sampling_steps=num_sampling_steps,
-                diffusion_steps=diffusion_steps,
-                generator=generator,
-            )
-        return self._design(
-            batch,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            diffusion_steps=diffusion_steps,
-            generator=generator,
-        )
-
-    @torch.no_grad()
-    def design(
-        self,
-        batch: RfDiffusionInput,
-        *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> AllAtomDesignCandidate:
-        r"""
-        Generate backbone-design candidates (the inference capability verb).
-
-        Runs ``num_samples`` independent reverse-diffusion trajectories under [torch.no_grad][] and stacks
-        their coords, sequence tokens, and pLDDT into one candidate. This is the distinct inference path;
-        [`forward`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.forward] is the training path.
-        ``recycling_steps`` is accepted for API symmetry but unused (RfDiffusion has no recycling loop).
-
-        Args:
-            batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
-            recycling_steps: Unused; accepted for interface compatibility.
-            num_samples: Number of independent design trajectories to sample.
-            num_sampling_steps: Number of denoising steps to run.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate] carrying stacked
-            ``pred_coords`` and ``sequence_tokens``, optional pLDDT scores, and per-sample metadata.
-
-        Examples:
-            >>> output = model.design(batch, num_samples=2)  # doctest: +SKIP
-        """
-
-        return self._design(
-            batch,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            diffusion_steps=diffusion_steps,
-            generator=generator,
-        )
-
-    def _design(
-        self,
-        batch: RfDiffusionInput,
-        *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> AllAtomDesignCandidate:
-        r"""Run the reverse-diffusion sampler for ``num_samples`` trajectories and assemble the candidate."""
-
-        del recycling_steps
-        sampler = self._sampler()
-        results = [
-            sampler.sample(
-                batch,
-                num_sampling_steps=num_sampling_steps,
-                diffusion_steps=diffusion_steps,
-                generator=generator,
-            )
-            for _ in range(num_samples)
-        ]
-        coords = torch.stack([result.coords for result in results])
-        sequence_tokens = torch.stack([result.sequence_tokens for result in results])
-        distogram_logits = torch.empty(0, dtype=coords.dtype, device=coords.device)
-        plddt = [result.plddt for result in results if result.plddt is not None]
-        scores = {"plddt": torch.stack(plddt)} if plddt else None
-        metadata = {
-            "architecture": "rfdiffusion",
-            "backend": "native_rfdiffusion_sampler",
-            "num_samples": num_samples,
-            "samples": [result.metadata for result in results],
-        }
-        return AllAtomDesignCandidate(
-            sequence_tokens=sequence_tokens,
-            structure_prediction=StructurePredictionOutput(
-                pred_coords=coords,
-                distogram_logits=distogram_logits,
-            ),
-            scores=scores,
-            metadata=metadata,
-        )
-
-    def _forward_train(
-        self,
-        batch: RfDiffusionInput,
-        *,
-        num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> AllAtomDesignCandidate:
-        r"""
-        Single grad-enabled denoising step for training.
-
-        RFdiffusion was released inference-only (no upstream training loop), so this is a grad-correct
-        single-step denoiser grounded in the model's real denoise output: the noised structure ``x_t`` and
-        its network features are built with the native sampler featurization under [torch.no_grad][] (data
-        prep, not part of the differentiable graph), then the RoseTTAFold network denoises ``x_t`` with grad
-        enabled. The loss is the mean-squared error between the predicted backbone and the diffusion target
-        ``x_0`` plus an amino-acid cross-entropy term, so gradients reach the trunk, the SE(3) frames, and the
-        readout heads. The network's single/pair activations are wrapped in the typed
-        [`RfDiffusionRepresentations`][ofoldx.models.rfdiffusion.model.RfDiffusionRepresentations] carriers at
-        the boundary and unwrapped before eager tensor math.
-
-        Args:
-            batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
-            num_sampling_steps: Timestep to noise/denoise at; capped at the diffuser's timestep count.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible noising.
-
-        Returns:
-            An [`AllAtomDesignCandidate`][ofoldx.models.contract.AllAtomDesignCandidate] whose inner
-            [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput] carries
-            ``denoised_coords`` / ``augmented_target`` / ``noise_level``, with the scalar ``loss`` (and its
-            detached ``coord_loss`` / ``aa_loss`` parts) in ``scores``.
-        """
-
-        sampler = self._sampler()
-        device = sampler.device
-        with torch.no_grad():
-            state = sampler.sample_init(batch, diffusion_steps=diffusion_steps, generator=generator)
-            t = state.t_step_input if num_sampling_steps is None else min(int(num_sampling_steps), state.t_step_input)
-            features = sampler.preprocess(state, state.seq_t, state.noisy_coords, t)
-            pdb_index = features.pdb_index
-            if state.symmetry is not None:
-                pdb_index, state.chain_idx = state.symmetry.res_idx_procesing(res_idx=pdb_index)
-
-        output = self.network(  # type: ignore[misc,operator]
-            features.msa_masked,
-            features.msa_full,
-            features.seq_in,
-            features.noisy_coords_in,
-            pdb_index,
-            template_1d=features.template_1d,
-            template_2d=features.template_2d,
-            template_coords=features.template_coords,
-            alpha_t=features.alpha_t,
+        msa_masked, msa_full, template_1d, template_2d, template_coords, alpha_t = self._features(batch)
+        output = self.network(
+            msa_masked,
+            msa_full,
+            batch.sequence,
+            batch.noisy_coords,
+            batch.residue_index,
+            template_1d=template_1d,
+            template_2d=template_2d,
+            template_coords=template_coords,
+            alpha_t=alpha_t,
             msa_prev=None,
             pair_prev=None,
             state_prev=None,
-            t=torch.tensor(t, device=device),
-            motif_mask=state.diffusion_mask.to(device),
-            cyclic_reses=state.cyclic_reses,
+            motif_mask=batch.fixed_structure_mask,
+            cyclic_reses=batch.cyclic_mask,
         )
-        # typed carriers at the trunk boundary; unwrap ``.tensor`` before eager tensor math
-        representations = RfDiffusionRepresentations(single=Single(output[0]), pair=Pair(output[1]))
-        pred_coords_raw, _alpha, _plddt = coerce_network_prediction(output)
-        pred_backbone = normalize_backbone_prediction(pred_coords_raw, state.noisy_coords)  # [1, L, 3, 3]
+        return RFdiffusionOutput(*output)
 
-        target_source = state.clean_coords if state.clean_coords is not None else state.noisy_coords
-        target_backbone = target_source[:, :3].to(pred_backbone).unsqueeze(0)  # [1, L, 3, 3]
-        finite = torch.isfinite(target_backbone)
-        target_backbone = torch.where(finite, target_backbone, pred_backbone.detach())
-        coord_loss = F.mse_loss(pred_backbone, target_backbone)
-
-        aa_logits = output[5]  # [B, L, vocab]
-        seq_target = features.seq_in.argmax(dim=-1).clamp_max(aa_logits.shape[-1] - 1)  # [1, L]
-        aa_loss = F.cross_entropy(aa_logits.transpose(1, 2), seq_target)
-        loss = coord_loss + aa_loss
-
-        structure = StructurePredictionOutput(
-            pred_coords=pred_backbone,
-            distogram_logits=representations.pair.tensor.new_zeros(0),
-            denoised_coords=pred_backbone,
-            augmented_target=target_backbone,
-            noise_level=torch.tensor(float(t), device=device),
-        )
-        return AllAtomDesignCandidate(
-            sequence_logits=aa_logits,
-            sequence_tokens=seq_target.squeeze(0),
-            structure_prediction=structure,
-            scores={"loss": loss, "coord_loss": coord_loss.detach(), "aa_loss": aa_loss.detach()},
-            metadata={"architecture": "rfdiffusion", "mode": "train", "timestep": int(t)},
-        )
-
-    def _sample(
+    def _features(
         self,
-        batch: RfDiffusionInput,
+        batch: RFdiffusionInput,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        r"""Build the exact released MSA/template feature channels."""
+
+        sequence = batch.sequence
+        batch_size, length = sequence.shape[:2]
+        msa_masked = sequence.new_zeros((batch_size, 1, length, 48))
+        msa_masked[..., :22] = sequence[:, None]
+        msa_masked[..., 22:44] = sequence[:, None]
+        msa_masked[:, :, 0, 46] = 1
+        msa_masked[:, :, -1, 47] = 1
+        msa_full = sequence.new_zeros((batch_size, 1, length, 25))
+        msa_full[..., :22] = sequence[:, None]
+        msa_full[:, :, 0, 23] = 1
+        msa_full[:, :, -1, 24] = 1
+
+        template_1d = sequence.new_zeros((batch_size, 1, length, 21))
+        visible_sequence = sequence[..., :21].clone()
+        masked = sequence[..., MASK_TOKEN] > 0.5
+        visible_sequence[..., 20] = visible_sequence[..., 20].masked_fill(masked, 1)
+        template_1d[..., :21] = visible_sequence[:, None]
+        time = 1 - batch.timestep.to(sequence.dtype) / float(self.num_timesteps)
+        time = (
+            time[:, None]
+            .expand_as(batch.fixed_structure_mask)
+            .masked_fill(
+                batch.fixed_structure_mask,
+                1,
+            )
+        )
+        template_1d = torch.cat((template_1d, time[:, None, :, None]), dim=-1)
+        if self.template_1d_size >= 24:
+            template_1d = torch.cat(
+                (
+                    template_1d,
+                    template_1d.new_zeros((batch_size, 1, length, 1)),
+                    batch.hotspot_mask[:, None, :, None].to(sequence.dtype),
+                ),
+                dim=-1,
+            )
+        if self.template_1d_size == 28:
+            template_1d = torch.cat((template_1d, batch.secondary_structure[:, None]), dim=-1)
+
+        coords = batch.noisy_coords.clone()
+        if self.sidechain_input:
+            coords[:, :, 3:] = coords[:, :, 3:].masked_fill(masked[:, :, None, None], float("nan"))
+        else:
+            coords[:, :, 3:] = coords[:, :, 3:].masked_fill(
+                (~batch.fixed_structure_mask)[:, :, None, None],
+                float("nan"),
+            )
+        template_coords = torch.cat(
+            (coords[:, None], coords.new_full((batch_size, 1, length, 13, 3), float("nan"))),
+            dim=3,
+        )
+        template_2d = coords_to_t2d(template_coords)
+        alpha_t = make_alpha_t(
+            template_coords,
+            template_1d[..., :21].argmax(dim=-1).reshape(batch_size, length),
+        )
+        if self.structure_self_conditioning:
+            template_2d[..., :44] = 0
+            template_coords = torch.zeros_like(template_coords)
+        if self.template_2d_size == 47:
+            template_2d = torch.cat((template_2d, batch.block_adjacency[:, None]), dim=-1)
+        return msa_masked, msa_full, template_1d, template_2d, template_coords, alpha_t
+
+    @torch.inference_mode()
+    def design(
+        self,
+        batch: RFdiffusionInput,
         *,
-        recycling_steps: int | None = None,
-        num_samples: int = 1,
+        num_candidates: int = 1,
         num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
+        final_step: int = 1,
+        partial_steps: int | None = None,
+        noise_scale_ca: float = 1.0,
+        final_noise_scale_ca: float | None = None,
+        ca_noise_schedule: Literal["constant", "linear"] = "constant",
+        noise_scale_frame: float = 1.0,
+        final_noise_scale_frame: float | None = None,
+        frame_noise_schedule: Literal["constant", "linear"] = "constant",
+        align_motif: bool = True,
+        return_trajectory: bool = False,
+        symmetry_recenter: bool = True,
+        symmetry_radius_angstrom: float = 10.0,
+        guidance_scale: float = 10.0,
+        guidance_decay: str = "constant",
         generator: torch.Generator | None = None,
-    ) -> Tensor:
-        r"""
-        Sample designs and return only the stacked backbone coords.
+    ) -> RFdiffusionResult:
+        r"""Generate canonical backbone Structures, sampling variable placement lengths per candidate.
 
-        Internal helper behind [`design`][ofoldx.models.rfdiffusion.model.RfDiffusionDesigner.design] for
-        callers that want a bare coord tensor rather than a full candidate object.
-
-        Args:
-            batch: A tokenized [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput].
-            recycling_steps: Unused; accepted for interface compatibility.
-            num_samples: Number of independent design trajectories to sample.
-            num_sampling_steps: Number of denoising steps to run.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            Stacked design coords of shape `[num_samples, L, 14, 3]`.
+        The sampler follows the released raw final-``pX0`` contract. Canonical motif
+        alignment and fixed-row restoration happen while decoding the Result. Full
+        trajectories are opt-in and stored on CPU. Distinct final noise values are
+        valid only with linear schedules. The caller-supplied ``generator`` (resolved once
+        at the Pipeline boundary) is the sole random stream; per-step reverse-diffusion
+        resampling remains model-intrinsic.
         """
 
-        del recycling_steps
-        sampler = self._sampler()
-        return torch.stack(
-            [
+        if num_candidates <= 0:
+            raise ValueError("num_candidates must be a positive integer")
+        if batch.sequence.shape[0] != 1:
+            raise ValueError("RFdiffusion design accepts one canonical system at a time")
+        prepared = [_sample_variable_lengths(batch, generator) for _ in range(num_candidates)]
+        sampler = RFdiffusionSampler(
+            self.config,
+            network=self.network,
+            allatom=self.allatom,
+            final_step=final_step,
+            partial_steps=partial_steps,
+            noise_scale_ca=noise_scale_ca,
+            final_noise_scale_ca=final_noise_scale_ca,
+            ca_noise_schedule=ca_noise_schedule,
+            noise_scale_frame=noise_scale_frame,
+            final_noise_scale_frame=final_noise_scale_frame,
+            frame_noise_schedule=frame_noise_schedule,
+            align_motif=align_motif,
+            symmetry_recenter=symmetry_recenter,
+            symmetry_radius_angstrom=symmetry_radius_angstrom,
+            guidance_scale=guidance_scale,
+            guidance_decay=guidance_decay,
+        )
+        return _decode_design(
+            (
                 sampler.sample(
-                    batch,
+                    candidate_input,
                     num_sampling_steps=num_sampling_steps,
-                    diffusion_steps=diffusion_steps,
                     generator=generator,
-                ).coords
-                for _ in range(num_samples)
-            ]
+                    return_trajectory=return_trajectory,
+                )
+                for candidate_input in prepared
+            ),
+            prepared,
+            align_motif=align_motif,
         )
 
-    def _sampler(self) -> NativeRfDiffusionSampler:
-        r"""Construct the native sampler bound to this model's config and network (imported lazily)."""
-
-        return NativeRfDiffusionSampler(self.config, network=self.network)
+    def _resolved_backend(self, tensor: Tensor) -> str:
+        return _select_backend(self.backend, tensor)
 
 
 class RoseTTAFoldModule(nn.Module):
     r"""
-    RoseTTAFold trunk driving one RfDiffusion denoising step.
+    RoseTTAFold trunk driving one RFdiffusion denoising step.
 
     Ported RoseTTAFold network: embeds the MSA/pair/state representations, injects template and recycling
     features, runs the [`IterativeSimulator`][ofoldx.models.rfdiffusion.model.IterativeSimulator] track,
     and reads out amino-acid logits, pLDDT, and the denoised backbone. The
-    [`NativeRfDiffusionSampler`][ofoldx.models.rfdiffusion.model.NativeRfDiffusionSampler] calls this
+    [`RFdiffusionSampler`][ofoldx.models.rfdiffusion.model.RFdiffusionSampler] calls this
     once per diffusion timestep.
 
     Args:
@@ -484,7 +587,7 @@ class RoseTTAFoldModule(nn.Module):
             se3_param_topk=se3_topk,
             dropout=dropout,
         )
-        self.coords_6d_pred = DistanceNetwork(pair_size, dropout=dropout)
+        self.coords_6d_pred = DistanceNetwork(pair_size)
         self.aa_pred = MaskedTokenNetwork(msa_size, vocab_size=vocab_size)
         self.lddt_pred = LDDTNetwork(state_size)
         self.exp_pred = ExpResolvedNetwork(msa_size, state_size)
@@ -496,7 +599,6 @@ class RoseTTAFoldModule(nn.Module):
         seq: Tensor,
         coords: Tensor,
         idx: Tensor,
-        t: Tensor | None,
         template_1d: Tensor | None = None,
         template_2d: Tensor | None = None,
         template_coords: Tensor | None = None,
@@ -519,7 +621,6 @@ class RoseTTAFoldModule(nn.Module):
             seq: One-hot sequence features `[B, L, 22]`.
             coords: Noisy backbone coords `[B, L, A, 3]`.
             idx: Residue-index tensor `[B, L]` used for relative-position features.
-            t: Diffusion timestep (unused here; time features are injected by the sampler).
             template_1d: 1D template features; required for inference.
             template_2d: 2D template features; required for inference.
             template_coords: Template backbone coords; required for inference.
@@ -531,9 +632,8 @@ class RoseTTAFoldModule(nn.Module):
             cyclic_reses: Optional cyclic-residue mask for cyclic-peptide relative positions.
 
         Returns:
-            A 7-tuple ``(msa_row0, pair, final_coords, state, alpha, aa_logits, plddt)`` where ``final_coords``
-            is the denoised backbone, ``aa_logits`` are amino-acid logits, and ``plddt`` is the per-residue
-            confidence.
+            The final denoising representations and predictions followed by the released geometry,
+            pLDDT, resolved-residue, backbone-trajectory, and torsion-trajectory training outputs.
 
         Raises:
             ValueError: If any required template feature is `None`.
@@ -541,26 +641,27 @@ class RoseTTAFoldModule(nn.Module):
 
         batch_size, _, length = msa_latent.shape[:3]
         msa_latent, pair, state = self.latent_emb(msa_latent, seq, idx, cyclic_reses)
-        msa_full = self.full_emb(msa_full, seq, idx)
+        msa_full = self.full_emb(msa_full, seq)
 
         if msa_prev is None:
             msa_prev = torch.zeros_like(msa_latent[:, 0])
             pair_prev = torch.zeros_like(pair)
             state_prev = torch.zeros_like(state)
-        msa_recycle, pair_recycle, state_recycle = self.recycle(seq, msa_prev, pair_prev, coords, state_prev)
+        msa_recycle, pair_recycle, state_recycle = self.recycle(msa_prev, pair_prev, coords, state_prev)
         msa_latent[:, 0] = msa_latent[:, 0] + msa_recycle.reshape(batch_size, length, -1)
         pair = pair + pair_recycle
         state = state + state_recycle
 
         # Time features are injected by the sampler's preprocess(); no timestep_embedder here.
-        if template_1d is None or template_2d is None or alpha_t is None or template_coords is None:
-            raise ValueError(
-                "template features template_1d, template_2d, alpha_t, and template_coords "
-                "are required for RFdiffusion inference"
-            )
         pair, state = self.templ_emb(template_1d, template_2d, alpha_t, template_coords, pair, state)
         if motif_mask is None:
-            motif_mask = torch.zeros(length, dtype=torch.bool, device=msa_latent.device)
+            motif_mask = torch.zeros(
+                (batch_size, length),
+                dtype=torch.bool,
+                device=msa_latent.device,
+            )
+        elif motif_mask.ndim == 1:
+            motif_mask = motif_mask.unsqueeze(0).expand(batch_size, -1)
         frozen_mask = motif_mask if self.freeze_track_motif else torch.zeros_like(motif_mask)
         msa, pair, rotations, translations, alpha_s, state = self.simulator(
             seq,
@@ -575,10 +676,14 @@ class RoseTTAFoldModule(nn.Module):
         )
 
         local = coords[:, :, :3] - coords[:, :, 1].unsqueeze(-2)
-        final_coords = _apply_frames(rotations[-1], translations[-1], local)
+        backbone_trajectory = torch.einsum("sblij,blaj->sblai", rotations, local)
+        backbone_trajectory = backbone_trajectory + translations.unsqueeze(-2)
+        final_coords = backbone_trajectory[-1]
 
+        distance_logits = self.coords_6d_pred(pair)
         logits_aa = self.aa_pred(msa)
         lddt_logits = self.lddt_pred(state)
+        resolved_logits = self.exp_pred(msa[:, 0], state)
         return (
             msa[:, 0],
             pair,
@@ -587,6 +692,11 @@ class RoseTTAFoldModule(nn.Module):
             alpha_s[-1],
             logits_aa.permute(0, 2, 1),
             _plddt_expectation(lddt_logits),
+            distance_logits,
+            lddt_logits,
+            resolved_logits,
+            backbone_trajectory,
+            alpha_s,
         )
 
 
@@ -601,12 +711,8 @@ def _plddt_expectation(logits: Tensor) -> Tensor:
 def _chain_ids(idx: torch.Tensor, threshold: int = 35) -> torch.Tensor:
     r"""Assign a chain id per residue by detecting large jumps (> ``threshold``) in the residue index."""
 
-    idx_np = idx.detach().cpu().numpy()
-    chain_ids = np.zeros(idx_np.shape, dtype=np.int64)
-    for batch_index, residue_idx in enumerate(idx_np):
-        for chain_index, start in enumerate(find_breaks(residue_idx, thresh=threshold), start=1):
-            chain_ids[batch_index, start:] = chain_index
-    return torch.as_tensor(chain_ids, device=idx.device)
+    starts = (idx[:, 1:] - idx[:, :-1] > threshold).to(torch.int64)
+    return torch.cat((torch.zeros_like(idx[:, :1]), starts), dim=1).cumsum(dim=1)
 
 
 def _cyclic_mask(cyclize: torch.Tensor | None, idx: torch.Tensor) -> torch.Tensor | None:
@@ -630,16 +736,6 @@ def _zero_bias(linear: nn.Linear) -> None:
     r"""Zero the bias of a linear layer in place."""
 
     nn.init.zeros_(linear.bias)
-
-
-def _pseudo_cbeta(coords: torch.Tensor) -> torch.Tensor:
-    r"""Reconstruct the pseudo-C-beta position from backbone N/CA/C coords `[B, L, A, 3]`."""
-
-    nitrogen, calpha, carbon = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
-    ca_to_n = calpha - nitrogen
-    c_to_ca = carbon - calpha
-    normal = torch.cross(ca_to_n, c_to_ca, dim=-1)
-    return -0.58273431 * normal + 0.56802827 * ca_to_n - 0.54067466 * c_to_ca + calpha
 
 
 class PositionalEncoding2D(nn.Module):
@@ -682,22 +778,14 @@ class PositionalEncoding2D(nn.Module):
         seqsep = idx[:, None, :] - idx[:, :, None]
         cyclic_residues = _cyclic_mask(cyclize, idx)
 
-        if cyclic_residues is not None and cyclic_residues.any():
+        if cyclic_residues is not None:
             chain_ids = _chain_ids(idx)
-            for batch_index in range(idx.shape[0]):
-                for chain_id in torch.unique(chain_ids[batch_index]):
-                    is_cyclic_chain = cyclic_residues[batch_index] & (chain_ids[batch_index] == chain_id)
-                    # keep the cycle length a 0-dim tensor so the forward path never calls ``.item()``
-                    cycle_length = is_cyclic_chain.sum()
-                    is_cycle = cycle_length >= 2
-                    same_cycle = is_cyclic_chain[:, None] & is_cyclic_chain[None, :]
-                    seqsep_slice = seqsep[batch_index]
-                    half = cycle_length // 2
-                    wrap_hi = is_cycle & same_cycle & (seqsep_slice > half)
-                    wrap_lo = is_cycle & same_cycle & (seqsep_slice < -half)
-                    seqsep_slice = torch.where(wrap_hi, seqsep_slice - cycle_length, seqsep_slice)
-                    seqsep_slice = torch.where(wrap_lo, seqsep_slice + cycle_length, seqsep_slice)
-                    seqsep[batch_index] = seqsep_slice
+            same_chain = chain_ids[:, :, None] == chain_ids[:, None, :]
+            same_cycle = same_chain & cyclic_residues[:, :, None] & cyclic_residues[:, None, :]
+            cycle_length = (same_chain & cyclic_residues[:, None, :]).sum(dim=-1)[:, :, None]
+            half = cycle_length // 2
+            seqsep = torch.where(same_cycle & (seqsep > half), seqsep - cycle_length, seqsep)
+            seqsep = torch.where(same_cycle & (seqsep < -half), seqsep + cycle_length, seqsep)
 
         relpos = torch.bucketize(seqsep, boundaries).long()
         return self.drop(pair + self.emb(relpos))
@@ -816,20 +904,18 @@ class ExtraMsaEmbedding(nn.Module):
         self.emb = init_lecun_normal(self.emb)
         _zero_bias(self.emb)
 
-    def forward(self, msa: torch.Tensor, seq: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, msa: torch.Tensor, seq: torch.Tensor) -> torch.Tensor:
         r"""
         Embed the extra MSA.
 
         Args:
             msa: Raw extra-MSA features `[B, N_full, L, input_feature_size]`.
             seq: One-hot sequence features `[B, L, 22]` used for the query embedding.
-            idx: Residue-index tensor; unused, accepted for signature symmetry.
 
         Returns:
             The embedded extra MSA `[B, N_full, L, msa_size]`.
         """
 
-        del idx
         msa_depth = msa.shape[1]
         msa = self.emb(msa)
         query = _one_hot_lookup(seq, self.emb_q).unsqueeze(1)
@@ -1030,7 +1116,6 @@ class Recycling(nn.Module):
 
     def forward(
         self,
-        seq: torch.Tensor,
         msa: torch.Tensor,
         pair: torch.Tensor,
         coords: torch.Tensor,
@@ -1040,7 +1125,6 @@ class Recycling(nn.Module):
         Build the recycled MSA, pair, and state contributions.
 
         Args:
-            seq: Sequence features; unused, accepted for signature symmetry.
             msa: Previous-iteration MSA row `[B, L, msa_size]`.
             pair: Previous-iteration pair representation `[B, L, L, pair_size]`.
             coords: Previous-iteration backbone coords `[B, L, A, 3]`.
@@ -1050,13 +1134,12 @@ class Recycling(nn.Module):
             A tuple ``(msa, pair, state)`` of the recycled contributions to add back into the trunk inputs.
         """
 
-        del seq
         _, length = pair.shape[:2]
         state = self.norm_state(state)
         left_state = state.unsqueeze(2).expand(-1, -1, length, -1)
         right_state = state.unsqueeze(1).expand(-1, length, -1, -1)
 
-        cbeta = _pseudo_cbeta(coords)
+        cbeta = generate_cbeta(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2])
         dist = rbf(torch.cdist(cbeta, cbeta))
         dist = self.proj_dist(torch.cat((dist, left_state, right_state), dim=-1))
 
@@ -1076,12 +1159,6 @@ def _se3_params(params: Mapping[str, int] | None) -> dict[str, int]:
     r"""Return a copy of ``params`` (or the default SE(3) sizing) as a plain mutable dict."""
 
     return dict(DEFAULT_SE3_PARAMS if params is None else params)
-
-
-def _zeros_motif_mask(length: int, device: torch.device) -> Tensor:
-    r"""Return an all-false motif mask `[L]` on ``device`` (no residues frozen)."""
-
-    return torch.zeros(length, dtype=torch.bool, device=device)
 
 
 def _query_state_update(msa: Tensor, state: Tensor) -> Tensor:
@@ -1108,7 +1185,7 @@ def _initial_frames(coords: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
     batch_size, length = coords.shape[:2]
     rotations = torch.eye(3, device=coords.device).reshape(1, 1, 3, 3).expand(batch_size, length, -1, -1)
-    translations = coords[:, :, 1].clone()
+    translations = coords[:, :, 1]
     local_coords = coords - translations.unsqueeze(-2)
     return rotations, translations, local_coords
 
@@ -1256,12 +1333,8 @@ class PairStr2Pair(nn.Module):
         self.proj_rbf = nn.Linear(hidden_size, pair_size)
         self.drop_row = Dropout(broadcast_dim=1, dropout=dropout)
         self.drop_col = Dropout(broadcast_dim=2, dropout=dropout)
-        self.row_attn = BiasedAxialAttention(
-            pair_size, pair_size, num_attention_heads, hidden_size, dropout=dropout, is_row=True
-        )
-        self.col_attn = BiasedAxialAttention(
-            pair_size, pair_size, num_attention_heads, hidden_size, dropout=dropout, is_row=False
-        )
+        self.row_attn = BiasedAxialAttention(pair_size, pair_size, num_attention_heads, hidden_size, is_row=True)
+        self.col_attn = BiasedAxialAttention(pair_size, pair_size, num_attention_heads, hidden_size, is_row=False)
         self.feed_forward = FeedForwardLayer(pair_size, 2)
         self.reset_parameter()
 
@@ -1302,7 +1375,6 @@ class MSA2Pair(nn.Module):
         msa_size: Width of the MSA representation.
         pair_size: Width of the pair representation being updated.
         hidden_size: Width of the left/right projections whose outer product feeds the pair update.
-        dropout: Dropout probability (accepted for signature symmetry).
     """
 
     def __init__(
@@ -1310,7 +1382,6 @@ class MSA2Pair(nn.Module):
         msa_size: int = 256,
         pair_size: int = 128,
         hidden_size: int = 32,
-        dropout: float = 0.15,
     ) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(msa_size)
@@ -1360,7 +1431,6 @@ class SCPred(nn.Module):
         msa_size: Width of the MSA row input.
         state_size: Width of the node-state input.
         hidden_size: Hidden width of the residual MLP blocks.
-        dropout: Dropout probability (accepted for signature symmetry).
     """
 
     def __init__(
@@ -1368,7 +1438,6 @@ class SCPred(nn.Module):
         msa_size: int = 256,
         state_size: int = 32,
         hidden_size: int = 128,
-        dropout: float = 0.15,
     ) -> None:
         super().__init__()
         self.norm_s0 = nn.LayerNorm(msa_size)
@@ -1435,7 +1504,6 @@ class Str2Str(nn.Module):
         pair_size: Width of the pair representation.
         state_size: Width of the node-state representation.
         se3_param: SE(3) sizing dict (defaults applied when `None`).
-        dropout: Dropout probability forwarded to the sidechain predictor.
     """
 
     def __init__(
@@ -1444,7 +1512,6 @@ class Str2Str(nn.Module):
         pair_size: int = 128,
         state_size: int = 16,
         se3_param: Mapping[str, int] | None = None,
-        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         se3_param = _se3_params(se3_param)
@@ -1462,7 +1529,7 @@ class Str2Str(nn.Module):
         self.norm_edge1 = nn.LayerNorm(num_edge_features)
         self.norm_edge2 = nn.LayerNorm(num_edge_features)
         self.se3 = SE3TransformerWrapper(**se3_param)
-        self.sc_predictor = SCPred(msa_size=msa_size, state_size=l0_out_features, dropout=dropout)
+        self.sc_predictor = SCPred(msa_size=msa_size, state_size=l0_out_features)
         self.reset_parameter()
 
     def reset_parameter(self) -> None:
@@ -1488,7 +1555,6 @@ class Str2Str(nn.Module):
         motif_mask: Tensor | None,
         cyclic_reses: Tensor | None = None,
         top_k: int = 64,
-        eps: float = 1e-5,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Refine backbone frames and predict torsions with the SE(3) transformer.
@@ -1504,7 +1570,6 @@ class Str2Str(nn.Module):
             motif_mask: Per-residue mask `[L]`; frame updates are zeroed on masked (motif) residues.
             cyclic_reses: Optional cyclic-residue mask for neighbor features.
             top_k: Number of neighbors for the residue graph; `0` builds the full graph.
-            eps: Numerical floor (accepted for signature symmetry).
 
         Returns:
             A tuple ``(rotations, translations, state, alpha)`` of the updated frames, node state, and
@@ -1512,7 +1577,9 @@ class Str2Str(nn.Module):
         """
 
         batch_size, _, length = msa.shape[:3]
-        motif_mask = _zeros_motif_mask(length, coords.device) if motif_mask is None else motif_mask
+        motif_mask = torch.zeros_like(idx, dtype=torch.bool) if motif_mask is None else motif_mask
+        if motif_mask.ndim == 1:
+            motif_mask = motif_mask.unsqueeze(0).expand(batch_size, -1)
 
         node = torch.cat((self.norm_msa(msa[:, 0]), self.norm_state(state)), dim=-1)
         node = self.norm_node(self.embed_x(node))
@@ -1531,7 +1598,7 @@ class Str2Str(nn.Module):
 
         state = shift["0"].reshape(batch_size, length, -1)
         offset = shift["1"].reshape(batch_size, length, 2, 3)
-        offset[:, motif_mask, ...] = 0
+        offset = offset.masked_fill(motif_mask[:, :, None, None], 0)
 
         translations = offset[:, :, 0, :] / 10.0
         rotation_vector = offset[:, :, 1, :] / 100.0
@@ -1587,12 +1654,15 @@ class IterBlock(nn.Module):
             hidden_size=msa_hidden_size,
             dropout=dropout,
         )
-        self.msa2pair = MSA2Pair(msa_size=msa_size, pair_size=pair_size, hidden_size=hidden_size // 2, dropout=dropout)
+        self.msa2pair = MSA2Pair(msa_size=msa_size, pair_size=pair_size, hidden_size=hidden_size // 2)
         self.pair2pair = PairStr2Pair(
             pair_size=pair_size, num_attention_heads=num_pair_attention_heads, hidden_size=hidden_size, dropout=dropout
         )
         self.str2str = Str2Str(
-            msa_size=msa_size, pair_size=pair_size, state_size=state_size, se3_param=se3_param, dropout=dropout
+            msa_size=msa_size,
+            pair_size=pair_size,
+            state_size=state_size,
+            se3_param=se3_param,
         )
 
     def forward(
@@ -1692,40 +1762,38 @@ class IterativeSimulator(nn.Module):
         self.num_refinement_blocks = num_refinement_blocks
         self.proj_state = nn.Linear(se3_param_topk["l0_out_features"], se3_param_full["l0_out_features"])
 
-        if num_extra_blocks > 0:
-            self.extra_block = nn.ModuleList(
-                [
-                    IterBlock(
-                        msa_size=full_msa_size,
-                        pair_size=pair_size,
-                        num_msa_attention_heads=num_msa_attention_heads,
-                        num_pair_attention_heads=num_pair_attention_heads,
-                        msa_hidden_size=8,
-                        hidden_size=hidden_size,
-                        dropout=dropout,
-                        use_global_attn=True,
-                        se3_param=se3_param_full,
-                    )
-                    for _ in range(num_extra_blocks)
-                ]
-            )
+        self.extra_block = nn.ModuleList(
+            [
+                IterBlock(
+                    msa_size=full_msa_size,
+                    pair_size=pair_size,
+                    num_msa_attention_heads=num_msa_attention_heads,
+                    num_pair_attention_heads=num_pair_attention_heads,
+                    msa_hidden_size=8,
+                    hidden_size=hidden_size,
+                    dropout=dropout,
+                    use_global_attn=True,
+                    se3_param=se3_param_full,
+                )
+                for _ in range(num_extra_blocks)
+            ]
+        )
 
-        if num_main_blocks > 0:
-            self.main_block = nn.ModuleList(
-                [
-                    IterBlock(
-                        msa_size=msa_size,
-                        pair_size=pair_size,
-                        num_msa_attention_heads=num_msa_attention_heads,
-                        num_pair_attention_heads=num_pair_attention_heads,
-                        hidden_size=hidden_size,
-                        dropout=dropout,
-                        use_global_attn=False,
-                        se3_param=se3_param_full,
-                    )
-                    for _ in range(num_main_blocks)
-                ]
-            )
+        self.main_block = nn.ModuleList(
+            [
+                IterBlock(
+                    msa_size=msa_size,
+                    pair_size=pair_size,
+                    num_msa_attention_heads=num_msa_attention_heads,
+                    num_pair_attention_heads=num_pair_attention_heads,
+                    hidden_size=hidden_size,
+                    dropout=dropout,
+                    use_global_attn=False,
+                    se3_param=se3_param_full,
+                )
+                for _ in range(num_main_blocks)
+            ]
+        )
 
         self.proj_state2 = nn.Linear(se3_param_full["l0_out_features"], se3_param_topk["l0_out_features"])
         if num_refinement_blocks > 0:
@@ -1734,7 +1802,6 @@ class IterativeSimulator(nn.Module):
                 pair_size=pair_size,
                 state_size=se3_param_topk["l0_out_features"],
                 se3_param=se3_param_topk,
-                dropout=dropout,
             )
 
         self.reset_parameter()
@@ -1778,8 +1845,9 @@ class IterativeSimulator(nn.Module):
             and ``alpha`` are stacked over all track steps `[steps, ...]`.
         """
 
-        _, length = pair.shape[:2]
-        motif_mask = _zeros_motif_mask(length, coords_in.device) if motif_mask is None else motif_mask
+        motif_mask = torch.zeros_like(idx, dtype=torch.bool) if motif_mask is None else motif_mask
+        if motif_mask.ndim == 1:
+            motif_mask = motif_mask.unsqueeze(0).expand(idx.shape[0], -1)
         rotations, translations, local_coords = _initial_frames(coords_in)
         state = self.proj_state(state)
 
@@ -1787,7 +1855,7 @@ class IterativeSimulator(nn.Module):
         translation_steps: list[Tensor] = []
         alpha_steps: list[Tensor] = []
 
-        for block in getattr(self, "extra_block", ()):
+        for block in self.extra_block:
             rotations = rotations.detach()
             translations = translations.detach()
             coords = _apply_frames(rotations, translations, local_coords)
@@ -1806,7 +1874,7 @@ class IterativeSimulator(nn.Module):
             translation_steps.append(translations)
             alpha_steps.append(alpha)
 
-        for block in getattr(self, "main_block", ()):
+        for block in self.main_block:
             rotations = rotations.detach()
             translations = translations.detach()
             coords = _apply_frames(rotations, translations, local_coords)
@@ -2212,7 +2280,6 @@ class BiasedAxialAttention(nn.Module):
         bias_size: Width of the bias feature the per-head bias is projected from.
         num_attention_heads: Number of attention heads.
         head_dim: Per-head dimension.
-        dropout: Dropout probability (accepted for signature symmetry).
         is_row: Whether to attend along rows (`True`) or columns (`False`).
     """
 
@@ -2222,7 +2289,6 @@ class BiasedAxialAttention(nn.Module):
         bias_size: int,
         num_attention_heads: int,
         head_dim: int,
-        dropout: float = 0.1,
         is_row: bool = True,
     ) -> None:
         super().__init__()
@@ -2284,9 +2350,6 @@ class BiasedAxialAttention(nn.Module):
         return out
 
 
-FiberEl = namedtuple("FiberEl", ["degree", "channels"])
-
-
 def degree_to_dim(degree: int) -> int:
     r"""
     Return the dimension ``2*degree + 1`` of a spherical-harmonic feature of the given degree.
@@ -2334,7 +2397,7 @@ def unfuse_features(features: Tensor, degrees: Iterable[int]) -> dict[str, Tenso
     )
 
 
-class Fiber(dict):
+class Fiber(dict[int, int]):
     r"""
     Degree-to-channel structure of an SE(3)-equivariant feature space.
 
@@ -2342,26 +2405,22 @@ class Fiber(dict):
     channels, and the total flattened feature width. Ported from the NVIDIA SE(3)-Transformer.
 
     Args:
-        structure: A ``{degree: channels}`` dict, a list of ``(degree, channels)`` pairs, or a list of
-            ``FiberEl`` tuples describing the fiber.
+        structure: A mapping or iterable of ``(degree, channels)`` pairs.
     """
 
-    def __init__(self, structure) -> None:
-        if isinstance(structure, dict):
-            structure = [
-                FiberEl(int(degree), int(channels))
-                for degree, channels in sorted(structure.items(), key=lambda item: item[0])
-            ]
-        elif not isinstance(structure[0], FiberEl):
-            structure = [FiberEl(*item) for item in sorted(structure, key=lambda item: item[0])]
-        self.structure = structure
-        super().__init__(dict(self.structure))
+    def __init__(self, structure: Mapping[int, int] | Iterable[tuple[int, int]]) -> None:
+        super().__init__(sorted(dict(structure).items()))
+
+    def __missing__(self, degree: int) -> int:
+        r"""Return zero channels for a degree absent from the fiber."""
+
+        return 0
 
     @property
     def degrees(self) -> list[int]:
         r"""Sorted list of representation degrees present in the fiber."""
 
-        return sorted([item.degree for item in self.structure])
+        return sorted(self)
 
     @property
     def channels(self) -> list[int]:
@@ -2373,7 +2432,7 @@ class Fiber(dict):
     def num_features(self) -> int:
         r"""Total flattened feature width, summing ``channels * degree_to_dim(degree)`` over all degrees."""
 
-        return sum(item.channels * degree_to_dim(item.degree) for item in self.structure)
+        return sum(channels * degree_to_dim(degree) for degree, channels in self.items())
 
     @staticmethod
     def create(num_degrees: int, num_channels: int) -> Fiber:
@@ -2396,51 +2455,16 @@ class Fiber(dict):
             144
         """
 
-        return Fiber([(degree, num_channels) for degree in range(num_degrees)])
-
-    def __getitem__(self, degree: int) -> int:
-        r"""Return the channel count for ``degree``, or 0 if the degree is absent from the fiber."""
-
-        return dict(self.structure).get(degree, 0)
-
-    def __iter__(self):
-        r"""Iterate over the ``FiberEl`` ``(degree, channels)`` entries."""
-
-        return iter(self.structure)
+        return Fiber((degree, num_channels) for degree in range(num_degrees))
 
     def __add__(self, other):
         r"""Add two fibers channel-wise per degree, or add an int to every degree's channel count."""
 
         if isinstance(other, Fiber):
-            return Fiber({item.degree: item.channels + other[item.degree] for item in self.structure})
+            return Fiber({degree: channels + other[degree] for degree, channels in self.items()})
         if isinstance(other, int):
-            return Fiber({item.degree: item.channels + other for item in self.structure})
+            return Fiber({degree: channels + other for degree, channels in self.items()})
         return NotImplemented
-
-
-class Sequential(nn.Sequential):
-    r"""
-    An [torch.nn.Sequential][] that threads extra positional and keyword arguments to every child module.
-
-    Needed because the SE(3) graph modules take the graph and basis alongside the running features.
-    """
-
-    def forward(self, input, *args, **kwargs):
-        r"""
-        Apply each child module in turn, forwarding ``*args``/``**kwargs`` to each.
-
-        Args:
-            input: The running feature passed through the stack.
-            *args: Extra positional arguments forwarded to every child.
-            **kwargs: Extra keyword arguments forwarded to every child.
-
-        Returns:
-            The output of the final child module.
-        """
-
-        for module in self:
-            input = module(input, *args, **kwargs)
-        return input
 
 
 class RadialProfile(nn.Module):
@@ -2518,6 +2542,7 @@ class VersatileConvSE3(nn.Module):
         self.freq_sum = freq_sum
         self.channels_out = channels_out
         self.channels_in = channels_in
+        self.backend = "auto"
         self.radial_func = RadialProfile(
             num_freq=freq_sum,
             channels_in=channels_in,
@@ -2544,7 +2569,7 @@ class VersatileConvSE3(nn.Module):
         )
         if basis is None:
             return radial_weights @ features
-        return weighted_tensor_product(features, basis, radial_weights)
+        return weighted_tensor_product(features, basis, radial_weights, backend=self.backend)
 
 
 class LinearSE3(nn.Module):
@@ -2563,20 +2588,18 @@ class LinearSE3(nn.Module):
         self.weights = nn.ParameterDict(
             {
                 str(degree_out): nn.Parameter(
-                    torch.randn(channels_out, fiber_in[degree_out]) / np.sqrt(fiber_in[degree_out])
+                    torch.randn(channels_out, fiber_in[degree_out]) / math.sqrt(fiber_in[degree_out])
                 )
-                for degree_out, channels_out in fiber_out
+                for degree_out, channels_out in fiber_out.items()
             }
         )
 
-    def forward(self, features: dict[str, Tensor], *args, **kwargs) -> dict[str, Tensor]:
+    def forward(self, features: dict[str, Tensor]) -> dict[str, Tensor]:
         r"""
         Apply the per-degree channel mix.
 
         Args:
             features: Per-degree feature dict keyed by string degree.
-            *args: Ignored; present for graph-module signature symmetry.
-            **kwargs: Ignored; present for graph-module signature symmetry.
 
         Returns:
             The mixed per-degree feature dict.
@@ -2607,14 +2630,12 @@ class NormSE3(nn.Module):
         self.nonlinearity = nn.ReLU() if nonlinearity is None else nonlinearity
         self.group_norm = nn.GroupNorm(num_groups=len(fiber.degrees), num_channels=sum(fiber.channels))
 
-    def forward(self, features: dict[str, Tensor], *args, **kwargs) -> dict[str, Tensor]:
+    def forward(self, features: dict[str, Tensor]) -> dict[str, Tensor]:
         r"""
         Apply the equivariant norm-nonlinearity.
 
         Args:
             features: Per-degree feature dict keyed by string degree.
-            *args: Ignored; present for graph-module signature symmetry.
-            **kwargs: Ignored; present for graph-module signature symmetry.
 
         Returns:
             The rescaled per-degree feature dict.
@@ -2669,15 +2690,18 @@ class ConvSE3(nn.Module):
         self.self_interaction = self_interaction
         self.max_degree = max_degree
         self.allow_fused_output = allow_fused_output
-        channels_in_set = {item.channels + fiber_edge[item.degree] * (item.degree > 0) for item in self.fiber_in}
-        channels_out_set = {item.channels for item in self.fiber_out}
+        self.backend = "auto"
+        channels_in_set = {channels + fiber_edge[degree] * (degree > 0) for degree, channels in self.fiber_in.items()}
+        channels_out_set = set(self.fiber_out.values())
         unique_channels_in = len(channels_in_set) == 1
         degrees_up_to_max = list(range(max_degree + 1))
         edge_dim = fiber_edge[0] + 1
+        self.fused_output = unique_channels_in and fiber_in.degrees == degrees_up_to_max
+        self.conv_out = nn.ModuleDict()
+        self.conv_in = nn.ModuleDict()
 
-        if unique_channels_in and fiber_in.degrees == degrees_up_to_max:
-            self.conv_out = nn.ModuleDict()
-            for degree_out, channels_out in fiber_out:
+        if self.fused_output:
+            for degree_out, channels_out in fiber_out.items():
                 sum_freq = sum(degree_to_dim(min(degree_out, degree)) for degree in fiber_in.degrees)
                 self.conv_out[str(degree_out)] = VersatileConvSE3(
                     sum_freq,
@@ -2687,8 +2711,7 @@ class ConvSE3(nn.Module):
                     use_layer_norm=use_layer_norm,
                 )
         else:
-            self.conv_in = nn.ModuleDict()
-            for degree_in, channels_in in fiber_in:
+            for degree_in, channels_in in fiber_in.items():
                 sum_freq = sum(degree_to_dim(min(degree_in, degree)) for degree in fiber_out.degrees)
                 self.conv_in[str(degree_in)] = VersatileConvSE3(
                     sum_freq,
@@ -2700,10 +2723,10 @@ class ConvSE3(nn.Module):
 
         if self_interaction:
             self.to_kernel_self = nn.ParameterDict()
-            for degree_out, channels_out in fiber_out:
+            for degree_out, channels_out in fiber_out.items():
                 if fiber_in[degree_out]:
                     self.to_kernel_self[str(degree_out)] = nn.Parameter(
-                        torch.randn(channels_out, fiber_in[degree_out]) / np.sqrt(fiber_in[degree_out])
+                        torch.randn(channels_out, fiber_in[degree_out]) / math.sqrt(fiber_in[degree_out])
                     )
 
     def forward(
@@ -2736,7 +2759,7 @@ class ConvSE3(nn.Module):
             in_features.append(src_node_features)
 
         out: dict[str, Tensor]
-        if hasattr(self, "conv_out"):
+        if self.fused_output:
             in_features_fused = torch.cat(in_features, dim=-1)
             out = {
                 str(degree_out): self.conv_out[str(degree_out)](
@@ -2761,9 +2784,16 @@ class ConvSE3(nn.Module):
                 out[str(degree_out)] = out[str(degree_out)] + torch.einsum(
                     "oc,ecd->eod", self.to_kernel_self[str(degree_out)], dst_features
                 )
+            out[str(degree_out)] = out[str(degree_out)].masked_fill(
+                ~graph.edge_mask[:, None, None],
+                0,
+            )
             if self.pool:
                 out[str(degree_out)] = segment_sum_csr(
-                    out[str(degree_out)], graph.row_offsets, num_segments=graph.num_nodes
+                    out[str(degree_out)],
+                    graph.row_offsets,
+                    num_segments=graph.num_nodes,
+                    backend=self.backend,
                 )
         return out
 
@@ -2787,6 +2817,7 @@ class AttentionSE3(nn.Module):
         self.num_heads = num_heads
         self.key_fiber = key_fiber
         self.value_fiber = value_fiber
+        self.backend = "auto"
 
     def forward(
         self,
@@ -2812,12 +2843,25 @@ class AttentionSE3(nn.Module):
         query_tensor = torch.cat([query[str(degree)] for degree in self.key_fiber.degrees], dim=-1)
         query_heads = query_tensor.reshape(query_tensor.shape[0], self.num_heads, -1)
 
-        edge_weights = (key_heads * query_heads[graph.dst]).sum(dim=-1) / np.sqrt(self.key_fiber.num_features)
-        edge_weights = cast(Tensor, segment_softmax_csr(edge_weights, graph.row_offsets))[..., None, None]
+        edge_weights = (key_heads * query_heads[graph.dst]).sum(dim=-1) / math.sqrt(self.key_fiber.num_features)
+        edge_weights = edge_weights.masked_fill(
+            ~graph.edge_mask[:, None],
+            torch.finfo(edge_weights.dtype).min,
+        )
+        edge_weights = cast(
+            Tensor,
+            segment_softmax_csr(edge_weights, graph.row_offsets, backend=self.backend),
+        )[..., None, None]
 
         value_heads = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
         feat_out = cast(
-            Tensor, segment_sum_csr(edge_weights * value_heads, graph.row_offsets, num_segments=graph.num_nodes)
+            Tensor,
+            segment_sum_csr(
+                edge_weights * value_heads,
+                graph.row_offsets,
+                num_segments=graph.num_nodes,
+                backend=self.backend,
+            ),
         )
         feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])
         return unfuse_features(feat_out, self.value_fiber.degrees)
@@ -2854,9 +2898,9 @@ class AttentionBlockSE3(nn.Module):
         max_degree: int = 1,
     ) -> None:
         super().__init__()
-        value_fiber = Fiber([(degree, channels // channels_div) for degree, channels in fiber_out])
+        value_fiber = Fiber((degree, channels // channels_div) for degree, channels in fiber_out.items())
         key_query_fiber = Fiber(
-            [(item.degree, item.channels) for item in value_fiber if item.degree in fiber_in.degrees]
+            (degree, channels) for degree, channels in value_fiber.items() if degree in fiber_in.degrees
         )
         self.to_key_value = ConvSE3(
             fiber_in,
@@ -2944,7 +2988,6 @@ class SE3Transformer(nn.Module):
         channels_div: Channel-division factor for the value fibers.
         fiber_edge: Edge fiber; empty when `None`.
         use_layer_norm: Whether the convolutions layer-norm their radial hidden activations.
-        **kwargs: Accepted and ignored for construction compatibility.
     """
 
     def __init__(
@@ -2957,7 +3000,6 @@ class SE3Transformer(nn.Module):
         channels_div: int,
         fiber_edge: Fiber | None = None,
         use_layer_norm: bool = True,
-        **kwargs,
     ) -> None:
         super().__init__()
         fiber_edge = Fiber({}) if fiber_edge is None else fiber_edge
@@ -2965,6 +3007,7 @@ class SE3Transformer(nn.Module):
         self.fiber_edge = fiber_edge
         self.num_heads = num_heads
         self.channels_div = channels_div
+        self.backend = "auto"
         self.max_degree = max(*fiber_in.degrees, *fiber_hidden.degrees, *fiber_out.degrees)
         graph_modules = []
         for _ in range(num_layers):
@@ -2991,7 +3034,7 @@ class SE3Transformer(nn.Module):
                 max_degree=self.max_degree,
             )
         )
-        self.graph_modules = Sequential(*graph_modules)
+        self.graph_modules = nn.ModuleList(graph_modules)
 
     def forward(
         self,
@@ -3015,10 +3058,16 @@ class SE3Transformer(nn.Module):
 
         basis = basis or cast(
             "dict[str, Tensor]",
-            se3_basis(graph.rel_pos, max_degree=self.max_degree, use_pad_trick=False, fully_fused=False),
+            se3_basis(graph.rel_pos, max_degree=self.max_degree, backend=self.backend),
         )
         edge_feats = get_populated_edge_features(graph.rel_pos, edge_feats)
-        return self.graph_modules(node_feats, edge_feats, graph=graph, basis=basis)
+        for block_index in range(self.num_layers):
+            attention = self.graph_modules[2 * block_index]
+            norm = self.graph_modules[2 * block_index + 1]
+            node_feats = attention(node_feats, edge_feats, graph, basis)
+            node_feats = norm(node_feats)
+        output = self.graph_modules[-1]
+        return output(node_feats, edge_feats, graph, basis)
 
 
 class SE3TransformerWrapper(nn.Module):
@@ -3125,10 +3174,9 @@ class DistanceNetwork(nn.Module):
 
     Args:
         n_feat: Width of the input pair representation.
-        dropout: Dropout probability (accepted for signature symmetry).
     """
 
-    def __init__(self, n_feat: int, dropout: float = 0.1) -> None:
+    def __init__(self, n_feat: int) -> None:
         super().__init__()
         self.proj_symm = nn.Linear(n_feat, DIST_BINS + OMEGA_BINS)
         self.proj_asymm = nn.Linear(n_feat, THETA_BINS + PHI_BINS)
@@ -3179,7 +3227,7 @@ class MaskedTokenNetwork(nn.Module):
 
     def __init__(self, n_feat: int, vocab_size: int = 21) -> None:
         super().__init__()
-        self.vocab_size = int(vocab_size)
+        self.vocab_size = vocab_size
         self.proj = nn.Linear(n_feat, self.vocab_size)
         self.reset_parameter()
 
@@ -3244,10 +3292,9 @@ class ExpResolvedNetwork(nn.Module):
     Args:
         msa_size: Width of the MSA row input.
         state_size: Width of the node-state input.
-        dropout: Dropout probability (accepted for signature symmetry).
     """
 
-    def __init__(self, msa_size: int, state_size: int, dropout: float = 0.1) -> None:
+    def __init__(self, msa_size: int, state_size: int) -> None:
         super().__init__()
         self.norm_msa = nn.LayerNorm(msa_size)
         self.norm_state = nn.LayerNorm(state_size)
@@ -3275,27 +3322,6 @@ class ExpResolvedNetwork(nn.Module):
         normalized_state = self.norm_state(state)
         logits = self.proj(torch.cat((normalized_seq, normalized_state), dim=-1))
         return logits.squeeze(-1)
-
-
-def find_breaks(ix: np.ndarray, thresh: int = 35) -> np.ndarray:
-    r"""
-    Return the positions where the residue index jumps by more than ``thresh`` (chain breaks).
-
-    Args:
-        ix: 1D residue-index array.
-        thresh: Minimum forward jump that counts as a chain break.
-
-    Returns:
-        A 1D array of break positions (indices into ``ix``).
-
-    Examples:
-        >>> import numpy as np
-        >>> from ofoldx.models.rfdiffusion.model import find_breaks
-        >>> find_breaks(np.array([1, 2, 3, 100, 101])).tolist()
-        [3]
-    """
-
-    return np.where(np.diff(ix) > thresh)[0] + 1
 
 
 def init_lecun_normal(module: nn.Module) -> nn.Module:
@@ -3331,6 +3357,9 @@ def init_lecun_normal_param(weight: torch.Tensor) -> torch.Tensor:
         torch.Size([2, 3])
     """
 
+    if weight.is_meta:
+        return torch.empty_like(weight)
+
     def truncated_normal(uniform: torch.Tensor, mu: float = 0.0, sigma: float = 1.0, a: int = -2, b: int = 2):
         r"""
         Map uniform samples to a normal distribution truncated to ``[a, b]`` via the inverse-CDF.
@@ -3352,9 +3381,9 @@ def init_lecun_normal_param(weight: torch.Tensor) -> torch.Tensor:
         alpha_cdf = normal.cdf(torch.tensor(alpha))
         p = alpha_cdf + (normal.cdf(torch.tensor(beta)) - alpha_cdf) * uniform
         v = torch.clamp(2 * p - 1, -1 + 1e-8, 1 - 1e-8)
-        return torch.clamp(mu + sigma * np.sqrt(2) * torch.erfinv(v), a, b)
+        return torch.clamp(mu + sigma * math.sqrt(2) * torch.erfinv(v), a, b)
 
-    stddev = np.sqrt(1.0 / weight.shape[-1]) / 0.87962566103423978
+    stddev = math.sqrt(1.0 / weight.shape[-1]) / 0.87962566103423978
     return stddev * truncated_normal(torch.rand(weight.shape, device=weight.device, dtype=weight.dtype))
 
 
@@ -3372,7 +3401,6 @@ class Dropout(nn.Module):
 
     def __init__(self, broadcast_dim: int | None = None, dropout: float = 0.15) -> None:
         super().__init__()
-        self.sampler = torch.distributions.bernoulli.Bernoulli(torch.tensor([1 - dropout]))
         self.broadcast_dim = broadcast_dim
         self.dropout = dropout
 
@@ -3387,12 +3415,12 @@ class Dropout(nn.Module):
             The dropped, rescaled tensor while training; ``x`` unchanged otherwise.
         """
 
-        if not self.training:
+        if not self.training or self.dropout == 0:
             return x
         shape = list(x.shape)
         if self.broadcast_dim is not None:
             shape[self.broadcast_dim] = 1
-        mask = self.sampler.sample(shape).to(x.device).view(shape)
+        mask = (torch.rand(shape, device=x.device) >= self.dropout).to(x.dtype)
         return mask * x / (1.0 - self.dropout)
 
 
@@ -3440,20 +3468,20 @@ def get_seqsep(idx: torch.Tensor, cyclic: torch.Tensor | None = None) -> torch.T
     neigh[neigh > 1] = 0.0
     neigh = sign * neigh
 
-    breaks = find_breaks(idx.squeeze().detach().cpu().numpy())
-    chainids = np.zeros_like(idx.squeeze().detach().cpu().numpy())
-    for i, break_index in enumerate(breaks):
-        chainids[break_index:] = i + 1
-    chainids = torch.from_numpy(chainids).to(device=idx.device)
-
-    if cyclic is not None:
-        for chain_id in torch.unique(chainids):
-            is_chain = chainids == chain_id
-            cur_cyclic = cyclic * is_chain
-            cur_res = cur_cyclic.nonzero()
-            if cur_cyclic.sum() >= 2:
-                neigh[:, cur_res[-1], cur_res[0]] = 1
-                neigh[:, cur_res[0], cur_res[-1]] = -1
+    cyclic_mask = _cyclic_mask(cyclic, idx)
+    if cyclic_mask is not None:
+        chain_ids = _chain_ids(idx)
+        same_chain = chain_ids[:, :, None] == chain_ids[:, None, :]
+        positions = torch.arange(idx.shape[1], device=idx.device)
+        earlier = positions[None, None, :] < positions[None, :, None]
+        later = positions[None, None, :] > positions[None, :, None]
+        cyclic_peers = same_chain & cyclic_mask[:, None, :]
+        first = cyclic_mask & ~(cyclic_peers & earlier).any(dim=-1)
+        last = cyclic_mask & ~(cyclic_peers & later).any(dim=-1)
+        forward_closure = last[:, :, None] & first[:, None, :] & same_chain
+        reverse_closure = first[:, :, None] & last[:, None, :] & same_chain
+        neigh = torch.where(forward_closure, torch.ones_like(neigh), neigh)
+        neigh = torch.where(reverse_closure, -torch.ones_like(neigh), neigh)
 
     return neigh.unsqueeze(-1)
 
@@ -3476,8 +3504,6 @@ class RFGraph:
         length: Number of residues per graph.
     """
 
-    __slots__ = ("src", "dst", "rel_pos", "edge_feats", "num_nodes", "row_offsets")
-
     def __init__(
         self,
         coords: torch.Tensor,
@@ -3485,6 +3511,7 @@ class RFGraph:
         batch: torch.Tensor,
         src_res: torch.Tensor,
         dst_res: torch.Tensor,
+        edge_mask: torch.Tensor,
         *,
         batch_size: int,
         length: int,
@@ -3494,14 +3521,18 @@ class RFGraph:
         order = torch.argsort(dst * (batch_size * length) + src, stable=True)
         src, dst = src[order], dst[order]
         batch, src_res, dst_res = batch[order], src_res[order], dst_res[order]
+        self.edge_mask = edge_mask[order]
         self.src = src
         self.dst = dst
         self.rel_pos = (coords[batch, dst_res, :] - coords[batch, src_res, :]).detach()
+        self.rel_pos = self.rel_pos.masked_fill(~self.edge_mask[:, None], 0)
+        self.rel_pos[:, 0] = self.rel_pos[:, 0].masked_fill(~self.edge_mask, 1)
         self.edge_feats = pair[batch, src_res, dst_res][..., None]
+        self.edge_feats = self.edge_feats.masked_fill(~self.edge_mask[:, None, None], 0)
         self.num_nodes = batch_size * length
-        counts = torch.bincount(dst, minlength=self.num_nodes)
-        self.row_offsets = torch.zeros(self.num_nodes + 1, dtype=torch.long, device=coords.device)
-        self.row_offsets[1:] = torch.cumsum(counts, dim=0)
+        counts = torch.zeros(self.num_nodes, dtype=torch.long, device=coords.device)
+        counts.scatter_add_(0, dst, torch.ones_like(dst))
+        self.row_offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
 
     def edges(self) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Return the ``(src, dst)`` global node-index tensors of the edge list."""
@@ -3528,9 +3559,21 @@ def make_full_graph(
     """
 
     batch_size, length = coords.shape[:2]
-    sep = idx[:, None, :] - idx[:, :, None]
-    batch, src_res, dst_res = torch.where(sep.abs() > 0)
-    graph = RFGraph(coords, pair, batch, src_res, dst_res, batch_size=batch_size, length=length)
+    residues = torch.arange(length, device=coords.device)
+    batch = torch.arange(batch_size, device=coords.device)[:, None, None].expand(-1, length, length).reshape(-1)
+    src_res = residues[None, :, None].expand(batch_size, -1, length).reshape(-1)
+    dst_res = residues[None, None, :].expand(batch_size, length, -1).reshape(-1)
+    edge_mask = (idx[:, None, :] != idx[:, :, None]).reshape(-1)
+    graph = RFGraph(
+        coords,
+        pair,
+        batch,
+        src_res,
+        dst_res,
+        edge_mask,
+        batch_size=batch_size,
+        length=length,
+    )
     return graph, graph.edge_feats
 
 
@@ -3565,121 +3608,538 @@ def make_topk_graph(
     distances = torch.cdist(coords, coords) + torch.eye(length, device=coords.device).unsqueeze(0) * 999.9
     sep = (idx[:, None, :] - idx[:, :, None]).abs() + torch.eye(length, device=coords.device).unsqueeze(0) * 999.9
     distances = distances + sep * eps
-    _, edge_index = torch.topk(distances, min(top_k, length), largest=False)
-    topk_matrix = torch.zeros((batch_size, length, length), device=coords.device)
-    topk_matrix.scatter_(2, edge_index, 1.0)
-    condition = torch.logical_or(topk_matrix > 0.0, sep < kmin)
-    batch, src_res, dst_res = torch.where(condition)
-    graph = RFGraph(coords, pair, batch, src_res, dst_res, batch_size=batch_size, length=length)
+    _, topk_targets = torch.topk(distances, min(top_k, length), largest=False)
+    residues = torch.arange(length, device=coords.device)
+    local_offsets = torch.arange(1 - kmin, kmin, device=coords.device)
+    local_targets = residues[:, None] + local_offsets[None]
+    local_valid = (local_targets >= 0) & (local_targets < length)
+    local_targets = local_targets.clamp(0, length - 1)
+    gathered_separation = torch.gather(
+        sep,
+        2,
+        local_targets[None].expand(batch_size, -1, -1),
+    )
+    local_valid = local_valid[None] & (gathered_separation < kmin)
+    local_valid = local_valid & ~(local_targets[None, :, :, None] == topk_targets[:, :, None, :]).any(dim=-1)
+    targets = torch.cat(
+        (topk_targets, local_targets[None].expand(batch_size, -1, -1)),
+        dim=-1,
+    )
+    edge_mask = torch.cat((torch.ones_like(topk_targets, dtype=torch.bool), local_valid), dim=-1)
+    edges_per_source = targets.shape[-1]
+    batch = (
+        torch.arange(batch_size, device=coords.device)[:, None, None].expand(-1, length, edges_per_source).reshape(-1)
+    )
+    src_res = residues[None, :, None].expand(batch_size, -1, edges_per_source).reshape(-1)
+    dst_res = targets.reshape(-1)
+    graph = RFGraph(
+        coords,
+        pair,
+        batch,
+        src_res,
+        dst_res,
+        edge_mask.reshape(-1),
+        batch_size=batch_size,
+        length=length,
+    )
     return graph, graph.edge_feats
 
 
-@register_pytree_dataclass
-@dataclass(slots=True)
-class RfDiffusionRepresentations:
+class RFdiffusionSymmetry:
+    r"""Project declared PointGroupSymmetry units onto one exact rotation group."""
+
+    def __init__(self, condition: PointGroupSymmetry, layout: RFdiffusionLayout) -> None:
+        row_by_reference = {reference: row for row, reference in enumerate(layout.output_residues)}
+        row_by_reference.update(
+            {
+                alias: row_by_reference[reference]
+                for alias, reference in symbolic_residue_aliases(layout.output_residues).items()
+            }
+        )
+        units = []
+        for unit in condition.units:
+            rows: list[int] = []
+            for target in unit:
+                if type(target) is str:
+                    rows.extend(
+                        row
+                        for row, reference in enumerate(layout.output_residues)
+                        if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                    )
+                else:
+                    rows.append(row_by_reference[target])
+            units.append(tuple(rows))
+        lengths = {len(unit) for unit in units}
+        if len(lengths) != 1:
+            raise ValueError("PointGroupSymmetry units must resolve to equal concrete lengths")
+        if len({row for unit in units for row in unit}) != sum(map(len, units)):
+            raise ValueError("PointGroupSymmetry units must not overlap")
+        if {row for unit in units for row in unit} != set(range(len(layout.output_residues))):
+            raise ValueError("RFdiffusion PointGroupSymmetry must cover every output residue exactly once")
+        self.units = tuple(units)
+        self.kind = condition.kind
+        self.rotations = self.rotation_matrices(condition.kind, condition.order)
+
+    @staticmethod
+    def rotation_matrices(kind: str, order: int | None) -> tuple[Tensor, ...]:
+        r"""Return RFdiffusion point-group matrices in the released upstream order."""
+
+        if kind == "cyclic":
+            angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
+            matrices = np.stack(
+                [
+                    np.array(
+                        (
+                            (np.cos(angle), -np.sin(angle), 0.0),
+                            (np.sin(angle), np.cos(angle), 0.0),
+                            (0.0, 0.0, 1.0),
+                        )
+                    )
+                    for angle in angles
+                ]
+            )
+        elif kind == "dihedral":
+            angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
+            flip = np.diag((1.0, -1.0, -1.0))
+            matrices = []
+            for angle in angles:
+                rotation = np.array(
+                    (
+                        (np.cos(angle), -np.sin(angle), 0.0),
+                        (np.sin(angle), np.cos(angle), 0.0),
+                        (0.0, 0.0, 1.0),
+                    )
+                )
+                matrices.extend((rotation, flip @ rotation))
+            matrices = np.stack(matrices)
+        else:
+            group = {"tetrahedral": "T", "octahedral": "O", "icosahedral": "I"}[kind]
+            matrices = Rotation.create_group(group).as_matrix()
+            if kind == "icosahedral":
+                q = np.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)))
+                matrices = np.einsum("ij,njk,lk->nil", q, matrices, q)
+            rounded = np.round(matrices, decimals=12)
+            canonical_order = sorted(
+                range(len(matrices)),
+                key=lambda index: tuple(rounded[index].reshape(-1)),
+            )
+            matrices = matrices[np.asarray(canonical_order)]
+            permutation = {
+                "tetrahedral": (10, 7, 11, 6, 5, 9, 4, 8, 3, 2, 1, 0),
+                "octahedral": (19, 18, 23, 21, 14, 15, 11, 10, 16, 22, 20, 17, 3, 2, 13, 7, 5, 8, 12, 6, 9, 1, 0, 4),
+                "icosahedral": (
+                    59,
+                    58,
+                    55,
+                    53,
+                    57,
+                    51,
+                    56,
+                    50,
+                    54,
+                    52,
+                    47,
+                    45,
+                    49,
+                    43,
+                    48,
+                    42,
+                    46,
+                    44,
+                    41,
+                    35,
+                    39,
+                    37,
+                    38,
+                    36,
+                    40,
+                    34,
+                    31,
+                    29,
+                    33,
+                    26,
+                    28,
+                    30,
+                    32,
+                    27,
+                    0,
+                    1,
+                    9,
+                    3,
+                    7,
+                    5,
+                    6,
+                    4,
+                    8,
+                    2,
+                    17,
+                    11,
+                    15,
+                    13,
+                    14,
+                    12,
+                    16,
+                    10,
+                    23,
+                    21,
+                    25,
+                    19,
+                    24,
+                    18,
+                    22,
+                    20,
+                ),
+            }[kind]
+            matrices = matrices[np.asarray(permutation)]
+        return tuple(torch.as_tensor(matrix, dtype=torch.float32) for matrix in matrices)
+
+    def apply(
+        self,
+        coords: Tensor,
+        sequence: Tensor,
+        *,
+        recenter: bool,
+        radius_angstrom: float,
+    ) -> tuple[Tensor, Tensor]:
+        r"""Project coordinates and sequence from the first declared unit."""
+
+        projected_coords = coords.clone()
+        projected_sequence = sequence.clone()
+        base_index = torch.tensor(self.units[0], device=coords.device)
+        base_coords = coords[base_index]
+        base_sequence = sequence[base_index]
+        for rows, rotation in zip(self.units, self.rotations, strict=True):
+            index = torch.tensor(rows, device=coords.device)
+            matrix = rotation.to(device=coords.device, dtype=coords.dtype)
+            rotated = torch.einsum("raj,kj->rak", base_coords, matrix)
+            if self.kind == "octahedral" and recenter:
+                offset = coords.new_tensor((radius_angstrom, 0.0, 0.0))
+                rotated = rotated - rotated[:, 1].mean(dim=0) + torch.einsum("j,kj->k", offset, matrix)
+            projected_coords[index] = rotated
+            projected_sequence[index] = base_sequence
+        return projected_coords, projected_sequence
+
+    def chain_broken_residue_index(self, residue_index: Tensor) -> Tensor:
+        r"""Add the released full-design-length unit breaks to residue indices."""
+
+        result = residue_index.clone()
+        offset = result.shape[-1]
+        for unit_index, rows in enumerate(self.units):
+            result[..., torch.tensor(rows, device=result.device)] += offset * (unit_index + 1)
+        return result
+
+
+class RFdiffusionGuidance:
+    r"""Differentiate canonical soft geometric Conditions during reverse diffusion."""
+
+    def __init__(
+        self,
+        layout: RFdiffusionLayout,
+    ) -> None:
+        self.layout = layout
+        self.row_by_reference = {reference: row for row, reference in enumerate(layout.output_residues)}
+        self.row_by_reference.update(
+            {
+                alias: self.row_by_reference[reference]
+                for alias, reference in symbolic_residue_aliases(layout.output_residues).items()
+            }
+        )
+        self.structure_index = (
+            {} if layout.structure is None else {site: index for index, site in enumerate(layout.structure.sites)}
+        )
+        reference_sites = {
+            site
+            for condition in layout.conditions
+            if type(condition) is ReferenceCoordinates
+            for site in condition.sites
+        }
+        anchor_rows: list[int] = []
+        anchor_atoms: list[int] = []
+        anchor_coordinates: list[np.ndarray] = []
+        if layout.structure is not None:
+            for row, reference in enumerate(layout.output_residues):
+                if type(reference) is not tuple:
+                    continue
+                sites = tuple(AtomSite(reference[0], reference[1], atom) for atom in ("N", "CA", "C"))
+                if not all(site in reference_sites for site in sites):
+                    continue
+                for atom_index, site in enumerate(sites):
+                    source = self.structure_index[site]
+                    anchor_rows.append(row)
+                    anchor_atoms.append(atom_index)
+                    anchor_coordinates.append(layout.structure.coordinates[source])
+                break
+        self.anchor_rows = tuple(anchor_rows)
+        self.anchor_atoms = tuple(anchor_atoms)
+        self.anchor_coordinates = np.asarray(anchor_coordinates, dtype=np.float32)
+        self.conditions = tuple(
+            condition
+            for condition in layout.conditions
+            if (
+                type(condition)
+                in (
+                    Coordination,
+                    Distance,
+                    RadiusOfGyration,
+                    SubstrateInteraction,
+                )
+                and condition.intent == "soft"
+            )
+            or (
+                type(condition) is SymbolicBond
+                and {
+                    (
+                        condition.site_a.atom_id
+                        if type(condition.site_a) is SymbolicAtomSite
+                        else condition.site_a.atom_id
+                    ),
+                    (
+                        condition.site_b.atom_id
+                        if type(condition.site_b) is SymbolicAtomSite
+                        else condition.site_b.atom_id
+                    ),
+                }
+                == {"N", "C"}
+            )
+        )
+        if any(type(condition) is SubstrateInteraction for condition in self.conditions) and not self.anchor_rows:
+            raise ValueError(
+                "SubstrateInteraction with external atoms requires fixed ReferenceCoordinates to define "
+                "the substrate frame"
+            )
+
+    def __bool__(self) -> bool:
+        return bool(self.conditions)
+
+    def __call__(self, coords: Tensor) -> Tensor:
+        potential = coords.new_zeros(())
+        for condition in self.conditions:
+            weight = 1.0 if type(condition) is SymbolicBond or condition.weight is None else condition.weight
+            if type(condition) is Coordination:
+                left = self._coordinates(condition.side_a, coords)
+                right = self._coordinates(condition.side_b, coords)
+                scaled = (torch.cdist(left, right) - condition.center_angstrom) / condition.scale_angstrom
+                coordination = (1 / (1 + scaled.pow(6))).sum()
+                direction = 1 if condition.direction == "maximize" else -1
+                potential = potential + direction * weight * coordination
+            elif type(condition) is Distance:
+                distance = torch.linalg.vector_norm(
+                    self._atom(condition.site_a, coords) - self._atom(condition.site_b, coords)
+                )
+                lower = max(0.0, condition.lower_angstrom - condition.tolerance_angstrom)
+                upper = condition.upper_angstrom + condition.tolerance_angstrom
+                violation = torch.relu(distance.new_tensor(lower) - distance).square()
+                violation = violation + torch.relu(distance - distance.new_tensor(upper)).square()
+                potential = potential - weight * violation
+            elif type(condition) is RadiusOfGyration:
+                rows = self._residue_rows(condition.targets)
+                calpha = coords[torch.tensor(rows, device=coords.device), 1]
+                distances = torch.linalg.vector_norm(calpha - calpha.mean(dim=0), dim=-1)
+                radius = torch.sqrt(torch.clamp_min(distances, condition.upper_angstrom).square().mean())
+                potential = potential - weight * radius
+            elif type(condition) is SubstrateInteraction:
+                rows = self._residue_rows(condition.residues)
+                residue_coords = coords[torch.tensor(rows, device=coords.device), 1]
+                substrate_coords = self._coordinates(condition.substrate_atoms, coords)
+                nearest = torch.cdist(residue_coords, substrate_coords).amin(dim=-1)
+                scaled = (nearest - condition.center_angstrom) / condition.scale_angstrom
+                attraction = condition.attraction_strength / (1 + scaled.pow(6))
+                exponent = 1.5
+                repulsion = (
+                    condition.repulsion_slope**2
+                    * torch.clamp_min(condition.repulsion_cutoff_angstrom - nearest, 0).pow(exponent)
+                    / (exponent * condition.repulsion_cutoff_angstrom ** (exponent - 1))
+                )
+                potential = potential + weight * (attraction - repulsion).sum()
+            else:
+                distance = torch.linalg.vector_norm(
+                    self._atom(condition.site_a, coords) - self._atom(condition.site_b, coords)
+                )
+                potential = potential - (distance - 1.33).square()
+        return potential
+
+    def _residue_rows(self, references: Iterable[object]) -> tuple[int, ...]:
+        rows: list[int] = []
+        for reference in references:
+            if type(reference) is str:
+                rows.extend(
+                    row
+                    for row, output in enumerate(self.layout.output_residues)
+                    if type(output) is SymbolicResidueSite and output.placement_id == reference
+                )
+            elif type(reference) in (tuple, SymbolicResidueSite):
+                rows.append(self.row_by_reference[reference])
+            elif type(reference) is SymbolicAtomSite:
+                rows.append(self.row_by_reference[reference.residue])
+            elif type(reference) is AtomSite:
+                system = self.layout.system
+                entity = system.entities[system.instances[reference.instance_id]]  # type: ignore[union-attr]
+                if type(entity) is not Molecule:
+                    rows.append(self.row_by_reference[(reference.instance_id, reference.component_index)])
+        return tuple(dict.fromkeys(rows))
+
+    def _coordinates(self, references: Iterable[object], coords: Tensor) -> Tensor:
+        values: list[Tensor] = []
+        for reference in references:
+            if type(reference) in (str, tuple, SymbolicResidueSite):
+                rows = self._residue_rows((reference,))
+                values.extend(self._residue_coordinate(row, coords) for row in rows)
+            else:
+                values.append(self._atom(reference, coords))
+        return torch.stack(values)
+
+    def _residue_coordinate(self, row: int, coords: Tensor) -> Tensor:
+        reference = self.layout.output_residues[row]
+        if type(reference) is tuple and self.layout.system is not None:
+            entity = self.layout.system.entities[self.layout.system.instances[reference[0]]]
+            if entity.components[reference[1]].component_id == "GLY":
+                return coords[row, 1]
+        return generate_cbeta(coords[row, 0], coords[row, 1], coords[row, 2])
+
+    def _atom(self, reference: AtomSite | SymbolicAtomSite, coords: Tensor) -> Tensor:
+        if type(reference) is SymbolicAtomSite:
+            row = self.row_by_reference[reference.residue]
+            atom_names = ("N", "CA", "C")
+            return coords[row, atom_names.index(reference.atom_id)]
+        row = self.row_by_reference.get((reference.instance_id, reference.component_index))
+        if row is not None:
+            system = self.layout.system
+            entity = system.entities[system.instances[reference.instance_id]]  # type: ignore[union-attr]
+            component_id = entity.components[reference.component_index].component_id
+            atom_names = ATOM14_NAMES[residue_token(component_id)]
+            return coords[row, atom_names.index(reference.atom_id)]
+        source_index = self.structure_index[reference]
+        value = torch.tensor(
+            self.layout.structure.coordinates[source_index],  # type: ignore[union-attr]
+            device=coords.device,
+            dtype=coords.dtype,
+        )
+        if not self.anchor_rows:
+            raise ValueError(
+                "guidance to atoms outside the RFdiffusion output requires fixed ReferenceCoordinates "
+                "to define their coordinate frame"
+            )
+        source_anchors = torch.as_tensor(
+            self.anchor_coordinates,
+            device=coords.device,
+            dtype=coords.dtype,
+        )
+        target_anchors = coords[
+            torch.tensor(self.anchor_rows, device=coords.device),
+            torch.tensor(self.anchor_atoms, device=coords.device),
+        ]
+        source_rotation, source_calpha = rigid_from_3_points(
+            source_anchors[0],
+            source_anchors[1],
+            source_anchors[2],
+        )
+        target_rotation, target_calpha = rigid_from_3_points(
+            target_anchors[0],
+            target_anchors[1],
+            target_anchors[2],
+        )
+        local = (value - source_calpha) @ source_rotation
+        return local @ target_rotation.transpose(-1, -2) + target_calpha
+
+
+class RFdiffusionSampler:
     r"""
-    Trunk representations produced by one RoseTTAFold denoising pass.
-
-    Wraps the network's first-MSA-row (single) and pair activations in the typed
-    [`Single`][ofoldx.modules.representation.Single] and [`Pair`][ofoldx.modules.representation.Pair]
-    carriers at the model boundary, the same way [`Coords`][ofoldx.modules.representation.Coords] is used on
-    [`StructurePredictionOutput`][ofoldx.models.contract.StructurePredictionOutput]. The carriers are
-    pytree-registered, so this dataclass introduces no graph break; unwrap ``.tensor`` before feeding eager
-    tensor math or the denoiser.
-
-    Attributes:
-        single: First-MSA-row activations ``[B, L, msa_size]`` as a
-            [`Single`][ofoldx.modules.representation.Single] carrier.
-        pair: Pair activations ``[B, L, L, pair_size]`` as a [`Pair`][ofoldx.modules.representation.Pair] carrier.
-    """
-
-    single: Single
-    pair: Pair
-
-
-@register_pytree_dataclass
-@dataclass(slots=True, kw_only=True)
-class RfDiffusionInput(BaseInput):
-    r"""
-    Tensor input consumed by the OFoldX-native RfDiffusion generator.
-
-    Produced by [`RfDiffusionProcessor`][ofoldx.models.rfdiffusion.processor.RfDiffusionProcessor]. All
-    tensors carry a leading batch dimension. Motif residues (fixed structure) and design residues (redesigned)
-    are distinguished by the masks; optional contig/inpaint fields override the config-level specification.
-
-    Attributes:
-        token_mask: Per-token validity mask `[B, L]`.
-        residue_index: Residue-position index `[B, L]`.
-        chain_index: Per-token chain index `[B, L]`.
-        residue_type: Per-token amino-acid type id `[B, L]`.
-        motif_positions: Representative-atom (CA) coords for motif conditioning `[B, L, 3]`.
-        motif_mask: Per-token mask marking fixed motif residues `[B, L]`.
-        design_mask: Per-token mask marking residues to redesign `[B, L]`; `None` when unset.
-        sequence_tokens: Per-token sequence ids `[B, L]`; `None` when unset.
-        target_features: Optional precomputed target feature dict bypassing PDB parsing.
-        contigs: Optional contig strings overriding the config-level specification.
-        inpaint_seq: Optional sequence-inpainting spans.
-        inpaint_str: Optional structure-inpainting spans.
-        provide_seq: Optional spans whose sequence is provided (unmasked).
-    """
-
-    token_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    residue_type: Tensor
-    motif_positions: Tensor
-    motif_mask: Tensor
-    design_mask: Tensor | None = None
-    sequence_tokens: Tensor | None = None
-    target_features: dict[str, Any] | None = None
-    contigs: list[str] | None = None
-    inpaint_seq: list[str] | None = None
-    inpaint_str: list[str] | None = None
-    provide_seq: list[str] | None = None
-
-
-# ``RfDiffusionInput`` is defined after ``RfDiffusionDesigner``; bind the keyword-tensor construction target
-# now that the type exists so ``model(**inputs)`` builds it on ``ModelMixin.__call__``.
-RfDiffusionDesigner.input_class = RfDiffusionInput
-
-
-class NativeRfDiffusionSampler:
-    r"""
-    Native RFdiffusion reverse-diffusion inference loop.
-
-    Drives one design trajectory: builds the initial noised structure and sequence features, then repeatedly
-    calls the RoseTTAFold network and steps the [`Denoiser`][ofoldx.models.rfdiffusion.model.Denoiser]
-    from ``x_T`` down to the final timestep. Handles contigs, symmetry, guiding potentials, and scaffold
-    guidance. The network is supplied at construction, so this module never imports it.
+    Reference PyTorch reverse-diffusion loop over one canonical RFdiffusion input.
 
     Args:
-        config: The [`RfDiffusionConfig`][ofoldx.models.rfdiffusion.config.RfDiffusionConfig] controlling
-            the diffuser, denoiser, and inference behavior.
-        network: The RoseTTAFold network to call each step, or `None` (sampling then raises).
-        device: Device to run on; inferred from ``network`` (or CUDA-if-available) when omitted.
+        config: Persistent checkpoint architecture and diffusion process.
+        network: The RoseTTAFold denoiser called at each reverse step.
+        allatom: The Model-owned atom-coordinate reconstruction module.
+        final_step: Last reverse timestep.
+        partial_steps: Optional partial-diffusion starting timestep.
+        noise_scale_ca: Initial CA-translation noise scale at the first reverse step.
+        final_noise_scale_ca: Optional CA-translation interpolation endpoint for a linear schedule.
+        ca_noise_schedule: CA noise schedule, ``"constant"`` or ``"linear"``.
+        noise_scale_frame: Initial backbone-frame noise scale at the first reverse step.
+        final_noise_scale_frame: Optional backbone-frame interpolation endpoint for a linear schedule.
+        frame_noise_schedule: Frame noise schedule, ``"constant"`` or ``"linear"``.
+        align_motif: Whether to align each predicted clean structure onto a fixed motif.
+        symmetry_recenter: Whether octahedral units are individually recentered and placed on a radius.
+        symmetry_radius_angstrom: Octahedral placement radius.
+        schedule_directory: Local IGSO(3) table cache.
     """
 
     def __init__(
         self,
-        config: RfDiffusionConfig,
+        config: RFdiffusionConfig,
         *,
-        network: nn.Module | None,
-        device: torch.device | str | None = None,
+        network: nn.Module,
+        allatom: ComputeAllAtomCoords,
+        final_step: int = 1,
+        partial_steps: int | None = None,
+        noise_scale_ca: float = 1.0,
+        final_noise_scale_ca: float | None = None,
+        ca_noise_schedule: Literal["constant", "linear"] = "constant",
+        noise_scale_frame: float = 1.0,
+        final_noise_scale_frame: float | None = None,
+        frame_noise_schedule: Literal["constant", "linear"] = "constant",
+        align_motif: bool = True,
+        symmetry_recenter: bool = True,
+        symmetry_radius_angstrom: float = 10.0,
+        guidance_scale: float = 10.0,
+        guidance_decay: str = "constant",
+        schedule_directory: str | Path | None = None,
     ) -> None:
+        final_step = integer_index(final_step)
+        partial_steps = None if partial_steps is None else integer_index(partial_steps)
+        if not 1 <= final_step <= config.diffuser.num_timesteps:
+            raise ValueError("final_step must be in [1, config.diffuser.num_timesteps]")
+        if partial_steps is not None and not 1 <= partial_steps <= config.diffuser.num_timesteps:
+            raise ValueError("partial_steps must be in [1, config.diffuser.num_timesteps]")
+        if not math.isfinite(guidance_scale) or guidance_scale < 0:
+            raise ValueError("guidance_scale must be finite and non-negative")
+        if guidance_decay not in {"constant", "linear", "quadratic", "cubic"}:
+            raise ValueError("guidance_decay must be constant, linear, quadratic, or cubic")
         self.config = config
         self.network = network
-        self.device = torch.device(device) if device is not None else self._infer_device(network)
-        self.allatom = ComputeAllAtomCoords().to(self.device)
+        self.allatom = allatom
+        self.final_step = final_step
+        self.partial_steps = partial_steps
+        self.noise_scale_ca = float(noise_scale_ca)
+        self.final_noise_scale_ca = self.noise_scale_ca if final_noise_scale_ca is None else float(final_noise_scale_ca)
+        self.ca_noise_schedule = ca_noise_schedule
+        self.noise_scale_frame = float(noise_scale_frame)
+        self.final_noise_scale_frame = (
+            self.noise_scale_frame if final_noise_scale_frame is None else float(final_noise_scale_frame)
+        )
+        self.frame_noise_schedule = frame_noise_schedule
+        if (
+            ca_noise_schedule == "constant"
+            and final_noise_scale_ca is not None
+            and self.final_noise_scale_ca != self.noise_scale_ca
+        ):
+            raise ValueError("final_noise_scale_ca can differ from noise_scale_ca only for a linear schedule")
+        if (
+            frame_noise_schedule == "constant"
+            and final_noise_scale_frame is not None
+            and self.final_noise_scale_frame != self.noise_scale_frame
+        ):
+            raise ValueError("final_noise_scale_frame can differ from noise_scale_frame only for a linear schedule")
+        self.align_motif = align_motif
+        self.symmetry_recenter = symmetry_recenter
+        self.symmetry_radius_angstrom = float(symmetry_radius_angstrom)
+        self.guidance_scale = float(guidance_scale)
+        self.guidance_decay = guidance_decay
+        self.schedule_directory = None if schedule_directory is None else Path(schedule_directory)
+        self.igso3_truncation_level = 2000
+        self.igso3_num_omega = 1000
+        self.igso3_num_sigma = 500
+        self.diffuser: Diffuser | None = None
 
     def sample(
         self,
-        batch: Any | None = None,
+        batch: RFdiffusionInput,
         *,
         num_sampling_steps: int | None = None,
-        diffusion_steps: int | None = None,
         final_step: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> RfDiffusionSampleResult:
+        return_trajectory: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
         Run one RFdiffusion reverse-diffusion trajectory end to end.
 
@@ -3687,260 +4147,236 @@ class NativeRfDiffusionSampler:
         the network and denoiser each step and accumulating the coord trajectory.
 
         Args:
-            batch: A tokenized RfDiffusion input, or `None` to sample from ``inference.input_pdb``.
-            num_sampling_steps: Starting timestep, capped at the diffuser's timestep count.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            final_step: Last (smallest) timestep to denoise to; defaults to ``inference.final_step``.
+            batch: One canonical RFdiffusion tensor input.
+            num_sampling_steps: Number of timesteps in the active translation, rotation, and time-feature schedules.
+            final_step: Last (smallest) timestep to denoise to; defaults to the constructor value.
             generator: Optional RNG for reproducible sampling.
+            return_trajectory: Whether to retain every reverse step on CPU.
 
         Returns:
-            An [`RfDiffusionSampleResult`][ofoldx.models.rfdiffusion.model.RfDiffusionSampleResult] with
-            the final coords, predicted sequence, optional pLDDT, trajectories, and metadata.
-
-        Raises:
-            RuntimeError: If no network is attached to the sampler.
+            Final upstream ``pX0`` coordinates and sequence tokens followed by
+            timesteps, pLDDT, ``pX0``, and ``x_{t-1}``. The final tensors have a
+            length-one timestep axis unless full CPU trajectories were requested.
 
         Examples:
             >>> result = sampler.sample(batch)  # doctest: +SKIP
         """
 
-        if self.network is None:
-            raise RuntimeError(
-                "RFdiffusion sampler/features are available, but no native RFdiffusion network is attached. "
-                "Set RfDiffusionDesigner.network to a module with the official inference signature."
-            )
-        state = self.sample_init(batch, diffusion_steps=diffusion_steps, generator=generator)
-        start_t = state.t_step_input if num_sampling_steps is None else min(int(num_sampling_steps), state.t_step_input)
-        stop_t = int(final_step if final_step is not None else self.config.inference.final_step)
-        pred_coords_traj: list[Tensor] = []
-        noisy_coords_traj: list[Tensor] = [state.noisy_coords.detach().clone()]
-        plddt: Tensor | None = None
-        seq_t = state.seq_t
-        noisy_coords = state.noisy_coords
-        for t in range(start_t, stop_t - 1, -1):
-            pred_coords, noisy_coords, seq_t, plddt = self.sample_step(
-                state=state, t=t, noisy_coords=noisy_coords, seq_init=seq_t, final_step=stop_t, generator=generator
-            )
-            pred_coords_traj.append(pred_coords.detach().clone())
-            noisy_coords_traj.append(noisy_coords.detach().clone())
-        sequence_tokens = seq_t.argmax(dim=-1) if seq_t.ndim == 2 else seq_t.long()
-        return RfDiffusionSampleResult(
-            coords=noisy_coords,
-            sequence_tokens=sequence_tokens,
-            plddt=plddt,
-            trajectory=torch.stack(noisy_coords_traj),
-            pred_coords_trajectory=torch.stack(pred_coords_traj) if pred_coords_traj else noisy_coords[None],
-            metadata={
-                "architecture": "rfdiffusion",
-                "backend": "native_rfdiffusion_sampler",
-                "contig": state.contig_map.sampled_mask,
-                "binder_length": state.binderlen,
-                "sequence": seq_to_chars(sequence_tokens),
-                "timesteps": list(range(start_t, stop_t - 1, -1)),
-            },
+        active_steps = (
+            self.config.diffuser.num_timesteps if num_sampling_steps is None else integer_index(num_sampling_steps)
         )
-
-    def sample_init(
-        self,
-        batch: Any | None = None,
-        *,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> RfDiffusionSampleState:
-        r"""
-        Build the initial noised structure ``x_T`` and sequence features for one design.
-
-        Dispatches to the scaffold-guided or base initializer depending on the configuration.
-
-        Args:
-            batch: A tokenized RfDiffusion input, or `None` to sample from ``inference.input_pdb``.
-            diffusion_steps: Override for the diffuser's total timestep count.
-            generator: Optional RNG for reproducible noising.
-
-        Returns:
-            An [`RfDiffusionSampleState`][ofoldx.models.rfdiffusion.model.RfDiffusionSampleState]
-            holding the noised coords, sequence, contig map, masks, and diffusion helpers.
-
-        Examples:
-            >>> state = sampler.sample_init(batch)  # doctest: +SKIP
-        """
-
-        if self._uses_scaffold_guidance():
-            return self._sample_init_scaffolded(batch, diffusion_steps=diffusion_steps, generator=generator)
-        return self._sample_init_base(batch, diffusion_steps=diffusion_steps, generator=generator)
-
-    def _sample_init_base(
-        self,
-        batch: Any | None = None,
-        *,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> RfDiffusionSampleState:
-        r"""Build the initial trajectory state for a standard (non-scaffold-guided) design."""
-
-        target_feats = self._target_features(batch)
-        contig_map = self._construct_contig(target_feats, batch)
-        mask_seq = torch.from_numpy(contig_map.inpaint_seq).bool()[None].to(self.device)
-        mask_str = torch.from_numpy(contig_map.inpaint_str).bool()[None].to(self.device)
-        binderlen = len(contig_map.inpaint)
-        diffusion_mask = mask_str.squeeze(0)
-        potential_manager = PotentialManager(
-            self.config.potentials,
-            self.config.diffuser,
-            self.config.inference,
-            binderlen,
-        )
-        diffuser = self._make_diffuser(diffusion_steps=diffusion_steps)
-        coords27 = target_feats["xyz_27"].to(self.device)
-        mask_27 = target_feats["mask_27"].to(self.device)
-        seq_orig = target_feats["seq"].to(self.device)
-        L_mapped = len(contig_map.reference)
-        if self.config.diffuser.partial_timesteps:
-            if coords27.shape[0] != L_mapped:
-                raise ValueError("partial diffusion requires one input coordinate per contig residue")
-            if contig_map.design_index0 != contig_map.reference_index0:
-                raise ValueError("partial diffusion requires matching input/output residue indices")
-            mapped_coords = coords27
-            motif_prealign_coords = mapped_coords.clone()
-            atom_mask_mapped = mask_27
+        if active_steps <= 0:
+            raise ValueError("num_sampling_steps must be positive")
+        stop_t = self.final_step if final_step is None else integer_index(final_step)
+        if batch.layout.templates and (
+            self.config.preprocess.template_1d_size != 28 or self.config.preprocess.template_2d_size != 47
+        ):
+            raise ValueError("Template evidence requires an RFdiffusion fold-conditioned checkpoint")
+        if any(type(condition) is SecondaryStructure for condition in batch.layout.conditions) and (
+            self.config.preprocess.template_1d_size != 28
+        ):
+            raise ValueError("SecondaryStructure requires an RFdiffusion fold-conditioned checkpoint")
+        mask_sequence = batch.fixed_sequence_mask
+        mask_structure = batch.fixed_structure_mask
+        diffusion_mask = mask_structure.squeeze(0)
+        diffuser = self._make_diffuser(active_steps)
+        length = batch.noisy_coords.shape[1]
+        coords27 = batch.noisy_coords.new_full((length, 27, 3), float("nan"))
+        coords27[:, :14] = batch.noisy_coords[0]
+        atom_mask = torch.isfinite(coords27).all(dim=-1)
+        original_sequence = batch.sequence[0].argmax(dim=-1)
+        if bool(diffusion_mask.any()):
+            center = coords27[diffusion_mask, 1].mean(dim=0)
         else:
-            mapped_coords = torch.full((1, 1, L_mapped, 27, 3), float("nan"), device=self.device)
-            mapped_coords[:, :, contig_map.design_index0] = coords27[contig_map.reference_index0]
-            motif_prealign_coords = mapped_coords.squeeze(0).squeeze(0).clone()
-            mapped_coords = get_init_coords(mapped_coords).squeeze(0).squeeze(0)
-            atom_mask_mapped = torch.zeros((L_mapped, 27), dtype=torch.bool, device=self.device)
-            atom_mask_mapped[contig_map.design_index0] = mask_27[contig_map.reference_index0]
+            observed_calpha = torch.isfinite(coords27[:, 1]).all(dim=-1)
+            center = coords27[observed_calpha, 1].mean(dim=0) if bool(observed_calpha.any()) else coords27.new_zeros(3)
+        if self.partial_steps is not None:
+            if batch.layout.structure is None:
+                raise ValueError("partial diffusion requires coordinates for every output residue")
+            source_index = {site: index for index, site in enumerate(batch.layout.structure.sites)}
+            for reference in batch.layout.output_residues:
+                if type(reference) is SymbolicResidueSite:
+                    raise ValueError("partial diffusion requires coordinates for every output residue")
+                for atom_name in ("N", "CA", "C"):
+                    source = source_index.get(AtomSite(reference[0], reference[1], atom_name))
+                    if source is None or not bool(batch.layout.structure.coordinate_mask[source]):
+                        raise ValueError(
+                            "partial diffusion requires observed N/CA/C coordinates for every output residue"
+                        )
+            initial_coords = coords27
+        else:
+            initial_coords = get_init_coords(coords27[None, None]).squeeze(0).squeeze(0)
 
-        t_step_input = self._t_step_input(diffusion_steps)
-        t_list = np.arange(1, t_step_input + 1)
-        seq_t = torch.full((L_mapped,), MASK_TOKEN, dtype=torch.long, device=self.device)
-        seq_t[contig_map.design_index0] = seq_orig[contig_map.reference_index0]
-        if self.config.contigmap.provide_seq is not None:
-            seq_t[mask_seq.squeeze(0)] = seq_orig[mask_seq.squeeze(0)]
-        seq_t[~mask_seq.squeeze(0)] = MASK_TOKEN
-        seq_t_oh = one_hot_sequence(seq_t)
-        clean_coords = mapped_coords.detach().clone()
-        fa_stack, _true_coords = diffuser.diffuse_pose(
-            mapped_coords,
-            seq_t_oh.clone(),
-            atom_mask_mapped.squeeze(),
+        trajectory_steps = active_steps
+        if self.partial_steps is not None:
+            if self.partial_steps > trajectory_steps:
+                raise ValueError("partial_steps must not exceed the active diffusion schedule")
+            trajectory_steps = self.partial_steps
+        start_t = trajectory_steps
+        if not 1 <= stop_t <= start_t:
+            raise ValueError("final_step must be between 1 and the starting timestep")
+        sequence = original_sequence.clone()
+        sequence[~mask_sequence.squeeze(0)] = MASK_TOKEN
+        sequence = one_hot_sequence(sequence)
+        diffused, _clean = diffuser.diffuse_pose(
+            initial_coords,
+            atom_mask,
             diffusion_mask=diffusion_mask,
-            t_list=t_list,
+            t_list=np.arange(1, start_t + 1),
             include_motif_sidechains=self.config.preprocess.motif_sidechain_input,
             generator=generator,
         )
-        noisy_coords = fa_stack[-1, :, :14]
-        self._attach_substrate_potentials(
-            target_feats=target_feats,
-            potential_manager=potential_manager,
-            diffusion_mask=diffusion_mask,
-            motif_coords=motif_prealign_coords,
-            diffuser=diffuser,
+        noisy_coords = diffused[-1, :, :14]
+        symmetry_conditions = tuple(
+            condition for condition in batch.layout.conditions if type(condition) is PointGroupSymmetry
         )
-        denoiser = self._make_denoiser(L_mapped, diffuser=diffuser, potential_manager=potential_manager)
-        symmetry = self._make_symmetry()
+        symmetry = None if not symmetry_conditions else RFdiffusionSymmetry(symmetry_conditions[0], batch.layout)
         if symmetry is not None:
-            noisy_coords, seq_t_oh = symmetry.apply_symmetry(noisy_coords, seq_t_oh)
-        chain_idx, pdb_index = self._build_output_indices(contig_map)
-        cyclic_reses = self._init_cyclic_reses(mask_str, contig_map)
-        return RfDiffusionSampleState(
-            noisy_coords=noisy_coords,
-            seq_t=seq_t_oh,
-            contig_map=contig_map,
-            mask_seq=mask_seq,
-            mask_str=mask_str,
-            diffusion_mask=diffusion_mask,
-            binderlen=binderlen,
-            chain_idx=chain_idx,
-            pdb_index=pdb_index,
-            t_step_input=t_step_input,
-            diffuser=diffuser,
-            denoiser=denoiser,
-            potential_manager=potential_manager,
-            symmetry=symmetry,
-            cyclic_reses=cyclic_reses,
-            clean_coords=clean_coords,
-        )
-
-    def sample_step(
-        self,
-        *,
-        state: RfDiffusionSampleState,
-        t: int,
-        noisy_coords: Tensor,
-        seq_init: Tensor,
-        final_step: int,
-        generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-        r"""
-        Run one reverse-diffusion step at timestep ``t``.
-
-        Prepares the network inputs, runs the network, reconstructs all-atom coords, applies symmetry and
-        motif alignment, and denoises one step toward ``x_{t-1}`` (or writes the prediction directly at the
-        final step).
-
-        Args:
-            state: The mutable trajectory state.
-            t: Current timestep.
-            noisy_coords: Current noised backbone coords `[L, 14, 3]`.
-            seq_init: Current sequence features.
-            final_step: The last timestep of the trajectory.
-            generator: Optional RNG for reproducible denoising.
-
-        Returns:
-            A tuple ``(pred_coords, next_noisy_coords, next_seq, plddt)`` for this step.
-        """
-
-        features = self.preprocess(state, seq_init, noisy_coords, t)
-        pdb_index = features.pdb_index
-        if state.symmetry is not None:
-            pdb_index, state.chain_idx = state.symmetry.res_idx_procesing(res_idx=pdb_index)
-        output = self.network(  # type: ignore[misc,operator]
-            features.msa_masked,
-            features.msa_full,
-            features.seq_in,
-            features.noisy_coords_in,
-            pdb_index,
-            template_1d=features.template_1d,
-            template_2d=features.template_2d,
-            template_coords=features.template_coords,
-            alpha_t=features.alpha_t,
-            msa_prev=None,
-            pair_prev=None,
-            state_prev=None,
-            t=torch.tensor(t, device=self.device),
-            motif_mask=state.diffusion_mask.to(self.device),
-            cyclic_reses=state.cyclic_reses,
-        )
-        pred_coords_raw, alpha, plddt = coerce_network_prediction(output)
-        seq_tokens = torch.argmax(features.seq_in, dim=-1)
-        _frames, pred_coords_full = self.allatom(
-            seq_tokens, normalize_backbone_prediction(pred_coords_raw, noisy_coords), alpha
-        )
-        pred_coords = pred_coords_full.squeeze(0)[:, :14]
-        if state.symmetry is not None and self.config.inference.symmetric_self_cond:
-            pred_coords, _ = state.symmetry.apply_symmetry(pred_coords, seq_init)
-        state.prev_pred = pred_coords.detach().clone()
-        seq_t_1 = seq_init.clone()
-        if t > final_step:
-            noisy_coords_prev, pred_coords = state.denoiser.get_next_pose(
-                noisy_coords=noisy_coords,
-                pred_coords=pred_coords,
-                t=t,
-                diffusion_mask=state.diffusion_mask,
-                align_motif=self.config.inference.align_motif,
-                include_motif_sidechains=self.config.preprocess.motif_sidechain_input,
-                generator=generator,
+            noisy_coords, sequence = symmetry.apply(
+                noisy_coords,
+                sequence,
+                recenter=self.symmetry_recenter,
+                radius_angstrom=self.symmetry_radius_angstrom,
             )
-        else:
-            noisy_coords_prev = pred_coords.to(noisy_coords.device)
-        if state.symmetry is not None:
-            noisy_coords_prev, seq_t_1 = state.symmetry.apply_symmetry(noisy_coords_prev, seq_t_1)
-        return pred_coords, noisy_coords_prev, seq_t_1, plddt
+        guidance = RFdiffusionGuidance(batch.layout)
+        denoiser = self._make_denoiser(
+            length,
+            diffuser=diffuser,
+            guidance=guidance if guidance else None,
+        )
 
-    def preprocess(
-        self, state: RfDiffusionSampleState, seq: Tensor, template_coords_in: Tensor, t: int
-    ) -> RfDiffusionStepFeatures:
+        if return_trajectory:
+            timesteps: list[int] = []
+            plddt_trajectory: list[Tensor] = []
+            px0_trajectory: list[Tensor] = []
+            xt_minus_1_trajectory: list[Tensor] = []
+        previous_prediction: Tensor | None = None
+        residue_index = batch.residue_index
+        if symmetry is not None:
+            residue_index = symmetry.chain_broken_residue_index(residue_index)
+        secondary_structure = batch.secondary_structure[0]
+        block_adjacency = batch.block_adjacency[0]
+        hotspot_mask = batch.hotspot_mask[0]
+        cyclic_mask = batch.cyclic_mask[0]
+        for t in range(start_t, stop_t - 1, -1):
+            (
+                msa_masked,
+                msa_full,
+                sequence_input,
+                noisy_coords_input,
+                template_1d,
+                template_2d,
+                template_coords,
+                alpha_t,
+            ) = self._preprocess(
+                sequence,
+                noisy_coords,
+                t,
+                mask_structure=mask_structure,
+                diffuser=diffuser,
+                previous_prediction=previous_prediction,
+                secondary_structure=secondary_structure,
+                block_adjacency=block_adjacency,
+                hotspot_mask=hotspot_mask,
+            )
+            output = self.network(  # type: ignore[misc,operator]
+                msa_masked,
+                msa_full,
+                sequence_input,
+                noisy_coords_input,
+                residue_index,
+                template_1d=template_1d,
+                template_2d=template_2d,
+                template_coords=template_coords,
+                alpha_t=alpha_t,
+                msa_prev=None,
+                pair_prev=None,
+                state_prev=None,
+                motif_mask=diffusion_mask,
+                cyclic_reses=cyclic_mask,
+            )
+            predicted_backbone, alpha, plddt = output[2], output[4], output[6]
+            sequence_tokens = sequence_input.argmax(dim=-1)
+            _frames, predicted_full = self.allatom(sequence_tokens, predicted_backbone, alpha)
+            pred_coords = predicted_full.squeeze(0)[:, :14]
+            if symmetry is not None:
+                symmetric_coords, _symmetric_sequence = symmetry.apply(
+                    pred_coords,
+                    sequence,
+                    recenter=self.symmetry_recenter,
+                    radius_angstrom=self.symmetry_radius_angstrom,
+                )
+                previous_prediction = symmetric_coords[:, :3].detach()
+                _frames, predicted_full = self.allatom(
+                    sequence_tokens,
+                    previous_prediction[None],
+                    alpha,
+                )
+                pred_coords = predicted_full.squeeze(0)[:, :14]
+            else:
+                previous_prediction = predicted_backbone.squeeze(0).detach()
+            px0_coords = pred_coords
+            if t > stop_t:
+                noisy_coords, px0_coords = denoiser.get_next_pose(
+                    noisy_coords=noisy_coords,
+                    pred_coords=pred_coords,
+                    t=t,
+                    diffusion_mask=diffusion_mask,
+                    align_motif=self.align_motif,
+                    include_motif_sidechains=self.config.preprocess.motif_sidechain_input,
+                    generator=generator,
+                )
+            else:
+                noisy_coords = pred_coords
+            if symmetry is not None:
+                noisy_coords, sequence = symmetry.apply(
+                    noisy_coords,
+                    sequence,
+                    recenter=self.symmetry_recenter,
+                    radius_angstrom=self.symmetry_radius_angstrom,
+                )
+            final_timestep = t
+            final_plddt = plddt.squeeze(0)
+            final_px0 = px0_coords
+            final_xt_minus_1 = noisy_coords
+            if return_trajectory:
+                timesteps.append(t)
+                plddt_trajectory.append(final_plddt.detach().cpu())
+                px0_trajectory.append(final_px0.detach().cpu())
+                xt_minus_1_trajectory.append(final_xt_minus_1.detach().cpu())
+        if return_trajectory:
+            center_cpu = center.detach().cpu()
+            timestep_values = torch.tensor(timesteps, dtype=torch.int64)
+            plddt_values = torch.stack(plddt_trajectory)
+            px0_values = torch.stack(px0_trajectory) + center_cpu
+            xt_minus_1_values = torch.stack(xt_minus_1_trajectory) + center_cpu
+        else:
+            timestep_values = noisy_coords.new_tensor((final_timestep,), dtype=torch.int64)
+            plddt_values = final_plddt[None]
+            px0_values = (final_px0 + center)[None]
+            xt_minus_1_values = (final_xt_minus_1 + center)[None]
+        return (
+            final_px0 + center,
+            sequence.argmax(dim=-1),
+            timestep_values,
+            plddt_values,
+            px0_values,
+            xt_minus_1_values,
+        )
+
+    def _preprocess(
+        self,
+        seq: Tensor,
+        template_coords_in: Tensor,
+        t: int,
+        *,
+        mask_structure: Tensor,
+        diffuser: Diffuser,
+        previous_prediction: Tensor | None,
+        secondary_structure: Tensor,
+        block_adjacency: Tensor,
+        hotspot_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
         Assemble the RoseTTAFold network input tensors for timestep ``t``.
 
@@ -3949,677 +4385,138 @@ class NativeRfDiffusionSampler:
         self-conditioning from the previous prediction.
 
         Args:
-            state: The mutable trajectory state.
             seq: Current one-hot sequence features `[L, 22]`.
             template_coords_in: Current template backbone coords `[L, A, 3]`.
             t: Current timestep.
-
-        Returns:
-            An [`RfDiffusionStepFeatures`][ofoldx.models.rfdiffusion.model.RfDiffusionStepFeatures]
-            bundle for one network call.
-
-        Raises:
-            ValueError: If the checkpoint expects scaffold SS/adjacency features that are absent from ``state``.
         """
 
         L = seq.shape[0]
-        msa_masked = torch.zeros((1, 1, L, 48), dtype=seq.dtype, device=self.device)
+        msa_masked = seq.new_zeros((1, 1, L, 48))
         msa_masked[:, :, :, :22] = seq[None, None]
         msa_masked[:, :, :, 22:44] = seq[None, None]
         msa_masked[:, :, 0, 46] = 1.0
         msa_masked[:, :, -1, 47] = 1.0
-        msa_full = torch.zeros((1, 1, L, 25), dtype=seq.dtype, device=self.device)
+        msa_full = seq.new_zeros((1, 1, L, 25))
         msa_full[:, :, :, :22] = seq[None, None]
         msa_full[:, :, 0, 23] = 1.0
         msa_full[:, :, -1, 24] = 1.0
-        template_1d = torch.zeros((1, 1, L, 21), dtype=seq.dtype, device=self.device)
+        template_1d = seq.new_zeros((1, 1, L, 21))
         seq_template_1d = seq.clone()
         mask_token_positions = seq_template_1d[:, MASK_TOKEN] == 1
         seq_template_1d[mask_token_positions, 20] = 1
         seq_template_1d[mask_token_positions, MASK_TOKEN] = 0
         template_1d[:, :, :, :21] = seq_template_1d[None, None, :, :21]
-        timefeature = torch.zeros((L,), dtype=seq.dtype, device=self.device)
-        timefeature[state.mask_str.squeeze(0)] = 1
-        timefeature[~state.mask_str.squeeze(0)] = 1 - t / self.config.diffuser.num_timesteps
+        timefeature = seq.new_zeros((L,))
+        timefeature[mask_structure.squeeze(0)] = 1
+        timefeature[~mask_structure.squeeze(0)] = 1 - t / diffuser.num_timesteps
         template_1d = torch.cat((template_1d, timefeature[None, None, :, None]), dim=-1).float()
 
         working_coords = template_coords_in.clone()
         if self.config.preprocess.sidechain_input:
             working_coords[mask_token_positions, 3:] = float("nan")
         else:
-            working_coords[~state.mask_str.squeeze(0), 3:] = float("nan")
+            working_coords[~mask_structure.squeeze(0), 3:] = float("nan")
         template_coords = working_coords[None, None]
         template_coords = torch.cat(
             (
                 template_coords,
-                torch.full((1, 1, L, 13, 3), float("nan"), dtype=template_coords.dtype, device=self.device),
+                template_coords.new_full((1, 1, L, 13, 3), float("nan")),
             ),
             dim=3,
         )
+        noisy_coords_input = template_coords.squeeze(0)
         template_2d = coords_to_t2d(template_coords)
-        if self.config.inference.model_runner == "SelfConditioning":
-            if (
-                state.prev_pred is not None
-                and (t < state.diffuser.num_timesteps)
-                and (t != self.config.diffuser.partial_timesteps)
-            ):
-                prev = state.prev_pred[:, :3][None, None]
-                zeros = torch.zeros((1, 1, L, 24, 3), dtype=prev.dtype, device=prev.device)
-                sidechain_coords = torch.cat((prev, zeros), dim=-2)
-                template_2d[..., :44] = coords_to_t2d(sidechain_coords)
-            else:
-                template_2d[..., :44] = 0
-        idx = torch.tensor(state.contig_map.residue_index, dtype=torch.long, device=self.device)[None]
         seq_tmp = template_1d[..., :-1].argmax(dim=-1).reshape(1, L)
         alpha_t = make_alpha_t(template_coords, seq_tmp)
+        if self.config.preprocess.structure_self_conditioning:
+            if previous_prediction is not None and (t < diffuser.num_timesteps) and (t != self.partial_steps):
+                prev = previous_prediction[:, :3][None, None]
+                zeros = prev.new_zeros((1, 1, L, 24, 3))
+                template_coords = torch.cat((prev, zeros), dim=-2)
+                template_2d[..., :44] = coords_to_t2d(template_coords)
+            else:
+                template_2d[..., :44] = 0
+                template_coords = torch.zeros_like(template_coords)
 
         if self.config.preprocess.template_1d_size >= 24:
-            hotspot_tens = torch.zeros(L, dtype=seq.dtype, device=self.device)
-            hotspot_idx = []
-            if self.config.ppi.hotspot_res is not None:
-                hotspots = [(item[0], int(item[1:])) for item in self.config.ppi.hotspot_res]
-                for idx_map, residue in enumerate(state.contig_map.contig_reference_pdb_index):
-                    if residue in hotspots:
-                        hotspot_idx.append(state.contig_map.design_index0[idx_map])
-            hotspot_tens[hotspot_idx] = 1.0
+            hotspot_tens = hotspot_mask.to(dtype=seq.dtype)
             template_1d = torch.cat(
                 (template_1d, torch.zeros_like(template_1d[..., :1]), hotspot_tens[None, None, :, None]), dim=-1
             )
 
         if self.config.preprocess.template_1d_size == 28:
-            if state.ss is None:
-                raise ValueError(
-                    "checkpoint expects scaffold secondary-structure features, but no SS tensor is present"
-                )
-            full_ss = state.ss
-            if state.target_pdb is not None:
-                blank_ss = F.one_hot(torch.full((L - state.binderlen,), 3, device=self.device), num_classes=4)
-                full_ss = torch.cat((state.ss, blank_ss), dim=0)
-                if state.target_ss is not None:
-                    full_ss[state.binderlen :] = state.target_ss
-            template_1d = torch.cat((template_1d, full_ss[None, None].to(self.device).float()), dim=-1)
+            template_1d = torch.cat((template_1d, secondary_structure[None, None].float()), dim=-1)
         if self.config.preprocess.template_2d_size == 47:
-            if state.adj is None:
-                raise ValueError("checkpoint expects scaffold adjacency features, but no adjacency tensor is present")
-            full_adj = state.adj
-            if state.target_pdb is not None:
-                full_adj = torch.zeros((L, L, 3), dtype=template_2d.dtype, device=self.device)
-                full_adj[:, :, -1] = 1.0
-                full_adj[: state.binderlen, : state.binderlen] = state.adj.to(self.device)
-                if state.target_adj is not None:
-                    full_adj[state.binderlen :, state.binderlen :] = state.target_adj
-            template_2d = torch.cat((template_2d, full_adj[None, None].to(self.device).float()), dim=-1)
-            if state.target_pdb is not None:
-                idx[:, state.binderlen :] += 200
+            template_2d = torch.cat((template_2d, block_adjacency[None, None].float()), dim=-1)
 
-        return RfDiffusionStepFeatures(
-            msa_masked=msa_masked,
-            msa_full=msa_full,
-            seq_in=seq[None],
-            noisy_coords_in=torch.squeeze(template_coords, dim=0),
-            pdb_index=idx,
-            template_1d=template_1d,
-            template_2d=template_2d,
-            template_coords=template_coords,
-            alpha_t=alpha_t,
+        return (
+            msa_masked,
+            msa_full,
+            seq[None],
+            noisy_coords_input,
+            template_1d,
+            template_2d,
+            template_coords,
+            alpha_t,
         )
 
-    def _sample_init_scaffolded(
-        self,
-        batch: Any | None = None,
-        *,
-        diffusion_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> RfDiffusionSampleState:
-        r"""Build the initial trajectory state for scaffold-guided (fold-conditioned) design."""
-
-        scaffold_length, ss, adj, target_pdb, target_ss, target_adj = self._scaffold_inputs()
-        if self.config.contigmap.contigs is None:
-            return self._sample_init_scaffold_auto(
-                scaffold_length=scaffold_length,
-                ss=ss,
-                adj=adj,
-                target_pdb=target_pdb,
-                target_ss=target_ss,
-                target_adj=target_adj,
-                diffusion_steps=diffusion_steps,
-                generator=generator,
-            )
-        state = self._sample_init_base(batch, diffusion_steps=diffusion_steps, generator=generator)
-        if hasattr(state.contig_map, "ss_spec"):
-            ss = ss_from_contig(state.contig_map.ss_spec).to(self.device)
-            if adj is None:
-                adj = _masked_adjacency(ss.shape[0], self.device)
-        state.ss = ss
-        state.adj = adj
-        state.target_pdb = target_pdb
-        state.target_ss = target_ss
-        state.target_adj = target_adj
-        return state
-
-    def _scaffold_inputs(
-        self,
-    ) -> tuple[int, Tensor | None, Tensor | None, dict[str, Any] | None, Tensor | None, Tensor | None]:
-        r"""
-        Load scaffold and target inputs for scaffold-guided sampling.
-
-        Returns:
-            A tuple ``(scaffold_length, ss, adj, target_pdb, target_ss, target_adj)`` of the sampled scaffold
-            length, its secondary-structure and adjacency tensors, and the optional target and its features.
-        """
-
-        if self.config.scaffoldguided.scaffold_dir is not None:
-            blockadjacency = BlockAdjacency(self.config, self.config.inference.num_designs)
-            scaffold_length, ss, adj_raw = blockadjacency.get_scaffold()
-            ss = ss.to(self.device)
-            adj = F.one_hot(adj_raw.long(), num_classes=3).to(self.device)
-        else:
-            scaffold_length = 100
-            ss = None
-            adj = None
-        target = None
-        target_pdb = None
-        target_ss = None
-        target_adj = None
-        if self.config.scaffoldguided.target_pdb:
-            target = Target(self.config.scaffoldguided, self.config.ppi.hotspot_res)
-            target_pdb = target.get_target()
-            if self.config.scaffoldguided.target_ss is not None:
-                loaded_ss = torch.load(self.config.scaffoldguided.target_ss, weights_only=True).long()
-                target_ss = F.one_hot(loaded_ss, num_classes=4).to(self.device)
-                if self.config.scaffoldguided.contig_crop is not None:
-                    target_ss = target_ss[target_pdb["crop_mask"]]
-            if self.config.scaffoldguided.target_adj is not None:
-                loaded_adj = torch.load(self.config.scaffoldguided.target_adj, weights_only=True).long()
-                target_adj = F.one_hot(loaded_adj, num_classes=3).to(self.device)
-                if self.config.scaffoldguided.contig_crop is not None:
-                    target_adj = target_adj[target_pdb["crop_mask"]][:, target_pdb["crop_mask"]]
-        return scaffold_length, ss, adj, target_pdb, target_ss, target_adj
-
-    def _sample_init_scaffold_auto(
-        self,
-        *,
-        scaffold_length: int,
-        ss: Tensor | None,
-        adj: Tensor | None,
-        target_pdb: dict[str, Any] | None,
-        target_ss: Tensor | None,
-        target_adj: Tensor | None,
-        diffusion_steps: int | None,
-        generator: torch.Generator | None,
-    ) -> RfDiffusionSampleState:
-        r"""Build the trajectory state for scaffold-guided design when no contigs are given (auto contigs)."""
-
-        if ss is None:
-            ss = _masked_secondary_structure(scaffold_length, self.device)
-        if adj is None:
-            adj = _masked_adjacency(scaffold_length, self.device)
-        noisy_coords, seq_t, atom_mask, diffusion_mask, contig_target, binderlen = self._auto_scaffold_tensors(
-            scaffold_length, target_pdb
-        )
-        contig_map = ContigMap(
-            False if contig_target is None else contig_target,
-            self._auto_scaffold_contig(target_pdb, binderlen),
-        )
-        mask_seq = diffusion_mask[None]
-        mask_str = diffusion_mask[None]
-        potential_manager = PotentialManager(
-            self.config.potentials,
-            self.config.diffuser,
-            self.config.inference,
-            binderlen,
-        )
-        diffuser = self._make_diffuser(diffusion_steps=diffusion_steps)
-        t_step_input = self._t_step_input(diffusion_steps)
-        fa_stack, _true_coords = diffuser.diffuse_pose(
-            noisy_coords,
-            seq_t.clone(),
-            atom_mask,
-            diffusion_mask=diffusion_mask,
-            t_list=np.arange(1, t_step_input + 1),
-            include_motif_sidechains=self.config.preprocess.motif_sidechain_input,
-            generator=generator,
-        )
-        noisy_coords = fa_stack[-1, :, :14]
-        if contig_target is not None:
-            self._attach_substrate_potentials(
-                target_feats=contig_target,
-                potential_manager=potential_manager,
-                diffusion_mask=diffusion_mask,
-                motif_coords=noisy_coords,
-                diffuser=diffuser,
-            )
-        denoiser = self._make_denoiser(noisy_coords.shape[0], diffuser=diffuser, potential_manager=potential_manager)
-        symmetry = self._make_symmetry()
-        if symmetry is not None:
-            noisy_coords, seq_t = symmetry.apply_symmetry(noisy_coords, seq_t)
-        chain_idx, pdb_index = self._build_output_indices(contig_map)
-        return RfDiffusionSampleState(
-            noisy_coords=noisy_coords,
-            seq_t=seq_t,
-            contig_map=contig_map,
-            mask_seq=mask_seq,
-            mask_str=mask_str,
-            diffusion_mask=diffusion_mask,
-            binderlen=binderlen,
-            chain_idx=chain_idx,
-            pdb_index=pdb_index,
-            t_step_input=t_step_input,
-            diffuser=diffuser,
-            denoiser=denoiser,
-            potential_manager=potential_manager,
-            symmetry=symmetry,
-            cyclic_reses=self._init_cyclic_reses(mask_str, contig_map),
-            ss=ss,
-            adj=adj,
-            target_ss=target_ss,
-            target_adj=target_adj,
-            target_pdb=target_pdb,
-        )
-
-    def _auto_scaffold_tensors(
-        self, scaffold_length: int, target_pdb: dict[str, Any] | None
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, dict[str, Any] | None, int]:
-        r"""
-        Build the initial coords, sequence, masks, and diffusion mask for auto scaffold-guided design.
-
-        Returns:
-            A tuple ``(noisy_coords, seq_t, atom_mask, diffusion_mask, contig_target, binderlen)`` combining
-            the binder scaffold with the optional fixed target.
-        """
-
-        binderlen = int(scaffold_length)
-        noisy_coords = torch.full((binderlen, 27, 3), float("nan"), dtype=torch.float32, device=self.device)
-        noisy_coords = get_init_coords(noisy_coords[None, None]).squeeze(0).squeeze(0)
-        seq_t = torch.full((binderlen,), MASK_TOKEN, dtype=torch.long, device=self.device)
-        diffusion_mask = torch.zeros((binderlen,), dtype=torch.bool, device=self.device)
-        atom_mask = torch.zeros((binderlen, 27), dtype=torch.bool, device=self.device)
-        if target_pdb is None:
-            return noisy_coords, one_hot_sequence(seq_t), atom_mask, diffusion_mask, None, binderlen
-        target_coords = torch.full((len(target_pdb["xyz"]), 27, 3), float("nan"), device=self.device)
-        target_coords[:, :14] = torch.as_tensor(target_pdb["xyz"], dtype=noisy_coords.dtype, device=self.device)
-        target_mask = torch.zeros((target_coords.shape[0], 27), dtype=torch.bool, device=self.device)
-        target_mask[:, :14] = torch.as_tensor(target_pdb["mask"], dtype=torch.bool, device=self.device)
-        noisy_coords = torch.cat((noisy_coords, target_coords), dim=0)
-        seq_t = torch.cat((seq_t, torch.as_tensor(target_pdb["seq"], dtype=torch.long, device=self.device)), dim=0)
-        atom_mask = torch.cat((atom_mask, target_mask), dim=0)
-        target_diffusion_mask = torch.ones(target_coords.shape[0], dtype=torch.bool, device=self.device)
-        diffusion_mask = torch.cat((diffusion_mask, target_diffusion_mask))
-        return noisy_coords, one_hot_sequence(seq_t), atom_mask, diffusion_mask, target_pdb, binderlen
-
-    def _auto_scaffold_contig(self, target_pdb: dict[str, Any] | None, binderlen: int) -> list[str]:
-        r"""Build the contig string for auto scaffold-guided design from the target chains and binder length."""
-
-        if target_pdb is None:
-            return [f"{binderlen}-{binderlen}"]
-        fragments: list[str] = []
-        pdb_idx = list(target_pdb["pdb_idx"])
-        start_chain, start_residue = pdb_idx[0]
-        previous_chain, previous_residue = start_chain, start_residue
-        for chain, residue in pdb_idx[1:]:
-            if chain != previous_chain or residue != previous_residue + 1:
-                fragments.append(f"{start_chain}{start_residue}-{previous_residue}/0")
-                start_chain, start_residue = chain, residue
-            previous_chain, previous_residue = chain, residue
-        fragments.append(f"{start_chain}{start_residue}-{previous_residue}/0")
-        fragments.append(f"{binderlen}-{binderlen}")
-        return [" ".join(fragments)]
-
-    def _target_features(self, batch: Any | None) -> dict[str, Any]:
-        r"""
-        Resolve the target feature dict from the batch, a precomputed dict, or ``inference.input_pdb``.
-
-        Raises:
-            ValueError: If no batch tensors and no ``inference.input_pdb`` are available.
-        """
-
-        # Imported lazily: the processor pulls in the processor package, which would cycle at load time.
-        from .processor import process_target
-
-        if batch is not None and getattr(batch, "target_features", None) is not None:
-            return _move_target_features(batch.target_features, self.device)
-        if self.config.inference.input_pdb is not None:
-            return process_target(self.config.inference.input_pdb, parse_hetatom=True, center=False)
-        if batch is None:
-            raise ValueError("RFdiffusion sampling needs batch target tensors or inference.input_pdb")
-        residue_type = batch.residue_type[0].to(self.device)
-        residue_index = batch.residue_index[0].to(self.device)
-        chain_index = batch.chain_index[0].to(self.device)
-        ca = batch.motif_positions[0].to(self.device)
-        return target_features_from_tensors(
-            residue_type=residue_type,
-            residue_index=residue_index,
-            chain_index=chain_index,
-            ca_coords=ca,
-        )
-
-    def _construct_contig(self, target_feats: dict[str, Any], batch: Any | None) -> ContigMap:
-        r"""
-        Build the [`ContigMap`][ofoldx.models.rfdiffusion.model.ContigMap] from config contigs or batch masks.
-
-        Raises:
-            ValueError: If neither config contigs nor a batch are available.
-        """
-
-        contigs = self.config.contigmap.contigs
-        if contigs is not None:
-            return ContigMap(target_feats, **_config_kwargs(self.config.contigmap))
-        if batch is None:
-            raise ValueError("contigmap.contigs is required when sampling from inference.input_pdb")
-        pdb_idx = list(target_feats["pdb_idx"])
-        residue_index = list(range(len(pdb_idx)))
-        mask_seq = (
-            _numpy_bool(~batch.design_mask[0])
-            if getattr(batch, "design_mask", None) is not None
-            else np.ones(len(pdb_idx), dtype=bool)
-        )
-        mask_str = (
-            _numpy_bool(batch.motif_mask[0])
-            if getattr(batch, "motif_mask", None) is not None
-            else np.ones(len(pdb_idx), dtype=bool)
-        )
-        return ContigMap(
-            target_feats,
-            reference_index=pdb_idx,
-            design_index=pdb_idx,
-            residue_index=residue_index,
-            inpaint_seq_tensor=mask_seq,
-            inpaint_str_tensor=mask_str,
-        )
-
-    def _make_diffuser(self, *, diffusion_steps: int | None) -> Diffuser:
+    def _make_diffuser(self, num_timesteps: int) -> Diffuser:
         r"""Construct the forward [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser] from config."""
 
-        kwargs = _diffuser_kwargs(self.config.diffuser)
-        if diffusion_steps is not None:
-            kwargs["num_timesteps"] = int(diffusion_steps)
-        schedule_dir = self.config.inference.schedule_directory_path or str(Path(".rfdiffusion_schedules"))
-        kwargs.setdefault("cache_dir", schedule_dir)
-        return Diffuser(**kwargs)
+        if self.diffuser is not None and self.diffuser.num_timesteps == num_timesteps:
+            return self.diffuser
+        config = self.config.diffuser
+        diffuser = Diffuser(
+            num_timesteps=num_timesteps,
+            beta_initial=config.beta_initial,
+            beta_final=config.beta_final,
+            min_sigma=config.min_rotation_sigma,
+            max_sigma=config.max_rotation_sigma,
+            min_b=config.min_rotation_beta,
+            max_b=config.max_rotation_beta,
+            schedule_type=config.schedule_type,
+            so3_schedule_type=config.rotation_schedule_type,
+            so3_type=config.rotation_diffuser,
+            crd_scale=config.coordinate_scale,
+            cache_dir=self.schedule_directory,
+            partial_timesteps=self.partial_steps,
+            truncation_level=self.igso3_truncation_level,
+            igso3_num_omega=self.igso3_num_omega,
+            igso3_num_sigma=self.igso3_num_sigma,
+        )
+        self.diffuser = diffuser
+        return diffuser
 
-    def _make_denoiser(self, length: int, *, diffuser: Diffuser, potential_manager: PotentialManager) -> Denoiser:
+    def _make_denoiser(
+        self,
+        length: int,
+        *,
+        diffuser: Diffuser,
+        guidance: RFdiffusionGuidance | None,
+    ) -> Denoiser:
         r"""Construct the reverse [`Denoiser`][ofoldx.models.rfdiffusion.model.Denoiser] from config."""
 
-        kwargs = _diffuser_kwargs(self.config.diffuser)
-        for diffuser_only_key in (
-            "truncation_level",
-            "igso3_num_omega",
-            "igso3_num_sigma",
-            "min_b",
-            "max_b",
-            "min_sigma",
-            "max_sigma",
-            "so3_schedule_type",
-        ):
-            kwargs.pop(diffuser_only_key, None)
-        kwargs.update(_config_kwargs(self.config.denoiser))
-        kwargs.update({"truncation_level": length, "diffuser": diffuser, "potential_manager": potential_manager})
-        return Denoiser(**kwargs)
-
-    def _make_symmetry(self) -> SymmetryGenerator | None:
-        r"""Construct the [`SymmetryGenerator`][ofoldx.models.rfdiffusion.model.SymmetryGenerator], or `None`."""
-
-        if self.config.inference.symmetry is None:
-            return None
-        return SymmetryGenerator(
-            self.config.inference.symmetry,
-            self.config.inference.recenter,
-            self.config.inference.radius,
-            self.config.inference.model_only_neighbors,
+        config = self.config.diffuser
+        return Denoiser(
+            num_timesteps=diffuser.num_timesteps,
+            truncation_level=length,
+            diffuser=diffuser,
+            beta_initial=config.beta_initial,
+            beta_final=config.beta_final,
+            schedule_type=config.schedule_type,
+            so3_type=config.rotation_diffuser,
+            noise_scale_ca=self.noise_scale_ca,
+            final_noise_scale_ca=self.final_noise_scale_ca,
+            ca_noise_schedule=self.ca_noise_schedule,
+            noise_scale_frame=self.noise_scale_frame,
+            final_noise_scale_frame=self.final_noise_scale_frame,
+            frame_noise_schedule=self.frame_noise_schedule,
+            crd_scale=config.coordinate_scale,
+            partial_timesteps=self.partial_steps,
+            guidance=guidance,
+            guidance_scale=self.guidance_scale,
+            guidance_decay=self.guidance_decay,
         )
-
-    def _attach_substrate_potentials(
-        self,
-        *,
-        target_feats: dict[str, Any],
-        potential_manager: PotentialManager,
-        diffusion_mask: Tensor,
-        motif_coords: Tensor,
-        diffuser: Diffuser,
-    ) -> None:
-        r"""
-        Wire ligand HETATM coords and the motif frame into any configured ``substrate_contacts`` potential.
-
-        Raises:
-            ValueError: If the substrate potential is requested but the required HETATM records or substrate
-                name are missing.
-        """
-
-        guiding = self.config.potentials.guiding_potentials
-        if not guiding or not any("substrate_contacts" in value for value in guiding):
-            return
-        hetatm_coords = target_feats.get("xyz_het")
-        info_het = target_feats.get("info_het", [])
-        if hetatm_coords is None or len(hetatm_coords) == 0:
-            raise ValueError("substrate_contacts requires ligand HETATM records in the input PDB")
-        substrate_name = self.config.potentials.substrate
-        if substrate_name is None:
-            raise ValueError("potentials.substrate must name the ligand residue for substrate_contacts")
-        het_names = np.asarray([str(info["name"]).strip() for info in info_het])
-        substrate = torch.as_tensor(
-            np.asarray(hetatm_coords)[het_names == substrate_name],
-            dtype=motif_coords.dtype,
-            device=self.device,
-        )
-        if substrate.numel() == 0:
-            raise ValueError(f"expected at least one heteroatom for ligand {substrate_name!r}")
-        motif_mask = diffusion_mask.to(device=motif_coords.device).bool()
-        motif_only = motif_coords[motif_mask]
-        for potential in potential_manager.potentials_to_apply:
-            if isinstance(potential, SubstrateContacts):
-                potential.motif_substrate_atoms = substrate
-                potential.diffusion_mask = diffusion_mask.squeeze().to(self.device)
-                potential.motif_coords = motif_only.to(self.device)
-
-    def _uses_scaffold_guidance(self) -> bool:
-        r"""Return whether the config enables scaffold guidance and supplies a scaffold or target input."""
-
-        if not bool(_cfg_get(self.config.scaffoldguided, "scaffoldguided", False)):
-            return False
-        scaffold_inputs = (
-            _cfg_get(self.config.scaffoldguided, "scaffold_dir", None),
-            _cfg_get(self.config.scaffoldguided, "scaffold_list", None),
-            _cfg_get(self.config.scaffoldguided, "target_path", None),
-            _cfg_get(self.config.scaffoldguided, "target_ss", None),
-            _cfg_get(self.config.scaffoldguided, "target_adj", None),
-            _cfg_get(self.config.contigmap, "inpaint_str_helix", None),
-            _cfg_get(self.config.contigmap, "inpaint_str_strand", None),
-            _cfg_get(self.config.contigmap, "inpaint_str_loop", None),
-        )
-        return any(value is not None for value in scaffold_inputs) or bool(
-            _cfg_get(self.config.scaffoldguided, "target_pdb", False)
-        )
-
-    def _t_step_input(self, diffusion_steps: int | None) -> int:
-        r"""
-        Return the starting timestep, honoring partial diffusion.
-
-        Raises:
-            ValueError: If ``partial_timesteps`` exceeds the total timestep count.
-        """
-
-        total = int(diffusion_steps if diffusion_steps is not None else self.config.diffuser.num_timesteps)
-        if self.config.diffuser.partial_timesteps:
-            if self.config.diffuser.partial_timesteps > total:
-                raise ValueError("partial_timesteps must be <= T")
-            return int(self.config.diffuser.partial_timesteps)
-        return total
-
-    def _build_output_indices(self, contig_map: ContigMap) -> tuple[list[str], list[int]]:
-        r"""
-        Assign output chain labels and PDB residue numbers per residue from the contig map.
-
-        Returns:
-            A ``(chain_idx, pdb_index)`` pair of per-residue chain labels and residue numbers.
-
-        Raises:
-            ValueError: If a chain block resolves to multiple chain ids, or no chain labels remain.
-        """
-
-        first_res = 0
-        chain_idx: list[str] = []
-        pdb_index: list[int] = []
-        all_chains = {ref[0] for ref in contig_map.reference}
-        available_chains = sorted(set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") - all_chains)
-        for last_res in contig_map.sampled_mask_length_bound:
-            chain_ids = {ref[0] for ref in contig_map.reference[first_res:last_res]}
-            if "_" in chain_ids:
-                pdb_index += [idx + 1 for idx in range(last_res - first_res)]
-                chain_ids = chain_ids - {"_"}
-                if not chain_ids:
-                    if not available_chains:
-                        raise ValueError("no available chain ids remain")
-                    chain_id = available_chains.pop(0)
-                else:
-                    if len(chain_ids) != 1:
-                        raise ValueError(f"multiple chain ids in designed chain: {chain_ids}")
-                    chain_id = list(chain_ids)[0]
-                chain_idx += [chain_id] * (last_res - first_res)
-            else:
-                pdb_index += [int(ref[1]) for ref in contig_map.reference[first_res:last_res]]
-                if len(chain_ids) != 1:
-                    raise ValueError(f"multiple chain ids in fixed chain: {chain_ids}")
-                chain_idx += [list(chain_ids)[0]] * (last_res - first_res)
-            first_res = last_res
-        return chain_idx, pdb_index
-
-    def _init_cyclic_reses(self, mask_str: Tensor, contig_map: ContigMap) -> Tensor:
-        r"""Build the per-residue cyclic-peptide mask from ``inference.cyclic`` and the configured chains."""
-
-        mask = mask_str.squeeze(0).to(self.device).bool()
-        if not self.config.inference.cyclic:
-            return torch.zeros_like(mask)
-        if self.config.inference.cyc_chains is None:
-            return ~mask
-        cyc_chains = [chain.upper() for chain in self.config.inference.cyc_chains]
-        is_cyclized = torch.zeros_like(mask)
-        chain_labels = [idx[0] for idx in contig_map.design]
-        for chain in cyc_chains:
-            chain_mask = torch.tensor([label == chain for label in chain_labels], dtype=torch.bool, device=self.device)
-            is_cyclized[chain_mask] = True
-        return is_cyclized
-
-    @staticmethod
-    def _infer_device(network: nn.Module | None) -> torch.device:
-        r"""Infer the device from the network's parameters, falling back to CUDA-if-available then CPU."""
-
-        if network is not None:
-            with contextlib.suppress(StopIteration):
-                return next(network.parameters()).device
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def coerce_network_prediction(
-    output: tuple[Tensor, ...],
-) -> tuple[Tensor, Tensor | None, Tensor | None]:
-    r"""
-    Extract backbone ``pred_coords``, torsion angles, and pLDDT from the network's 7-tuple output.
-
-    Args:
-        output: The RoseTTAFold network output tuple.
-
-    Returns:
-        A tuple ``(pred_coords, alpha, plddt)`` where ``alpha`` and ``plddt`` are `None` if absent.
-
-    Raises:
-        TypeError: If the predicted coords entry is not a tensor.
-    """
-
-    pred_coords, alpha, plddt = output[2], output[4], output[6]
-    if not torch.is_tensor(pred_coords):
-        raise TypeError("RFdiffusion network output must include tensor pred_coords coords")
-    return pred_coords, alpha if torch.is_tensor(alpha) else None, plddt if torch.is_tensor(plddt) else None
-
-
-def normalize_backbone_prediction(pred_coords: Tensor, noisy_coords_ref: Tensor) -> Tensor:
-    r"""
-    Normalize network backbone ``pred_coords`` to ``(1, L, 3, 3)`` for all-atom reconstruction.
-
-    Moves the prediction onto the reference device/dtype and squeezes stray leading singleton dimensions.
-
-    Args:
-        pred_coords: Predicted backbone coords in a `(B, L, 3, 3)`-compatible shape.
-        noisy_coords_ref: Reference tensor supplying the target device and dtype.
-
-    Returns:
-        The backbone prediction reshaped to `(1, L, 3, 3)`.
-
-    Raises:
-        ValueError: If the prediction is not a single `(1, L, 3, 3)` backbone.
-    """
-
-    pred_coords = pred_coords.to(device=noisy_coords_ref.device, dtype=noisy_coords_ref.dtype)
-    if pred_coords.ndim == 3:
-        pred_coords = pred_coords.unsqueeze(0)
-    while pred_coords.ndim > 4 and pred_coords.shape[0] == 1:
-        pred_coords = pred_coords.squeeze(0)
-    if pred_coords.ndim != 4 or pred_coords.shape[-2:] != (3, 3):
-        raise ValueError(f"pred_coords backbone must have shape (B, L, 3, 3), got {tuple(pred_coords.shape)}")
-    if pred_coords.shape[0] != 1:
-        raise ValueError("RFdiffusion sampler expects one design trajectory per network call")
-    return pred_coords
-
-
-def _masked_secondary_structure(length: int, device: torch.device) -> Tensor:
-    r"""Return an all-masked one-hot secondary-structure tensor `[L, 4]` (class 3 = masked/loop)."""
-
-    tokens = torch.full((length,), 3, dtype=torch.long, device=device)
-    return F.one_hot(tokens, num_classes=4).float()
-
-
-def _masked_adjacency(length: int, device: torch.device) -> Tensor:
-    r"""Return an all-masked one-hot block-adjacency tensor `[L, L, 3]` (class 2 = masked)."""
-
-    tokens = torch.full((length, length), 2, dtype=torch.long, device=device)
-    return F.one_hot(tokens, num_classes=3).float()
-
-
-def _config_kwargs(config: Mapping[str, Any] | object) -> dict[str, Any]:
-    r"""Return a plain dict of ``config``'s entries, handling chanfig configs, mappings, and plain objects."""
-
-    if hasattr(config, "to_dict"):
-        return dict(config.to_dict())
-    if isinstance(config, Mapping):
-        return dict(config)
-    return dict(vars(config))
-
-
-def _diffuser_kwargs(config: Mapping[str, Any] | object) -> dict[str, Any]:
-    r"""Return RFdiffusion diffuser config entries using the runtime constructor names."""
-
-    kwargs = _config_kwargs(config)
-    aliases = {
-        "b_0": "beta_initial",
-        "b_T": "beta_final",
-        "so3_schedule_type": "so3_schedule_type",
-    }
-    for saved_name, runtime_name in aliases.items():
-        if saved_name in kwargs:
-            kwargs[runtime_name] = kwargs.pop(saved_name)
-    return kwargs
-
-
-def _cfg_get(config: Mapping[str, Any] | object, key: str, default: Any = None) -> Any:
-    r"""Get ``key`` from ``config`` whether it is a mapping or a plain attribute-bearing object."""
-
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def _move_target_features(features: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    r"""Return a copy of ``features`` with every tensor value moved to ``device`` (non-tensors untouched)."""
-
-    moved: dict[str, Any] = {}
-    for key, value in features.items():
-        moved[key] = value.to(device) if torch.is_tensor(value) else value
-    return moved
-
-
-def _numpy_bool(value: Tensor) -> np.ndarray:
-    r"""Return a detached CPU boolean numpy array of ``value``."""
-
-    return value.detach().cpu().bool().numpy()
 
 
 def get_beta_schedule(
@@ -4627,9 +4524,6 @@ def get_beta_schedule(
     beta_initial: float,
     beta_final: float,
     schedule_type: str,
-    schedule_params: dict[str, Any] | None = None,
-    *,
-    inference: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
     r"""
     Build the RFdiffusion translation-noise beta, alpha, and cumulative alpha-bar schedules.
@@ -4639,8 +4533,6 @@ def get_beta_schedule(
         beta_initial: Initial beta (rescaled by ``200 / num_timesteps``).
         beta_final: Final beta (rescaled by ``200 / num_timesteps``).
         schedule_type: Schedule shape; only `"linear"` is supported.
-        schedule_params: Unused; accepted for interface compatibility.
-        inference: Unused; accepted for interface compatibility.
 
     Returns:
         A tuple ``(beta, alpha, alpha_bar)`` of `[num_timesteps]` schedule tensors.
@@ -4655,7 +4547,6 @@ def get_beta_schedule(
         torch.Size([50])
     """
 
-    del schedule_params, inference
     if schedule_type != "linear":
         raise ValueError(f"unsupported RFdiffusion beta schedule {schedule_type!r}")
     if num_timesteps < 15:
@@ -4690,7 +4581,7 @@ class EuclideanDiffuser:
         *,
         schedule_type: str = "linear",
     ) -> None:
-        self.num_timesteps = int(num_timesteps)
+        self.num_timesteps = integer_index(num_timesteps)
         self.beta_schedule, _, _ = get_beta_schedule(
             self.num_timesteps,
             beta_initial,
@@ -4704,6 +4595,7 @@ class EuclideanDiffuser:
         *,
         diffusion_mask: Tensor | None = None,
         var_scale: float = 1.0,
+        num_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
         r"""
@@ -4722,8 +4614,11 @@ class EuclideanDiffuser:
 
         bb_stack: list[Tensor] = []
         delta_stack: list[Tensor] = []
-        current = coords.clone()
-        for t in range(1, self.num_timesteps + 1):
+        current = coords
+        steps = self.num_timesteps if num_steps is None else integer_index(num_steps)
+        if not 1 <= steps <= self.num_timesteps:
+            raise ValueError("num_steps must be in [1, num_timesteps]")
+        for t in range(1, steps + 1):
             current, delta = self.apply_kernel(
                 current,
                 t,
@@ -4757,12 +4652,7 @@ class EuclideanDiffuser:
         Returns:
             A tuple ``(noised, delta)`` of the noised coords and the CA delta applied.
 
-        Raises:
-            ValueError: If ``x`` is not `(L, A, 3)`.
         """
-
-        if x.ndim != 3:
-            raise ValueError("translation noising expects coords with shape (L, A, 3)")
         t_idx = t - 1
         ca_coords = x[:, 1]
         beta_t = self.beta_schedule.to(device=x.device, dtype=x.dtype)[t_idx]
@@ -4771,7 +4661,6 @@ class EuclideanDiffuser:
         sampled = mean + torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator) * std
         delta = sampled - ca_coords
         if diffusion_mask is not None:
-            delta = delta.clone()
             delta[diffusion_mask.to(device=delta.device).bool()] = 0
         return x + delta[:, None], delta
 
@@ -4807,15 +4696,15 @@ class IGSO3Diffuser:
         max_sigma: float,
         min_b: float,
         max_b: float,
-        cache_dir: str | Path,
+        cache_dir: str | Path | None,
         num_omega: int = 1000,
         num_sigma: int = 500,
         schedule: str = "linear",
         truncation_level: int = 2000,
     ) -> None:
-        self.num_timesteps = int(num_timesteps)
+        self.num_timesteps = integer_index(num_timesteps)
         self.schedule = schedule
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
         self.min_b = float(min_b)
@@ -4824,9 +4713,9 @@ class IGSO3Diffuser:
             self.max_sigma = float(self.sigma(torch.tensor(1.0)))
         if self.schedule not in {"linear", "exponential"}:
             raise ValueError(f"unsupported IGSO3 schedule {schedule!r}")
-        self.num_omega = int(num_omega)
-        self.num_sigma = int(num_sigma)
-        self.truncation_level = int(truncation_level)
+        self.num_omega = integer_index(num_omega)
+        self.num_sigma = integer_index(num_sigma)
+        self.truncation_level = integer_index(truncation_level)
         self.igso3_vals = self._calc_igso3_vals()
         self.step_size = 1 / self.num_timesteps
 
@@ -4897,12 +4786,19 @@ class IGSO3Diffuser:
             The scalar diffusion coefficient `sqrt(d(sigma^2)/dt)` at ``t``.
         """
 
-        t_tensor = torch.as_tensor(t, dtype=torch.float32).requires_grad_(True)
-        sigma_sq = self.sigma(t_tensor) ** 2
-        grad = torch.autograd.grad(sigma_sq.sum(), t_tensor)[0]
-        return torch.sqrt(grad)
+        with torch.inference_mode(False), torch.enable_grad():
+            t_tensor = torch.as_tensor(t, dtype=torch.float32).requires_grad_(True)
+            sigma_sq = self.sigma(t_tensor) ** 2
+            grad = torch.autograd.grad(sigma_sq.sum(), t_tensor)[0]
+            return torch.sqrt(grad)
 
-    def sample(self, ts: np.ndarray, *, n_samples: int = 1) -> np.ndarray:
+    def sample(
+        self,
+        ts: np.ndarray,
+        *,
+        n_samples: int = 1,
+        generator: torch.Generator | None = None,
+    ) -> np.ndarray:
         r"""
         Inverse-CDF sample IGSO3 rotation angles at the given timesteps.
 
@@ -4923,10 +4819,18 @@ class IGSO3Diffuser:
         for t in ts:
             sigma_idx = int(np.asarray(self.t_to_idx(int(t))).item())
             cdf = self.igso3_vals["cdf"][sigma_idx]
-            all_samples.append(np.interp(np.random.rand(n_samples), cdf, self.igso3_vals["discrete_omega"]))
+            rng_device = torch.device("cpu") if generator is None else generator.device
+            uniform = torch.rand(n_samples, device=rng_device, generator=generator).cpu().numpy()
+            all_samples.append(np.interp(uniform, cdf, self.igso3_vals["discrete_omega"]))
         return np.stack(all_samples, axis=0)
 
-    def sample_vec(self, ts: np.ndarray, *, n_samples: int = 1) -> np.ndarray:
+    def sample_vec(
+        self,
+        ts: np.ndarray,
+        *,
+        n_samples: int = 1,
+        generator: torch.Generator | None = None,
+    ) -> np.ndarray:
         r"""
         Sample IGSO3 rotation vectors (random axis times sampled angle) at the given timesteps.
 
@@ -4938,9 +4842,10 @@ class IGSO3Diffuser:
             Rotation vectors `[len(ts), n_samples, 3]` (unit axis scaled by the sampled angle).
         """
 
-        axes = np.random.randn(len(ts), n_samples, 3)
+        rng_device = torch.device("cpu") if generator is None else generator.device
+        axes = torch.randn((len(ts), n_samples, 3), device=rng_device, generator=generator).cpu().numpy()
         axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
-        return axes * self.sample(ts, n_samples=n_samples)[..., None]
+        return axes * self.sample(ts, n_samples=n_samples, generator=generator)[..., None]
 
     def score_norm(self, t: int, omega: np.ndarray) -> np.ndarray:
         r"""
@@ -4963,6 +4868,7 @@ class IGSO3Diffuser:
         *,
         t_list: np.ndarray | None = None,
         diffusion_mask: np.ndarray | Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         r"""
         Noise residue frames with IGSO3 rotations across timesteps.
@@ -4980,7 +4886,7 @@ class IGSO3Diffuser:
             coords_np = coords.detach().cpu().numpy()
         else:
             coords_np = coords
-        t_values = np.arange(self.num_timesteps) + 1
+        t_values = np.arange(self.num_timesteps) + 1 if t_list is None else np.asarray(t_list, dtype=np.int64)
         num_res = len(coords_np)
         N = torch.from_numpy(coords_np[None, :, 0])
         Ca = torch.from_numpy(coords_np[None, :, 1])
@@ -4988,21 +4894,15 @@ class IGSO3Diffuser:
         R_true, Ca_true = rigid_from_3_points(N, Ca, C)
         R_true_np = R_true[0].detach().cpu().numpy()
         Ca_np = Ca_true[0].detach().cpu().numpy()
-        sampled_rots = self.sample_vec(t_values, n_samples=num_res)
+        sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
         if diffusion_mask is not None:
             mask_np = (
                 diffusion_mask.detach().cpu().numpy() if torch.is_tensor(diffusion_mask) else np.asarray(diffusion_mask)
             )
             sampled_rots = sampled_rots * (1 - mask_np[None, :, None])
-        R_sampled = (
-            Rotation.from_rotvec(sampled_rots.reshape(-1, 3)).as_matrix().reshape(self.num_timesteps, num_res, 3, 3)
-        )
+        R_sampled = Rotation.from_rotvec(sampled_rots.reshape(-1, 3)).as_matrix().reshape(len(t_values), num_res, 3, 3)
         R_perturbed = np.einsum("tnij,njk->tnik", R_sampled, R_true_np)
         perturbed = np.einsum("tnij,naj->tnai", R_sampled, coords_np[:, :3] - Ca_np[:, None]) + Ca_np[None, :, None]
-        if t_list is not None:
-            indices = [int(t) - 1 for t in t_list]
-            perturbed = perturbed[indices]
-            R_perturbed = R_perturbed[indices]
         return perturbed.transpose(1, 0, 2, 3), R_perturbed.transpose(1, 0, 2, 3)
 
     def reverse_sample_vectorized(
@@ -5014,6 +4914,7 @@ class IGSO3Diffuser:
         *,
         mask: Tensor | None = None,
         return_perturb: bool = False,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
         Take one reverse IGSO3 step toward the predicted clean rotations.
@@ -5045,9 +4946,11 @@ class IGSO3Diffuser:
             ]
         )
         rot_g = self.diffusion_coefficient(t / self.num_timesteps).to(device=score.device, dtype=score.dtype)
-        z = torch.randn_like(score) * noise_level
+        rng_device = score.device if generator is None else generator.device
+        z = torch.randn(score.shape, dtype=score.dtype, device=rng_device, generator=generator).to(score.device)
+        z = z * noise_level
         delta_r = (rot_g**2) * self.step_size * score
-        perturb_tangent = delta_r + rot_g * np.sqrt(self.step_size) * z
+        perturb_tangent = delta_r + rot_g * math.sqrt(self.step_size) * z
         if mask is not None:
             perturb_tangent = perturb_tangent * (1 - mask.long()).to(device=perturb_tangent.device)[:, None]
         perturb = exp_map(perturb_tangent)
@@ -5058,11 +4961,21 @@ class IGSO3Diffuser:
     def _calc_igso3_vals(self) -> dict[str, np.ndarray]:
         r"""Load the cached IGSO3 lookup tables, computing and caching them on a miss."""
 
+        if (
+            self.num_timesteps == 50
+            and self.num_omega == 1000
+            and self.num_sigma == 500
+            and self.truncation_level == 2000
+            and self.schedule == "linear"
+            and self.min_sigma == 0.02
+            and self.min_b == 1.5
+            and self.max_b == 2.5
+        ):
+            return rfdiffusion_schedule()
         cache_file = self._cache_file()
-        if cache_file.exists():
-            from .processor import read_pickle
-
-            return read_pickle(cache_file)  # type: ignore[return-value]
+        if cache_file is not None and cache_file.exists():
+            with cache_file.open("rb") as handle:
+                return cast(dict[str, np.ndarray], pickle.load(handle))
         values = calculate_igso3(
             num_sigma=self.num_sigma,
             min_sigma=self.min_sigma,
@@ -5070,10 +4983,11 @@ class IGSO3Diffuser:
             num_omega=self.num_omega,
             num_terms=self.truncation_level,
         )
-        write_pickle(cache_file, values)
+        if cache_file is not None:
+            write_pickle(cache_file, values)
         return values
 
-    def _cache_file(self) -> Path:
+    def _cache_file(self) -> Path | None:
         r"""Return the cache-file path encoding the IGSO3 schedule parameters."""
 
         def fmt(value: object) -> str:
@@ -5101,7 +5015,7 @@ class IGSO3Diffuser:
             parts.extend([f"min_b_{fmt(self.min_b)}", f"max_b_{fmt(self.max_b)}"])
         else:
             parts.append(f"max_sigma_{fmt(self.max_sigma)}")
-        return self.cache_dir / ("_".join(parts) + ".pkl")
+        return None if self.cache_dir is None else self.cache_dir / ("_".join(parts) + ".pkl")
 
 
 class Diffuser:
@@ -5150,7 +5064,7 @@ class Diffuser:
         crd_scale: float,
         *,
         var_scale: float = 1.0,
-        cache_dir: str | Path = ".",
+        cache_dir: str | Path | None = None,
         partial_timesteps: int | None = None,
         truncation_level: int = 2000,
         igso3_num_omega: int = 1000,
@@ -5158,15 +5072,15 @@ class Diffuser:
     ) -> None:
         if so3_type != "igso3":
             raise ValueError(f"unsupported SO(3) diffuser {so3_type!r}")
-        self.num_timesteps = int(num_timesteps)
-        self.partial_timesteps = None if partial_timesteps is None else int(partial_timesteps)
+        self.num_timesteps = integer_index(num_timesteps)
+        self.partial_timesteps = None if partial_timesteps is None else integer_index(partial_timesteps)
         if self.partial_timesteps is not None and not 0 < self.partial_timesteps <= self.num_timesteps:
             raise ValueError("partial_timesteps must be in the interval [1, T]")
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
         self.crd_scale = float(crd_scale)
         self.var_scale = float(var_scale)
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self.so3_diffuser = IGSO3Diffuser(
             num_timesteps=self.num_timesteps,
             min_sigma=self.min_sigma,
@@ -5189,7 +5103,6 @@ class Diffuser:
     def diffuse_pose(
         self,
         coords: Tensor,
-        seq: Tensor,
         atom_mask: Tensor,
         *,
         include_motif_sidechains: bool = True,
@@ -5205,8 +5118,7 @@ class Diffuser:
 
         Args:
             coords: Backbone coords `[L, 27, 3]` to noise.
-            seq: Sequence features; unused, accepted for signature symmetry.
-            atom_mask: Atom mask; unused, accepted for signature symmetry.
+            atom_mask: Atom mask used when preserving fixed motif sidechains.
             include_motif_sidechains: Whether to preserve fixed-motif sidechain coords.
             diffusion_mask: Per-residue mask; masked (motif) residues stay fixed.
             t_list: Optional one-indexed timesteps to return; all timesteps otherwise.
@@ -5216,46 +5128,56 @@ class Diffuser:
             A tuple ``(diffused_fullatom, true_coords)`` of the noised atom27 trajectory and the centered
             clean coords.
 
-        Raises:
-            ValueError: If the backbone coords contain NaNs before diffusion.
         """
 
-        del seq, atom_mask
         if diffusion_mask is None:
             diffusion_mask = torch.zeros(len(coords.squeeze()), dtype=torch.bool, device=coords.device)
         diffusion_mask = diffusion_mask.to(device=coords.device).bool()
-        if torch.isnan(coords[:, :3]).any():
-            raise ValueError("backbone coords must be initialized before diffusion")
         if diffusion_mask.any():
             motif_com = coords[diffusion_mask, 1].mean(dim=0)
             coords = coords - motif_com
         else:
             coords = coords - coords[:, 1].mean(dim=0)
-        true_coords = coords.clone()
+        true_coords = coords
+        t_values = (
+            np.arange(1, self.num_timesteps + 1, dtype=np.int64)
+            if t_list is None
+            else np.asarray(t_list, dtype=np.int64)
+        )
+        if t_values.ndim != 1 or len(t_values) == 0 or np.any(t_values < 1) or np.any(t_values > self.num_timesteps):
+            raise ValueError("t_list must contain one-indexed timesteps in the active diffusion schedule")
+        max_step = int(t_values.max())
         scaled = coords * self.crd_scale
         _diffused_T, deltas = self.eucl_diffuser.diffuse_translations(
-            scaled[:, :3].clone(),
+            scaled[:, :3],
             diffusion_mask=diffusion_mask,
             var_scale=self.var_scale,
+            num_steps=max_step,
             generator=generator,
         )
         deltas = deltas / self.crd_scale
         frame_coords, _frames = self.so3_diffuser.diffuse_frames(
-            scaled[:, :3].clone(),
+            scaled[:, :3],
             diffusion_mask=diffusion_mask.detach().cpu().numpy(),
-            t_list=None,
+            t_list=t_values,
+            generator=generator,
         )
         frame_coords = torch.from_numpy(frame_coords).to(device=coords.device, dtype=coords.dtype) / self.crd_scale
         cum_delta = deltas.cumsum(dim=1)
+        requested = torch.as_tensor(t_values - 1, dtype=torch.long, device=cum_delta.device)
+        cum_delta = cum_delta.index_select(1, requested)
         diffused_bb = (frame_coords + cum_delta[:, :, None]).transpose(0, 1)
         t_steps, length = diffused_bb.shape[:2]
-        diffused_fa = torch.zeros((t_steps, length, 27, 3), dtype=coords.dtype, device=coords.device)
+        diffused_fa = torch.full(
+            (t_steps, length, 27, 3),
+            float("nan"),
+            dtype=coords.dtype,
+            device=coords.device,
+        )
         diffused_fa[:, :, :3] = diffused_bb
         if include_motif_sidechains:
-            diffused_fa[:, diffusion_mask, :14] = true_coords[None, diffusion_mask, :14]
-        if t_list is not None:
-            indices = [int(t) - 1 for t in t_list]
-            diffused_fa = diffused_fa[indices]
+            preserve = diffusion_mask[:, None] & atom_mask.to(device=coords.device, dtype=torch.bool)
+            diffused_fa = torch.where(preserve[None, :, :, None], true_coords[None], diffused_fa)
         return diffused_fa, true_coords
 
 
@@ -5268,6 +5190,7 @@ def get_next_frames(
     diffusion_mask: Tensor,
     *,
     noise_scale: float = 1.0,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     r"""
     Update backbone frames from ``noisy_coords`` one reverse step toward predicted ``x_0``.
@@ -5308,6 +5231,7 @@ def get_next_frames(
                     t,
                     noise_level=noise_scale,
                     return_perturb=True,
+                    generator=generator,
                 )
                 .detach()
                 .cpu()
@@ -5408,20 +5332,19 @@ def get_next_ca(
     )
     delta = sampled - noisy_coords_scaled[:, 1]
     if diffusion_mask is not None:
-        delta = delta.clone()
         delta[diffusion_mask.to(device=delta.device).bool()] = 0
     out = noisy_coords_scaled + delta[:, None]
     return out / crd_scale, delta / crd_scale
 
 
-def get_noise_schedule(num_timesteps: int, final_noise: float, initial_noise: float, schedule_type: str):
+def get_noise_schedule(num_timesteps: int, initial_noise: float, final_noise: float, schedule_type: str):
     r"""
     Return a callable mapping a timestep to its noise scale.
 
     Args:
         num_timesteps: Total number of timesteps (for the linear interpolation).
-        final_noise: Noise scale at the final timestep.
-        initial_noise: Noise scale at the first timestep.
+        initial_noise: Noise scale at the initial timestep ``t = num_timesteps``.
+        final_noise: Linear-interpolation endpoint at timestep ``t = 1``.
         schedule_type: Schedule shape (`"constant"` or `"linear"`).
 
     Returns:
@@ -5438,65 +5361,14 @@ def get_noise_schedule(num_timesteps: int, final_noise: float, initial_noise: fl
     """
 
     schedules = {
-        "constant": lambda t: final_noise,
-        "linear": lambda t: ((t - 1) / (num_timesteps - 1)) * (final_noise - initial_noise) + initial_noise,
+        "constant": lambda t: initial_noise,
+        "linear": lambda t: ((t - 1) / (num_timesteps - 1)) * (initial_noise - final_noise) + final_noise,
     }
     if schedule_type not in schedules:
         raise ValueError(f"noise schedule must be one of {tuple(schedules)}")
+    if schedule_type == "constant" and final_noise != initial_noise:
+        raise ValueError("a constant noise schedule cannot have different initial and final values")
     return schedules[schedule_type]
-
-
-class NullPotentialManager:
-    r"""
-    No-op stand-in for the potential manager when no guiding potentials are configured.
-
-    Exposes the same ``is_empty`` / ``compute_all_potentials`` / ``get_guide_scale`` surface as the real
-    [`PotentialManager`][ofoldx.models.rfdiffusion.model.PotentialManager] so the sampler can call it
-    unconditionally: every method returns the neutral value (empty, zero energy, zero guide scale), leaving the
-    reverse-diffusion step unguided.
-
-    Attributes:
-        potentials_to_apply: Always the empty list; kept for interface parity with the real manager.
-    """
-
-    potentials_to_apply: list[object] = []
-
-    def is_empty(self) -> bool:
-        r"""
-        Report that no potentials are registered.
-
-        Returns:
-            Always `True`; a null manager holds no potentials.
-        """
-
-        return True
-
-    def compute_all_potentials(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the (zero) total potential energy for ``coords``.
-
-        Args:
-            coords: Structure coordinates whose device and dtype the returned scalar matches.
-
-        Returns:
-            A zero scalar tensor on ``coords``' device/dtype (no potential to compute).
-        """
-
-        return torch.zeros((), dtype=coords.dtype, device=coords.device)
-
-    def get_guide_scale(self, t: int) -> float:
-        r"""
-        Return the guidance scale at timestep ``t``.
-
-        Args:
-            t: Diffusion timestep (ignored; a null manager applies no guidance).
-
-        Returns:
-            Always `0.0`.
-        """
-
-        del t
-        return 0.0
 
 
 class Denoiser:
@@ -5504,7 +5376,7 @@ class Denoiser:
     Reverse RFdiffusion pose updater stepping ``x_t`` toward ``x_{t-1}``.
 
     Combines the CA-translation posterior sample and the IGSO3 frame reverse step, optionally aligns the
-    prediction onto the fixed motif, and adds guiding-potential gradients.
+    prediction onto the fixed motif.
 
     Args:
         num_timesteps: Total number of diffusion timesteps.
@@ -5515,14 +5387,16 @@ class Denoiser:
         schedule_type: Translation beta-schedule shape.
         so3_type: Rotation diffuser family; only `"igso3"` is supported.
         noise_scale_ca: Initial CA-translation noise scale.
-        final_noise_scale_ca: Final CA-translation noise scale.
-        ca_noise_schedule_type: CA noise-schedule shape.
+        final_noise_scale_ca: Optional CA-translation endpoint for a linear schedule.
+        ca_noise_schedule: CA noise-schedule shape.
         noise_scale_frame: Initial frame (rotation) noise scale.
-        final_noise_scale_frame: Final frame noise scale.
-        frame_noise_schedule_type: Frame noise-schedule shape.
+        final_noise_scale_frame: Optional frame endpoint for a linear schedule.
+        frame_noise_schedule: Frame noise-schedule shape.
         crd_scale: Coordinate-scaling factor.
-        potential_manager: Guiding-potential manager; a null manager is used when `None`.
         partial_timesteps: Number of steps for partial diffusion, or `None`.
+        guidance: Canonical soft geometric Conditions lowered to a differentiable scalar.
+        guidance_scale: Overall gradient scale.
+        guidance_decay: Constant, linear, quadratic, or cubic decay over reverse time.
 
     Raises:
         ValueError: If ``partial_timesteps`` is out of range.
@@ -5539,18 +5413,20 @@ class Denoiser:
         schedule_type: str = "linear",
         so3_type: str = "igso3",
         noise_scale_ca: float = 1.0,
-        final_noise_scale_ca: float = 1.0,
-        ca_noise_schedule_type: str = "constant",
+        final_noise_scale_ca: float | None = None,
+        ca_noise_schedule: Literal["constant", "linear"] = "constant",
         noise_scale_frame: float = 0.5,
-        final_noise_scale_frame: float = 0.5,
-        frame_noise_schedule_type: str = "constant",
+        final_noise_scale_frame: float | None = None,
+        frame_noise_schedule: Literal["constant", "linear"] = "constant",
         crd_scale: float = 1 / 15,
-        potential_manager: Any | None = None,
         partial_timesteps: int | None = None,
+        guidance: RFdiffusionGuidance | None = None,
+        guidance_scale: float = 10.0,
+        guidance_decay: str = "constant",
     ) -> None:
-        self.num_timesteps = int(num_timesteps)
-        self.truncation_level = int(truncation_level)
-        self.partial_timesteps = None if partial_timesteps is None else int(partial_timesteps)
+        self.num_timesteps = integer_index(num_timesteps)
+        self.truncation_level = integer_index(truncation_level)
+        self.partial_timesteps = None if partial_timesteps is None else integer_index(partial_timesteps)
         if self.partial_timesteps is not None and not 0 < self.partial_timesteps <= self.num_timesteps:
             raise ValueError("partial_timesteps must be in the interval [1, T]")
         self.diffuser = diffuser
@@ -5560,35 +5436,49 @@ class Denoiser:
         self.so3_type = so3_type
         self.crd_scale = float(crd_scale)
         self.noise_scale_ca = float(noise_scale_ca)
-        self.final_noise_scale_ca = float(final_noise_scale_ca)
-        self.ca_noise_schedule_type = ca_noise_schedule_type
+        self.final_noise_scale_ca = self.noise_scale_ca if final_noise_scale_ca is None else float(final_noise_scale_ca)
+        self.ca_noise_schedule = ca_noise_schedule
         self.noise_scale_frame = float(noise_scale_frame)
-        self.final_noise_scale_frame = float(final_noise_scale_frame)
-        self.frame_noise_schedule_type = frame_noise_schedule_type
-        self.potential_manager: Any = NullPotentialManager() if potential_manager is None else potential_manager
+        self.final_noise_scale_frame = (
+            self.noise_scale_frame if final_noise_scale_frame is None else float(final_noise_scale_frame)
+        )
+        self.frame_noise_schedule = frame_noise_schedule
+        if (
+            ca_noise_schedule == "constant"
+            and final_noise_scale_ca is not None
+            and self.final_noise_scale_ca != self.noise_scale_ca
+        ):
+            raise ValueError("final_noise_scale_ca can differ from noise_scale_ca only for a linear schedule")
+        if (
+            frame_noise_schedule == "constant"
+            and final_noise_scale_frame is not None
+            and self.final_noise_scale_frame != self.noise_scale_frame
+        ):
+            raise ValueError("final_noise_scale_frame can differ from noise_scale_frame only for a linear schedule")
+        self.guidance = guidance
+        self.guidance_scale = guidance_scale
+        self.guidance_decay = guidance_decay
         self.schedule, _, self.alphabar_schedule = get_beta_schedule(
             self.num_timesteps,
             self.beta_initial,
             self.beta_final,
             self.schedule_type,
-            inference=True,
         )
         self.noise_schedule_ca = get_noise_schedule(
             self.num_timesteps,
             self.noise_scale_ca,
             self.final_noise_scale_ca,
-            self.ca_noise_schedule_type,
+            self.ca_noise_schedule,
         )
         self.noise_schedule_frame = get_noise_schedule(
             self.num_timesteps,
             self.noise_scale_frame,
             self.final_noise_scale_frame,
-            self.frame_noise_schedule_type,
+            self.frame_noise_schedule,
         )
 
-    def align_to_xt_motif(
-        self, pred_coords: Tensor, final_coords: Tensor, diffusion_mask: Tensor, *, eps: float = 1e-6
-    ) -> Tensor:
+    @staticmethod
+    def align_to_xt_motif(pred_coords: Tensor, final_coords: Tensor, diffusion_mask: Tensor) -> Tensor:
         r"""
         Kabsch-align predicted coords onto the fixed motif residues in ``final_coords``.
 
@@ -5596,71 +5486,33 @@ class Denoiser:
             pred_coords: Predicted coords `[L, A, 3]` to align.
             final_coords: Reference (noised) coords `[L, A, 3]` holding the fixed motif.
             diffusion_mask: Per-residue mask selecting the motif residues to align on.
-            eps: Numerical floor (accepted for signature symmetry).
 
         Returns:
             The aligned predicted coords `[L, A, 3]`.
 
-        Raises:
-            ValueError: If the atom dimensions of the two coord tensors differ.
         """
-
-        if final_coords.shape[1] != pred_coords.shape[1]:
-            raise ValueError(
-                f"final_coords and pred_coords atom dimensions differ: {final_coords.shape} vs {pred_coords.shape}"
-            )
+        output_dtype = pred_coords.dtype
         atom_mask = ~torch.isnan(pred_coords)
-        pred_coords_np = pred_coords.detach().cpu().numpy()
-        noisy_coords_np = final_coords.detach().cpu().numpy()
-        motif_mask = diffusion_mask.detach().cpu().bool().numpy()
-        pred_coords_motif = pred_coords_np[motif_mask, :3].reshape(-1, 3)
-        noisy_coords_motif = noisy_coords_np[motif_mask, :3].reshape(-1, 3)
-        if pred_coords_motif.size == 0:
+        working_coords = pred_coords.float()
+        motif_mask = diffusion_mask.to(device=pred_coords.device, dtype=torch.bool)
+        pred_coords_motif = working_coords[motif_mask, :3].reshape(-1, 3)
+        noisy_coords_motif = final_coords.to(device=pred_coords.device, dtype=torch.float32)[motif_mask, :3].reshape(
+            -1, 3
+        )
+        if pred_coords_motif.numel() == 0:
             return pred_coords
         pred_coords_mean = pred_coords_motif.mean(0)
         noisy_coords_mean = noisy_coords_motif.mean(0)
         A = noisy_coords_motif - noisy_coords_mean
         B = pred_coords_motif - pred_coords_mean
         cov = A.T @ B
-        U, _S, Vt = np.linalg.svd(cov)
-        handed = np.eye(3)
-        handed[-1, -1] = np.sign(np.linalg.det(Vt.T @ U.T))
+        U, _S, Vt = torch.linalg.svd(cov)
+        handed = torch.eye(3, dtype=torch.float32, device=pred_coords.device)
+        handed[-1, -1] = torch.sign(torch.linalg.det(Vt.T @ U.T))
         rotation = Vt.T @ handed @ U.T
-        pred_coords_np[~atom_mask.detach().cpu().numpy()] = 0
-        aligned = (pred_coords_np.reshape(-1, 3) - pred_coords_mean) @ rotation + noisy_coords_mean
-        aligned = aligned.reshape(pred_coords_np.shape)
-        aligned[~atom_mask.detach().cpu().numpy()] = np.nan
-        return torch.as_tensor(aligned, dtype=pred_coords.dtype, device=pred_coords.device)
-
-    def get_potential_gradients(self, coords: Tensor, *, diffusion_mask: Tensor | None) -> Tensor:
-        r"""
-        Compute per-residue CA gradients of the summed guiding potentials.
-
-        Args:
-            coords: Backbone coords `[L, A, 3]` to differentiate against.
-            diffusion_mask: Per-residue mask; masked (motif) CA gradients are zeroed.
-
-        Returns:
-            The CA gradients `[L, 3]` (zeros when no potentials are configured).
-
-        Raises:
-            RuntimeError: If the potential backward produces no coordinate gradients.
-        """
-
-        if getattr(self.potential_manager, "is_empty", lambda: True)():
-            return torch.zeros(coords.shape[0], 3, dtype=coords.dtype, device=coords.device)
-        coords = coords.detach().clone().requires_grad_(True)
-        with torch.enable_grad():
-            potential = self.potential_manager.compute_all_potentials(coords)
-            potential.backward()
-        if coords.grad is None:
-            raise RuntimeError("RFdiffusion potential backward produced no coordinate gradients")
-        grads = coords.grad[:, 1]
-        if diffusion_mask is not None:
-            grads[diffusion_mask.to(device=grads.device).bool()] = 0
-        if torch.isnan(grads).any():
-            grads = torch.nan_to_num(grads, nan=0.0)
-        return grads.detach()
+        aligned = (torch.nan_to_num(working_coords).reshape(-1, 3) - pred_coords_mean) @ rotation + noisy_coords_mean
+        aligned = torch.where(atom_mask, aligned.reshape_as(working_coords), torch.nan)
+        return aligned.to(dtype=output_dtype)
 
     def get_next_pose(
         self,
@@ -5689,12 +5541,7 @@ class Denoiser:
             A tuple ``(next_coords, pred_coords)`` of the atom14 next pose and the (possibly aligned)
             prediction.
 
-        Raises:
-            ValueError: If the coord tensors do not hold atom14 or atom27 coords.
         """
-
-        if noisy_coords.shape[1] not in {14, 27} or pred_coords.shape[1] not in {14, 27}:
-            raise ValueError("xt and pred_coords must contain atom14 or atom27 coords")
         diffusion_mask = diffusion_mask.to(device=noisy_coords.device).bool()
         if align_motif and diffusion_mask.any():
             pred_coords = self.align_to_xt_motif(pred_coords, noisy_coords, diffusion_mask)
@@ -5720,9 +5567,22 @@ class Denoiser:
             so3_type=self.so3_type,
             diffusion_mask=diffusion_mask,
             noise_scale=noise_scale_frame,
+            generator=generator,
         )
-        grad_ca = self.get_potential_gradients(noisy_coords.clone(), diffusion_mask=diffusion_mask)
-        ca_deltas = ca_deltas + self.potential_manager.get_guide_scale(t) * grad_ca
+        if self.guidance is not None and self.guidance_scale:
+            with torch.inference_mode(False):
+                guided_coords = noisy_coords.detach().clone().requires_grad_(True)
+                potential = self.guidance(guided_coords)
+                gradient = torch.autograd.grad(potential, guided_coords)[0][:, 1]
+            gradient = gradient.masked_fill(diffusion_mask[:, None], 0)
+            fraction = t / self.num_timesteps
+            decay = {
+                "constant": 1.0,
+                "linear": fraction,
+                "quadratic": fraction**2,
+                "cubic": fraction**3,
+            }[self.guidance_decay]
+            ca_deltas = ca_deltas + self.guidance_scale * decay * gradient
         frames_next = frames_next + ca_deltas[:, None]
         fullatom_next = torch.full_like(noisy_coords, float("nan")).unsqueeze(0)
         fullatom_next[:, :, :3] = frames_next[None]
@@ -5731,1641 +5591,12 @@ class Denoiser:
         return fullatom_next.squeeze(0)[:, :14], pred_coords
 
 
-class Potential:
-    r"""
-    Base class for scalar guiding potentials maximized during denoising.
-
-    Subclasses implement `compute` to return a scalar whose gradient with respect to CA coords nudges the
-    design toward a goal (compactness, contacts, ...).
-    """
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the scalar potential value for backbone ``coords`` `[L, A, 3]`.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]` (A = 14 or 27); CA is atom index 1.
-
-        Returns:
-            The scalar potential value (subclasses define the sign convention).
-
-        Raises:
-            NotImplementedError: Always; subclasses override this.
-        """
-
-        raise NotImplementedError
-
-
-class MonomerRadiusOfGyration(Potential):
-    r"""
-    Radius-of-gyration potential rewarding compact monomers.
-
-    Args:
-        weight: Scaling weight on the potential.
-        min_distance: Floor on the per-residue centroid distance.
-    """
-
-    def __init__(self, weight: float = 1.0, min_distance: float = 15.0) -> None:
-        self.weight = float(weight)
-        self.min_distance = float(min_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the negative radius of gyration of the monomer CA coords.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; CA is atom index 1.
-
-        Returns:
-            The weighted negative radius of gyration (maximizing it rewards compactness).
-        """
-
-        ca = coords[:, 1]
-        centroid = torch.mean(ca, dim=0, keepdim=True)
-        distogram = torch.cdist(ca[None].contiguous(), centroid[None].contiguous(), p=2).squeeze(0)
-        distogram = torch.maximum(torch.full_like(distogram, self.min_distance), distogram)
-        return -self.weight * torch.sqrt(torch.sum(distogram.square()) / ca.shape[0])
-
-
-class BinderRadiusOfGyration(Potential):
-    r"""
-    Radius-of-gyration potential applied to the binder chain only.
-
-    Args:
-        binderlen: Number of leading residues that form the binder.
-        weight: Scaling weight on the potential.
-        min_distance: Floor on the per-residue centroid distance.
-    """
-
-    def __init__(self, binderlen: int, weight: float = 1.0, min_distance: float = 15.0) -> None:
-        self.binderlen = int(binderlen)
-        self.weight = float(weight)
-        self.min_distance = float(min_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the negative radius of gyration of the binder CA coords.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; the leading ``binderlen`` residues are the binder.
-
-        Returns:
-            The weighted negative radius of gyration of the binder chain.
-        """
-
-        ca = coords[: self.binderlen, 1]
-        centroid = torch.mean(ca, dim=0, keepdim=True)
-        distogram = torch.cdist(ca[None].contiguous(), centroid[None].contiguous(), p=2).squeeze(0)
-        distogram = torch.maximum(torch.full_like(distogram, self.min_distance), distogram)
-        return -self.weight * torch.sqrt(torch.sum(distogram.square()) / ca.shape[0])
-
-
-class DimerRadiusOfGyration(Potential):
-    r"""
-    Radius-of-gyration potential averaged over the two chains of a dimer.
-
-    Args:
-        binderlen: Number of leading residues that form the first chain.
-        weight: Scaling weight on the potential.
-        min_distance: Floor on the per-residue centroid distance.
-    """
-
-    def __init__(self, binderlen: int, weight: float = 1.0, min_distance: float = 15.0) -> None:
-        self.binderlen = int(binderlen)
-        self.weight = float(weight)
-        self.min_distance = float(min_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the mean negative radius of gyration of the two dimer chains.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; split into two chains at ``binderlen``.
-
-        Returns:
-            The mean of the two chains' weighted negative radii of gyration.
-        """
-
-        binder = coords[: self.binderlen]
-        receptor = coords[self.binderlen :]
-        return 0.5 * (
-            BinderRadiusOfGyration(len(binder), self.weight, self.min_distance).compute(binder)
-            + BinderRadiusOfGyration(len(receptor), self.weight, self.min_distance).compute(receptor)
-        )
-
-
-class BinderContacts(Potential):
-    r"""
-    Potential rewarding intra-binder CA-CA contacts.
-
-    Args:
-        binderlen: Number of leading residues that form the binder.
-        weight: Scaling weight on the potential.
-        contact_radius: Softening radius of the contact count.
-        contact_distance: Contact distance threshold.
-    """
-
-    def __init__(
-        self, binderlen: int, weight: float = 1.0, contact_radius: float = 8.0, contact_distance: float = 4.0
-    ) -> None:
-        self.binderlen = int(binderlen)
-        self.weight = float(weight)
-        self.contact_radius = float(contact_radius)
-        self.contact_distance = float(contact_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the weighted count of intra-binder CA-CA contacts.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; the leading ``binderlen`` residues are the binder.
-
-        Returns:
-            The weighted soft count of CA-CA contacts within the binder.
-        """
-
-        ca = coords[: self.binderlen, 1]
-        distogram = torch.cdist(ca[None].contiguous(), ca[None].contiguous(), p=2)
-        return self.weight * contact_count(distogram, self.contact_distance, self.contact_radius).sum()
-
-
-class InterfaceContacts(Potential):
-    r"""
-    Potential rewarding binder-target interface CA-CA contacts.
-
-    Args:
-        binderlen: Number of leading residues that form the binder.
-        weight: Scaling weight on the potential.
-        contact_radius: Softening radius of the contact count.
-        contact_distance: Contact distance threshold.
-    """
-
-    def __init__(
-        self, binderlen: int, weight: float = 1.0, contact_radius: float = 8.0, contact_distance: float = 6.0
-    ) -> None:
-        self.binderlen = int(binderlen)
-        self.weight = float(weight)
-        self.contact_radius = float(contact_radius)
-        self.contact_distance = float(contact_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the weighted count of binder-target interface CA-CA contacts.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; residues split into binder/target at ``binderlen``.
-
-        Returns:
-            The weighted soft count of CA-CA contacts across the binder-target interface.
-        """
-
-        ca_b = coords[: self.binderlen, 1]
-        ca_t = coords[self.binderlen :, 1]
-        distogram = torch.cdist(ca_b[None].contiguous(), ca_t[None].contiguous(), p=2)
-        return self.weight * contact_count(distogram, self.contact_distance, self.contact_radius).sum()
-
-
-class MonomerContacts(Potential):
-    r"""
-    Potential rewarding intra-monomer CA-CA contacts.
-
-    Args:
-        weight: Scaling weight on the potential.
-        contact_radius: Softening radius of the contact count.
-        contact_distance: Contact distance threshold.
-    """
-
-    def __init__(self, weight: float = 1.0, contact_radius: float = 8.0, contact_distance: float = 2.0) -> None:
-        self.weight = float(weight)
-        self.contact_radius = float(contact_radius)
-        self.contact_distance = float(contact_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the weighted count of intra-monomer CA-CA contacts.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; CA is atom index 1.
-
-        Returns:
-            The weighted soft count of CA-CA contacts within the monomer.
-        """
-
-        ca = coords[:, 1]
-        distogram = torch.cdist(ca[None].contiguous(), ca[None].contiguous(), p=2)
-        return self.weight * contact_count(distogram, self.contact_distance, self.contact_radius).sum()
-
-
-class OligomerContacts(Potential):
-    r"""
-    Potential rewarding (or repelling) inter-chain contacts per an oligomer contact matrix.
-
-    Args:
-        contact_matrix: Square symmetric matrix of ``{-1, 0, 1}`` per chain pair (attract/ignore/repel).
-        weight_intra: Weight on intra-chain contacts.
-        weight_inter: Weight on inter-chain contacts.
-        contact_radius: Softening radius of the contact count.
-        contact_distance: Contact distance threshold.
-
-    Raises:
-        ValueError: If the contact matrix is not square, symmetric, or valued in ``{-1, 0, 1}``.
-    """
-
-    def __init__(
-        self,
-        contact_matrix: np.ndarray,
-        weight_intra: float = 1.0,
-        weight_inter: float = 1.0,
-        contact_radius: float = 8.0,
-        contact_distance: float = 2.0,
-    ) -> None:
-        self.contact_matrix = np.asarray(contact_matrix)
-        if self.contact_matrix.ndim != 2 or self.contact_matrix.shape[0] != self.contact_matrix.shape[1]:
-            raise ValueError("contact matrix must be square")
-        if not np.isin(self.contact_matrix.flatten(), [-1, 0, 1]).all():
-            raise ValueError("contact matrix entries must be -1, 0, or 1")
-        if not np.all(self.contact_matrix == self.contact_matrix.T):
-            raise ValueError("contact matrix must be symmetric")
-        self.nchain = self.contact_matrix.shape[0]
-        self.weight_intra = float(weight_intra)
-        self.weight_inter = float(weight_inter)
-        self.contact_radius = float(contact_radius)
-        self.contact_distance = float(contact_distance)
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the signed, weighted inter/intra-chain contact count per the contact matrix.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; ``L`` must split evenly into ``nchain`` chains.
-
-        Returns:
-            The signed, weighted soft contact count summed over all chain pairs (attractive pairs add,
-            repulsive pairs subtract).
-
-        Raises:
-            ValueError: If the design length is not divisible by the number of chains.
-        """
-
-        length = coords.shape[0]
-        if length % self.nchain != 0:
-            raise ValueError("oligomer potential expects equal chain lengths")
-        chain_len = length // self.nchain
-        total = torch.zeros((), dtype=coords.dtype, device=coords.device)
-        for i in range(self.nchain):
-            for j in range(i, self.nchain):
-                contact_type = self.contact_matrix[i, j]
-                if contact_type == 0:
-                    continue
-                ca_i = coords[i * chain_len : (i + 1) * chain_len, 1]
-                ca_j = coords[j * chain_len : (j + 1) * chain_len, 1]
-                distogram = torch.cdist(ca_i[None].contiguous(), ca_j[None].contiguous(), p=2)
-                scalar = self.weight_intra / 2 if i == j else self.weight_inter
-                total = (
-                    total
-                    + contact_count(distogram, self.contact_distance, self.contact_radius).sum()
-                    * float(contact_type)
-                    * scalar
-                )
-        return total
-
-
-class SubstrateContacts(Potential):
-    r"""
-    Ligand-contact potential used by the RFdiffusion enzyme-design examples.
-
-    Transforms the configured substrate atoms into the current motif frame, then attracts non-motif CA atoms
-    toward the substrate while repelling clashes. The substrate atoms and motif frame are wired in by the
-    sampler at initialization.
-
-    Args:
-        weight: Overall scaling weight on the potential.
-        contact_radius: Softening radius of the attraction contact count.
-        contact_distance: Attraction contact distance threshold.
-        attraction_scale: Scaling on the attraction term.
-        repulsion_radius: Radius within which repulsion acts.
-        repulsion_scale: Scaling on the repulsion term.
-        min_repulsion_distance: Floor distance for repulsion.
-        eps: Unused; accepted for interface compatibility.
-    """
-
-    def __init__(
-        self,
-        weight: float = 1.0,
-        contact_radius: float = 8.0,
-        contact_distance: float = 2.0,
-        attraction_scale: float = 1.0,
-        repulsion_radius: float = 5.0,
-        repulsion_scale: float = 2.0,
-        min_repulsion_distance: float = 1.0,
-        eps: float = 1e-6,
-    ) -> None:
-        del eps
-        self.weight = float(weight)
-        self.contact_radius = float(contact_radius)
-        self.contact_distance = float(contact_distance)
-        self.attraction_scale = float(attraction_scale)
-        self.repulsion_radius = float(repulsion_radius)
-        self.repulsion_scale = float(repulsion_scale)
-        self.min_repulsion_distance = float(min_repulsion_distance)
-        self.motif_substrate_atoms: Tensor | None = None
-        self.diffusion_mask: Tensor | None = None
-        self.motif_coords: Tensor | None = None
-        self.motif_frame: Tensor | None = None
-        self.motif_mapping: list[tuple[int, int]] | None = None
-
-    def compute(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the substrate-contact potential (attraction minus clash repulsion), or zero if unwired.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]`; non-motif CA atoms are scored against the substrate.
-
-        Returns:
-            The weighted substrate-contact potential, or a zero scalar when the substrate/motif frame has not
-            been wired in by the sampler.
-        """
-
-        if self.motif_substrate_atoms is None or self.diffusion_mask is None or self.motif_coords is None:
-            return torch.zeros((), dtype=coords.dtype, device=coords.device)
-        self._grab_motif_residues(self.motif_coords.to(device=coords.device, dtype=coords.dtype))
-        if self.motif_frame is None or self.motif_mapping is None:
-            return torch.zeros((), dtype=coords.dtype, device=coords.device)
-        residue_index = torch.tensor([item[0] for item in self.motif_mapping], dtype=torch.long, device=coords.device)
-        atom_index = torch.tensor([item[1] for item in self.motif_mapping], dtype=torch.long, device=coords.device)
-        motif_mask = self.diffusion_mask.to(device=coords.device).bool()
-        new_frame = coords[motif_mask][residue_index, atom_index]
-        affine, translation = recover_affine(self.motif_frame, new_frame)
-        substrate = self.motif_substrate_atoms.to(device=coords.device, dtype=coords.dtype)
-        substrate = substrate @ affine.T + translation
-        diffusion_mask = mask_expand(motif_mask, 1)
-        ca = coords[~diffusion_mask, 1]
-        distogram = torch.cdist(ca[None].contiguous(), substrate[None].contiguous(), p=2)[0]
-        attraction = (
-            -contact_count(torch.min(distogram, dim=-1).values, self.contact_distance, self.contact_radius).sum()
-            * self.attraction_scale
-        )
-        repulsion = poly_repulse(
-            torch.min(distogram, dim=-1).values, self.repulsion_radius, self.repulsion_scale, p=1.5
-        ).sum()
-        return -self.weight * (attraction + repulsion)
-
-    def _grab_motif_residues(self, motif_coords: Tensor) -> None:
-        r"""Select the reference motif frame and its residue/atom mapping used to place the substrate."""
-
-        if motif_coords.shape[0] == 0:
-            self.motif_frame = None
-            self.motif_mapping = None
-            return
-        if motif_coords.shape[0] >= 4:
-            selected = torch.arange(4, device=motif_coords.device)
-            self.motif_frame = motif_coords[selected, 1]
-            self.motif_mapping = [(int(index), 1) for index in selected]
-            return
-        self.motif_frame = motif_coords[0, :4]
-        self.motif_mapping = [(0, atom_idx) for atom_idx in range(4)]
-
-
-IMPLEMENTED_POTENTIALS = {
-    "monomer_ROG": MonomerRadiusOfGyration,
-    "binder_ROG": BinderRadiusOfGyration,
-    "dimer_ROG": DimerRadiusOfGyration,
-    "binder_ncontacts": BinderContacts,
-    "interface_ncontacts": InterfaceContacts,
-    "monomer_contacts": MonomerContacts,
-    "olig_contacts": OligomerContacts,
-    "substrate_contacts": SubstrateContacts,
-}
-
-REQUIRE_BINDERLEN = {
-    "binder_ROG",
-    "dimer_ROG",
-    "binder_ncontacts",
-    "interface_ncontacts",
-}
-
-
-class PotentialManager:
-    r"""
-    Parse, instantiate, and aggregate RFdiffusion guiding potentials.
-
-    Reads the configured potential strings, builds the corresponding
-    [`Potential`][ofoldx.models.rfdiffusion.model.Potential] objects (injecting binder length and
-    oligomer contact matrices as needed), and sums their values and gradient scales during denoising.
-
-    Args:
-        potentials_config: Potential configuration (strings, guide scale, decay, oligomer options).
-        diffuser_config: Diffuser configuration supplying the timestep count.
-        inference_config: Inference configuration supplying the symmetry (for oligomer contacts).
-        binderlen: Number of binder residues, used by binder-specific potentials.
-    """
-
-    def __init__(
-        self,
-        potentials_config: Mapping[str, Any] | object,
-        diffuser_config: Mapping[str, Any] | object,
-        inference_config: Mapping[str, Any] | object,
-        binderlen: int,
-    ) -> None:
-        self.potentials_config = potentials_config
-        self.inference_config = inference_config
-        self.guide_scale = float(_cfg_get(potentials_config, "guide_scale", 10.0))
-        self.guide_decay = str(_cfg_get(potentials_config, "guide_decay", "constant"))
-        settings = []
-        guiding = _cfg_get(potentials_config, "guiding_potentials", None)
-        if guiding is not None:
-            settings = [self.parse_potential_string(value) for value in guiding]
-        if binderlen > 0:
-            for setting in settings:
-                if setting["type"] in REQUIRE_BINDERLEN:
-                    setting["binderlen"] = binderlen
-        self.potentials_to_apply = self.initialize_all_potentials(settings)
-        self.num_timesteps = int(_cfg_get(diffuser_config, "num_timesteps", 50))
-
-    def is_empty(self) -> bool:
-        r"""Return whether no guiding potentials are configured."""
-
-        return len(self.potentials_to_apply) == 0
-
-    def parse_potential_string(self, potstr: str) -> dict[str, Any]:
-        r"""
-        Parse one terse ``"key:value,..."`` potential string into a constructor-kwargs dict.
-
-        Args:
-            potstr: A potential specification string.
-
-        Returns:
-            A settings dict with the house-vocabulary keys and float-coerced values.
-        """
-
-        raw = {entry.split(":")[0]: entry.split(":")[1] for entry in potstr.split(",")}
-        setting: dict[str, Any] = {_POTENTIAL_KWARG_RENAMES.get(key, key): value for key, value in raw.items()}
-        for key, value in list(setting.items()):
-            if key != "type":
-                setting[key] = float(value)
-        return setting
-
-    def initialize_all_potentials(self, settings: Sequence[dict[str, Any]]) -> list[Potential]:
-        r"""
-        Instantiate the configured potentials from parsed settings.
-
-        Args:
-            settings: Parsed potential settings dicts.
-
-        Returns:
-            The list of instantiated [`Potential`][ofoldx.models.rfdiffusion.model.Potential] objects.
-
-        Raises:
-            ValueError: If a setting names an unimplemented potential.
-        """
-
-        to_apply: list[Potential] = []
-        for setting in settings:
-            potential_type = setting["type"]
-            if potential_type not in IMPLEMENTED_POTENTIALS:
-                raise ValueError(f"unknown RFdiffusion potential {potential_type!r}")
-            kwargs = {key: value for key, value in setting.items() if key != "type"}
-            symmetry = _cfg_get(self.inference_config, "symmetry", None)
-            if symmetry and potential_type == "olig_contacts":
-                nchain = calc_nchains(str(symmetry), components=1)
-                kwargs["contact_matrix"] = make_contact_matrix(
-                    nchain,
-                    intra_all=bool(_cfg_get(self.potentials_config, "olig_intra_all", False)),
-                    inter_all=bool(_cfg_get(self.potentials_config, "olig_inter_all", False)),
-                    contact_string=_cfg_get(self.potentials_config, "olig_custom_contact", None),
-                )
-            to_apply.append(IMPLEMENTED_POTENTIALS[potential_type](**kwargs))
-        return to_apply
-
-    def compute_all_potentials(self, coords: Tensor) -> Tensor:
-        r"""
-        Return the summed value of all configured potentials for backbone ``coords``.
-
-        Args:
-            coords: Backbone atom coordinates `[L, A, 3]` passed to each registered potential.
-
-        Returns:
-            The sum of every configured potential's value, or a zero scalar when none are configured.
-        """
-
-        if not self.potentials_to_apply:
-            return torch.zeros((), dtype=coords.dtype, device=coords.device)
-        return torch.stack([potential.compute(coords) for potential in self.potentials_to_apply]).sum()
-
-    def get_guide_scale(self, t: int) -> float:
-        r"""
-        Return the guidance gradient scale at timestep ``t`` per the configured decay.
-
-        Args:
-            t: Current diffusion timestep; scaled against ``num_timesteps`` for the non-constant decays.
-
-        Returns:
-            The guidance gradient scale to multiply the potential gradient by at timestep ``t``.
-
-        Raises:
-            ValueError: If the configured guide decay is unknown.
-        """
-
-        schedules = {
-            "constant": lambda t_value: self.guide_scale,
-            "linear": lambda t_value: t_value / self.num_timesteps * self.guide_scale,
-            "quadratic": lambda t_value: t_value**2 / self.num_timesteps**2 * self.guide_scale,
-            "cubic": lambda t_value: t_value**3 / self.num_timesteps**3 * self.guide_scale,
-        }
-        if self.guide_decay not in schedules:
-            raise ValueError(f"unknown potential guide decay {self.guide_decay!r}")
-        return float(schedules[self.guide_decay](t))
-
-
-def make_contact_matrix(
-    nchain: int,
-    *,
-    intra_all: bool | None = False,
-    inter_all: bool | None = False,
-    contact_string: str | None = None,
-) -> np.ndarray:
-    r"""
-    Build the symmetric oligomer contact matrix from the intra/inter flags and a custom contact spec.
-
-    Args:
-        nchain: Number of chains.
-        intra_all: Whether every chain contacts itself.
-        inter_all: Whether every chain pair contacts.
-        contact_string: Comma-separated ``"A&B"`` (attract) / ``"A!B"`` (repel) chain-pair specs.
-
-    Returns:
-        A `[nchain, nchain]` matrix valued in ``{-1, 0, 1}``.
-
-    Raises:
-        ValueError: If a contact spec is malformed or uses an unknown operator.
-    """
-
-    contacts = np.zeros((nchain, nchain), dtype=float)
-    if intra_all:
-        contacts[np.arange(nchain), np.arange(nchain)] = 1
-    if inter_all:
-        contacts[~np.eye(nchain, dtype=bool)] = 1
-    if contact_string is not None:
-        alphabet = {letter: idx for idx, letter in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}
-        for contact in contact_string.split(","):
-            if len(contact) != 3:
-                raise ValueError(f"invalid oligomer contact spec {contact!r}")
-            i, j = alphabet[contact[0]], alphabet[contact[2]]
-            if contact[1] == "!":
-                contacts[i, j] = contacts[j, i] = -1
-            elif contact[1] == "&":
-                contacts[i, j] = contacts[j, i] = 1
-            else:
-                raise ValueError(f"invalid oligomer contact operator {contact[1]!r}")
-    return contacts
-
-
-def calc_nchains(symbol: str, components: int = 1) -> int:
-    r"""
-    Return the number of chains implied by a symmetry symbol.
-
-    Args:
-        symbol: A symmetry symbol (e.g. `"c3"`, `"d2"`, `"tetrahedral"`).
-        components: Multiplier for multi-component assemblies.
-
-    Returns:
-        The total number of chains.
-
-    Raises:
-        RuntimeError: If the symmetry symbol is unrecognized.
-    """
-
-    lowered = symbol.lower()
-    if lowered.startswith("c"):
-        return int(lowered[1:]) * components
-    if lowered.startswith("d"):
-        return 2 * int(lowered[1:]) * components
-    if lowered.startswith("t"):
-        return 12 * components
-    if lowered.startswith("o"):
-        return 24 * components
-    if lowered.startswith("i"):
-        return 60 * components
-    raise RuntimeError(f"unknown symmetry symbol {symbol!r}")
-
-
-# Upstream RFdiffusion ``guiding_potentials`` config strings still use the terse tokens
-# (e.g. "type:substrate_contacts,r_0:8,d_0:2,s:1"); map them onto the spelled-out house
-# constructor kwargs so external configs keep working (same role as convert.py's key map).
-_POTENTIAL_KWARG_RENAMES = {
-    "d_0": "contact_distance",
-    "r_0": "contact_radius",
-    "s": "attraction_scale",
-    "rep_r_0": "repulsion_radius",
-    "rep_s": "repulsion_scale",
-    "rep_r_min": "min_repulsion_distance",
-    "min_dist": "min_distance",
-}
-
-
-def contact_count(distogram: Tensor, contact_distance: float, contact_radius: float) -> Tensor:
-    r"""
-    Return the soft (differentiable) contact count of a distance map with a smooth cutoff.
-
-    Args:
-        distogram: Pairwise distance map; any shape.
-        contact_distance: Distance at which a pair is counted as a full contact.
-        contact_radius: Width of the smooth transition around ``contact_distance``.
-
-    Returns:
-        The soft contact indicator per pair, shaped like ``distogram`` (near 1 inside the cutoff, near 0
-        outside).
-    """
-
-    divide_by = (distogram - contact_distance) / contact_radius
-    numerator = torch.pow(divide_by, 6)
-    denominator = torch.pow(divide_by, 12)
-    return (1 - numerator) / (1 - denominator).clamp_min(1e-8)
-
-
-def poly_repulse(distogram: Tensor, repulsion_radius: float, repulsion_scale: float, p: float = 1.0) -> Tensor:
-    r"""
-    Return a polynomial short-range repulsion penalty for distances below ``repulsion_radius``.
-
-    Args:
-        distogram: Pairwise distance map; any shape.
-        repulsion_radius: Distance below which the repulsion turns on.
-        repulsion_scale: Overall strength of the repulsion.
-        p: Polynomial exponent controlling how sharply the penalty grows toward zero distance.
-
-    Returns:
-        The per-pair repulsion penalty, shaped like ``distogram`` (zero at or beyond ``repulsion_radius``).
-    """
-
-    a = repulsion_scale / (p * repulsion_radius ** (p - 1))
-    return (distogram < repulsion_radius) * a * torch.abs(repulsion_radius - distogram) ** p * repulsion_scale
-
-
-def recover_affine(frame_from: Tensor, frame_to: Tensor) -> tuple[Tensor, Tensor]:
-    r"""
-    Least-squares recover the affine ``(rotation, translation)`` mapping ``frame_from`` onto ``frame_to``.
-
-    Args:
-        frame_from: Source points `[N, 3]` defining the reference frame.
-        frame_to: Corresponding target points `[N, 3]` the source is mapped onto.
-
-    Returns:
-        A tuple ``(rotation, translation)`` with the `[3, 3]` linear map and `[3]` offset.
-    """
-
-    ones = torch.ones((frame_from.shape[0], 1), dtype=frame_from.dtype, device=frame_from.device)
-    source = torch.cat((frame_from, ones), dim=-1)
-    transform = torch.linalg.lstsq(source, frame_to).solution
-    return transform[:3].T, transform[3]
-
-
-def mask_expand(mask: Tensor, n: int = 1) -> Tensor:
-    r"""
-    Dilate a boolean ``mask`` by ``n`` positions on each side (set neighbors of true entries true).
-
-    Args:
-        mask: One-dimensional boolean mask `[L]`.
-        n: Number of positions to expand each true entry by on either side.
-
-    Returns:
-        The dilated boolean mask `[L]`.
-    """
-
-    out = mask.clone()
-    for idx in torch.where(mask)[0]:
-        start = max(int(idx) - n, 0)
-        stop = min(int(idx) + n + 1, len(mask))
-        out[start:stop] = True
-    return out
-
-
-class ContigMap:
-    r"""
-    Resolve RFdiffusion contig strings into reference, output, and RF-relative residue indices.
-
-    Expands a contig specification (fixed motif segments interleaved with variable-length designed gaps) into
-    per-residue reference PDB indices, output design indices, and RF-internal residue numbering, plus the
-    sequence- and structure-inpainting masks. Can also be built directly from explicit index lists.
-
-    Args:
-        parsed_pdb: Parsed target dict (with ``pdb_idx``), or `False` when none is available.
-        contigs: Contig strings; required unless explicit index lists are given.
-        inpaint_seq: Sequence-inpainting residue spans.
-        inpaint_str: Structure-inpainting residue spans.
-        length: Optional total-length spec constraining the sampled contigs.
-        reference_index: Explicit reference PDB indices (bypasses contig sampling).
-        design_index: Explicit output design indices (required with ``reference_index``).
-        residue_index: Explicit RF residue indices (required with ``reference_index``).
-        inpaint_seq_tensor: Precomputed sequence-inpaint mask overriding ``inpaint_seq``.
-        inpaint_str_tensor: Precomputed structure-inpaint mask overriding ``inpaint_str``.
-        topo: Whether all blocks are treated as topology (receptor) blocks.
-        provide_seq: Residue spans whose sequence is provided (unmasked).
-        inpaint_str_strand: Structure-inpaint spans forced to strand.
-        inpaint_str_helix: Structure-inpaint spans forced to helix.
-        inpaint_str_loop: Structure-inpaint spans forced to loop.
-
-    Raises:
-        ValueError: If neither contigs nor a complete explicit index mapping is given, or the specification is
-            internally inconsistent.
-    """
-
-    chain_order = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-    def __init__(
-        self,
-        parsed_pdb: Mapping[str, Any] | bool,
-        contigs: Sequence[str] | None = None,
-        inpaint_seq: Sequence[str] | None = None,
-        inpaint_str: Sequence[str] | None = None,
-        length: str | None = None,
-        reference_index: Sequence[PdbIndex] | None = None,
-        design_index: Sequence[PdbIndex] | None = None,
-        residue_index: Sequence[int] | None = None,
-        inpaint_seq_tensor: np.ndarray | None = None,
-        inpaint_str_tensor: np.ndarray | None = None,
-        topo: bool = False,
-        provide_seq: Sequence[str] | None = None,
-        inpaint_str_strand: Sequence[str] | None = None,
-        inpaint_str_helix: Sequence[str] | None = None,
-        inpaint_str_loop: Sequence[str] | None = None,
-    ) -> None:
-        if contigs is None and reference_index is None:
-            raise ValueError("must specify either contigs or explicit reference_index/design_index/residue_index")
-        if any(value is not None for value in (residue_index, design_index, reference_index)) and not all(
-            value is not None for value in (residue_index, design_index, reference_index)
-        ):
-            raise ValueError("explicit contig mapping requires reference_index, design_index, and residue_index")
-
-        # Imported lazily: the processor pulls in the processor package, which would cycle at load time.
-        from .processor import _parse_length, _parse_mask_segments
-
-        self.parsed_pdb = parsed_pdb
-        self.topo = topo
-        self.length = _parse_length(length)
-        self.contigs = list(contigs) if contigs is not None else None
-        self.inpaint_seq_arg = _parse_mask_segments(inpaint_seq)
-        self.inpaint_str_arg = _parse_mask_segments(inpaint_str)
-        self.inpaint_str_helix_arg = _parse_mask_segments(inpaint_str_helix)
-        self.inpaint_str_strand_arg = _parse_mask_segments(inpaint_str_strand)
-        self.inpaint_str_loop_arg = _parse_mask_segments(inpaint_str_loop)
-
-        if reference_index is None:
-            if self.contigs is None:
-                raise ValueError("contigs cannot be None when reference_index is not provided")
-            self.sampled_mask, self.contig_length, self.n_inpaint_chains = self.get_sampled_mask()
-            self.receptor_chain = self.chain_order[self.n_inpaint_chains]
-            (
-                self.receptor,
-                self.receptor_design,
-                self.receptor_residue_index,
-                self.inpaint,
-                self.inpaint_design,
-                self.inpaint_residue_index,
-                self.sampled_mask_length_bound,
-            ) = self.expand_sampled_mask()
-            self.reference = self.inpaint + self.receptor
-            self.design = self.inpaint_design + self.receptor_design
-            self.residue_index = self.inpaint_residue_index + self.receptor_residue_index
-        else:
-            self.reference = list(reference_index)
-            self.design = list(design_index or [])
-            self.residue_index = list(residue_index or [])
-            self.sampled_mask = []
-            self.contig_length = len(self.reference)
-            self.n_inpaint_chains = 1
-            self.receptor = []
-            self.receptor_design = []
-            self.receptor_residue_index = []
-            self.inpaint = list(self.reference)
-            self.inpaint_design = list(self.design)
-            self.inpaint_residue_index = list(self.residue_index)
-            self.sampled_mask_length_bound = _bounds_from_design(self.design)
-
-        self.mask_1d = [residue != ("_", "_") for residue in self.reference]
-        if inpaint_seq_tensor is not None:
-            self.inpaint_seq = inpaint_seq_tensor
-        elif self.inpaint_seq_arg is None:
-            self.inpaint_seq = np.asarray(self.mask_1d, dtype=bool)
-        else:
-            self.inpaint_seq = self.get_inpaint_seq_str(self.inpaint_seq_arg)
-
-        if inpaint_str_tensor is not None:
-            self.inpaint_str = inpaint_str_tensor
-        elif self.inpaint_str_arg is None:
-            self.inpaint_str = np.asarray(self.mask_1d, dtype=bool)
-        else:
-            self.inpaint_str = self.get_inpaint_seq_str(self.inpaint_str_arg)
-
-        (
-            self.reference_index0,
-            self.design_index0,
-            self.design_index0_receptor,
-        ) = self.get_index0()
-        self.contig_reference_pdb_index = [value for value in self.reference if value != ("_", "_")]
-
-        if provide_seq is not None:
-            for span in provide_seq:
-                if "-" in span:
-                    start, stop = span.split("-", maxsplit=1)
-                    self.inpaint_seq[int(start) : int(stop) + 1] = True
-                else:
-                    self.inpaint_seq[int(span)] = True
-
-        if any(arg is not None for arg in (inpaint_str_helix, inpaint_str_strand, inpaint_str_loop)):
-            self.ss_spec: dict[str, np.ndarray] = {}
-            for key, value in (
-                ("helix", self.inpaint_str_helix_arg),
-                ("strand", self.inpaint_str_strand_arg),
-                ("loop", self.inpaint_str_loop_arg),
-            ):
-                self.ss_spec[key] = (
-                    ~self.get_inpaint_seq_str(value, ss=True)
-                    if value is not None
-                    else np.zeros(len(self.inpaint_seq), dtype=bool)
-                )
-            for key, mask in self.ss_spec.items():
-                if np.sum(mask * self.inpaint_str) != 0:
-                    raise ValueError(f"secondary-structure mask {key!r} includes residues not structure-masked")
-            stack = np.vstack(list(self.ss_spec.values()))
-            if np.max(np.sum(stack, axis=0)) > 1:
-                raise ValueError("secondary-structure masks overlap")
-
-    def get_sampled_mask(self) -> tuple[list[str], int, int]:
-        r"""
-        Sample concrete lengths for the variable contig segments until the length constraint is met.
-
-        Returns:
-            A tuple ``(sampled_mask, contig_length, n_inpaint_chains)`` of the resolved contig strings, the
-            total designed length, and the number of inpaint chains.
-
-        Raises:
-            ValueError: If no length-compatible sample is found, or contigs are unset.
-        """
-
-        if self.contigs is None:
-            raise ValueError("contigs are required")
-        for _attempt in range(100000):
-            inpaint_chains = 0
-            contig_list = self.contigs[0].strip().split()
-            sampled_mask: list[str] = []
-            sampled_mask_length = 0
-            if contig_list and all(part[0].isalpha() for part in contig_list[-1].split("/")):
-                contig_list[-1] = f"{contig_list[-1]}/0"
-            for contig in contig_list:
-                parts = contig.split("/")
-                is_receptor = (all(part[0].isalpha() for part in parts[:-1]) and parts[-1] == "0") or self.topo
-                if is_receptor:
-                    sampled_mask.append(contig)
-                    continue
-                inpaint_chains += 1
-                sampled_parts: list[str] = []
-                for part in parts:
-                    if part[0].isalpha():
-                        sampled_parts.append(part)
-                        sampled_mask_length += _contig_part_length(part)
-                    elif part == "0":
-                        sampled_parts.append("0")
-                    else:
-                        sampled_length = _sample_length_part(part)
-                        sampled_parts.append(f"{sampled_length}-{sampled_length}")
-                        sampled_mask_length += sampled_length
-                sampled_mask.append("/".join(sampled_parts))
-            if self.length is None or (sampled_mask_length >= self.length[0] and sampled_mask_length < self.length[1]):
-                return sampled_mask, sampled_mask_length, inpaint_chains
-        raise ValueError("contig string incompatible with length range")
-
-    def expand_sampled_mask(
-        self,
-    ) -> tuple[list[PdbIndex], list[PdbIndex], list[int], list[PdbIndex], list[PdbIndex], list[int], list[int]]:
-        r"""
-        Expand the sampled contig mask into per-residue reference/design indices and chain bounds.
-
-        Returns:
-            A 7-tuple ``(receptor, receptor_design, receptor_residue_index, inpaint, inpaint_design,
-            inpaint_residue_index, bounds)`` describing the receptor and designed chains.
-
-        Raises:
-            ValueError: If a fragmented receptor block spans multiple chains or is out of PDB order.
-        """
-
-        receptor: list[PdbIndex] = []
-        inpaint: list[PdbIndex] = []
-        receptor_design: list[PdbIndex] = []
-        inpaint_design: list[PdbIndex] = []
-        receptor_idx = 1
-        inpaint_idx = 1
-        inpaint_chain_idx = -1
-        receptor_chain_break: list[tuple[int, int]] = []
-        inpaint_chain_break: list[tuple[int, int]] = []
-        receptor_bounds: list[int] = []
-        inpaint_bounds: list[int] = []
-        for contig in self.sampled_mask:
-            parts = contig.split("/")
-            is_receptor = (all(part[0].isalpha() for part in parts[:-1]) and parts[-1] == "0") or self.topo
-            if is_receptor:
-                subcontigs = parts[:-1]
-                if not subcontigs:
-                    continue
-                if not all(part[0] == subcontigs[0][0] for part in subcontigs):
-                    raise ValueError("fragmented receptor blocks must derive from one chain")
-                starts = [int(part.split("-")[0][1:]) for part in subcontigs]
-                if any(first >= second for first, second in zip(starts, starts[1:], strict=False)):
-                    raise ValueError("receptor fragments from one chain must be in ascending PDB order")
-                for idx, part in enumerate(subcontigs):
-                    ref_to_add = _expand_residue_range(part)
-                    receptor.extend(ref_to_add)
-                    receptor_design.extend(
-                        (self.receptor_chain, value) for value in range(receptor_idx, receptor_idx + len(ref_to_add))
-                    )
-                    receptor_idx += len(ref_to_add)
-                    if idx != len(subcontigs) - 1:
-                        jump = int(subcontigs[idx + 1].split("-")[0][1:]) - int(part.split("-")[1]) - 1
-                        receptor_chain_break.append((receptor_idx - 1, jump))
-                    else:
-                        receptor_chain_break.append((receptor_idx - 1, 200))
-                receptor_bounds.append(len(receptor))
-            else:
-                inpaint_chain_idx += 1
-                for part in parts:
-                    if part[0].isalpha():
-                        ref_to_add = _expand_residue_range(part)
-                        inpaint.extend(ref_to_add)
-                        inpaint_design.extend(
-                            (self.chain_order[inpaint_chain_idx], value)
-                            for value in range(inpaint_idx, inpaint_idx + len(ref_to_add))
-                        )
-                        inpaint_idx += len(ref_to_add)
-                    else:
-                        length = int(part.split("-")[0])
-                        inpaint.extend(cast(list[PdbIndex], [("_", "_")] * length))
-                        inpaint_design.extend(
-                            (self.chain_order[inpaint_chain_idx], value)
-                            for value in range(inpaint_idx, inpaint_idx + length)
-                        )
-                        inpaint_idx += length
-                inpaint_chain_break.append((inpaint_idx - 1, 200))
-                inpaint_bounds.append(len(inpaint))
-
-        if self.topo or not inpaint_design:
-            receptor_design = [(chain, residue) for chain, residue in receptor_design]
-        else:
-            receptor_design = [(chain, residue + inpaint_design[-1][1]) for chain, residue in receptor_design]
-        inpaint_residue_index = np.arange(0, len(inpaint))
-        receptor_residue_index = np.arange(len(inpaint) + 200, len(inpaint) + len(receptor) + 200)
-        for ch_break in inpaint_chain_break[:-1]:
-            receptor_residue_index[:] += 200
-            inpaint_residue_index[ch_break[0] :] += ch_break[1]
-        for ch_break in receptor_chain_break[:-1]:
-            receptor_residue_index[ch_break[0] :] += ch_break[1]
-        bounds = list(inpaint_bounds)
-        inpaint_last_bound = inpaint_bounds[-1] if inpaint_bounds else 0
-        bounds.extend(value + inpaint_last_bound for value in receptor_bounds)
-        return (
-            receptor,
-            receptor_design,
-            receptor_residue_index.tolist(),
-            inpaint,
-            inpaint_design,
-            inpaint_residue_index.tolist(),
-            bounds,
-        )
-
-    def get_inpaint_seq_str(self, inpaint_s: Sequence[str], *, ss: bool = False) -> np.ndarray:
-        r"""
-        Build a boolean mask marking residues named in the inpaint spans as inpainted (false).
-
-        Args:
-            inpaint_s: Residue spans (single residues or ranges) to mask.
-            ss: Whether to start from an all-true mask (secondary-structure spec) rather than ``mask_1d``.
-
-        Returns:
-            A boolean mask over the reference residues.
-        """
-
-        mask = np.ones(len(self.mask_1d), dtype=bool) if ss else np.asarray(self.mask_1d, dtype=bool)
-        residues: list[PdbIndex] = []
-        for item in inpaint_s:
-            if "-" in item:
-                residues.extend(_expand_residue_range(item))
-            else:
-                residues.append((item[0], int(item[1:])))
-        for residue in residues:
-            if residue in self.reference:
-                mask[self.reference.index(residue)] = False
-        return np.asarray(mask, dtype=bool)
-
-    def get_index0(self) -> tuple[list[int], list[int], list[int]]:
-        r"""
-        Compute the zero-based reference/design index mappings against the parsed PDB order.
-
-        Returns:
-            A tuple ``(reference_index0, design_index0, design_index0_receptor)`` of the zero-based indices.
-
-        Raises:
-            ValueError: If a referenced residue is absent from the parsed PDB.
-        """
-
-        reference_index0: list[int] = []
-        design_index0: list[int] = []
-        design_index0_receptor: list[int] = []
-        pdb_idx: list[PdbIndex] = []
-        if isinstance(self.parsed_pdb, Mapping):
-            pdb_idx = cast(list[PdbIndex], list(self.parsed_pdb["pdb_idx"]))
-        for idx, value in enumerate(self.reference):
-            if value != ("_", "_"):
-                if value not in pdb_idx:
-                    raise ValueError(f"{value} is not in pdb file")
-                design_index0.append(idx)
-                reference_index0.append(pdb_idx.index(value))
-        for idx, value in enumerate(self.receptor):
-            if value != ("_", "_"):
-                design_index0_receptor.append(idx)
-        return (
-            reference_index0,
-            design_index0,
-            design_index0_receptor,
-        )
-
-
-def _contig_part_length(part: str) -> int:
-    r"""Return the residue count of a fixed contig part (single residue or ``<chain><start>-<stop>`` range)."""
-
-    if "-" not in part:
-        return 1
-    start, stop = part.split("-", maxsplit=1)
-    return int(stop) - int(start[1:]) + 1
-
-
-def _sample_length_part(part: str) -> int:
-    r"""Sample a concrete length for a variable contig part (a single value or a ``low-high`` range)."""
-
-    if "-" not in part:
-        return int(part)
-    start, stop = part.split("-", maxsplit=1)
-    return random.randint(int(start), int(stop))
-
-
-def _expand_residue_range(part: str) -> list[PdbIndex]:
-    r"""Expand a fixed contig part into its list of ``(chain, residue_number)`` PDB indices."""
-
-    if "-" not in part:
-        return [(part[0], int(part[1:]))]
-    start, stop = part.split("-", maxsplit=1)
-    return [(part[0], residue) for residue in np.arange(int(start[1:]), int(stop) + 1)]
-
-
-def _bounds_from_design(hal: Sequence[PdbIndex]) -> list[int]:
-    r"""Return the per-chain end offsets (chain boundaries) of an explicit design index list."""
-
-    if not hal:
-        return [0]
-    bounds: list[int] = []
-    previous_chain = hal[0][0]
-    for idx, (chain, _residue) in enumerate(hal, start=1):
-        if chain != previous_chain:
-            bounds.append(idx - 1)
-            previous_chain = chain
-    bounds.append(len(hal))
-    return bounds
-
-
-class BlockAdjacency:
-    r"""
-    Sample and reshape secondary-structure and block-adjacency tensors from scaffold files.
-
-    Loads precomputed ``*_ss.pt`` / ``*_adj.pt`` scaffold tensors, expands their loops by random insertions and
-    N/C-terminal extensions, and masks them per the configured erosion, producing the SS/adjacency conditioning
-    for scaffold-guided sampling.
-
-    Args:
-        conf: Configuration object holding the ``scaffoldguided`` (and ``inference``) sub-config.
-        num_designs: Number of designs to generate (used for deterministic seeding).
-
-    Raises:
-        ValueError: If ``scaffold_list`` is neither a list nor a `.txt` path, or masked-loop settings conflict
-            with sampled extensions.
-    """
-
-    def __init__(self, conf: Mapping[str, Any] | object, num_designs: int) -> None:
-        self.conf = conf
-        scaffoldguided = _cfg_get(conf, "scaffoldguided", conf)
-        scaffold_list = _cfg_get(scaffoldguided, "scaffold_list", None)
-        if scaffold_list is not None:
-            if isinstance(scaffold_list, list):
-                self.scaffold_list = scaffold_list
-            elif str(scaffold_list).endswith(".txt"):
-                with open(scaffold_list) as handle:
-                    self.scaffold_list = [line.strip() for line in handle if line.strip()]
-            else:
-                raise ValueError("scaffold_list must be a list or .txt path")
-        else:
-            scaffold_dir = _cfg_get(scaffoldguided, "scaffold_dir", None)
-            self.scaffold_list = [os.path.split(path)[1][:-6] for path in glob.glob(f"{scaffold_dir}/*_ss.pt")]
-            self.scaffold_list.sort()
-        self.scaffold_dir = _cfg_get(scaffoldguided, "scaffold_dir", None)
-        # Imported lazily: the processor pulls in the processor package, which would cycle at load time.
-        from .processor import _parse_range
-
-        self.sampled_insertion = _parse_range(_cfg_get(scaffoldguided, "sampled_insertion", 0))
-        self.sampled_N = _parse_range(_cfg_get(scaffoldguided, "sampled_N", 0))
-        self.sampled_C = _parse_range(_cfg_get(scaffoldguided, "sampled_C", 0))
-        self.ss_mask = int(_cfg_get(scaffoldguided, "ss_mask", 0))
-        self.systematic = bool(_cfg_get(scaffoldguided, "systematic", False))
-        self.num_designs = int(num_designs)
-        self.num_completed = 0
-        self.item_n = 0
-        self.mask_loops = bool(_cfg_get(scaffoldguided, "mask_loops", True))
-        if not self.mask_loops and (
-            self.sampled_N != [0, 0] or self.sampled_C != [0, 0] or self.sampled_insertion != [0, 0]
-        ):
-            raise ValueError("cannot add sampled length when mask_loops is false")
-
-    def get_ss_adj(self, item: str) -> tuple[Tensor, Tensor]:
-        r"""
-        Load the ``(ss, adj)`` secondary-structure and adjacency tensors for a scaffold ``item``.
-
-        Args:
-            item: Scaffold file stem; the ``_ss.pt`` and ``_adj.pt`` tensors are loaded from ``scaffold_dir``.
-
-        Returns:
-            The ``(ss, adj)`` secondary-structure and block-adjacency tensors.
-        """
-
-        ss = torch.load(os.path.join(self.scaffold_dir, f"{item.split('.')[0]}_ss.pt"), weights_only=True)
-        adj = torch.load(os.path.join(self.scaffold_dir, f"{item.split('.')[0]}_adj.pt"), weights_only=True)
-        return ss, adj
-
-    def mask_to_segments(self, mask: Tensor) -> list[tuple[str, int]]:
-        r"""
-        Split a loop/SS boolean ``mask`` into a list of ``(kind, length)`` runs (``"ss"`` or ``"loop"``).
-
-        Args:
-            mask: Per-residue boolean mask `[L]`; true marks loop residues, false marks structured (SS) ones.
-
-        Returns:
-            Consecutive runs as ``(kind, length)`` pairs, ``kind`` being ``"loop"`` or ``"ss"``.
-        """
-
-        segments: list[tuple[str, int]] = []
-        begin = 0
-        for idx in range(1, mask.shape[0]):
-            if mask[idx] != mask[idx - 1]:
-                segments.append(("loop" if bool(mask[idx - 1]) else "ss", idx - begin))
-                begin = idx
-        segments.append(("loop" if bool(mask[-1]) else "ss", mask.shape[0] - begin))
-        return segments
-
-    def expand_mask(self, mask: Tensor, segments: list[tuple[str, int]]) -> Tensor:
-        r"""
-        Expand the scaffold mask with random terminal extensions and loop insertions.
-
-        Args:
-            mask: The original loop/SS boolean mask.
-            segments: The ``(kind, length)`` runs from `mask_to_segments`.
-
-        Returns:
-            The expanded boolean mask.
-
-        Raises:
-            ValueError: If expansion drops secondary-structure residues.
-        """
-
-        N_add = random.randint(self.sampled_N[0], self.sampled_N[1])
-        C_add = random.randint(self.sampled_C[0], self.sampled_C[1])
-        output: list[bool] = [False] * N_add
-        for kind, length in segments:
-            if kind == "ss":
-                output.extend([True] * length)
-            else:
-                insertion = random.randint(self.sampled_insertion[0], self.sampled_insertion[1])
-                output.extend([False] * (length + insertion))
-        output.extend([False] * C_add)
-        expanded = torch.tensor(output, dtype=torch.bool)
-        if int(expanded.sum()) != int((~mask).sum()):
-            raise ValueError("expanded scaffold mask lost secondary-structure residues")
-        return expanded
-
-    def expand_ss(self, ss: Tensor, adj: Tensor, mask: Tensor, expanded_mask: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Scatter the secondary-structure and adjacency tensors into the expanded (extended) layout.
-
-        Args:
-            ss: Original per-residue secondary-structure labels.
-            adj: Original block-adjacency matrix.
-            mask: Original loop/SS mask.
-            expanded_mask: The expanded mask marking SS positions in the new layout.
-
-        Returns:
-            The expanded ``(ss, adj)`` tensors.
-        """
-
-        ss_out = torch.ones(expanded_mask.shape[0], dtype=ss.dtype) * 3
-        adj_out = torch.zeros((expanded_mask.shape[0], expanded_mask.shape[0]), dtype=adj.dtype)
-        ss_out[expanded_mask] = ss[~mask]
-        expanded_mask_2d = torch.ones_like(adj_out, dtype=torch.bool)
-        expanded_mask_2d[~expanded_mask] = False
-        expanded_mask_2d[:, ~expanded_mask] = False
-        mask_2d = torch.ones_like(adj, dtype=torch.bool)
-        mask_2d[mask] = False
-        mask_2d[:, mask] = False
-        adj_out[expanded_mask_2d] = adj[mask_2d]
-        return ss_out, adj_out.reshape((expanded_mask.shape[0], expanded_mask.shape[0]))
-
-    def mask_ss_adj(self, ss: Tensor, adj: Tensor, expanded_mask: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Erode secondary-structure segment ends and mask loop entries in the SS/adjacency tensors.
-
-        Args:
-            ss: Expanded secondary-structure labels (modified in place).
-            adj: Expanded adjacency matrix (modified in place).
-            expanded_mask: The expanded SS mask.
-
-        Returns:
-            The masked ``(ss, adj)`` tensors.
-        """
-
-        original = expanded_mask.clone()
-        if self.ss_mask > 0:
-            for idx in range(1, self.ss_mask + 1):
-                expanded_mask[idx:] &= original[:-idx]
-                expanded_mask[:-idx] &= original[idx:]
-        if self.mask_loops:
-            ss[~expanded_mask] = 3
-            adj[~expanded_mask] = 0
-            adj[:, ~expanded_mask] = 0
-        adj[~expanded_mask] = 2
-        adj[:, ~expanded_mask] = 2
-        return ss, adj
-
-    def get_scaffold(self) -> tuple[int, Tensor, Tensor]:
-        r"""
-        Sample one scaffold and return its length and conditioning tensors.
-
-        Returns:
-            A tuple ``(length, ss_one_hot, adj)`` of the sampled scaffold length, its one-hot
-            secondary-structure tensor, and its block-adjacency matrix.
-        """
-
-        inference = _cfg_get(self.conf, "inference", self.conf)
-        if bool(_cfg_get(inference, "deterministic", False)):
-            torch.manual_seed(self.num_completed)
-            np.random.seed(self.num_completed)
-            random.seed(self.num_completed)
-        if self.systematic:
-            if self.item_n >= len(self.scaffold_list):
-                self.item_n = 0
-            item = self.scaffold_list[self.item_n]
-            self.item_n += 1
-        else:
-            item = random.choice(self.scaffold_list)
-        ss, adj = self.get_ss_adj(item)
-        mask = torch.where(ss == 2, 1, 0).bool()
-        segments = self.mask_to_segments(mask)
-        expanded_mask = self.expand_mask(mask, segments)
-        ss, adj = self.expand_ss(ss, adj, mask, expanded_mask)
-        ss, adj = self.mask_ss_adj(ss, adj, expanded_mask)
-        self.num_completed += 1
-        return ss.shape[0], F.one_hot(ss.long(), num_classes=4), adj
-
-
-class Target:
-    r"""
-    Target PDB loader and crop helper for scaffold-guided binder design.
-
-    Parses the target PDB, marks its hotspot residues, and optionally crops it to a contig region while
-    preserving the hotspots.
-
-    Args:
-        conf: Configuration object holding ``target_path`` and optional ``contig_crop``.
-        hotspots: Hotspot residue ids as `"<chain><number>"` strings, or `None`.
-    """
-
-    def __init__(self, conf: Mapping[str, Any] | object, hotspots: list[str] | None = None) -> None:
-        from .processor import parse_pdb
-
-        self.pdb = parse_pdb(_cfg_get(conf, "target_path", None), parse_hetatom=True)
-        self.hotspots = [] if hotspots is None else hotspots
-        self.pdb["hotspots"] = np.asarray(
-            [f"{chain}{residue}" in self.hotspots for chain, residue in self.pdb["pdb_idx"]]
-        )
-        contig_crop = _cfg_get(conf, "contig_crop", None)
-        if contig_crop:
-            self.contig_crop(contig_crop)
-
-    def parse_contig(self, contig_crop: list[str]) -> list[list[tuple[str, int]]]:
-        r"""
-        Parse a contig-crop spec into per-contig lists of ``(chain, residue_number)`` indices.
-
-        Args:
-            contig_crop: Contig-crop specification; its first entry is split into space-separated contigs, each a
-                ``/``-joined list of ``<chain><start>-<stop>`` ranges.
-
-        Returns:
-            One list of ``(chain, residue_number)`` pairs per contig.
-        """
-
-        contig_list: list[list[tuple[str, int]]] = []
-        for contig in contig_crop[0].split(" "):
-            residues: list[tuple[str, int]] = []
-            for crop in contig.split("/"):
-                if crop and crop[0].isalpha():
-                    start, stop = crop.split("-", maxsplit=1)
-                    residues.extend((crop[0], int(value)) for value in np.arange(int(start[1:]), int(stop) + 1))
-            contig_list.append(residues)
-        return contig_list
-
-    def contig_crop(self, contig_crop: list[str], *, residue_offset: int = 200) -> None:
-        r"""
-        Crop the loaded target PDB to the residues named in the contig-crop spec, in place.
-
-        Args:
-            contig_crop: The contig-crop specification.
-            residue_offset: Residue-number offset inserted between cropped chains.
-
-        Raises:
-            ValueError: If cropping would drop hotspot residues.
-        """
-
-        for idx, value in enumerate(self.pdb["pdb_idx"]):
-            if idx != 0 and value != self.pdb["pdb_idx"][idx - 1]:
-                self.pdb["idx"][idx:] += residue_offset + idx
-        contig_list = self.parse_contig(contig_crop)
-        for contig in contig_list[1:]:
-            start = int(contig[0][1])
-            self.pdb["idx"][start:] += residue_offset
-        flat = [item for contig in contig_list for item in contig]
-        mask = np.asarray([value in flat for value in self.pdb["pdb_idx"]])
-        if np.sum(self.pdb["hotspots"]) != np.sum(self.pdb["hotspots"][mask]):
-            raise ValueError("supplied hotspot residues are missing from the target contig")
-        for key, value in list(self.pdb.items()):
-            try:
-                self.pdb[key] = value[mask]
-            except Exception:
-                self.pdb[key] = [item for idx, item in enumerate(value) if mask[idx]]
-        self.pdb["crop_mask"] = mask
-
-    def get_target(self) -> dict[str, Any]:
-        r"""Return the (possibly cropped) parsed target PDB dictionary."""
-
-        return self.pdb
-
-
-def ss_from_contig(ss_masks: dict[str, np.ndarray]) -> Tensor:
-    r"""
-    Convert helix/strand/loop boolean masks into RFdiffusion one-hot secondary-structure features.
-
-    Args:
-        ss_masks: Dict with ``"helix"``, ``"strand"``, and ``"loop"`` boolean masks over residues.
-
-    Returns:
-        A one-hot secondary-structure tensor `[L, 4]` (class 3 = unassigned/masked).
-    """
-
-    length = len(ss_masks["helix"])
-    ss = torch.zeros((length, 4), dtype=torch.long)
-    ss[:, 3] = 1
-    for idx, key in enumerate(("helix", "strand", "loop")):
-        mask = torch.as_tensor(ss_masks[key], dtype=torch.bool)
-        ss[mask, idx] = 1
-        ss[mask, 3] = 0
-    return ss
-
-
-_SAVED_GROUPS = {
-    "tetrahedral": "T",
-    "octahedral": "O",
-    "icosahedral": "I",
-}
-
-
-class SymmetryGenerator:
-    r"""
-    Apply RFdiffusion-style cyclic, dihedral, tetrahedral, octahedral, or icosahedral symmetry.
-
-    Replicates the first subunit's coords and sequence onto all symmetry copies each step, and relabels the
-    per-chain residue indices so the symmetric assembly is well-formed. The concrete ``apply_symmetry`` method
-    is chosen at construction from ``global_sym``.
-
-    Args:
-        global_sym: Symmetry symbol (e.g. `"c3"`, `"d2"`, `"tetrahedral"`, `"octahedral"`, `"icosahedral"`,
-            `"t3"`).
-        recenter: Whether to recenter subunits (octahedral placement).
-        radius: Placement radius for polyhedral symmetry.
-        model_only_neighbors: Unused; accepted for interface compatibility.
-
-    Raises:
-        ValueError: If the symmetry symbol is unrecognized or malformed.
-    """
-
-    def __init__(self, global_sym: str, recenter: bool, radius: float, model_only_neighbors: bool = False) -> None:
-        del model_only_neighbors
-        self._recenter = bool(recenter)
-        self._radius = float(radius)
-        symbol = global_sym.lower()
-        if symbol.startswith("c"):
-            if not symbol[1:].isdigit():
-                raise ValueError(f"invalid cyclic symmetry {global_sym!r}")
-            self._init_cyclic(int(symbol[1:]))
-            self.apply_symmetry = self._apply_cyclic
-        elif symbol.startswith("d"):
-            if not symbol[1:].isdigit():
-                raise ValueError(f"invalid dihedral symmetry {global_sym!r}")
-            self._init_group(f"D{int(symbol[1:])}")
-            self.apply_symmetry = self._apply_cyclic
-        elif symbol == "t3":
-            self.sym_rots = [
-                torch.eye(3, dtype=torch.float32),
-                torch.tensor([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]),
-                torch.tensor([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]),
-                torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]),
-            ]
-            self.order = 4
-            self.apply_symmetry = self._apply_cyclic
-        elif symbol in _SAVED_GROUPS:
-            self._init_group(_SAVED_GROUPS[symbol])
-            self.apply_symmetry = self._apply_octahedral if symbol == "octahedral" else self._apply_cyclic
-        else:
-            raise ValueError(f"unrecognized RFdiffusion symmetry {global_sym!r}")
-        self.res_idx_procesing = fn.partial(self._lin_chainbreaks, num_breaks=self.order)
-
-    def _init_cyclic(self, order: int) -> None:
-        r"""Build the ``order`` rotation matrices of a cyclic group about the z-axis."""
-
-        self.sym_rots = [
-            torch.as_tensor(Rotation.from_euler("z", i * 360.0 / order, degrees=True).as_matrix(), dtype=torch.float32)
-            for i in range(order)
-        ]
-        self.order = order
-
-    def _init_group(self, group: str) -> None:
-        r"""Build the rotation matrices of a named point group, with the identity ordered first."""
-
-        matrices = Rotation.create_group(group).as_matrix()
-        identity = np.eye(3)
-        order = list(range(len(matrices)))
-        identity_index = next(
-            (idx for idx, matrix in enumerate(matrices) if np.isclose(((matrix - identity) ** 2).sum(), 0)), 0
-        )
-        order.insert(0, order.pop(identity_index))
-        self.sym_rots = [torch.as_tensor(matrices[idx], dtype=torch.float32) for idx in order]
-        self.order = len(self.sym_rots)
-
-    def _apply_cyclic(self, coords_in: Tensor, seq_in: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Replicate the first subunit onto all symmetry copies by rotation.
-
-        Raises:
-            ValueError: If the sequence length is not divisible by the symmetry order.
-        """
-
-        coords_out = coords_in.clone()
-        seq_out = seq_in.clone()
-        if seq_out.shape[0] % self.order != 0:
-            raise ValueError(f"sequence length must be divisible by symmetry order {self.order}")
-        subunit_len = seq_out.shape[0] // self.order
-        base_coords = coords_out[:subunit_len]
-        base_seq = seq_out[:subunit_len]
-        for idx, rotation in enumerate(self.sym_rots):
-            start = subunit_len * idx
-            stop = subunit_len * (idx + 1)
-            rot = rotation.to(device=coords_in.device, dtype=coords_in.dtype)
-            coords_out[start:stop] = torch.einsum("bnj,kj->bnk", base_coords, rot)
-            seq_out[start:stop] = base_seq
-        return coords_out, seq_out
-
-    def _apply_octahedral(self, coords_in: Tensor, seq_in: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Replicate the first subunit onto octahedral copies, recentering each onto a placement axis.
-
-        Raises:
-            ValueError: If the sequence length is not divisible by the symmetry order.
-        """
-
-        coords_out = coords_in.clone()
-        seq_out = seq_in.clone()
-        if seq_out.shape[0] % self.order != 0:
-            raise ValueError(f"sequence length must be divisible by symmetry order {self.order}")
-        subunit_len = seq_out.shape[0] // self.order
-        base_axis = torch.tensor([self._radius, 0.0, 0.0], dtype=coords_in.dtype, device=coords_in.device)[None]
-        for idx, rotation in enumerate(self.sym_rots):
-            start = subunit_len * idx
-            stop = subunit_len * (idx + 1)
-            rot = rotation.to(device=coords_in.device, dtype=coords_in.dtype)
-            subunit = torch.einsum("bnj,kj->bnk", coords_in[:subunit_len], rot)
-            if self._recenter:
-                center = torch.mean(subunit[:, 1], dim=0)
-                subunit = subunit - center[None, None]
-                rotated_axis = torch.einsum("nj,kj->nk", base_axis, rot)
-                subunit = subunit + rotated_axis[:, None]
-            coords_out[start:stop] = subunit
-            seq_out[start:stop] = seq_in[:subunit_len]
-        return coords_out, seq_out
-
-    def _lin_chainbreaks(self, num_breaks: int, res_idx: Tensor, offset: int | None = None) -> tuple[Tensor, list[str]]:
-        r"""
-        Offset per-subunit residue indices and assign chain labels so subunits form distinct chains.
-
-        Raises:
-            ValueError: If ``res_idx`` is not `(B, L)`.
-        """
-
-        if res_idx.ndim != 2:
-            raise ValueError("residue indices must have shape (B, L)")
-        res_idx = res_idx.clone()
-        subunit_len = res_idx.shape[-1] // num_breaks
-        if offset is None:
-            offset = res_idx.shape[-1]
-        chain_labels = list(string.ascii_uppercase) + [
-            f"{first}{second}" for first in string.ascii_uppercase for second in string.ascii_uppercase
-        ]
-        chain_delimiters: list[str] = []
-        for idx in range(num_breaks):
-            start = subunit_len * idx
-            stop = subunit_len * (idx + 1)
-            chain_delimiters.extend([chain_labels[idx]] * subunit_len)
-            res_idx[:, start:stop] = res_idx[:, start:stop] + offset * (idx + 1)
-        return res_idx, chain_delimiters
-
-
-def seq_to_chars(seq: Tensor | list[int] | tuple[int, ...]) -> str:
-    r"""
-    Convert RFdiffusion residue ids to a one-letter amino-acid sequence string.
-
-    Args:
-        seq: Residue ids as a tensor or a sequence of ints.
-
-    Returns:
-        The one-letter sequence string (unknown residues render as `"?"`).
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import seq_to_chars
-        >>> seq_to_chars([0, 7, 20])
-        'AG?'
-    """
-
-    values = seq.detach().cpu().tolist() if isinstance(seq, Tensor) else list(seq)
-    return "".join(AA3_TO_1.get(NUM2AA[int(value)], "?") for value in values)
-
-
-PdbIndex = tuple[str, int]
-
 PAIR_PARAMS = {
     "DMIN": 2.0,
     "DMAX": 20.0,
     "DBINS": 36,
     "ABINS": 36,
 }
-
-
-def target_features_from_tensors(
-    *,
-    residue_type: Tensor,
-    residue_index: Tensor,
-    chain_index: Tensor,
-    ca_coords: Tensor,
-    atom_mask: Tensor | None = None,
-) -> dict[str, Any]:
-    r"""
-    Build a minimal RFdiffusion target dictionary from already-tokenized input tensors.
-
-    Places the CA coords into an atom27 slot and derives ``pdb_idx`` from the chain/residue indices, giving the
-    sampler a target-feature dict equivalent to a parsed PDB.
-
-    Args:
-        residue_type: Per-token amino-acid type ids `[L]`.
-        residue_index: Per-token residue numbers `[L]`.
-        chain_index: Per-token chain ids `[L]`.
-        ca_coords: Per-token CA coords `[L, 3]`.
-        atom_mask: Optional atom-present mask.
-
-    Returns:
-        A target dict with ``xyz_27``, ``mask_27``, ``seq``, and ``pdb_idx``.
-
-    Raises:
-        ValueError: If the index tensors are not 1D or ``ca_coords`` is not `(L, 3)`.
-    """
-
-    if residue_type.ndim != 1 or residue_index.ndim != 1 or chain_index.ndim != 1:
-        raise ValueError("target tensor features must be unbatched 1D tensors")
-    if ca_coords.shape != (residue_type.shape[0], 3):
-        raise ValueError("ca_coords must have shape (L, 3)")
-    coords27 = torch.full((residue_type.shape[0], 27, 3), float("nan"), dtype=ca_coords.dtype, device=ca_coords.device)
-    coords27[:, 1] = ca_coords
-    mask_27 = torch.zeros((residue_type.shape[0], 27), dtype=torch.bool, device=ca_coords.device)
-    mask_27[:, 1] = True
-    if atom_mask is not None:
-        mask_27[:, : atom_mask.shape[-1]] = atom_mask.bool()
-    chain_ids = _chain_ids_from_index(chain_index.detach().cpu().tolist())
-    pdb_idx = [
-        (chain_id, int(residue_number))
-        for chain_id, residue_number in zip(chain_ids, residue_index.detach().cpu().tolist(), strict=True)
-    ]
-    return {
-        "xyz_27": coords27,
-        "mask_27": mask_27,
-        "seq": residue_type.long(),
-        "pdb_idx": pdb_idx,
-    }
 
 
 def one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
@@ -7386,7 +5617,7 @@ def one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
         torch.Size([2, 22])
     """
 
-    return F.one_hot(seq.long().clamp(0, num_classes - 1), num_classes=num_classes).float()
+    return F.one_hot(seq.long(), num_classes=num_classes).float()
 
 
 def generate_cbeta(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
@@ -7483,9 +5714,9 @@ def planar_angle(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
 
     v = a - b
     w = c - b
-    v = v / torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(1e-8)
-    w = w / torch.linalg.norm(w, dim=-1, keepdim=True).clamp_min(1e-8)
-    return torch.acos(torch.clamp(torch.sum(v * w, dim=-1), -1.0, 1.0))
+    v = v / torch.norm(v, dim=-1, keepdim=True)
+    w = w / torch.norm(w, dim=-1, keepdim=True)
+    return torch.acos(torch.sum(v * w, dim=-1))
 
 
 def dihedral(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
@@ -7505,7 +5736,7 @@ def dihedral(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
     beta_initial = a - b
     b1 = c - b
     b2 = d - c
-    b1 = b1 / torch.linalg.norm(b1, dim=-1, keepdim=True).clamp_min(1e-8)
+    b1 = b1 / torch.norm(b1, dim=-1, keepdim=True)
     v = beta_initial - torch.sum(beta_initial * b1, dim=-1, keepdim=True) * b1
     w = b2 - torch.sum(b2 * b1, dim=-1, keepdim=True) * b1
     x = torch.sum(v * w, dim=-1)
@@ -7531,20 +5762,30 @@ def coords_to_c6d(coords: Tensor, params: dict[str, float | int] = PAIR_PARAMS) 
     Cb = generate_cbeta(N, Ca, C)
     coords_6d = torch.zeros((batch, nres, nres, 4), dtype=coords.dtype, device=coords.device)
     dist = pair_dist(Cb, Cb)
-    dist = torch.nan_to_num(dist, nan=999.9)
-    coords_6d[..., 0] = dist + 999.9 * torch.eye(nres, dtype=coords.dtype, device=coords.device)[None]
-    b_idx, i_idx, j_idx = torch.where(coords_6d[..., 0] < float(params["DMAX"]))
-    if b_idx.numel() > 0:
-        coords_6d[b_idx, i_idx, j_idx, 1] = dihedral(
-            Ca[b_idx, i_idx], Cb[b_idx, i_idx], Cb[b_idx, j_idx], Ca[b_idx, j_idx]
-        )
-        coords_6d[b_idx, i_idx, j_idx, 2] = dihedral(
-            N[b_idx, i_idx], Ca[b_idx, i_idx], Cb[b_idx, i_idx], Cb[b_idx, j_idx]
-        )
-        coords_6d[b_idx, i_idx, j_idx, 3] = planar_angle(Ca[b_idx, i_idx], Cb[b_idx, i_idx], Cb[b_idx, j_idx])
-    coords_6d[..., 0][coords_6d[..., 0] >= float(params["DMAX"])] = 999.9
-    mask = torch.zeros((batch, nres, nres), dtype=coords.dtype, device=coords.device)
-    mask[b_idx, i_idx, j_idx] = 1.0
+    dist = torch.where(torch.isnan(dist), 999.9, dist)
+    coords_6d[..., 0] = dist + 999.9 * torch.eye(nres, device=coords.device)[None]
+    valid = coords_6d[..., 0] < float(params["DMAX"])
+    left_ca = Ca[:, :, None]
+    left_cb = Cb[:, :, None]
+    right_cb = Cb[:, None, :]
+    right_ca = Ca[:, None, :]
+    coords_6d[..., 1] = torch.where(
+        valid,
+        dihedral(left_ca, left_cb, right_cb, right_ca),
+        0,
+    )
+    coords_6d[..., 2] = torch.where(
+        valid,
+        dihedral(N[:, :, None], left_ca, left_cb, right_cb),
+        0,
+    )
+    coords_6d[..., 3] = torch.where(
+        valid,
+        planar_angle(left_ca, left_cb, right_cb),
+        0,
+    )
+    coords_6d[..., 0] = torch.where(valid, coords_6d[..., 0], 999.9)
+    mask = valid.to(dtype=coords.dtype)
     return coords_6d, mask
 
 
@@ -7656,60 +5897,128 @@ def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
     Computes backbone (omega/phi/psi) and sidechain chi torsions and encodes them as ``(cos, sin)`` pairs.
 
     Args:
-        coords: Backbone/sidechain coords `[B, L, A, 3]`.
+        coords: RFdiffusion atom27 coords `[B, L, 27, 3]`.
         seq: Per-token residue ids `[B, L]` (or flattenable to it).
 
     Returns:
         A tuple ``(features, mask)`` of the torsion features `[B, L, 10, 2]` and the validity mask
         `[B, L, 10]`.
 
-    Raises:
-        ValueError: If ``coords`` is not `(B, L, A, 3)`.
     """
 
-    if coords.ndim != 4:
-        raise ValueError("xyz must have shape (B, L, A, 3)")
+    def normalize(value: Tensor) -> Tensor:
+        return value / torch.sqrt(value.square().sum(dim=-1, keepdim=True) + 1e-8)
+
+    def angle_pair(left: Tensor, right: Tensor) -> Tensor:
+        left = normalize(left)
+        right = normalize(right)
+        cosine = torch.clamp((left * right).sum(dim=-1), -1, 1)
+        sine = torch.sqrt(1 - cosine.square() + 1e-8)
+        return torch.stack((cosine, sine), dim=-1)
+
+    def dihedral_pair(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
+        ab = normalize(a - b)
+        bc = normalize(b - c)
+        cd = normalize(c - d)
+        first = normalize(torch.cross(ab, bc, dim=-1))
+        second = normalize(torch.cross(bc, cd, dim=-1))
+        sine = (torch.cross(first, bc, dim=-1) * second).sum(dim=-1)
+        cosine = (first * second).sum(dim=-1)
+        return torch.stack((cosine, sine), dim=-1)
+
     B, L = coords.shape[:2]
-    seq = seq.long().reshape(B, L).clamp(0, len(NUM2AA) - 1)
-    angles = torch.zeros((B, L, 10), dtype=coords.dtype, device=coords.device)
-    mask = torch.zeros((B, L, 10), dtype=torch.bool, device=coords.device)
-    valid = ~torch.isnan(coords[..., 0])
+    seq = seq.long().reshape(B, L)
+    coords = coords.clone()
+    rotation, translation = rigid_from_3_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
+    ideal_nitrogen = coords.new_tensor((-0.5272, 1.3593, 0.0))
+    ideal_carbon = coords.new_tensor((1.5233, 0.0, 0.0))
+    coords[..., 0, :] = torch.einsum("...ij,j->...i", rotation, ideal_nitrogen) + translation
+    coords[..., 2, :] = torch.einsum("...ij,j->...i", rotation, ideal_carbon) + translation
+
+    features = coords.new_zeros((B, L, 10, 2))
+    mask = torch.ones((B, L, 10), dtype=torch.bool, device=coords.device)
+    features[:, 0, 1, 0] = 1
+    features[:, -1, 0, 0] = 1
+    mask[:, 0, 1] = False
+    mask[:, -1, 0] = False
     if L > 1:
-        omega_valid = valid[:, :-1, 1] & valid[:, :-1, 2] & valid[:, 1:, 0] & valid[:, 1:, 1]
-        phi_valid = valid[:, :-1, 2] & valid[:, 1:, 0] & valid[:, 1:, 1] & valid[:, 1:, 2]
-        angles[:, :-1, 0] = dihedral(coords[:, :-1, 1], coords[:, :-1, 2], coords[:, 1:, 0], coords[:, 1:, 1])
-        angles[:, 1:, 1] = dihedral(coords[:, :-1, 2], coords[:, 1:, 0], coords[:, 1:, 1], coords[:, 1:, 2])
-        mask[:, :-1, 0] = omega_valid
-        mask[:, 1:, 1] = phi_valid
-    psi_valid = valid[:, :, 0] & valid[:, :, 1] & valid[:, :, 2] & valid[:, :, 3]
-    angles[:, :, 2] = -dihedral(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2], coords[:, :, 3])
-    mask[:, :, 2] = psi_valid
+        features[:, :-1, 0] = dihedral_pair(coords[:, :-1, 1], coords[:, :-1, 2], coords[:, 1:, 0], coords[:, 1:, 1])
+        features[:, 1:, 1] = dihedral_pair(coords[:, :-1, 2], coords[:, 1:, 0], coords[:, 1:, 1], coords[:, 1:, 2])
+    features[:, :, 2] = -dihedral_pair(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2], coords[:, :, 3])
+
+    mask[:, :, 3:7] = False
     for aa_idx, chi_defs in enumerate(CHI_ATOM_NAMES):
         aa_positions = seq == aa_idx
-        if not aa_positions.any():
-            continue
         atom_names = ATOM14_NAMES[aa_idx]
         for chi_idx, chi_atoms in enumerate(chi_defs):
             if chi_atoms is None:
                 continue
-            atom_indices: list[int] = []
-            for atom_name in chi_atoms:
-                try:
-                    atom_indices.append(atom_names.index(atom_name))
-                except ValueError:
-                    atom_indices = []
-                    break
-            if len(atom_indices) != 4:
-                continue
-            chi_angle = dihedral(*(coords[:, :, atom_index] for atom_index in atom_indices))
-            chi_valid = aa_positions
-            for atom_index in atom_indices:
-                chi_valid = chi_valid & valid[:, :, atom_index]
-            angles[:, :, 3 + chi_idx] = torch.where(chi_valid, chi_angle, angles[:, :, 3 + chi_idx])
-            mask[:, :, 3 + chi_idx] = mask[:, :, 3 + chi_idx] | chi_valid
-    encoded = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
-    encoded = torch.nan_to_num(encoded, nan=0.0)
-    return encoded, mask
+            atom_indices = tuple(atom_names.index(atom_name) for atom_name in chi_atoms)
+            chi = dihedral_pair(*(coords[:, :, atom_index] for atom_index in atom_indices))
+            features[:, :, 3 + chi_idx] = torch.where(aa_positions[..., None], chi, features[:, :, 3 + chi_idx])
+            mask[:, :, 3 + chi_idx] |= aa_positions
+    for aa_idx, chi_idx, atom_indices in (
+        (residue_token("CYS"), 1, (1, 4, 5, 18)),
+        (residue_token("HIS"), 2, (7, 8, 19, 9)),
+        (residue_token("PRO"), 2, (4, 5, 6, 19)),
+        (residue_token("SER"), 1, (1, 4, 5, 15)),
+        (residue_token("THR"), 1, (1, 4, 5, 15)),
+        (residue_token("TYR"), 2, (8, 10, 11, 22)),
+    ):
+        aa_positions = seq == aa_idx
+        chi = dihedral_pair(*(coords[:, :, atom_index] for atom_index in atom_indices))
+        features[:, :, 3 + chi_idx] = torch.where(aa_positions[..., None], chi, features[:, :, 3 + chi_idx])
+        mask[:, :, 3 + chi_idx] |= aa_positions
+
+    _, _, reference_coords = rf_all_atom_kinematics()
+    reference_coords = reference_coords.to(device=coords.device, dtype=coords.dtype)
+    reference_nc = 0.5 * (reference_coords[:, 0, :3] + reference_coords[:, 2, :3])
+    reference_ca = reference_coords[:, 1, :3]
+    reference_cb = reference_coords[:, 4, :3]
+    reference_cg = reference_coords[:, 5, :3]
+    reference_cb_bend = angle_pair(reference_cb - reference_ca, reference_nc - reference_ca)
+    reference_nc_projection = reference_coords[:, 2, :3] - reference_coords[:, 0, :3]
+    reference_nc_projection = reference_nc_projection - (
+        (reference_nc_projection * reference_nc).sum(dim=-1, keepdim=True)
+        / reference_nc.square().sum(dim=-1, keepdim=True)
+        * reference_nc
+    )
+    reference_cb_twist = angle_pair(reference_cb - reference_ca, reference_nc_projection)
+    reference_cg_bend = angle_pair(reference_cg, reference_coords.new_tensor((-1.0, 0.0, 0.0)))
+
+    nc = 0.5 * (coords[:, :, 0] + coords[:, :, 2])
+    ca = coords[:, :, 1]
+    cb = coords[:, :, 4]
+    cb_bend = angle_pair(cb - ca, nc - ca)
+    nc_axis = nc - ca
+    nc_projection = coords[:, :, 2] - coords[:, :, 0]
+    nc_projection = nc_projection - (
+        (nc_projection * nc_axis).sum(dim=-1, keepdim=True) / nc_axis.square().sum(dim=-1, keepdim=True) * nc_axis
+    )
+    cb_twist = angle_pair(cb - ca, nc_projection)
+    cg_bend = angle_pair(coords[:, :, 5] - cb, ca - cb)
+    for index, (observed, reference) in enumerate(
+        ((cb_bend, reference_cb_bend), (cb_twist, reference_cb_twist), (cg_bend, reference_cg_bend)),
+        start=7,
+    ):
+        expected = reference[seq]
+        features[:, :, index] = torch.stack(
+            (
+                (observed * expected).sum(dim=-1),
+                observed[..., 0] * expected[..., 1] - observed[..., 1] * expected[..., 0],
+            ),
+            dim=-1,
+        )
+
+    glycine = residue_token("GLY")
+    mask[:, :, 7] = seq != glycine
+    mask[:, :, 8] = seq != glycine
+    mask[:, :, 9] = (
+        (seq != glycine) & (seq != residue_token("ALA")) & (seq != residue_token("UNK")) & (seq != MASK_TOKEN)
+    )
+    features[..., 0] = torch.nan_to_num(features[..., 0], nan=1.0)
+    features[..., 1] = torch.nan_to_num(features[..., 1], nan=0.0)
+    return features, mask
 
 
 def make_alpha_t(template_coords: Tensor, seq: Tensor) -> Tensor:
@@ -7717,7 +6026,7 @@ def make_alpha_t(template_coords: Tensor, seq: Tensor) -> Tensor:
     Build the flattened ``alpha_t`` torsion tensor expected by RFdiffusion inference.
 
     Args:
-        template_coords: Template coords `[B, T, L, A, 3]`.
+        template_coords: Template atom27 coords `[B, T, L, 27, 3]`.
         seq: Per-token residue ids broadcastable to `[B*T, L]`.
 
     Returns:
@@ -7730,15 +6039,6 @@ def make_alpha_t(template_coords: Tensor, seq: Tensor) -> Tensor:
     alpha = alpha.reshape(B, T, length, 10, 2)
     alpha_mask = alpha_mask.reshape(B, T, length, 10, 1).float()
     return torch.cat((alpha, alpha_mask), dim=-1).reshape(B, T, length, 30)
-
-
-def _chain_ids_from_index(chain_index: Sequence[int]) -> list[str]:
-    r"""Map integer chain indices to one-letter chain labels (A, B, ... a, b, ...)."""
-
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    unique = sorted({int(value) for value in chain_index})
-    mapping = {value: letters[index % len(letters)] for index, value in enumerate(unique)}
-    return [mapping[int(value)] for value in chain_index]
 
 
 L_DEFAULT = 2000
@@ -7761,9 +6061,14 @@ def exp_map(rotation_vector: Tensor) -> Tensor:
         torch.Size([1, 3, 3])
     """
 
-    device, dtype = rotation_vector.device, rotation_vector.dtype
-    matrix = Rotation.from_rotvec(rotation_vector.detach().cpu().numpy()).as_matrix()
-    return torch.as_tensor(matrix, dtype=dtype, device=device)
+    angle = torch.linalg.vector_norm(rotation_vector, dim=-1, keepdim=True)
+    scale = torch.sinc(angle / math.pi)
+    second_order_scale = 0.5 * torch.sinc(angle / (2 * math.pi)).square()
+    x, y, z = rotation_vector.unbind(dim=-1)
+    zero = torch.zeros_like(x)
+    skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), dim=-1).reshape(rotation_vector.shape[:-1] + (3, 3))
+    identity = torch.eye(3, dtype=rotation_vector.dtype, device=rotation_vector.device)
+    return identity + scale[..., None] * skew + second_order_scale[..., None] * (skew @ skew)
 
 
 def f_igso3(omega_value: Tensor, t: float | Tensor, num_terms: int = L_DEFAULT) -> Tensor:
@@ -8034,13 +6339,8 @@ class ComputeAllAtomCoords(nn.Module):
         Returns:
             A tuple ``(frames, coords_out)`` of the per-torsion frames and the atom14 coords `[B, L, 14, 3]`.
 
-        Raises:
-            ValueError: If ``coords`` is not `(B, L, 3, 3)`.
         """
-
-        if coords.ndim != 4 or coords.shape[-2:] != (3, 3):
-            raise ValueError(f"backbone prediction must have shape (B, L, 3, 3), got {tuple(coords.shape)}")
-        seq = seq.long().clamp(0, MASK_TOKEN)
+        seq = seq.long()
         batch_size, length = coords.shape[:2]
         if alphas is None:
             alphas = torch.zeros((batch_size, length, 10, 2), dtype=coords.dtype, device=coords.device)
@@ -8094,106 +6394,1058 @@ class ComputeAllAtomCoords(nn.Module):
         return frames, coords_out[..., :14, :3]
 
 
-@dataclass(slots=True)
-class RfDiffusionStepFeatures:
-    r"""
-    One assembled bundle of RoseTTAFold network input tensors for a single timestep.
+def _sample_variable_lengths(
+    batch: RFdiffusionInput,
+    generator: torch.Generator | None,
+) -> RFdiffusionInput:
+    # Deferred to break the model<->processor import cycle after contract.py was folded in.
+    from .processor import terminal_cyclization_instance
 
-    Attributes:
-        msa_masked: Masked MSA features `[1, 1, L, 48]`.
-        msa_full: Full MSA features `[1, 1, L, 25]`.
-        seq_in: Sequence features `[1, L, 22]`.
-        noisy_coords_in: Noised template coords fed to the network `[1, L, A, 3]`.
-        pdb_index: RF residue-index tensor `[1, L]`.
-        template_1d: 1D template features.
-        template_2d: 2D template features.
-        template_coords: Template backbone coords.
-        alpha_t: Template torsion features.
+    placements = [condition for condition in batch.layout.conditions if type(condition) is RFdiffusionPlacements]
+    if not placements:
+        return batch
+    placement = placements[0]
+    rng_device = torch.device("cpu") if generator is None else generator.device
+
+    def draw(low: int, high: int) -> int:
+        if low == high:
+            return low
+        return int(
+            torch.randint(
+                low,
+                high + 1,
+                (),
+                device=rng_device,
+                generator=generator,
+            ).item()
+        )
+
+    # RFdiffusion ContigMap.length (batch.layout.combined_length): the combined generated length
+    # across the placement's GeneratedSegment rows -- the family-owned §3.7 topology constraint
+    # threaded from the Processor. Upstream RFdiffusion re-samples the per-subcon generated lengths
+    # until their inpaint total lands in the requested [min, max] window and errors if it never can
+    # (contigs.py get_sampled_mask, the `while length_compatible is False` loop). We honor it the
+    # same way: reject-and-resample the per-GeneratedSegment draws until their combined length
+    # satisfies the window, with an upstream-style attempt cap that raises rather than silently
+    # dropping the request. When it is None the single draw below is unconstrained.
+    combined_length = batch.layout.combined_length
+    # placement_id -> GeneratedSegment, so a whole-placement reference (spelled as the bare
+    # placement_id string, e.g. in PointGroupSymmetry units) recovers its length bounds
+    # without the value carrying its own id.
+    segments_by_id = {
+        placement_id: value
+        for group in placement.placements.values()
+        for placement_id, value in group.items()
+        if type(value) is GeneratedSegment
+    }
+    chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
+
+    def sample_segment_lengths() -> dict[str, int]:
+        sampled_lengths: dict[str, int] = {}
+        for group, chain_length in zip(placement.placements.values(), chain_lengths, strict=True):
+            if chain_length is None:
+                continue
+            segments = [
+                (placement_id, value) for placement_id, value in group.items() if type(value) is GeneratedSegment
+            ]
+            remaining = chain_length - sum(
+                value.stop - value.start for value in group.values() if type(value) is ExistingSpan
+            )
+            for index, (placement_id, segment) in enumerate(segments):
+                following = [value for _, value in segments[index + 1 :]]
+                low = max(segment.min_length, remaining - sum(value.max_length for value in following))
+                high = min(segment.max_length, remaining - sum(value.min_length for value in following))
+                if low > high:
+                    raise ValueError("placement chain length cannot be realized by its generated segments")
+                length = draw(low, high)
+                sampled_lengths[placement_id] = length
+                remaining -= length
+
+        symmetry = next(
+            (condition for condition in batch.layout.conditions if type(condition) is PointGroupSymmetry),
+            None,
+        )
+        if symmetry is not None:
+            unit_ranges = []
+            for unit in symmetry.units:
+                minimum = sum(
+                    sampled_lengths.get(target, segments_by_id[target].min_length) if type(target) is str else 1
+                    for target in unit
+                )
+                maximum = sum(
+                    sampled_lengths.get(target, segments_by_id[target].max_length) if type(target) is str else 1
+                    for target in unit
+                )
+                unit_ranges.append((minimum, maximum))
+            minimum = max(value[0] for value in unit_ranges)
+            maximum = min(value[1] for value in unit_ranges)
+            if minimum > maximum:
+                raise ValueError("placement chain lengths are incompatible with PointGroupSymmetry")
+            total = draw(minimum, maximum)
+            for unit in symmetry.units:
+                segments = [target for target in unit if type(target) is str and target not in sampled_lengths]
+                remaining = (
+                    total
+                    - sum(type(target) is not str for target in unit)
+                    - sum(
+                        sampled_lengths[target] for target in unit if type(target) is str and target in sampled_lengths
+                    )
+                )
+                for index, placement_id in enumerate(segments):
+                    segment = segments_by_id[placement_id]
+                    following = [segments_by_id[value] for value in segments[index + 1 :]]
+                    low = max(segment.min_length, remaining - sum(value.max_length for value in following))
+                    high = min(segment.max_length, remaining - sum(value.min_length for value in following))
+                    if low > high:
+                        raise ValueError("placement chain lengths are incompatible with PointGroupSymmetry")
+                    length = draw(low, high)
+                    sampled_lengths[placement_id] = length
+                    remaining -= length
+
+        # Any GeneratedSegment not pinned by a chain-length or symmetry coupling is drawn freely
+        # within its own [min_length, max_length]; hoisted here (out of the reference-building loop
+        # below) so the combined generated total is known before it is checked against the window.
+        for group in placement.placements.values():
+            for placement_id, part in group.items():
+                if type(part) is GeneratedSegment and placement_id not in sampled_lengths:
+                    sampled_lengths[placement_id] = draw(part.min_length, part.max_length)
+        return sampled_lengths
+
+    # A GeneratedSegment always realizes within [min_length, max_length], so the combined generated
+    # total is always within these summed bounds regardless of the per-chain / symmetry couplings;
+    # if the requested window misses this envelope it can never be satisfied -- report that directly
+    # instead of spinning the resampler to the cap.
+    reachable_low = sum(segment.min_length for segment in segments_by_id.values())
+    reachable_high = sum(segment.max_length for segment in segments_by_id.values())
+    if combined_length is not None and (combined_length[1] < reachable_low or combined_length[0] > reachable_high):
+        raise ValueError(
+            f"combined_length {combined_length} cannot be realized: the placement's generated segments "
+            f"admit a combined generated length in [{reachable_low}, {reachable_high}]"
+        )
+    max_attempts = 100000  # matches upstream RFdiffusion get_sampled_mask
+    sampled_lengths = sample_segment_lengths()
+    if combined_length is not None:
+        attempt = 1
+        while not combined_length[0] <= sum(sampled_lengths[pid] for pid in segments_by_id) <= combined_length[1]:
+            if attempt >= max_attempts:
+                raise ValueError(
+                    f"combined_length {combined_length} could not be satisfied after {max_attempts} "
+                    f"resampling attempts of the placement's generated segment lengths"
+                )
+            sampled_lengths = sample_segment_lengths()
+            attempt += 1
+
+    output_residues: list[tuple[str, int] | SymbolicResidueSite] = []
+    output_instances: list[str] = []
+    # Frozen §3.7 canonical realized-instance-id convention (W6 caveat b): mint the realized
+    # OUTPUT instance ids with the shared `InstanceIdAllocator`, walking declaration groups in
+    # order and calling `allocate()` once per realized output chain with >=1 occurrence — the
+    # canonical `chain_{n}` (uniform, 0-based, no family prefix). A declaration group that
+    # realizes to zero residues mints no chain and consumes no index. Identical to the processor
+    # lowering in `_resolve_placement`.
+    allocator = InstanceIdAllocator()
+    for group in placement.placements.values():
+        group_residues: list[tuple[str, int] | SymbolicResidueSite] = []
+        for placement_id, part in group.items():
+            if type(part) is ExistingSpan:
+                references = [(part.instance_id, index) for index in range(part.start, part.stop)]
+            else:
+                length = sampled_lengths[placement_id]
+                references = [SymbolicResidueSite(placement_id, index) for index in range(length)]
+            group_residues.extend(references)
+        if not group_residues:
+            continue  # zero-length declaration group mints no realized chain, consumes no index
+        instance_id = allocator.allocate()
+        output_residues.extend(group_residues)
+        output_instances.extend([instance_id] * len(group_residues))
+
+    references = tuple(output_residues)
+    instances = tuple(output_instances)
+    if references == batch.layout.output_residues and instances == batch.layout.output_instance_ids:
+        return batch
+    if batch.layout.templates:
+        raise ValueError("variable generated lengths cannot be combined with aligned Template evidence")
+
+    old_index = {reference: index for index, reference in enumerate(batch.layout.output_residues)}
+    length = len(references)
+    coords = batch.noisy_coords.new_empty((1, length, 14, 3))
+    sequence = batch.sequence.new_zeros((1, length, 22))
+    sequence[..., MASK_TOKEN] = 1
+    fixed_structure = torch.zeros((1, length), dtype=torch.bool, device=batch.noisy_coords.device)
+    fixed_sequence = torch.zeros_like(fixed_structure)
+    hotspots = torch.zeros_like(fixed_structure)
+    for row, reference in enumerate(references):
+        previous = old_index.get(reference)
+        if previous is None:
+            coords[0, row] = float("nan")
+            continue
+        coords[0, row] = batch.noisy_coords[0, previous]
+        sequence[0, row] = batch.sequence[0, previous]
+        fixed_structure[0, row] = batch.fixed_structure_mask[0, previous]
+        fixed_sequence[0, row] = batch.fixed_sequence_mask[0, previous]
+        hotspots[0, row] = batch.hotspot_mask[0, previous]
+    for row, reference in enumerate(references):
+        if type(reference) is SymbolicResidueSite:
+            sequence[0, row].zero_()
+            sequence[0, row, MASK_TOKEN] = 1
+            fixed_sequence[0, row] = False
+    residue_indices: list[int] = []
+    previous_instance = None
+    chain_index = -1
+    chain_start = 0
+    for row, instance_id in enumerate(instances):
+        if instance_id != previous_instance:
+            chain_index += 1
+            chain_start = row
+            previous_instance = instance_id
+        residue_indices.append(200 * chain_index + row - chain_start)
+    row_by_reference = {reference: row for row, reference in enumerate(references)}
+    row_by_reference.update(
+        {alias: row_by_reference[reference] for alias, reference in symbolic_residue_aliases(references).items()}
+    )
+    for condition in batch.layout.conditions:
+        if type(condition) is not AllowedResidueIdentities:
+            continue
+        token = residue_token(next(iter(condition.component_ids)))
+        rows: list[int] = []
+        for target in condition.positions:
+            if type(target) is str:
+                rows.extend(
+                    row
+                    for row, reference in enumerate(references)
+                    if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                )
+            else:
+                rows.append(row_by_reference[target])
+        for row in rows:
+            sequence[0, row].zero_()
+            sequence[0, row, token] = 1
+            fixed_sequence[0, row] = True
+    secondary_labels = torch.full((1, length), 3, dtype=torch.int64, device=coords.device)
+    label_by_kind = {"helix": 0, "strand": 1, "loop": 2}
+    for condition in batch.layout.conditions:
+        if type(condition) is not SecondaryStructure:
+            continue
+        rows: list[int] = []
+        for target in condition.targets:
+            if type(target) is str:
+                rows.extend(
+                    row
+                    for row, reference in enumerate(references)
+                    if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                )
+            else:
+                rows.append(row_by_reference[target])
+        secondary_labels[0, torch.tensor(rows, device=coords.device)] = label_by_kind[condition.kind]
+    cyclic_mask = torch.zeros((1, length), dtype=torch.bool, device=coords.device)
+    row_by_reference_for_cyclization = dict(row_by_reference)
+    for condition in batch.layout.conditions:
+        if type(condition) is not SymbolicBond:
+            continue
+        instance_id = terminal_cyclization_instance(
+            condition,
+            row_by_reference_for_cyclization,
+            instances,
+        )
+        cyclic_mask[0] |= torch.tensor(
+            [value == instance_id for value in instances],
+            device=coords.device,
+        )
+    return RFdiffusionInput(
+        noisy_coords=coords,
+        sequence=sequence,
+        residue_index=torch.tensor(residue_indices, dtype=torch.int64, device=coords.device)[None],
+        fixed_structure_mask=fixed_structure,
+        fixed_sequence_mask=fixed_sequence,
+        hotspot_mask=hotspots,
+        cyclic_mask=cyclic_mask,
+        secondary_structure=F.one_hot(
+            secondary_labels,
+            num_classes=4,
+        ).to(coords.dtype),
+        block_adjacency=F.one_hot(
+            torch.full((1, length, length), 2, dtype=torch.int64, device=coords.device),
+            num_classes=3,
+        ).to(coords.dtype),
+        timestep=batch.timestep,
+        layout=RFdiffusionLayout(
+            system=batch.layout.system,
+            structure=batch.layout.structure,
+            templates=batch.layout.templates,
+            conditions=batch.layout.conditions,
+            output_residues=references,
+            output_instance_ids=instances,
+            combined_length=batch.layout.combined_length,
+        ),
+    )
+
+
+def _resolved_placement_condition(layout: RFdiffusionLayout) -> RFdiffusionPlacements | None:
+    r"""The RFdiffusionPlacements that drove this layout, for placement_map materialization.
+
+    An explicit :class:`RFdiffusionPlacements` condition is used directly; otherwise the
+    trivial all-existing default placement is reconstructed from the retained input system
+    exactly as :meth:`RFdiffusionProcessor.__call__` synthesizes it (each protein input
+    instance -> one whole-chain ``ExistingSpan`` under its own declaration group), so the
+    default protein-input path also carries a placement_map. ``None`` when there is neither a
+    placements condition nor a molecular input.
     """
 
-    msa_masked: Tensor
-    msa_full: Tensor
-    seq_in: Tensor
-    noisy_coords_in: Tensor
-    pdb_index: Tensor
-    template_1d: Tensor
-    template_2d: Tensor
-    template_coords: Tensor
-    alpha_t: Tensor
+    for condition in layout.conditions:
+        if type(condition) is RFdiffusionPlacements:
+            return condition
+    system = layout.system
+    if system is None:
+        return None
+    placements: dict[str, dict[str, ExistingSpan]] = {}
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if type(entity) is PolymerSequence and entity.polymer_type == "protein":
+            placements[instance_id] = {instance_id: ExistingSpan(instance_id, 0, len(entity))}
+    return RFdiffusionPlacements(placements=placements) if placements else None
 
 
-@dataclass(slots=True)
-class RfDiffusionSampleState:
-    r"""
-    Mutable per-trajectory state carried across RFdiffusion denoising steps.
+def _decode_design(
+    samples: Iterable[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]],
+    inputs: list[RFdiffusionInput],
+    *,
+    align_motif: bool,
+) -> RFdiffusionResult:
+    # RFdiffusion is coordinate-producing and variable-topology, so each sample is wired into
+    # the family-owned standalone RFdiffusionDesignCandidate/RFdiffusionResult (results.py),
+    # carrying the decoded Structure and per-sample values, rather than reusing or widening the
+    # frozen coordinate-free shared DesignResult, which §5.3.1/§5.3.3 forbids. Diffusion
+    # internals (timesteps / px0 / x_t_minus_1) are dropped as §5.1 trajectory diagnostics.
+    candidates: list[RFdiffusionDesignCandidate] = []
+    for sample, batch in zip(samples, inputs, strict=True):
+        raw_coordinates, sequence, _timesteps, self_consistency_plddt, _px0, _xt_minus_1 = sample
+        coordinates = raw_coordinates.clone()
+        fixed = batch.fixed_structure_mask[0].to(device=coordinates.device, dtype=torch.bool)
+        if bool(fixed.any()):
+            reference = batch.noisy_coords[0].to(device=coordinates.device, dtype=coordinates.dtype)
+            if align_motif:
+                coordinates = Denoiser.align_to_xt_motif(coordinates, reference, fixed)
+            coordinates[fixed] = reference[fixed]
+        layout = batch.layout
+        candidate, _identity_map, residue_map = _decode_structure(
+            coordinates,
+            sequence,
+            batch.fixed_sequence_mask[0],
+            layout,
+        )
+        candidate_outcomes = _condition_outcomes(candidate, layout, residue_map)
+        _require_hard_conditions(layout, candidate_outcomes)
+        # self_consistency_plddt is [steps, L]; the final step is the per-residue design pLDDT,
+        # aligned row-for-row to the output residues (residue_map keys are the ComponentReference
+        # / SymbolicResidueSite identities, its values the realized output ComponentReferences).
+        # The released expectation lies on (0, 1] (bins linspace(1/num_bins, 1, num_bins)); the
+        # decode multiplies by 100 so the §5.1 cross-family reserved `plddt` name carries its
+        # reserved 0-100 scale. This is a mapping requirement applied only in decode -- not a
+        # change to the parity-locked sampler/network.
+        plddt = self_consistency_plddt[-1].detach().to(device="cpu", dtype=torch.float32).numpy() * 100.0
+        plddt_axis = tuple(residue_map[reference] for reference in layout.output_residues)
+        # W6 caveat a: adopt the shared grouped placement_map as the per-candidate OUTPUT
+        # identity (losslessly reconstructed from the flat output_residues + residue_map;
+        # exhaustive coverage enforced inside materialize_placement_map). The realized ids in
+        # its ComponentReference[0] values are this candidate's Structure.system instance ids.
+        from .processor import materialize_placement_map
 
-    Attributes:
-        noisy_coords: Current noised backbone coords.
-        seq_t: Current sequence features.
-        contig_map: The resolved [`ContigMap`][ofoldx.models.rfdiffusion.model.ContigMap].
-        mask_seq: Sequence-inpainting mask.
-        mask_str: Structure-inpainting mask.
-        diffusion_mask: Per-residue mask marking fixed (motif) residues.
-        binderlen: Number of binder residues.
-        chain_idx: Per-residue output chain labels.
-        pdb_index: Per-residue output PDB residue numbers.
-        t_step_input: The starting timestep.
-        diffuser: The forward [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser].
-        denoiser: The reverse [`Denoiser`][ofoldx.models.rfdiffusion.model.Denoiser].
-        potential_manager: The guiding-potential manager.
-        symmetry: Optional symmetry generator.
-        cyclic_reses: Optional cyclic-residue mask.
-        ss: Optional scaffold secondary-structure tensor.
-        adj: Optional scaffold block-adjacency tensor.
-        target_ss: Optional target secondary-structure tensor.
-        target_adj: Optional target block-adjacency tensor.
-        target_pdb: Optional fixed-target feature dict.
-        prev_pred: Previous-step prediction for self-conditioning.
-        clean_coords: Un-noised mapped coords ``[L, A, 3]`` (the diffusion ``x_0``); the denoising target for
-            the training forward. ``None`` outside the base initializer.
+        placement_condition = _resolved_placement_condition(layout)
+        placement_map = (
+            {}
+            if placement_condition is None
+            else materialize_placement_map(placement_condition, layout.output_residues, residue_map)[0]
+        )
+        candidates.append(
+            RFdiffusionDesignCandidate(
+                structure=candidate,
+                placement_map=placement_map,
+                scores={
+                    "mean_plddt": Score(
+                        value=float(plddt.mean()),
+                        unit="0-100",
+                        preferred="higher",
+                    )
+                },
+                metrics={"plddt": Metric(values=plddt, axis=plddt_axis, unit="0-100")},
+            )
+        )
+    return RFdiffusionResult(candidates=tuple(candidates))
+
+
+def _decode_structure(
+    coords: Tensor,
+    sequence: Tensor,
+    fixed_sequence_mask: Tensor,
+    layout: RFdiffusionLayout,
+) -> tuple[
+    Structure,
+    tuple[tuple[SymbolicResidueSite, tuple[str, int]], ...],
+    dict[tuple[str, int] | SymbolicResidueSite, tuple[str, int]],
+]:
+    source = layout.system
+    rows_by_instance: dict[str, list[tuple[int, tuple[str, int] | SymbolicResidueSite]]] = {}
+    for row, (reference, instance_id) in enumerate(zip(layout.output_residues, layout.output_instance_ids)):
+        rows_by_instance.setdefault(instance_id, []).append((row, reference))
+
+    aliases = symbolic_residue_aliases(layout.output_residues)
+    allowed_references: set[tuple[str, int] | SymbolicResidueSite] = set()
+    for condition in layout.conditions:
+        if type(condition) is not AllowedResidueIdentities:
+            continue
+        for target in condition.positions:
+            if type(target) is str:
+                for reference in layout.output_residues:
+                    if type(reference) is SymbolicResidueSite and reference.placement_id == target:
+                        allowed_references.add(reference)
+            else:
+                allowed_references.add(aliases.get(target, target))
+
+    residue_map: dict[tuple[str, int] | SymbolicResidueSite, tuple[str, int]] = {}
+    output_sequences: dict[str, tuple[ChemicalComponent, ...]] = {}
+    for instance_id, rows in rows_by_instance.items():
+        residue_components: list[ChemicalComponent] = []
+        for component_index, (row, reference) in enumerate(rows):
+            token = int(sequence[row])
+            if (
+                type(reference) is not SymbolicResidueSite
+                and bool(fixed_sequence_mask[row])
+                and reference not in allowed_references
+            ):
+                entity = source.entities[source.instances[reference[0]]]  # type: ignore[union-attr]
+                residue_components.append(entity.components[reference[1]])
+            else:
+                residue_components.append(get_component("UNK" if token == MASK_TOKEN else NUM2AA[token]))
+            residue_map[reference] = (instance_id, component_index)
+        output_sequences[instance_id] = tuple(residue_components)
+
+    residue_map.update({alias: residue_map[reference] for alias, reference in aliases.items()})
+
+    touched_instances = {reference[0] for reference in layout.output_residues if type(reference) is tuple}
+    retained_instance_ids = (
+        []
+        if source is None
+        else [instance_id for instance_id in source.instances if instance_id not in touched_instances]
+    )
+    entities: dict[str, PolymerSequence | Molecule] = {}
+    instances: dict[str, str] = {}
+    entity_ids: set[str] = set()
+    if source is not None:
+        for instance_id in retained_instance_ids:
+            entity_id = source.instances[instance_id]
+            entities[entity_id] = source.entities[entity_id]
+            instances[instance_id] = entity_id
+            entity_ids.add(entity_id)
+    for instance_id, residue_components in output_sequences.items():
+        base = f"{instance_id}_rfdesign"
+        entity_id = base
+        suffix = 2
+        while entity_id in entity_ids:
+            entity_id = f"{base}_{suffix}"
+            suffix += 1
+        entity_ids.add(entity_id)
+        entities[entity_id] = PolymerSequence("protein", residue_components)
+        instances[instance_id] = entity_id
+
+    valid_instance_ids = set(instances)
+    bonds: set[SystemBond] = set()
+    if source is not None:
+        for bond in source.bonds:
+            remapped = _remap_bond(bond, residue_map, touched_instances)
+            if remapped.site_a.instance_id in valid_instance_ids and remapped.site_b.instance_id in valid_instance_ids:
+                bonds.add(remapped)
+    for condition in layout.conditions:
+        if type(condition) is not SymbolicBond:
+            continue
+        endpoints: list[AtomSite] = []
+        for reference in (condition.site_a, condition.site_b):
+            if type(reference) is SymbolicAtomSite:
+                instance_id, component_index = residue_map[reference.residue]
+                endpoints.append(AtomSite(instance_id, component_index, reference.atom_id))
+            else:
+                mapped = residue_map.get((reference.instance_id, reference.component_index))
+                endpoints.append(reference if mapped is None else AtomSite(mapped[0], mapped[1], reference.atom_id))
+        bonds.add(SystemBond(endpoints[0], endpoints[1], origin="user"))
+    system = MolecularSystem(entities, instances, frozenset(bonds))
+
+    sites: list[AtomSite] = []
+    coordinate_rows: list[np.ndarray] = []
+    masks: list[bool] = []
+    coords_cpu = coords.detach().to(device="cpu", dtype=torch.float32).numpy()
+    for row, reference in enumerate(layout.output_residues):
+        instance_id, component_index = residue_map[reference]
+        for atom_index, atom_name in enumerate(("N", "CA", "C", "O")):
+            sites.append(AtomSite(instance_id, component_index, atom_name))
+            value = np.asarray(coords_cpu[row, atom_index], dtype=np.float32)
+            present = bool(np.isfinite(value).all())
+            coordinate_rows.append(value if present else np.zeros(3, dtype=np.float32))
+            masks.append(present)
+
+    site_set = set(sites)
+    if layout.structure is not None:
+        source_index = {site: index for index, site in enumerate(layout.structure.sites)}
+        for condition in layout.conditions:
+            if type(condition) is not ReferenceCoordinates:
+                continue
+            for original in condition.sites:
+                mapped_residue = residue_map[(original.instance_id, original.component_index)]
+                mapped = AtomSite(mapped_residue[0], mapped_residue[1], original.atom_id)
+                if mapped in site_set:
+                    continue
+                source_row = source_index[original]
+                sites.append(mapped)
+                site_set.add(mapped)
+                coordinate_rows.append(np.asarray(layout.structure.coordinates[source_row], dtype=np.float32))
+                masks.append(True)
+
+    if layout.structure is not None and source is not None:
+        retained_ids = set(retained_instance_ids)
+        for index, site in enumerate(layout.structure.sites):
+            if site.instance_id not in retained_ids or site in sites:
+                continue
+            sites.append(site)
+            coordinate_rows.append(np.asarray(layout.structure.coordinates[index], dtype=np.float32))
+            masks.append(bool(layout.structure.coordinate_mask[index]))
+    structure = Structure(
+        system=system,
+        sites=tuple(sites),
+        coordinates=np.asarray(coordinate_rows, dtype=np.float32),
+        coordinate_mask=np.asarray(masks, dtype=np.bool_),
+    )
+    identity_map = tuple(
+        (reference, residue_map[reference])
+        for reference in layout.output_residues
+        if type(reference) is SymbolicResidueSite
+    )
+    return structure, identity_map, residue_map
+
+
+def _require_hard_conditions(
+    layout: RFdiffusionLayout,
+    outcomes: tuple[tuple[bool | None, float | None, str | None], ...],
+) -> None:
+    for index, (condition, outcome) in enumerate(zip(layout.conditions, outcomes, strict=True)):
+        # The shared FROZEN §3.7.1/§3.7.4 records carry no ``.intent`` field -- hard/soft is
+        # family-owned and rides on the family envelope -- so RFdiffusion pins each shared record's
+        # fixed intent here instead of reading a ``.intent`` it does not have. The identity record
+        # (AllowedResidueIdentities), the covalent link (SymbolicBond, collapsed to cyclic_mask),
+        # and the single-sided distance-free target-conditioning Hotspot (realized as hotspot_mask)
+        # are all consumed as HARD: a shared Hotspot IS a hard positive hotspot constraint, which is
+        # the whole meaning of the frozen §3.7.4 label. The geometric Contact is a family-scorer-only
+        # measurement with no released input-side potential, so it is never enforced. Every
+        # family-owned spatial record still carries its own ``.intent`` (unchanged behavior).
+        if type(condition) is Contact:
+            is_hard = False
+        elif type(condition) in (AllowedResidueIdentities, Hotspot, SymbolicBond):
+            is_hard = True
+        else:
+            is_hard = condition.intent == "hard"
+        # Raise only on a MEASURED hard violation. An unmeasured outcome is ``None`` -- the
+        # conditioning-only Hotspot biases sampling through hotspot_mask but its satisfaction is
+        # never verified post-hoc, so it cannot be asserted as a violation. Every family hard
+        # condition and the measured shared records (AllowedResidueIdentities / SymbolicBond) report
+        # a concrete bool here, so ``is False`` preserves their existing raise behavior exactly.
+        if is_hard and outcome[0] is False:
+            raise RuntimeError(f"RFdiffusion violated hard conditions[{index}] during result decoding")
+
+
+def _remap_bond(
+    bond: SystemBond,
+    residue_map: Mapping[tuple[str, int] | SymbolicResidueSite, tuple[str, int]],
+    touched_instances: set[str],
+) -> SystemBond:
+    def site(value: AtomSite) -> AtomSite:
+        if value.instance_id not in touched_instances:
+            return value
+        mapped = residue_map.get((value.instance_id, value.component_index))
+        if mapped is None:
+            raise ValueError("placement omits a residue participating in an input system bond")
+        return AtomSite(mapped[0], mapped[1], value.atom_id)
+
+    stereo_sites = None if bond.stereo_sites is None else tuple(site(value) for value in bond.stereo_sites)
+    return SystemBond(
+        site_a=site(bond.site_a),
+        site_b=site(bond.site_b),
+        order=bond.order,
+        aromatic=bond.aromatic,
+        stereo=bond.stereo,
+        stereo_sites=stereo_sites,
+        origin=bond.origin,
+    )
+
+
+def _condition_outcomes(
+    candidate: Structure,
+    layout: RFdiffusionLayout,
+    residue_map: Mapping[tuple[str, int] | SymbolicResidueSite, tuple[str, int]],
+) -> tuple[tuple[bool | None, float | None, str | None], ...]:
+    # Deferred to break the model<->processor import cycle after contract.py was folded in.
+    from .processor import rfdiffusion_secondary_structure
+
+    # TODO(§3.7↔§5 reopened): per-condition constraint measurement. Each (satisfied, value,
+    # unit) triple below carries a real geometric measurement (angstrom min-distance / RMSD /
+    # coordination / helix fraction) that has no frozen per-condition home; only `satisfied`
+    # is consumed here, to drive the hard-condition raise. Await a §3.7↔§5 sub-freeze to
+    # surface value/unit under their actual Score/Metric names.
+    coordinate_index = {site: index for index, site in enumerate(candidate.sites)}
+    source_index = (
+        {} if layout.structure is None else {site: index for index, site in enumerate(layout.structure.sites)}
+    )
+    values: list[tuple[bool | None, float | None, str | None]] = []
+    for condition in layout.conditions:
+        if type(condition) is AllowedResidueIdentities:
+            references: list[tuple[str, int] | SymbolicResidueSite] = []
+            for target in condition.positions:
+                if type(target) is str:
+                    references.extend(
+                        reference
+                        for reference in layout.output_residues
+                        if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                    )
+                else:
+                    references.append(target)
+            component_ids = []
+            for reference in references:
+                instance_id, component_index = residue_map[reference]
+                entity = candidate.system.entities[candidate.system.instances[instance_id]]
+                component_ids.append(entity.components[component_index].component_id)
+            values.append(
+                (
+                    all(component_id in condition.component_ids for component_id in component_ids),
+                    None,
+                    None,
+                )
+            )
+            continue
+        if type(condition) is RFdiffusionPlacements:
+            values.append((True, None, None))
+            continue
+        if type(condition) is ReferenceCoordinates and layout.structure is not None:
+            original_coordinates: list[np.ndarray] = []
+            candidate_coordinates: list[np.ndarray] = []
+            complete = True
+            for original in condition.sites:
+                system = layout.system
+                entity = system.entities[system.instances[original.instance_id]]  # type: ignore[union-attr]
+                if type(entity) is Molecule:
+                    mapped = original
+                else:
+                    mapped_residue = residue_map.get((original.instance_id, original.component_index))
+                    mapped = (
+                        None
+                        if mapped_residue is None
+                        else AtomSite(mapped_residue[0], mapped_residue[1], original.atom_id)
+                    )
+                old_index = source_index.get(original)
+                new_index = None if mapped is None else coordinate_index.get(mapped)
+                if (
+                    old_index is None
+                    or new_index is None
+                    or not bool(layout.structure.coordinate_mask[old_index])
+                    or not bool(candidate.coordinate_mask[new_index])
+                ):
+                    complete = False
+                    break
+                original_coordinates.append(layout.structure.coordinates[old_index])
+                candidate_coordinates.append(candidate.coordinates[new_index])
+            distances = (
+                _proper_alignment_distances(
+                    np.asarray(candidate_coordinates, dtype=np.float64),
+                    np.asarray(original_coordinates, dtype=np.float64),
+                )
+                if complete
+                else None
+            )
+            maximum = None if distances is None else float(distances.max())
+            values.append(
+                (
+                    maximum is not None and maximum <= condition.tolerance_angstrom,
+                    maximum,
+                    "angstrom",
+                )
+            )
+            continue
+        if type(condition) is Distance:
+            endpoints = []
+            for reference in (condition.site_a, condition.site_b):
+                if type(reference) is SymbolicAtomSite:
+                    mapped_residue = residue_map.get(reference.residue)
+                    site = (
+                        None
+                        if mapped_residue is None
+                        else AtomSite(mapped_residue[0], mapped_residue[1], reference.atom_id)
+                    )
+                else:
+                    mapped_residue = residue_map.get((reference.instance_id, reference.component_index))
+                    site = (
+                        reference
+                        if mapped_residue is None
+                        else AtomSite(mapped_residue[0], mapped_residue[1], reference.atom_id)
+                    )
+                coordinate = None if site is None else coordinate_index.get(site)
+                endpoints.append(
+                    None
+                    if coordinate is None or not bool(candidate.coordinate_mask[coordinate])
+                    else candidate.coordinates[coordinate]
+                )
+            if endpoints[0] is None or endpoints[1] is None:
+                values.append((None, None, None))
+            else:
+                distance = float(np.linalg.norm(endpoints[0] - endpoints[1]))
+                lower = condition.lower_angstrom - condition.tolerance_angstrom
+                upper = condition.upper_angstrom + condition.tolerance_angstrom
+                values.append((lower <= distance <= upper, distance, "angstrom"))
+            continue
+        if type(condition) is Coordination:
+            side_a = _contact_coordinates(condition.side_a, candidate, residue_map, coordinate_index)
+            side_b = _contact_coordinates(condition.side_b, candidate, residue_map, coordinate_index)
+            if not side_a or not side_b:
+                values.append((None, None, None))
+            else:
+                distances = np.linalg.norm(
+                    np.asarray(side_a, dtype=np.float32)[:, None] - np.asarray(side_b, dtype=np.float32)[None],
+                    axis=-1,
+                )
+                scaled = (distances - condition.center_angstrom) / condition.scale_angstrom
+                coordination = float((1 / (1 + scaled**6)).sum())
+                values.append((None, coordination, None))
+            continue
+        if type(condition) is RadiusOfGyration:
+            coordinates = _contact_coordinates(
+                condition.targets,
+                candidate,
+                residue_map,
+                coordinate_index,
+            )
+            if not coordinates:
+                values.append((None, None, None))
+            else:
+                array = np.asarray(coordinates, dtype=np.float32)
+                radius = float(np.sqrt(np.square(array - array.mean(axis=0)).sum(axis=-1).mean()))
+                values.append(
+                    (
+                        radius <= condition.upper_angstrom,
+                        radius,
+                        "angstrom",
+                    )
+                )
+            continue
+        if type(condition) is SubstrateInteraction:
+            residues = _contact_coordinates(
+                condition.residues,
+                candidate,
+                residue_map,
+                coordinate_index,
+            )
+            substrate = _contact_coordinates(
+                condition.substrate_atoms,
+                candidate,
+                residue_map,
+                coordinate_index,
+            )
+            if not residues or not substrate:
+                values.append((None, None, None))
+            else:
+                nearest = np.linalg.norm(
+                    np.asarray(residues, dtype=np.float32)[:, None] - np.asarray(substrate, dtype=np.float32)[None],
+                    axis=-1,
+                ).min(axis=-1)
+                scaled = (nearest - condition.center_angstrom) / condition.scale_angstrom
+                attraction = condition.attraction_strength / (1 + scaled**6)
+                exponent = 1.5
+                repulsion = (
+                    condition.repulsion_slope**2
+                    * np.maximum(condition.repulsion_cutoff_angstrom - nearest, 0) ** exponent
+                    / (exponent * condition.repulsion_cutoff_angstrom ** (exponent - 1))
+                )
+                values.append((None, float((attraction - repulsion).sum()), None))
+            continue
+        if type(condition) is SecondaryStructure:
+            ca_coordinates = []
+            for reference in layout.output_residues:
+                mapped = residue_map[reference]
+                coordinate = coordinate_index[AtomSite(mapped[0], mapped[1], "CA")]
+                ca_coordinates.append(candidate.coordinates[coordinate])
+            labels = rfdiffusion_secondary_structure(torch.as_tensor(np.asarray(ca_coordinates)))
+            expected = {"helix": 0, "strand": 1, "loop": 2}[condition.kind]
+            target_rows = []
+            for target in condition.targets:
+                if type(target) is str:
+                    target_rows.extend(
+                        row
+                        for row, reference in enumerate(layout.output_residues)
+                        if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                    )
+                else:
+                    target_rows.append(layout.output_residues.index(target))
+            fraction = float((labels[target_rows] == expected).to(torch.float32).mean())
+            values.append((fraction == 1.0, fraction, "fraction"))
+            continue
+        if type(condition) is PointGroupSymmetry:
+            symmetry = RFdiffusionSymmetry(condition, layout)
+            units: list[np.ndarray] = []
+            complete = True
+            for rows in symmetry.units:
+                unit = []
+                for row in rows:
+                    mapped = residue_map[layout.output_residues[row]]
+                    residue_atoms = []
+                    for atom_name in ("N", "CA", "C"):
+                        coordinate = coordinate_index.get(AtomSite(mapped[0], mapped[1], atom_name))
+                        if coordinate is None or not bool(candidate.coordinate_mask[coordinate]):
+                            complete = False
+                            break
+                        residue_atoms.append(candidate.coordinates[coordinate])
+                    if not complete:
+                        break
+                    unit.append(residue_atoms)
+                if not complete:
+                    break
+                units.append(np.asarray(unit, dtype=np.float64))
+            if complete:
+                observed = np.asarray(units, dtype=np.float64)
+                rotations = np.stack([rotation.cpu().numpy() for rotation in symmetry.rotations])
+                rmsd = _point_group_rmsd(observed, rotations)
+            else:
+                rmsd = None
+            values.append(
+                (
+                    rmsd is not None and rmsd <= condition.tolerance_angstrom,
+                    rmsd,
+                    "angstrom",
+                )
+            )
+            continue
+        if type(condition) is SymbolicBond:
+            endpoint_sites = []
+            for reference in (condition.site_a, condition.site_b):
+                if type(reference) is SymbolicAtomSite:
+                    mapped = residue_map[reference.residue]
+                    endpoint_sites.append(AtomSite(mapped[0], mapped[1], reference.atom_id))
+                else:
+                    mapped = residue_map.get((reference.instance_id, reference.component_index))
+                    endpoint_sites.append(
+                        reference if mapped is None else AtomSite(mapped[0], mapped[1], reference.atom_id)
+                    )
+            bond = any({value.site_a, value.site_b} == set(endpoint_sites) for value in candidate.system.bonds)
+            values.append((bond, None, None))
+            continue
+        if type(condition) is Contact:
+            side_a = _contact_coordinates(condition.side_a, candidate, residue_map, coordinate_index)
+            side_b = _contact_coordinates(condition.side_b, candidate, residue_map, coordinate_index)
+            if side_a and side_b:
+                distances = np.linalg.norm(
+                    np.asarray(side_a, dtype=np.float32)[:, None] - np.asarray(side_b, dtype=np.float32)[None],
+                    axis=-1,
+                )
+                minimum = float(distances.min())
+                values.append(
+                    (
+                        minimum <= condition.cutoff_angstrom + condition.tolerance_angstrom,
+                        minimum,
+                        "angstrom",
+                    )
+                )
+            else:
+                values.append((None, None, None))
+            continue
+        values.append((None, None, None))
+    return tuple(values)
+
+
+def _proper_alignment_distances(moving: np.ndarray, target: np.ndarray) -> np.ndarray:
+    if np.array_equal(moving, target):
+        return np.zeros(len(moving), dtype=np.float64)
+    moving_centered = moving - moving.mean(axis=0)
+    target_centered = target - target.mean(axis=0)
+    left, _singular, right = np.linalg.svd(moving_centered.T @ target_centered)
+    rotation = left @ right
+    if np.linalg.det(rotation) < 0:
+        left[:, -1] *= -1
+        rotation = left @ right
+    aligned = moving_centered @ rotation + target.mean(axis=0)
+    return np.linalg.norm(aligned - target, axis=-1)
+
+
+def _point_group_rmsd(observed: np.ndarray, rotations: np.ndarray) -> float:
+    center = observed.reshape(-1, 3).mean(axis=0)
+
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        frame = Rotation.from_rotvec(parameters[:3]).as_matrix()
+        origin = parameters[3:]
+        base = observed[0] - origin
+        predicted = np.stack([base @ frame @ rotation.T @ frame.T + origin for rotation in rotations])
+        return (predicted - observed).reshape(-1)
+
+    starts = (
+        np.zeros(3),
+        np.asarray([math.pi / 2, 0.0, 0.0]),
+        np.asarray([0.0, math.pi / 2, 0.0]),
+        np.asarray([0.0, 0.0, math.pi / 2]),
+        np.asarray([math.pi, 0.0, 0.0]),
+        np.asarray([0.0, math.pi, 0.0]),
+        np.asarray([0.0, 0.0, math.pi]),
+    )
+    fitted = least_squares(residual, np.concatenate((starts[0], center)))
+    best = residual(fitted.x).reshape(-1, 3)
+    for frame in starts[1:]:
+        fitted = least_squares(residual, np.concatenate((frame, center)))
+        values = residual(fitted.x).reshape(-1, 3)
+        if np.square(values).sum() < np.square(best).sum():
+            best = values
+    return float(np.sqrt(np.square(best).sum(axis=-1).mean()))
+
+
+def _contact_coordinates(
+    references: tuple[object, ...],
+    structure: Structure,
+    residue_map: Mapping[tuple[str, int] | SymbolicResidueSite, tuple[str, int]],
+    coordinate_index: Mapping[AtomSite, int],
+) -> list[np.ndarray]:
+    values: list[np.ndarray] = []
+    for reference in references:
+        mapped_sites: list[AtomSite] = []
+        if type(reference) in (tuple, SymbolicResidueSite):
+            mapped = residue_map.get(reference)
+            if mapped is not None:
+                coordinate = _residue_contact_coordinate(structure, mapped, coordinate_index)
+                if coordinate is not None:
+                    values.append(coordinate)
+        elif type(reference) is str:
+            for symbolic, mapped in residue_map.items():
+                if type(symbolic) is SymbolicResidueSite and symbolic.placement_id == reference:
+                    coordinate = _residue_contact_coordinate(structure, mapped, coordinate_index)
+                    if coordinate is not None:
+                        values.append(coordinate)
+        elif type(reference) is SymbolicAtomSite:
+            mapped = residue_map.get(reference.residue)
+            if mapped is not None:
+                mapped_sites.append(AtomSite(mapped[0], mapped[1], reference.atom_id))
+        else:
+            mapped = residue_map.get((reference.instance_id, reference.component_index))
+            mapped_sites.append(reference if mapped is None else AtomSite(mapped[0], mapped[1], reference.atom_id))
+        for site in mapped_sites:
+            index = coordinate_index.get(site)
+            if index is not None and bool(structure.coordinate_mask[index]):
+                values.append(structure.coordinates[index])
+    return values
+
+
+def _residue_contact_coordinate(
+    structure: Structure,
+    residue: tuple[str, int],
+    coordinate_index: Mapping[AtomSite, int],
+) -> np.ndarray | None:
+    entity = structure.system.entities[structure.system.instances[residue[0]]]
+    if entity.components[residue[1]].component_id == "GLY":
+        index = coordinate_index.get(AtomSite(residue[0], residue[1], "CA"))
+        return None if index is None else structure.coordinates[index]
+    indices = [coordinate_index.get(AtomSite(residue[0], residue[1], atom_name)) for atom_name in ("N", "CA", "C")]
+    if any(index is None or not bool(structure.coordinate_mask[index]) for index in indices):
+        return None
+    nitrogen, calpha, carbon = (structure.coordinates[index] for index in indices)  # type: ignore[index]
+    b = calpha - nitrogen
+    c = carbon - calpha
+    return -0.58273431 * np.cross(b, c) + 0.56802827 * b - 0.54067466 * c + calpha
+
+
+# ---------------------------------------------------------------------------
+# Folded from rfdiffusion/contract.py: RFdiffusion's exact tensor boundary and
+# semantic layout.  Records moved verbatim; the imports they need are declared
+# at the top of this module.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RFdiffusionLayout:
+    r"""Canonical identities required to realize denoised tensor rows.
+
+    ``output_residues[i]`` identifies row ``i`` as either an existing canonical
+    residue or one symbolic residue declared by the input placement.  Chain and
+    instance rows are explicit because RFdiffusion's internal residue numbers are
+    not canonical identities.  This is the only non-tensor leaf of
+    :class:`RFdiffusionInput` and is deliberately ignored by the denoiser graph.
+    """
+
+    system: MolecularSystem | None
+    structure: Structure | None
+    templates: tuple[Template, ...]
+    conditions: tuple[
+        AllowedResidueIdentities
+        | Contact
+        | Hotspot
+        | RFdiffusionPlacements
+        | Coordination
+        | Distance
+        | PointGroupSymmetry
+        | RadiusOfGyration
+        | ReferenceCoordinates
+        | SecondaryStructure
+        | SubstrateInteraction
+        | SymbolicBond,
+        ...,
+    ]
+    output_residues: tuple[ComponentReference | SymbolicResidueSite, ...]
+    output_instance_ids: tuple[str, ...]
+    # Family-owned §3.7 topology argument (RFdiffusion ContigMap.length): the combined
+    # generated length bounds across all inpaint chains, excluding receptor ExistingSpan
+    # rows. This is a concrete family operation argument (distinct from ODesign per-chain
+    # lengths and BoltzGen total_len), NOT a shared placement-core invariant. Defaulted None so the
+    # denoiser graph -- which ignores this non-tensor leaf -- is unaffected when absent.
+    combined_length: tuple[int, int] | None = None
+
+
+@dataclass(kw_only=True, eq=False)
+class RFdiffusionInput:
+    r"""One compile-friendly RFdiffusion denoiser input.
+
+    Every optional official condition channel has a neutral tensor value instead
+    of changing the object schema: all-false hotspots, class-3 (masked) secondary
+    structure, and class-2 (masked) block adjacency.
     """
 
     noisy_coords: Tensor
-    seq_t: Tensor
-    contig_map: ContigMap
-    mask_seq: Tensor
-    mask_str: Tensor
-    diffusion_mask: Tensor
-    binderlen: int
-    chain_idx: list[str]
-    pdb_index: list[int]
-    t_step_input: int
-    diffuser: Diffuser
-    denoiser: Denoiser
-    potential_manager: PotentialManager
-    symmetry: SymmetryGenerator | None = None
-    cyclic_reses: Tensor | None = None
-    ss: Tensor | None = None
-    adj: Tensor | None = None
-    target_ss: Tensor | None = None
-    target_adj: Tensor | None = None
-    target_pdb: dict[str, Any] | None = None
-    prev_pred: Tensor | None = None
-    clean_coords: Tensor | None = None
+    sequence: Tensor
+    residue_index: Tensor
+    fixed_structure_mask: Tensor
+    fixed_sequence_mask: Tensor
+    hotspot_mask: Tensor
+    cyclic_mask: Tensor
+    secondary_structure: Tensor
+    block_adjacency: Tensor
+    timestep: Tensor
+    layout: RFdiffusionLayout
 
 
-@dataclass(slots=True)
-class RfDiffusionSampleResult:
-    r"""
-    Output tensors and diagnostics from one completed RFdiffusion trajectory.
+@dataclass(eq=False)
+class RFdiffusionOutput:
+    r"""All released RoseTTAFold denoising and training-head outputs."""
 
-    Attributes:
-        coords: Final designed backbone coords.
-        sequence_tokens: Final designed sequence token ids.
-        plddt: Final per-residue pLDDT, or `None`.
-        trajectory: The stacked noised-coord trajectory over all steps.
-        pred_coords_trajectory: The stacked predicted-coord trajectory over all steps.
-        metadata: Run metadata (architecture, contig, sequence, timesteps, ...).
-    """
+    single: Tensor
+    pair: Tensor
+    backbone_coords: Tensor
+    state: Tensor
+    torsion_angles: Tensor
+    sequence_logits: Tensor
+    plddt: Tensor
+    distance_logits: tuple[Tensor, Tensor, Tensor, Tensor]
+    plddt_logits: Tensor
+    resolved_logits: Tensor
+    backbone_trajectory: Tensor
+    torsion_trajectory: Tensor
 
-    coords: Tensor
-    sequence_tokens: Tensor
-    plddt: Tensor | None
-    trajectory: Tensor
-    pred_coords_trajectory: Tensor
-    metadata: dict[str, Any]
+
+def symbolic_residue_aliases(
+    references: tuple[ComponentReference | SymbolicResidueSite, ...],
+) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
+    r"""Map canonical negative segment offsets to the concrete positive trajectory identities."""
+
+    segments: dict[str, list[SymbolicResidueSite]] = {}
+    for reference in references:
+        if type(reference) is SymbolicResidueSite:
+            segments.setdefault(reference.placement_id, []).append(reference)
+    return {
+        SymbolicResidueSite(placement_id, index - len(rows)): reference
+        for placement_id, rows in segments.items()
+        for index, reference in enumerate(rows)
+    }

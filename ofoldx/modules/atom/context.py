@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from torch import Tensor
 
 
-@dataclass(slots=True)
+@dataclass
 class AtomContext:
     r"""
     Precomputed atom-pair and per-atom conditioning tensors.
@@ -35,7 +35,7 @@ class AtomContext:
     conditioning: Tensor
 
 
-@dataclass(slots=True)
+@dataclass
 class AtomToTokenOutput:
     r"""
     Atom encoder output consumed by token embedders and coordinate decoders.

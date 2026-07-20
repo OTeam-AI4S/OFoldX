@@ -31,3 +31,15 @@ def test_schedule(scheduler: EdmScheduler, dtype: torch.dtype) -> None:
 def test_invalid_inputs() -> None:
     with pytest.raises(ValueError, match="num_sampling_steps"):
         EdmScheduler()(num_sampling_steps=0, dtype=torch.float32)
+    with pytest.raises(ValueError, match="max_noise_level"):
+        EdmScheduler()(dtype=torch.float32, max_noise_level=0.0)
+
+
+def test_call_can_override_the_initial_noise_level() -> None:
+    schedule = EdmScheduler(max_noise_level=10.0, sigma_data=16.0)(
+        num_sampling_steps=1,
+        dtype=torch.float32,
+        max_noise_level=2.0,
+    )
+
+    assert schedule.tolist() == pytest.approx([32.0, 0.0])

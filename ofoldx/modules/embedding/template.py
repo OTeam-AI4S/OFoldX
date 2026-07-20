@@ -18,7 +18,7 @@ from ..backend import LayerNorm
 from ..trunk.msa import TrianglePairUpdateBlock
 
 
-@dataclass(slots=True)
+@dataclass
 class TemplateFeatures:
     r"""
     Typed template features consumed by ``TemplateEmbedder``.
@@ -44,58 +44,6 @@ class TemplateFeatures:
     unit_vector: Tensor
     backbone_frame_mask: Tensor
     template_mask: Tensor | None = None
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-        non_blocking: bool = False,
-        copy: bool = False,
-    ) -> TemplateFeatures:
-        r"""
-        Return a copy with tensors moved to the requested device and dtype.
-
-        Floating-point features (distogram, masks, unit vectors) are cast to ``dtype``; the integer
-        ``residue_type`` and ``template_mask`` are moved but never cast, so their integer semantics are
-        preserved.
-
-        Args:
-            device: Optional destination device for all tensors.
-            dtype: Optional dtype for the floating-point features only.
-            non_blocking: Passed through to `torch.Tensor.to` for async host-to-device copies.
-            copy: Force a copy even when the move would otherwise be a no-op.
-
-        Returns:
-            A new ``TemplateFeatures`` with the same fields moved/cast as requested.
-
-        Examples:
-            >>> import torch
-            >>> templates = TemplateFeatures(
-            ...     distogram=torch.zeros(1, 1, 3, 3, 4),
-            ...     pseudo_beta_mask=torch.zeros(1, 1, 3, 3),
-            ...     residue_type=torch.zeros(1, 1, 3, dtype=torch.long),
-            ...     unit_vector=torch.zeros(1, 1, 3, 3, 3),
-            ...     backbone_frame_mask=torch.zeros(1, 1, 3, 3),
-            ... )
-            >>> moved = templates.to(dtype=torch.float64)
-            >>> moved.distogram.dtype, moved.residue_type.dtype
-            (torch.float64, torch.int64)
-        """
-
-        return type(self)(
-            distogram=self.distogram.to(device=device, dtype=dtype, non_blocking=non_blocking, copy=copy),
-            pseudo_beta_mask=self.pseudo_beta_mask.to(device=device, dtype=dtype, non_blocking=non_blocking, copy=copy),
-            residue_type=self.residue_type.to(device=device, non_blocking=non_blocking, copy=copy),
-            unit_vector=self.unit_vector.to(device=device, dtype=dtype, non_blocking=non_blocking, copy=copy),
-            backbone_frame_mask=self.backbone_frame_mask.to(
-                device=device, dtype=dtype, non_blocking=non_blocking, copy=copy
-            ),
-            template_mask=(
-                None
-                if self.template_mask is None
-                else self.template_mask.to(device=device, non_blocking=non_blocking, copy=copy)
-            ),
-        )
 
 
 class TemplateEmbedder(nn.Module):

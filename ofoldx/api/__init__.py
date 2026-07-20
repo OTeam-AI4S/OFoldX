@@ -1,9 +1,17 @@
-r"""
-Public command entry points.
-"""
+r"""The four standard biological task APIs."""
 
 from __future__ import annotations
 
-from .run import evaluate, infer, train
-
-__all__ = ["evaluate", "infer", "train"]
+from .tasks import (
+    DesignInput,
+    FoldInput,
+    MSAInput,
+    PackInput,
+    ScoreInput,
+    TemplateInput,
+    design,
+    fold,
+    pack,
+    pipeline,
+    score,
+)

@@ -16,7 +16,6 @@ from ..attention import (
     TriangleAttention,
     TriangleMultiplication,
 )
-from ..functional import checkpoint_blocks
 from ..transition import RowwiseDropout, Transition
 
 
@@ -24,9 +23,8 @@ class PairformerStack(nn.Module):
     r"""
     Stack of [`PairformerBlock`][ofoldx.modules.trunk.pairformer.PairformerBlock] run in sequence.
 
-    The stack applies ``num_blocks`` identical blocks under gradient checkpointing, grouped into
-    ``blocks_per_checkpoint``-sized segments. When ``single_size`` is ``0`` every block is pair-only and
-    the stack accepts (and returns) ``None`` for the single representation.
+    The stack applies ``num_blocks`` identical blocks in sequence. When ``single_size`` is ``0``
+    every block is pair-only and the stack accepts (and returns) ``None`` for the single representation.
 
     Args:
         num_blocks: Number of Pairformer blocks in the stack.
@@ -38,7 +36,6 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
         expansion: Feed-forward expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
-        blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables grouping.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -66,11 +63,10 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        blocks_per_checkpoint: int | None = None,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.blocks_per_checkpoint = blocks_per_checkpoint
+        self.single_size = single_size
         self.blocks = nn.ModuleList(
             [
                 PairformerBlock(
@@ -94,8 +90,8 @@ class PairformerStack(nn.Module):
         r"""
         Run every [`PairformerBlock`][ofoldx.modules.trunk.pairformer.PairformerBlock] in sequence.
 
-        Blocks are grouped into ``blocks_per_checkpoint``-sized gradient-checkpoint segments. A pair-only
-        stack (``single_size == 0``) is invoked with ``single=None`` and returns ``single`` as ``None``.
+        A pair-only stack (``single_size == 0``) is invoked with ``single=None`` and returns
+        ``single`` as ``None``.
 
         Args:
             single: Single representation `[B, N, single_size]`, or ``None`` for a pair-only stack.
@@ -118,13 +114,13 @@ class PairformerStack(nn.Module):
             (True, torch.Size([1, 3, 3, 4]))
         """
 
-        if single is None:
-            pair_blocks = [lambda pair, block=block: block(None, pair, pair_mask=pair_mask)[1] for block in self.blocks]
-            (pair,) = checkpoint_blocks(pair_blocks, (pair,), self.blocks_per_checkpoint)
+        if self.single_size == 0:
+            for block in self.blocks:
+                _, pair = block(None, pair, pair_mask=pair_mask)
             return None, pair
 
-        blocks = [lambda single, pair, block=block: block(single, pair, pair_mask=pair_mask) for block in self.blocks]
-        single, pair = checkpoint_blocks(blocks, (single, pair), self.blocks_per_checkpoint)
+        for block in self.blocks:
+            single, pair = block(single, pair, pair_mask=pair_mask)
         return single, pair
 
 
@@ -235,9 +231,6 @@ class PairformerBlock(nn.Module):
             Updated ``(single, pair)`` of shapes `[B, N, single_size]` (or ``None``) and
             `[B, N, N, pair_size]`.
 
-        Raises:
-            ValueError: If ``single_size > 0`` but ``single`` is ``None``.
-
         Examples:
             >>> import torch
             >>> block = PairformerBlock(
@@ -262,8 +255,6 @@ class PairformerBlock(nn.Module):
         )
         pair = pair + self.pair_feed_forward(pair)
         if self.pair_attention is not None and self.single_feed_forward is not None:
-            if single is None:
-                raise ValueError("single representation is required when single_size > 0")
             single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
             single = single + self.single_feed_forward(single)
         return single, pair

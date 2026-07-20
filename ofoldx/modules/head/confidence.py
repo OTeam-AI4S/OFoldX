@@ -1,405 +1,405 @@
 r"""
-Confidence cross-entropy losses.
+Shared confidence head for the AlphaFold 3 / Protenix families.
+
+Predicts pLDDT, PAE, PDE, and resolved logits from the trunk single/pair states and the predicted
+coordinates. AlphaFold 3 and Protenix share this parameterized head; the real architectural
+differences between the two families are exposed as constructor flags rather than duplicated code
+(mirroring the shared :class:`~ofoldx.modules.head.distogram.DistogramHead` precedent):
+
+- ``single_max_abs`` -- clamp on the trunk single before scoring (AlphaFold 3 ``None`` / unclamped,
+  Protenix ``512``).
+- ``use_single_norm`` -- Protenix applies one extra ``LayerNorm`` to the single before the sample
+  loop (upstream ``input_strunk_ln``); AlphaFold 3 does not.
+- ``use_distance_projection`` -- Protenix adds a raw-distance projection channel in the pair
+  embedder; AlphaFold 3 does not.
+- ``symmetrize_pde_before_projection`` -- Protenix symmetrizes the pair *state* before the PDE
+  norm/projection (upstream ``pde_ln(z + z.transpose(-2, -3))``); AlphaFold 3 symmetrizes the
+  projected *logits* (``left + swapaxes(left, -2, -3)``). ``LayerNorm`` is non-linear, so the two
+  are distinct functions.
+- ``persistent_distance_bins`` -- whether the distance-bin buffers appear in ``state_dict``
+  (Protenix persistent, AlphaFold 3 non-persistent).
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .distogram import distance_bin_indices, masked_cross_entropy
-from .frames import frame_aligned_error_squared, gather_atoms_by_index, gather_frame_atoms, insert_sample_axis
-from .lddt import compute_per_atom_lddt, lddt_bin_labels
+from ..atom import TokenToAtomBroadcast
+from ..backend import LayerNorm
+from ..trunk import PairformerStack
+from .frames import gather_atoms_by_index, insert_sample_axis
 
-_MOLECULE_RNA, _MOLECULE_DNA, _MOLECULE_LIGAND = 1, 2, 3
 
-
-class ConfidenceLoss(nn.Module):
+class ConfidenceHead(nn.Module):
     r"""
-    Cross-entropy losses for the confidence logits.
+    Predict pLDDT, PAE, PDE, and resolved logits from the trunk single/pair states and predicted coords.
 
-    Bundles the pLDDT, resolved-atom, predicted-aligned-error (PAE) and predicted-distance-error
-    (PDE) heads: [forward][ofoldx.modules.head.confidence.ConfidenceLoss.forward] derives the
-    per-head binned targets from predicted and ground-truth coords and averages the available
-    cross-entropy terms. Only pLDDT is mandatory; the other three are computed when their logits are
-    supplied.
+    Embeds representative-atom distances into the pair state, runs a small Pairformer stack, and projects to
+    the atom-level (pLDDT / resolved) and pair-level (PAE / PDE) confidence logits. Each diffusion sample is
+    scored independently and the per-sample logits are stacked on a leading sample axis.
 
     Args:
-        distance_error_max: Maximum error distance used to bin the aligned and pair distance errors.
-
-    Examples:
-        >>> loss = ConfidenceLoss(distance_error_max=32.0)
-        >>> loss.distance_error_max
-        32.0
+        single_size: Width of the single (token) representation.
+        pair_size: Width of the pair representation.
+        token_feature_size: Width of the packed per-token feature vector.
+        distance_bin_start: Lower edge of the representative-distance one-hot bins in Angstrom.
+        distance_bin_end: Upper edge of the representative-distance one-hot bins in Angstrom.
+        distance_bin_step: Width of each representative-distance bin in Angstrom.
+        num_plddt_bins: Number of pLDDT bins.
+        num_resolved_bins: Number of resolved-classification bins.
+        max_atoms_per_token: Maximum atoms per token, sizing the per-offset weight tables.
+        num_pae_bins: Number of predicted-aligned-error bins.
+        num_pde_bins: Number of predicted-distance-error bins.
+        num_blocks: Number of Pairformer blocks in the confidence stack.
+        num_pair_attention_heads: Number of pair-attention heads in the Pairformer stack.
+        triangle_multiplication_hidden_size: Hidden width of the triangle-multiplication updates.
+        triangle_attention_hidden_size: Per-head width of the triangle-attention updates.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        expansion: Feed-forward expansion factor in the Pairformer transitions.
+        dropout: Pairformer dropout probability.
+        single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
+        use_single_norm: Whether to apply a ``LayerNorm`` to the single before the sample loop (Protenix).
+        use_distance_projection: Whether the pair embedder adds a raw-distance projection channel (Protenix).
+        symmetrize_pde_before_projection: Whether the PDE projector symmetrizes the pair state before the
+            norm/projection (Protenix) instead of symmetrizing the projected logits (AlphaFold 3).
+        persistent_distance_bins: Whether the distance-bin buffers are stored in ``state_dict`` (Protenix).
     """
 
-    def __init__(self, distance_error_max: float = 32.0) -> None:
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+        num_plddt_bins: int = 50,
+        num_resolved_bins: int = 2,
+        max_atoms_per_token: int = 24,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        num_blocks: int = 4,
+        num_pair_attention_heads: int = 16,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        single_max_abs: float | None = 512.0,
+        use_single_norm: bool = False,
+        use_distance_projection: bool = True,
+        symmetrize_pde_before_projection: bool = True,
+        persistent_distance_bins: bool = True,
+    ) -> None:
         super().__init__()
-        self.distance_error_max = distance_error_max
+        self.single_max_abs = single_max_abs
+        self.single_norm = LayerNorm(single_size) if use_single_norm else None
+        self.pair_embedder = ConfidencePairEmbedder(
+            pair_size=pair_size,
+            token_feature_size=token_feature_size,
+            distance_bin_start=distance_bin_start,
+            distance_bin_end=distance_bin_end,
+            distance_bin_step=distance_bin_step,
+            use_distance_projection=use_distance_projection,
+            persistent_distance_bins=persistent_distance_bins,
+        )
+        self.pairformer_stack = PairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+        )
+        self.atom_projector = AtomConfidenceProjector(
+            single_size=single_size,
+            num_plddt_bins=num_plddt_bins,
+            num_resolved_bins=num_resolved_bins,
+            max_atoms_per_token=max_atoms_per_token,
+        )
+        self.pair_projector = PairConfidenceProjector(
+            pair_size=pair_size,
+            num_pae_bins=num_pae_bins,
+            num_pde_bins=num_pde_bins,
+            symmetrize_before_projection=symmetrize_pde_before_projection,
+        )
 
     def forward(
         self,
-        *,
+        single: Tensor,
+        pair: Tensor,
+        token_embedding: Tensor,
         pred_coords: Tensor,
-        target_positions: Tensor,
-        target_mask: Tensor,
-        representative_atom_mask: Tensor,
         token_to_rep_atom: Tensor,
-        frame_atom_index: Tensor,
-        frame_mask: Tensor,
-        molecule_type: Tensor,
         atom_to_token: Tensor,
-        atom_mask: Tensor,
-        plddt_logits: Tensor,
-        resolved_logits: Tensor | None = None,
-        pae_logits: Tensor | None = None,
-        pde_logits: Tensor | None = None,
-    ) -> Tensor:
+        atom_token_index: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
-        Return the average confidence loss over available logits.
-
-        ``representative_atom_mask`` is the per-atom polymer-neighbour mask used multiplicatively by
-        the pLDDT target; ``token_to_rep_atom`` is the per-token global rep-atom gather index used to
-        select representative coords for the frame/pair losses (a per-element gather that supports
-        batched/sampled leading dims, replacing a boolean mask over the atom axis).
+        Return atom-level and token-pair confidence logits for every predicted sample.
 
         Args:
-            pred_coords: `[..., num_samples, N_atom, 3]` predicted coords.
-            target_positions: `[..., N_atom, 3]` target coords.
-            target_mask: `[..., N_atom]` valid-target mask.
-            representative_atom_mask: `[..., N_atom]` neighbour-eligibility mask for LDDT.
-            token_to_rep_atom: `[..., N_token]` representative atom indices.
-            frame_atom_index: `[..., N_token, 3]` frame atom indices.
-            frame_mask: `[..., N_token]` frame-validity mask.
-            molecule_type: `[..., N_token]` molecule type ids.
-            atom_to_token: `[..., N_atom]` token index for each atom.
-            atom_mask: `[..., N_atom]` valid-atom mask.
-            plddt_logits: pLDDT logits (mandatory).
-            resolved_logits: Optional resolved-atom logits.
-            pae_logits: Optional predicted aligned-error logits.
-            pde_logits: Optional predicted distance-error logits.
+            single: Token single representation ``(..., N_token, single_size)``.
+            pair: Token pair representation ``(..., N_token, N_token, pair_size)``.
+            token_embedding: Token embedding ``(..., N_token, token_feature_size)``.
+            pred_coords: Predicted atom coords ``(..., N_sample, N_atom, 3)``.
+            token_to_rep_atom: Representative atom index for each token ``(..., N_token)``.
+            atom_to_token: Token index for each atom ``(..., N_atom)``.
+            atom_token_index: Within-token atom offset for each atom ``(..., N_atom)``.
+            pair_mask: Optional boolean token-pair validity mask ``(..., N_token, N_token)``.
 
         Returns:
-            Scalar average over the available confidence loss terms.
-
-        Examples:
-            >>> import torch  # doctest: +SKIP
-            >>> loss = ConfidenceLoss()  # doctest: +SKIP
-            >>> loss(  # doctest: +SKIP
-            ...     pred_coords=pred_coords,
-            ...     target_positions=target_positions,
-            ...     target_mask=target_mask,
-            ...     representative_atom_mask=representative_atom_mask,
-            ...     token_to_rep_atom=token_to_rep_atom,
-            ...     frame_atom_index=frame_atom_index,
-            ...     frame_mask=frame_mask,
-            ...     molecule_type=molecule_type,
-            ...     atom_to_token=atom_to_token,
-            ...     atom_mask=atom_mask,
-            ...     plddt_logits=plddt_logits,
-            ... )
+            pLDDT, PAE, PDE, and resolved logits, each with a leading per-sample axis.
         """
 
-        losses = [
-            self._plddt_loss(
-                plddt_logits,
-                pred_coords=pred_coords,
-                target_positions=target_positions,
-                target_mask=target_mask,
-                representative_atom_mask=representative_atom_mask,
-                token_to_rep_atom=token_to_rep_atom,
-                molecule_type=molecule_type,
-                atom_to_token=atom_to_token,
-            )
-        ]
-        if resolved_logits is not None:
-            losses.append(
-                self._resolved_loss(
-                    resolved_logits,
-                    target_mask=target_mask,
-                    atom_mask=atom_mask,
-                    token_to_rep_atom=token_to_rep_atom,
-                )
-            )
-        if pae_logits is not None:
-            losses.append(
-                self._frame_aligned_error_loss(
-                    pae_logits,
-                    pred_coords=pred_coords,
-                    target_positions=target_positions,
-                    target_mask=target_mask,
-                    token_to_rep_atom=token_to_rep_atom,
-                    frame_atom_index=frame_atom_index,
-                    frame_mask=frame_mask,
-                )
-            )
-        if pde_logits is not None:
-            losses.append(
-                self._pair_error_loss(
-                    pde_logits,
-                    pred_coords=pred_coords,
-                    target_positions=target_positions,
-                    target_mask=target_mask,
-                    token_to_rep_atom=token_to_rep_atom,
-                )
-            )
-        return torch.stack(losses).mean()
-
-    def _plddt_loss(
-        self,
-        logits: Tensor,
-        *,
-        pred_coords: Tensor,
-        target_positions: Tensor,
-        target_mask: Tensor,
-        representative_atom_mask: Tensor,
-        token_to_rep_atom: Tensor,
-        molecule_type: Tensor,
-        atom_to_token: Tensor,
-    ) -> Tensor:
-        r"""
-        Per-atom LDDT target binned for the pLDDT cross-entropy.
-
-        The label is the relative-distance-preservation score against polymer representative-atom
-        neighbours within the locality radius, NOT an absolute positional error.
-
-        Args:
-            logits: pLDDT logits with the bin axis last, targeting either atoms or tokens.
-            pred_coords: `[..., num_samples, N_atom, 3]` predicted coords.
-            target_positions: `[..., N_atom, 3]` target coords.
-            target_mask: `[..., N_atom]` valid-target mask.
-            representative_atom_mask: `[..., N_atom]` neighbour-eligibility mask.
-            token_to_rep_atom: `[..., N_token]` representative atom indices.
-            molecule_type: `[..., N_token]` molecule type ids.
-            atom_to_token: `[..., N_atom]` token index for each atom.
-
-        Returns:
-            Scalar masked cross-entropy loss for the pLDDT head.
-        """
-
-        target_positions = target_positions.to(device=logits.device, dtype=logits.dtype)
-        pred_coords = pred_coords.to(dtype=logits.dtype)
-        atom_molecule_type = torch.gather(
-            molecule_type.to(device=logits.device), -1, atom_to_token.to(device=logits.device)
-        )  # [..., N_atom]
-        is_nucleotide = (atom_molecule_type == _MOLECULE_RNA) | (atom_molecule_type == _MOLECULE_DNA)
-        is_polymer = atom_molecule_type != _MOLECULE_LIGAND
-        neighbor_mask = representative_atom_mask.to(device=logits.device).bool() & is_polymer
-
-        per_atom_lddt, per_atom_weight = compute_per_atom_lddt(
-            pred_coords,
-            target_positions,
-            neighbor_mask=neighbor_mask,
-            is_nucleotide=is_nucleotide,
-        )
-        labels = lddt_bin_labels(per_atom_lddt, per_atom_weight, num_bins=logits.shape[-1])
-        labels, mask = _match_atom_or_token_axis(
-            logits,
-            atom_labels=labels,
-            atom_mask=target_mask.to(device=logits.device).bool(),
-            token_to_rep_atom=token_to_rep_atom,
-        )
-        return masked_cross_entropy(logits, labels, mask)
-
-    @staticmethod
-    def _resolved_loss(
-        logits: Tensor,
-        *,
-        target_mask: Tensor,
-        atom_mask: Tensor,
-        token_to_rep_atom: Tensor,
-    ) -> Tensor:
-        r"""
-        Binary resolved-atom cross-entropy over atoms or tokens.
-
-        Args:
-            logits: Resolved-atom logits with a 2-class axis last, targeting atoms or tokens.
-            target_mask: `[..., N_atom]` whether a resolved coordinate exists (the 2-class target).
-            atom_mask: `[..., N_atom]` whether the atom physically exists (the averaging mask).
-            token_to_rep_atom: `[..., N_token]` representative atom indices for a token-level head.
-
-        Returns:
-            Scalar masked cross-entropy loss for the resolved-atom head.
-
-        Raises:
-            ValueError: If ``logits`` targets neither the atom nor the token axis.
-        """
-
-        # Per-atom 2-class target: whether a resolved coordinate exists (``target_mask``). The loss is masked by
-        # ``atom_mask`` (whether the atom physically exists) so padded atoms do not pollute the mean.
-        target_mask = target_mask.to(device=logits.device).bool()
-        atom_mask = atom_mask.to(device=logits.device).bool()
-        num_samples = logits.shape[-3]
-        if logits.shape[-2] == target_mask.shape[-1]:
-            labels = insert_sample_axis(target_mask.long(), num_samples, dim=-2)
-            mask = insert_sample_axis(atom_mask, num_samples, dim=-2)
-        elif logits.shape[-2] == token_to_rep_atom.shape[-1]:
-            rep_index = token_to_rep_atom.to(device=logits.device, dtype=torch.long)
-            labels = insert_sample_axis(torch.gather(target_mask.long(), -1, rep_index), num_samples, dim=-2)
-            mask = insert_sample_axis(torch.gather(atom_mask, -1, rep_index), num_samples, dim=-2)
-        else:
-            raise ValueError(
-                "resolved logits must target either atoms or tokens: "
-                f"logits axis={logits.shape[-2]}, atoms={target_mask.shape[-1]}, "
-                f"tokens={token_to_rep_atom.shape[-1]}"
-            )
-        return masked_cross_entropy(logits, labels, mask)
-
-    def _frame_aligned_error_loss(
-        self,
-        logits: Tensor,
-        *,
-        pred_coords: Tensor,
-        target_positions: Tensor,
-        target_mask: Tensor,
-        token_to_rep_atom: Tensor,
-        frame_atom_index: Tensor,
-        frame_mask: Tensor,
-    ) -> Tensor:
-        r"""
-        Frame-based predicted aligned error binned into PAE classes.
-
-        Each token's representative atom is expressed in every token's ``(N, CA, C)`` frame for both
-        the prediction and ground truth; the per-frame/per-token distance between the two becomes the
-        binned PAE label, masked to valid frames and resolved tokens.
-
-        Args:
-            logits: PAE logits with the bin axis last.
-            pred_coords: `[..., num_samples, N_atom, 3]` predicted coords.
-            target_positions: `[..., N_atom, 3]` target coords.
-            target_mask: `[..., N_atom]` valid-target mask.
-            token_to_rep_atom: `[..., N_token]` representative atom indices.
-            frame_atom_index: `[..., N_token, 3]` frame atom indices.
-            frame_mask: `[..., N_token]` frame-validity mask.
-
-        Returns:
-            Scalar masked cross-entropy loss for the PAE head.
-        """
-
-        target_positions = target_positions.to(device=logits.device, dtype=logits.dtype)
-        pred_coords = pred_coords.to(dtype=logits.dtype)
-        frame_atom_index = frame_atom_index.to(device=logits.device)
-        rep_index = token_to_rep_atom.to(device=logits.device, dtype=torch.long)  # [..., N_token]
+        if self.single_max_abs is not None:
+            single = torch.clamp(single, min=-self.single_max_abs, max=self.single_max_abs)
+        if self.single_norm is not None:
+            single = self.single_norm(single)
+        # Select each token's representative-atom coordinate by gathering on the per-token global atom index
+        # (replaces a boolean mask over the atom axis; supports batched/sampled leading dims). pred_coords
+        # is ``[..., N_sample, N_atom, 3]``; insert the sample axis into the per-token index before gathering.
+        rep_index = token_to_rep_atom.to(device=pred_coords.device, dtype=torch.long)
         num_samples = pred_coords.shape[-3]
-
-        # Insert the sample axis (frame index has a trailing static 3, so the sample axis goes at -3)
-        # and expand only that axis so the token axis is left as-is.
-        sample_frame_index = insert_sample_axis(frame_atom_index, num_samples, dim=-3)
-        pred_frames = gather_frame_atoms(pred_coords, sample_frame_index)  # [..., S, N_token, 3, 3]
-        true_frames = gather_frame_atoms(target_positions, frame_atom_index)  # [..., N_token, 3, 3]
-
-        # Gather each token's representative-atom centre by per-token global atom index.
         sample_rep_index = insert_sample_axis(rep_index, num_samples)
-        pred_centers = gather_atoms_by_index(pred_coords, sample_rep_index)  # [..., S, N_token, 3]
-        true_centers = gather_atoms_by_index(target_positions, rep_index)  # [..., N_token, 3]
-        squared_error = frame_aligned_error_squared(pred_centers, true_centers, pred_frames, true_frames)
-        errors = squared_error.clamp_min(0.0).sqrt()  # [..., S, N_frame, N_token]
+        representative_coords = gather_atoms_by_index(pred_coords, sample_rep_index)
 
-        labels = distance_bin_indices(
-            errors,
-            num_bins=logits.shape[-1],
-            min_distance=0.0,
-            max_distance=self.distance_error_max,
+        plddt_logits = []
+        pae_logits = []
+        pde_logits = []
+        resolved_logits = []
+        for representative_coords_sample in representative_coords.unbind(dim=-3):
+            sample_pair = self.pair_embedder(pair, token_embedding, representative_coords_sample)
+            sample_single, sample_pair = self.pairformer_stack(single, sample_pair, pair_mask=pair_mask)
+            sample_plddt, sample_resolved = self.atom_projector(sample_single, atom_to_token, atom_token_index)
+            sample_pae, sample_pde = self.pair_projector(sample_pair)
+            plddt_logits.append(sample_plddt)
+            pae_logits.append(sample_pae)
+            pde_logits.append(sample_pde)
+            resolved_logits.append(sample_resolved)
+
+        return (
+            torch.stack(plddt_logits, dim=-3),
+            torch.stack(pae_logits, dim=-4),
+            torch.stack(pde_logits, dim=-4),
+            torch.stack(resolved_logits, dim=-3),
         )
-        frame_mask = frame_mask.to(device=logits.device).bool()  # [..., N_token]
-        token_mask = torch.gather(target_mask.to(device=logits.device).bool(), -1, rep_index)  # [..., N_token]
-        pair_mask = frame_mask.unsqueeze(-1) & token_mask.unsqueeze(-2)  # [..., N_frame, N_token]
-        # Add the sample axis (-1 on the other dims) so the mask aligns with ``labels`` for the cross entropy.
-        pair_mask = insert_sample_axis(pair_mask, labels.shape[-3], dim=-3)
-        return masked_cross_entropy(logits, labels, pair_mask)
-
-    def _pair_error_loss(
-        self,
-        logits: Tensor,
-        *,
-        pred_coords: Tensor,
-        target_positions: Tensor,
-        target_mask: Tensor,
-        token_to_rep_atom: Tensor,
-    ) -> Tensor:
-        r"""
-        Predicted-distance-error cross-entropy over token-pair representative distances.
-
-        The absolute difference between predicted and target pairwise representative-atom distances
-        is binned into PDE classes and compared against ``logits``, masked to token pairs whose both
-        tokens have a resolved target.
-
-        Args:
-            logits: PDE logits with the bin axis last.
-            pred_coords: `[..., num_samples, N_atom, 3]` predicted coords.
-            target_positions: `[..., N_atom, 3]` target coords.
-            target_mask: `[..., N_atom]` valid-target mask.
-            token_to_rep_atom: `[..., N_token]` representative atom indices.
-
-        Returns:
-            Scalar masked cross-entropy loss for the PDE head.
-        """
-
-        target_positions = target_positions.to(device=logits.device, dtype=logits.dtype)
-        rep_index = token_to_rep_atom.to(device=logits.device, dtype=torch.long)  # [..., N_token]
-        num_samples = pred_coords.shape[-3]
-
-        # Gather each token's representative-atom coordinate by per-token global atom index.
-        sample_rep_index = insert_sample_axis(rep_index, num_samples)
-        predicted_representatives = gather_atoms_by_index(pred_coords, sample_rep_index).to(logits.dtype)
-        target_representatives = gather_atoms_by_index(target_positions, rep_index)
-        target_representatives = target_representatives.unsqueeze(-3)
-        token_mask = torch.gather(target_mask.to(device=logits.device).bool(), -1, rep_index)  # [..., N_token]
-        # Pairwise representative-atom distances.
-        pred = predicted_representatives.float()
-        predicted_distances = torch.cdist(pred, pred).to(logits.dtype)
-        tgt = target_representatives.float()
-        target_distances = torch.cdist(tgt, tgt).to(logits.dtype)
-        distance_errors = (predicted_distances - target_distances).abs()
-        labels = distance_bin_indices(
-            distance_errors,
-            num_bins=logits.shape[-1],
-            min_distance=0.0,
-            max_distance=self.distance_error_max,
-        )
-        pair_mask = token_mask.unsqueeze(-1) & token_mask.unsqueeze(-2)
-        # Add the sample axis (-1 on the other dims) so the mask aligns with ``labels``.
-        pair_mask = insert_sample_axis(pair_mask, labels.shape[-3], dim=-3)
-        return masked_cross_entropy(logits, labels, pair_mask)
 
 
-def _match_atom_or_token_axis(
-    logits: Tensor,
-    *,
-    atom_labels: Tensor,
-    atom_mask: Tensor,
-    token_to_rep_atom: Tensor,
-) -> tuple[Tensor, Tensor]:
+class ConfidencePairEmbedder(nn.Module):
     r"""
-    Return labels/mask aligned to either an atom-level or token-level confidence head.
+    Augment the pair state with token-embedding projections and representative-atom distance features.
 
-    The head is inferred from ``logits.shape[-2]``: when it matches the atom count the atom-level
-    labels/mask pass through, and when it matches the token count they are gathered down to the
-    per-token representative atoms.
+    Adds left/right token-embedding projections plus a binned one-hot projection of the representative-atom
+    pairwise distances, so the confidence Pairformer sees the predicted geometry. When
+    ``use_distance_projection`` is set (Protenix), an additional raw-distance projection channel is added.
 
     Args:
-        logits: Confidence logits whose ``-2`` axis is either the atom or token count.
-        atom_labels: `[..., num_samples, N_atom]` atom-level integer bin labels.
-        atom_mask: `[..., N_atom]` atom-level averaging mask.
-        token_to_rep_atom: `[..., N_token]` representative atom indices.
-
-    Returns:
-        ``(labels, mask)`` aligned to the inferred head, each with a materialized sample axis.
-
-    Raises:
-        ValueError: If ``logits`` targets neither the atom nor the token axis.
+        pair_size: Width of the pair representation.
+        token_feature_size: Width of the packed per-token feature vector.
+        distance_bin_start: Lower edge of the distance one-hot bins in Angstrom.
+        distance_bin_end: Upper edge of the distance one-hot bins in Angstrom.
+        distance_bin_step: Width of each distance bin in Angstrom.
+        use_distance_projection: Whether to add a raw-distance projection channel (Protenix).
+        persistent_distance_bins: Whether the distance-bin buffers appear in ``state_dict`` (Protenix).
     """
 
-    num_samples = atom_labels.shape[-2]
-    if logits.shape[-2] == atom_labels.shape[-1]:
-        return atom_labels, insert_sample_axis(atom_mask, num_samples, dim=-2)
-    if logits.shape[-2] == token_to_rep_atom.shape[-1]:
-        rep_index = token_to_rep_atom.to(device=logits.device, dtype=torch.long)
-        sample_rep_index = insert_sample_axis(rep_index, num_samples, dim=-2)
-        token_labels = torch.gather(atom_labels, -1, sample_rep_index)
-        token_mask = torch.gather(atom_mask, -1, rep_index)
-        return token_labels, insert_sample_axis(token_mask, num_samples, dim=-2)
-    raise ValueError(
-        "pLDDT logits must target either atoms or tokens: "
-        f"logits axis={logits.shape[-2]}, atoms={atom_labels.shape[-1]}, tokens={token_to_rep_atom.shape[-1]}"
-    )
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+        use_distance_projection: bool = True,
+        persistent_distance_bins: bool = True,
+    ) -> None:
+        super().__init__()
+        self.left_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        self.right_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        buffer_device = self.left_token_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        lower_bins = torch.arange(
+            distance_bin_start,
+            distance_bin_end,
+            distance_bin_step,
+            device=buffer_device,
+            dtype=self.left_token_projection.weight.dtype,
+        )
+        upper_bins = torch.cat([lower_bins[1:], lower_bins.new_tensor([torch.inf])], dim=-1)
+        self.lower_bins: Tensor
+        self.upper_bins: Tensor
+        self.register_buffer("lower_bins", lower_bins, persistent=persistent_distance_bins)
+        self.register_buffer("upper_bins", upper_bins, persistent=persistent_distance_bins)
+        self.distance_one_hot_projection = nn.Linear(len(lower_bins), pair_size, bias=False)
+        self.distance_projection = nn.Linear(1, pair_size, bias=False) if use_distance_projection else None
+
+    def forward(self, pair: Tensor, token_embedding: Tensor, representative_coords: Tensor) -> Tensor:
+        r"""
+        Add token-projection and representative-distance channels to the pair state.
+
+        Args:
+            pair: Token pair state ``(..., N_token, N_token, pair_size)``.
+            token_embedding: Token features ``(..., N_token, token_feature_size)``.
+            representative_coords: Representative-atom coords ``(..., N_token, 3)``.
+
+        Returns:
+            Updated pair state ``(..., N_token, N_token, pair_size)``.
+        """
+
+        pair = pair + self.left_token_projection(token_embedding).unsqueeze(-2)
+        pair = pair + self.right_token_projection(token_embedding).unsqueeze(-3)
+        # torch.cdist does not implement CUDA bf16; keep the cast local to this distance calculation.
+        distance = torch.cdist(representative_coords.to(torch.float32), representative_coords.to(torch.float32))
+        distance_bins = ((distance[..., None] > self.lower_bins) & (distance[..., None] < self.upper_bins)).to(
+            distance.dtype
+        )
+        pair = pair + self.distance_one_hot_projection(distance_bins)
+        if self.distance_projection is not None:
+            pair = pair + self.distance_projection(distance.unsqueeze(-1))
+        return pair
+
+
+class AtomConfidenceProjector(nn.Module):
+    r"""
+    Project token single representations to per-atom pLDDT and resolved logits.
+
+    Broadcasts each token's single representation to its atoms, then contracts each atom's normalized
+    features against the weight matrix selected by its within-token offset, giving a distinct projection
+    per atom position.
+
+    Args:
+        single_size: Width of the single (token) representation.
+        num_plddt_bins: Number of pLDDT bins.
+        num_resolved_bins: Number of resolved-classification bins.
+        max_atoms_per_token: Maximum atoms per token, sizing the per-offset weight tables.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        num_plddt_bins: int = 50,
+        num_resolved_bins: int = 2,
+        max_atoms_per_token: int = 24,
+    ):
+        super().__init__()
+        self.plddt_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_plddt_bins))
+        self.resolved_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_resolved_bins))
+        self.plddt_norm = LayerNorm(single_size)
+        self.resolved_norm = LayerNorm(single_size)
+        self.token_to_atom_broadcast = TokenToAtomBroadcast()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""
+        Zero-initialize the per-atom-offset pLDDT and resolved weight tensors.
+        """
+
+        nn.init.zeros_(self.plddt_weight)
+        nn.init.zeros_(self.resolved_weight)
+
+    def forward(self, single: Tensor, atom_to_token: Tensor, atom_token_index: Tensor) -> tuple[Tensor, Tensor]:
+        r"""
+        Broadcast token singles to atoms and project to per-atom pLDDT/resolved logits.
+
+        Args:
+            single: Token single representation ``(..., N_token, single_size)``.
+            atom_to_token: Token index per atom ``(..., N_atom)``.
+            atom_token_index: Within-token atom offset per atom ``(..., N_atom)``.
+
+        Returns:
+            ``(plddt_logits, resolved_logits)`` with shapes ``(..., N_atom, num_plddt_bins)`` and
+            ``(..., N_atom, num_resolved_bins)``.
+        """
+
+        atom_single = self.token_to_atom_broadcast(single, atom_to_token)
+        atom_token_index = atom_token_index.to(device=single.device, dtype=torch.long)
+        plddt_weight = self._gather_atom_weight(self.plddt_weight, atom_token_index)
+        resolved_weight = self._gather_atom_weight(self.resolved_weight, atom_token_index)
+        plddt_logits = torch.einsum("...nc,...ncb->...nb", self.plddt_norm(atom_single), plddt_weight)
+        resolved_logits = torch.einsum("...nc,...ncb->...nb", self.resolved_norm(atom_single), resolved_weight)
+        return plddt_logits, resolved_logits
+
+    def _gather_atom_weight(self, weight: Tensor, atom_token_index: Tensor) -> Tensor:
+        r"""
+        Select each atom's per-within-token-offset weight matrix ``[..., N_atom, C, B]`` per element.
+
+        ``F.embedding`` on the flattened ``[max_atoms_per_token, C*B]`` table gathers a per-element (batched)
+        ``atom_token_index`` correctly — unlike dense-parameter advanced indexing ``weight[atom_token_index]``
+        with the ``ncb`` einsum, which assumes one shared 1-D index (bsz=1). The trailing ``C*B -> (C, B)`` split
+        is over static dims. (Out-of-range offsets raise in ``F.embedding``; no ``.max()`` sync needed.)
+        """
+
+        num_offsets, channels, bins = weight.shape
+        gathered = F.embedding(atom_token_index, weight.reshape(num_offsets, channels * bins))
+        return gathered.reshape(*gathered.shape[:-1], channels, bins)
+
+
+class PairConfidenceProjector(nn.Module):
+    r"""
+    Project the pair representation to PAE and (symmetrized) PDE logits.
+
+    PAE is projected from the normalized pair state. The PDE symmetrization convention differs between
+    families and is selected by ``symmetrize_before_projection``:
+
+    - ``False`` (AlphaFold 3): symmetrize the projected distance-error *logits* --
+      ``left = pde_projection(pde_norm(pair)); pde = left + left.transpose(-2, -3)`` -- matching DeepMind
+      (``confidence_head.py``: ``left + swapaxes(left, -2, -3)``).
+    - ``True`` (Protenix): symmetrize the pair *state* before the norm/projection --
+      ``pde = pde_projection(pde_norm(pair + pair.transpose(-2, -3)))`` -- matching Protenix
+      (``confidence.py``: ``pde_ln(z + z.transpose(-2, -3))``).
+
+    Because ``LayerNorm`` is non-linear, the two conventions are distinct functions.
+
+    Args:
+        pair_size: Width of the pair representation.
+        num_pae_bins: Number of predicted-aligned-error bins.
+        num_pde_bins: Number of predicted-distance-error bins.
+        symmetrize_before_projection: Whether to symmetrize the pair state before the PDE norm/projection
+            (Protenix) instead of symmetrizing the projected logits (AlphaFold 3).
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        symmetrize_before_projection: bool = True,
+    ) -> None:
+        super().__init__()
+        self.symmetrize_before_projection = symmetrize_before_projection
+        self.pae_norm = LayerNorm(pair_size)
+        self.pde_norm = LayerNorm(pair_size)
+        self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+        self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+
+    def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:
+        r"""
+        Project the pair state to PAE and (symmetrized) PDE logits.
+
+        Args:
+            pair: Token pair state ``(..., N_token, N_token, pair_size)``.
+
+        Returns:
+            ``(pae_logits, pde_logits)`` with shapes ``(..., N_token, N_token, num_pae_bins)`` and
+            ``(..., N_token, N_token, num_pde_bins)``.
+        """
+
+        pae_logits = self.pae_projection(self.pae_norm(pair))
+        if self.symmetrize_before_projection:
+            pde_logits = self.pde_projection(self.pde_norm(pair + pair.transpose(-2, -3)))
+        else:
+            # DeepMind symmetrizes the distance-error LOGITS, not the pair state: it projects the raw
+            # (unsymmetrized) pair through ``LayerNorm`` + ``left_half_distance_logits`` and only then
+            # adds the transpose (``confidence_head.py``: ``left + swapaxes(left, -2, -3)``).  Because
+            # ``LayerNorm`` is non-linear, symmetrizing the pair *before* the norm/projection is a
+            # different function and diverges from the checkpoint; symmetrize after.
+            left_distance_logits = self.pde_projection(self.pde_norm(pair))
+            pde_logits = left_distance_logits + left_distance_logits.transpose(-2, -3)
+        return pae_logits, pde_logits

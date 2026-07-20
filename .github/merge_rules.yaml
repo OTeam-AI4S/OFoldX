@@ -1,6 +1,6 @@
 - name: merge
   patterns:
-    - allodesign/**
+    - ofoldx/**
   approved_by:
     - ZhiyuanChen
   mandatory_checks_name:

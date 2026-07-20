@@ -16,24 +16,17 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-@pytest.mark.parametrize("count_eps", [0.0, 1e-6])
 @pytest.mark.parametrize("extra_prefix", [(), (1,)])
-def test_atom_token_transfer(count_eps: float, extra_prefix: tuple[int, ...]) -> None:
+def test_atom_token_transfer(extra_prefix: tuple[int, ...]) -> None:
     # masked-out atom 1 drops from both sum and count, so token 0 = [1,2]/1, token 1 = ([5,10]+[7,14])/2.
     atom_hidden = torch.tensor([[[1.0, 2.0], [3.0, 6.0], [5.0, 10.0], [7.0, 14.0]]])
     atom_to_token = torch.tensor([[0, 0, 1, 1]])
     atom_mask = torch.tensor([[True, False, True, True]])
 
-    # count_eps softens the denominator from clamp(count, 1) to count + eps: each mean scales by count/(count+eps).
-    token0_scale = 1.0 / (1.0 + count_eps) if count_eps else 1.0
-    token1_scale = 2.0 / (2.0 + count_eps) if count_eps else 1.0
-    expected = torch.tensor(
-        [[[1.0 * token0_scale, 2.0 * token0_scale], [6.0 * token1_scale, 12.0 * token1_scale], [0.0, 0.0]]]
-    )
+    expected = torch.tensor([[[1.0, 2.0], [6.0, 12.0], [0.0, 0.0]]])
 
-    token_hidden = scatter_mean_to_tokens(atom_hidden, atom_to_token, 3, atom_mask, count_eps=count_eps)
-    # tight tol so the ~5e-7 count_eps shift is discriminated, not absorbed
-    torch.testing.assert_close(token_hidden, expected, rtol=0.0, atol=1e-6)
+    token_hidden = scatter_mean_to_tokens(atom_hidden, atom_to_token, 3, atom_mask)
+    torch.testing.assert_close(token_hidden, expected, rtol=0.0, atol=0.0)
 
     # token -> atom broadcast gathers each atom's token row, here through an arbitrary leading dim
     token_hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]).reshape(1, *extra_prefix, 3, 2)

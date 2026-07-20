@@ -4,7 +4,6 @@ Shared atom-pair encoding arithmetic.
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor, nn
 
 
@@ -18,7 +17,7 @@ def encode_atom_pair(
     inverse_term_mask: Tensor | float,
     valid_mask: Tensor,
     pair_bias: Tensor | None = None,
-    prefix_ndim: int | None = None,
+    prefix_ndim: int,
 ) -> Tensor:
     r"""
     Windowed atom-pair arithmetic shared by dense and local atom encoders.
@@ -28,8 +27,7 @@ def encode_atom_pair(
     ``left_atom_projection``, ``right_atom_projection``, ``feed_forward``). ``distance_vectors`` is the canonical
     displacement ``d = query - key`` used by AF3/Protenix atom attention. The masks are
     caller-defined so dense and local encoders can share the same arithmetic. ``prefix_ndim`` is the number of
-    leading batch/sample axes before the pair/window axes; it is used only when ``pair_bias`` carries extra prefix
-    axes.
+    leading batch/sample axes before the pair/window axes.
 
     Args:
         module: Module supplying the expected atom-pair projection attributes.
@@ -40,14 +38,11 @@ def encode_atom_pair(
         inverse_term_mask: Scalar or tensor mask for inverse-distance terms.
         valid_mask: ``[..., N_query, N_key, 1]`` valid pair mask.
         pair_bias: Optional precomputed pair bias to add.
-        prefix_ndim: Optional number of leading prefix axes before pair/window axes.
+        prefix_ndim: Number of leading prefix axes before pair/window axes.
 
     Returns:
         ``[..., N_query, N_key, C]`` encoded atom-pair features (same prefix and pair axes as
         ``distance_vectors``, with ``C`` set by the module's projection width).
-
-    Raises:
-        ValueError: If ``pair_bias`` cannot be broadcast onto the encoded pair tensor.
 
     Examples:
         >>> import torch
@@ -76,6 +71,7 @@ def encode_atom_pair(
         ...     distance_term_mask=1.0,
         ...     inverse_term_mask=1.0,
         ...     valid_mask=valid_mask,
+        ...     prefix_ndim=1,
         ... )
         >>> out.shape
         torch.Size([1, 3, 3, 2])
@@ -89,71 +85,11 @@ def encode_atom_pair(
     # of distance_vectors, no sample axis) is reshaped once to align with a possibly sample-prefixed pair_bias.
     pair = pair + module.left_atom_projection(query_single) + module.right_atom_projection(key_single)
     if pair_bias is not None:
-        pair = _match_prefix(pair, pair_bias, prefix_ndim=prefix_ndim) + pair_bias
+        missing_prefix_dims = pair_bias.dim() - pair.dim()
+        pair = pair.reshape(
+            *pair.shape[:prefix_ndim],
+            *((1,) * missing_prefix_dims),
+            *pair.shape[prefix_ndim:],
+        )
+        pair = pair + pair_bias
     return pair + module.feed_forward(pair)
-
-
-def _match_prefix(source: Tensor, target: Tensor, *, prefix_ndim: int | None) -> Tensor:
-    r"""
-    Reshape ``source`` so ``target``'s extra leading prefix axes broadcast against it.
-
-    Args:
-        source: The encoded pair tensor to align.
-        target: The ``pair_bias`` tensor whose (possibly higher) rank drives the alignment.
-        prefix_ndim: Number of leading prefix axes on ``source``; inferred from the matching
-            suffix axes when ``None``.
-
-    Returns:
-        ``source`` reshaped with singleton axes inserted so it broadcasts to ``target``'s shape.
-
-    Raises:
-        ValueError: If ``target`` has lower rank than ``source``, if ``prefix_ndim`` is out of
-            range, or if the shapes are otherwise not broadcast-compatible.
-    """
-    missing_prefix_dims = target.dim() - source.dim()
-    if missing_prefix_dims < 0:
-        raise ValueError(f"pair_bias rank {target.dim()} cannot be smaller than pair rank {source.dim()}")
-    if missing_prefix_dims == 0:
-        return source
-    if prefix_ndim is None:
-        prefix_ndim = source.dim() - _matching_suffix_dims(source, target)
-    if prefix_ndim < 0 or prefix_ndim > source.dim():
-        raise ValueError(f"prefix_ndim={prefix_ndim} is invalid for pair rank {source.dim()}")
-    reshaped = source.reshape(
-        *source.shape[:prefix_ndim],
-        *((1,) * missing_prefix_dims),
-        *source.shape[prefix_ndim:],
-    )
-    try:
-        broadcast_shape = torch.broadcast_shapes(tuple(reshaped.shape), tuple(target.shape))
-    except RuntimeError as error:
-        raise ValueError(
-            f"pair_bias shape {tuple(target.shape)} is incompatible with pair shape {tuple(source.shape)}"
-        ) from error
-    if broadcast_shape != tuple(target.shape):
-        raise ValueError(f"pair_bias shape {tuple(target.shape)} cannot receive pair shape {tuple(source.shape)}")
-    return reshaped
-
-
-def _matching_suffix_dims(source: Tensor, target: Tensor) -> int:
-    r"""
-    Count the trailing axes ``source`` and ``target`` share, used to infer the prefix split.
-
-    Args:
-        source: The encoded pair tensor.
-        target: The ``pair_bias`` tensor being aligned onto ``source``.
-
-    Returns:
-        The number of matching trailing axes (at least one).
-
-    Raises:
-        ValueError: If no trailing axis matches, so no valid prefix split exists.
-    """
-    suffix_dims = 0
-    for offset in range(1, min(source.dim(), target.dim()) + 1):
-        if source.shape[-offset] != target.shape[-offset]:
-            break
-        suffix_dims = offset
-    if suffix_dims == 0:
-        raise ValueError(f"pair_bias shape {tuple(target.shape)} is incompatible with pair shape {tuple(source.shape)}")
-    return suffix_dims

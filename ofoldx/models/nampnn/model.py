@@ -1,34 +1,36 @@
-r"""
-NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structures.
-"""
+r"""NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structures."""
 
 from __future__ import annotations
 
-import itertools
-from collections.abc import Mapping
+import math
 from dataclasses import dataclass
-from typing import Any, ClassVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ...modules.message_passing import (
-    ProteinDecoderLayer,
-    ProteinEncoderLayer,
-    RelativePositionEncoding,
+from ...data.components import get_component
+from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
+from ...data.molecular import ComponentReference, MolecularSystem, Molecule, PolymerSequence
+from ...data.structure import Structure
+from ...modules.mpnn import (
+    MpnnDecoderLayer,
+    MpnnEncoderLayer,
+    MpnnOutput,
+    MpnnRelativePositionEncoding,
+    MpnnSamplingOutput,
+    _autoregressive_masks,
+    _radial_basis,
+    _virtual_beta_carbon,
     cat_neighbors_nodes,
     gather_edges,
     gather_nodes,
 )
-from ...modules.representation import Single
-from ...results_registry import register_sequence_decoder
-from ..contract import BaseInput, SequenceDesignCandidate, register_pytree_dataclass
-from ..mixin import ModelMixin
-from ..registry import DESIGN_MODELS, MODELS
-from .config import NAMPNNConfig
+from ...results import DesignCandidate, DesignResult, Metric, MpnnProbabilityResult, Score, ScoreResult
+from .config import NaMpnnConfig
 
-NAMPNN_ATOM_NAMES = (
+MIXED_POLYMER_ATOM_NAMES = (
     "N",
     "CA",
     "C",
@@ -46,10 +48,8 @@ NAMPNN_ATOM_NAMES = (
     "O2'",
     "C1'",
 )
-NAMPNN_ATOM_TO_ID = {name: index for index, name in enumerate(NAMPNN_ATOM_NAMES)}
-NAMPNN_POLYMER_TYPES = ("PP", "DNA", "RNA", "UNK", "MAS", "PAD")
-NAMPNN_POLYMER_TYPE_TO_ID = {name: index for index, name in enumerate(NAMPNN_POLYMER_TYPES)}
-NAMPNN_RESTYPES = (
+MIXED_POLYMER_ATOM_TO_INDEX = {name: index for index, name in enumerate(MIXED_POLYMER_ATOM_NAMES)}
+MIXED_POLYMER_COMPONENT_IDS = (
     "ALA",
     "ARG",
     "ASN",
@@ -84,1140 +84,25 @@ NAMPNN_RESTYPES = (
     "MAS",
     "PAD",
 )
-NAMPNN_RESTYPE_TO_ID = {name: index for index, name in enumerate(NAMPNN_RESTYPES)}
-NAMPNN_TOKEN_TO_LETTER = {
-    "ALA": "A",
-    "ARG": "R",
-    "ASN": "N",
-    "ASP": "D",
-    "CYS": "C",
-    "GLN": "Q",
-    "GLU": "E",
-    "GLY": "G",
-    "HIS": "H",
-    "ILE": "I",
-    "LEU": "L",
-    "LYS": "K",
-    "MET": "M",
-    "PHE": "F",
-    "PRO": "P",
-    "SER": "S",
-    "THR": "T",
-    "TRP": "W",
-    "TYR": "Y",
-    "VAL": "V",
-    "UNK": "X",
-    "DA": "a",
-    "DC": "c",
-    "DG": "g",
-    "DT": "t",
-    "DX": "x",
-    "A": "b",
-    "C": "d",
-    "G": "h",
-    "U": "u",
-    "RX": "y",
-    "MAS": "-",
-    "PAD": "+",
-}
-NAMPNN_LETTER_TO_TOKEN = {value: key for key, value in NAMPNN_TOKEN_TO_LETTER.items()}
-NAMPNN_INVALID_SAMPLE_TOKEN_IDS = (
-    NAMPNN_RESTYPE_TO_ID["UNK"],
-    NAMPNN_RESTYPE_TO_ID["DX"],
-    NAMPNN_RESTYPE_TO_ID["RX"],
-    NAMPNN_RESTYPE_TO_ID["MAS"],
-    NAMPNN_RESTYPE_TO_ID["PAD"],
+MIXED_POLYMER_TOKEN_BY_COMPONENT = {name: index for index, name in enumerate(MIXED_POLYMER_COMPONENT_IDS)}
+PAD_TOKEN = MIXED_POLYMER_TOKEN_BY_COMPONENT["PAD"]
+INVALID_GENERATION_TOKEN_IDS = (
+    MIXED_POLYMER_TOKEN_BY_COMPONENT["UNK"],
+    MIXED_POLYMER_TOKEN_BY_COMPONENT["DX"],
+    MIXED_POLYMER_TOKEN_BY_COMPONENT["RX"],
+    MIXED_POLYMER_TOKEN_BY_COMPONENT["MAS"],
+    MIXED_POLYMER_TOKEN_BY_COMPONENT["PAD"],
 )
-
-
-@MODELS.register("nampnn")
-@DESIGN_MODELS.register("nampnn")
-class NAMPNNDesigner(ModelMixin):
-    r"""
-    Message-passing model that designs protein, DNA, and RNA sequences from fixed polymer backbones.
-
-    Args:
-        config: Architecture configuration. Defaults to
-            [`NAMPNNConfig`][ofoldx.models.nampnn.config.NAMPNNConfig].
-
-    Examples:
-        >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-        >>> processor = AutoProcessor.from_pretrained("oteam/nampnn-design")  # doctest: +SKIP
-        >>> model = AutoModel.from_pretrained("oteam/nampnn-design")  # doctest: +SKIP
-        >>> output = model.design(processor("complex.pdb"), num_samples=8)  # doctest: +SKIP
-    """
-
-    config_class = NAMPNNConfig
-    input_class: ClassVar[type[BaseInput]]  # bound to NAMPNNInput once that dataclass is defined below.
-
-    def __init__(self, config: NAMPNNConfig | None = None) -> None:
-        config = NAMPNNConfig() if config is None else config
-        super().__init__(config)
-        self.backbone = NAMPNNBackbone(config)
-        self.post_init()
-
-    def _init_module_weights(self, module: nn.Module) -> None:
-        return None
-
-    def reset_parameters(self) -> None:
-        r"""
-        Re-initialize parameters with the released NA-MPNN Xavier-uniform scheme.
-
-        Examples:
-            >>> model = NAMPNNDesigner()  # doctest: +SKIP
-            >>> model.reset_parameters()  # doctest: +SKIP
-        """
-
-        for parameter in self.backbone.parameters():
-            if parameter.dim() > 1:
-                nn.init.xavier_uniform_(parameter)
-
-    def forward(
-        self,
-        batch: NAMPNNInput,
-        *,
-        use_sequence: bool = True,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Teacher-forced training forward: one graph encode plus a single-order autoregressive decode.
-
-        This is the TRAINING path and mirrors the upstream NA-MPNN ``ProteinMPNN.forward`` (encode, then
-        teacher-forced decode over one noised decoding order, returning per-position ``log_probs`` for the
-        masked cross-entropy loss). It is a lean, ``.item()``-free tensor path built to trace under
-        ``torch.compile(model, fullgraph=True)`` for both forward and backward; the batched inference verbs
-        [`score`][ofoldx.models.nampnn.model.NAMPNNDesigner.score] and
-        [`design`][ofoldx.models.nampnn.model.NAMPNNDesigner.design] cover the distinct inference path.
-
-        Args:
-            batch: Typed NA-MPNN input carrying atom coords and sequence tokens.
-            use_sequence: Whether the decoder conditions on the input sequence identities (teacher forcing).
-
-        Returns:
-            Design output with per-position logits, log-probabilities, and the masked sequence log-likelihood.
-
-        Examples:
-            >>> output = model(batch)  # doctest: +SKIP
-        """
-
-        features = self._training_feature_dict(batch)
-        representations = self._representations(features)
-        logits = self.backbone.decode_teacher_forced(
-            representations.single.tensor,
-            representations.edges,
-            representations.neighbor_idx,
-            features["S"],
-            features["mask"],
-            features["chain_mask"],
-            features["randn"],
-            use_sequence=use_sequence,
-        )
-        log_probs = F.log_softmax(logits, dim=-1)
-        return SequenceDesignCandidate(
-            sequence_logits=logits,
-            sequence_tokens=features["S"],
-            scores={
-                "log_probs": log_probs,
-                "sequence_log_likelihood": _sequence_log_likelihood(features["S"], log_probs, features["mask"]),
-            },
-            metadata={
-                "architecture": "nampnn",
-                "backend": "native_nampnn",
-                "num_edges": self.config.k_neighbors,
-                "use_sequence": use_sequence,
-                "mode": "training",
-            },
-        )
-
-    def _representations(self, features: Mapping[str, Any]) -> NAMPNNRepresentations:
-        r"""
-        Run the graph encoder and wrap node states in the typed [`Single`][ofoldx.modules.representation.Single]
-        carrier at the representations boundary.
-
-        The k-nearest-neighbor edge features have shape `(B, L, K, hidden_size)` -- a sparse per-edge tensor,
-        not a dense square `(i, j)` pair -- so they ride alongside as a raw tensor rather than in the
-        [`Pair`][ofoldx.modules.representation.Pair] carrier, whose contract requires equal `i`/`j` axes.
-        """
-
-        node_states, edge_states, neighbor_idx = self.backbone.encode(features)
-        return NAMPNNRepresentations(single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx)
-
-    def _training_feature_dict(self, batch: NAMPNNInput) -> dict[str, Tensor]:
-        r"""
-        Build the tensor-only feature mapping consumed by the teacher-forced training forward.
-
-        Unlike [`_feature_dict`][ofoldx.models.nampnn.model.NAMPNNDesigner._feature_dict] (which carries the
-        sampler controls, symmetry lists, RNG, and shape validation that would break a compiled graph), this
-        keeps the training pass a pure tensor path: every value is a tensor derived straight from ``batch``.
-        """
-
-        dtype = batch.atom_coords.dtype
-        mask = batch.token_mask.to(dtype=dtype)
-        chain_mask = batch.design_mask.to(dtype=dtype) if batch.design_mask is not None else torch.ones_like(mask)
-        noise = batch.decoding_order_noise
-        randn = torch.randn_like(mask) if noise is None else noise.to(dtype=dtype)
-        return {
-            "X": batch.atom_coords,
-            "X_m": batch.atom_mask,
-            "S": batch.sequence_tokens.long(),
-            "mask": mask,
-            "R_idx": batch.residue_index.long(),
-            "chain_labels": batch.chain_index.long(),
-            "chain_mask": chain_mask,
-            "protein_mask": batch.protein_mask.to(dtype=dtype),
-            "dna_mask": batch.dna_mask.to(dtype=dtype),
-            "rna_mask": batch.rna_mask.to(dtype=dtype),
-            "R_polymer_type": batch.polymer_type_ids.long(),
-            "randn": randn,
-        }
-
-    def score(
-        self,
-        batch: NAMPNNInput,
-        *,
-        use_sequence: bool = True,
-        num_samples: int | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Score sequence tokens under the NA-MPNN autoregressive decoder.
-
-        Args:
-            batch: Typed NA-MPNN input.
-            use_sequence: Whether to condition on the input sequence.
-            num_samples: Number of decode orders to score; ``None`` uses the batch default.
-
-        Returns:
-            Design output whose ``scores`` include ``log_probs`` and ``sequence_log_likelihood``.
-
-        Examples:
-            >>> scored = model.score(batch)  # doctest: +SKIP
-            >>> scored.scores["log_probs"].shape  # doctest: +SKIP
-            torch.Size([1, 12, 33])
-        """
-
-        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
-        scored = self.backbone.score(features, use_sequence=use_sequence)
-        log_probs = scored["log_probs"]
-        return SequenceDesignCandidate(
-            sequence_logits=scored["logits"],
-            sequence_tokens=scored["S"],
-            scores={
-                "log_probs": log_probs,
-                "sequence_log_likelihood": _sequence_log_likelihood(scored["S"], log_probs, features["mask"]),
-            },
-            metadata={
-                "architecture": "nampnn",
-                "backend": "native_nampnn",
-                "num_edges": self.config.k_neighbors,
-                "use_sequence": use_sequence,
-            },
-        )
-
-    @torch.no_grad()
-    def design(
-        self,
-        batch: NAMPNNInput,
-        *,
-        temperature: float | Tensor | None = None,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Generate designed polymer sequences under ``torch.no_grad``.
-
-        Args:
-            batch: Typed NA-MPNN input for one backbone.
-            temperature: Sampling temperature; ``None`` uses the batch default.
-            num_samples: Number of independent samples; ``None`` uses the batch default.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            Design output with sampled tokens and sampling probabilities.
-
-        Examples:
-            >>> output = model.design(batch, temperature=0.1, num_samples=8)  # doctest: +SKIP
-        """
-
-        return self._sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
-
-    def _sample(
-        self,
-        batch: NAMPNNInput,
-        *,
-        temperature: float | Tensor | None = None,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Autoregressively sample protein, DNA, and RNA sequence tokens (the inference sampler behind
-        [`design`][ofoldx.models.nampnn.model.NAMPNNDesigner.design]).
-
-        The public inference entry point is ``design``; this runs the N-step Python decoding loop it wraps.
-
-        Args:
-            batch: Typed NA-MPNN input for one backbone.
-            temperature: Sampling temperature; ``None`` uses the batch default.
-            num_samples: Number of independent samples; ``None`` uses the batch default.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            Design output with sampled tokens, logits, log-probabilities, and sampling probabilities.
-        """
-
-        features = self._feature_dict(
-            batch,
-            temperature=temperature,
-            num_samples=num_samples,
-            generator=generator,
-            for_sampling=True,
-        )
-        sampled = self.backbone.sample(features)
-        return SequenceDesignCandidate(
-            sequence_logits=sampled["logits"],
-            sequence_tokens=sampled["S"],
-            scores={
-                "log_probs": sampled["log_probs"],
-                "sampling_probs": sampled["sampling_probs"],
-                "sequence_log_likelihood": _sequence_log_likelihood(
-                    sampled["S"], sampled["log_probs"], features["mask"] * features["chain_mask"]
-                ),
-            },
-            metadata={
-                "architecture": "nampnn",
-                "backend": "native_nampnn",
-                "num_edges": self.config.k_neighbors,
-                "temperature": features["temperature"],
-            },
-        )
-
-    def unconditional_probs(
-        self,
-        batch: NAMPNNInput,
-        *,
-        num_samples: int | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Predict per-position log-probabilities from backbone context alone.
-
-        Args:
-            batch: Typed NA-MPNN input.
-            num_samples: Number of repeated decode passes; ``None`` uses the batch default.
-
-        Returns:
-            Design output whose ``scores`` include unconditional ``log_probs``.
-
-        Examples:
-            >>> output = model.unconditional_probs(batch)  # doctest: +SKIP
-        """
-
-        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
-        output = self.backbone.unconditional_probs(features)
-        return SequenceDesignCandidate(
-            sequence_logits=output["logits"],
-            sequence_tokens=output["S"],
-            scores={"log_probs": output["log_probs"]},
-            metadata={"architecture": "nampnn", "backend": "native_nampnn", "score_mode": "unconditional"},
-        )
-
-    def _feature_dict(
-        self,
-        batch: NAMPNNInput,
-        *,
-        temperature: float | Tensor | None = None,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-        for_sampling: bool,
-    ) -> dict[str, Any]:
-        r"""
-        Convert a typed input dataclass into the tensor mapping consumed by the backbone.
-        """
-
-        _validate_nampnn_input(batch, require_sampling=for_sampling, vocab_size=self.config.vocab_size)
-        sample_count = int(num_samples if num_samples is not None else (batch.num_samples or 1))
-        if sample_count <= 0:
-            raise ValueError("num_samples must be positive")
-        device = batch.sequence_tokens.device
-        length = batch.sequence_tokens.shape[1]
-        randn = batch.decoding_order_noise
-        if randn is None:
-            randn = torch.randn(sample_count, length, device=device, generator=generator)
-        else:
-            randn = randn.to(device=device)
-            sample_count = int(randn.shape[0])
-        default_bias = torch.zeros(
-            *batch.sequence_tokens.shape,
-            self.config.vocab_size,
-            dtype=batch.atom_coords.dtype,
-            device=device,
-        )
-        bias = default_bias if batch.amino_acid_bias is None else batch.amino_acid_bias.to(device=device)
-        features = {
-            "X": batch.atom_coords,
-            "X_m": batch.atom_mask,
-            "S": batch.sequence_tokens.long(),
-            "mask": batch.token_mask.to(device=device, dtype=batch.atom_coords.dtype),
-            "R_idx": batch.residue_index.long(),
-            "chain_labels": batch.chain_index.long(),
-            "chain_mask": _optional_mask(batch.design_mask, batch.token_mask),
-            "protein_mask": batch.protein_mask.to(device=device, dtype=batch.atom_coords.dtype),
-            "dna_mask": batch.dna_mask.to(device=device, dtype=batch.atom_coords.dtype),
-            "rna_mask": batch.rna_mask.to(device=device, dtype=batch.atom_coords.dtype),
-            "R_polymer_type": batch.polymer_type_ids.long(),
-            "batch_size": sample_count,
-            "num_samples": sample_count,
-            "randn": randn,
-            "temperature": temperature if temperature is not None else batch.temperature,
-            "bias": bias,
-            "symmetry_residues": batch.symmetry_residue_groups or [[]],
-            "symmetry_weights": batch.symmetry_weights or [[]],
-            "fixed_position_mask": batch.fixed_position_mask,
-            "generator": generator,
-        }
-        if batch.pair_amino_acid_bias is not None:
-            features["pair_bias"] = batch.pair_amino_acid_bias.to(device=device)
-        return features
-
-
-class NAMPNNBackbone(nn.Module):
-    r"""
-    NA-MPNN graph encoder and autoregressive decoder.
-
-    Args:
-        config: Architecture configuration providing widths, layer counts, and atom/polymer vocab sizes.
-    """
-
-    def __init__(self, config: NAMPNNConfig) -> None:
-        super().__init__()
-        self.vocab_size = config.vocab_size
-        self.feature_encoder = NAMPNNFeatureEncoder(config)
-        self.node_embedding = nn.Linear(config.node_feature_size, config.hidden_size)
-        self.edge_embedding = nn.Linear(config.edge_feature_size, config.hidden_size)
-        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.encoder_layers = nn.ModuleList(
-            [
-                ProteinEncoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
-                for _ in range(config.num_encoder_layers)
-            ]
-        )
-        self.decoder_layers = nn.ModuleList(
-            [
-                ProteinDecoderLayer(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
-                for _ in range(config.num_decoder_layers)
-            ]
-        )
-        self.output_projection = nn.Linear(config.hidden_size, config.vocab_size)
-
-    def encode(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Encode polymer geometry into node and edge states.
-
-        Args:
-            features: Feature mapping with atom coords, masks, residue indices, and polymer ids.
-
-        Returns:
-            A ``(node_states, edge_states, neighbor_idx)`` tuple.
-        """
-
-        node_features, edge_features, neighbor_idx = self.feature_encoder(features)
-        node_states = self.node_embedding(node_features)
-        edge_states = self.edge_embedding(edge_features)
-        mask = features["mask"]
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_idx).squeeze(-1)
-        attend_mask = mask.unsqueeze(-1) * attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(node_states, edge_states, neighbor_idx, mask, attend_mask)
-        return node_states, edge_states, neighbor_idx
-
-    def decode_teacher_forced(
-        self,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        randn: Tensor,
-        *,
-        use_sequence: bool,
-    ) -> Tensor:
-        r"""
-        Teacher-forced autoregressive decode over a single noised decoding order (training path).
-
-        Mirrors the decode half of the upstream NA-MPNN ``ProteinMPNN.forward``: it conditions each position on
-        the true neighbor tokens under a backward autoregressive mask and returns the vocabulary logits. Pure
-        tensor ops with no ``.item()`` so it traces under ``torch.compile(fullgraph=True)``.
-
-        Args:
-            node_states: Encoded node states `[B, L, hidden_size]`.
-            edge_states: Encoded edge states `[B, L, K, hidden_size]`.
-            neighbor_idx: Neighbor index `[B, L, K]`.
-            sequence: True residue tokens `[B, L]` used for teacher forcing.
-            mask: Valid-token mask `[B, L]`.
-            chain_mask: Designable-position mask `[B, L]`.
-            randn: Decoding-order noise `[B, L]`.
-            use_sequence: Whether to condition on the true neighbor tokens.
-
-        Returns:
-            Per-position vocabulary logits `[B, L, vocab_size]`.
-        """
-
-        decode_mask = mask * chain_mask
-        decode_order = torch.argsort((decode_mask + 0.0001) * randn.abs())
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-
-        token_states = self.token_embedding(sequence)
-        edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
-        forward_context = forward_mask * encoder_context
-
-        if use_sequence:
-            for layer in self.decoder_layers:
-                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
-                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
-        else:
-            for layer in self.decoder_layers:
-                node_states = layer(node_states, forward_context, mask)
-        return self.output_projection(node_states)
-
-    def score(self, features: Mapping[str, Any], *, use_sequence: bool) -> dict[str, Tensor]:
-        r"""
-        Tensor-level scoring pass.
-
-        Args:
-            features: Feature mapping built by
-                [`NAMPNNDesigner._feature_dict`][ofoldx.models.nampnn.model.NAMPNNDesigner].
-            use_sequence: Whether the decoder conditions on the input sequence.
-
-        Returns:
-            Mapping with sequence tokens, logits, log-probabilities, and decode order.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = mask * features["chain_mask"]
-        randn = features["randn"]
-        num_samples = int(features["num_samples"])
-
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        decode_order = torch.argsort((chain_mask + 0.0001) * randn.abs())
-        neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-        mask = mask.repeat(num_samples, 1)
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-        sequence = sequence.repeat(num_samples, 1)
-        node_states = node_states.repeat(num_samples, 1, 1)
-        edge_states = edge_states.repeat(num_samples, 1, 1, 1)
-
-        token_states = self.token_embedding(sequence)
-        edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
-        forward_context = forward_mask * encoder_context
-
-        if use_sequence:
-            for layer in self.decoder_layers:
-                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
-                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
-        else:
-            for layer in self.decoder_layers:
-                node_states = layer(node_states, forward_context, mask)
-
-        logits = self.output_projection(node_states)
-        return {
-            "S": sequence,
-            "logits": logits,
-            "log_probs": F.log_softmax(logits, dim=-1),
-            "decoding_order": decode_order,
-        }
-
-    def sample(self, features: Mapping[str, Any]) -> dict[str, Tensor]:
-        r"""
-        Tensor-level autoregressive sampler.
-
-        Args:
-            features: Feature mapping with sampling controls and conditioning masks.
-
-        Returns:
-            Mapping with sampled tokens, logits, log-probabilities, sampling probabilities, and decode order.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = mask * features["chain_mask"] * _fixed_position_mask(features, mask)
-        bias = features["bias"]
-        randn = features["randn"]
-        num_samples = int(features["num_samples"])
-        symmetry_groups = features["symmetry_residues"]
-
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        decode_order = torch.argsort((chain_mask + 0.0001) * randn.abs())
-        if _has_no_symmetry(symmetry_groups):
-            return self._sample_independent(
-                sequence,
-                mask,
-                chain_mask,
-                bias,
-                features.get("pair_bias"),
-                features["temperature"],
-                decode_order,
-                node_states,
-                edge_states,
-                neighbor_idx,
-                num_samples,
-                features.get("generator"),
-            )
-        return self._sample_symmetric(
-            sequence,
-            mask,
-            chain_mask,
-            bias,
-            features.get("pair_bias"),
-            features["temperature"],
-            decode_order,
-            symmetry_groups,
-            features["symmetry_weights"],
-            node_states,
-            edge_states,
-            neighbor_idx,
-            num_samples,
-            features.get("generator"),
-        )
-
-    def _decode_state(
-        self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        pair_bias: Tensor | None,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
-    ) -> dict[str, Any]:
-        r"""
-        Initialize tensors shared by the sampling loops.
-        """
-
-        _, length = sequence.shape
-        device = sequence.device
-        return {
-            "sequence_true": sequence.repeat(num_samples, 1),
-            "mask": mask.repeat(num_samples, 1),
-            "chain_mask": chain_mask.repeat(num_samples, 1),
-            "bias": bias.repeat(num_samples, 1, 1),
-            "pair_bias": None if pair_bias is None else pair_bias.repeat(num_samples, 1, 1, 1, 1),
-            "node_states": node_states.repeat(num_samples, 1, 1),
-            "edge_states": edge_states.repeat(num_samples, 1, 1, 1),
-            "neighbor_idx": neighbor_idx.repeat(num_samples, 1, 1),
-            "sampled": (self.vocab_size - 1) * torch.ones(num_samples, length, dtype=torch.long, device=device),
-            "token_states": node_states.new_zeros(num_samples, length, node_states.shape[-1]),
-            "layer_states": [
-                node_states.repeat(num_samples, 1, 1),
-                *[node_states.new_zeros(num_samples, length, node_states.shape[-1]) for _ in self.decoder_layers],
-            ],
-            "probabilities": node_states.new_zeros(num_samples, length, self.vocab_size),
-            "log_probs_out": node_states.new_zeros(num_samples, length, self.vocab_size),
-            "logits_out": node_states.new_zeros(num_samples, length, self.vocab_size),
-        }
-
-    def _sample_independent(
-        self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        pair_bias: Tensor | None,
-        temperature: float | Tensor,
-        decode_order: Tensor,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
-        generator: torch.Generator | None,
-    ) -> dict[str, Tensor]:
-        r"""
-        Independent-position autoregressive decoding loop.
-        """
-
-        _, length = sequence.shape
-        state = self._decode_state(
-            sequence, mask, chain_mask, bias, pair_bias, node_states, edge_states, neighbor_idx, num_samples
-        )
-        neighbor_idx = state["neighbor_idx"]
-        mask = state["mask"]
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(state["token_states"]), state["edge_states"], neighbor_idx)
-        encoder_context = cat_neighbors_nodes(state["node_states"], encoder_edges, neighbor_idx)
-        forward_context = forward_mask * encoder_context
-
-        for step in range(length):
-            residue = decode_order[:, step]
-            logits = self._decode_residue(state, residue, backward_mask, forward_context)
-            bias_t = _gather_position(state["bias"], residue)
-            pair_bias_t = _pair_bias_at(state["pair_bias"], residue, state["sampled"], self.vocab_size)
-            log_probs = F.log_softmax(logits, dim=-1)
-            probs = _sampling_distribution(logits, bias_t, pair_bias_t, temperature)
-            sampled_t = torch.multinomial(probs, 1, generator=generator)[:, 0]
-            chain_mask_t = torch.gather(state["chain_mask"], 1, residue[:, None])[:, 0]
-            true_t = torch.gather(state["sequence_true"], 1, residue[:, None])[:, 0]
-            sampled_t = (sampled_t * chain_mask_t + true_t * (1.0 - chain_mask_t)).long()
-            self._scatter_decode_result(state, residue, sampled_t, probs, logits, log_probs, chain_mask_t)
-
-        return {
-            "S": state["sampled"],
-            "sampling_probs": state["probabilities"],
-            "logits": state["logits_out"],
-            "log_probs": state["log_probs_out"],
-            "decoding_order": decode_order,
-        }
-
-    def _sample_symmetric(
-        self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        pair_bias: Tensor | None,
-        temperature: float | Tensor,
-        decode_order: Tensor,
-        symmetry_groups: list[list[int]],
-        symmetry_weights_groups: list[list[float]],
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
-        generator: torch.Generator | None,
-    ) -> dict[str, Tensor]:
-        r"""
-        Symmetry-aware autoregressive decoding loop.
-        """
-
-        _, length = sequence.shape
-        device = sequence.device
-        ordered_groups = _decode_groups(decode_order[0], symmetry_groups)
-        flat_order = torch.tensor(list(itertools.chain(*ordered_groups)), device=device)[None, :]
-        decode_order = flat_order.repeat(num_samples, 1)
-        symmetry_weights = torch.ones(length, dtype=node_states.dtype, device=device)
-        for group_index, residue_group in enumerate(symmetry_groups):
-            for member_index, residue in enumerate(residue_group):
-                symmetry_weights[residue] = float(symmetry_weights_groups[group_index][member_index])
-
-        state = self._decode_state(
-            sequence, mask, chain_mask, bias, pair_bias, node_states, edge_states, neighbor_idx, num_samples
-        )
-        neighbor_idx = state["neighbor_idx"]
-        mask = state["mask"]
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(state["token_states"]), state["edge_states"], neighbor_idx)
-        encoder_context = cat_neighbors_nodes(state["node_states"], encoder_edges, neighbor_idx)
-        forward_context = forward_mask * encoder_context
-
-        for residue_group in ordered_groups:
-            group_logits = 0.0
-            group_bias = None
-            group_pair_bias = None
-            for residue_int in residue_group:
-                residue = torch.full((num_samples,), residue_int, dtype=torch.long, device=device)
-                logits = self._decode_residue(state, residue, backward_mask, forward_context)
-                log_probs = F.log_softmax(logits, dim=-1)
-                chain_mask_t = state["chain_mask"][:, residue_int]
-                state["log_probs_out"][:, residue_int] = chain_mask_t[:, None] * log_probs
-                group_logits = group_logits + symmetry_weights[residue_int] * logits
-                group_bias = state["bias"][:, residue_int]
-                group_pair_bias = _pair_bias_at(state["pair_bias"], residue, state["sampled"], self.vocab_size)
-
-            assert group_bias is not None
-            probs = _sampling_distribution(group_logits, group_bias, group_pair_bias, temperature)
-            sampled_t = torch.multinomial(probs, 1, generator=generator)[:, 0]
-            for residue_int in residue_group:
-                residue = torch.full((num_samples,), residue_int, dtype=torch.long, device=device)
-                chain_mask_t = state["chain_mask"][:, residue_int]
-                true_t = state["sequence_true"][:, residue_int]
-                token = (sampled_t * chain_mask_t + true_t * (1.0 - chain_mask_t)).long()
-                self._scatter_decode_result(
-                    state,
-                    residue,
-                    token,
-                    probs,
-                    group_logits,
-                    state["log_probs_out"][:, residue_int],
-                    chain_mask_t,
-                )
-
-        return {
-            "S": state["sampled"],
-            "sampling_probs": state["probabilities"],
-            "logits": state["logits_out"],
-            "log_probs": state["log_probs_out"],
-            "decoding_order": decode_order,
-        }
-
-    def _decode_residue(
-        self,
-        state: Mapping[str, Any],
-        residue: Tensor,
-        backward_mask: Tensor,
-        forward_context: Tensor,
-    ) -> Tensor:
-        r"""
-        Decode one residue position from the current autoregressive state.
-        """
-
-        neighbor_idx = state["neighbor_idx"]
-        edge_states = state["edge_states"]
-        token_states = state["token_states"]
-        layer_states = state["layer_states"]
-        edge_t = torch.gather(
-            edge_states,
-            1,
-            residue[:, None, None, None].repeat(1, 1, edge_states.shape[-2], edge_states.shape[-1]),
-        )
-        neighbor_idx_t = torch.gather(neighbor_idx, 1, residue[:, None, None].repeat(1, 1, neighbor_idx.shape[-1]))
-        edge_token_t = cat_neighbors_nodes(token_states, edge_t, neighbor_idx_t)
-        forward_t = torch.gather(
-            forward_context,
-            1,
-            residue[:, None, None, None].repeat(1, 1, forward_context.shape[-2], forward_context.shape[-1]),
-        )
-        backward_t = torch.gather(
-            backward_mask,
-            1,
-            residue[:, None, None, None].repeat(1, 1, backward_mask.shape[-2], backward_mask.shape[-1]),
-        )
-        mask_t = torch.gather(state["mask"], 1, residue[:, None])[:, 0]
-        for layer_index, layer in enumerate(self.decoder_layers):
-            decoder_context = cat_neighbors_nodes(layer_states[layer_index], edge_token_t, neighbor_idx_t)
-            node_t = torch.gather(
-                layer_states[layer_index],
-                1,
-                residue[:, None, None].repeat(1, 1, layer_states[layer_index].shape[-1]),
-            )
-            updated = layer(node_t, backward_t * decoder_context + forward_t, mask_t)
-            layer_states[layer_index + 1].scatter_(
-                1,
-                residue[:, None, None].repeat(1, 1, updated.shape[-1]),
-                updated,
-            )
-        final_t = torch.gather(
-            layer_states[-1],
-            1,
-            residue[:, None, None].repeat(1, 1, layer_states[-1].shape[-1]),
-        )[:, 0]
-        return self.output_projection(final_t)
-
-    def _scatter_decode_result(
-        self,
-        state: Mapping[str, Any],
-        residue: Tensor,
-        token: Tensor,
-        probs: Tensor,
-        logits: Tensor,
-        log_probs: Tensor,
-        chain_mask_t: Tensor,
-    ) -> None:
-        r"""
-        Scatter one decoded position back into the running sampling state.
-        """
-
-        token_states = state["token_states"]
-        state["probabilities"].scatter_(
-            1,
-            residue[:, None, None].repeat(1, 1, self.vocab_size),
-            chain_mask_t[:, None, None] * probs[:, None, :],
-        )
-        state["logits_out"].scatter_(
-            1,
-            residue[:, None, None].repeat(1, 1, self.vocab_size),
-            chain_mask_t[:, None, None] * logits[:, None, :],
-        )
-        state["log_probs_out"].scatter_(
-            1,
-            residue[:, None, None].repeat(1, 1, self.vocab_size),
-            chain_mask_t[:, None, None] * log_probs[:, None, :],
-        )
-        state["sampled"].scatter_(1, residue[:, None], token[:, None])
-        token_states.scatter_(
-            1,
-            residue[:, None, None].repeat(1, 1, token_states.shape[-1]),
-            self.token_embedding(token)[:, None, :],
-        )
-
-    def unconditional_probs(self, features: Mapping[str, Any]) -> dict[str, Tensor]:
-        r"""
-        Tensor-level unconditional probability pass.
-
-        Args:
-            features: Feature mapping built by the model wrapper.
-
-        Returns:
-            Mapping with sequence tokens, logits, and log-probabilities.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        num_samples = int(features["num_samples"])
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-        mask = mask.repeat(num_samples, 1)
-        order_mask = torch.zeros(mask.shape[0], mask.shape[1], mask.shape[1], dtype=mask.dtype, device=mask.device)
-        attend = torch.gather(order_mask, 2, neighbor_idx).unsqueeze(-1)
-        node_states = node_states.repeat(num_samples, 1, 1)
-        edge_states = edge_states.repeat(num_samples, 1, 1, 1)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(node_states), edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
-        forward_context = mask.view(mask.shape[0], mask.shape[1], 1, 1) * (1.0 - attend) * encoder_context
-        for layer in self.decoder_layers:
-            node_states = layer(node_states, forward_context, mask)
-        logits = self.output_projection(node_states)
-        return {
-            "S": sequence.repeat(num_samples, 1),
-            "logits": logits,
-            "log_probs": F.log_softmax(logits, dim=-1),
-        }
-
-
-class NAMPNNFeatureEncoder(nn.Module):
-    r"""
-    Geometric feature encoder for unified protein/nucleic-acid polymer graphs.
-
-    Args:
-        config: NA-MPNN architecture configuration.
-    """
-
-    def __init__(self, config: NAMPNNConfig) -> None:
-        super().__init__()
-        if config.na_ref_atom not in NAMPNN_ATOM_TO_ID:
-            raise ValueError(f"unknown NA reference atom {config.na_ref_atom!r}")
-        self.k_neighbors = config.k_neighbors
-        self.num_rbf = config.num_rbf
-        self.num_polymer_types = config.num_polymer_types
-        self.include_predicted_na_n = bool(config.include_predicted_na_n)
-        self.protein_coord_noise_scale = _noise_scale(config.protein_coord_noise_scale, config.coord_noise_scale)
-        self.dna_coord_noise_scale = _noise_scale(config.dna_coord_noise_scale, config.coord_noise_scale)
-        self.rna_coord_noise_scale = _noise_scale(config.rna_coord_noise_scale, config.coord_noise_scale)
-        self.n_idx = NAMPNN_ATOM_TO_ID["N"]
-        self.ca_idx = NAMPNN_ATOM_TO_ID["CA"]
-        self.c_idx = NAMPNN_ATOM_TO_ID["C"]
-        self.o4prime_idx = NAMPNN_ATOM_TO_ID["O4'"]
-        self.c1prime_idx = NAMPNN_ATOM_TO_ID["C1'"]
-        self.c2prime_idx = NAMPNN_ATOM_TO_ID["C2'"]
-        self.na_ref_atom_idx = NAMPNN_ATOM_TO_ID[config.na_ref_atom]
-        total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
-        self.relative_position = RelativePositionEncoding(config.num_positional_embeddings)
-        self.node_projection = nn.Linear(config.num_polymer_types, config.node_feature_size, bias=False)
-        self.node_norm = nn.LayerNorm(config.node_feature_size)
-        self.edge_projection = nn.Linear(
-            config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
-            config.edge_feature_size,
-            bias=False,
-        )
-        self.edge_norm = nn.LayerNorm(config.edge_feature_size)
-
-    def forward(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Build node features, edge features, and nearest-neighbor indices.
-
-        Args:
-            features: Feature mapping with atom coords, atom masks, token masks, and polymer ids.
-
-        Returns:
-            ``(node_features, edge_features, neighbor_idx)``.
-        """
-
-        dtype = self.edge_projection.weight.dtype
-        coords = features["X"].to(dtype=dtype)
-        atom_mask = features["X_m"].to(dtype=dtype)
-        token_mask = features["mask"].to(dtype=dtype)
-        protein_mask = features["protein_mask"].to(dtype=dtype)
-        dna_mask = features["dna_mask"].to(dtype=dtype)
-        rna_mask = features["rna_mask"].to(dtype=dtype)
-        if self.training and (
-            self.protein_coord_noise_scale > 0 or self.dna_coord_noise_scale > 0 or self.rna_coord_noise_scale > 0
-        ):
-            scale = (
-                protein_mask * self.protein_coord_noise_scale
-                + dna_mask * self.dna_coord_noise_scale
-                + rna_mask * self.rna_coord_noise_scale
-            )
-            coords = coords + atom_mask[:, :, :, None] * scale[:, :, None, None] * torch.randn_like(coords)
-
-        ca = coords[:, :, self.ca_idx]
-        n_atom = coords[:, :, self.n_idx]
-        c_atom = coords[:, :, self.c_idx]
-        cb = _virtual_cb(n_atom, ca, c_atom)
-        na_ref = coords[:, :, self.na_ref_atom_idx]
-        augmented_coords = [coords, cb[:, :, None, :]]
-        augmented_mask = [atom_mask, protein_mask[:, :, None]]
-        if self.include_predicted_na_n:
-            o4prime = coords[:, :, self.o4prime_idx]
-            c1prime = coords[:, :, self.c1prime_idx]
-            c2prime = coords[:, :, self.c2prime_idx]
-            na_n = _virtual_na_n(o4prime, c1prime, c2prime)
-            augmented_coords.append(na_n[:, :, None, :])
-            augmented_mask.append((dna_mask + rna_mask).clamp(max=1.0)[:, :, None])
-        all_coords = torch.cat(augmented_coords, dim=-2)
-        all_mask = torch.cat(augmented_mask, dim=-1)
-
-        _, neighbor_idx = _knn(ca + na_ref, token_mask, self.k_neighbors)
-        pair_rbf = _all_pair_rbf(all_coords, all_mask, neighbor_idx, self.num_rbf)
-        residue_offset = features["R_idx"][:, :, None] - features["R_idx"][:, None, :]
-        residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        same_chain = (features["chain_labels"][:, :, None] == features["chain_labels"][:, None, :]).long()
-        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        position_features = self.relative_position(residue_offset.long(), same_chain)
-        edge_features = self.edge_norm(self.edge_projection(torch.cat((position_features, pair_rbf), dim=-1)))
-
-        polymer_one_hot = F.one_hot(features["R_polymer_type"], num_classes=self.num_polymer_types).to(dtype=dtype)
-        node_features = self.node_norm(self.node_projection(polymer_one_hot))
-        return node_features, edge_features, neighbor_idx
-
-
-@register_pytree_dataclass
-@dataclass(slots=True)
-class NAMPNNRepresentations:
-    r"""
-    Family-owned encoder outputs at the representations boundary.
-
-    Node states are wrapped in the typed [`Single`][ofoldx.modules.representation.Single] carrier (the genuine
-    per-token representation), the way [`Coords`][ofoldx.modules.representation.Coords] wraps predicted
-    coordinates on structure-prediction outputs. The k-nearest-neighbor edge features are a sparse
-    `(B, L, K, hidden_size)` per-edge tensor -- not a dense square `(i, j)` pair -- so they ride alongside as a
-    raw tensor rather than in the [`Pair`][ofoldx.modules.representation.Pair] carrier (which requires equal
-    `i`/`j` axes). Registered as a pytree node so the carrier boundary introduces no ``torch.compile`` graph
-    break.
-
-    Attributes:
-        single: Encoded node states `[B, L, hidden_size]` wrapped in the ``Single`` carrier.
-        edges: Encoded neighbor edge states `[B, L, K, hidden_size]`.
-        neighbor_idx: Neighbor index `[B, L, K]`.
-    """
-
-    single: Single
-    edges: Tensor
-    neighbor_idx: Tensor
-
-
-@register_pytree_dataclass
-@dataclass(slots=True, kw_only=True)
-class NAMPNNInput(BaseInput):
-    r"""
-    Batched atom/sequence tensors and sampler controls consumed by NA-MPNN.
-
-    Attributes:
-        atom_coords: Atom coords in NA-MPNN atom order with shape `(B, L, 16, 3)`.
-        atom_mask: Atom-validity mask with shape `(B, L, 16)`.
-        sequence_tokens: Residue tokens in the NA-MPNN alphabet with shape `(B, L)`.
-        token_mask: Valid-token mask with shape `(B, L)`.
-        residue_index: Residue numbers used for relative-position features with shape `(B, L)`.
-        chain_index: Integer chain ids with shape `(B, L)`.
-        polymer_type_ids: Polymer-type ids with shape `(B, L)`.
-        protein_mask: Protein-token mask with shape `(B, L)`.
-        dna_mask: DNA-token mask with shape `(B, L)`.
-        rna_mask: RNA-token mask with shape `(B, L)`.
-        design_mask: Optional mask whose ones mark positions to design.
-        amino_acid_bias: Optional per-position token logit bias with shape `(B, L, 33)`.
-        pair_amino_acid_bias: Optional nearest-neighbor token-pair bias with shape `(B, L, 33, L, 33)`.
-        decoding_order_noise: Optional decode-order noise with shape `(num_samples, L)`.
-        temperature: Sampling temperature.
-        num_samples: Number of autoregressive samples.
-        symmetry_residue_groups: Residue groups decoded with tied identities.
-        symmetry_weights: Logit weights aligned with ``symmetry_residue_groups``.
-        fixed_position_mask: Optional hard-fixed-position mask with shape `(B, L)`.
-        rna_token_conversion_mask: Optional mask identifying RNA residues represented by shared DNA token ids.
-    """
-
-    atom_coords: Tensor
-    atom_mask: Tensor
-    sequence_tokens: Tensor
-    token_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    polymer_type_ids: Tensor
-    protein_mask: Tensor
-    dna_mask: Tensor
-    rna_mask: Tensor
-    design_mask: Tensor | None = None
-    amino_acid_bias: Tensor | None = None
-    pair_amino_acid_bias: Tensor | None = None
-    decoding_order_noise: Tensor | None = None
-    temperature: float | Tensor = 0.1
-    num_samples: int | None = None
-    symmetry_residue_groups: list[list[int]] | None = None
-    symmetry_weights: list[list[float]] | None = None
-    fixed_position_mask: Tensor | None = None
-    rna_token_conversion_mask: Tensor | None = None
-
-
-#: Bind the keyword-tensor construction path (``model(**tensors)``) to this family's typed input.
-NAMPNNDesigner.input_class = NAMPNNInput
-
-
-def _validate_nampnn_input(batch: NAMPNNInput, *, require_sampling: bool, vocab_size: int) -> None:
-    r"""
-    Validate the shape contract of a typed NA-MPNN input.
-    """
-
-    if batch.atom_coords.ndim != 4 or batch.atom_coords.shape[2:] != (len(NAMPNN_ATOM_NAMES), 3):
-        raise ValueError("atom_coords must have shape (B, L, 16, 3)")
-    if batch.atom_mask.shape != batch.atom_coords.shape[:3]:
-        raise ValueError("atom_mask must have shape (B, L, 16)")
-    if batch.sequence_tokens.shape != batch.token_mask.shape:
-        raise ValueError("sequence_tokens and token_mask must have matching shape (B, L)")
-    if batch.atom_coords.shape[:2] != batch.sequence_tokens.shape:
-        raise ValueError("atom_coords and sequence_tokens/token_mask must share batch and length axes")
-    for name in ("residue_index", "chain_index", "polymer_type_ids", "protein_mask", "dna_mask", "rna_mask"):
-        if getattr(batch, name).shape != batch.sequence_tokens.shape:
-            raise ValueError(f"{name} must have shape (B, L)")
-    if batch.design_mask is not None and batch.design_mask.shape != batch.sequence_tokens.shape:
-        raise ValueError("design_mask must have shape (B, L)")
-    if batch.fixed_position_mask is not None and batch.fixed_position_mask.shape != batch.sequence_tokens.shape:
-        raise ValueError("fixed_position_mask must have shape (B, L)")
-    if batch.amino_acid_bias is not None and batch.amino_acid_bias.shape != (*batch.sequence_tokens.shape, vocab_size):
-        raise ValueError(f"amino_acid_bias must have shape (B, L, {vocab_size})")
-    expected_pair_shape = (*batch.sequence_tokens.shape, vocab_size, batch.sequence_tokens.shape[1], vocab_size)
-    if batch.pair_amino_acid_bias is not None and batch.pair_amino_acid_bias.shape != expected_pair_shape:
-        raise ValueError(f"pair_amino_acid_bias must have shape {expected_pair_shape}")
-    if batch.decoding_order_noise is not None and (
-        batch.decoding_order_noise.ndim != 2 or batch.decoding_order_noise.shape[1] != batch.sequence_tokens.shape[1]
-    ):
-        raise ValueError("decoding_order_noise must have shape (num_samples, L)")
-    if require_sampling and batch.sequence_tokens.shape[0] != 1:
-        raise ValueError("NA-MPNN sampling follows the official single-backbone batch contract")
-
-
-def _optional_mask(mask: Tensor | None, reference: Tensor) -> Tensor:
-    r"""
-    Return ``mask`` as ``reference``'s dtype/device, or an all-ones mask when absent.
-    """
-
-    if mask is None:
-        return torch.ones_like(reference)
-    return mask.to(device=reference.device, dtype=reference.dtype)
-
-
-def _noise_scale(polymer_scale: float | None, default: float) -> float:
-    r"""
-    Resolve a polymer-specific noise scale.
-    """
-
-    return float(default if polymer_scale is None else polymer_scale)
-
-
-def _virtual_cb(n_atom: Tensor, ca: Tensor, c_atom: Tensor) -> Tensor:
-    r"""
-    Reconstruct the idealized protein Cβ coordinate from N, Cα, and C.
-    """
-
-    b = ca - n_atom
-    c = c_atom - ca
-    a = torch.cross(b, c, dim=-1)
-    return -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + ca
+# Contiguous generatable token columns per polymer type. RNA shares the DNA columns
+# in the released shared-token mode and owns tokens 26..29 in separate-token mode.
+_PROTEIN_TOKENS = tuple(range(0, 20))
+_DNA_TOKENS = tuple(range(21, 25))
+_RNA_SHARED_TOKENS = tuple(range(21, 25))
+_RNA_SEPARATE_TOKENS = tuple(range(26, 30))
 
 
 def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
-    r"""
-    Reconstruct the idealized nucleic-acid base nitrogen coordinate.
-    """
+    r"""Reconstruct the idealized nucleic-acid base nitrogen coordinate."""
 
     b = c1prime - o4prime
     c = c2prime - c1prime
@@ -1225,165 +110,1078 @@ def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
     return -0.56967352 * a + 0.51055973 * b - 0.53122153 * c + c1prime
 
 
-def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""
-    Find nearest valid graph neighbors for every token.
-    """
+def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tensor, num_bins: int) -> Tensor:
+    r"""RBF-encode every ordered atom-pair distance for each neighbor edge."""
 
-    pair_mask = mask[:, None, :] * mask[:, :, None]
-    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
-    distances = pair_mask * distances
-    max_distance = distances.max(dim=-1, keepdim=True).values
-    adjusted = distances + (1.0 - pair_mask) * max_distance
-    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
-
-
-def _rbf(distances: Tensor, num_bins: int) -> Tensor:
-    r"""
-    Expand distances into Gaussian radial-basis features.
-    """
-
-    centers = torch.linspace(2.0, 22.0, num_bins, device=distances.device, dtype=distances.dtype)
-    centers = centers.view(*((1,) * distances.ndim), num_bins)
-    width = (22.0 - 2.0) / num_bins
-    return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
-
-
-def _all_pair_rbf(coords: Tensor, atom_mask: Tensor, neighbor_idx: Tensor, num_bins: int) -> Tensor:
-    r"""
-    RBF-encode all ordered atom-pair distances for each neighbor edge.
-    """
-
-    flat = coords.reshape(coords.shape[0], coords.shape[1], -1)
-    neighbor_flat = gather_nodes(flat, neighbor_idx)
-    neighbor_coords = neighbor_flat.reshape(*neighbor_flat.shape[:-1], coords.shape[-2], coords.shape[-1])
-    distances = torch.sqrt(torch.sum((coords[:, :, None, :, None, :] - neighbor_coords[:, :, :, None]) ** 2, -1) + 1e-6)
-    rbf = _rbf(distances, num_bins)
-    neighbor_mask = gather_nodes(atom_mask, neighbor_idx)
-    rbf = rbf * atom_mask[:, :, None, :, None, None] * neighbor_mask[:, :, :, None, :, None]
-    return rbf.reshape(coords.shape[0], coords.shape[1], neighbor_idx.shape[-1], -1)
-
-
-def _autoregressive_masks(decode_order: Tensor, neighbor_idx: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-    r"""
-    Build backward and forward autoregressive neighbor masks.
-    """
-
-    length = decode_order.shape[1]
-    device = decode_order.device
-    reverse = F.one_hot(decode_order, num_classes=length).float()
-    backward_order = torch.einsum(
-        "ij,biq,bjp->bqp",
-        1 - torch.triu(torch.ones(length, length, device=device)),
-        reverse,
-        reverse,
+    flat = coordinates.reshape(coordinates.shape[0], coordinates.shape[1], -1)
+    neighbor_flat = gather_nodes(flat, neighbor_indices)
+    neighbor_coordinates = neighbor_flat.reshape(
+        *neighbor_flat.shape[:-1], coordinates.shape[-2], coordinates.shape[-1]
     )
-    attend = torch.gather(backward_order, 2, neighbor_idx).unsqueeze(-1)
-    mask = mask.view(mask.shape[0], length, 1, 1)
-    return mask * attend, mask * (1.0 - attend)
+    differences = coordinates[:, :, None, :, None, :] - neighbor_coordinates[:, :, :, None]
+    distances = torch.sqrt(torch.sum(differences**2, -1) + 1e-6)
+    rbf = _radial_basis(distances, num_bins)
+    neighbor_mask = gather_nodes(atom_mask, neighbor_indices)
+    rbf = rbf * atom_mask[:, :, None, :, None, None] * neighbor_mask[:, :, :, None, :, None]
+    return rbf.reshape(coordinates.shape[0], coordinates.shape[1], neighbor_indices.shape[-1], -1)
 
 
-def _sequence_log_likelihood(sequence: Tensor, log_probs: Tensor, mask: Tensor) -> Tensor:
-    r"""
-    Compute masked-mean per-sequence token log-likelihood.
+def _nearest_neighbors(coordinates: Tensor, valid_mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> Tensor:
+    r"""Return the released masked nearest-neighbor indices over the reference atom."""
+
+    pair_mask = valid_mask[:, :, None] * valid_mask[:, None, :]
+    distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
+    distances = pair_mask * distances
+    maximum = distances.max(dim=-1, keepdim=True).values
+    adjusted = distances + (1.0 - pair_mask) * maximum
+    return torch.topk(adjusted, min(num_neighbors, coordinates.shape[1]), dim=-1, largest=False).indices
+
+
+class NaMpnnFeatureEncoder(nn.Module):
+    r"""Geometric feature encoder for unified protein/nucleic-acid polymer graphs."""
+
+    def __init__(self, config: NaMpnnConfig) -> None:
+        super().__init__()
+        self.k_neighbors = config.k_neighbors
+        self.num_rbf = config.num_rbf
+        self.num_polymer_types = config.num_polymer_types
+        self.include_predicted_na_n = config.include_predicted_na_n
+        self.n_idx = MIXED_POLYMER_ATOM_TO_INDEX["N"]
+        self.ca_idx = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
+        self.c_idx = MIXED_POLYMER_ATOM_TO_INDEX["C"]
+        self.o4prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
+        self.c1prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
+        self.c2prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
+        total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
+        self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
+        self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
+        self.node_norm = nn.LayerNorm(config.feature_size)
+        self.edge_projection = nn.Linear(
+            config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
+            config.feature_size,
+            bias=False,
+        )
+        self.edge_norm = nn.LayerNorm(config.feature_size)
+
+    def forward(
+        self,
+        atom_coordinates: Tensor,
+        atom_mask: Tensor,
+        valid_mask: Tensor,
+        residue_indices: Tensor,
+        chain_indices: Tensor,
+        polymer_type_ids: Tensor,
+        protein_mask: Tensor,
+        dna_mask: Tensor,
+        rna_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Build node features, edge features, and nearest-neighbor indices."""
+
+        dtype = atom_coordinates.dtype
+        atom_mask = atom_mask.to(dtype=dtype)
+        valid = valid_mask.to(dtype=dtype)
+        protein = protein_mask.to(dtype=dtype)
+        dna = dna_mask.to(dtype=dtype)
+        rna = rna_mask.to(dtype=dtype)
+
+        ca = atom_coordinates[:, :, self.ca_idx]
+        n_atom = atom_coordinates[:, :, self.n_idx]
+        c_atom = atom_coordinates[:, :, self.c_idx]
+        beta_carbon = _virtual_beta_carbon(n_atom, ca, c_atom)
+        reference = atom_coordinates[:, :, self.c1prime_idx]
+        augmented_coordinates = [atom_coordinates, beta_carbon[:, :, None, :]]
+        augmented_mask = [atom_mask, protein[:, :, None]]
+        if self.include_predicted_na_n:
+            o4prime = atom_coordinates[:, :, self.o4prime_idx]
+            c1prime = atom_coordinates[:, :, self.c1prime_idx]
+            c2prime = atom_coordinates[:, :, self.c2prime_idx]
+            na_n = _virtual_na_n(o4prime, c1prime, c2prime)
+            augmented_coordinates.append(na_n[:, :, None, :])
+            augmented_mask.append((dna + rna).clamp(max=1.0)[:, :, None])
+        all_coordinates = torch.cat(augmented_coordinates, dim=-2)
+        all_mask = torch.cat(augmented_mask, dim=-1)
+
+        neighbor_indices = _nearest_neighbors(ca + reference, valid, self.k_neighbors)
+        pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
+        residue_offset = residue_indices[:, :, None] - residue_indices[:, None, :]
+        residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]
+        same_chain = (chain_indices[:, :, None] == chain_indices[:, None, :]).long()
+        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_indices)[:, :, :, 0]
+        position_features = self.relative_position(residue_offset.long(), same_chain)
+        edge_features = self.edge_norm(self.edge_projection(torch.cat((position_features, pair_rbf), dim=-1)))
+
+        polymer_one_hot = F.one_hot(polymer_type_ids, num_classes=self.num_polymer_types).to(dtype=dtype)
+        node_features = self.node_norm(self.node_projection(polymer_one_hot))
+        return node_features, edge_features, neighbor_indices
+
+
+class NaMpnnModel(nn.Module):
+    r"""Message-passing Model for fixed-backbone protein and nucleic-acid design."""
+
+    config_class = NaMpnnConfig
+
+    def __init__(self, config: NaMpnnConfig | None = None) -> None:
+        super().__init__()
+        self.config = NaMpnnConfig() if config is None else config
+        self.vocab_size = self.config.vocab_size
+        self.feature_encoder = NaMpnnFeatureEncoder(self.config)
+        self.node_embedding = nn.Linear(self.config.feature_size, self.config.hidden_size)
+        self.edge_embedding = nn.Linear(self.config.feature_size, self.config.hidden_size)
+        self.token_embedding = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.encoder_layers = nn.ModuleList(
+            MpnnEncoderLayer(self.config.hidden_size, self.config.hidden_size * 2, dropout=self.config.dropout)
+            for _ in range(self.config.num_encoder_layers)
+        )
+        self.decoder_layers = nn.ModuleList(
+            MpnnDecoderLayer(self.config.hidden_size, self.config.hidden_size * 3, dropout=self.config.dropout)
+            for _ in range(self.config.num_decoder_layers)
+        )
+        self.output_projection = nn.Linear(self.config.hidden_size, self.config.vocab_size)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""Apply the released Xavier-uniform matrix initialization."""
+
+        for parameter in self.parameters():
+            if parameter.ndim > 1:
+                nn.init.xavier_uniform_(parameter)
+
+    # ------------------------------------------------------------------
+    # Shared validation and evaluation-axis helpers.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
+        r"""Validate the independent decoding-order evaluation count."""
+
+        if type(num_decoding_orders) is not int or num_decoding_orders <= 0:
+            raise ValueError("num_decoding_orders must be a positive integer")
+        return num_decoding_orders
+
+    @staticmethod
+    def _require_single_target(input: NaMpnnInput) -> None:
+        r"""Reject an execution-batch axis on one-target biological operations."""
+
+        if input.atom_coordinates.shape[0] != 1 or len(input.structures) != 1:
+            raise ValueError("this NaMpnn operation returns one target and therefore accepts one input")
+
+    @staticmethod
+    def _repeat_input(input: NaMpnnInput, count: int) -> NaMpnnInput:
+        r"""Repeat one biological input into ``count`` aligned evaluation rows."""
+
+        def repeat(value: Tensor | None) -> Tensor | None:
+            return None if value is None else value.repeat_interleave(count, dim=0)
+
+        return NaMpnnInput(
+            atom_coordinates=repeat(input.atom_coordinates),
+            atom_mask=repeat(input.atom_mask),
+            sequence_tokens=repeat(input.sequence_tokens),
+            valid_mask=repeat(input.valid_mask),
+            residue_indices=repeat(input.residue_indices),
+            chain_indices=repeat(input.chain_indices),
+            polymer_type_ids=repeat(input.polymer_type_ids),
+            protein_mask=repeat(input.protein_mask),
+            dna_mask=repeat(input.dna_mask),
+            rna_mask=repeat(input.rna_mask),
+            design_mask=repeat(input.design_mask),
+            token_group_ids=repeat(input.token_group_ids),
+            structures=input.structures * count,
+            component_references=input.component_references * count,
+            polymer_types=input.polymer_types * count,
+            conditions=input.conditions * count,
+            tied_weights=repeat(input.tied_weights),
+            residue_logit_bias=repeat(input.residue_logit_bias),
+            allowed_token_mask=repeat(input.allowed_token_mask),
+            pair_logit_bias=repeat(input.pair_logit_bias),
+        )
+
+    def _probability_result(
+        self,
+        input: NaMpnnInput,
+        logits: Tensor,
+        decoding_ranks: Tensor,
+    ) -> MpnnProbabilityResult:
+        r"""Wrap aligned per-evaluation logits with the one target's identity."""
+
+        return MpnnProbabilityResult(
+            target=input.structures[0],
+            component_references=input.component_references[0],
+            sequence_tokens=input.sequence_tokens[0],
+            valid_mask=input.valid_mask[0],
+            design_mask=input.design_mask[0],
+            logits=logits,
+            decoding_ranks=decoding_ranks,
+        )
+
+    @staticmethod
+    def _generate_ranks(
+        valid_mask: Tensor,
+        design_mask: Tensor,
+        token_group_ids: Tensor,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        r"""Draw fixed-first causal ranks directly from aligned causal-unit IDs.
+
+        Every causal unit receives one random priority; members of a unit share its
+        priority through ``token_group_ids`` and therefore share its rank, while
+        every distinct unit receives a distinct rank. A unit is generated only when
+        all of its members are designed; those units sort after every fixed unit.
+        """
+
+        device = token_group_ids.device
+        batch, length = token_group_ids.shape
+        designed = (valid_mask & design_mask).to(torch.long)
+        unit_designed = torch.ones(batch, length, dtype=torch.long, device=device)
+        unit_designed.scatter_reduce_(1, token_group_ids, designed, reduce="amin", include_self=True)
+        priority = torch.rand(batch, length, device=device, generator=generator)
+        unit_key = priority + 2 * unit_designed.to(priority.dtype)
+        unit_order = torch.argsort(unit_key, dim=1)
+        unit_rank = torch.empty_like(unit_order)
+        unit_rank.scatter_(1, unit_order, torch.arange(length, device=device).expand(batch, length))
+        return torch.gather(unit_rank, 1, token_group_ids)
+
+    @staticmethod
+    def _shared_ranks(
+        valid_mask: Tensor,
+        design_mask: Tensor,
+        token_group_ids: Tensor,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        r"""Draw one causal ranking shared across the sampling evaluation axis.
+
+        The released sampler decodes one biological structure many times with an
+        order shared across the draw axis so tied members stay simultaneous; only
+        the multinomial draw differs per sample. Members of a unit share its rank
+        and generated units sort after every fixed unit.
+        """
+
+        row = NaMpnnModel._generate_ranks(
+            valid_mask[:1],
+            design_mask[:1],
+            token_group_ids[:1],
+            generator,
+        )
+        return row.expand(token_group_ids.shape[0], token_group_ids.shape[1]).contiguous()
+
+    # ------------------------------------------------------------------
+    # Encoder / teacher-forced decoder.
+    # ------------------------------------------------------------------
+    def _encode(
+        self,
+        input: NaMpnnInput,
+        *,
+        polymer_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Run the one coordinate encoder shared by every official operation."""
+
+        coordinates = input.atom_coordinates
+        protein_noise, dna_noise, rna_noise = polymer_noise
+        if protein_noise or dna_noise or rna_noise:
+            scale = (
+                input.protein_mask.to(coordinates.dtype) * protein_noise
+                + input.dna_mask.to(coordinates.dtype) * dna_noise
+                + input.rna_mask.to(coordinates.dtype) * rna_noise
+            )
+            noise = torch.randn(
+                coordinates.shape,
+                device=coordinates.device,
+                dtype=coordinates.dtype,
+                generator=generator,
+            )
+            coordinates = coordinates + scale[:, :, None, None] * noise
+        node_features, edge_features, neighbor_indices = self.feature_encoder(
+            coordinates,
+            input.atom_mask,
+            input.valid_mask,
+            input.residue_indices,
+            input.chain_indices,
+            input.polymer_type_ids,
+            input.protein_mask,
+            input.dna_mask,
+            input.rna_mask,
+        )
+        node_states = self.node_embedding(node_features)
+        edge_states = self.edge_embedding(edge_features)
+        mask = input.valid_mask.to(dtype=node_states.dtype)
+        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        attend_mask = mask.unsqueeze(-1) * attend_mask
+        for layer in self.encoder_layers:
+            node_states, edge_states = layer(node_states, edge_states, neighbor_indices, mask, attend_mask)
+        return node_states, edge_states, neighbor_indices
+
+    def _decode_logits(
+        self,
+        node_states: Tensor,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+        sequence_tokens: Tensor,
+        valid_mask: Tensor,
+        decoding_ranks: Tensor,
+    ) -> Tensor:
+        r"""Return raw teacher-forced logits for one exact causal ranking."""
+
+        token_states = self.token_embedding(sequence_tokens)
+        sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
+        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
+        backward_mask, forward_mask = _autoregressive_masks(
+            decoding_ranks,
+            neighbor_indices,
+            valid_mask.to(dtype=node_states.dtype),
+        )
+        forward_context = forward_mask * encoder_context
+        mask = valid_mask.to(node_states.dtype)
+        for layer in self.decoder_layers:
+            decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
+            node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+        return self.output_projection(node_states)
+
+    def _decode_unconditional_logits(
+        self,
+        node_states: Tensor,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        r"""Return sequence-free all-equal-rank logits: every row sees no decoded neighbor."""
+
+        mask = valid_mask.to(dtype=node_states.dtype)
+        encoder_edges = cat_neighbors_nodes(torch.zeros_like(node_states), edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
+        forward_context = mask[:, :, None, None] * encoder_context
+        states = node_states
+        for layer in self.decoder_layers:
+            states = layer(states, forward_context, mask)
+        return self.output_projection(states)
+
+    def encode(
+        self,
+        input: NaMpnnInput,
+        *,
+        protein_noise: float = 0.0,
+        dna_noise: float = 0.0,
+        rna_noise: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Return the shared node states, edge states, and neighbor indices."""
+
+        return self._encode(
+            input,
+            polymer_noise=(float(protein_noise), float(dna_noise), float(rna_noise)),
+            generator=generator,
+        )
+
+    def forward(
+        self,
+        input: NaMpnnInput,
+        *,
+        decoding_ranks: Tensor | None = None,
+        decode_protein_first: bool = False,
+        protein_noise: float = 0.0,
+        dna_noise: float = 0.0,
+        rna_noise: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> MpnnOutput:
+        r"""Return the single teacher-forced differentiable sequence-conditioned pass.
+
+        ``decode_protein_first`` and the three polymer coordinate noises are the
+        released training-only augmentation; inference operations never expose
+        them. The returned ranks are the exact causal order used.
+        """
+
+        node_states, edge_states, neighbor_indices = self._encode(
+            input,
+            polymer_noise=(float(protein_noise), float(dna_noise), float(rna_noise)),
+            generator=generator,
+        )
+        if decoding_ranks is None:
+            decoding_ranks = self._training_ranks(input, decode_protein_first, generator)
+        logits = self._decode_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            input.sequence_tokens,
+            input.valid_mask,
+            decoding_ranks,
+        )
+        return MpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
+
+    @staticmethod
+    def _training_ranks(
+        input: NaMpnnInput,
+        decode_protein_first: bool,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        r"""Draw the released noised training decode order, protein-first when asked."""
+
+        device = input.valid_mask.device
+        decode_mask = (input.valid_mask & input.design_mask).to(torch.float32)
+        if decode_protein_first:
+            decode_mask = decode_mask * (~input.protein_mask.bool()).to(torch.float32)
+        noise = torch.rand(input.valid_mask.shape, device=device, generator=generator)
+        order = torch.argsort((decode_mask + 1e-4) * noise, dim=1)
+        ranks = torch.empty_like(order)
+        ranks.scatter_(1, order, torch.arange(order.shape[1], device=device).expand_as(order))
+        return ranks
+
+    # ------------------------------------------------------------------
+    # Probability operations.
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def score(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        decoding_ranks: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+
+        self._require_single_target(input)
+        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        repeated = self._repeat_input(input, num_decoding_orders)
+        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        if decoding_ranks is None:
+            decoding_ranks = self._generate_ranks(
+                repeated.valid_mask,
+                repeated.design_mask,
+                repeated.token_group_ids,
+                generator,
+            )
+        logits = self._decode_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            repeated.sequence_tokens,
+            repeated.valid_mask,
+            decoding_ranks,
+        )
+        return self._probability_result(input, logits, decoding_ranks)
+
+    @torch.inference_mode()
+    def unconditional_probabilities(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return sequence-free all-equal-rank probabilities for every row."""
+
+        self._require_single_target(input)
+        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        repeated = self._repeat_input(input, num_decoding_orders)
+        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        logits = self._decode_unconditional_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            repeated.valid_mask,
+        )
+        decoding_ranks = torch.zeros(
+            num_decoding_orders,
+            input.valid_mask.shape[1],
+            dtype=torch.long,
+            device=input.atom_coordinates.device,
+        )
+        return self._probability_result(input, logits, decoding_ranks)
+
+    # ------------------------------------------------------------------
+    # Autoregressive sampler with the simultaneous-group bias equation.
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def sample(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_samples: int = 1,
+        temperature: float = 0.1,
+        decoding_ranks: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> MpnnSamplingOutput:
+        r"""Sample sequences, resolving token-symmetry groups on one causal path."""
+
+        self._require_single_target(input)
+        if type(num_samples) is not int or num_samples <= 0:
+            raise ValueError("num_samples must be a positive integer")
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be a finite positive number")
+
+        repeated = self._repeat_input(input, num_samples)
+        device = repeated.atom_coordinates.device
+        length = repeated.sequence_tokens.shape[1]
+        vocabulary = self.vocab_size
+
+        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        if decoding_ranks is None:
+            ranks = self._shared_ranks(
+                repeated.valid_mask,
+                repeated.design_mask,
+                repeated.token_group_ids,
+                generator,
+            )
+        else:
+            ranks = decoding_ranks
+        hard_support = self._hard_support(repeated.allowed_token_mask, length, device)
+
+        backward_mask, forward_mask = _autoregressive_masks(
+            ranks,
+            neighbor_indices,
+            repeated.valid_mask.to(dtype=node_states.dtype),
+        )
+        token_states = torch.zeros_like(node_states)
+        encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
+        forward_context = forward_mask * encoder_context
+        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+
+        sequences = torch.full((num_samples, length), PAD_TOKEN, dtype=torch.long, device=device)
+        log_probabilities = node_states.new_zeros(num_samples, length, vocabulary)
+        sampling_probabilities = torch.zeros_like(log_probabilities)
+
+        designed = (input.design_mask[0] & input.valid_mask[0]).tolist()
+        tied_weights = repeated.tied_weights
+        residue_bias = repeated.residue_logit_bias
+        pair_bias = repeated.pair_logit_bias
+
+        for members in self._ordered_units(input.token_group_ids[0], ranks[0]):
+            member_neural: dict[int, Tensor] = {}
+            group_logits = node_states.new_zeros(num_samples, vocabulary)
+            group_residue_bias = node_states.new_zeros(num_samples, vocabulary)
+            group_pair_bias = node_states.new_zeros(num_samples, vocabulary)
+            group_support = torch.ones(num_samples, vocabulary, dtype=torch.bool, device=device)
+            for member in members:
+                logits = self._decode_position(
+                    member,
+                    edge_states,
+                    neighbor_indices,
+                    token_states,
+                    layer_states,
+                    backward_mask,
+                    forward_context,
+                    repeated.valid_mask,
+                )
+                member_neural[member] = logits
+                weight = 1.0 if tied_weights is None else tied_weights[:, member].unsqueeze(-1)
+                group_logits = group_logits + weight * logits
+                if residue_bias is not None:
+                    group_residue_bias = group_residue_bias + residue_bias[:, member]
+                if pair_bias is not None:
+                    group_pair_bias = group_pair_bias + self._pair_contribution(
+                        pair_bias, member, members, sequences, vocabulary
+                    )
+                if hard_support is not None:
+                    group_support = group_support & hard_support[:, member]
+
+            total = group_logits + group_residue_bias + group_pair_bias
+            if global_logit_bias is not None:
+                total = total + global_logit_bias
+            # Hard support intersects the combined logit last, before temperature and
+            # the one group draw, matching the released -1e8 pre-softmax masking; a
+            # post-softmax intersection underflows to all-zero support when the top
+            # logit is a disallowed token at low temperature.
+            total = total.masked_fill(~group_support, float("-inf"))
+            probabilities = F.softmax(total / temperature, dim=-1)
+
+            generated_unit = all(designed[member] for member in members)
+            if generated_unit:
+                drawn = torch.multinomial(probabilities, 1, generator=generator)[:, 0]
+            else:
+                drawn = None
+            for member in members:
+                raw_log = F.log_softmax(member_neural[member], dim=-1)
+                keep = float(designed[member])
+                if generated_unit and drawn is not None:
+                    token = drawn
+                else:
+                    token = repeated.sequence_tokens[:, member]
+                sequences[:, member] = token
+                log_probabilities[:, member] = keep * raw_log
+                sampling_probabilities[:, member] = keep * probabilities
+                token_states[:, member] = self.token_embedding(token)
+
+        return MpnnSamplingOutput(
+            sequences=sequences,
+            log_probabilities=log_probabilities,
+            sampling_probabilities=sampling_probabilities,
+            decoding_ranks=ranks,
+        )
+
+    @staticmethod
+    def _hard_support(allowed_token_mask: Tensor | None, length: int, device: torch.device) -> Tensor | None:
+        r"""Return the final per-row generatable support, or ``None`` when unconstrained."""
+
+        return None if allowed_token_mask is None else allowed_token_mask.bool()
+
+    @staticmethod
+    def _ordered_units(token_group_ids: Tensor, ranks: Tensor) -> list[list[int]]:
+        r"""Return the shared causal units as ascending-rank member lists."""
+
+        members_by_id: dict[int, list[int]] = {}
+        for index, group_id in enumerate(token_group_ids.tolist()):
+            members_by_id.setdefault(int(group_id), []).append(index)
+        units = list(members_by_id.values())
+        rank_values = ranks.tolist()
+        units.sort(key=lambda members: rank_values[members[0]])
+        return units
+
+    def _decode_position(
+        self,
+        position: int,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+        token_states: Tensor,
+        layer_states: list[Tensor],
+        backward_mask: Tensor,
+        forward_context: Tensor,
+        valid_mask: Tensor,
+    ) -> Tensor:
+        r"""Incrementally decode one position across the whole evaluation axis."""
+
+        edge_slice = edge_states[:, position : position + 1]
+        neighbor_slice = neighbor_indices[:, position : position + 1]
+        sequence_edge = cat_neighbors_nodes(token_states, edge_slice, neighbor_slice)
+        forward_slice = forward_context[:, position : position + 1]
+        backward_slice = backward_mask[:, position : position + 1]
+        mask_slice = valid_mask[:, position : position + 1].to(dtype=token_states.dtype)
+        for layer_index, layer in enumerate(self.decoder_layers):
+            decoder_context = cat_neighbors_nodes(layer_states[layer_index], sequence_edge, neighbor_slice)
+            node_slice = layer_states[layer_index][:, position : position + 1]
+            updated = layer(node_slice, backward_slice * decoder_context + forward_slice, mask_slice)
+            layer_states[layer_index + 1][:, position : position + 1] = updated
+        return self.output_projection(layer_states[-1][:, position])
+
+    @staticmethod
+    def _pair_contribution(
+        pair_bias: Tensor,
+        member: int,
+        members: list[int],
+        sequences: Tensor,
+        vocabulary: int,
+    ) -> Tensor:
+        r"""Directed adjacent-token pair contribution for one target member row.
+
+        External context rows use the pre-rank-block sampled tokens, ``self`` stays
+        at PAD, and another internal member is evaluated at the shared candidate
+        token via the diagonal. Both directions of a mirrored internal pair
+        therefore contribute without averaging.
+        """
+
+        samples, length = sequences.shape
+        device = sequences.device
+        row_bias = pair_bias[:, member]  # [S, V, L, V]
+        context = sequences.clone()
+        context[:, member] = PAD_TOKEN
+        gathered = torch.gather(
+            row_bias,
+            -1,
+            context[:, None, :, None].expand(samples, vocabulary, length, 1),
+        ).squeeze(
+            -1
+        )  # [S, V, L]
+        internal_others = [other for other in members if other != member]
+        if internal_others:
+            gathered[:, :, internal_others] = 0.0
+        contribution = gathered.sum(dim=-1)
+        diagonal_index = torch.arange(vocabulary, device=device)
+        for other in internal_others:
+            contribution = contribution + row_bias[:, diagonal_index, other, diagonal_index]
+        return contribution
+
+    # ------------------------------------------------------------------
+    # Realized design and specificity operations.
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def design(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_candidates: int = 1,
+        temperature: float = 0.1,
+        global_logit_bias: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> DesignResult:
+        r"""Design complete coordinate-free protein/DNA/RNA MolecularSystems."""
+
+        self._require_single_target(input)
+        if type(num_candidates) is not int or num_candidates <= 0:
+            raise ValueError("num_candidates must be a positive integer")
+        sampled = self.sample(
+            input,
+            num_samples=num_candidates,
+            temperature=temperature,
+            global_logit_bias=global_logit_bias,
+            generator=generator,
+        )
+        losses = -torch.gather(sampled.log_probabilities, -1, sampled.sequences.unsqueeze(-1)).squeeze(-1)
+        designed = (input.valid_mask & input.design_mask).repeat_interleave(num_candidates, dim=0).to(losses.dtype)
+        design_count = designed.sum(dim=-1)
+        confidence = torch.exp(-(losses * designed).sum(dim=-1) / design_count.clamp_min(1.0))
+        matches = (sampled.sequences == input.sequence_tokens.repeat_interleave(num_candidates, dim=0)).to(losses.dtype)
+        recovery = (matches * designed).sum(dim=-1) / design_count.clamp_min(1.0)
+
+        references = input.component_references[0]
+        polymer_types = input.polymer_types[0]
+        design_rows = (input.design_mask[0] & input.valid_mask[0]).tolist()
+        designed_scope = frozenset(
+            reference for reference, selected in zip(references, design_rows) if reference is not None and selected
+        )
+        empty_scope = len(designed_scope) == 0
+
+        host_sequences = sampled.sequences.detach().cpu().tolist()
+        host_confidence = confidence.detach().cpu().tolist()
+        host_recovery = recovery.detach().cpu().tolist()
+        candidates: list[DesignCandidate] = []
+        for index in range(num_candidates):
+            system = _realize_system(
+                input.structures[0].system,
+                references,
+                polymer_types,
+                host_sequences[index],
+                design_rows,
+                self.config,
+            )
+            candidates.append(
+                DesignCandidate(
+                    system=system,
+                    scores={
+                        "designed_sequence_confidence": Score(
+                            float("nan") if empty_scope else float(host_confidence[index]),
+                            preferred="higher",
+                            scope=designed_scope,
+                        ),
+                        "sequence_recovery": Score(
+                            float("nan") if empty_scope else float(host_recovery[index]),
+                            preferred="higher",
+                            scope=designed_scope,
+                        ),
+                    },
+                )
+            )
+        return DesignResult(candidates=tuple(candidates))
+
+    @torch.inference_mode()
+    def specificity_profile(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_samples: int = 30,
+        temperature: float = 0.6,
+        global_logit_bias: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> ScoreResult:
+        r"""Average nucleic-acid sampling probabilities with protein context fixed."""
+
+        self._require_single_target(input)
+        na_design = input.design_mask & ~input.protein_mask
+        fixed = NaMpnnInput(
+            atom_coordinates=input.atom_coordinates,
+            atom_mask=input.atom_mask,
+            sequence_tokens=input.sequence_tokens,
+            valid_mask=input.valid_mask,
+            residue_indices=input.residue_indices,
+            chain_indices=input.chain_indices,
+            polymer_type_ids=input.polymer_type_ids,
+            protein_mask=input.protein_mask,
+            dna_mask=input.dna_mask,
+            rna_mask=input.rna_mask,
+            design_mask=na_design,
+            token_group_ids=input.token_group_ids,
+            structures=input.structures,
+            component_references=input.component_references,
+            polymer_types=input.polymer_types,
+            conditions=input.conditions,
+            tied_weights=input.tied_weights,
+            residue_logit_bias=input.residue_logit_bias,
+            allowed_token_mask=input.allowed_token_mask,
+            pair_logit_bias=input.pair_logit_bias,
+        )
+        sampled = self.sample(
+            fixed,
+            num_samples=num_samples,
+            temperature=temperature,
+            global_logit_bias=global_logit_bias,
+            generator=generator,
+        )
+        mean_probabilities = sampled.sampling_probabilities.to(torch.float64).mean(dim=0).cpu().numpy()
+
+        references = input.component_references[0]
+        polymer_types = input.polymer_types[0]
+        selected = (na_design[0] & input.valid_mask[0]).tolist()
+        na_rows = [
+            index
+            for index, (reference, polymer, keep) in enumerate(zip(references, polymer_types, selected))
+            if reference is not None and keep and polymer in ("dna", "rna")
+        ]
+        axis = tuple(references[index] for index in na_rows)
+        # Both released checkpoints are shared-token, so every nucleic row reads the
+        # shared DA/DC/DG/DT base columns 21..24 (_DNA_TOKENS == _RNA_SHARED_TOKENS). The
+        # separate-token 26..29 path (_RNA_SEPARATE_TOKENS) is not exercised by released weights.
+        base_names = ("adenine", "cytosine", "guanine", "thymine_uracil")
+        metrics: dict[str, Metric] = {}
+        for base_index, base in enumerate(base_names):
+            values = np.array(
+                [
+                    mean_probabilities[
+                        row,
+                        _DNA_TOKENS[base_index] if polymer_types[row] == "dna" else _RNA_SHARED_TOKENS[base_index],
+                    ]
+                    for row in na_rows
+                ],
+                dtype=np.float64,
+            )
+            metrics[f"{base}_probability"] = Metric(values=values, axis=axis)
+        return ScoreResult(target=input.structures[0], scores={}, metrics=metrics)
+
+
+def _component_from_token(token: int, polymer_type: str, shared_nucleic_tokens: bool) -> str:
+    r"""Realize one sampled token as a canonical component under its polymer type."""
+
+    if polymer_type == "protein":
+        if token >= 20:
+            raise RuntimeError(f"NA-MPNN sampled non-protein token {token} for a protein residue")
+        return MIXED_POLYMER_COMPONENT_IDS[token]
+    if polymer_type == "dna":
+        if not 21 <= token <= 24:
+            raise RuntimeError(f"NA-MPNN sampled non-DNA token {token} for a DNA residue")
+        return ("DA", "DC", "DG", "DT")[token - 21]
+    if 21 <= token <= 24:
+        return ("A", "C", "G", "U")[token - 21]
+    if 26 <= token <= 29:
+        return ("A", "C", "G", "U")[token - 26]
+    raise RuntimeError(f"NA-MPNN sampled non-RNA token {token} for an RNA residue")
+
+
+def _realize_system(
+    system: MolecularSystem,
+    component_references: tuple[ComponentReference | None, ...],
+    polymer_types: tuple[str, ...],
+    sampled_tokens: list[int],
+    design_rows: list[bool],
+    config: NaMpnnConfig,
+) -> MolecularSystem:
+    r"""Realize one candidate, partitioning divergent copies into distinct entities.
+
+    Copies within one original entity that realize different sequences are split
+    into distinct output entities; original entities are never merged, and
+    divergent shared instances never raise. Every ``ComponentReference`` and every
+    still-realizable bond is preserved.
     """
 
-    token_log_probs = torch.gather(log_probs, -1, sequence[..., None]).squeeze(-1)
-    mask = mask.to(dtype=token_log_probs.dtype)
-    if mask.shape[0] != token_log_probs.shape[0]:
-        mask = mask.repeat(token_log_probs.shape[0] // mask.shape[0], 1)
-    return (token_log_probs * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
-
-
-def _fixed_position_mask(features: Mapping[str, Any], mask: Tensor) -> Tensor:
-    r"""
-    Return the hard-fixed-position mask, defaulting to ones.
-    """
-
-    fixed = features.get("fixed_position_mask")
-    if fixed is None:
-        return torch.ones_like(mask)
-    return fixed.to(device=mask.device, dtype=mask.dtype)
-
-
-def _gather_position(tensor: Tensor, position: Tensor) -> Tensor:
-    r"""
-    Select per-batch rows from a `(B, L, C)` tensor.
-    """
-
-    index = position[:, None, None].expand(-1, 1, tensor.shape[-1])
-    return torch.gather(tensor, 1, index)[:, 0, :]
-
-
-def _pair_bias_at(pair_bias: Tensor | None, residue: Tensor, sampled: Tensor, vocab_size: int) -> Tensor | None:
-    r"""
-    Gather pairwise token bias induced by already-sampled positions.
-    """
-
-    if pair_bias is None:
-        return None
-    selected = torch.gather(
-        pair_bias,
-        1,
-        residue[:, None, None, None, None].repeat(1, 1, vocab_size, sampled.shape[1], vocab_size),
-    )[:, 0]
-    selected = torch.gather(selected, -1, sampled[:, None, :, None].repeat(1, vocab_size, 1, 1))[:, :, :, 0]
-    return selected.sum(dim=-1)
-
-
-def _sampling_distribution(
-    logits: Tensor,
-    bias: Tensor,
-    pair_bias: Tensor | None,
-    temperature: float | Tensor,
-) -> Tensor:
-    r"""
-    Convert logits to a valid NA-MPNN sampling distribution.
-    """
-
-    total = logits + bias
-    if pair_bias is not None:
-        total = total + pair_bias
-    probs = F.softmax(total / temperature, dim=-1)
-    probs = probs.clone()
-    probs[:, list(NAMPNN_INVALID_SAMPLE_TOKEN_IDS)] = 0.0
-    return probs / probs.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(probs.dtype).tiny)
-
-
-def _has_no_symmetry(groups: list[list[int]]) -> bool:
-    r"""
-    Return whether ``groups`` is the empty-symmetry sentinel.
-    """
-
-    return len(groups) == 1 and len(groups[0]) == 0
-
-
-def _decode_groups(decode_order: Tensor, symmetry_groups: list[list[int]]) -> list[list[int]]:
-    r"""
-    Expand a per-position decode order into symmetry groups.
-    """
-
-    ordered: list[list[int]] = []
-    seen: set[int] = set()
-    for residue in decode_order.detach().cpu().tolist():
-        residue = int(residue)
-        if residue in seen:
+    shared = True  # released alphabet always shares nucleic tokens for realization
+    replacements: dict[ComponentReference, object] = {}
+    for reference, polymer, token, selected in zip(component_references, polymer_types, sampled_tokens, design_rows):
+        if reference is None or not selected:
             continue
-        group = next((candidate for candidate in symmetry_groups if residue in candidate), None)
-        selected = list(group) if group is not None else [residue]
-        ordered.append(selected)
-        seen.update(selected)
-    return ordered
+        replacements[reference] = get_component(_component_from_token(int(token), polymer, shared))
+
+    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            realized_by_instance[instance_id] = PolymerSequence(
+                entity.polymer_type,
+                tuple(
+                    replacements.get((instance_id, index), component)
+                    for index, component in enumerate(entity.components)
+                ),
+            )
+        else:
+            realized_by_instance[instance_id] = entity
+
+    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
+        entity_id: [] for entity_id in system.entities
+    }
+    for instance_id, entity_id in system.instances.items():
+        entity = realized_by_instance[instance_id]
+        signature = tuple(component.component_id for component in entity.components)
+        partition = next(
+            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
+            None,
+        )
+        if partition is None:
+            partitions[entity_id].append((signature, entity, [instance_id]))
+        else:
+            partition[2].append(instance_id)
+
+    used_ids = set(system.entities)
+    new_entities: dict[str, PolymerSequence | Molecule] = {}
+    instance_entities: dict[str, str] = {}
+    for entity_id, original in system.entities.items():
+        values = partitions[entity_id]
+        original_signature = tuple(component.component_id for component in original.components)
+        primary_index = next(
+            (index for index, value in enumerate(values) if value[0] == original_signature),
+            0,
+        )
+        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
+            signature, entity, instance_ids = values[partition_index]
+            if partition_index == primary_index:
+                output_id = entity_id
+            else:
+                suffix = 2
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+            new_entities[output_id] = original if signature == original_signature else entity
+            for instance_id in instance_ids:
+                instance_entities[instance_id] = output_id
+    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
+
+    candidate = MolecularSystem(new_entities, new_instances)
+    retained_bonds = []
+    for bond in system.bonds:
+        try:
+            candidate.atom(bond.site_a)
+            candidate.atom(bond.site_b)
+            if bond.stereo_sites is not None:
+                candidate.atom(bond.stereo_sites[0])
+                candidate.atom(bond.stereo_sites[1])
+        except KeyError:
+            continue
+        retained_bonds.append(bond)
+    return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
 
 
-def _decode_nampnn_sequence(tokens):
-    r"""Decode NA-MPNN token ids into a residue-letter string (protein/DNA; RNA renders as its DNA letter)."""
-    letters = []
-    for token in tokens:
-        index = int(token)
-        restype = NAMPNN_RESTYPES[index] if 0 <= index < len(NAMPNN_RESTYPES) else "UNK"
-        letters.append(NAMPNN_TOKEN_TO_LETTER.get(restype, "X"))
-    return "".join(letters)
+# ---------------------------------------------------------------------------
+# Typed tensor and canonical-identity boundary (formerly contract.py)
+# ---------------------------------------------------------------------------
 
 
-register_sequence_decoder("nampnn", _decode_nampnn_sequence)
+@dataclass(eq=False)
+class NaMpnnInput:
+    r"""Aligned tensors and canonical identities consumed by NA-MPNN operations.
+
+    One biological Processor call owns one ``Structure``; the leading tensor axis
+    is an execution-evaluation axis, not a scientific batch. ``token_group_ids``
+    is the dense causal-unit contract: exact ties, token symmetry groups,
+    same-entity shared instances, and bonded fixing all lower into it so the graph
+    hot path never reasons about nested Python groups. Aligned residue bias and
+    tied weights are ordinary zero/one tensors; the dominant ``[B, L, V, L, V]``
+    pair tensor is ``None`` when absent.
+    """
+
+    atom_coordinates: Tensor
+    atom_mask: Tensor
+    sequence_tokens: Tensor
+    valid_mask: Tensor
+    residue_indices: Tensor
+    chain_indices: Tensor
+    polymer_type_ids: Tensor
+    protein_mask: Tensor
+    dna_mask: Tensor
+    rna_mask: Tensor
+    design_mask: Tensor
+    token_group_ids: Tensor
+    structures: tuple[Structure, ...]
+    component_references: tuple[tuple[ComponentReference | None, ...], ...]
+    polymer_types: tuple[tuple[str, ...], ...]
+    conditions: tuple[tuple[AllowedResidueIdentities | TiedResidueIdentities, ...], ...]
+    tied_weights: Tensor | None = None
+    residue_logit_bias: Tensor | None = None
+    allowed_token_mask: Tensor | None = None
+    pair_logit_bias: Tensor | None = None
+
+
+def token_groups_from_ids(
+    token_group_ids: Tensor,
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    r"""Reconstruct per-batch token-symmetry member groups from dense causal-unit IDs.
+
+    The sampling and probability hot paths consume ``token_group_ids`` directly;
+    this helper serves non-compiled orchestration that still reasons about explicit
+    member groups. Every returned group holds more than one row and lists members
+    in ascending row order, matching the dense first-row ID assignment; untied
+    singleton units are omitted.
+    """
+
+    batches: list[tuple[tuple[int, ...], ...]] = []
+    for row in token_group_ids.tolist():
+        members_by_id: dict[int, list[int]] = {}
+        for index, group_id in enumerate(row):
+            members_by_id.setdefault(group_id, []).append(index)
+        batches.append(tuple(tuple(members) for members in members_by_id.values() if len(members) > 1))
+    return tuple(batches)
+
+
+# Differentiable training objectives published by NA-MPNN.
+#
+# The released NA-MPNN training surface owns two ordinary per-token losses over the
+# 33-class protein/DNA/RNA vocabulary. Both consume ``[B, L]`` sequence tokens and
+# ``[B, L, 33]`` vocabulary log probabilities and return the unreduced per-row loss
+# with shape ``sequence_tokens.shape``. The polymer-specific label smoothing
+# distributes its mass only over each row's own polymer restype set. Masked mean,
+# accuracy, PPM injection, and the training command's fixed token aggregate belong
+# to a later Runner and are deliberately excluded here.
+
+# Contiguous vocabulary spans of the released 33-token alphabet. Protein occupies
+# tokens 0..20 (twenty amino acids plus UNK), DNA tokens 21..25 (DA/DC/DG/DT/DX),
+# and RNA tokens 26..30 (A/C/G/U/RX); MAS and PAD are never smoothing targets.
+_PROTEIN_RESTYPE_SPAN = (0, 21)
+_DNA_RESTYPE_SPAN = (21, 26)
+_RNA_RESTYPE_SPAN = (26, 31)
+_POLYMER_PROTEIN = 0
+_POLYMER_DNA = 1
+_POLYMER_RNA = 2
+
+
+def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
+    r"""Return the per-token negative log likelihood of the observed tokens.
+
+    Gathers ``-log_probabilities`` at each target token, matching upstream
+    NA-MPNN's ``NLLLoss(reduction="none")`` without the caller-owned mask
+    reduction. The result has shape ``sequence_tokens.shape``.
+    """
+
+    return -log_probabilities.gather(-1, sequence_tokens.unsqueeze(-1)).squeeze(-1)
+
+
+def smoothed_loss(
+    sequence_tokens: Tensor,
+    log_probabilities: Tensor,
+    polymer_type_ids: Tensor,
+    *,
+    weight: float = 0.1,
+) -> Tensor:
+    r"""Return the per-token polymer-specific label-smoothed cross entropy.
+
+    Each row's smoothing mass ``weight`` is distributed uniformly over that row's
+    own polymer restype set (protein 21, DNA 5, RNA 5), and the true column is
+    scaled by ``1 - weight`` before the eps is added, matching upstream NA-MPNN's
+    ``loss_smoothed``. At ``weight=0`` this reduces to :func:`nll_loss`. The
+    result has shape ``sequence_tokens.shape``.
+    """
+
+    num_classes = log_probabilities.shape[-1]
+    device = log_probabilities.device
+    dtype = log_probabilities.dtype
+    target = F.one_hot(sequence_tokens, num_classes).to(dtype)
+
+    def span_mask(span: tuple[int, int]) -> Tensor:
+        mask = torch.zeros(num_classes, device=device, dtype=dtype)
+        mask[span[0] : span[1]] = 1.0
+        return mask
+
+    protein_set = span_mask(_PROTEIN_RESTYPE_SPAN)
+    dna_set = span_mask(_DNA_RESTYPE_SPAN)
+    rna_set = span_mask(_RNA_RESTYPE_SPAN)
+    restype_mask = protein_set + dna_set + rna_set
+
+    target = target * torch.where(restype_mask.bool(), 1.0 - weight, torch.ones((), device=device, dtype=dtype))
+
+    protein_rows = (polymer_type_ids == _POLYMER_PROTEIN).to(dtype).unsqueeze(-1)
+    dna_rows = (polymer_type_ids == _POLYMER_DNA).to(dtype).unsqueeze(-1)
+    rna_rows = (polymer_type_ids == _POLYMER_RNA).to(dtype).unsqueeze(-1)
+    eps = (
+        protein_rows * protein_set * (weight / (_PROTEIN_RESTYPE_SPAN[1] - _PROTEIN_RESTYPE_SPAN[0]))
+        + dna_rows * dna_set * (weight / (_DNA_RESTYPE_SPAN[1] - _DNA_RESTYPE_SPAN[0]))
+        + rna_rows * rna_set * (weight / (_RNA_RESTYPE_SPAN[1] - _RNA_RESTYPE_SPAN[0]))
+    )
+    target = target + eps
+    return -(target * log_probabilities).sum(dim=-1)

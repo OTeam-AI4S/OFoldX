@@ -1,35 +1,41 @@
-r"""
-Public API for the Protenix v0.5 structure-prediction model: config, model, and processor.
-"""
+r"""Protenix v0.5 default and constraint model family."""
 
 from __future__ import annotations
 
+from ..registry import register_model as _register_model
 from .config import (
     ProtenixConfig,
-    ProtenixConstraintContactAtomConfig,
-    ProtenixConstraintContactConfig,
-    ProtenixConstraintEmbedderConfig,
-    ProtenixConstraintPocketConfig,
-    ProtenixConstraintSubstructureConfig,
+    ProtenixConstraintConfig,
+    ProtenixConstraintProcessorConfig,
+    ProtenixProcessorConfig,
 )
 from .model import (
-    ProtenixConstraintFeatures,
-    ProtenixGuidanceFeatures,
+    AtomConfidenceProjector,
+    ConfidenceHead,
+    ConfidencePairEmbedder,
+    InputEmbedder,
+    PairConfidenceProjector,
+    ProtenixAtomContact,
+    ProtenixConstraintEmbedder,
+    ProtenixConstraintModel,
+    ProtenixConstraintSubstructureEmbedder,
     ProtenixInput,
     ProtenixModel,
+    ProtenixOutput,
+    ProtenixPocket,
+    ProtenixTokenContact,
 )
-from .processor import ProtenixProcessor
+from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
-__all__ = [
-    "ProtenixConfig",
-    "ProtenixConstraintContactAtomConfig",
-    "ProtenixConstraintContactConfig",
-    "ProtenixConstraintEmbedderConfig",
-    "ProtenixConstraintFeatures",
-    "ProtenixInput",
-    "ProtenixModel",
-    "ProtenixConstraintPocketConfig",
-    "ProtenixProcessor",
-    "ProtenixConstraintSubstructureConfig",
-    "ProtenixGuidanceFeatures",
-]
+_register_model(
+    "ofoldx.protenix",
+    model=ProtenixModel,
+    processor=ProtenixProcessor,
+    standard_tasks=("fold",),
+)
+_register_model(
+    "ofoldx.protenix_constraint",
+    model=ProtenixConstraintModel,
+    processor=ProtenixConstraintProcessor,
+    standard_tasks=("fold",),
+)

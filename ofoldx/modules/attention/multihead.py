@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import Literal
 
 from torch import Tensor, nn
 
@@ -19,8 +20,7 @@ class GatedMultiheadAttention(nn.Module):
 
     Wraps a [`MultiheadAttentionProjection`][ofoldx.modules.attention.multihead.MultiheadAttentionProjection]
     and dispatches the scaled-dot-product core to the resolved operator backend
-    (``oops`` fused kernels, DeepSpeed ``DS4Sci_EvoformerAttention``, or the pure-PyTorch
-    ``scaled_dot_product_attention`` reference). This is the shared attention block used by the trunk,
+    (``oops`` fused kernels or a pure-PyTorch reference). This is the shared attention block used by the trunk,
     atom, and diffusion stacks; higher-level modules supply the pair-derived ``biases``.
 
     Args:
@@ -35,8 +35,9 @@ class GatedMultiheadAttention(nn.Module):
         output_bias: Whether the output projection carries a learnable bias.
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
+        torch_backend: Fixed PyTorch reference used when ``operator_backend="auto"`` cannot use OOps.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``sdpa`` reference otherwise.
+            to ``torch_backend`` otherwise.
 
     Examples:
         >>> import torch
@@ -60,11 +61,15 @@ class GatedMultiheadAttention(nn.Module):
         gating: bool = True,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
+        torch_backend: Literal["sdpa", "eager"] = "sdpa",
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        if torch_backend not in {"sdpa", "eager"}:
+            raise ValueError(f"unsupported torch_backend {torch_backend!r}; expected 'eager' or 'sdpa'")
+        self.torch_backend = torch_backend
         self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "sdpa", "deepspeed", "eager"), public_default="sdpa"
+            operator_backend, supported=("oops", "sdpa", "eager"), public_default=torch_backend
         )
         self.projection = MultiheadAttentionProjection(
             hidden_size=hidden_size,
@@ -91,8 +96,8 @@ class GatedMultiheadAttention(nn.Module):
         r"""
         Run gated multi-head attention, dispatching to the configured backend.
 
-        Projects q/k/v into heads, computes biased and masked attention via the ``oops``,
-        ``deepspeed``, or ``sdpa`` backend, then merges heads applying the optional sigmoid gate.
+        Projects q/k/v into heads, computes biased and masked attention via the selected OOps or
+        PyTorch implementation, then merges heads applying the optional sigmoid gate.
 
         Args:
             query: Query tokens `[..., q_tokens, query_size]`.
@@ -123,6 +128,7 @@ class GatedMultiheadAttention(nn.Module):
             attention_mask=attention_mask,
             projection=self.projection,
             operator_backend=self.operator_backend,
+            torch_backend=self.torch_backend,
         )
 
 
@@ -178,7 +184,7 @@ class MultiheadAttentionProjection(nn.Module):
         gate_bias_init: float = 0.0,
     ) -> None:
         super().__init__()
-        if hidden_size % num_attention_heads != 0:
+        if head_dim is None and hidden_size % num_attention_heads != 0:
             raise ValueError(
                 f"hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
             )
@@ -241,8 +247,8 @@ class MultiheadAttentionProjection(nn.Module):
         r"""
         Project q/k/v into heads without scaling the query.
 
-        The unscaled variant is used by backends (e.g. DeepSpeed) that fold the ``1 / sqrt(head_dim)``
-        scaling into their own attention core.
+        The unscaled variant is used by backends that fold the ``1 / sqrt(head_dim)`` scaling into
+        their own attention core.
 
         Args:
             query: Query tokens `[..., q_tokens, query_size]`.

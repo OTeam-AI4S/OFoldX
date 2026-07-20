@@ -1,10 +1,9 @@
 r"""
 Backend dispatch for the MSA pair-weighted-averaging operator.
 
-The dispatcher owns everything backend-specific for this operator in one place: the supported
-backends, ``"auto"`` resolution, the CUDA guard, and each backend's calling convention. Modules pass
-their gathered parameters plus the requested ``operator_backend`` and stay backend-agnostic. New
-backends (cuEquivariance / NVIDIA) are added as a branch here, not in every caller.
+The dispatcher owns backend selection, availability, and calling-convention
+adaptation. Modules pass the ordinary tensor arguments without a second
+validation layer.
 """
 
 from __future__ import annotations
@@ -102,6 +101,13 @@ def pair_weighted_average(
         if pair_mask is not None and not pair_mask.is_cuda:
             raise OOpsUnsupportedError(
                 "MsaPairWeightedAveraging backend 'oops' requires a CUDA pair_mask; use operator_backend='eager'"
+            )
+        # The fused kernel applies a single epsilon to both the MSA and pair LayerNorms; the eager path
+        # keeps them independent. Guard the mismatch instead of silently dropping norm_pair_eps.
+        if norm_msa_eps != norm_pair_eps:
+            raise OOpsUnsupportedError(
+                "MsaPairWeightedAveraging backend 'oops' requires norm_msa_eps == norm_pair_eps "
+                f"(got {norm_msa_eps} and {norm_pair_eps}); use operator_backend='eager'"
             )
         return _oops_pair_weighted_average(
             msa,

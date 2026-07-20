@@ -6,8 +6,8 @@ Official DeepMind AlphaFold 2 parameters are distributed as ``params_*.npz`` fil
 flat-parameter convention ``scope//name``. This module handles the official package
 shape end to end: it finds the selected model, loads the NPZ without pickle,
 normalizes the flat Haiku names into OFoldX-style tensor keys, converts common
-Haiku dense/attention/outer-product layouts into PyTorch-style layouts, strict-loads
-them into the PyTorch AF2 model, and writes an OFoldX model artifact.
+Haiku dense/attention/outer-product layouts into PyTorch-style layouts and strict-loads
+them into the PyTorch AF2 model.
 
 The current OFoldX ``AlphaFold2Model`` can run through an AF2-shaped forward path,
 and official monomer / pTM parameters strict-load into the PyTorch parameter tree.
@@ -20,37 +20,20 @@ from __future__ import annotations
 import io
 import re
 import tarfile
-from collections import Counter
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import BinaryIO, Iterator
 
 import numpy as np
 import torch
-from chanfig import Config
 from torch import Tensor
 
-from ....artifacts import ARTIFACT_MANIFEST_NAME
-from ...mixin import ModelMixin, no_init_weights
-
-OFFICIAL_AF2_PARAMS_URL = "https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar"
-OFFICIAL_AF2_PARAMS_ARCHIVE = "alphafold_params_2022-12-06.tar"
-OFFICIAL_AF2_CODE_LICENSE = "Apache-2.0"
-OFFICIAL_AF2_PARAMS_LICENSE = "CC BY 4.0"
-CONVERSION_CONFIG_NAME = "conversion_config.json"
-CONVERTED_WEIGHTS_NAME = ModelMixin.WEIGHTS_NAME
+from ..config import AlphaFold2Config
+from ..model import AlphaFold2Model
 
 _MODEL_NAME_RE = re.compile(r"^model_[1-5](?:_ptm|_multimer(?:_v[123])?)?$")
-OFFICIAL_AF2_MODEL_NAMES = tuple(
-    [f"model_{index}" for index in range(1, 6)]
-    + [f"model_{index}_ptm" for index in range(1, 6)]
-    + [f"model_{index}_multimer_v3" for index in range(1, 6)]
-)
-_STRICT_LOAD_READY = "strict_load_ready"
-_STRICT_LOAD_BLOCKED = "strict_load_blocked"
 _PARAMETER_NAME_MAP = {
     "weights": ("weight",),
     "scale": ("weight",),
@@ -113,23 +96,6 @@ _STACK_SCOPE_MAP = {
     "gating_linear": ("gating_linear",),
     "attention": ("attention", "projection"),
 }
-_BLOCKED_PREFIX_REASONS: dict[str, str] = {}
-
-
-@dataclass(frozen=True, slots=True)
-class _NormalizedParamKey:
-    target_key: str
-    target_group: str
-    strict_load_status: str
-    strict_load_blocker: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _LoadedOfficialParams:
-    tensors: dict[str, Tensor]
-    model_name: str
-    source_path: Path
-    archive_member: str | None
 
 
 def load_official_alphafold2_params(
@@ -157,126 +123,48 @@ def load_official_alphafold2_params(
             parameter file or if the NPZ does not look like official AF2 params.
     """
 
-    return _load_official_alphafold2_params(params_path, model_name=model_name).tensors
-
-
-def inspect_official_alphafold2_checkpoint(
-    checkpoint_path: str | PathLike[str],
-    *,
-    model_name: str | None = None,
-) -> dict[str, Any]:
-    r"""
-    Return a lightweight summary of an official AF2 checkpoint.
-
-    Args:
-        checkpoint_path: Official NPZ, params directory/download root, or tar archive.
-        model_name: Official model id when the path contains multiple models.
-
-    Returns:
-        JSON-serializable checkpoint summary.
-    """
-
-    loaded = _load_official_alphafold2_params(checkpoint_path, model_name=model_name)
-    scopes = Counter(key.split("//", 1)[0] for key in loaded.tensors)
-    mapping_summary = inspect_official_alphafold2_mapping(loaded.tensors)
-    return {
-        "checkpoint": str(Path(checkpoint_path)),
-        "checkpoint_source": "deepmind",
-        "checkpoint_format": "official_alphafold2_npz",
-        "model_name": loaded.model_name,
-        "source_archive_member": loaded.archive_member,
-        "num_tensors": len(loaded.tensors),
-        "num_parameters": sum(tensor.numel() for tensor in loaded.tensors.values()),
-        "top_scopes": dict(scopes.most_common(20)),
-        "mapping_summary": mapping_summary,
-        "dtypes": _dtype_counts(loaded.tensors),
-        "source_release": OFFICIAL_AF2_PARAMS_URL,
-        "official_code_license": OFFICIAL_AF2_CODE_LICENSE,
-        "official_params_license": OFFICIAL_AF2_PARAMS_LICENSE,
-    }
+    params, _ = _load_official_alphafold2_params(params_path, model_name=model_name)
+    return params
 
 
 def convert_deepmind_alphafold2_checkpoint(
     checkpoint_path: str | PathLike[str],
-    output_dir: str | PathLike[str],
     *,
     model_name: str | None = None,
     dtype: torch.dtype | None = None,
-    inspect_only: bool = False,
-    verify_artifact: bool = True,
-) -> dict[str, Any]:
+) -> AlphaFold2Model:
     r"""
-    Convert official AlphaFold 2 parameters into an OFoldX model artifact.
-
-    The artifact contains ``manifest.json``, ``config.json``, ``model.safetensors``,
-    and ``conversion_config.json``. Official monomer and pTM checkpoints are
-    strict-loaded into [`AlphaFold2Model`][] before the artifact is written.
+    Convert official AlphaFold 2 parameters into a strict-loaded native model.
 
     Args:
         checkpoint_path: Official AF2 NPZ, params directory/download root, or tar archive.
-        output_dir: Directory to write the converted model artifact.
         model_name: Official model id when ``checkpoint_path`` contains multiple models.
-        dtype: Optional dtype for floating-point persisted tensors.
-        inspect_only: If ``True``, only return a checkpoint summary and write nothing.
-        verify_artifact: If ``True``, reload the just-written artifact with strict
-            model loading before returning.
+        dtype: Optional dtype for floating-point converted tensors.
 
     Returns:
-        JSON-serializable conversion report.
+        The converted, strict-loaded model.
     """
 
-    if inspect_only:
-        return inspect_official_alphafold2_checkpoint(checkpoint_path, model_name=model_name)
+    params, resolved_model_name = _load_official_alphafold2_params(checkpoint_path, model_name=model_name)
+    if _model_family(resolved_model_name) == "multimer":
+        # AF-Multimer is a second registered pair in this family sharing the trunk;
+        # its converter builds AlphaFold2MultimerConfig/AlphaFold2MultimerModel and
+        # applies the multimer key normalization. Imported lazily to avoid a
+        # converters<->model import cycle at module load.
+        from . import deepmind_multimer
 
-    loaded = _load_official_alphafold2_params(checkpoint_path, model_name=model_name)
-    _validate_supported_model_package(loaded)
-    converted = convert_official_alphafold2_state_dict(loaded.tensors, dtype=dtype)
+        return deepmind_multimer.convert_deepmind_multimer_checkpoint(
+            params,
+            model_name=resolved_model_name,
+            dtype=dtype,
+        )
+    converted = convert_official_alphafold2_state_dict(params, dtype=dtype)
 
-    from ..config import AlphaFold2Config
-    from ..model import AlphaFold2Model
-
-    model_config = AlphaFold2Config(_model_config_overrides(loaded.model_name))
-    model_config["checkpoint_variant"] = loaded.model_name
-    model_config["model_family"] = _model_family(loaded.model_name)
-    with no_init_weights():
+    model_config = AlphaFold2Config(_model_config_overrides(resolved_model_name))
+    with torch.device("meta"):
         model = AlphaFold2Model(model_config)
-    _validate_converted_state_dict_matches_model(converted, model.state_dict(), model_name=loaded.model_name)
-    model.load_state_dict(converted, strict=True)
-    if dtype is not None:
-        model.to(dtype=dtype)
-
-    output_path = Path(output_dir)
-    model.save_pretrained(output_path)
-    _write_processor_component(output_path)
-
-    persisted_state = dict(model.state_dict())
-    config = _conversion_config(loaded, persisted_state, dtype=dtype)
-    Config(config).json(output_path / CONVERSION_CONFIG_NAME)
-    _update_manifest_metadata(output_path)
-
-    if verify_artifact:
-        AlphaFold2Model.from_pretrained(output_path, strict=True)
-
-    return {
-        "checkpoint": str(Path(checkpoint_path)),
-        "output_dir": str(output_path),
-        "architecture": "alphafold2",
-        "artifact_kind": "model",
-        "checkpoint_source": "deepmind",
-        "checkpoint_format": "official_alphafold2_npz",
-        "model_name": loaded.model_name,
-        "source_archive_member": loaded.archive_member,
-        "source_release": OFFICIAL_AF2_PARAMS_URL,
-        "official_code_license": OFFICIAL_AF2_CODE_LICENSE,
-        "official_params_license": OFFICIAL_AF2_PARAMS_LICENSE,
-        "runnable_model": True,
-        "tensor_count": len(persisted_state),
-        "dtype": str(dtype) if dtype is not None else None,
-        "dtype_counts": _dtype_counts(persisted_state),
-        "mapping_summary": _mapping_summary_from_keys(loaded.tensors),
-        "processor_written": True,
-        "verified": verify_artifact,
-    }
+    model.load_state_dict(converted, strict=True, assign=True)
+    return model
 
 
 def convert_official_alphafold2_state_dict(
@@ -303,7 +191,6 @@ def convert_official_alphafold2_state_dict(
         ValueError: If a source key is malformed or two source keys collide after normalization.
     """
 
-    _validate_official_param_keys(params)
     converted: dict[str, Tensor] = {}
     for source_key, tensor in params.items():
         target_key = normalize_official_param_key(source_key)
@@ -363,7 +250,15 @@ def normalize_official_param_key(key: str) -> str:
         'structure_module.layer_norm.weight'
     """
 
-    return _normalize_official_param_key(key).target_key
+    scope, name = _split_official_param_key(key)
+    parts = [part for part in scope.split("/") if part]
+    if parts[:2] == ["alphafold", "alphafold_iteration"]:
+        parts = parts[2:]
+    elif parts[:1] == ["alphafold"]:
+        parts = parts[1:]
+    normalized_parts = _normalize_scope_parts(parts)
+    combined = _rename_triangle_attention_children([*normalized_parts, *_normalize_parameter_parts(name)])
+    return ".".join(combined)
 
 
 def _expand_stacked_block_tensor(
@@ -409,35 +304,6 @@ def _is_stacked_block_tensor(source_key: str, target_key: str, tensor: Tensor) -
     return False
 
 
-def inspect_official_alphafold2_mapping(params: Mapping[str, Tensor]) -> dict[str, Any]:
-    r"""
-    Summarize how official AF2 tensors normalize into the OFoldX parameter tree.
-
-    The summary is intentionally about strict-load readiness, not just string
-    rewriting. A tensor can have a clean OFoldX-style target key while the current
-    module still cannot strict-load the official checkpoint because the native AF2
-    module is not implemented yet.
-    """
-
-    _validate_official_param_keys(params)
-    return _mapping_summary_from_keys(params)
-
-
-def unflatten_official_params(params: Mapping[str, Tensor]) -> dict[str, dict[str, Tensor]]:
-    r"""
-    Rebuild the two-level Haiku ``scope -> name -> tensor`` structure.
-
-    This mirrors the upstream ``flat_params_to_haiku`` helper while keeping values
-    as PyTorch tensors for converter-side inspection.
-    """
-
-    nested: dict[str, dict[str, Tensor]] = {}
-    for key, tensor in params.items():
-        scope, name = _split_official_param_key(key)
-        nested.setdefault(scope, {})[name] = tensor
-    return nested
-
-
 def official_param_filename(model_name: str) -> str:
     r"""
     Return the official NPZ filename for an AlphaFold 2 model id.
@@ -445,45 +311,6 @@ def official_param_filename(model_name: str) -> str:
 
     _validate_model_name(model_name)
     return f"params_{model_name}.npz"
-
-
-def _normalize_official_param_key(key: str) -> _NormalizedParamKey:
-    scope, name = _split_official_param_key(key)
-    parts = [part for part in scope.split("/") if part]
-    if parts[:2] == ["alphafold", "alphafold_iteration"]:
-        parts = parts[2:]
-    elif parts[:1] == ["alphafold"]:
-        parts = parts[1:]
-
-    normalized_parts = _normalize_scope_parts(parts)
-    parameter_parts = _normalize_parameter_parts(name, normalized_parts)
-    target_key = ".".join([*normalized_parts, *parameter_parts])
-    target_group = _target_group(target_key)
-    strict_load_blocker = _strict_load_blocker(target_key)
-    return _NormalizedParamKey(
-        target_key=target_key,
-        target_group=target_group,
-        strict_load_status=_STRICT_LOAD_READY if strict_load_blocker is None else _STRICT_LOAD_BLOCKED,
-        strict_load_blocker=strict_load_blocker,
-    )
-
-
-def _mapping_summary_from_keys(params: Mapping[str, Tensor]) -> dict[str, Any]:
-    mappings = [_normalize_official_param_key(key) for key in params]
-    status_counts = Counter(mapping.strict_load_status for mapping in mappings)
-    group_counts = Counter(mapping.target_group for mapping in mappings)
-    blocker_counts = Counter(mapping.strict_load_blocker for mapping in mappings if mapping.strict_load_blocker)
-    blocked_groups: dict[str, int] = {}
-    for mapping in mappings:
-        if mapping.strict_load_blocker is not None:
-            blocked_groups[mapping.target_group] = blocked_groups.get(mapping.target_group, 0) + 1
-    return {
-        "strict_load_ready": not blocker_counts,
-        "strict_load_status_counts": dict(sorted(status_counts.items())),
-        "target_group_counts": dict(sorted(group_counts.items())),
-        "blocked_group_counts": dict(sorted(blocked_groups.items())),
-        "blocker_counts": dict(sorted(blocker_counts.items())),
-    }
 
 
 def _normalize_scope_parts(parts: list[str]) -> list[str]:
@@ -536,7 +363,7 @@ def _normalize_evoformer_block_scope(parts: list[str]) -> list[str]:
             normalized.append(part)
         else:
             normalized.extend(mapped)
-    return normalized
+    return _rename_outer_product_mean_norm(normalized)
 
 
 def _normalize_stack_scope(parts: list[str]) -> list[str]:
@@ -550,6 +377,70 @@ def _normalize_stack_scope(parts: list[str]) -> list[str]:
             normalized.append(part)
         else:
             normalized.extend(mapped)
+    return _rename_outer_product_mean_norm(normalized)
+
+
+def _rename_outer_product_mean_norm(normalized: list[str]) -> list[str]:
+    # The outer-product mean now subclasses the shared ``OuterProductMean``, whose pre-LayerNorm is
+    # registered as ``norm_msa``; the official Haiku scope names it ``layer_norm_input`` (the same
+    # name the triangle-multiplication norm uses, which must keep its ``layer_norm_input`` target).
+    for index in range(1, len(normalized)):
+        if normalized[index] == "layer_norm_input" and normalized[index - 1] == "outer_product_mean":
+            normalized[index] = "norm_msa"
+    return _rename_triangle_multiplication_children(normalized)
+
+
+# Child-leaf renames for the unified ``TriangleMultiplication``: the shared bias-free module names its
+# submodules ``norm_input``/``norm_output``/``left_gate_projection``/``right_gate_projection``/
+# ``gate_projection`` (the official Haiku scope uses ``layer_norm_input``/``center_layer_norm``/
+# ``left_gate``/``right_gate``/``gating_linear``). For the *incoming* update the shared module fixes the
+# canonical einsum ``"...kih,...kjh->...ijh"`` (left owns row ``i``, right owns column ``j``), so the
+# left/right value and gate projections must swap to reproduce DeepMind's own ``"...kjc,...kic->..."``
+# incoming contraction. Outgoing loads straight through. See TRUNK_EINSUM_LOCK.md.
+_TRIANGLE_MULTIPLICATION_CHILD_MAP = {
+    "layer_norm_input": "norm_input",
+    "center_layer_norm": "norm_output",
+    "left_projection": "left_projection",
+    "right_projection": "right_projection",
+    "left_gate": "left_gate_projection",
+    "right_gate": "right_gate_projection",
+    "output_projection": "output_projection",
+    "gating_linear": "gate_projection",
+}
+_TRIANGLE_MULTIPLICATION_CHILD_MAP_SWAPPED = {
+    **_TRIANGLE_MULTIPLICATION_CHILD_MAP,
+    "left_projection": "right_projection",
+    "right_projection": "left_projection",
+    "left_gate": "right_gate_projection",
+    "right_gate": "left_gate_projection",
+}
+
+
+# Child renames for the unified ``TriangleAttention`` (shared bias-free module + the AlphaFold 2
+# subclass): its pre-attention LayerNorm is registered ``norm_pair`` and its per-head triangle-bias
+# projection ``bias_projection`` (the official Haiku names are ``query_norm``/``feat_2d_weights``, which
+# other modules — MSA row/column attention — keep). Scope the rename to a triangle-attention parent.
+_TRIANGLE_ATTENTION_PARENTS = frozenset({"triangle_attention_starting_node", "triangle_attention_ending_node"})
+_TRIANGLE_ATTENTION_CHILD_MAP = {"query_norm": "norm_pair", "feat_2d_weights": "bias_projection"}
+
+
+def _rename_triangle_attention_children(parts: list[str]) -> list[str]:
+    for index in range(1, len(parts)):
+        if parts[index - 1] in _TRIANGLE_ATTENTION_PARENTS:
+            parts[index] = _TRIANGLE_ATTENTION_CHILD_MAP.get(parts[index], parts[index])
+    return parts
+
+
+def _rename_triangle_multiplication_children(normalized: list[str]) -> list[str]:
+    for index in range(len(normalized) - 1):
+        parent = normalized[index]
+        if parent == "triangle_multiplication_outgoing":
+            child_map = _TRIANGLE_MULTIPLICATION_CHILD_MAP
+        elif parent == "triangle_multiplication_incoming":
+            child_map = _TRIANGLE_MULTIPLICATION_CHILD_MAP_SWAPPED
+        else:
+            continue
+        normalized[index + 1] = child_map.get(normalized[index + 1], normalized[index + 1])
     return normalized
 
 
@@ -601,7 +492,7 @@ def _normalize_head_scope(parts: list[str]) -> list[str]:
     return parts
 
 
-def _normalize_parameter_parts(name: str, normalized_scope_parts: list[str]) -> tuple[str, ...]:
+def _normalize_parameter_parts(name: str) -> tuple[str, ...]:
     if name == "feat_2d_weights":
         return ("feat_2d_weights", "weight")
     parameter_parts = _PARAMETER_NAME_MAP.get(name)
@@ -610,57 +501,18 @@ def _normalize_parameter_parts(name: str, normalized_scope_parts: list[str]) -> 
     return (name,)
 
 
-def _target_group(target_key: str) -> str:
-    if target_key.startswith("input_embedding."):
-        return "input_embedding"
-    if target_key.startswith("recycling_embedding."):
-        return "recycling"
-    if target_key.startswith("extra_msa_embedding."):
-        return "extra_msa_embedding"
-    if target_key.startswith(("evoformer.", "extra_msa_stack.", "single_activations.")):
-        return "evoformer"
-    if target_key.startswith(("template_embedder.", "template_msa_embedding.")):
-        return "template"
-    if target_key.startswith("structure_module."):
-        return "structure_module"
-    if target_key.startswith(
-        (
-            "distogram_head.",
-            "experimentally_resolved_head.",
-            "masked_msa_head.",
-            "predicted_aligned_error_head.",
-            "predicted_lddt_head.",
-        )
-    ):
-        return "heads"
-    return "other"
-
-
-def _strict_load_blocker(target_key: str) -> str | None:
-    for prefix, reason in _BLOCKED_PREFIX_REASONS.items():
-        if target_key.startswith(prefix):
-            return reason
-    return None
-
-
 def _load_official_alphafold2_params(
     params_path: str | PathLike[str],
     *,
     model_name: str | None,
-) -> _LoadedOfficialParams:
+) -> tuple[dict[str, Tensor], str]:
     source_path = Path(params_path)
     with (
-        _open_official_npz(source_path, model_name=model_name) as (handle, resolved_model_name, archive_member),
+        _open_official_npz(source_path, model_name=model_name) as (handle, resolved_model_name),
         np.load(handle, allow_pickle=False) as npz,
     ):
-        tensors = {_key: _tensor_from_numpy(npz[_key]) for _key in npz.files}
-    _validate_official_param_keys(tensors)
-    return _LoadedOfficialParams(
-        tensors=tensors,
-        model_name=resolved_model_name,
-        source_path=source_path,
-        archive_member=archive_member,
-    )
+        tensors = {_key: torch.from_numpy(npz[_key]) for _key in npz.files}
+    return tensors, resolved_model_name
 
 
 @contextmanager
@@ -668,19 +520,19 @@ def _open_official_npz(
     source_path: Path,
     *,
     model_name: str | None,
-) -> Iterator[tuple[BinaryIO, str, str | None]]:
+) -> Iterator[tuple[BinaryIO, str]]:
     if model_name is not None:
         _validate_model_name(model_name)
     if source_path.is_dir():
         param_file, resolved_model_name = _select_directory_param_file(source_path, model_name=model_name)
         with param_file.open("rb") as handle:
-            yield handle, resolved_model_name, None
+            yield handle, resolved_model_name
         return
     if source_path.suffix == ".npz":
         resolved_model_name = model_name or _model_name_from_param_filename(source_path.name)
         _validate_model_name(resolved_model_name)
         with source_path.open("rb") as handle:
-            yield handle, resolved_model_name, None
+            yield handle, resolved_model_name
         return
     if source_path.is_file() and tarfile.is_tarfile(source_path):
         with tarfile.open(source_path) as archive:
@@ -690,7 +542,7 @@ def _open_official_npz(
                 raise ValueError(f"could not extract {member.name!r} from {source_path}")
             payload = extracted.read()
         resolved_model_name = _model_name_from_param_filename(Path(member.name).name)
-        yield io.BytesIO(payload), resolved_model_name, member.name
+        yield io.BytesIO(payload), resolved_model_name
         return
     raise ValueError(
         "expected an official AlphaFold 2 params .npz file, params directory/download root, "
@@ -740,17 +592,7 @@ def _model_name_from_param_filename(filename: str) -> str:
 
 def _validate_model_name(model_name: str) -> None:
     if not _MODEL_NAME_RE.fullmatch(model_name):
-        known = ", ".join(OFFICIAL_AF2_MODEL_NAMES[:3])
-        raise ValueError(f"unsupported AlphaFold 2 model name {model_name!r}; expected names like {known}, ...")
-
-
-def _tensor_from_numpy(array: np.ndarray) -> Tensor:
-    if array.dtype.hasobject:
-        raise ValueError("official AlphaFold 2 parameter arrays must be numeric and pickle-free")
-    writable = np.asarray(array)
-    if not writable.flags.writeable:
-        writable = writable.copy()
-    return torch.from_numpy(writable)
+        raise ValueError(f"unsupported AlphaFold 2 model name {model_name!r}")
 
 
 def _split_official_param_key(key: str) -> tuple[str, str]:
@@ -760,102 +602,6 @@ def _split_official_param_key(key: str) -> tuple[str, str]:
     if not scope or not name:
         raise ValueError(f"official AF2 parameter key must have non-empty scope and name: {key!r}")
     return scope, name
-
-
-def _validate_official_param_keys(params: Mapping[str, Tensor]) -> None:
-    if not params:
-        raise ValueError("official AlphaFold 2 parameter mapping is empty")
-    for key in params:
-        _split_official_param_key(key)
-    if not any(key.startswith("alphafold/alphafold_iteration/") for key in params):
-        raise ValueError("expected official AlphaFold 2 params with 'alphafold/alphafold_iteration/' keys")
-
-
-def _validate_supported_model_package(loaded: _LoadedOfficialParams) -> None:
-    family = _model_family(loaded.model_name)
-    if family == "multimer":
-        raise NotImplementedError(
-            "official AF-Multimer checkpoints use a distinct feature/model surface; "
-            "convert monomer or monomer pTM AF2 checkpoints until AF-Multimer is implemented explicitly"
-        )
-
-
-def _validate_converted_state_dict_matches_model(
-    converted: Mapping[str, Tensor],
-    expected: Mapping[str, Tensor],
-    *,
-    model_name: str,
-) -> None:
-    missing = sorted(set(expected) - set(converted))
-    unexpected = sorted(set(converted) - set(expected))
-    shape_mismatches = sorted(
-        key for key in set(expected) & set(converted) if tuple(expected[key].shape) != tuple(converted[key].shape)
-    )
-    if not missing and not unexpected and not shape_mismatches:
-        return
-    details: list[str] = []
-    if missing:
-        details.append(f"missing={len(missing)} examples={missing[:5]}")
-    if unexpected:
-        details.append(f"unexpected={len(unexpected)} examples={unexpected[:5]}")
-    if shape_mismatches:
-        examples = [
-            f"{key}: expected {tuple(expected[key].shape)}, got {tuple(converted[key].shape)}"
-            for key in shape_mismatches[:5]
-        ]
-        details.append(f"shape_mismatches={len(shape_mismatches)} examples={examples}")
-    raise ValueError(
-        f"official AF2 {model_name!r} converted tensors do not match AlphaFold2Model; "
-        f"refusing to write a partial runnable model artifact ({'; '.join(details)})"
-    )
-
-
-def _conversion_config(
-    loaded: _LoadedOfficialParams,
-    persisted: Mapping[str, Tensor],
-    *,
-    dtype: torch.dtype | None,
-) -> dict[str, object]:
-    return {
-        "architecture": "alphafold2",
-        "artifact_kind": "model",
-        "model_name": loaded.model_name,
-        "model_family": _model_family(loaded.model_name),
-        "source_path": str(loaded.source_path),
-        "source_archive_member": loaded.archive_member,
-        "checkpoint_source": "deepmind",
-        "checkpoint_format": "official_alphafold2_npz",
-        "source_release": OFFICIAL_AF2_PARAMS_URL,
-        "official_archive": OFFICIAL_AF2_PARAMS_ARCHIVE,
-        "official_code_license": OFFICIAL_AF2_CODE_LICENSE,
-        "official_params_license": OFFICIAL_AF2_PARAMS_LICENSE,
-        "converted_weights": CONVERTED_WEIGHTS_NAME,
-        "linear_weight_layout": "haiku_dense_attention_outer_product_layouts_to_pytorch",
-        "tensor_count": len(persisted),
-        "dtype": str(dtype) if dtype is not None else None,
-        "dtype_counts": _dtype_counts(persisted),
-        "model_config": _model_config_overrides(loaded.model_name),
-        "mapping_summary": _mapping_summary_from_keys(loaded.tensors),
-        "runnable_model": True,
-    }
-
-
-def _write_processor_component(output_path: Path) -> None:
-    from ..processor import AlphaFold2Processor
-
-    AlphaFold2Processor().save_pretrained(output_path / "processor")
-
-
-def _update_manifest_metadata(output_path: Path) -> None:
-    manifest_path = output_path / ARTIFACT_MANIFEST_NAME
-    manifest = Config.from_json(manifest_path)
-    files = dict(manifest.get("files", {}))
-    files["conversion_config"] = CONVERSION_CONFIG_NAME
-    manifest["files"] = files
-    components = dict(manifest.get("components", {}))
-    components["processor"] = {"path": "processor"}
-    manifest["components"] = components
-    manifest.json(manifest_path)
 
 
 def _model_family(model_name: str) -> str:
@@ -880,11 +626,3 @@ def _model_index(model_name: str) -> int:
     if len(parts) < 2 or not parts[1].isdecimal():
         raise ValueError(f"unsupported AlphaFold 2 model name {model_name!r}")
     return int(parts[1])
-
-
-def _dtype_counts(state_dict: Mapping[str, Tensor]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for tensor in state_dict.values():
-        name = str(tensor.dtype).removeprefix("torch.")
-        counts[name] = counts.get(name, 0) + 1
-    return dict(sorted(counts.items()))

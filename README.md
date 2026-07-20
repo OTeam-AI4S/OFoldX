@@ -5,6 +5,16 @@ follows a small, consistent shape: processors turn structures into typed model i
 models consume those inputs, and pipelines package the processor/model boundary for
 inference.
 
+OFoldX is pre-release. A family package or prototype is not a support claim;
+registration is reserved for a family only after all of its released scientific
+functions, checkpoint variants, canonical mappings, and conversion paths are
+complete.
+
+Training orchestration is not part of the current Model Hub API freeze. The tree
+retains a working Danling-based Runner scaffold; its final public contract will be
+one config-only `ofoldx.runners.Runner` supporting train, evaluate, and infer.
+Training support is not a model-registration requirement.
+
 ## Get Started
 
 Install OFoldX:
@@ -21,77 +31,66 @@ cd OFoldX
 pip install -e .
 ```
 
-Load a task pipeline directly from a local directory or Hub repository:
+Run the current fixed-backbone design task directly:
 
 ```python
-from ofoldx.pipelines import Pipeline
+import ofoldx
+from ofoldx.data import Structure
 
-pipeline = Pipeline.from_pretrained("oteam/model-name")
-output = pipeline("complex.cif")
+structure: Structure = ...  # construct or obtain one canonical Structure
+result = ofoldx.design(structure, model="oteam/model-name")
+print(result.candidates[0].target)
 ```
 
 Drop down to the `Auto*` factories when you need direct model or processor control:
 
 ```python
-from ofoldx import AutoModel, AutoProcessor
+from ofoldx import AutoModel, AutoProcessor, DesignPipeline
 
-processor = AutoProcessor.from_pretrained("oteam/model-name")
-model = AutoModel.from_pretrained("oteam/model-name")
-batch = processor("complex.cif")
-output = model(batch)
+processor = AutoProcessor("oteam/model-name")
+model = AutoModel("oteam/model-name")
+pipeline = DesignPipeline(model=model, processor=processor)
+result = pipeline.design(structure)
 ```
 
-Pretrained objects use `save_pretrained` / `from_pretrained` and are compatible with local
-directories or Hugging Face Hub repositories.
-
-## Hub Round Trip
-
-Any saved model, processor, or pipeline is an artifact directory with a root `manifest.json`.
-Push helpers generate a Hub `README.md` with task metadata, static examples, and a pipeline-first usage path:
+Write one registered Model/Processor pair as a standard repository with the sole
+public artifact writer:
 
 ```python
-from ofoldx.pipelines import Pipeline
+from ofoldx.artifacts import save_model
 
-pipeline = Pipeline.from_pretrained("./protein-model")
-pipeline.push_to_hub("oteam/protein-model", private=True, tag="v0.1.0")
-loaded = Pipeline.from_pretrained("oteam/protein-model")
+save_model("./model-repository", model=model, processor=processor)
 ```
 
-Converters expose the same upload switches:
+The writer emits only `model.json`, `processor.json`, and standard safetensors
+weights. Model-card authorship and Hub publishing are separate. Pipelines do not
+have save/load methods.
 
-```bash
-python -m ofoldx.models.rfdiffusion.convert Base_ckpt.pt out/rfdiffusion \
-  --push-to-hub --repo-id oteam/rfdiffusion-base --tag v0.1.0
-```
+Canonical PDB/mmCIF input and output live in `ofoldx.io`; MultiMolecule owns FASTA
+and the other biological-sequence formats used by family Processors.
 
-Release helpers keep Hub cards and pipeline packages reproducible:
-
-```bash
-python scripts/publish_hub_cards.py --root artifacts/hub/ofoldx --namespace oteam --upload --verify-remote
-python scripts/build_pipeline_artifacts.py --root artifacts/hub/ofoldx --output-root artifacts/hub/ofoldx-pipelines \
-  --copy --overwrite --upload --delete-existing-files --verify-remote
-python scripts/validate_hub_artifacts.py --root artifacts/hub/ofoldx-pipelines --load-pipeline
-```
+`AutoModel` and `AutoProcessor` accept either a local model directory or a Hugging Face
+Hub repository ID. A Pipeline is an in-memory binding, not a separately serialized
+artifact.
 
 ## Explore
 
 | Package                                  | Purpose                                                                                       |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [`ofoldx.models`](ofoldx/models)         | Model families — per-family config, typed input/output, checkpoint conversion, and the model. |
-| [`ofoldx.processors`](ofoldx/processors) | Structure/MSA/template processors that build typed model inputs, plus `AutoProcessor`.        |
-| [`ofoldx.pipelines`](ofoldx/pipelines)   | Saveable processor + model inference boundaries.                                              |
+| [`ofoldx.models`](ofoldx/models)         | Model registration; concrete family packages are imported explicitly.                        |
+| `ofoldx.artifacts`                       | The one public writer for a validated standard Model/Processor repository.                    |
+| [`ofoldx.pipelines`](ofoldx/pipelines)   | Explicit `FoldPipeline`, `DesignPipeline`, `ScorePipeline`, and `PackPipeline` bindings.        |
 | [`ofoldx.modules`](ofoldx/modules)       | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion.         |
-| [`ofoldx.io`](ofoldx/io)                 | Structure parsing and writing.                                                                |
-| [`ofoldx.data`](ofoldx/data)             | Chemical/reference data and dataset helpers.                                                  |
-| [`ofoldx.runners`](ofoldx/runners)       | DanLing-based train / predict / design / evaluate entry points above the models.              |
+| [`ofoldx.io`](ofoldx/io)                 | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.                |
+| [`ofoldx.data`](ofoldx/data)             | Canonical molecular, evidence, selection, and closed Condition domain values.                  |
+| `ofoldx.runners`                         | Pre-release Danling Runner scaffold; its config-only construction contract is deferred.        |
 
-## Design
+The low-level values exported by `ofoldx.data` are part of the domain API: atom, bond,
+component, attachment, entity, instance, and site values are what make an in-memory
+`MolecularSystem` and `Structure` referentially closed.
 
-- [`DESIGN.md`](DESIGN.md) — architecture blueprint and locked design decisions.
-- [`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md) — the review bar: contracts, protocols, and style.
-- [`docs/naming.md`](docs/naming.md) — canonical vocabulary.
-- [`docs/docstrings.md`](docs/docstrings.md) — docstring & doctest convention.
+## Status
 
-OFoldX is pre-alpha research software under the AGPL; see
-[`DESIGN_PRINCIPLES.md`](DESIGN_PRINCIPLES.md) for the compatibility and conversion
-policy.
+OFoldX is pre-release research software under the AGPL-3.0 license. V1 is not complete
+or released until all normative verbs, inputs, Results, and complete PDB/mmCIF I/O
+pass their automated release gates.

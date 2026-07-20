@@ -1,24 +1,38 @@
-r"""
-BoltzGen design models.
+r"""BoltzGen raw-tensor design models.
+
+The family is deliberately unregistered until canonical Processor lowering and DesignResult decoding exist.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, ClassVar, cast
+from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from typing_extensions import Self
 
+from ...data.bonds import SymbolicBond
+from ...data.conditions import Contact, Hotspot
+from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
+from ...data.placement import (
+    PlacementMap,
+    PlacementSpec,
+    validate_placement,
+)
+from ...data.structure import Structure
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
-from ...modules.atom.transfer import dense_mean_to_tokens
+from ...modules.atom.transfer import (
+    TokenPairToLocalAtomPairBroadcast,
+    TokenToAtomBroadcast,
+    dense_mean_to_tokens,
+)
 from ...modules.atom.window import gather_key_windows
-from ...modules.attention import PairBiasedSelfAttention
+from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import condition_pair, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
@@ -27,32 +41,294 @@ from ...modules.embedding.position import RelativePositionEmbedder, generate_rel
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import DistogramHead
-from ...modules.representation import Pair, Single
-from ...modules.transformer import ConditionedTransformer
-from ...modules.transition import RowwiseDropout, Transition
+from ...modules.transformer import ConditionedTransformer, ConditionedTransformerLayer, ConditionedTransitionBlock
+from ...modules.transition import ConditionedTransition, RowwiseDropout, Transition
 from ...modules.trunk.msa import MsaModule, MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateBlock
 from ...modules.trunk.pairformer import PairformerStack
-from ..contract import (
-    BaseInput,
-    SequenceDesignCandidate,
-    StructureDesignCandidate,
-    StructurePredictionOutput,
-    register_pytree_dataclass,
+from ...results import Metric, PairMetric, Score
+from .config import BoltzGenConfig, BoltzGenIFoldConfig
+
+
+@dataclass(frozen=True)
+class SymbolicResidueSite:
+    r"""A pre-realization reference to one generated residue by segment and offset.
+
+    §3.7 owner-gated family-local placeholder (RFdiffusion spelling). Used only to
+    name rows of a fully-generated ``total_len`` assembly before the shared
+    placement core resolves; NOT a frozen public shape.
+    """
+
+    segment_id: str
+    offset: int
+
+
+@dataclass(frozen=True)
+class BoltzGenPlacements:
+    r"""One BoltzGen whole-assembly generation-topology request (frozen §3.7 core, X1-B).
+
+    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
+    unique across the whole mapping and is the SOLE pre-realization reference target
+    (validated at construction). Unlike ODesign — which declares one group **per output
+    chain** — a BoltzGen assembly is ONE declaration group whose inner placements are its
+    chains, so the outer group key is a pure whole-assembly grouping label that no reference
+    names (frozen §3.7 "BoltzGen whole-assembly handling (X1-B)").
+
+    Per-chain lengths are drawn at realization from the family-owned whole-assembly
+    ``total_len`` budget (the shared core carries no total-length field), so a ranged
+    :class:`~ofoldx.data.placement.GeneratedSegment` (``min_length != max_length``) is resolved
+    against ``total_len`` rather than fixed on the core. ``total_len is None`` realizes every
+    generated placement at its ``max_length``.
+    """
+
+    placements: PlacementSpec
+
+    def __post_init__(self) -> None:
+        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
+        # the construction-time uniqueness check (raises ValueError on any duplicate).
+        validate_placement(self.placements)
+
+
+@dataclass(frozen=True)
+class BoltzGenDesignMask:
+    r"""Positions to (re)design → ``design_mask`` on the model input.
+
+    ``positions`` are the designable residues (upstream ``design`` / complement of
+    ``not_design``); every named token is marked designable.
+    """
+
+    positions: tuple[ComponentReference, ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenBinding:
+    r"""Binding-specification conditioning → ``binding_type`` ids.
+
+    ``binding`` is the frozen §3.7.4 shared :class:`~ofoldx.data.conditions.Hotspot` — the
+    distance-free per-residue POSITIVE binding label (owner verdict D3: BoltzGen ``binding`` is
+    the canonical hotspot analog). ``not_binding`` is the BoltzGen-owned NEGATIVE signed label
+    (embedding id 2) that has no analog in the other families, so — like ``kind`` on
+    :class:`BoltzGenContact` — it stays on this family envelope rather than on the shared
+    ``Hotspot`` core. Realized as the released binding-specification embedding ids
+    (0 = unspecified, 1 = binding, 2 = not-binding).
+    """
+
+    binding: Hotspot = Hotspot(())
+    not_binding: tuple[ComponentReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class BoltzGenSecondaryStructure:
+    r"""Per-residue secondary-structure conditioning → ``ss_type`` ids.
+
+    Each assignment pairs a residue with one of the released labels ``"H"`` (helix),
+    ``"E"`` (strand), or ``"L"`` (loop); unlisted residues take the masked/unspecified
+    class.
+    """
+
+    assignments: tuple[tuple[ComponentReference, Literal["H", "E", "L"]], ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenStructureGroup:
+    r"""One structure group → per-token ``structure_group`` → ``token_distance_mask``.
+
+    §3.7 family-owned (not fixed coordinates): geometry is exposed only *within* the
+    same **nonzero** group and distinct groups move independently. Realized through the
+    per-token ``structure_group`` id and its pairwise ``token_distance_mask``, never by
+    writing absolute coordinates; ``reference_space_id`` stays per-residue (the released
+    featurizer does NOT regroup it). ``group_id == 0`` is the free (ungrouped) class.
+    Ratified/frozen under the §3.7.2 family-owned spatial-conditioning contract,
+    validated exact-equal to the released featurizer (``process_token_features``,
+    2026-07-19); see the Processor lowering (``_structure_group_ids`` /
+    ``_token_distance_mask``).
+    """
+
+    members: tuple[ComponentReference, ...]
+    group_id: int
+
+
+@dataclass(frozen=True)
+class BoltzGenResidueConstraint:
+    r"""Per-residue amino-acid identity constraint → ``aa_constraint_mask`` (inverse folding).
+
+    ``allowed`` is the set of canonical three-letter residue codes permitted at
+    ``position`` (upstream ``residue_constraints``); consumed by
+    ``BoltzGenIFoldModel`` as an ``aa_constraint_mask`` gate.
+    """
+
+    position: ComponentReference
+    allowed: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenContact:
+    r"""A pairwise contact declaration → ``contact_conditioning`` / ``contact_threshold``.
+
+    ``contact`` is the frozen §3.7.4 shared two-sided geometric
+    :class:`~ofoldx.data.conditions.Contact`; its ``side_a`` / ``side_b`` name the two
+    contacting endpoint sets and its ``cutoff_angstrom`` is the contact distance cutoff used by
+    the released contact-conditioning encoder (BoltzGen writes it as the ``contact_threshold``
+    matrix). ``kind`` is the BoltzGen-owned released directed contact CLASS
+    (``pocket>binder`` / ``binder>pocket`` / ``contact``); directionality is a family-owned
+    extension that stays OFF the symmetric shared core and rides on this envelope.
+    """
+
+    contact: Contact
+    kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
+
+
+@dataclass(frozen=True)
+class BoltzGenCovalentBond:
+    r"""A requested covalent link → derived ``cyclic_period`` (envelope over ``SymbolicBond``).
+
+    ``bond`` is the frozen §3.7.4 shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
+    may be EXISTING input atoms (:class:`~ofoldx.data.molecular.AtomSite`) or GENERATED atoms
+    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the frozen placement
+    core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
+    :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
+    released head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
+    input system already carried (this family declares NO physical topology beyond that — a
+    non-terminal link simply surfaces as a token bond). ``intent`` is the BoltzGen-owned
+    hard/soft label kept OFF the shared bond core, per owner verdict (no ``intent`` on
+    ``SymbolicBond``).
+    """
+
+    bond: SymbolicBond
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class BoltzGenSymmetry:
+    r"""A symmetric group of equal-length residue units → ``symmetry_index`` / ``symmetric_group``.
+
+    Each unit in ``units`` is one symmetric copy; matching offsets across units are
+    tied. Consumed by structure design as ``symmetry_index`` and by inverse folding
+    as ``symmetric_group`` (with ``tie_symmetric_sequences``).
+    """
+
+    units: tuple[tuple[ComponentReference, ...], ...]
+
+
+# The ``conditions=`` parameter type on ``BoltzGenProcessor`` (structure design). The
+# inverse-fold Processor consumes ``BoltzGenResidueConstraint`` / ``BoltzGenSymmetry``
+# through their own dedicated keyword arguments, not this union. ``BoltzGenPlacements`` carries
+# the frozen §3.7 whole-assembly generation topology (X1-B) alongside the spatial records.
+BoltzGenSchema = (
+    BoltzGenPlacements
+    | BoltzGenDesignMask
+    | BoltzGenBinding
+    | BoltzGenSecondaryStructure
+    | BoltzGenStructureGroup
+    | BoltzGenContact
+    | BoltzGenCovalentBond
+    | BoltzGenSymmetry
 )
-from ..mixin import ModelMixin
-from ..registry import DESIGN_MODELS, MODELS
-from .config import BoltzGenAffinityConfig, BoltzGenConfig, BoltzGenIFoldConfig
 
 
-@MODELS.register("boltzgen")
-@DESIGN_MODELS.register("boltzgen")
-@MODELS.register("boltzgen_diverse")
-@DESIGN_MODELS.register("boltzgen_diverse")
-@MODELS.register("boltzgen_adherence")
-@DESIGN_MODELS.register("boltzgen_adherence")
-@MODELS.register("boltzgen_structuretrained_small")
-@DESIGN_MODELS.register("boltzgen_structuretrained_small")
-class BoltzGenDesigner(ModelMixin):
+def symbolic_residue_aliases(
+    references: tuple[ComponentReference | SymbolicResidueSite, ...],
+) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
+    r"""Map canonical negative segment offsets to concrete positive trajectory identities.
+
+    Mirrors ``rfdiffusion.model.symbolic_residue_aliases`` so a fully-generated
+    ``total_len`` assembly can address its generated rows by segment/offset before
+    the shared placement core resolves.
+    """
+
+    segments: dict[str, list[SymbolicResidueSite]] = {}
+    for reference in references:
+        if type(reference) is SymbolicResidueSite:
+            segments.setdefault(reference.segment_id, []).append(reference)
+    return {
+        SymbolicResidueSite(segment_id, index - len(rows)): reference
+        for segment_id, rows in segments.items()
+        for index, reference in enumerate(rows)
+    }
+
+
+@dataclass(eq=False)
+class BoltzGenCandidate:
+    r"""One designed (and optionally refolded) complex and its aligned scientific values.
+
+    Each candidate owns the complete ``Structure`` of the designed assembly. The
+    assembly length varies across candidates, which is the coordinate-producing,
+    variable-length property that forbids reuse of the frozen fixed-length
+    ``DesignCandidate``.
+
+    Attributes:
+        structure: The designed complex (post inverse folding, optionally refolded by boltz2).
+        scores: Whole-candidate canonical [`Score`][ofoldx.results.Score] values keyed by name.
+        metrics: Axis-aligned [`Metric`][ofoldx.results.Metric] values (e.g. per-residue NLL / pLDDT).
+        pair_metrics: Two-axis [`PairMetric`][ofoldx.results.PairMetric] values (e.g. interaction PAE).
+    """
+
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+    pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class BoltzGenResult:
+    r"""One generation-ordered collection of coordinate-producing BoltzGen designs.
+
+    Tuple position is candidate identity for one generation context; there is no
+    auxiliary index field, and no input/context/provenance field is carried
+    (matching ``ESMFold2DesignResult``). The composite upstream ranking key is a
+    Pipeline-level argument, not part of this Result: the Result exposes the
+    primitive Scores and ``best(score)`` so a caller ranks by any single canonical
+    Score.
+    """
+
+    candidates: tuple[BoltzGenCandidate, ...]
+
+    def best(self, score: str) -> BoltzGenCandidate:
+        r"""Return the earliest best candidate under one explicit score.
+
+        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the
+        score's ``preferred`` direction must be consistently ``"higher"`` or
+        ``"lower"``; unit and scope must match across every candidate; a NaN value or
+        an undefined direction raises at ranking time; infinity is rankable; and the
+        earliest candidate wins a tie.
+        """
+
+        scores = tuple(candidate.scores[score] for candidate in self.candidates)
+        directions = {value.preferred for value in scores}
+        if directions not in ({"higher"}, {"lower"}):
+            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+        if len({value.unit for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical unit")
+        if len({value.scope for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical scope")
+        if any(math.isnan(value.value) for value in scores):
+            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+        if directions == {"higher"}:
+            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+@dataclass(eq=False)
+class BoltzGenOutput:
+    r"""Tensor output of one BoltzGen structure-design forward or sampling pass."""
+
+    pred_coords: Tensor
+    distogram_logits: Tensor
+    bfactor_logits: Tensor | None = None
+    denoised_coords: Tensor | None = None
+    augmented_target: Tensor | None = None
+    noise_level: Tensor | None = None
+
+
+@dataclass(eq=False)
+class BoltzGenIFoldOutput:
+    r"""Per-token inverse-folding logits and optional sampled tokens."""
+
+    logits: Tensor
+    tokens: Tensor | None = None
+
+
+class BoltzGenModel(nn.Module):
     r"""
     BoltzGen structure-generating design model (``boltzgen1_diverse`` / ``boltzgen1_adherence``).
 
@@ -66,24 +342,17 @@ class BoltzGenDesigner(ModelMixin):
     Args:
         config: Optional BoltzGen model config. Defaults to ``BoltzGenConfig()``.
 
-    Examples:
-        >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-        >>> processor = AutoProcessor.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-        >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-        >>> output = model(processor("complex.cif"), num_samples=2)  # doctest: +SKIP
     """
 
     config_class = BoltzGenConfig
-
-    #: Typed input this model's ``forward`` consumes (built by the keyword-tensor call path).
-    input_class: ClassVar[type[BaseInput]]
 
     def __init__(
         self,
         config: BoltzGenConfig | None = None,
     ) -> None:
-        config = config or BoltzGenConfig()
-        super().__init__(config)
+        config = BoltzGenConfig() if config is None else config
+        super().__init__()
+        self.config = config
         self._recycling_steps = config.recycling_steps
         single_size, pair_size = config.single_size, config.pair_size
         embedder, trunk, diffusion, sampler = config.input_embedder, config.trunk, config.diffusion, config.sampler
@@ -104,7 +373,7 @@ class BoltzGenDesigner(ModelMixin):
             num_molecule_types=embedder.num_molecule_types,
             add_binding_specification=embedder.add_binding_specification,
             add_ss_specification=embedder.add_ss_specification,
-            operator_backend=trunk.operator_backend,
+            operator_backend="auto",
         )
 
         self.single_init_projection = nn.Linear(single_size, single_size, bias=False)
@@ -120,6 +389,8 @@ class BoltzGenDesigner(ModelMixin):
         self.pair_recycle_norm = LayerNorm(pair_size)
         self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
         self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
+        nn.init.zeros_(self.single_recycle_projection.weight)
+        nn.init.zeros_(self.pair_recycle_projection.weight)
 
         # BoltzGen swap 1: v1 template module (a_proj/pairformer pattern), not the v2 embedder.
         self.template_module = TemplateModule(
@@ -133,7 +404,7 @@ class BoltzGenDesigner(ModelMixin):
             triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
             num_triangle_attention_heads=config.template.num_triangle_attention_heads,
             miniformer_blocks=config.template.miniformer_blocks,
-            operator_backend=trunk.operator_backend,
+            operator_backend="auto",
         )
         # BoltzGen swap 2: token-distance conditioning module. The structuretrained-small artifact omits it.
         self.token_distance = (
@@ -147,7 +418,7 @@ class BoltzGenDesigner(ModelMixin):
                 max_dist=config.template.max_distance,
                 triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
                 num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-                operator_backend=trunk.operator_backend,
+                operator_backend="auto",
             )
             if design.use_token_distance
             else None
@@ -169,7 +440,7 @@ class BoltzGenDesigner(ModelMixin):
                 msa_head_dim=trunk.msa_head_dim,
                 triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-                operator_backend=trunk.operator_backend,
+                operator_backend="auto",
             )
             if not trunk.msa_miniformer_blocks
             else MiniformerMsaModule(
@@ -185,7 +456,7 @@ class BoltzGenDesigner(ModelMixin):
                 pair_dropout=trunk.dropout,
                 num_msa_attention_heads=trunk.num_msa_attention_heads,
                 msa_head_dim=trunk.msa_head_dim,
-                operator_backend=trunk.operator_backend,
+                operator_backend="auto",
             )
         )
         self.pairformer_stack = (
@@ -195,7 +466,7 @@ class BoltzGenDesigner(ModelMixin):
                 pair_size=pair_size,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.dropout,
-                operator_backend=trunk.operator_backend,
+                operator_backend="auto",
             )
             if trunk.use_miniformer
             else PairformerStack(
@@ -206,7 +477,7 @@ class BoltzGenDesigner(ModelMixin):
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.dropout,
-                operator_backend=trunk.operator_backend,
+                operator_backend="auto",
             )
         )
         self.distogram_head = DistogramHead(
@@ -242,7 +513,7 @@ class BoltzGenDesigner(ModelMixin):
             num_atom_decoder_blocks=diffusion.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=diffusion.num_atom_attention_heads,
             conditioning_transition_layers=diffusion.conditioning_transition_layers,
-            operator_backend=diffusion.operator_backend,
+            operator_backend="auto",
         )
         self.structure_module = AtomDiffusion(
             score_model,
@@ -261,71 +532,34 @@ class BoltzGenDesigner(ModelMixin):
             time_dilation_end=sampler.time_dilation_end,
         )
         self.bfactor_head = BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
+        self.set_backend("auto")
+        _zero_initialize_boltzgen_updates(self)
 
-        # Opt-in scoring heads (base design generator omits both; enabling either grows the parameter count).
-        if config.use_confidence_head:
-            confidence = config.confidence
-            self.confidence_head = ConfidenceHead(
-                single_size=single_size,
-                pair_size=pair_size,
-                num_blocks=confidence.num_pairformer_blocks,
-                num_pair_attention_heads=confidence.num_pair_attention_heads,
-                num_distogram_bins=confidence.num_distogram_bins,
-                max_distance=confidence.max_distance,
-                relative_position_size=config.relative_position_size,
-                num_bond_types=config.num_bond_types,
-                conditioning_cutoff_min=config.conditioning_cutoff_min,
-                conditioning_cutoff_max=config.conditioning_cutoff_max,
-                num_plddt_bins=confidence.num_plddt_bins,
-                num_pae_bins=confidence.num_pae_bins,
-                num_pde_bins=confidence.num_pde_bins,
-                operator_backend=trunk.operator_backend,
-            )
-        if config.use_affinity_head:
-            affinity = config.affinity
-            if affinity.ensemble:
-                self.affinity_module1 = self._build_affinity_head(affinity, affinity.num_pairformer_blocks1)
-                self.affinity_module2 = self._build_affinity_head(affinity, affinity.num_pairformer_blocks2)
-            else:
-                self.affinity_module = self._build_affinity_head(affinity, affinity.num_pairformer_blocks)
-        self.post_init()
+    def set_backend(self, backend: str) -> Self:
+        r"""Select the operator implementation used by this model."""
 
-    def _build_affinity_head(self, affinity: BoltzGenAffinityConfig, num_blocks: int) -> AffinityHead:
-        r"""
-        Build one affinity head with the shared affinity-config dims and the given Pairformer depth.
-
-        Args:
-            affinity: Affinity-head sub-configuration supplying the shared dimensions.
-            num_blocks: Number of Pairformer blocks for this head (per-ensemble-member depth).
-
-        Returns:
-            The constructed affinity head.
-        """
-
-        return AffinityHead(
-            single_size=self.config.single_size,
-            pair_size=self.config.pair_size,
-            num_blocks=num_blocks,
-            num_pair_attention_heads=affinity.num_pair_attention_heads,
-            num_distogram_bins=affinity.num_distogram_bins,
-            max_distance=affinity.max_distance,
-            num_conditioning_transitions=affinity.num_conditioning_transitions,
-            expansion=affinity.expansion,
-            triangle_attention_hidden_size=affinity.triangle_attention_hidden_size,
-            num_triangle_attention_heads=affinity.num_triangle_attention_heads,
-            dropout=affinity.dropout,
-            operator_backend=self.config.trunk.operator_backend,
-        )
-
-    def reset_parameters(self) -> None:
-        r"""
-        Zero the recycle projections and apply the BoltzGen final-layer / conditioning zero-init scheme.
-        """
-
-        nn.init.zeros_(self.single_recycle_projection.weight)
-        nn.init.zeros_(self.pair_recycle_projection.weight)
-        self.input_embedder.reset_parameters()
-        _init_boltzgen_final_weights(self)
+        if backend not in {"auto", "torch", "oops"}:
+            raise ValueError(f"unknown backend: {backend!r}")
+        self.backend = backend
+        attention_backend = "eager" if backend == "torch" else backend
+        operator_backend = "eager" if backend == "torch" else backend
+        for module in self.modules():
+            if isinstance(module, GatedMultiheadAttention):
+                module.torch_backend = "eager"
+                module.operator_backend = attention_backend
+            elif isinstance(
+                module,
+                (
+                    Transition,
+                    TriangleMultiplication,
+                    MsaPairWeightedAveraging,
+                    OuterProductMean,
+                    TokenToAtomBroadcast,
+                    TokenPairToLocalAtomPairBroadcast,
+                ),
+            ):
+                module.operator_backend = operator_backend
+        return self
 
     def forward(
         self,
@@ -333,17 +567,17 @@ class BoltzGenDesigner(ModelMixin):
         *,
         recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> StructureDesignCandidate:
+    ) -> BoltzGenOutput:
         r"""
         Training path: one EDM denoising step of the structure diffusion module.
 
-        Mirrors the upstream BoltzGen training diffusion step (``AtomDiffusion.forward``): run the trunk,
+        This is the structure-training graph in both ``train()`` and ``eval()`` modes; those modes only control
+        ordinary stochastic layers such as dropout. It mirrors the upstream BoltzGen training diffusion step
+        (``AtomDiffusion.forward``): run the trunk,
         center-and-augment the experimental target coords, corrupt them at a log-normal-sampled noise level, and
         denoise once with the EDM-preconditioned score network. The returned candidate carries the single-step
         training tensors (``denoised_coords``, ``augmented_target``, ``noise_level``) from which the EDM-weighted
-        denoising loss is computed; the DISTINCT inference sampler is
-        [`design`][ofoldx.models.boltzgen.model.BoltzGenDesigner.design]. This is the compile-friendly grad path
-        (no ``.item()``, no data-dependent Python control flow).
+        denoising loss is computed. This is the compile-friendly gradient path.
 
         Args:
             batch: Typed model input. ``target_positions`` supplies the training target; ``coords`` is the
@@ -352,20 +586,18 @@ class BoltzGenDesigner(ModelMixin):
             generator: Optional PyTorch random generator for the augmentation, noise level, and Gaussian noise.
 
         Returns:
-            Structure-design candidate whose ``structure_prediction`` holds the single-step training tensors.
+            The single-step structure-training tensors.
 
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-            >>> loss_inputs = model(AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif"))  # doctest: +SKIP
         """
 
-        steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        representations = self.run_trunk(batch, recycling_steps=steps)
+        single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
+            batch,
+            recycling_steps=recycling_steps,
+        )
         conditioning = self.diffusion_conditioning(
-            representations.single.tensor,
-            representations.pair.tensor,
-            representations.relative_position_encoding,
+            single,
+            pair,
+            relative_position_encoding,
             atom_features=batch.atom_features,
             reference_positions=batch.reference_positions,
             atom_mask=batch.atom_mask,
@@ -387,129 +619,98 @@ class BoltzGenDesigner(ModelMixin):
             sigmas,
             multiplicity=1,
             atom_mask=atom_mask,
-            single_inputs=representations.single_inputs,
-            single_trunk=representations.single.tensor,
+            single_inputs=single_inputs,
+            single_trunk=single,
             conditioning=conditioning,
             atom_to_token=batch.atom_to_token,
             token_mask=batch.token_mask,
         )
-        structure_prediction = StructurePredictionOutput(
+        return BoltzGenOutput(
             pred_coords=denoised_coords,
-            distogram_logits=representations.distogram_logits,
-            bfactor_logits=self.bfactor_head(representations.single.tensor),
+            distogram_logits=distogram_logits,
+            bfactor_logits=self.bfactor_head(single),
             denoised_coords=denoised_coords,
             augmented_target=augmented_target,
             noise_level=sigmas,
         )
-        return StructureDesignCandidate(structure_prediction=structure_prediction)
 
-    @torch.no_grad()
     def design(
         self,
         batch: BoltzGenInput,
         *,
-        recycling_steps: int | None = None,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
+        recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
         step_scale: float | None = None,
         noise_scale: float | None = None,
-    ) -> StructureDesignCandidate:
-        r"""
-        Inference path: reverse-diffusion structure generation (the ``design`` capability verb).
+    ) -> BoltzGenOutput:
+        r"""Sample whole-assembly design coordinates (canonical expert operation).
 
-        Runs the trunk once, then draws ``num_samples`` reverse-diffusion samples from the EDM sampler and
-        restores the sample axis on every produced tensor. This is the DISTINCT inference path; the training step
-        is [`forward`][ofoldx.models.boltzgen.model.BoltzGenDesigner.forward]. Returns the raw typed
-        ``StructureDesignCandidate`` (the design facade wraps it into the pipeline result).
+        Thin public wrapper over the parity-passing ``_design`` reverse-diffusion body;
+        the numerics are unchanged. Produces ``pred_coords [B, num_samples, A, 3]`` plus
+        the trunk ``distogram_logits`` and ``bfactor_logits``. Sequence assignment and the
+        canonical ``BoltzGenResult`` decoding are owned by ``BoltzGenPipeline``.
 
         Args:
-            batch: Typed model input.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            batch: Typed structure-design input from ``BoltzGenProcessor``.
             num_samples: Number of reverse-diffusion samples to draw.
-            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
+            num_sampling_steps: Optional EDM sampling steps. Defaults to the sampler config value.
+            recycling_steps: Optional recycling passes. Defaults to the config value.
             generator: Optional PyTorch random generator for diffusion noise.
             step_scale: Optional per-call sampler step-scale override.
             noise_scale: Optional per-call sampler noise-scale override.
 
         Returns:
-            Design-generator output with ``structure_prediction`` populated.
-
-        Raises:
-            ValueError: If ``num_samples`` is not positive.
-
-        Examples:
-            >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-            >>> model = AutoModel.from_pretrained("oteam/boltzgen")  # doctest: +SKIP
-            >>> batch = AutoProcessor.from_pretrained("oteam/boltzgen")("complex.cif")  # doctest: +SKIP
-            >>> output = model.design(batch)  # doctest: +SKIP
+            The sampled structure output.
         """
 
-        if num_samples < 1:
-            raise ValueError(f"num_samples must be positive, got {num_samples}")
-        steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        output = self._generate(
+        return self._design(
             batch,
-            recycling_steps=steps,
-            num_sampling_steps=num_sampling_steps,
+            recycling_steps=recycling_steps,
             num_samples=num_samples,
+            num_sampling_steps=num_sampling_steps,
             generator=generator,
             step_scale=step_scale,
             noise_scale=noise_scale,
         )
-        batch_size = batch.token_mask.shape[0]
-        bfactor_logits = output.bfactor_logits.unsqueeze(1).expand(-1, num_samples, -1, -1)
-        confidence_axis = partial(_sample_axis, batch_size=batch_size, num_samples=num_samples)
-        structure_prediction = StructurePredictionOutput(
-            pred_coords=_sample_axis(output.pred_coords, batch_size=batch_size, num_samples=num_samples),
-            distogram_logits=output.distogram_logits,
-            bfactor_logits=bfactor_logits,
-            plddt_logits=None if output.plddt_logits is None else confidence_axis(output.plddt_logits),
-            pae_logits=None if output.pae_logits is None else confidence_axis(output.pae_logits),
-            pde_logits=None if output.pde_logits is None else confidence_axis(output.pde_logits),
-            resolved_logits=None if output.resolved_logits is None else confidence_axis(output.resolved_logits),
-        )
-        return StructureDesignCandidate(structure_prediction=structure_prediction)
 
-    def _generate(
+    @torch.no_grad()
+    def _design(
         self,
         batch: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
-        num_sampling_steps: int | None = None,
         num_samples: int = 1,
+        num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
         step_scale: float | None = None,
         noise_scale: float | None = None,
-    ) -> BoltzGenStructureOutput:
+    ) -> BoltzGenOutput:
         r"""
-        Full structure generation: trunk -> diffusion-sampled coords -> distogram / bfactor logits.
-
-        The internal reverse-diffusion body backing the ``design`` inference verb.
+        Draw reverse-diffusion structure samples from a preprocessed batch.
 
         Args:
             batch: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             num_samples: Number of reverse-diffusion samples to draw.
+            num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             generator: Optional PyTorch random generator for diffusion noise.
             step_scale: Optional per-call sampler step-scale override.
             noise_scale: Optional per-call sampler noise-scale override.
 
-        Returns:
-            Model-specific structure-generation output.
+        This remains private until a processor can decode it into the canonical design result.
 
-        Raises:
-            ValueError: If ``num_samples`` is not positive.
         """
 
-        if num_samples < 1:
-            raise ValueError(f"num_samples must be positive, got {num_samples}")
-        representations = self.run_trunk(batch, recycling_steps=recycling_steps)
+        single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
+            batch,
+            recycling_steps=recycling_steps,
+        )
         conditioning = self.diffusion_conditioning(
-            representations.single.tensor,
-            representations.pair.tensor,
-            representations.relative_position_encoding,
+            single,
+            pair,
+            relative_position_encoding,
             atom_features=batch.atom_features,
             reference_positions=batch.reference_positions,
             atom_mask=batch.atom_mask,
@@ -523,178 +724,25 @@ class BoltzGenDesigner(ModelMixin):
             generator=generator,
             step_scale=step_scale,
             noise_scale=noise_scale,
-            single_inputs=representations.single_inputs,
-            single_trunk=representations.single.tensor,
+            single_inputs=single_inputs,
+            single_trunk=single,
             conditioning=conditioning,
             atom_to_token=batch.atom_to_token,
             token_mask=batch.token_mask,
         )
-        confidence: dict[str, Tensor] = {}
-        if hasattr(self, "confidence_head"):
-            confidence = self.score_confidence(representations, batch, pred_coords, multiplicity=num_samples)
-        return BoltzGenStructureOutput(
-            pred_coords=pred_coords,
-            distogram_logits=representations.distogram_logits,
-            bfactor_logits=self.bfactor_head(representations.single.tensor),
-            plddt_logits=confidence.get("plddt_logits"),
-            pae_logits=confidence.get("pae_logits"),
-            pde_logits=confidence.get("pde_logits"),
-            resolved_logits=confidence.get("resolved_logits"),
+        batch_size = batch.token_mask.shape[0]
+        return BoltzGenOutput(
+            pred_coords=pred_coords.reshape(batch_size, num_samples, *pred_coords.shape[1:]),
+            distogram_logits=distogram_logits,
+            bfactor_logits=self.bfactor_head(single).unsqueeze(1).expand(-1, num_samples, -1, -1),
         )
 
-    def score_confidence(
+    def _run_trunk(
         self,
-        representations: BoltzGenRepresentations,
         batch: BoltzGenInput,
-        pred_coords: Tensor,
         *,
-        multiplicity: int = 1,
-    ) -> dict[str, Tensor]:
-        r"""
-        Score sampled coords with the (opt-in) confidence head, returning pLDDT / pAE / pDE / resolved logits.
-
-        ``pred_coords`` is the flattened ``[B * multiplicity, num_atoms, 3]`` diffusion sample; the trunk
-        representations are interleaved internally to match its multiplicity.
-
-        Args:
-            representations: Trunk single/pair representations produced by the forward pass.
-            batch: The typed model input carrying token/atom indexing and conditioning features.
-            pred_coords: Flattened sampled atom coordinates of shape `[B * multiplicity, num_atoms, 3]`.
-            multiplicity: Number of samples per input drawn during diffusion; the trunk tensors are repeated this
-                many times to align with ``pred_coords``.
-
-        Returns:
-            A mapping with ``plddt_logits``, ``pae_logits``, ``pde_logits``, and ``resolved_logits`` tensors from
-            the confidence head.
-
-        Raises:
-            RuntimeError: If the confidence head was not enabled (``use_confidence_head=False``) in the config.
-        """
-
-        if not hasattr(self, "confidence_head"):
-            raise RuntimeError("confidence head is disabled; set use_confidence_head=True to enable scoring")
-        return self.confidence_head(
-            representations.single_inputs,
-            representations.single.tensor,
-            representations.pair.tensor,
-            pred_coords,
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            token_bonds=batch.token_bonds,
-            type_bonds=batch.type_bonds,
-            contact_conditioning=batch.contact_conditioning,
-            contact_threshold=batch.contact_threshold,
-            token_to_rep_atom=batch.token_to_rep_atom,
-            token_mask=batch.token_mask,
-            cyclic_period=batch.cyclic_period,
-            multiplicity=multiplicity,
-        )
-
-    def score_affinity(
-        self,
-        representations: BoltzGenRepresentations,
-        batch: BoltzGenInput,
-        pred_coords: Tensor,
-        *,
-        multiplicity: int = 1,
-        affinity_token_mask: Tensor | None = None,
-        affinity_mw: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        r"""
-        Score sampled coords with the (opt-in) affinity head, returning affinity value and binder-probability
-        tensors (ensemble-averaged and molecular-weight-corrected when configured).
-
-        ``pred_coords`` is the flattened ``[B * multiplicity, num_atoms, 3]`` diffusion sample.
-
-        Args:
-            representations: Trunk single/pair representations produced by the forward pass.
-            batch: The typed model input carrying token/atom indexing, chain/molecule types, and affinity metadata.
-            pred_coords: Flattened sampled atom coordinates of shape `[B * multiplicity, num_atoms, 3]`.
-            multiplicity: Number of samples per input drawn during diffusion; the trunk tensors are repeated this
-                many times to align with ``pred_coords``.
-            affinity_token_mask: Optional `[..., num_tokens]` boolean mask selecting the ligand tokens; falls back
-                to the mask resolved from ``batch`` when ``None``.
-            affinity_mw: Optional `[...]` ligand molecular weights (daltons) driving the molecular-weight
-                correction; falls back to ``batch.affinity_mw`` when ``None``.
-
-        Returns:
-            A mapping with ``affinity_pred_value`` and ``affinity_probability_binary`` (plus per-module
-            ``*1`` / ``*2`` entries under the ensemble), after any molecular-weight correction.
-
-        Raises:
-            RuntimeError: If the affinity head was not enabled (``use_affinity_head=False``) in the config.
-        """
-
-        if not (hasattr(self, "affinity_module") or hasattr(self, "affinity_module1")):
-            raise RuntimeError("affinity head is disabled; set use_affinity_head=True to enable scoring")
-        ligand_mask = _resolve_affinity_token_mask(batch, affinity_token_mask)
-        if batch.molecule_type is None:
-            receptor_mask = batch.chain_type == 0
-        else:
-            receptor_mask = batch.molecule_type == 0
-        head_kwargs = {
-            "single_inputs": representations.single_inputs,
-            "pair": representations.pair.tensor,
-            "pred_coords": pred_coords,
-            "token_to_rep_atom": batch.token_to_rep_atom,
-            "token_mask": batch.token_mask,
-            "ligand_mask": ligand_mask,
-            "receptor_mask": receptor_mask,
-            "multiplicity": multiplicity,
-        }
-        if self.config.affinity.ensemble:
-            scores1 = self.affinity_module1(**head_kwargs)
-            scores2 = self.affinity_module2(**head_kwargs)
-            probability1 = torch.sigmoid(scores1["affinity_logits_binary"])
-            probability2 = torch.sigmoid(scores2["affinity_logits_binary"])
-            scores = {
-                "affinity_pred_value": (scores1["affinity_pred_value"] + scores2["affinity_pred_value"]) / 2,
-                "affinity_probability_binary": (probability1 + probability2) / 2,
-                "affinity_pred_value1": scores1["affinity_pred_value"],
-                "affinity_logits_binary1": scores1["affinity_logits_binary"],
-                "affinity_probability_binary1": probability1,
-                "affinity_pred_value2": scores2["affinity_pred_value"],
-                "affinity_logits_binary2": scores2["affinity_logits_binary"],
-                "affinity_probability_binary2": probability2,
-            }
-        else:
-            scores = self.affinity_module(**head_kwargs)
-            scores["affinity_probability_binary"] = torch.sigmoid(scores["affinity_logits_binary"])
-        scores["affinity_pred_value"] = self._apply_molecular_weight_correction(
-            scores["affinity_pred_value"], batch, affinity_mw=affinity_mw
-        )
-        return scores
-
-    def _apply_molecular_weight_correction(
-        self, affinity_pred_value: Tensor, batch: BoltzGenInput, *, affinity_mw: Tensor | None
-    ) -> Tensor:
-        r"""
-        Apply the affinity molecular-weight correction ``a*value + b*MW**e + c`` when enabled.
-        """
-
-        affinity = self.config.affinity
-        if not affinity.molecular_weight_correction:
-            return affinity_pred_value
-        if affinity_mw is None:
-            affinity_mw = batch.affinity_mw
-        if affinity_mw is None:
-            raise ValueError("affinity_mw is required when molecular_weight_correction is enabled")
-        mw = affinity_mw.to(device=affinity_pred_value.device, dtype=affinity_pred_value.dtype).reshape(-1)
-        if mw.shape[0] != affinity_pred_value.shape[0]:
-            raise ValueError(
-                f"affinity_mw must have one value per row, got {mw.shape[0]} for {affinity_pred_value.shape[0]}"
-            )
-        correction = affinity.molecular_weight_coefficient * mw.pow(affinity.molecular_weight_exponent)
-        return (
-            affinity.molecular_weight_model_coefficient * affinity_pred_value
-            + correction.unsqueeze(-1)
-            + affinity.molecular_weight_bias
-        )
-
-    def run_trunk(self, batch: BoltzGenInput, *, recycling_steps: int | None = None) -> BoltzGenRepresentations:
+        recycling_steps: int | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
         Run the structure trunk.
 
@@ -703,16 +751,11 @@ class BoltzGenDesigner(ModelMixin):
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
 
         Returns:
-            Trunk representations and distogram logits.
+            ``(single_inputs, single, pair, relative_position_encoding, distogram_logits)``.
 
-        Raises:
-            ValueError: If ``recycling_steps`` is negative or required design/MSA inputs are missing.
         """
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if steps < 0:
-            raise ValueError(f"recycling_steps must be non-negative, got {steps}")
-        binding_type, design_mask, ss_type = _design_conditioning_for_embedder(batch, self.input_embedder)
         single_inputs = self.input_embedder(
             atom_features=batch.atom_features,
             reference_positions=batch.reference_positions,
@@ -726,9 +769,9 @@ class BoltzGenDesigner(ModelMixin):
             modified=batch.modified,
             cyclic_period=batch.cyclic_period,
             chain_type=batch.chain_type,
-            binding_type=binding_type,
-            design_mask=design_mask,
-            ss_type=ss_type,
+            binding_type=batch.binding_type,
+            design_mask=batch.design_mask,
+            ss_type=batch.ss_type,
         )
 
         single_init = self.single_init_projection(single_inputs)
@@ -742,7 +785,7 @@ class BoltzGenDesigner(ModelMixin):
             token_index=batch.token_index,
             cyclic_period=batch.cyclic_period,
             dtype=single_init.dtype,
-        ).to(device=single_init.device)
+        )
         relative_position_encoding = self.relative_position_embedder(relative_features)
         pair_init = pair_init + relative_position_encoding
         pair_init = pair_init + self.token_bond_projection(batch.token_bonds.unsqueeze(-1).to(pair_init.dtype))
@@ -756,9 +799,7 @@ class BoltzGenDesigner(ModelMixin):
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
         for cycle in range(steps + 1):
-            grad_enabled = torch.is_grad_enabled()
-            if self.training and self.config.recycling_detach and cycle < steps:
-                grad_enabled = False
+            grad_enabled = torch.is_grad_enabled() and cycle == steps
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
@@ -767,13 +808,6 @@ class BoltzGenDesigner(ModelMixin):
                 if batch.template_restype is not None:
                     pair = pair + self.template_module(pair, batch, pair_mask=pair_mask)
                 if batch.msa is not None:
-                    if (
-                        batch.has_deletion is None
-                        or batch.deletion_value is None
-                        or batch.msa_paired is None
-                        or batch.msa_mask is None
-                    ):
-                        raise ValueError("MSA features are incomplete")
                     pair = pair + self.msa_module(
                         pair,
                         single_inputs,
@@ -786,18 +820,16 @@ class BoltzGenDesigner(ModelMixin):
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
-        return BoltzGenRepresentations(
-            single_inputs=single_inputs,
-            single=Single(single),
-            pair=Pair(pair),
-            relative_position_encoding=relative_position_encoding,
-            distogram_logits=self.distogram_head(pair),
+        return (
+            single_inputs,
+            single,
+            pair,
+            relative_position_encoding,
+            self.distogram_head(pair),
         )
 
 
-@MODELS.register("boltzgen_ifold")
-@DESIGN_MODELS.register("boltzgen_ifold")
-class BoltzGenInverseFoldDesigner(ModelMixin):
+class BoltzGenIFoldModel(nn.Module):
     r"""
     BoltzGen inverse-folding model for structure-conditioned sequence design.
 
@@ -807,35 +839,29 @@ class BoltzGenInverseFoldDesigner(ModelMixin):
     Args:
         config: Optional inverse-folding config. Defaults to ``BoltzGenIFoldConfig()``.
 
-    Examples:
-        >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-        >>> model = AutoModel.from_pretrained("oteam/boltzgen-inversefolding")  # doctest: +SKIP
-        >>> processor = AutoProcessor.from_pretrained("oteam/boltzgen-inversefolding")  # doctest: +SKIP
-        >>> output = model.design(processor("bb.cif"))  # doctest: +SKIP
     """
 
     config_class = BoltzGenIFoldConfig
-    #: Typed input this model's ``forward`` consumes (built by the keyword-tensor call path).
-    input_class: ClassVar[type[BaseInput]]
 
     def __init__(self, config: BoltzGenIFoldConfig | None = None) -> None:
-        config = config or BoltzGenIFoldConfig()
-        super().__init__(config)
+        config = BoltzGenIFoldConfig() if config is None else config
+        super().__init__()
+        self.config = config
         ifold = config.ifold
         self.input_embedder = AtomConditionedInputEmbedder(
             single_size=config.single_size,
             atom_hidden_size=config.atom_hidden_size,
             atom_pair_hidden_size=config.atom_pair_hidden_size,
             atom_feature_size=config.atom_feature_size,
-            num_query_atoms=config.diffusion.num_query_atoms,
-            num_key_atoms=config.diffusion.num_key_atoms,
+            num_query_atoms=ifold.num_query_atoms,
+            num_key_atoms=ifold.num_key_atoms,
             num_atom_encoder_blocks=ifold.num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=ifold.num_atom_encoder_attention_heads,
             vocab_size=config.input_embedder.vocab_size,
             msa_profile_size=config.input_embedder.msa_profile_size,
             num_method_types=config.input_embedder.num_method_types,
             num_molecule_types=config.input_embedder.num_molecule_types,
-            operator_backend=ifold.operator_backend,
+            operator_backend="auto",
         )
         self.encoder = InverseFoldingEncoder(
             single_size=config.single_size,
@@ -845,7 +871,9 @@ class BoltzGenInverseFoldDesigner(ModelMixin):
             num_layers=ifold.num_encoder_layers,
             num_attention_heads=ifold.num_attention_heads,
             k_neighbors=ifold.k_neighbors,
-            enable_input_embedder=True,
+            dropout=ifold.dropout,
+            softmax_dropout=ifold.softmax_dropout,
+            inverse_fold_noise=ifold.inverse_fold_noise,
         )
         self.decoder = InverseFoldingDecoder(
             node_size=ifold.node_size,
@@ -853,21 +881,39 @@ class BoltzGenInverseFoldDesigner(ModelMixin):
             hidden_size=ifold.hidden_size,
             num_layers=ifold.num_decoder_layers,
             num_attention_heads=ifold.num_attention_heads,
-            inverse_fold_restriction=list(ifold.inverse_fold_restriction),
-            tie_symmetric_sequences=ifold.tie_symmetric_sequences,
-            constraint_inf=ifold.constraint_inf,
+            dropout=ifold.dropout,
+            softmax_dropout=ifold.softmax_dropout,
         )
-        self.post_init()
+        self.set_backend("auto")
+        _zero_initialize_boltzgen_updates(self)
 
-    def reset_parameters(self) -> None:
-        r"""
-        Reset the input embedder and apply the BoltzGen final-layer / conditioning zero-init scheme.
-        """
+    def set_backend(self, backend: str) -> Self:
+        r"""Select the operator implementation used by this model."""
 
-        self.input_embedder.reset_parameters()
-        _init_boltzgen_final_weights(self)
+        if backend not in {"auto", "torch", "oops"}:
+            raise ValueError(f"unknown backend: {backend!r}")
+        self.backend = backend
+        attention_backend = "eager" if backend == "torch" else backend
+        operator_backend = "eager" if backend == "torch" else backend
+        for module in self.modules():
+            if isinstance(module, GatedMultiheadAttention):
+                module.torch_backend = "eager"
+                module.operator_backend = attention_backend
+            elif isinstance(
+                module,
+                (
+                    Transition,
+                    TriangleMultiplication,
+                    MsaPairWeightedAveraging,
+                    OuterProductMean,
+                    TokenToAtomBroadcast,
+                    TokenPairToLocalAtomPairBroadcast,
+                ),
+            ):
+                module.operator_backend = operator_backend
+        return self
 
-    def forward(self, batch: BoltzGenInput) -> SequenceDesignCandidate:
+    def forward(self, batch: BoltzGenIFoldInput) -> BoltzGenIFoldOutput:
         r"""
         Return per-token residue-type logits for structure-conditioned sequence design.
 
@@ -893,24 +939,61 @@ class BoltzGenInverseFoldDesigner(ModelMixin):
             chain_type=batch.chain_type,
         )
         edge_index, valid_mask, node, edge = self.encoder(batch, single_inputs=single_inputs)
-        return SequenceDesignCandidate(
-            sequence_logits=self.decoder(node, edge, edge_index, valid_mask, batch),
+        return BoltzGenIFoldOutput(
+            logits=self.decoder(node, edge, edge_index, valid_mask, batch),
+        )
+
+    def design(
+        self,
+        batch: BoltzGenIFoldInput,
+        *,
+        temperature: float | None = None,
+        inverse_fold_restriction: tuple[str, ...] = (),
+        tie_symmetric_sequences: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenIFoldOutput:
+        r"""Design residue tokens on a fixed backbone (canonical expert operation).
+
+        Thin public wrapper over the parity-passing ``_design`` autoregressive body;
+        the numerics are unchanged. Returns per-token ``logits`` and sampled ``tokens``.
+
+        Args:
+            batch: Typed inverse-fold input from ``BoltzGenIFoldProcessor``.
+            temperature: Optional categorical sampling temperature. ``None`` selects argmax.
+            inverse_fold_restriction: Canonical amino acids to exclude from this call.
+            tie_symmetric_sequences: Whether symmetric copies share one sample.
+            generator: Optional PyTorch random generator for decode order and sampling.
+
+        Returns:
+            The per-token sequence logits and sampled tokens.
+        """
+
+        return self._design(
+            batch,
+            temperature=temperature,
+            inverse_fold_restriction=inverse_fold_restriction,
+            tie_symmetric_sequences=tie_symmetric_sequences,
+            generator=generator,
         )
 
     @torch.no_grad()
-    def design(
+    def _design(
         self,
-        batch: BoltzGenInput,
+        batch: BoltzGenIFoldInput,
         *,
         temperature: float | None = None,
+        inverse_fold_restriction: tuple[str, ...] = (),
+        tie_symmetric_sequences: bool = False,
         generator: torch.Generator | None = None,
-    ) -> SequenceDesignCandidate:
+    ) -> BoltzGenIFoldOutput:
         r"""
         Autoregressively design residue tokens from the conditioned structure.
 
         Args:
             batch: Typed model input.
             temperature: Optional categorical sampling temperature. ``None`` selects argmax decoding.
+            inverse_fold_restriction: Canonical amino acids to exclude from this design call.
+            tie_symmetric_sequences: Whether matching positions across symmetric copies share one sample.
             generator: Optional PyTorch random generator for decode order and categorical sampling.
 
         Returns:
@@ -932,18 +1015,20 @@ class BoltzGenInverseFoldDesigner(ModelMixin):
             chain_type=batch.chain_type,
         )
         edge_index, valid_mask, node, edge = self.encoder(batch, single_inputs=single_inputs)
-        output = self.decoder.sample(
+        logits, residue_type = self.decoder.sample(
             node,
             edge,
             edge_index,
             valid_mask,
             batch,
             temperature=temperature,
+            inverse_fold_restriction=inverse_fold_restriction,
+            tie_symmetric_sequences=tie_symmetric_sequences,
             generator=generator,
         )
-        return SequenceDesignCandidate(
-            sequence_logits=output.logits,
-            sequence_tokens=output.residue_type.argmax(dim=-1),
+        return BoltzGenIFoldOutput(
+            logits=logits,
+            tokens=residue_type.argmax(dim=-1),
         )
 
 
@@ -976,7 +1061,7 @@ class AtomConditionedInputEmbedder(nn.Module):
         add_ss_specification: Whether to add the secondary-structure conditioning.
         num_binding_types: Number of binding-specification ids.
         num_ss_types: Number of secondary-structure ids.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1027,6 +1112,13 @@ class AtomConditionedInputEmbedder(nn.Module):
 
         self.residue_type_projection = nn.Linear(vocab_size, single_size, bias=False)
         self.msa_profile_projection = nn.Linear(msa_profile_size, single_size, bias=False)
+        self.method_embedding: nn.Embedding | None = None
+        self.modified_embedding: nn.Embedding | None = None
+        self.cyclic_projection: nn.Linear | None = None
+        self.molecule_type_embedding: nn.Embedding | None = None
+        self.binding_specification_embedding: nn.Embedding | None = None
+        self.design_mask_embedding: nn.Embedding | None = None
+        self.ss_specification_embedding: nn.Embedding | None = None
         if add_method_conditioning:
             self.method_embedding = nn.Embedding(num_method_types, single_size)
         if add_modified_flag:
@@ -1040,42 +1132,20 @@ class AtomConditionedInputEmbedder(nn.Module):
             self.design_mask_embedding = nn.Embedding(2, single_size)
         if add_ss_specification:
             self.ss_specification_embedding = nn.Embedding(num_ss_types, single_size)
-
-    def reset_parameters(self) -> None:
-        r"""
-        Zero-init the optional conditioning embeddings and the cyclic projection so they start as no-ops.
-        """
-
-        for name in (
-            "method_embedding",
-            "modified_embedding",
-            "molecule_type_embedding",
-            "binding_specification_embedding",
-            "design_mask_embedding",
-            "ss_specification_embedding",
+        for module in (
+            self.method_embedding,
+            self.modified_embedding,
+            self.molecule_type_embedding,
+            self.binding_specification_embedding,
+            self.design_mask_embedding,
+            self.ss_specification_embedding,
         ):
-            module = getattr(self, name, None)
             if module is not None:
                 nn.init.zeros_(module.weight)
-        if hasattr(self, "cyclic_projection"):
+        if self.cyclic_projection is not None:
             nn.init.zeros_(self.cyclic_projection.weight)
 
-    def forward(self, **inputs: Tensor) -> Tensor:
-        r"""
-        Build the token single embedding from atom-derived states and token encodings.
-
-        Args:
-            **inputs: Keyword tensors forwarded to the internal single-embedding builder (atom features and
-                reference geometry, ``atom_to_token``, ``residue_type``, ``msa_profile``, and the optional
-                conditioning tensors). See ``_forward_single``.
-
-        Returns:
-            Token single representation ``(B, N_token, single_size)``.
-        """
-
-        return self._forward_single(**inputs)
-
-    def _forward_single(
+    def forward(
         self,
         *,
         atom_features: Tensor,
@@ -1117,8 +1187,6 @@ class AtomConditionedInputEmbedder(nn.Module):
         Returns:
             Token single representation ``(B, N_token, single_size)``.
 
-        Raises:
-            ValueError: If ``chain_type`` is missing while the molecule-type embedding is enabled.
         """
 
         atom_query, atom_conditioning, atom_pair = self.atom_encoder(
@@ -1134,24 +1202,22 @@ class AtomConditionedInputEmbedder(nn.Module):
         msa_features = torch.cat([msa_profile, deletion_mean.unsqueeze(-1)], dim=-1)
         single = single + self.msa_profile_projection(msa_features.to(single.dtype))
 
-        if hasattr(self, "method_embedding"):
-            single = single + self.method_embedding(method_feature)
-        if hasattr(self, "modified_embedding"):
-            single = single + self.modified_embedding(modified)
-        if hasattr(self, "cyclic_projection"):
-            assert cyclic_period is not None
-            single = single + self.cyclic_projection(cyclic_period.clamp(max=1.0).unsqueeze(-1).to(single.dtype))
-        if hasattr(self, "molecule_type_embedding"):
-            if chain_type is None:
-                raise ValueError("chain_type is required when molecule_type_embedding is enabled")
-            single = single + self.molecule_type_embedding(chain_type)
-        if hasattr(self, "design_mask_embedding"):
-            assert design_mask is not None
-            single = single + self.design_mask_embedding(design_mask.int())
-        if hasattr(self, "binding_specification_embedding"):
-            single = single + self.binding_specification_embedding(binding_type)
-        if hasattr(self, "ss_specification_embedding"):
-            single = single + self.ss_specification_embedding(ss_type)
+        if self.method_embedding is not None:
+            single = single + self.method_embedding(cast(Tensor, method_feature))
+        if self.modified_embedding is not None:
+            single = single + self.modified_embedding(cast(Tensor, modified))
+        if self.cyclic_projection is not None:
+            single = single + self.cyclic_projection(
+                cast(Tensor, cyclic_period).clamp(max=1.0).unsqueeze(-1).to(single.dtype)
+            )
+        if self.molecule_type_embedding is not None:
+            single = single + self.molecule_type_embedding(cast(Tensor, chain_type))
+        if self.binding_specification_embedding is not None:
+            single = single + self.binding_specification_embedding(cast(Tensor, binding_type))
+        if self.design_mask_embedding is not None:
+            single = single + self.design_mask_embedding(cast(Tensor, design_mask).int())
+        if self.ss_specification_embedding is not None:
+            single = single + self.ss_specification_embedding(cast(Tensor, ss_type))
         return single
 
 
@@ -1188,11 +1254,12 @@ class AtomEncoder(nn.Module):
         super().__init__()
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
-        self.structure_prediction = structure_prediction
         self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.single_trunk_projection: nn.Sequential | None = None
+        self.pair_trunk_projection: nn.Sequential | None = None
         if structure_prediction:
             self.single_trunk_projection = nn.Sequential(
                 LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
@@ -1290,14 +1357,14 @@ class AtomEncoder(nn.Module):
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
         pair_bias = None
-        if self.structure_prediction:
-            assert atom_to_token is not None
-            token_index = atom_to_token
-            single_proj = self.single_trunk_projection(single_trunk)
+        single_trunk_projection = self.single_trunk_projection
+        if single_trunk_projection is not None:
+            token_index = cast(Tensor, atom_to_token)
+            single_proj = single_trunk_projection(cast(Tensor, single_trunk))
             atom_single = atom_single + single_proj.gather(
                 1, token_index.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
             )
-            pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+            pair_from_trunk = cast(nn.Sequential, self.pair_trunk_projection)(cast(Tensor, pair_trunk))
             token_windows = pad_atoms(token_index)
             query_token = token_windows.view(batch, num_windows, num_query_atoms)
             key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
@@ -1336,7 +1403,7 @@ class AtomAttentionEncoder(nn.Module):
         num_atom_encoder_blocks: Number of atom-transformer blocks.
         num_atom_encoder_attention_heads: Number of attention heads per block.
         structure_prediction: Whether to inject noisy positions and return diffusion skip states.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1351,7 +1418,7 @@ class AtomAttentionEncoder(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.structure_prediction = structure_prediction
+        self.noisy_position_projection: nn.Linear | None = None
         if structure_prediction:
             self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
         self.atom_transformer = PackedAtomAttention(
@@ -1401,8 +1468,9 @@ class AtomAttentionEncoder(nn.Module):
         conditioning = atom_conditioning
         mask = atom_mask
         token_index = atom_to_token
-        if self.structure_prediction:
-            query = query.repeat_interleave(multiplicity, 0) + self.noisy_position_projection(noisy_positions)
+        noisy_position_projection = self.noisy_position_projection
+        if noisy_position_projection is not None:
+            query = query.repeat_interleave(multiplicity, 0) + noisy_position_projection(cast(Tensor, noisy_positions))
             conditioning = conditioning.repeat_interleave(multiplicity, 0)
             mask = mask.repeat_interleave(multiplicity, 0)
             token_index = token_index.repeat_interleave(multiplicity, 0)
@@ -1416,7 +1484,7 @@ class AtomAttentionEncoder(nn.Module):
         )
         token_from_atom = self.token_projection(atom_query)
         token_repr = dense_mean_to_tokens(token_from_atom, token_index, num_tokens, atom_mask=mask, count_eps=1e-6)
-        if self.structure_prediction:
+        if noisy_position_projection is not None:
             return token_repr, atom_query, conditioning
         return token_repr
 
@@ -1435,7 +1503,7 @@ class AtomAttentionDecoder(nn.Module):
         num_key_atoms: Number of key atoms per attention window.
         num_atom_decoder_blocks: Number of atom-transformer blocks.
         num_atom_decoder_attention_heads: Number of attention heads per block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1561,7 +1629,7 @@ class MiniTrianglePairUpdateBlock(nn.Module):
         pair_size: Width of the pair representation channel.
         expansion: Feed-forward expansion factor of the pair transition.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1604,7 +1672,7 @@ class MiniformerBlock(nn.Module):
         num_pair_attention_heads: Number of pair-biased single-attention heads.
         expansion: Feed-forward expansion factor of the transitions.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1659,7 +1727,7 @@ class MiniformerStack(nn.Module):
         pair_size: Width of the pair representation channel.
         num_pair_attention_heads: Number of pair-biased single-attention heads per block.
         dropout: Row-wise dropout probability inside each block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1721,7 +1789,7 @@ class MiniformerMsaModule(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside each layer.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -1824,7 +1892,7 @@ class MiniformerMsaLayer(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside the layer.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -2042,7 +2110,7 @@ class DiffusionConditioning(nn.Module):
         atom_mask: Tensor,
         reference_space_id: Tensor,
         atom_to_token: Tensor,
-    ) -> dict[str, object]:
+    ) -> dict[str, Tensor]:
         r"""
         Precompute the noise-independent diffusion conditioning shared across all denoiser calls.
 
@@ -2160,7 +2228,7 @@ class DiffusionScoreModel(nn.Module):
         num_atom_decoder_blocks: Number of atom-decoder blocks.
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         conditioning_transition_layers: Number of transition layers in the single conditioner.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -2221,7 +2289,7 @@ class DiffusionScoreModel(nn.Module):
         single_trunk: Tensor,
         noisy_positions: Tensor,
         noise_level: Tensor,
-        conditioning: dict[str, object],
+        conditioning: dict[str, Tensor],
         *,
         atom_mask: Tensor,
         atom_to_token: Tensor,
@@ -2261,7 +2329,7 @@ class DiffusionScoreModel(nn.Module):
         token_repr, atom_skip, conditioning_skip = self.atom_attention_encoder(
             conditioning["atom_query"],
             conditioning["atom_conditioning"],
-            cast(Any, conditioning["atom_enc_bias"]).repeat_interleave(multiplicity, 0),
+            conditioning["atom_enc_bias"].repeat_interleave(multiplicity, 0),
             atom_mask,
             atom_to_token,
             token_mask.shape[-1],
@@ -2273,7 +2341,7 @@ class DiffusionScoreModel(nn.Module):
         token_repr = self.token_transformer(
             token_repr,
             single,
-            cast(Any, conditioning["token_trans_bias"]).repeat_interleave(multiplicity, 0),
+            conditioning["token_trans_bias"].repeat_interleave(multiplicity, 0),
             token_mask.repeat_interleave(multiplicity, 0).float(),
         )
         token_repr = self.token_norm(token_repr)
@@ -2282,7 +2350,7 @@ class DiffusionScoreModel(nn.Module):
             token_repr,
             atom_skip,
             conditioning_skip,
-            cast(Any, conditioning["atom_dec_bias"]).repeat_interleave(multiplicity, 0),
+            conditioning["atom_dec_bias"].repeat_interleave(multiplicity, 0),
             atom_mask,
             atom_to_token,
             multiplicity=multiplicity,
@@ -2428,9 +2496,8 @@ class AtomDiffusion(nn.Module):
         """
 
         batch = noised_coords.shape[0]
-        if not torch.is_tensor(sigma):
-            sigma = torch.full((batch,), float(sigma), device=noised_coords.device, dtype=noised_coords.dtype)
-        padded = cast(Tensor, sigma).reshape(batch, 1, 1)
+        sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
+        padded = sigma.reshape(batch, 1, 1)
         update = self.score_model(
             noisy_positions=self.preconditioner.c_in(padded) * noised_coords,
             noise_level=self.preconditioner.c_noise(sigma),
@@ -2480,7 +2547,7 @@ class AtomDiffusion(nn.Module):
 
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
 
-    def sample_schedule_af3(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
+    def sample_schedule_karras(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
         r"""
         Build the Karras ``rho``-power noise schedule, scaled by ``sigma_data`` and terminated with a trailing 0.
 
@@ -2506,7 +2573,7 @@ class AtomDiffusion(nn.Module):
         Build the BoltzGen dilated Karras schedule used by the released design inference config.
 
         The schedule first maps uniformly spaced normalized times through the upstream piecewise dilation
-        transform, then applies the same Karras ``rho`` curve as the AF3 schedule.
+        transform, then applies the same Karras ``rho`` curve as the ``karras`` schedule.
         """
 
         steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
@@ -2533,7 +2600,7 @@ class AtomDiffusion(nn.Module):
         """
 
         if self.sampling_schedule == "af3":
-            return self.sample_schedule_af3(num_sampling_steps, device=device)
+            return self.sample_schedule_karras(num_sampling_steps, device=device)
         if self.sampling_schedule == "dilated":
             return self.sample_schedule_dilated(num_sampling_steps, device=device)
         raise ValueError(f"unknown BoltzGen sampling_schedule: {self.sampling_schedule!r}")
@@ -2581,8 +2648,17 @@ class AtomDiffusion(nn.Module):
 
         coords = sigmas[0] * randn()
         denoised = None
+        # The EDM *step math* matches BoltzGenCoordinateEdmSampler (the shared sampler subclass that injects
+        # BoltzGen's faithful ``noise_scale**2 * sqrt(sigma_hat**2 - sigma_current**2)`` churn factor) plus the
+        # opt-in ``alignment_reverse_diff`` mid-step align. The loop stays in-model for the same three
+        # RNG-load-bearing framing divergences as Boltz-2 -- here with the *dilated* Karras schedule
+        # (sample_schedule_dilated) rather than EdmScheduler, the right-multiply (R^T @ x) augmentation
+        # convention, and torch.randn draws the structure_diffusion_parity harness patches. Genuine structural
+        # divergence in the sampler framing, so it is left separate (Frankenstein principle).
+        # The fixed Python loop controls denoiser invocation; schedule values stay as tensors so sampling does not
+        # synchronize them to the host on every step.
         for index in range(len(sigmas) - 1):
-            sigma_current, sigma_next, gamma = sigmas[index].item(), sigmas[index + 1].item(), gammas[index + 1].item()
+            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
             rotation = uniform_random_rotation(
                 expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
             )
@@ -2595,7 +2671,7 @@ class AtomDiffusion(nn.Module):
 
             sigma_hat = sigma_current * (1 + gamma)
             noise_var = noise_scale_value**2 * (sigma_hat**2 - sigma_current**2)
-            noisy = coords + noise_scale_value * math.sqrt(max(noise_var, 0.0)) * randn()
+            noisy = coords + noise_scale_value * torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
             denoised = self.preconditioned_network_forward(
                 noisy, sigma_hat, multiplicity=multiplicity, atom_mask=base_atom_mask, **conditioning
             )
@@ -2698,530 +2774,20 @@ class BFactorHead(nn.Module):
 # against boltz2_conf / boltz2_aff), which are in turn the upstream boltzgen ConfidenceModule / AffinityModule.
 
 
-class ConfidenceHead(nn.Module):
-    r"""
-    Token-level confidence head (pLDDT / pAE / pDE / resolved) scoring sampled coords against the trunk.
-
-    Args:
-        single_size: Width of the single representation channel.
-        pair_size: Width of the pair representation channel.
-        num_blocks: Number of Pairformer blocks.
-        num_pair_attention_heads: Number of pair-biased single-attention heads per block.
-        num_distogram_bins: Number of distance-distogram bins built from the sampled coords.
-        max_distance: Upper edge (angstrom) of the distogram binning.
-        relative_position_size: Width of the relative-position input features.
-        num_bond_types: Number of token bond-type ids.
-        conditioning_cutoff_min: Lower distance cutoff (angstrom) for contact conditioning.
-        conditioning_cutoff_max: Upper distance cutoff (angstrom) for contact conditioning.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of predicted-aligned-error output bins.
-        num_pde_bins: Number of predicted-distance-error output bins.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        num_blocks: int = 8,
-        num_pair_attention_heads: int = 16,
-        num_distogram_bins: int = 64,
-        max_distance: float = 22.0,
-        relative_position_size: int = 139,
-        num_bond_types: int = 7,
-        conditioning_cutoff_min: float = 4.0,
-        conditioning_cutoff_max: float = 20.0,
-        num_plddt_bins: int = 50,
-        num_pae_bins: int = 64,
-        num_pde_bins: int = 64,
-        operator_backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
-        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
-
-        self.input_single_norm = LayerNorm(single_size)
-        self.single_norm = LayerNorm(single_size)
-        self.norm_pair = LayerNorm(pair_size)
-        self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
-        self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
-
-        self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
-        self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
-        self.token_bond_type_embedding = nn.Embedding(num_bond_types, pair_size)
-        self.contact_conditioning = ContactConditioning(
-            pair_size, cutoff_min=conditioning_cutoff_min, cutoff_max=conditioning_cutoff_max
-        )
-
-        self.pairformer_stack = PairformerStack(
-            num_blocks=num_blocks,
-            single_size=single_size,
-            pair_size=pair_size,
-            num_pair_attention_heads=num_pair_attention_heads,
-            operator_backend=operator_backend,
-        )
-        self.confidence_heads = ConfidenceHeads(
-            single_size, pair_size, num_plddt_bins=num_plddt_bins, num_pae_bins=num_pae_bins, num_pde_bins=num_pde_bins
-        )
-
-    def forward(
-        self,
-        single_inputs: Tensor,
-        single: Tensor,
-        pair: Tensor,
-        pred_coords: Tensor,
-        *,
-        residue_index: Tensor,
-        chain_index: Tensor,
-        entity_index: Tensor,
-        symmetry_index: Tensor,
-        token_index: Tensor,
-        token_bonds: Tensor,
-        type_bonds: Tensor,
-        contact_conditioning: Tensor,
-        contact_threshold: Tensor,
-        token_to_rep_atom: Tensor,
-        token_mask: Tensor,
-        cyclic_period: Tensor | None = None,
-        multiplicity: int = 1,
-    ) -> dict[str, Tensor]:
-        r"""
-        Rebuild the pair representation (relative-position, bonds, contact, and a binned distogram of
-        representative-atom distances), refine with a Pairformer stack, and project to confidence logits.
-
-        Args:
-            single_inputs: Trunk input single ``(B, N, single_size)``.
-            single: Trunk refined single ``(B, N, single_size)``.
-            pair: Trunk pair ``(B, N, N, pair_size)``.
-            pred_coords: Sampled atom coords ``(B*multiplicity, M, 3)``.
-            residue_index, chain_index, entity_index, symmetry_index, token_index: Relative-position features.
-            token_bonds: Token covalent adjacency ``(B, N, N)``.
-            type_bonds: Token bond-type ids ``(B, N, N)``.
-            contact_conditioning: Contact-class one-hot ``(B, N, N, num_classes)``.
-            contact_threshold: Contact thresholds ``(B, N, N)``.
-            token_to_rep_atom: Representative atom index per token ``(B, N)``.
-            token_mask: Boolean token validity mask ``(B, N)``.
-            cyclic_period: Optional cyclic-position periods ``(B, N)``.
-            multiplicity: Samples per batch element; trunk tensors are interleaved to ``B*multiplicity``.
-
-        Returns:
-            Logit dict from [`ConfidenceHeads`][ofoldx.models.boltzgen.model.ConfidenceHeads]: ``pae_logits``,
-            ``pde_logits``, ``plddt_logits``, ``resolved_logits``.
-        """
-
-        single_inputs = self.input_single_norm(single_inputs)
-        single = self.single_norm(single)
-        single = single + self.input_single_projection(single_inputs)
-        pair = self.norm_pair(pair)
-
-        relative_features = generate_relative_position_features(
-            residue_index=residue_index,
-            chain_index=chain_index,
-            entity_index=entity_index,
-            symmetry_index=symmetry_index,
-            token_index=token_index,
-            cyclic_period=cyclic_period,
-            dtype=single.dtype,
-        ).to(device=single.device)
-        pair = pair + self.relative_position_embedder(relative_features)
-        pair = pair + self.token_bond_projection(token_bonds.unsqueeze(-1).to(pair.dtype))
-        pair = pair + self.token_bond_type_embedding(type_bonds.long())
-        pair = pair + self.contact_conditioning(contact_conditioning.to(pair.dtype), contact_threshold.to(pair.dtype))
-
-        single = single.repeat_interleave(multiplicity, 0)
-        pair = (
-            pair
-            + self.single_to_pair_row(single_inputs).unsqueeze(-2)
-            + self.single_to_pair_col(single_inputs).unsqueeze(-3)
-        )
-        pair = pair + self.single_to_pair_product_out(
-            self.single_to_pair_product_left(single_inputs).unsqueeze(-2)
-            * self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
-        )
-        pair = pair.repeat_interleave(multiplicity, 0)
-
-        rep_atom_index = token_to_rep_atom.repeat_interleave(multiplicity, 0)
-        representative = pred_coords.gather(1, rep_atom_index.unsqueeze(-1).expand(-1, -1, pred_coords.shape[-1]))
-        distances = torch.cdist(representative, representative)
-        distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        pair = pair + self.distance_embedding(distogram)
-
-        token_mask = token_mask.repeat_interleave(multiplicity, 0)
-        pair_mask = pair_mask_from_token_mask(token_mask)
-        single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
-
-        chain_index = chain_index.repeat_interleave(multiplicity, 0)
-        return self.confidence_heads(single, pair, chain_index)
-
-
-class ConfidenceHeads(nn.Module):
-    r"""
-    Project the confidence single / pair representations to pLDDT / resolved / pAE / pDE logits.
-
-    Args:
-        single_size: Width of the single representation channel.
-        pair_size: Width of the pair representation channel.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of predicted-aligned-error output bins.
-        num_pde_bins: Number of predicted-distance-error output bins.
-    """
-
-    def __init__(
-        self, single_size: int, pair_size: int, num_plddt_bins: int = 50, num_pae_bins: int = 64, num_pde_bins: int = 64
-    ) -> None:
-        super().__init__()
-        self.pae_intra_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
-        self.pae_inter_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
-        self.pde_intra_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
-        self.pde_inter_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
-        self.plddt_projection = nn.Linear(single_size, num_plddt_bins, bias=False)
-        self.resolved_projection = nn.Linear(single_size, 2, bias=False)
-
-    def forward(self, single: Tensor, pair: Tensor, chain_index: Tensor) -> dict[str, Tensor]:
-        r"""
-        Project the confidence single/pair representations to error logits, selecting intra- vs inter-chain
-        projections per token pair via ``chain_index``; pDE uses the symmetrized pair.
-
-        Args:
-            single: Confidence single representation of shape `[B, num_tokens, single_size]`.
-            pair: Confidence pair representation of shape `[B, num_tokens, num_tokens, pair_size]`.
-            chain_index: Per-token chain id of shape `[B, num_tokens]`, used to gate the intra-/inter-chain heads.
-
-        Returns:
-            A mapping with ``pae_logits`` `[B, num_tokens, num_tokens, num_pae_bins]`, ``pde_logits``
-            `[B, num_tokens, num_tokens, num_pde_bins]`, ``plddt_logits`` `[B, num_tokens, num_plddt_bins]`, and
-            ``resolved_logits`` `[B, num_tokens, 2]`.
-        """
-
-        same_chain = (chain_index.unsqueeze(-1) == chain_index.unsqueeze(-2)).float().unsqueeze(-1)
-        different_chain = 1.0 - same_chain
-        pae_logits = self.pae_intra_projection(pair) * same_chain + self.pae_inter_projection(pair) * different_chain
-        symmetric = pair + pair.transpose(-3, -2)
-        pde_logits = (
-            self.pde_intra_projection(symmetric) * same_chain + self.pde_inter_projection(symmetric) * different_chain
-        )
-        return {
-            "pae_logits": pae_logits,
-            "pde_logits": pde_logits,
-            "plddt_logits": self.plddt_projection(single),
-            "resolved_logits": self.resolved_projection(single),
-        }
-
-
-class AffinityHead(nn.Module):
-    r"""
-    Pair-only affinity head: distogram-condition the trunk pair over the ligand/receptor sub-graph, refine with a
-    Pairformer stack, then pool to scalar affinity value and binary-binder logits (Boltz-2 / boltzgen affinity).
-
-    Args:
-        single_size: Width of the single representation channel.
-        pair_size: Width of the pair representation channel.
-        num_blocks: Number of pair-only Pairformer blocks.
-        num_pair_attention_heads: Number of pair-biased attention heads per block.
-        num_distogram_bins: Number of distance-distogram bins built from the sampled coords.
-        max_distance: Upper edge (angstrom) of the distogram binning.
-        num_conditioning_transitions: Number of transition layers in the pairwise conditioner.
-        expansion: Feed-forward / conditioning-transition expansion factor.
-        triangle_attention_hidden_size: Per-head width of the triangle attention.
-        num_triangle_attention_heads: Number of triangle-attention heads.
-        dropout: Dropout probability inside the Pairformer.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        num_blocks: int = 4,
-        num_pair_attention_heads: int = 16,
-        num_distogram_bins: int = 64,
-        max_distance: float = 22.0,
-        num_conditioning_transitions: int = 2,
-        expansion: int = 2,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        dropout: float = 0.0,
-        operator_backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
-        self.dist_bin_pairwise_embed = nn.Embedding(num_distogram_bins, pair_size)
-        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size)
-        self.pair_linear = nn.Linear(pair_size, pair_size, bias=False)
-        self.pairwise_conditioner = PairwiseConditioning(
-            pair_size=pair_size,
-            relative_position_size=pair_size,
-            num_transitions=num_conditioning_transitions,
-            transition_expansion=expansion,
-        )
-        self.pairformer_stack = PairformerStack(
-            num_blocks=num_blocks,
-            single_size=0,
-            pair_size=pair_size,
-            triangle_attention_hidden_size=triangle_attention_hidden_size,
-            num_triangle_attention_heads=num_triangle_attention_heads,
-            num_pair_attention_heads=num_pair_attention_heads,
-            dropout=dropout,
-            operator_backend=operator_backend,
-        )
-        self.affinity_heads = AffinityHeads(pair_size=pair_size, single_size=single_size)
-
-    def forward(
-        self,
-        *,
-        single_inputs: Tensor,
-        pair: Tensor,
-        pred_coords: Tensor,
-        token_to_rep_atom: Tensor,
-        token_mask: Tensor,
-        ligand_mask: Tensor,
-        receptor_mask: Tensor,
-        multiplicity: int = 1,
-    ) -> dict[str, Tensor]:
-        r"""
-        Score affinity from trunk pair features and predicted atom coords over the ligand/receptor sub-graph.
-
-        Distogram-conditions the trunk pair on the representative-atom distances, restricts attention to the
-        receptor/ligand and ligand/ligand pair mask, refines with the pair-only Pairformer, and pools to scalars.
-
-        Args:
-            single_inputs: Trunk input single ``(B, N_token, single_size)``.
-            pair: Trunk pair ``(B, N_token, N_token, pair_size)``.
-            pred_coords: Sampled atom coords ``(B*multiplicity, N_atom, 3)``.
-            token_to_rep_atom: Representative atom index per token ``(B, N_token)``.
-            token_mask: Boolean token validity mask ``(B, N_token)``.
-            ligand_mask: Boolean ligand-token mask ``(B, N_token)``.
-            receptor_mask: Boolean receptor-token mask ``(B, N_token)``.
-            multiplicity: Samples per batch element; trunk tensors are interleaved to ``B*multiplicity``.
-
-        Returns:
-            Dict with ``affinity_pred_value`` ``(B*multiplicity, 1)`` and ``affinity_logits_binary``
-            ``(B*multiplicity, 1)``.
-        """
-
-        pair = self.pair_linear(self.pair_norm(pair))
-        pair = pair + self.single_to_pair_product_left(single_inputs).unsqueeze(-2)
-        pair = pair + self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
-        pair = pair.repeat_interleave(multiplicity, 0)
-
-        rep_atom_index = token_to_rep_atom.repeat_interleave(multiplicity, 0).long()
-        representative = pred_coords.gather(
-            1,
-            rep_atom_index.unsqueeze(-1).expand(-1, -1, pred_coords.shape[-1]),
-        )
-        distances = torch.cdist(representative, representative)
-        distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        pair = pair + self.pairwise_conditioner(pair, self.dist_bin_pairwise_embed(distogram))
-
-        token_mask = token_mask.repeat_interleave(multiplicity, 0).bool()
-        ligand_mask = ligand_mask.repeat_interleave(multiplicity, 0).bool() & token_mask
-        receptor_mask = receptor_mask.repeat_interleave(multiplicity, 0).bool() & token_mask
-        affinity_pair_mask = _affinity_pair_mask(ligand_mask, receptor_mask)
-        _, pair = self.pairformer_stack(None, pair, pair_mask=affinity_pair_mask)
-        return self.affinity_heads(pair, affinity_pair_mask)
-
-
-class AffinityHeads(nn.Module):
-    r"""
-    Project pooled affinity pair features to an affinity value and binary-binder logits.
-
-    Args:
-        pair_size: Width of the pair representation channel.
-        single_size: Width of the intermediate MLP channel.
-    """
-
-    def __init__(self, pair_size: int = 128, single_size: int = 384) -> None:
-        super().__init__()
-        self.affinity_out_mlp = nn.Sequential(
-            nn.Linear(pair_size, pair_size),
-            nn.ReLU(),
-            nn.Linear(pair_size, single_size),
-            nn.ReLU(),
-        )
-        self.to_affinity_pred_value = nn.Sequential(
-            nn.Linear(single_size, single_size),
-            nn.ReLU(),
-            nn.Linear(single_size, single_size),
-            nn.ReLU(),
-            nn.Linear(single_size, 1),
-        )
-        self.to_affinity_pred_score = nn.Sequential(
-            nn.Linear(single_size, single_size),
-            nn.ReLU(),
-            nn.Linear(single_size, single_size),
-            nn.ReLU(),
-            nn.Linear(single_size, 1),
-        )
-        self.to_affinity_logits_binary = nn.Linear(1, 1)
-
-    def forward(self, pair: Tensor, affinity_pair_mask: Tensor) -> dict[str, Tensor]:
-        r"""
-        Mean-pool the receptor/ligand and ligand/ligand pair states (excluding the diagonal) and project to scalars.
-
-        Args:
-            pair: Refined affinity pair states ``(B*multiplicity, N_token, N_token, pair_size)``.
-            affinity_pair_mask: Boolean receptor/ligand + ligand/ligand pair mask ``(B*multiplicity, N, N)``.
-
-        Returns:
-            Dict with ``affinity_pred_value`` ``(B*multiplicity, 1)`` and ``affinity_logits_binary``
-            ``(B*multiplicity, 1)``.
-        """
-
-        num_tokens = affinity_pair_mask.shape[-1]
-        non_diagonal = ~torch.eye(num_tokens, device=affinity_pair_mask.device, dtype=torch.bool).unsqueeze(0)
-        pool_mask = (affinity_pair_mask.bool() & non_diagonal).to(dtype=pair.dtype).unsqueeze(-1)
-        pooled = torch.sum(pair * pool_mask, dim=(-3, -2)) / torch.sum(pool_mask, dim=(-3, -2)).clamp_min(1e-7)
-        pooled = self.affinity_out_mlp(pooled)
-        affinity_pred_value = self.to_affinity_pred_value(pooled).reshape(-1, 1)
-        affinity_pred_score = self.to_affinity_pred_score(pooled).reshape(-1, 1)
-        affinity_logits_binary = self.to_affinity_logits_binary(affinity_pred_score).reshape(-1, 1)
-        return {
-            "affinity_pred_value": affinity_pred_value,
-            "affinity_logits_binary": affinity_logits_binary,
-        }
-
-
-def _affinity_pair_mask(ligand_mask: Tensor, receptor_mask: Tensor) -> Tensor:
-    r"""
-    Build the boolean pair mask over receptor/ligand and ligand/ligand token pairs used by the affinity head.
-
-    Args:
-        ligand_mask: Boolean ligand-token mask ``(..., N_token)``.
-        receptor_mask: Boolean receptor-token mask ``(..., N_token)``.
-
-    Returns:
-        Boolean pair mask ``(..., N_token, N_token)`` true on receptor/ligand and ligand/ligand pairs.
-    """
-
-    return (
-        ligand_mask.unsqueeze(-1) & receptor_mask.unsqueeze(-2)
-        | receptor_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
-        | ligand_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
-    )
-
-
-def _resolve_affinity_token_mask(batch: BoltzGenInput, affinity_token_mask: Tensor | None = None) -> Tensor:
-    r"""
-    Resolve the ligand-token mask for affinity scoring, defaulting to ``molecule_type == 3`` (NONPOLYMER) tokens.
-    """
-
-    if affinity_token_mask is None:
-        affinity_token_mask = batch.affinity_token_mask
-    if affinity_token_mask is None:
-        if batch.molecule_type is None:
-            raise ValueError("affinity_token_mask is required when molecule_type is unavailable")
-        affinity_token_mask = batch.molecule_type == 3
-    affinity_token_mask = affinity_token_mask.to(device=batch.token_mask.device, dtype=torch.bool)
-    if affinity_token_mask.shape != batch.token_mask.shape:
-        raise ValueError(
-            f"affinity_token_mask shape {tuple(affinity_token_mask.shape)} must match token_mask "
-            f"{tuple(batch.token_mask.shape)}"
-        )
-    if not bool((affinity_token_mask & batch.token_mask.bool()).any()):
-        raise ValueError("affinity_token_mask selects no valid tokens")
-    return affinity_token_mask
-
-
-def _design_conditioning_for_embedder(
-    batch: BoltzGenInput, embedder: AtomConditionedInputEmbedder
-) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
-    r"""
-    Resolve and validate the design-conditioning tensors required by the input embedder's enabled channels.
-
-    Args:
-        batch: Typed model input.
-        embedder: The atom-conditioned input embedder (its enabled conditioning channels decide what is required).
-
-    Returns:
-        Tuple of ``(binding_type, design_mask, ss_type)`` (each may be ``None`` when the channel is disabled).
-
-    Raises:
-        ValueError: If a conditioning tensor required by an enabled channel is missing.
-    """
-
-    binding_type, design_mask, ss_type = batch.binding_type, batch.design_mask, batch.ss_type
-    if hasattr(embedder, "binding_specification_embedding") and binding_type is None:
-        raise ValueError("binding_type is required for BoltzGen structure design")
-    if hasattr(embedder, "design_mask_embedding") and design_mask is None:
-        raise ValueError("design_mask is required for BoltzGen structure design")
-    if hasattr(embedder, "ss_specification_embedding") and ss_type is None:
-        raise ValueError("ss_type is required for BoltzGen structure design")
-    return binding_type, design_mask, ss_type
-
-
-def _require_template_features(
-    batch: BoltzGenInput,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    r"""
-    Return the nine template feature tensors required by the template module, raising if any is missing.
-
-    Args:
-        batch: Typed model input.
-
-    Returns:
-        Tuple of ``(template_restype, template_mask_frame, template_frame_rot, template_frame_t, template_cb,
-        template_ca, template_mask_cb, template_mask, visibility_ids)``.
-
-    Raises:
-        ValueError: If any required template feature is missing.
-    """
-
-    if (
-        batch.template_restype is None
-        or batch.template_mask_frame is None
-        or batch.template_frame_rot is None
-        or batch.template_frame_t is None
-        or batch.template_cb is None
-        or batch.template_ca is None
-        or batch.template_mask_cb is None
-        or batch.template_mask is None
-        or batch.visibility_ids is None
-    ):
-        raise ValueError("template features are incomplete")
-    return (
-        batch.template_restype,
-        batch.template_mask_frame,
-        batch.template_frame_rot,
-        batch.template_frame_t,
-        batch.template_cb,
-        batch.template_ca,
-        batch.template_mask_cb,
-        batch.template_mask,
-        batch.visibility_ids,
-    )
-
-
-def _token_bonds_with_channel(batch: BoltzGenInput) -> Tensor:
-    r"""
-    Return ``batch.token_bonds`` with a trailing singleton channel, adding one when it is rank-3.
-
-    Args:
-        batch: Typed model input.
-
-    Returns:
-        Token bonds ``(B, N_token, N_token, 1)``.
-    """
-
-    if batch.token_bonds.ndim == 3:
-        return batch.token_bonds.unsqueeze(-1)
-    return batch.token_bonds
-
-
-def _gather_backbone4(batch: BoltzGenInput, batch_size: int, num_tokens: int) -> Tensor:
+def _gather_backbone4(
+    token_to_bb4_atoms: Tensor,
+    coords: Tensor,
+    batch_size: int,
+    num_tokens: int,
+) -> Tensor:
     r"""Gather the four backbone-atom coordinates per token -> ``(B, N_token, 4, 3)``."""
-    bb4_index = batch.token_to_bb4_atoms.reshape(batch_size, num_tokens * 4)
-    coords = batch.coords.reshape(batch_size, -1, 3)
+    bb4_index = token_to_bb4_atoms.reshape(batch_size, num_tokens * 4)
+    coords = coords.reshape(batch_size, -1, 3)
     backbone = coords.gather(1, bb4_index.unsqueeze(-1).expand(-1, -1, 3))
     return backbone.reshape(batch_size, num_tokens, 4, 3)
 
 
-def _init_boltzgen_final_weights(module: nn.Module) -> None:
+def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
     r"""
     Apply the BoltzGen zero-init scheme to every final-layer / gating / conditioning weight under ``module``.
 
@@ -3233,17 +2799,15 @@ def _init_boltzgen_final_weights(module: nn.Module) -> None:
     """
 
     for child in module.modules():
-        if isinstance(child, AtomConditionedInputEmbedder):
-            child.reset_parameters()
         if isinstance(child, AtomEncoder):
-            if hasattr(child, "single_trunk_projection"):
+            if child.single_trunk_projection is not None:
                 nn.init.zeros_(child.single_trunk_projection[1].weight)
-            if hasattr(child, "pair_trunk_projection"):
+            if child.pair_trunk_projection is not None:
                 nn.init.zeros_(child.pair_trunk_projection[1].weight)
             nn.init.zeros_(child.left_atom_projection[1].weight)
             nn.init.zeros_(child.right_atom_projection[1].weight)
             nn.init.zeros_(child.feed_forward[5].weight)
-        elif isinstance(child, AtomAttentionEncoder) and hasattr(child, "noisy_position_projection"):
+        elif isinstance(child, AtomAttentionEncoder) and child.noisy_position_projection is not None:
             nn.init.zeros_(child.noisy_position_projection.weight)
         elif isinstance(child, AtomAttentionDecoder):
             nn.init.zeros_(child.token_projection.weight)
@@ -3256,15 +2820,13 @@ def _init_boltzgen_final_weights(module: nn.Module) -> None:
             nn.init.zeros_(child.g_out.weight)
         elif isinstance(child, Transition):
             nn.init.zeros_(child.output_projection.weight)
-
-        projection = getattr(getattr(child, "attention", None), "projection", None)
-        if projection is not None and hasattr(projection, "output_projection"):
-            nn.init.zeros_(projection.output_projection.weight)
-        if hasattr(child, "output_gate_projection"):
+        elif isinstance(child, GatedMultiheadAttention):
+            nn.init.zeros_(child.projection.output_projection.weight)
+        elif isinstance(child, ConditionedTransformerLayer):
             nn.init.zeros_(child.output_gate_projection.weight)
             if child.output_gate_projection.bias is not None:
                 nn.init.constant_(child.output_gate_projection.bias, -2.0)
-        if hasattr(child, "conditioning_gate_projection"):
+        elif isinstance(child, (ConditionedTransition, ConditionedTransitionBlock)):
             nn.init.zeros_(child.conditioning_gate_projection.weight)
             if child.conditioning_gate_projection.bias is not None:
                 nn.init.constant_(child.conditioning_gate_projection.bias, -2.0)
@@ -3307,50 +2869,39 @@ CANONICAL_TOKENS: tuple[str, ...] = (
 )
 
 
-def build_constraint_logit_mask(
+def _build_constraint_logit_mask(
     num_nodes: int,
     aa_constraint_mask: Tensor | None,
-    inverse_fold_restriction: list[str],
-    inf: float,
+    inverse_fold_restriction: tuple[str, ...],
     device: torch.device,
+    dtype: torch.dtype,
 ) -> Tensor:
     r"""
     Build the additive per-position canonical-amino-acid logit mask for constrained inverse folding.
 
     Combines a per-residue block mask (``aa_constraint_mask``, ``(num_nodes, 20)``, ``> 0`` = blocked) with a
-    global block list (``inverse_fold_restriction``, three-letter CCD codes blocked everywhere). Positions left
-    with no allowed amino acid have their per-residue constraints relaxed; if a position is still fully blocked by
-    the global list alone, a ``ValueError`` is raised. Faithful to upstream ``build_constraint_logit_mask``.
+    global block list (``inverse_fold_restriction``, three-letter CCD codes blocked everywhere). A position with no
+    allowed amino acid raises instead of silently relaxing the explicit per-residue constraints.
 
     Args:
         num_nodes: Number of packed valid tokens.
         aa_constraint_mask: Optional per-residue block mask ``(num_nodes, 20)``; ``None`` = no per-residue blocks.
         inverse_fold_restriction: Canonical amino acids (three-letter codes) to block at every position.
-        inf: Positive magnitude of the additive penalty applied to a blocked amino acid.
         device: Device for the returned mask.
+        dtype: Floating dtype for the returned additive mask.
 
     Returns:
-        Additive logit bias ``(num_nodes, 20)``: ``0.0`` where allowed, ``-inf`` where blocked.
+        Additive logit bias ``(num_nodes, 20)``: ``0.0`` where allowed, ``-1e6`` where blocked.
 
     Raises:
-        ValueError: If a position is fully blocked by the global restriction alone.
+        ValueError: If the combined restrictions block every identity at a position.
     """
 
     num_aa = NUM_CANONICAL_TOKENS
-    has_per_residue = False
     if aa_constraint_mask is None:
         per_residue_blocked = torch.zeros(num_nodes, num_aa, dtype=torch.bool, device=device)
-    elif aa_constraint_mask.shape != (num_nodes, num_aa):
-        warnings.warn(
-            f"aa_constraint_mask shape {tuple(aa_constraint_mask.shape)} != {(num_nodes, num_aa)}; "
-            "ignoring per-residue constraints.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        per_residue_blocked = torch.zeros(num_nodes, num_aa, dtype=torch.bool, device=device)
     else:
-        has_per_residue = True
-        per_residue_blocked = aa_constraint_mask.to(device=device) > 0
+        per_residue_blocked = aa_constraint_mask > 0
 
     global_blocked = torch.zeros(num_aa, dtype=torch.bool, device=device)
     for res_type in inverse_fold_restriction:
@@ -3358,23 +2909,11 @@ def build_constraint_logit_mask(
 
     combined = per_residue_blocked | global_blocked.unsqueeze(0)
     all_blocked = combined.all(dim=1)
-    if all_blocked.any() and has_per_residue:
-        warnings.warn(
-            f"Positions {torch.where(all_blocked)[0].tolist()} have all amino acids blocked; relaxing "
-            "per-residue constraints there.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        per_residue_blocked = per_residue_blocked.clone()
-        per_residue_blocked[all_blocked] = False
-        combined = per_residue_blocked | global_blocked.unsqueeze(0)
-
-    if combined.all(dim=1).any():
+    if all_blocked.any():
         raise ValueError(
-            f"Inverse folding has no valid amino acids at positions {torch.where(combined.all(dim=1))[0].tolist()} "
-            "after applying the global restriction; reduce inverse_fold_restriction."
+            f"inverse folding has no valid amino acids at positions {torch.where(all_blocked)[0].tolist()}"
         )
-    return combined.to(dtype=torch.float32) * (-inf)
+    return combined.to(dtype=dtype) * -1e6
 
 
 class InverseFoldingEncoder(nn.Module):
@@ -3395,8 +2934,8 @@ class InverseFoldingEncoder(nn.Module):
         k_neighbors: Number of nearest neighbours per token.
         max_relative_position: Clamp range for the relative-position edge feature.
         dropout: Dropout probability inside the graph-attention layers.
-        enable_input_embedder: Whether node features come from the token single embedding (else raw node features).
-        node_feature_size: Width of the raw node features when the input embedder is disabled.
+        softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
+        inverse_fold_noise: Coordinate-noise standard deviation used by the training graph.
     """
 
     def __init__(
@@ -3409,20 +2948,20 @@ class InverseFoldingEncoder(nn.Module):
         num_attention_heads: int = 4,
         k_neighbors: int = 30,
         max_relative_position: int = 32,
-        dropout: float = 0.0,
-        enable_input_embedder: bool = True,
-        node_feature_size: int = 135,
+        dropout: float = 0.1,
+        softmax_dropout: float = 0.2,
+        inverse_fold_noise: float = 0.2,
     ) -> None:
         super().__init__()
         self.k_neighbors = k_neighbors
         self.max_relative_position = max_relative_position
-        self.enable_input_embedder = enable_input_embedder
+        self.inverse_fold_noise = inverse_fold_noise
         # geo (4x4 backbone-atom distances x 16 RBF = 256)
         # + edge attrs (2*max_relative_position+2 + same_chain + same_residue)
         # + bond (token_bonds + one-hot bond type).
         self.edge_input_size = 256 + (2 * max_relative_position + 2) + 2 + 1 + (NUM_BOND_TYPES + 1)
 
-        self.node_input_projection = nn.Linear(single_size if enable_input_embedder else node_feature_size, node_size)
+        self.node_input_projection = nn.Linear(single_size, node_size)
         self.edge_input_projection = nn.Linear(self.edge_input_size, edge_size)
         self.layers = nn.ModuleList(
             GraphAttentionLayer(
@@ -3431,13 +2970,14 @@ class InverseFoldingEncoder(nn.Module):
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
                 dropout=dropout,
+                softmax_dropout=softmax_dropout,
             )
             for _ in range(num_layers)
         )
         self.distance_smearing = GaussianSmearing(start=0.0, stop=20.0, num_gaussians=16)
 
     @torch.no_grad()
-    def build_knn_graph(self, batch: BoltzGenInput) -> tuple[Tensor, Tensor, Tensor]:
+    def build_knn_graph(self, batch: BoltzGenIFoldInput) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Build the kNN token graph from representative-atom distances.
 
@@ -3462,7 +3002,7 @@ class InverseFoldingEncoder(nn.Module):
 
         # token_bonds carries a trailing singleton (B, N, N, 1); drop it so the gather index (B, N, k_neighbors)
         # matches its rank (the BoltzGen reference does the same, asserting shape[-1] == 1). type_bonds is (B, N, N).
-        token_bonds = torch.gather(_token_bonds_with_channel(batch)[..., 0], 2, src)
+        token_bonds = torch.gather(batch.token_bonds[..., 0], 2, src)
         type_bonds = torch.gather(batch.type_bonds, 2, src)
 
         src, dst = src.flatten(start_dim=1), dst.flatten(start_dim=1)
@@ -3479,7 +3019,7 @@ class InverseFoldingEncoder(nn.Module):
         return edge_index, valid_mask, bond
 
     @torch.no_grad()
-    def edge_geometry(self, batch: BoltzGenInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
+    def edge_geometry(self, batch: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
         r"""
         Compute the per-edge backbone-atom (4x4) pairwise-distance RBF feature.
 
@@ -3494,12 +3034,20 @@ class InverseFoldingEncoder(nn.Module):
 
         src, dst = edge_index[0], edge_index[1]
         batch_size, num_tokens = valid_mask.shape
-        backbone = _gather_backbone4(batch, batch_size, num_tokens)[valid_mask]  # (Nvalid, 4, 3)
+        coords = batch.coords
+        if self.training and self.inverse_fold_noise > 0:
+            coords = coords + torch.randn_like(coords) * self.inverse_fold_noise
+        backbone = _gather_backbone4(
+            batch.token_to_bb4_atoms,
+            coords,
+            batch_size,
+            num_tokens,
+        )[valid_mask]
         distance = torch.norm(backbone[src, None] - backbone[dst, :, None], dim=-1).flatten(start_dim=1)
         return self.distance_smearing(distance)
 
     @torch.no_grad()
-    def edge_attributes(self, batch: BoltzGenInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
+    def edge_attributes(self, batch: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
         r"""
         Compute the per-edge relative-position / same-chain / same-residue attributes.
 
@@ -3525,10 +3073,9 @@ class InverseFoldingEncoder(nn.Module):
 
     def forward(
         self,
-        batch: BoltzGenInput,
+        batch: BoltzGenIFoldInput,
         *,
-        single_inputs: Tensor | None = None,
-        node_features: Tensor | None = None,
+        single_inputs: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Encode the structure into a packed kNN token graph with attention-refined node and edge states.
@@ -3539,33 +3086,19 @@ class InverseFoldingEncoder(nn.Module):
 
         Args:
             batch: Typed model input.
-            single_inputs: Token single embedding ``(B, N_token, single_size)``; required when
-                ``enable_input_embedder`` is True.
-            node_features: Precomputed node features ``(B, N_token, node_feature_size)``; required when
-                ``enable_input_embedder`` is False.
+            single_inputs: Token single embedding ``(B, N_token, single_size)``.
 
         Returns:
             Tuple of ``edge_index`` ``(2, E)`` into packed valid tokens, ``valid_mask`` ``(B, N_token)``, packed
             node states ``(N_valid, node_size)``, and packed edge states ``(E, edge_size)``.
 
-        Raises:
-            ValueError: If the required node-feature source for the configured mode is missing.
         """
 
         edge_index, valid_mask, bond = self.build_knn_graph(batch)
         geometry = self.edge_geometry(batch, edge_index, valid_mask)
         edge_attr = self.edge_attributes(batch, edge_index, valid_mask)
 
-        if self.enable_input_embedder:
-            if single_inputs is None:
-                raise ValueError("single_inputs is required when enable_input_embedder=True")
-            node_attr = single_inputs[valid_mask]
-        else:
-            if node_features is None:
-                raise ValueError("node_features is required when enable_input_embedder=False")
-            node_attr = node_features[valid_mask]
-
-        node = self.node_input_projection(node_attr)
+        node = self.node_input_projection(single_inputs[valid_mask])
         edge = self.edge_input_projection(torch.cat([geometry, edge_attr, bond], dim=-1))
         for layer in self.layers:
             node, edge = layer(node, edge, edge_index)
@@ -3588,9 +3121,7 @@ class InverseFoldingDecoder(nn.Module):
         num_attention_heads: Number of attention heads per layer.
         vocab_size: Number of residue-type tokens.
         dropout: Dropout probability inside the graph-attention layers.
-        inverse_fold_restriction: Canonical amino acids (three-letter codes) globally blocked during sampling.
-        tie_symmetric_sequences: Whether to tie homomer copies during autoregressive decoding.
-        constraint_inf: Additive logit penalty magnitude applied to a blocked amino acid.
+        softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
     def __init__(
@@ -3601,16 +3132,11 @@ class InverseFoldingDecoder(nn.Module):
         num_layers: int = 3,
         num_attention_heads: int = 4,
         vocab_size: int = NUM_RESIDUE_TYPES,
-        dropout: float = 0.0,
-        inverse_fold_restriction: list[str] | None = None,
-        tie_symmetric_sequences: bool = False,
-        constraint_inf: float = 1e6,
+        dropout: float = 0.1,
+        softmax_dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
-        self.inverse_fold_restriction = list(inverse_fold_restriction or [])
-        self.tie_symmetric_sequences = tie_symmetric_sequences
-        self.constraint_inf = constraint_inf
         # Each layer's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
         decoder_edge_size = edge_size + node_size
         self.layers = nn.ModuleList(
@@ -3620,6 +3146,7 @@ class InverseFoldingDecoder(nn.Module):
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
                 dropout=dropout,
+                softmax_dropout=softmax_dropout,
             )
             for _ in range(num_layers)
         )
@@ -3627,7 +3154,7 @@ class InverseFoldingDecoder(nn.Module):
         self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
 
     def forward(
-        self, node: Tensor, edge: Tensor, edge_index: Tensor, valid_mask: Tensor, batch: BoltzGenInput
+        self, node: Tensor, edge: Tensor, edge_index: Tensor, valid_mask: Tensor, batch: BoltzGenIFoldInput
     ) -> Tensor:
         r"""
         Predict per-token residue-type logits with teacher forcing and random per-edge neighbour visibility.
@@ -3651,7 +3178,7 @@ class InverseFoldingDecoder(nn.Module):
         with torch.no_grad():
             # Teacher forcing with random per-edge visibility: an edge reveals its source residue type only when
             # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
-            rand = torch.rand(int(valid_mask.sum()), device=valid_mask.device)
+            rand = torch.rand(node.shape[0], device=node.device)
             visibility = rand[src] < rand[dst]
             known = batch.residue_type.bool()[valid_mask][src] * visibility[:, None]
             known = known.to(edge.dtype)
@@ -3674,11 +3201,13 @@ class InverseFoldingDecoder(nn.Module):
         edge: Tensor,
         edge_index: Tensor,
         valid_mask: Tensor,
-        batch: BoltzGenInput,
+        batch: BoltzGenIFoldInput,
         *,
         temperature: float | None = None,
+        inverse_fold_restriction: tuple[str, ...] = (),
+        tie_symmetric_sequences: bool = False,
         generator: torch.Generator | None = None,
-    ) -> InverseFoldingSample:
+    ) -> tuple[Tensor, Tensor]:
         r"""
         Autoregressively decode residue types one position at a time, in a random order.
 
@@ -3688,10 +3217,11 @@ class InverseFoldingDecoder(nn.Module):
         positions are fixed to ``res_type_clone``.
 
         Faithful to the upstream boltzgen ``InverseFoldingDecoder.sample``, including per-residue amino-acid
-        constraints (``batch.aa_constraint_mask`` + global ``inverse_fold_restriction``, combined into an additive
-        canonical-logit mask via ``build_constraint_logit_mask``) and, when ``tie_symmetric_sequences`` is set,
+        constraints (``batch.aa_constraint_mask`` + call-time ``inverse_fold_restriction``, combined into an additive
+        canonical-logit mask via ``_build_constraint_logit_mask``) and, when ``tie_symmetric_sequences`` is set,
         homomer-symmetry tying (logits are averaged across a symmetric group, sampled once, and applied to every
-        copy). Input-side masks (``aa_constraint_mask``, ``symmetric_group``) are built by the processor.
+        copy). Input-side masks (``aa_constraint_mask``, ``symmetric_group``) must be supplied by the caller until
+        the canonical Processor exists.
 
         Args:
             node: Packed encoder node states of shape `[num_valid, node_size]`.
@@ -3701,28 +3231,27 @@ class InverseFoldingDecoder(nn.Module):
             batch: The typed model input, supplying ``design_mask``, ground-truth ``residue_type``, and the
                 per-residue / symmetry constraint masks.
             temperature: Optional softmax temperature for stochastic sampling; ``None`` (or 0) argmaxes instead.
+            inverse_fold_restriction: Canonical amino acids to block in this sampling call.
+            tie_symmetric_sequences: Whether matching positions across symmetric copies share one sample.
             generator: Optional random generator seeding the decode order and any temperature sampling.
 
         Returns:
-            An [`InverseFoldingSample`][ofoldx.models.boltzgen.model.InverseFoldingSample] carrying the decoded
-            per-token residue types and their logits.
+            The decoded logits and one-hot residue types on the dense token grid.
         """
 
         src, dst = edge_index[0], edge_index[1]
         num_nodes = node.shape[0]
-        if batch.design_mask is None:
-            raise ValueError("design_mask is required for inverse-folding sampling")
-        design_mask = batch.design_mask.bool()[valid_mask]
+        design_mask = cast(Tensor, batch.design_mask).bool()[valid_mask]
         decoded = node.new_zeros(num_nodes, self.vocab_size)
         logits = node.new_zeros(num_nodes, self.vocab_size)
 
         constraint_mask = None if batch.aa_constraint_mask is None else batch.aa_constraint_mask[valid_mask]
-        per_residue_mask = build_constraint_logit_mask(
+        per_residue_mask = _build_constraint_logit_mask(
             num_nodes=num_nodes,
             aa_constraint_mask=constraint_mask,
-            inverse_fold_restriction=self.inverse_fold_restriction,
-            inf=self.constraint_inf,
+            inverse_fold_restriction=inverse_fold_restriction,
             device=node.device,
+            dtype=node.dtype,
         )
 
         order = torch.randperm(num_nodes, device=node.device, generator=generator).tolist()
@@ -3733,7 +3262,11 @@ class InverseFoldingDecoder(nn.Module):
             fixed = set(torch.where(~design_mask)[0].tolist())
             order = [position for position in order if position not in fixed]
 
-        symmetry_groups, position_to_group = self._build_symmetric_groups(batch, valid_mask, design_mask)
+        symmetry_groups, position_to_group = (
+            self._build_symmetric_groups(batch, valid_mask, design_mask)
+            if tie_symmetric_sequences and batch.symmetric_group is not None
+            else ({}, {})
+        )
         sampled: set[int] = set()
 
         for position in order:
@@ -3759,14 +3292,13 @@ class InverseFoldingDecoder(nn.Module):
                 aggregated_logits = (
                     position_logits if aggregated_logits is None else aggregated_logits + position_logits
                 )
-            assert aggregated_logits is not None
-            aggregated_logits = aggregated_logits / len(positions)
+            aggregated_logits = cast(Tensor, aggregated_logits) / len(positions)
 
             canonical = (
                 aggregated_logits[:, CANONICALS_OFFSET : CANONICALS_OFFSET + NUM_CANONICAL_TOKENS]
                 + per_residue_mask[position : position + 1]
             )
-            if temperature is None:
+            if temperature is None or temperature == 0:
                 chosen = canonical.argmax(dim=-1)
             else:
                 chosen = torch.multinomial(
@@ -3785,32 +3317,29 @@ class InverseFoldingDecoder(nn.Module):
         dense_logits[valid_mask] = logits
         dense_res_type = decoded.new_zeros(batch_size, num_tokens, self.vocab_size)
         dense_res_type[valid_mask] = decoded
-        return InverseFoldingSample(logits=dense_logits, residue_type=dense_res_type, valid_mask=valid_mask)
+        return dense_logits, dense_res_type
 
     def _build_symmetric_groups(
-        self, batch: BoltzGenInput, valid_mask: Tensor, design_mask: Tensor
+        self, batch: BoltzGenIFoldInput, valid_mask: Tensor, design_mask: Tensor
     ) -> tuple[dict[int, list[int]], dict[int, int]]:
         r"""
         Group designable packed-token positions that must share a residue type under homomer symmetry.
 
         Returns ``(groups, position_to_group)`` where ``groups`` maps a group id to its member positions (only
         groups with more than one member are kept) and ``position_to_group`` maps a position to its group id.
-        Returns empty maps unless ``tie_symmetric_sequences`` is set and ``symmetric_group`` is available; positions
-        are tied when they share the same ``(symmetric_group, residue_index)`` key.
+        Positions are tied when they share the same ``(symmetric_group, residue_index)`` key.
         """
 
-        if not self.tie_symmetric_sequences or batch.symmetric_group is None:
-            return {}, {}
-        symmetric_group = batch.symmetric_group[valid_mask]
-        residue_index = batch.residue_index[valid_mask]
+        metadata = torch.stack(
+            [design_mask, cast(Tensor, batch.symmetric_group)[valid_mask], batch.residue_index[valid_mask]], dim=-1
+        ).tolist()
         key_to_positions: dict[tuple[int, int], list[int]] = {}
-        for position in range(symmetric_group.shape[0]):
-            if not bool(design_mask[position]):
+        for position, (designable, group, residue_index) in enumerate(metadata):
+            if not designable:
                 continue
-            group = int(symmetric_group[position])
             if group <= 0:  # 0 = no symmetry group.
                 continue
-            key = (group, int(residue_index[position]))
+            key = (group, residue_index)
             key_to_positions.setdefault(key, []).append(position)
 
         groups: dict[int, list[int]] = {}
@@ -3839,7 +3368,7 @@ class TokenDistanceModule(nn.Module):
         distance_gaussian_dim: Number of Gaussian basis functions in the distance encoder.
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -3940,7 +3469,7 @@ class TemplateModule(nn.Module):
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
         miniformer_blocks: Whether the pairformer uses compact Miniformer pair updates.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"public"``).
+        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
     def __init__(
@@ -3995,27 +3524,23 @@ class TemplateModule(nn.Module):
 
         Args:
             pair: Trunk pair representation ``(B, N_token, N_token, pair_size)``.
-            batch: Typed model input (supplies the template features via ``_require_template_features``).
+            batch: Typed model input supplying the template features.
             pair_mask: Optional boolean pair mask ``(B, N_token, N_token)``.
 
         Returns:
             Additive pair update ``(B, N_token, N_token, pair_size)``.
 
-        Raises:
-            ValueError: If any required template feature is missing.
         """
 
-        (
-            res_type,
-            frame_mask,
-            frame_rotation,
-            frame_translation,
-            cb_coords,
-            ca_coords,
-            cb_mask,
-            template_mask,
-            visibility,
-        ) = _require_template_features(batch)
+        res_type = cast(Tensor, batch.template_restype)
+        frame_mask = cast(Tensor, batch.template_mask_frame)
+        frame_rotation = cast(Tensor, batch.template_frame_rot)
+        frame_translation = cast(Tensor, batch.template_frame_t)
+        cb_coords = cast(Tensor, batch.template_cb)
+        ca_coords = cast(Tensor, batch.template_ca)
+        cb_mask = cast(Tensor, batch.template_mask_cb)
+        template_mask = cast(Tensor, batch.template_mask)
+        visibility = cast(Tensor, batch.visibility_ids)
         present = template_mask.any(dim=2).float()
         count = present.sum(dim=1).clamp(min=1)
         batch_size, num_templates, num_tokens = res_type.shape[:3]
@@ -4097,7 +3622,12 @@ class DistanceTokenEncoder(nn.Module):
         """
 
         batch_size, num_tokens = relative_position_encoding.shape[:2]
-        backbone = _gather_backbone4(batch, batch_size, num_tokens).permute(0, 2, 1, 3)  # (B, 4, N, 3)
+        backbone = _gather_backbone4(
+            batch.token_to_bb4_atoms,
+            batch.coords,
+            batch_size,
+            num_tokens,
+        ).permute(0, 2, 1, 3)
         distance = (backbone.unsqueeze(-2) - backbone.unsqueeze(-3)).norm(dim=-1).unsqueeze(-1)  # (B, 4, N, N, 1)
         gaussian = self.distance_smearing(distance)  # (B, 4, N, N, gaussians)
         relative = relative_position_encoding.view(batch_size, 1, num_tokens, num_tokens, -1).expand(-1, 4, -1, -1, -1)
@@ -4120,6 +3650,7 @@ class GraphAttentionLayer(nn.Module):
         hidden_size: Width of the attention hidden channel.
         num_attention_heads: Number of attention heads.
         dropout: Dropout probability inside the layer.
+        softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
     def __init__(
@@ -4128,10 +3659,12 @@ class GraphAttentionLayer(nn.Module):
         edge_size: int = 128,
         hidden_size: int = 128,
         num_attention_heads: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
+        softmax_dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
+        self.softmax_dropout = softmax_dropout
         self.attention_weight_mlp = _mlp([node_size * 2 + edge_size, hidden_size, hidden_size, num_attention_heads])
         self.attention_value_mlp = _mlp([node_size + edge_size, hidden_size, hidden_size, node_size])
         self.attention_output = nn.Sequential(
@@ -4173,7 +3706,9 @@ class GraphAttentionLayer(nn.Module):
         edge = edge + self.edge_transition(torch.cat([node[src], node[dst], edge], dim=1))
         weight = self.attention_weight_mlp(torch.cat([node[dst], node[src], edge], dim=1))
         value = self.attention_value_mlp(torch.cat([node[src], edge], dim=1))
-        weight = scatter_softmax(weight, dst, dim=0)
+        if self.training and self.softmax_dropout > 0:
+            weight = _softmax_dropout(weight, dst, node.shape[0], self.softmax_dropout)
+        weight = scatter_softmax(weight, dst, dim=0, dim_size=node.shape[0])
         message = scatter_sum(weight.unsqueeze(-1) * value.unsqueeze(1), dst, dim=0, dim_size=node.shape[0]).flatten(
             start_dim=1
         )
@@ -4197,6 +3732,7 @@ class GraphAttentionLayerNoEdge(nn.Module):
         hidden_size: Width of the attention hidden channel.
         num_attention_heads: Number of attention heads.
         dropout: Dropout probability inside the layer.
+        softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
     def __init__(
@@ -4205,10 +3741,12 @@ class GraphAttentionLayerNoEdge(nn.Module):
         edge_size: int = 256,
         hidden_size: int = 128,
         num_attention_heads: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
+        softmax_dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
+        self.softmax_dropout = softmax_dropout
         self.attention_weight_mlp = _mlp([node_size + edge_size, hidden_size, hidden_size, num_attention_heads])
         self.attention_value_mlp = _mlp([edge_size, hidden_size, hidden_size, node_size])
         self.attention_output = nn.Sequential(
@@ -4241,7 +3779,9 @@ class GraphAttentionLayerNoEdge(nn.Module):
         dst = edge_index[1]
         weight = self.attention_weight_mlp(torch.cat([node[dst], edge], dim=1))
         value = self.attention_value_mlp(edge)
-        weight = scatter_softmax(weight, dst, dim=0)
+        if self.training and self.softmax_dropout > 0:
+            weight = _softmax_dropout(weight, dst, node.shape[0], self.softmax_dropout)
+        weight = scatter_softmax(weight, dst, dim=0, dim_size=node.shape[0])
         message = scatter_sum(weight.unsqueeze(-1) * value.unsqueeze(1), dst, dim=0, dim_size=node.shape[0]).flatten(
             start_dim=1
         )
@@ -4264,7 +3804,9 @@ class GraphAttentionLayerNoEdge(nn.Module):
         dst = torch.zeros(edge.shape[0], dtype=torch.long, device=edge.device)
         weight = self.attention_weight_mlp(torch.cat([node[dst], edge], dim=1))
         value = self.attention_value_mlp(edge)
-        weight = scatter_softmax(weight, dst, dim=0)
+        if self.training and self.softmax_dropout > 0:
+            weight = _softmax_dropout(weight, dst, 1, self.softmax_dropout)
+        weight = scatter_softmax(weight, dst, dim=0, dim_size=1)
         message = scatter_sum(weight.unsqueeze(-1) * value.unsqueeze(1), dst, dim=0, dim_size=1).flatten(start_dim=1)
         node = node + self.attention_output(message)
         return node + self.node_transition(node)
@@ -4286,6 +3828,8 @@ class BroadcastGaussianSmearing(nn.Module):
     def __init__(self, start: float = 0.0, stop: float = 2.0, num_gaussians: int = 32) -> None:
         super().__init__()
         offset = torch.linspace(start, stop, num_gaussians)
+        # Match the BoltzGen reference: derive the RBF width from the float32 ``offset`` spacing, not the float64
+        # analytic spacing (see GaussianSmearing above) so the distance features are bit-faithful to upstream.
         self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
         self.register_buffer("offset", offset)
 
@@ -4316,6 +3860,9 @@ class GaussianSmearing(nn.Module):
     def __init__(self, start: float = 0.0, stop: float = 5.0, num_gaussians: int = 16) -> None:
         super().__init__()
         offset = torch.linspace(start, stop, num_gaussians)
+        # Derive the RBF width from the float32 ``offset`` spacing (matching the BoltzGen reference) rather than
+        # the float64 analytic spacing: for non-float32-representable spacings (e.g. 20/15) the two differ by
+        # ~6e-8 relative, and that discrepancy amplifies through the 6-layer encoder to ~1e-3 in the logits.
         self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
         self.register_buffer("offset", offset)
 
@@ -4370,7 +3917,18 @@ class ProjectionTransition(nn.Module):
         return self.output_projection(self.silu(self.gate_projection(normalized)) * self.value_projection(normalized))
 
 
-def scatter_sum(src: Tensor, index: Tensor, dim: int = 0, dim_size: int | None = None) -> Tensor:
+def _softmax_dropout(logits: Tensor, index: Tensor, num_groups: int, probability: float) -> Tensor:
+    r"""Apply the released rejection-sampled attention-logit dropout."""
+
+    for _ in range(10):
+        dropped = torch.rand_like(logits) < probability
+        kept = scatter_sum((~dropped).to(torch.int64), index, dim_size=num_groups)
+        if kept.all():
+            return logits.masked_fill(dropped, -torch.inf)
+    raise RuntimeError("attention dropout failed to keep an incoming edge for every destination and head")
+
+
+def scatter_sum(src: Tensor, index: Tensor, dim_size: int, dim: int = 0) -> Tensor:
     r"""
     Sum ``src`` rows into buckets given by ``index`` (native reimplementation of ``torch_scatter.scatter_sum``).
 
@@ -4378,7 +3936,7 @@ def scatter_sum(src: Tensor, index: Tensor, dim: int = 0, dim_size: int | None =
         src: Source tensor whose slices along ``dim`` are summed per bucket.
         index: Destination bucket index for each slice along ``dim``.
         dim: Dimension along which to scatter.
-        dim_size: Number of output buckets. Defaults to ``index.max() + 1``.
+        dim_size: Number of output buckets.
 
     Returns:
         Tensor with ``dim_size`` buckets along ``dim``, each the sum of its assigned ``src`` slices.
@@ -4386,12 +3944,10 @@ def scatter_sum(src: Tensor, index: Tensor, dim: int = 0, dim_size: int | None =
     Examples:
         >>> import torch
         >>> src = torch.tensor([[1.0], [2.0], [3.0]])
-        >>> scatter_sum(src, torch.tensor([0, 0, 1])).tolist()
+        >>> scatter_sum(src, torch.tensor([0, 0, 1]), dim_size=2).tolist()
         [[3.0], [3.0]]
     """
 
-    if dim_size is None:
-        dim_size = int(index.max()) + 1 if index.numel() > 0 else 0
     shape = list(src.shape)
     shape[dim] = dim_size
     out = torch.zeros(shape, dtype=src.dtype, device=src.device)
@@ -4402,7 +3958,7 @@ def scatter_sum(src: Tensor, index: Tensor, dim: int = 0, dim_size: int | None =
     return out
 
 
-def scatter_softmax(src: Tensor, index: Tensor, dim: int = 0) -> Tensor:
+def scatter_softmax(src: Tensor, index: Tensor, dim_size: int, dim: int = 0) -> Tensor:
     r"""
     Softmax over rows sharing a destination ``index`` (per-group / segmented softmax).
 
@@ -4410,18 +3966,18 @@ def scatter_softmax(src: Tensor, index: Tensor, dim: int = 0) -> Tensor:
         src: Source tensor whose slices along ``dim`` are softmaxed within each group.
         index: Group index for each slice along ``dim``.
         dim: Dimension along which to group.
+        dim_size: Number of groups.
 
     Returns:
         Tensor the same shape as ``src`` whose slices sum to one within each group.
 
     Examples:
         >>> import torch
-        >>> weight = scatter_softmax(torch.tensor([1.0, 1.0, 5.0]), torch.tensor([0, 0, 1]))
+        >>> weight = scatter_softmax(torch.tensor([1.0, 1.0, 5.0]), torch.tensor([0, 0, 1]), dim_size=2)
         >>> weight.round(decimals=4).tolist()
         [0.5, 0.5, 1.0]
     """
 
-    dim_size = int(index.max()) + 1 if index.numel() > 0 else 0
     group_max = src.new_full((dim_size, *src.shape[1:]), float("-inf"))
     expanded = index
     for _ in range(src.dim() - index.dim()):
@@ -4452,61 +4008,8 @@ def _mlp(sizes: list[int]) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
-def _sample_axis(coords: Tensor, *, batch_size: int, num_samples: int) -> Tensor:
-    r"""
-    Reshape a flattened ``(batch_size*num_samples, ...)`` tensor back into a ``(batch_size, num_samples, ...)`` one.
-
-    Args:
-        coords: Tensor whose leading axis is ``batch_size*num_samples`` (or ``batch_size`` when ``num_samples`` is 1).
-        batch_size: Number of batch elements.
-        num_samples: Number of samples per batch element.
-
-    Returns:
-        Tensor with the sample axis restored: ``(batch_size, num_samples, ...)``.
-
-    Raises:
-        ValueError: If the leading axis is not ``batch_size*num_samples``.
-    """
-
-    if coords.shape[0] == batch_size * num_samples:
-        return coords.reshape(batch_size, num_samples, *coords.shape[1:])
-    if num_samples == 1 and coords.shape[0] == batch_size:
-        return coords.unsqueeze(1)
-    raise ValueError(
-        "pred_coords leading axis must equal batch_size*num_samples, got "
-        f"{coords.shape[0]} for batch_size={batch_size} and num_samples={num_samples}"
-    )
-
-
-@register_pytree_dataclass
-@dataclass(slots=True)
-class BoltzGenRepresentations:
-    r"""
-    Trunk outputs consumed by BoltzGen diffusion and heads.
-
-    The ``single``/``pair`` trunk states are held in the typed
-    [`Single`][ofoldx.modules.representation.Single] / [`Pair`][ofoldx.modules.representation.Pair] carriers at
-    this boundary (the same way [`Coords`][ofoldx.modules.representation.Coords] wraps predicted coordinates);
-    unwrap ``.tensor`` before feeding the denoiser or eager tensor math.
-
-    Attributes:
-        single_inputs: Initial token single representations.
-        single: Final token single representation carrier.
-        pair: Final token pair representation carrier.
-        relative_position_encoding: Relative-position pair features.
-        distogram_logits: Trunk distogram logits.
-    """
-
-    single_inputs: Tensor
-    single: Single
-    pair: Pair
-    relative_position_encoding: Tensor
-    distogram_logits: Tensor
-
-
-@register_pytree_dataclass
-@dataclass(slots=True, kw_only=True)
-class BoltzGenInput(BaseInput):
+@dataclass(kw_only=True)
+class BoltzGenInput:
     r"""
     Input tensors consumed by BoltzGen design models.
 
@@ -4562,11 +4065,6 @@ class BoltzGenInput(BaseInput):
         binding_type: Optional binding conditioning ids.
         design_mask: Optional token mask selecting designable positions.
         ss_type: Optional secondary-structure conditioning ids.
-        affinity_token_mask: Optional mask selecting the ligand tokens scored by the affinity head.
-        affinity_mw: Optional ligand molecular weight used by the affinity molecular-weight correction.
-        aa_constraint_mask: Optional per-token per-canonical-AA blocking mask for constrained inverse folding
-            (``(B, N_token, 20)``, ``1`` = blocked).
-        symmetric_group: Optional per-token symmetry-copy id used to tie homomer sequences during decoding.
     """
 
     token_mask: Tensor
@@ -4620,53 +4118,110 @@ class BoltzGenInput(BaseInput):
     binding_type: Tensor | None = None
     design_mask: Tensor | None = None
     ss_type: Tensor | None = None
-    affinity_token_mask: Tensor | None = None
-    affinity_mw: Tensor | None = None
+    # Additive, backward-compatible: the canonical identity layout populated by
+    # ``BoltzGenProcessor`` and read by ``BoltzGenPipeline`` when it decodes rows back into
+    # molecular identities. Ignored by the model graph. See ``BoltzGenLayout`` below.
+    layout: BoltzGenLayout | None = None
+
+
+@dataclass(kw_only=True)
+class BoltzGenIFoldInput:
+    r"""Input tensors consumed by the distinct inverse-folding architecture."""
+
+    token_mask: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    atom_features: Tensor
+    atom_to_token: Tensor
+    atom_mask: Tensor
+    reference_positions: Tensor
+    reference_space_id: Tensor
+    residue_type: Tensor
+    msa_profile: Tensor
+    deletion_mean: Tensor
+    token_bonds: Tensor
+    type_bonds: Tensor
+    chain_type: Tensor
+    center_coords: Tensor
+    token_to_bb4_atoms: Tensor
+    coords: Tensor
+    method_feature: Tensor | None = None
+    modified: Tensor | None = None
+    cyclic_period: Tensor | None = None
+    design_mask: Tensor | None = None
     aa_constraint_mask: Tensor | None = None
     symmetric_group: Tensor | None = None
+    # Additive, backward-compatible: the canonical identity layout populated by
+    # ``BoltzGenIFoldProcessor`` and read by ``BoltzGenPipeline``. Ignored by the model
+    # graph. See ``BoltzGenIFoldLayout`` below.
+    layout: BoltzGenIFoldLayout | None = None
 
 
-@dataclass(slots=True)
-class BoltzGenStructureOutput:
-    r"""
-    Structure-design inference outputs before sample-axis restoration.
-
-    Attributes:
-        pred_coords: Sampled atom coords.
-        distogram_logits: Pairwise distance logits.
-        bfactor_logits: Predicted B-factor logits.
-        plddt_logits: Optional per-token pLDDT logits (confidence head).
-        pae_logits: Optional predicted aligned-error logits (confidence head).
-        pde_logits: Optional predicted distance-error logits (confidence head).
-        resolved_logits: Optional resolved-atom logits (confidence head).
-    """
-
-    pred_coords: Tensor
-    distogram_logits: Tensor
-    bfactor_logits: Tensor
-    plddt_logits: Tensor | None = None
-    pae_logits: Tensor | None = None
-    pde_logits: Tensor | None = None
-    resolved_logits: Tensor | None = None
+# ---------------------------------------------------------------------------
+# Canonical identity layouts (folded in from the former ``contract.py``).
+#
+# These are the non-tensor leaves the design/inverse-fold Processors populate and
+# the design Pipeline reads when it decodes tensor rows back into canonical molecular
+# identities; the model graph above deliberately ignores them.
+# ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class InverseFoldingSample:
-    r"""
-    Autoregressive inverse-folding sample result.
+@dataclass(frozen=True)
+class BoltzGenLayout:
+    r"""Canonical molecular identities aligned to one ``BoltzGenModel`` tensor layout.
+
+    A structure-design assembly may be partly or wholly generated (``total_len``
+    minted rows), so ``output_residues[i]`` names token row ``i`` as either an
+    existing canonical [`ComponentReference`][ofoldx.data.molecular.ComponentReference]
+    or one symbolic generated residue
+    ([`SymbolicResidueSite`][ofoldx.models.boltzgen.model.SymbolicResidueSite]).
+    The symbolic rows follow the RFdiffusion pattern (§3.7 owner-gated): the shared
+    PlacementSpec / placement_map core stays unresolved, so these are family-local
+    provisional identities, not a frozen public placement contract.
 
     Attributes:
-        logits: Per-step residue logits.
-        residue_type: Sampled residue type ids.
-        valid_mask: Boolean mask for sampled positions.
+        system: The canonical molecular system the tensor batch was lowered from
+            (``None`` for a fully-generated assembly with no input system).
+        atom_sites: Model atom order aligned to the atom axis (heavy atoms, sans padding).
+        token_sites: Model token order aligned to the token axis; polymer tokens carry
+            ``(instance_id, monomer_index)`` and ligand-atom tokens carry the single ``AtomSite``.
+        output_residues: Per-token canonical identity (existing residue or symbolic generated residue).
+        output_instance_ids: Per-token owning instance id (explicit because generated rows have no
+            canonical instance until the placement core resolves).
+        placement_map: Frozen §3.7 realized output surface for a whole-assembly ``total_len``
+            generation (``declaration_group -> placement_id -> ordered ComponentReference
+            occurrences``). Empty for an existing-input design that generates no topology.
+        instance_of: The derived ``placement_id -> declaration_group`` index (built once from the
+            PlacementSpec), used with ``ofoldx.data.placement.resolve`` to resolve a ``SymbolicResidueSite``.
     """
 
-    logits: Tensor
-    residue_type: Tensor
-    valid_mask: Tensor
+    system: MolecularSystem | None
+    atom_sites: tuple[AtomSite, ...]
+    token_sites: tuple[AtomSite | tuple[str, int], ...]
+    output_residues: tuple[ComponentReference | SymbolicResidueSite, ...]
+    output_instance_ids: tuple[str, ...]
+    placement_map: PlacementMap = field(default_factory=dict)
+    instance_of: dict[str, str] = field(default_factory=dict)
 
 
-# Bind the typed input for the keyword-tensor call path (``model(**inputs)``); assigned here because
-# ``BoltzGenInput`` is defined after the model classes.
-BoltzGenDesigner.input_class = BoltzGenInput
-BoltzGenInverseFoldDesigner.input_class = BoltzGenInput
+@dataclass(frozen=True)
+class BoltzGenIFoldLayout:
+    r"""Canonical molecular identities aligned to one ``BoltzGenIFoldModel`` tensor layout.
+
+    Inverse folding never generates topology: every row maps to an existing input
+    backbone residue, so ``output_residues`` is a tuple of canonical
+    ``ComponentReference`` values only.
+
+    Attributes:
+        system: The canonical molecular system the fixed backbone was lowered from.
+        atom_sites: Model atom order aligned to the atom axis (heavy atoms, sans padding).
+        token_sites: Model token order aligned to the token axis.
+        output_residues: Per-token canonical residue identity of the fixed backbone.
+        output_instance_ids: Per-token owning instance id.
+    """
+
+    system: MolecularSystem
+    atom_sites: tuple[AtomSite, ...]
+    token_sites: tuple[AtomSite | tuple[str, int], ...]
+    output_residues: tuple[ComponentReference, ...]
+    output_instance_ids: tuple[str, ...]

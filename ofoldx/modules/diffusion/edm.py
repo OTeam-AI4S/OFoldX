@@ -170,7 +170,7 @@ class EdmPreconditioner(nn.Module):
         """
 
         noise_level = self.broadcast_noise_level(noise_level, coordinate_update)
-        noisy_coords = noisy_coords.to(device=coordinate_update.device, dtype=coordinate_update.dtype)
+        noisy_coords = noisy_coords.to(dtype=coordinate_update.dtype)
         denoised_coords = self.c_skip(noise_level) * noisy_coords + self.c_out(noise_level) * coordinate_update
         return denoised_coords.to(dtype=coordinate_update.dtype)
 
@@ -179,8 +179,9 @@ class EdmPreconditioner(nn.Module):
         r"""
         Broadcast a per-sample noise-level tensor to a target coordinate rank.
 
-        Moves ``noise_level`` onto ``target``'s device/dtype and appends trailing singleton dimensions so it aligns
-        with the leading axes of ``target`` and broadcasts over the trailing coord axes.
+        Casts ``noise_level`` to ``target``'s dtype and appends trailing singleton dimensions so it
+        aligns with the leading axes of ``target`` and broadcasts over the trailing coordinate axes.
+        Both tensors follow the module's ordinary same-device contract.
 
         Args:
             noise_level: Noise level tensor.
@@ -189,9 +190,6 @@ class EdmPreconditioner(nn.Module):
         Returns:
             ``noise_level`` reshaped with trailing singleton dimensions to match ``target``'s rank.
 
-        Raises:
-            ValueError: If ``noise_level`` has more dimensions than ``target``.
-
         Examples:
             >>> import torch
             >>> pre = EdmPreconditioner()
@@ -199,8 +197,8 @@ class EdmPreconditioner(nn.Module):
             torch.Size([2, 1, 1])
         """
 
-        noise_level = noise_level.to(device=target.device, dtype=target.dtype)
-        missing_dims = target.dim() - noise_level.dim()
-        if missing_dims < 0:
-            raise ValueError("noise_level cannot have more dimensions than the target tensor")
-        return noise_level.reshape(*noise_level.shape, *((1,) * missing_dims))
+        noise_level = noise_level.to(dtype=target.dtype)
+        return noise_level.reshape(
+            *noise_level.shape,
+            *((1,) * (target.dim() - noise_level.dim())),
+        )

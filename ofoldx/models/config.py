@@ -1,6 +1,4 @@
-r"""
-Shared model configuration blocks.
-"""
+r"""Shared configuration blocks for diffusion structure models."""
 
 from __future__ import annotations
 
@@ -45,21 +43,21 @@ class ConfidenceConfig(Config):
         max_atoms_per_token: Maximum number of atoms represented for a single token.
         single_max_abs: Optional clamp on the absolute value of single-representation features; ``None`` disables it.
         num_blocks: Number of Pairformer blocks in the confidence trunk.
-        blocks_per_checkpoint: Blocks grouped into one gradient-checkpoint segment; ``None`` disables checkpointing.
-        operator_backend: Operator backend selector (``"auto"`` prefers the OOps kernels when available).
         num_pair_attention_heads: Number of attention heads used for pair-biased attention.
         triangle_multiplication_hidden_size: Hidden width of the triangle-multiplication update.
         triangle_attention_hidden_size: Per-head hidden width of triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
         expansion: Feed-forward expansion factor inside the Pairformer transition.
         pairformer_dropout: Dropout probability applied inside the confidence Pairformer.
+        rank_metric_eps: Denominator epsilon for the contact-weighted PAE ranking metric
+            ``-(pae * contact).sum() / (contact.sum() + rank_metric_eps)`` (DeepMind AF3 ``rank_metric``,
+            upstream ``1e-6``). Only consumed by the AF3 ranking reduction; unused by families without a
+            contact-weighted rank metric.
 
     Examples:
         >>> config = ConfidenceConfig()
         >>> config.num_pae_bins
         64
-        >>> config.operator_backend
-        'auto'
     """
 
     num_plddt_bins: int = 50
@@ -72,14 +70,13 @@ class ConfidenceConfig(Config):
     max_atoms_per_token: int = 24
     single_max_abs: float | None = 512.0
     num_blocks: int = 4
-    blocks_per_checkpoint: int | None = 1
-    operator_backend: str = "auto"
     num_pair_attention_heads: int = 16
     triangle_multiplication_hidden_size: int = 128
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
     expansion: int = 4
     pairformer_dropout: float = 0.0
+    rank_metric_eps: float = 1e-6
 
 
 class TrunkConfig(Config):
@@ -91,8 +88,6 @@ class TrunkConfig(Config):
 
     Attributes:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
-        blocks_per_checkpoint: Blocks grouped into one gradient-checkpoint segment; ``None`` disables checkpointing.
-        operator_backend: Operator backend selector (``"auto"`` prefers the OOps kernels when available).
         pairformer_dropout: Dropout probability applied inside each Pairformer block.
         msa_dropout: Dropout probability applied along the MSA path.
         pair_dropout: Dropout probability applied along the pair path.
@@ -104,8 +99,6 @@ class TrunkConfig(Config):
     """
 
     num_pairformer_blocks: int = 48
-    blocks_per_checkpoint: int | None = 1
-    operator_backend: str = "auto"
     pairformer_dropout: float = 0.25
     msa_dropout: float = 0.15
     pair_dropout: float = 0.25
@@ -157,8 +150,6 @@ class DenoiserConfig(Config):
     Attributes:
         num_token_encoder_blocks: Number of token-level transformer blocks in the denoiser trunk.
         num_token_encoder_attention_heads: Number of attention heads in the token-level trunk.
-        blocks_per_checkpoint: Blocks grouped into one gradient-checkpoint segment; ``None`` disables checkpointing.
-        operator_backend: Operator backend selector (``"auto"`` prefers the OOps kernels when available).
         sigma_data: Data noise scale used by the EDM preconditioning.
         atom_hidden_size: Width of the per-atom single representation.
         atom_pair_hidden_size: Width of the per-atom pair representation.
@@ -180,8 +171,6 @@ class DenoiserConfig(Config):
 
     num_token_encoder_blocks: int = 24
     num_token_encoder_attention_heads: int = 16
-    blocks_per_checkpoint: int | None = 1
-    operator_backend: str = "auto"
     sigma_data: float = 16.0
     atom_hidden_size: int = 128
     atom_pair_hidden_size: int = 16
@@ -231,85 +220,3 @@ class SamplerConfig(Config):
     max_noise_level: float = 160.0
     min_noise_level: float = 4e-4
     rho: float = 7.0
-
-
-class DiffusionTrainingConfig(Config):
-    r"""
-    Single-step diffusion-training configuration.
-
-    Training denoises noised ground truth in one step, with independent log-normal noise per sample. A
-    separate no-grad ``rollout_steps`` sampler produces coords for the confidence head; the full
-    ``sampler.num_sampling_steps`` loop is used only for eval/inference.
-
-    Attributes:
-        num_samples: Number of independently noised diffusion samples drawn per training example.
-        noise_log_mean: Mean of the log-normal training noise-level distribution.
-        noise_log_std: Standard deviation of the log-normal training noise-level distribution.
-        rollout_steps: Steps of the no-grad mini-rollout sampler that feeds the confidence head.
-        rollout_num_samples: Number of samples produced by the mini-rollout sampler.
-
-    Examples:
-        >>> config = DiffusionTrainingConfig()
-        >>> config.num_samples
-        48
-        >>> config.rollout_steps
-        20
-    """
-
-    num_samples: int = 48
-    noise_log_mean: float = -1.2
-    noise_log_std: float = 1.5
-    rollout_steps: int = 20
-    rollout_num_samples: int = 1
-
-
-class StructurePredictionConfig(Config):
-    r"""
-    Shared configuration for structure-prediction models with token, pair, template, diffusion, and confidence paths.
-
-    Concrete AlphaFold3-family architectures subclass this and set their own ``architecture`` key; the base
-    class collects the representation widths and the nested sub-configs (distogram, confidence, trunk,
-    template, denoiser, sampler, diffusion-training) shared across the family.
-
-    Attributes:
-        token_feature_size: Width of the per-token input feature vector.
-        single_size: Width of the single (token) representation.
-        pair_size: Width of the pair representation.
-        atom_feature_size: Width of the per-atom input feature vector.
-        relative_position_size: Number of relative-position encoding channels.
-        initializer_range: Standard deviation of the truncated-normal weight initialization.
-        distogram: Distogram head sub-configuration.
-        confidence: Confidence head sub-configuration.
-        trunk: Representation trunk sub-configuration.
-        template: Template embedding sub-configuration.
-        denoiser: Coordinate denoiser sub-configuration.
-        sampler: Coordinate sampler sub-configuration.
-        diffusion_training: Single-step diffusion-training sub-configuration.
-        recycling_steps: Number of trunk recycling iterations.
-
-    Examples:
-        >>> config = StructurePredictionConfig()
-        >>> config.single_size
-        384
-        >>> config.pair_size
-        128
-        >>> config.trunk.num_pairformer_blocks
-        48
-    """
-
-    token_feature_size: int = 449
-    single_size: int = 384
-    pair_size: int = 128
-    atom_feature_size: int = 385
-    relative_position_size: int = 139
-    initializer_range: float = 0.02
-
-    distogram: DistogramConfig = DistogramConfig()
-    confidence: ConfidenceConfig = ConfidenceConfig()
-    trunk: TrunkConfig = TrunkConfig()
-    template: TemplateConfig = TemplateConfig()
-    denoiser: DenoiserConfig = DenoiserConfig()
-    sampler: SamplerConfig = SamplerConfig()
-    diffusion_training: DiffusionTrainingConfig = DiffusionTrainingConfig()
-
-    recycling_steps: int = 4

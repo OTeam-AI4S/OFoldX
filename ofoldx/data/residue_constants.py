@@ -617,61 +617,12 @@ restypes: list[str] = [
 restype_num = len(restypes)  # := 20
 
 
-restype_1to3: dict[str, str] = {
-    "A": "ALA",
-    "R": "ARG",
-    "N": "ASN",
-    "D": "ASP",
-    "C": "CYS",
-    "Q": "GLN",
-    "E": "GLU",
-    "G": "GLY",
-    "H": "HIS",
-    "I": "ILE",
-    "L": "LEU",
-    "K": "LYS",
-    "M": "MET",
-    "F": "PHE",
-    "P": "PRO",
-    "S": "SER",
-    "T": "THR",
-    "W": "TRP",
-    "Y": "TYR",
-    "V": "VAL",
-}
-
-restype_3to1 = {value: key for key, value in restype_1to3.items()}
-
-# ``restype_1to3`` extended with the unknown-residue letter ``X`` -> ``UNK``, matching the official
-# Protenix one-letter map (``json_parser.PROTEIN_1to3``). Kept distinct from ``restype_1to3`` (which
-# holds only the 20 standard residues) so callers that must accept ``X`` opt in explicitly.
-restype_1to3_with_unknown: dict[str, str] = {**restype_1to3, "X": "UNK"}
-
-# One-letter to CCD-code maps for nucleic polymers (upstream ``json_parser.DNA_1to3`` / ``RNA_1to3``),
-# beside ``restype_1to3`` so the family JSON parsers share one nucleic reference.
-dna_1to3: dict[str, str] = {
-    "A": "DA",
-    "G": "DG",
-    "C": "DC",
-    "T": "DT",
-    "X": "DN",
-    "I": "DI",
-    "N": "DN",
-    "U": "DU",
-}
-rna_1to3: dict[str, str] = {"A": "A", "G": "G", "C": "C", "U": "U", "X": "N", "I": "I", "N": "N"}
-
-# Heavy leaving atoms trimmed at internal (non-terminal) residues, kept at chain termini (verified from
-# the CCD: protein C-terminal ``OXT``, nucleic 5'-terminal ``OP3``). Keyed by molecule-type name so both
-# the structure processor and the CCD heavy-atom selector share one reference table.
-LEAVING_ATOMS: dict[str, frozenset[str]] = {
-    "protein": frozenset({"OXT"}),
-    "rna": frozenset({"OP3"}),
-    "dna": frozenset({"OP3"}),
-}
-# Element symbols treated as hydrogen (protium and deuterium), dropped from heavy-atom sets.
-HYDROGEN_ELEMENTS: frozenset[str] = frozenset({"H", "D"})
-
+# The neutral one-letter <-> component_id chemistry maps and the neutral leaving-atom /
+# hydrogen-element tables live in ``molecular`` as the single source of truth (they are
+# coordinate-free chemistry facts, not AF2 torsion geometry); consumers import them from there.
+# ``restype_1to3`` alone is pulled in below to key the genuine AF2 side-chain geometry that
+# stays in this module.
+from .molecular import restype_1to3  # noqa: E402
 
 restype_atom14_to_rigid_group = np.zeros([21, 14], dtype=np.int64)
 restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)

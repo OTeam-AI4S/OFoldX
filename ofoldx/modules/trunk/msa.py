@@ -18,7 +18,7 @@ from ..backend import LayerNorm
 from ..backend import outer_product_mean as dispatch_outer_product_mean
 from ..backend import pair_weighted_average as dispatch_pair_weighted_average
 from ..backend import resolve_config_operator_backend
-from ..functional import checkpoint_blocks, pair_mask_from_msa_mask, pair_mask_from_token_mask
+from ..functional import pair_mask_from_msa_mask, pair_mask_from_token_mask
 from ..transition import RowwiseDropout, Transition
 
 
@@ -27,9 +27,9 @@ class MsaTrunk(nn.Module):
     Stack of MSA and pair update blocks with the final block emitting only a pair update.
 
     The trunk linearly projects the raw MSA features and an optional per-token embedding to width
-    ``msa_size``, then runs ``num_blocks`` joint update blocks under gradient checkpointing. The last block
-    is swapped for a [`FinalMsaPairBlock`][ofoldx.modules.trunk.msa.FinalMsaPairBlock], which refines
-    the pair representation without touching the MSA.
+    ``msa_size``, then runs ``num_blocks`` joint update blocks. The last block is swapped for a
+    [`FinalMsaPairBlock`][ofoldx.modules.trunk.msa.FinalMsaPairBlock], which refines the pair
+    representation without touching the MSA.
 
     Args:
         msa_size: Width of the projected MSA representation.
@@ -46,8 +46,6 @@ class MsaTrunk(nn.Module):
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
         operator_backend: Operator backend selector forwarded to every submodule.
-        blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables grouping.
-
     Examples:
         >>> import torch
         >>> trunk = MsaTrunk(
@@ -78,10 +76,8 @@ class MsaTrunk(nn.Module):
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
         operator_backend: str = "auto",
-        blocks_per_checkpoint: int | None = None,
     ) -> None:
         super().__init__()
-        self.blocks_per_checkpoint = blocks_per_checkpoint
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
         self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -125,7 +121,7 @@ class MsaTrunk(nn.Module):
         pair_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         r"""
-        Project the MSA features and optional token embedding, then run the checkpointed block stack.
+        Project the MSA features and optional token embedding, then run the block stack.
 
         The MSA features are projected to width ``msa_size``; when ``token_embedding`` is given its
         projection is broadcast over the sequence axis and added. When ``pair_mask`` is omitted but
@@ -159,11 +155,8 @@ class MsaTrunk(nn.Module):
             msa = msa + self.token_projection(token_embedding).unsqueeze(-3)
         if pair_mask is None and msa_mask is not None:
             pair_mask = pair_mask_from_msa_mask(msa_mask)
-        blocks = [
-            lambda msa, pair, block=block: block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-            for block in self.blocks
-        ]
-        msa, pair = checkpoint_blocks(blocks, (msa, pair), self.blocks_per_checkpoint)
+        for block in self.blocks:
+            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -983,6 +976,8 @@ class OuterProductMean(nn.Module):
             norm_bias=self.norm_msa.bias,
             proj_left_weight=self.left_projection.weight,
             proj_right_weight=self.right_projection.weight,
+            proj_left_bias=self.left_projection.bias,
+            proj_right_bias=self.right_projection.bias,
             proj_out_weight=self.output_projection.weight,
             proj_out_bias=self.output_projection.bias,
             norm_eps=self.norm_msa.eps,

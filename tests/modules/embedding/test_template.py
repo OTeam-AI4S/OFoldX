@@ -17,19 +17,6 @@ def make_features(num_templates: int = 1, num_tokens: int = 3) -> TemplateFeatur
     )
 
 
-def test_features_to():
-    moved = make_features().to(dtype=torch.float16)
-
-    # Only floating fields follow the requested dtype; integer/bool fields keep their type.
-    assert moved.distogram.dtype == torch.float16
-    assert moved.pseudo_beta_mask.dtype == torch.float16
-    assert moved.unit_vector.dtype == torch.float16
-    assert moved.backbone_frame_mask.dtype == torch.float16
-    assert moved.residue_type.dtype == torch.long
-    assert moved.template_mask is not None
-    assert moved.template_mask.dtype == torch.bool
-
-
 @pytest.mark.parametrize(("num_blocks", "num_templates"), [(0, 1), (0, 0), (1, 0)])
 def test_zero_update_when_disabled(num_blocks, num_templates):
     # Either no triangle blocks or no templates short-circuits to an exact-zero update.

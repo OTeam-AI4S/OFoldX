@@ -1,0 +1,1421 @@
+r"""Released MpnnPacker model."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import torch.distributions as distributions
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from ...data import residue_constants as rc
+from ...data.molecular import AtomSite, ComponentReference, restype_3to1
+from ...data.structure import Structure
+from ...modules.mpnn import (
+    AMINO_ACID_COMPONENT_IDS,
+    MpnnDecoderLayer,
+    MpnnEncoderLayer,
+    MpnnRelativePositionEncoding,
+    _radial_basis,
+    _virtual_beta_carbon,
+    cat_neighbors_nodes,
+    gather_nodes,
+    periodic_group_period,
+)
+from ...results import Metric, PackPrediction, PackResult
+from .config import MpnnPackerConfig
+
+
+def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> Tensor:
+    r"""Direction features of ``points`` expressed in each residue's local backbone frame.
+
+    Builds a per-residue orthonormal frame from N/CA/C, projects the context points into it, and returns
+    scale-invariant planar/spatial direction cosines (the LigandMPNN local-angle context features).
+
+    Args:
+        n: Nitrogen coordinates `[B, L, 3]`.
+        ca: Alpha-carbon coordinates `[B, L, 3]`.
+        c: Carbon coordinates `[B, L, 3]`.
+        points: Context atom coordinates `[B, L, A, 3]`.
+
+    Returns:
+        Direction features `[B, L, A, 4]`.
+    """
+
+    first_axis = F.normalize(n - ca, dim=-1)
+    c_vector = c - ca
+    projected = torch.einsum("bli,bli->bl", first_axis, c_vector)[..., None]
+    second_axis = F.normalize(c_vector - first_axis * projected, dim=-1)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
+    local = torch.einsum("blqp,blyq->blyp", frame, points - ca[:, :, None])
+    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
+    spatial_radius = torch.norm(local, dim=-1) + 1e-8
+    return torch.stack(
+        (
+            local[..., 0] / planar_radius,
+            local[..., 1] / planar_radius,
+            planar_radius / spatial_radius,
+            local[..., 2] / spatial_radius,
+        ),
+        dim=-1,
+    )
+
+
+def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
+    r"""Find the ``k_neighbors`` nearest residues by CA distance, after every valid pair.
+
+    Args:
+        points: Reference (CA) coordinates `[B, L, 3]`.
+        mask: Valid-residue mask `[B, L]`.
+        k_neighbors: Number of neighbors to keep (capped at ``L``).
+        eps: Numerical floor under the distance square root.
+
+    Returns:
+        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
+    """
+
+    pair_mask = mask[:, None, :] & mask[:, :, None]
+    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
+    adjusted = torch.where(pair_mask, distances, torch.inf)
+    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
+
+
+def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
+    r"""Compute every ordered atom-pair distance along the residue neighbor graph.
+
+    Args:
+        atoms: Per-residue atom coordinates `[B, L, A, 3]`.
+        neighbor_idx: Neighbor indices `[B, L, K]`.
+
+    Returns:
+        Distances `[B, L, K, A, A]`, with source atom before target atom.
+    """
+
+    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
+    neighbors = atoms[batch, neighbor_idx]
+    distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
+    return distances
+
+
+_ATOM14 = 14
+
+
+class MpnnPackerModel(nn.Module):
+    r"""
+    Predicts side-chain chi angles as a Von Mises mixture and denoises them into atom coordinates.
+
+    Encodes the backbone graph and ligand context, then decodes a mixture-of-Von-Mises
+    distribution over the four side-chain chi angles per residue. [`pack`]
+    [ofoldx.models.mpnn_packer.model.MpnnPackerModel.pack] runs the released
+    iterative sampler and returns canonical packed Structures.
+
+    Args:
+        config: Side-chain packer configuration; a default
+            [`MpnnPackerConfig`][ofoldx.models.mpnn_packer.config.MpnnPackerConfig] is used
+            when ``None``.
+    """
+
+    config_class = MpnnPackerConfig
+
+    def __init__(self, config: MpnnPackerConfig | None = None) -> None:
+        config = MpnnPackerConfig() if config is None else config
+        super().__init__()
+        self.config = config
+        self.num_mix = config.num_mix
+        self.features = MpnnPackerFeatures(
+            node_size=config.hidden_size,
+            edge_size=config.edge_size,
+            num_positional_embeddings=config.num_positional_embeddings,
+            num_rbf=config.num_rbf,
+            k_neighbors=config.k_neighbors,
+            atom_context_num=config.atom_context_num,
+            coordinate_noise=config.coordinate_noise,
+            lower_bound=config.lower_bound,
+            upper_bound=config.upper_bound,
+        )
+        self.softplus = nn.Softplus(beta=1, threshold=20)
+
+        self.edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
+        self.node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
+        self.decode_edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
+        self.side_chain_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
+        self.linear_down = nn.Linear(2 * config.hidden_size, config.hidden_size)
+        self.torsion_projection = nn.Linear(config.hidden_size, 4 * 3 * config.num_mix)
+
+        self.encoder_layers = nn.ModuleList(
+            [
+                MpnnEncoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
+                for _ in range(config.num_encoder_layers)
+            ]
+        )
+        self.residue_context_input = nn.Linear(config.hidden_size, config.hidden_size)
+        self.context_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
+        self.atom_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
+        self.atom_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
+        self.context_layers = nn.ModuleList(
+            [MpnnDecoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout) for _ in range(2)]
+        )
+        self.context_output = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_norm = nn.LayerNorm(config.hidden_size)
+        self.atom_context_layers = nn.ModuleList(
+            [MpnnDecoderLayer(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(2)]
+        )
+        self.context_dropout = nn.Dropout(config.dropout)
+        self.decoder_layers = nn.ModuleList(
+            [
+                MpnnDecoderLayer(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
+                for _ in range(config.num_decoder_layers)
+            ]
+        )
+
+        self.reset_parameters()
+
+        buffer_device = self.torsion_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        buffer_dtype = self.torsion_projection.weight.dtype
+        component_ids = (*AMINO_ACID_COMPONENT_IDS, "UNK")
+        standard_restype_order = [
+            rc.restypes.index(restype_3to1[component_id]) for component_id in AMINO_ACID_COMPONENT_IDS
+        ]
+        restype_order = [*standard_restype_order, len(rc.restypes)]
+
+        restype_atom37_mask = []
+        restype_chi_atom_indices = []
+        for component_id in AMINO_ACID_COMPONENT_IDS:
+            atom_names = {atom[0] for atom in rc.rigid_group_atom_positions[component_id]}
+            restype_atom37_mask.append([atom_name in atom_names for atom_name in rc.atom_types])
+            chi_atom_indices = [
+                [rc.atom_order[atom_name] for atom_name in chi] for chi in rc.chi_angles_atoms[component_id]
+            ]
+            restype_chi_atom_indices.append(chi_atom_indices + [[0, 0, 0, 0]] * (4 - len(chi_atom_indices)))
+        restype_atom37_mask.append([False] * len(rc.atom_types))
+        restype_chi_atom_indices.append([[0, 0, 0, 0]] * 4)
+
+        self.register_buffer(
+            "restype_atom14_mask",
+            torch.tensor(
+                rc.restype_atom14_mask[restype_order],
+                dtype=torch.bool,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_atom37_mask",
+            torch.tensor(restype_atom37_mask, dtype=torch.bool, device=buffer_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_atom14_to_atom37",
+            torch.tensor(
+                [
+                    [
+                        rc.atom_order[atom_name] if atom_name else 0
+                        for atom_name in rc.restype_name_to_atom14_names[component_id]
+                    ]
+                    for component_id in component_ids
+                ],
+                dtype=torch.long,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_chi_atom_indices",
+            torch.tensor(restype_chi_atom_indices, dtype=torch.long, device=buffer_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_chi_angles_mask",
+            torch.tensor(
+                [
+                    *[rc.chi_angles_mask[restype] for restype in standard_restype_order],
+                    [False, False, False, False],
+                ],
+                dtype=torch.bool,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_rigid_group_default_frame",
+            torch.tensor(
+                rc.restype_rigid_group_default_frame[restype_order],
+                dtype=buffer_dtype,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_atom14_to_rigid_group",
+            torch.tensor(
+                rc.restype_atom14_to_rigid_group[restype_order],
+                dtype=torch.long,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "restype_atom14_rigid_group_positions",
+            torch.tensor(
+                rc.restype_atom14_rigid_group_positions[restype_order],
+                dtype=buffer_dtype,
+                device=buffer_device,
+            ),
+            persistent=False,
+        )
+
+    def reset_parameters(self) -> None:
+        r"""
+        Re-initialize MpnnPacker weights to match the released LigandMPNN scheme.
+        """
+
+        for parameter in self.parameters():
+            if parameter.dim() > 1:
+                nn.init.xavier_uniform_(parameter)
+
+    def encode(
+        self,
+        input: MpnnPackerInput,
+        *,
+        atom14_coordinates: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Encode one explicit atom14 state into residue and edge representations."""
+
+        residue_mask = input.residue_mask
+        node_features, edges, neighbor_indices, atom_nodes, atom_edges, context_nodes, context_mask = (
+            self.features.encode(
+                atom14_coordinates=atom14_coordinates,
+                sequence_tokens=input.sequence_tokens,
+                residue_mask=residue_mask,
+                residue_index=input.residue_index,
+                chain_index=input.chain_index,
+                context_coordinates=input.context_coordinates,
+                context_atomic_numbers=input.context_atomic_numbers,
+                context_mask=input.context_mask,
+            )
+        )
+        context = self.context_edge_embedding(context_nodes)
+        node_states = self.node_embedding(node_features)
+        edge_states = self.edge_embedding(edges)
+        attend_mask = gather_nodes(residue_mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        attend_mask = residue_mask.unsqueeze(-1) & attend_mask
+        for layer in self.encoder_layers:
+            node_states, edge_states = layer(
+                node_states,
+                edge_states,
+                neighbor_indices,
+                residue_mask,
+                attend_mask,
+            )
+
+        residue_context = self.residue_context_input(node_states)
+        atom_pair_mask = context_mask[:, :, :, None] & context_mask[:, :, None, :]
+        atom_nodes = self.atom_node_embedding(atom_nodes)
+        atom_edges = self.atom_edge_embedding(atom_edges)
+        for layer_index, layer in enumerate(self.context_layers):
+            atom_nodes = self.atom_context_layers[layer_index](
+                atom_nodes,
+                atom_edges,
+                context_mask,
+                atom_pair_mask,
+            )
+            residue_context = layer(
+                residue_context,
+                torch.cat([context, atom_nodes], dim=-1),
+                residue_mask,
+                context_mask,
+            )
+        residue_context = self.context_output(residue_context)
+        node_states = node_states + self.context_norm(self.context_dropout(residue_context))
+        return node_states, edge_states, neighbor_indices
+
+    def decode(
+        self,
+        input: MpnnPackerInput,
+        *,
+        atom14_coordinates: Tensor,
+        atom14_mask: Tensor,
+        node_states: Tensor,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+    ) -> MpnnPackerOutput:
+        r"""Decode torsion mixtures from an explicit atom14 state and encoded graph."""
+
+        residue_mask = input.residue_mask
+        side_chain_nodes, decode_edges = self.features.decode(
+            atom14_coordinates=atom14_coordinates,
+            atom14_mask=atom14_mask,
+            sequence_tokens=input.sequence_tokens,
+            residue_mask=residue_mask,
+            neighbor_indices=neighbor_indices,
+            context_coordinates=input.context_coordinates,
+            context_atomic_numbers=input.context_atomic_numbers,
+            context_mask=input.context_mask,
+        )
+        decode_edges = self.decode_edge_embedding(decode_edges)
+        edge_context = torch.cat([edge_states, decode_edges], dim=-1)
+        side_chain_states = self.side_chain_node_embedding(side_chain_nodes)
+        node_states = self.linear_down(torch.cat([node_states, side_chain_states], dim=-1))
+        attend_mask = gather_nodes(residue_mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        attend_mask = residue_mask.unsqueeze(-1) & attend_mask
+
+        for layer in self.decoder_layers:
+            neighbor_states = cat_neighbors_nodes(node_states, edge_context, neighbor_indices)
+            node_states = layer(node_states, neighbor_states, residue_mask, attend_mask)
+
+        torsions = self.torsion_projection(node_states)
+        torsions = torsions.reshape(node_states.shape[0], node_states.shape[1], 4, self.num_mix, 3)
+        return MpnnPackerOutput(
+            mean=torsions[..., 0],
+            concentration=0.1 + self.softplus(torsions[..., 1]),
+            mix_logits=torsions[..., 2],
+        )
+
+    def forward(
+        self,
+        input: MpnnPackerInput,
+        *,
+        atom14_coordinates: Tensor,
+        atom14_mask: Tensor,
+    ) -> MpnnPackerOutput:
+        r"""Predict four per-residue torsion mixtures for one explicit atom14 state."""
+
+        node_states, edge_states, neighbor_indices = self.encode(input, atom14_coordinates=atom14_coordinates)
+        return self.decode(
+            input,
+            atom14_coordinates=atom14_coordinates,
+            atom14_mask=atom14_mask,
+            node_states=node_states,
+            edge_states=edge_states,
+            neighbor_indices=neighbor_indices,
+        )
+
+    @torch.inference_mode()
+    def sample(
+        self,
+        input: MpnnPackerInput,
+        *,
+        num_denoising_steps: int = 3,
+        num_torsion_samples: int = 16,
+        generator: torch.Generator | None = None,
+    ) -> MpnnPackerSamplingOutput:
+        r"""Generate one final atom14 sample with the released iterative sampler."""
+
+        if num_denoising_steps <= 0:
+            raise ValueError("num_denoising_steps must be positive")
+        if num_torsion_samples <= 0:
+            raise ValueError("num_torsion_samples must be positive")
+
+        device = input.sequence_tokens.device
+        batch_size, length = input.residue_mask.shape
+        backbone_atom37_coordinates = torch.zeros(
+            batch_size,
+            length,
+            37,
+            3,
+            device=device,
+            dtype=input.backbone_coordinates.dtype,
+        )
+        backbone_atom37_coordinates[:, :, :3] = input.backbone_coordinates[:, :, :3]
+        backbone_atom37_coordinates[:, :, 4] = input.backbone_coordinates[:, :, 3]
+
+        restype = input.sequence_tokens.long()
+        atom14_exists = self.restype_atom14_mask[restype]
+        atom37_exists = self.restype_atom37_mask[restype]
+        atom14_to_atom37 = self.restype_atom14_to_atom37[restype]
+        chi_atom_indices = self.restype_chi_atom_indices[restype]
+        chi_angles_mask = self.restype_chi_angles_mask[restype]
+        default_frames = self.restype_rigid_group_default_frame[restype]
+        atom14_to_rigid_group = self.restype_atom14_to_rigid_group[restype]
+        atom14_rigid_group_positions = self.restype_atom14_rigid_group_positions[restype]
+        torsion_sin_cos, _ = atom37_to_torsion_angles(
+            backbone_atom37_coordinates,
+            atom37_exists,
+            chi_atom_indices=chi_atom_indices,
+            chi_angles_mask=chi_angles_mask,
+        )
+        backbone_frames = Frame.make_transform_from_reference(
+            backbone_atom37_coordinates[:, :, 0],
+            backbone_atom37_coordinates[:, :, 1],
+            backbone_atom37_coordinates[:, :, 2],
+            eps=1e-9,
+        )
+
+        input_torsion_sin_cos, _ = atom37_to_torsion_angles(
+            input.atom37_coordinates,
+            input.atom37_mask,
+            chi_atom_indices=chi_atom_indices,
+            chi_angles_mask=chi_angles_mask,
+        )
+        input_chi_sin_cos = input_torsion_sin_cos[:, :, 3:].clone()
+        pack_mask = input.pack_mask[:, :, None, None]
+        random_angles = (
+            2
+            * torch.pi
+            * torch.rand(
+                batch_size,
+                length,
+                4,
+                device=device,
+                dtype=input.backbone_coordinates.dtype,
+                generator=generator,
+            )
+        )
+        random_sin_cos = torch.stack(
+            [torch.sin(random_angles), torch.cos(random_angles)],
+            dim=-1,
+        )
+        torsion_sin_cos = torsion_sin_cos.clone()
+        torsion_sin_cos[:, :, 3:] = torch.where(pack_mask, random_sin_cos, input_chi_sin_cos)
+
+        frames = torsion_angles_to_frames(
+            backbone_frames,
+            torsion_sin_cos,
+            default_frames=default_frames,
+        )
+        atom14_coordinates = frames_and_literature_positions_to_atom14_pos(
+            frames,
+            atom14_to_rigid_group=atom14_to_rigid_group,
+            atom14_rigid_group_positions=atom14_rigid_group_positions,
+            atom14_mask=atom14_exists,
+        )
+        observed_atom14_mask = torch.gather(input.atom37_mask, 2, atom14_to_atom37) & atom14_exists
+        observed_atom14_coordinates = torch.gather(
+            input.atom37_coordinates,
+            2,
+            atom14_to_atom37[:, :, :, None].expand(-1, -1, -1, 3),
+        )
+        fixed_unknown = ~input.pack_mask & (restype == len(AMINO_ACID_COMPONENT_IDS))
+        observed_atom14_mask[:, :, :4] = torch.where(
+            fixed_unknown[:, :, None],
+            input.atom37_mask[:, :, [0, 1, 2, 4]],
+            observed_atom14_mask[:, :, :4],
+        )
+        observed_atom14_coordinates[:, :, :4] = torch.where(
+            fixed_unknown[:, :, None, None],
+            input.atom37_coordinates[:, :, [0, 1, 2, 4]],
+            observed_atom14_coordinates[:, :, :4],
+        )
+        atom14_mask = torch.where(
+            input.pack_mask[:, :, None],
+            atom14_exists,
+            observed_atom14_mask,
+        )
+        atom14_mask = atom14_mask & input.residue_mask[:, :, None]
+        partial_fixed = ~input.pack_mask & (observed_atom14_mask != atom14_exists).any(dim=-1)
+        atom14_coordinates = torch.where(
+            partial_fixed[:, :, None, None],
+            observed_atom14_coordinates,
+            atom14_coordinates,
+        )
+        atom14_coordinates = atom14_coordinates * atom14_mask[:, :, :, None]
+
+        node_states, edge_states, neighbor_indices = self.encode(
+            input,
+            atom14_coordinates=atom14_coordinates,
+        )
+        for _ in range(num_denoising_steps):
+            output = self.decode(
+                input,
+                atom14_coordinates=atom14_coordinates,
+                atom14_mask=atom14_mask,
+                node_states=node_states,
+                edge_states=edge_states,
+                neighbor_indices=neighbor_indices,
+            )
+            predicted_distribution = distributions.MixtureSameFamily(
+                distributions.Categorical(logits=output.mix_logits),
+                distributions.VonMises(output.mean, output.concentration),
+            )
+            candidates = _sample_von_mises_mixture(
+                output.mean,
+                output.concentration,
+                output.mix_logits,
+                num_samples=num_torsion_samples,
+                generator=generator,
+            )
+            candidate_log_densities = predicted_distribution.log_prob(candidates)
+            best = torch.argmax(candidate_log_densities, dim=0)[None]
+            sampled_chi_angles = torch.gather(candidates, dim=0, index=best)[0]
+
+            sampled_chi_sin_cos = torch.stack(
+                [torch.sin(sampled_chi_angles), torch.cos(sampled_chi_angles)],
+                dim=-1,
+            )
+            torsion_sin_cos[:, :, 3:] = torch.where(pack_mask, sampled_chi_sin_cos, input_chi_sin_cos)
+            frames = torsion_angles_to_frames(
+                backbone_frames,
+                torsion_sin_cos,
+                default_frames=default_frames,
+            )
+            atom14_coordinates = frames_and_literature_positions_to_atom14_pos(
+                frames,
+                atom14_to_rigid_group=atom14_to_rigid_group,
+                atom14_rigid_group_positions=atom14_rigid_group_positions,
+                atom14_mask=atom14_exists,
+            )
+            atom14_coordinates = torch.where(
+                partial_fixed[:, :, None, None],
+                observed_atom14_coordinates,
+                atom14_coordinates,
+            )
+            atom14_coordinates = atom14_coordinates * atom14_mask[:, :, :, None]
+
+        return MpnnPackerSamplingOutput(
+            atom14_coordinates=atom14_coordinates,
+            atom14_mask=atom14_mask,
+            sampled_chi_angles=sampled_chi_angles,
+            chi_log_densities=predicted_distribution.log_prob(sampled_chi_angles),
+            mean=output.mean,
+            concentration=output.concentration,
+            mix_logits=output.mix_logits,
+            input_chi_sin_cos=input_chi_sin_cos,
+        )
+
+    @torch.inference_mode()
+    def pack(
+        self,
+        input: MpnnPackerInput,
+        *,
+        num_samples: int = 1,
+        num_denoising_steps: int = 3,
+        num_torsion_samples: int = 16,
+        generator: torch.Generator | None = None,
+    ) -> PackResult:
+        r"""Generate independent packed Structures with the released iterative sampler."""
+
+        if input.sequence_tokens.shape[0] != 1:
+            raise ValueError("pack requires batch size one")
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+        if num_denoising_steps <= 0:
+            raise ValueError("num_denoising_steps must be positive")
+        if num_torsion_samples <= 0:
+            raise ValueError("num_torsion_samples must be positive")
+        if not bool(input.pack_mask.any()):
+            return PackResult(predictions=tuple(PackPrediction(input.structure) for _ in range(num_samples)))
+
+        predictions = tuple(
+            _pack_candidate(
+                input,
+                self.sample(
+                    input,
+                    num_denoising_steps=num_denoising_steps,
+                    num_torsion_samples=num_torsion_samples,
+                    generator=generator,
+                ),
+            )
+            for _ in range(num_samples)
+        )
+        return PackResult(predictions=predictions)
+
+
+class MpnnPackerFeatures(nn.Module):
+    r"""
+    Turns backbone coordinates and ligand context into the graph and distance features the MpnnPacker consumes.
+
+    Builds the backbone graph, ligand-context, and side-chain atom-distance features used by the
+    MpnnPacker encoder and decoder. Mirrors the reference LigandMPNN ``ProteinFeatures`` used by the
+    MpnnPacker (note: distinct from the sequence-model feature encoder).
+
+    Args:
+        node_size: Width of the per-node features.
+        edge_size: Width of the per-edge features.
+        num_positional_embeddings: Width of the relative-position embedding.
+        num_rbf: Number of radial basis functions per distance feature.
+        k_neighbors: Number of nearest-neighbor residues in the graph.
+        atom_context_num: Number of ligand context atoms per residue used by the decoder.
+        coordinate_noise: Training-time Gaussian coordinate-noise standard deviation.
+        lower_bound: Lower distance bound for the context RBF expansion.
+        upper_bound: Upper distance bound for the context RBF expansion.
+    """
+
+    def __init__(
+        self,
+        *,
+        node_size: int,
+        edge_size: int,
+        num_positional_embeddings: int,
+        num_rbf: int,
+        k_neighbors: int,
+        atom_context_num: int,
+        coordinate_noise: float,
+        lower_bound: float,
+        upper_bound: float,
+    ) -> None:
+        super().__init__()
+        self.num_rbf = num_rbf
+        self.k_neighbors = k_neighbors
+        self.atom_context_num = atom_context_num
+        self.coordinate_noise = coordinate_noise
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.relative_position = MpnnRelativePositionEncoding(num_positional_embeddings)
+
+        self.edge_projection = nn.Linear(num_positional_embeddings + num_rbf * 25, edge_size, bias=False)
+        self.edge_norm = nn.LayerNorm(edge_size)
+        self.node_projection = nn.Linear(len(AMINO_ACID_COMPONENT_IDS) + 1, node_size, bias=False)
+        self.node_norm = nn.LayerNorm(node_size)
+
+        self.context_down_projection = nn.Linear(num_rbf + 120, num_rbf)
+        self.decode_edge_projection = nn.Linear(
+            num_rbf * _ATOM14 * _ATOM14 + 2 * (len(AMINO_ACID_COMPONENT_IDS) + 1),
+            edge_size,
+            bias=False,
+        )
+        self.decode_edge_norm = nn.LayerNorm(edge_size)
+        self.decode_node_projection = nn.Linear(_ATOM14 * atom_context_num * num_rbf, node_size, bias=False)
+        self.decode_node_norm = nn.LayerNorm(node_size)
+
+        self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
+        self.context_node_norm = nn.LayerNorm(node_size)
+        self.element_projection = nn.Linear(147, 64)
+        self.atom_node_projection = nn.Linear(147, node_size, bias=False)
+        self.atom_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
+        self.atom_edge_norm = nn.LayerNorm(node_size)
+        self.atom_node_norm = nn.LayerNorm(node_size)
+
+        buffer_device = self.element_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        group, period = periodic_group_period(device=buffer_device)
+        self.register_buffer("periodic_group", group, persistent=False)
+        self.register_buffer("periodic_period", period, persistent=False)
+
+    def _context_rbf(self, distances: Tensor) -> Tensor:
+        r"""RBF-expand distances over the configured ``[lower_bound, upper_bound]`` range."""
+
+        return _radial_basis(distances, self.num_rbf, self.lower_bound, self.upper_bound)
+
+    def _element_features(self, atomic_numbers: Tensor, *, dtype: torch.dtype) -> Tensor:
+        r"""One-hot-encode atoms by element, periodic group, and period `[..., 147]`."""
+
+        atomic_numbers = atomic_numbers.long()
+        group = self.periodic_group[atomic_numbers]
+        period = self.periodic_period[atomic_numbers]
+        return torch.cat([F.one_hot(atomic_numbers, 120), F.one_hot(group, 19), F.one_hot(period, 8)], dim=-1).to(
+            dtype=dtype
+        )
+
+    def encode(
+        self,
+        *,
+        atom14_coordinates: Tensor,
+        sequence_tokens: Tensor,
+        residue_mask: Tensor,
+        residue_index: Tensor,
+        chain_index: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        r"""
+        Build the encoder inputs: backbone-graph edges, sequence nodes, and ligand-context features.
+
+        Args:
+            atom14_coordinates: Current atom14 coordinates ``[B, L, 14, 3]``.
+            sequence_tokens: Residue tokens ``[B, L]``.
+            residue_mask: Valid-residue mask ``[B, L]``.
+            residue_index: Residue positions used by relative-position encoding ``[B, L]``.
+            chain_index: Chain indices ``[B, L]``.
+            context_coordinates: Per-residue non-protein context coordinates ``[B, L, A, 3]``.
+            context_atomic_numbers: Atomic numbers for the context coordinates ``[B, L, A]``.
+            context_mask: Valid-context mask ``[B, L, A]``.
+
+        Returns:
+            Tuple ``(nodes, edges, neighbor_idx, atom_nodes, atom_edges, context_nodes, context_mask)``.
+        """
+
+        coordinates = atom14_coordinates
+        if self.training and self.coordinate_noise > 0:
+            coordinates = coordinates + self.coordinate_noise * torch.randn_like(coordinates)
+        context_atomic_numbers = context_atomic_numbers.long()
+
+        n, ca, c, o = (
+            coordinates[:, :, 0],
+            coordinates[:, :, 1],
+            coordinates[:, :, 2],
+            coordinates[:, :, 3],
+        )
+        cb = _virtual_beta_carbon(n, ca, c)
+        _, neighbor_indices = _knn(ca, residue_mask, self.k_neighbors)
+
+        backbone_atoms = torch.stack((n, ca, c, o, cb), dim=2)
+        pair_distances = _neighbor_atom_distances(backbone_atoms, neighbor_indices)
+        pair_rbf = _radial_basis(
+            pair_distances,
+            self.num_rbf,
+            self.lower_bound,
+            self.upper_bound,
+        ).flatten(start_dim=-3)
+        batch = torch.arange(coordinates.shape[0], device=coordinates.device)[:, None, None]
+        neighbor_residue_index = residue_index[batch, neighbor_indices]
+        offset = residue_index[:, :, None] - neighbor_residue_index
+        neighbor_chain = chain_index[batch, neighbor_indices]
+        same_chain = (chain_index[:, :, None] == neighbor_chain).long()
+        edges = self.edge_norm(
+            self.edge_projection(torch.cat([self.relative_position(offset.long(), same_chain), pair_rbf], dim=-1))
+        )
+        nodes = self.node_norm(
+            self.node_projection(
+                F.one_hot(sequence_tokens.long(), len(AMINO_ACID_COMPONENT_IDS) + 1).to(dtype=coordinates.dtype)
+            )
+        )
+
+        element_features = self._element_features(context_atomic_numbers, dtype=coordinates.dtype)
+        element_projection = self.element_projection(element_features)
+        context_distances = torch.sqrt(
+            torch.sum(
+                (backbone_atoms[:, :, :, None] - context_coordinates[:, :, None]) ** 2,
+                dim=-1,
+            )
+            + 1e-6
+        )
+        context_features = self._context_rbf(context_distances.movedim(2, 3)).flatten(start_dim=-2)
+        angle_features = _local_angle_features(n, ca, c, context_coordinates)
+        context = torch.cat([context_features, element_projection, angle_features], dim=-1)
+        context_nodes = self.context_node_norm(self.context_node_projection(context))
+
+        atom_pair_distances = torch.sqrt(
+            torch.sum(
+                (context_coordinates[:, :, :, None] - context_coordinates[:, :, None, :]) ** 2,
+                dim=-1,
+            )
+            + 1e-6
+        )
+        atom_edges = self.atom_edge_norm(self.atom_edge_projection(self._context_rbf(atom_pair_distances)))
+        atom_nodes = self.atom_node_norm(self.atom_node_projection(element_features))
+        return nodes, edges, neighbor_indices, atom_nodes, atom_edges, context_nodes, context_mask
+
+    def decode(
+        self,
+        *,
+        atom14_coordinates: Tensor,
+        atom14_mask: Tensor,
+        sequence_tokens: Tensor,
+        residue_mask: Tensor,
+        neighbor_indices: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        r"""
+        Build the decoder inputs: explicit atom14-atom and atom14-ligand distance features.
+
+        Args:
+            atom14_coordinates: Current atom14 coordinates ``[B, L, 14, 3]``.
+            atom14_mask: Current atom14 mask ``[B, L, 14]``.
+            sequence_tokens: Residue tokens ``[B, L]``.
+            residue_mask: Valid-residue mask ``[B, L]``.
+            neighbor_indices: Encoded residue-neighbor indices ``[B, L, K]``.
+            context_coordinates: Per-residue non-protein context coordinates ``[B, L, A, 3]``.
+            context_atomic_numbers: Atomic numbers for the context coordinates ``[B, L, A]``.
+            context_mask: Valid-context mask ``[B, L, A]``.
+
+        Returns:
+            Tuple ``(side_chain_nodes, decode_edges)`` of per-residue side-chain node features and the
+            decoder edge context.
+        """
+
+        coordinates = atom14_coordinates
+        atom_mask = atom14_mask & residue_mask[:, :, None]
+        context_coordinates = context_coordinates[:, :, : self.atom_context_num]
+        context_mask = context_mask[:, :, : self.atom_context_num]
+        context_atomic_numbers = context_atomic_numbers[:, :, : self.atom_context_num].long()
+        batch, length = coordinates.shape[:2]
+
+        gathered_mask = gather_nodes(atom_mask, neighbor_indices)
+        side_chain_distances = _neighbor_atom_distances(coordinates, neighbor_indices)
+        pair_mask = atom_mask[:, :, None, :, None] & gathered_mask[:, :, :, None, :]
+        side_chain_rbf = _radial_basis(
+            side_chain_distances,
+            self.num_rbf,
+            self.lower_bound,
+            self.upper_bound,
+        )
+        side_chain_rbf = (side_chain_rbf * pair_mask[..., None]).flatten(start_dim=-3)
+
+        atom_context_distances = torch.sqrt(
+            torch.sum(
+                (coordinates[:, :, :, None, :] - context_coordinates[:, :, None, :, :]) ** 2,
+                dim=-1,
+            )
+            + 1e-6
+        )
+        atom_context_features = self._context_rbf(atom_context_distances)
+        atom_context_features = (
+            atom_context_features * atom_mask[:, :, :, None, None] * context_mask[:, :, None, :, None]
+        )
+        context_types_1hot = F.one_hot(context_atomic_numbers, 120).to(dtype=coordinates.dtype)
+        combined = torch.cat(
+            [atom_context_features, context_types_1hot[:, :, None].expand(-1, -1, _ATOM14, -1, -1)], dim=-1
+        )
+        node_features = self.context_down_projection(combined).view(batch, length, -1)
+        side_chain_nodes = self.decode_node_norm(self.decode_node_projection(node_features))
+
+        sequence_1hot = F.one_hot(sequence_tokens.long(), len(AMINO_ACID_COMPONENT_IDS) + 1).to(dtype=coordinates.dtype)
+        gathered_sequence = gather_nodes(sequence_1hot, neighbor_indices)
+        sequence_features = torch.cat(
+            [
+                sequence_1hot[:, :, None].expand(-1, -1, neighbor_indices.shape[2], -1),
+                gathered_sequence,
+            ],
+            dim=-1,
+        )
+        decode_edges = torch.cat([side_chain_rbf, sequence_features], dim=-1)
+        decode_edges = self.decode_edge_norm(self.decode_edge_projection(decode_edges))
+        return side_chain_nodes, decode_edges
+
+
+def _sample_von_mises_mixture(
+    mean: Tensor,
+    concentration: Tensor,
+    mix_logits: Tensor,
+    *,
+    num_samples: int,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""Match PyTorch's mixture/Von-Mises sampling while accepting a Generator."""
+
+    probabilities = mix_logits.softmax(dim=-1).reshape(-1, mix_logits.shape[-1])
+    mixture_indices = torch.multinomial(
+        probabilities,
+        num_samples,
+        replacement=True,
+        generator=generator,
+    ).T.reshape(num_samples, *mix_logits.shape[:-1])
+
+    loc = mean.to(torch.double)
+    kappa = concentration.to(torch.double)
+    tau = 1 + torch.sqrt(1 + 4 * kappa**2)
+    rho = (tau - torch.sqrt(2 * tau)) / (2 * kappa)
+    proposal = (1 + rho**2) / (2 * rho)
+    proposal = torch.where(kappa < 1e-5, 1 / kappa + kappa, proposal)
+    shape = (num_samples, *mean.shape)
+    component_samples = torch.empty(shape, dtype=torch.double, device=mean.device)
+    done = torch.zeros(shape, dtype=torch.bool, device=mean.device)
+    while not bool(done.all()):
+        uniform = torch.rand((3, *shape), dtype=torch.double, device=mean.device, generator=generator)
+        first, second, third = uniform.unbind()
+        z = torch.cos(math.pi * first)
+        f = (1 + proposal * z) / (proposal + z)
+        c = kappa * (proposal - f)
+        accept = ((c * (2 - c) - second) > 0) | ((c / second).log() + 1 - c >= 0)
+        component_samples = torch.where(accept, (third - 0.5).sign() * f.acos(), component_samples)
+        done = done | accept
+    component_samples = ((component_samples + math.pi + loc) % (2 * math.pi) - math.pi).to(mean.dtype)
+    return torch.gather(component_samples, -1, mixture_indices.unsqueeze(-1)).squeeze(-1)
+
+
+def _pack_candidate(
+    input: MpnnPackerInput,
+    packed: MpnnPackerSamplingOutput,
+) -> PackPrediction:
+    r"""Realize one sampled atom14 state without materializing unselected atoms."""
+
+    structure = input.structure
+    source_index = {site: index for index, site in enumerate(structure.sites)}
+    selected = input.pack_mask[0].detach().cpu().tolist()
+    selected_references = {
+        reference for reference, is_selected in zip(input.component_references, selected) if is_selected
+    }
+    component_ids = {
+        reference: AMINO_ACID_COMPONENT_IDS[int(token)]
+        for reference, token, is_selected in zip(
+            input.component_references,
+            input.sequence_tokens[0].detach().cpu().tolist(),
+            selected,
+        )
+        if is_selected
+    }
+    expected_atoms = {
+        reference: frozenset(filter(None, rc.restype_name_to_atom14_names[component_ids[reference]]))
+        for reference in selected_references
+    }
+    sites = [
+        site
+        for site in structure.sites
+        if (site.instance_id, site.component_index) not in selected_references
+        or (
+            (site.instance_id, site.component_index) in selected_references
+            and (site.atom_id in expected_atoms[(site.instance_id, site.component_index)] or site.atom_id == "OXT")
+        )
+    ]
+    retained_sites = set(sites)
+    for reference, is_selected in zip(input.component_references, selected):
+        if not is_selected:
+            continue
+        for atom_name in rc.restype_name_to_atom14_names[component_ids[reference]][4:]:
+            if not atom_name:
+                continue
+            site = AtomSite(reference[0], reference[1], atom_name)
+            if site not in retained_sites:
+                sites.append(site)
+                retained_sites.add(site)
+    sites = tuple(sites)
+    output_index = {site: index for index, site in enumerate(sites)}
+    atom14 = packed.atom14_coordinates[0].detach().cpu().numpy()
+    coordinate_dtype = np.result_type(structure.coordinates.dtype, atom14.dtype)
+    coordinates = np.zeros((len(sites), 3), dtype=coordinate_dtype)
+    coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
+    occupancy = (
+        None
+        if structure.occupancy is None
+        else np.full(
+            len(sites),
+            np.nan,
+            dtype=np.result_type(structure.occupancy.dtype, np.float32),
+        )
+    )
+    for index, site in enumerate(sites):
+        source = source_index.get(site)
+        if source is None:
+            continue
+        coordinates[index] = structure.coordinates[source]
+        coordinate_mask[index] = structure.coordinate_mask[source]
+        if occupancy is not None:
+            occupancy[index] = structure.occupancy[source]
+
+    atom14_mask = packed.atom14_mask[0].detach().cpu().numpy()
+    for row, (reference, is_selected) in enumerate(zip(input.component_references, selected)):
+        if not is_selected:
+            continue
+        for atom, atom_name in enumerate(rc.restype_name_to_atom14_names[component_ids[reference]][4:], start=4):
+            if not atom_name:
+                continue
+            index = output_index[AtomSite(reference[0], reference[1], atom_name)]
+            coordinates[index] = atom14[row, atom]
+            coordinate_mask[index] = atom14_mask[row, atom]
+            if occupancy is not None:
+                occupancy[index] = np.nan
+
+    realized = Structure(
+        structure.system,
+        sites,
+        coordinates,
+        coordinate_mask,
+        occupancy,
+        structure.residue_numbers,
+    )
+    metrics: dict[str, Metric] = {}
+    chi_log_densities = packed.chi_log_densities[0].detach().cpu().numpy()
+    for chi_index in range(4):
+        rows = tuple(
+            row
+            for row, (reference, is_selected) in enumerate(zip(input.component_references, selected))
+            if is_selected and len(rc.chi_angles_atoms[component_ids[reference]]) > chi_index
+        )
+        if rows:
+            metrics[f"chi{chi_index + 1}_log_density"] = Metric(
+                values=chi_log_densities[rows, chi_index],
+                axis=tuple(input.component_references[row] for row in rows),
+                unit="nat/radian",
+            )
+    return PackPrediction(structure=realized, metrics=metrics)
+
+
+# ---------------------------------------------------------------------------
+# Typed tensor boundary for MpnnPacker (folded in from contract.py).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class MpnnPackerInput:
+    r"""Complete tensor input and canonical decode mapping for side-chain packing."""
+
+    backbone_coordinates: Tensor
+    sequence_tokens: Tensor
+    residue_mask: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    context_coordinates: Tensor
+    context_atomic_numbers: Tensor
+    context_mask: Tensor
+    atom37_coordinates: Tensor
+    atom37_mask: Tensor
+    pack_mask: Tensor
+    structure: Structure
+    component_references: tuple[ComponentReference, ...]
+
+
+@dataclass(eq=False)
+class MpnnPackerOutput:
+    r"""Von Mises mixture parameters predicted for four side-chain torsions."""
+
+    mean: Tensor
+    concentration: Tensor
+    mix_logits: Tensor
+
+
+@dataclass(eq=False)
+class MpnnPackerSamplingOutput:
+    r"""Final tensors from one released iterative side-chain sample."""
+
+    atom14_coordinates: Tensor
+    atom14_mask: Tensor
+    sampled_chi_angles: Tensor
+    chi_log_densities: Tensor
+    mean: Tensor
+    concentration: Tensor
+    mix_logits: Tensor
+    input_chi_sin_cos: Tensor
+
+
+class Frame:
+    r"""
+    Rigid frame stored as a rotation matrix and a translation.
+
+    A minimal rotation-matrix analogue of the OpenFold ``Rigid`` transform, exposing only the
+    operations the MpnnPacker needs. Batched over any number of leading dimensions.
+
+    Args:
+        rotation: Rotation matrices with shape ``(*, 3, 3)``.
+        translation: Translations with shape ``(*, 3)``.
+
+    Attributes:
+        rotation: Rotation matrices with shape ``(*, 3, 3)``.
+        translation: Translations with shape ``(*, 3)``.
+
+    Examples:
+        >>> import torch
+        >>> frame = Frame(torch.eye(3), torch.tensor([1.0, 2.0, 3.0]))
+        >>> frame.apply(torch.zeros(3)).tolist()
+        [1.0, 2.0, 3.0]
+    """
+
+    def __init__(self, rotation: Tensor, translation: Tensor) -> None:
+        self.rotation = rotation
+        self.translation = translation
+
+    def compose(self, other: Frame) -> Frame:
+        r"""
+        Compose two frames, applying ``other`` in ``self``'s local frame.
+
+        Args:
+            other: Frame to apply after ``self``.
+
+        Returns:
+            The composed frame ``self ∘ other``.
+        """
+
+        rotation = self.rotation @ other.rotation
+        translation = _rotate(self.rotation, other.translation) + self.translation
+        return Frame(rotation, translation)
+
+    def apply(self, points: Tensor) -> Tensor:
+        r"""
+        Map local points into the global frame (rotate then translate).
+
+        Args:
+            points: Local coordinates with shape ``(*, 3)``.
+
+        Returns:
+            Global coordinates with shape ``(*, 3)``.
+        """
+
+        return _rotate(self.rotation, points) + self.translation
+
+    def invert_apply(self, points: Tensor) -> Tensor:
+        r"""
+        Map global points back into the local frame (inverse of `apply`).
+
+        Args:
+            points: Global coordinates with shape ``(*, 3)``.
+
+        Returns:
+            Local coordinates with shape ``(*, 3)``.
+        """
+
+        inverse_rotation = self.rotation.transpose(-1, -2)
+        inverse_translation = -_rotate(inverse_rotation, self.translation)
+        return _rotate(inverse_rotation, points) + inverse_translation
+
+    def unsqueeze(self, dim: int) -> Frame:
+        r"""
+        Insert a size-one dimension into the shared leading axes.
+
+        Args:
+            dim: Position of the new axis among the leading (batch) dimensions.
+
+        Returns:
+            A frame with the extra leading axis inserted into both rotation and translation.
+        """
+
+        rotation_dim = dim - 2 if dim < 0 else dim
+        translation_dim = dim - 1 if dim < 0 else dim
+        return Frame(self.rotation.unsqueeze(rotation_dim), self.translation.unsqueeze(translation_dim))
+
+    def __getitem__(self, index) -> Frame:
+        r"""Index the shared leading (batch) axes, returning the sub-frame at ``index``."""
+
+        if not isinstance(index, tuple):
+            index = (index,)
+        return Frame(self.rotation[index + (slice(None), slice(None))], self.translation[index + (slice(None),)])
+
+    @staticmethod
+    def from_tensor_4x4(transform: Tensor) -> Frame:
+        r"""
+        Build a frame from a homogeneous 4x4 transform.
+
+        Args:
+            transform: Homogeneous transforms with shape ``(*, 4, 4)``.
+
+        Returns:
+            A frame taking the rotation from the top-left 3x3 block and translation from the last column.
+        """
+
+        return Frame(transform[..., :3, :3], transform[..., :3, 3])
+
+    @staticmethod
+    def from_3_points(neg_x_axis: Tensor, origin: Tensor, xy_plane: Tensor, eps: float = 1e-8) -> Frame:
+        r"""
+        Gram-Schmidt frame from three points (AF2 algorithm 21).
+
+        Args:
+            neg_x_axis: Point defining the negative x-axis direction, shape ``(*, 3)``.
+            origin: Frame origin, shape ``(*, 3)``.
+            xy_plane: Point placed in the xy-plane, shape ``(*, 3)``.
+            eps: Numerical floor for the normalizations.
+
+        Returns:
+            The Gram-Schmidt frame with origin at ``origin``.
+        """
+
+        neg_x = neg_x_axis.unbind(dim=-1)
+        origin_xyz = origin.unbind(dim=-1)
+        xy_plane_xyz = xy_plane.unbind(dim=-1)
+
+        e0 = tuple(origin_axis - negative_axis for origin_axis, negative_axis in zip(origin_xyz, neg_x))
+        e1 = tuple(xy_axis - origin_axis for xy_axis, origin_axis in zip(xy_plane_xyz, origin_xyz))
+        denominator = torch.sqrt(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2] + eps)
+        e0 = tuple(axis / denominator for axis in e0)
+        dot = e0[0] * e1[0] + e0[1] * e1[1] + e0[2] * e1[2]
+        e1 = tuple(axis - e0_axis * dot for e0_axis, axis in zip(e0, e1))
+        denominator = torch.sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2] + eps)
+        e1 = tuple(axis / denominator for axis in e1)
+        e2 = (
+            e0[1] * e1[2] - e0[2] * e1[1],
+            e0[2] * e1[0] - e0[0] * e1[2],
+            e0[0] * e1[1] - e0[1] * e1[0],
+        )
+        rotation = torch.stack(tuple(axis for frame_axis in zip(e0, e1, e2) for axis in frame_axis), dim=-1)
+        return Frame(rotation.reshape(rotation.shape[:-1] + (3, 3)), torch.stack(origin_xyz, dim=-1))
+
+    @staticmethod
+    def make_transform_from_reference(n_xyz: Tensor, ca_xyz: Tensor, c_xyz: Tensor, eps: float = 1e-20) -> Frame:
+        r"""
+        Backbone frame from N/CA/C coordinates (AF2 reference-frame construction).
+
+        Args:
+            n_xyz: Nitrogen coordinates, shape ``(*, 3)``.
+            ca_xyz: Alpha-carbon coordinates, shape ``(*, 3)``.
+            c_xyz: Carbon coordinates, shape ``(*, 3)``.
+            eps: Numerical floor for the normalizations.
+
+        Returns:
+            The backbone frame with origin at the alpha carbon.
+        """
+
+        translation = -ca_xyz
+        n_local = n_xyz + translation
+        c_local = c_xyz + translation
+
+        c_x, c_y, c_z = c_local[..., 0], c_local[..., 1], c_local[..., 2]
+        norm = torch.sqrt(eps + c_x**2 + c_y**2)
+        sin_c1, cos_c1 = -c_y / norm, c_x / norm
+        c1 = _stack_rot([[cos_c1, -sin_c1, None], [sin_c1, cos_c1, None], [None, None, 1.0]], c_x)
+
+        norm = torch.sqrt(eps + c_x**2 + c_y**2 + c_z**2)
+        sin_c2, cos_c2 = c_z / norm, torch.sqrt(c_x**2 + c_y**2) / norm
+        c2 = _stack_rot([[cos_c2, None, sin_c2], [None, 1.0, None], [-sin_c2, None, cos_c2]], c_x)
+
+        c_rots = c2 @ c1
+        n_rotated = _rotate(c_rots, n_local)
+        n_y, n_z = n_rotated[..., 1], n_rotated[..., 2]
+        norm = torch.sqrt(eps + n_y**2 + n_z**2)
+        sin_n, cos_n = -n_z / norm, n_y / norm
+        n_rot = _stack_rot([[1.0, None, None], [None, cos_n, -sin_n], [None, sin_n, cos_n]], c_x)
+
+        rotation = (n_rot @ c_rots).transpose(-1, -2)
+        return Frame(rotation, -translation)
+
+
+def _rotate(rotation: Tensor, points: Tensor) -> Tensor:
+    r"""Apply rotation matrices ``(*, 3, 3)`` to points ``(*, 3)``."""
+
+    return torch.matmul(rotation, points.unsqueeze(-1)).squeeze(-1)
+
+
+def _stack_rot(rows: list[list], like: Tensor) -> Tensor:
+    r"""Assemble a batched ``(*, 3, 3)`` rotation from per-entry tensors/scalars/``None``."""
+
+    zeros = torch.zeros_like(like)
+    filled = [
+        [zeros if entry is None else (entry + zeros if not torch.is_tensor(entry) else entry) for entry in row]
+        for row in rows
+    ]
+    return torch.stack([torch.stack(row, dim=-1) for row in filled], dim=-2)
+
+
+def atom37_to_torsion_angles(
+    all_atom_positions: Tensor,
+    all_atom_mask: Tensor,
+    *,
+    chi_atom_indices: Tensor,
+    chi_angles_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Compute the seven backbone/side-chain torsion angles as sin/cos pairs.
+
+    Compact reimplementation of OpenFold ``atom37_to_torsion_angles`` restricted to what the
+    MpnnPacker consumes: the sin/cos torsion tensor and its validity mask.
+
+    Args:
+        all_atom_positions: Atom37 coordinates with shape ``(B, L, 37, 3)``.
+        all_atom_mask: Atom37 existence mask with shape ``(B, L, 37)``.
+        chi_atom_indices: Pre-indexed atom37 indices for the four chi angles, shape
+            ``(B, L, 4, 4)``.
+        chi_angles_mask: Pre-indexed chi existence mask, shape ``(B, L, 4)``.
+
+    Returns:
+        Tuple ``(torsion_sin_cos, torsion_mask)`` with shapes ``(B, L, 7, 2)``
+        and ``(B, L, 7)``.
+
+    Examples:
+        >>> torsions, torsion_mask = atom37_to_torsion_angles(  # doctest: +SKIP
+        ...     all_atom_positions,
+        ...     all_atom_mask,
+        ...     chi_atom_indices=chi_atom_indices,
+        ...     chi_angles_mask=chi_angles_mask,
+        ... )
+    """
+
+    pad = all_atom_positions.new_zeros([*all_atom_positions.shape[:-3], 1, 37, 3])
+    prev_positions = torch.cat([pad, all_atom_positions[..., :-1, :, :]], dim=-3)
+    pad = all_atom_mask.new_zeros([*all_atom_mask.shape[:-2], 1, 37])
+    prev_mask = torch.cat([pad, all_atom_mask[..., :-1, :]], dim=-2)
+
+    pre_omega_pos = torch.cat([prev_positions[..., 1:3, :], all_atom_positions[..., :2, :]], dim=-2)
+    phi_pos = torch.cat([prev_positions[..., 2:3, :], all_atom_positions[..., :3, :]], dim=-2)
+    psi_pos = torch.cat([all_atom_positions[..., :3, :], all_atom_positions[..., 4:5, :]], dim=-2)
+
+    pre_omega_mask = prev_mask[..., 1:3].all(dim=-1) & all_atom_mask[..., :2].all(dim=-1)
+    phi_mask = prev_mask[..., 2] & all_atom_mask[..., :3].all(dim=-1)
+    psi_mask = all_atom_mask[..., :3].all(dim=-1) & all_atom_mask[..., 4]
+
+    batch_indices = torch.arange(all_atom_positions.shape[0], device=all_atom_positions.device)[:, None, None, None]
+    residue_indices = torch.arange(all_atom_positions.shape[1], device=all_atom_positions.device)[None, :, None, None]
+    chis_pos = all_atom_positions[batch_indices, residue_indices, chi_atom_indices]
+    chi_atoms_mask = all_atom_mask[batch_indices, residue_indices, chi_atom_indices].all(dim=-1)
+    chis_mask = chi_angles_mask & chi_atoms_mask
+
+    torsions_pos = torch.cat(
+        [pre_omega_pos[..., None, :, :], phi_pos[..., None, :, :], psi_pos[..., None, :, :], chis_pos], dim=-3
+    )
+    torsion_angles_mask = torch.cat(
+        [pre_omega_mask[..., None], phi_mask[..., None], psi_mask[..., None], chis_mask], dim=-1
+    )
+
+    frames = Frame.from_3_points(torsions_pos[..., 1, :], torsions_pos[..., 2, :], torsions_pos[..., 0, :])
+    fourth_atom_rel = frames.invert_apply(torsions_pos[..., 3, :])
+    torsion_angles_sin_cos = torch.stack([fourth_atom_rel[..., 2], fourth_atom_rel[..., 1]], dim=-1)
+    denom = torch.sqrt(torch.sum(torsion_angles_sin_cos**2, dim=-1, keepdim=True) + 1e-8)
+    torsion_angles_sin_cos = torsion_angles_sin_cos / denom
+    torsion_angles_sin_cos[..., 2, :] = -torsion_angles_sin_cos[..., 2, :]
+    return torsion_angles_sin_cos, torsion_angles_mask
+
+
+def torsion_angles_to_frames(
+    backbone_frames: Frame,
+    torsions: Tensor,
+    *,
+    default_frames: Tensor,
+) -> Frame:
+    r"""
+    Turn per-residue torsion sin/cos into the eight global rigid-group frames.
+
+    Args:
+        backbone_frames: Per-residue backbone frames with batch shape ``(B, L)``.
+        torsions: Torsion sin/cos with shape ``(B, L, 7, 2)`` (three backbone + four chi).
+        default_frames: Pre-indexed rigid-group transforms with shape ``(B, L, 8, 4, 4)``.
+
+    Returns:
+        Eight global rigid-group frames with batch shape ``(B, L, 8)``.
+
+    Examples:
+        >>> frames = torsion_angles_to_frames(  # doctest: +SKIP
+        ...     backbone_frames, torsions, default_frames=default_frames
+        ... )
+    """
+
+    default = Frame.from_tensor_4x4(default_frames)
+
+    backbone_rotation = torsions.new_zeros((*((1,) * len(torsions.shape[:-1])), 2))
+    backbone_rotation[..., 1] = 1
+    alpha = torch.cat([backbone_rotation.expand(*torsions.shape[:-2], -1, -1), torsions], dim=-2)
+
+    all_rots = alpha.new_zeros(default.rotation.shape)
+    all_rots[..., 0, 0] = 1
+    all_rots[..., 1, 1] = alpha[..., 1]
+    all_rots[..., 1, 2] = -alpha[..., 0]
+    all_rots[..., 2, 1] = alpha[..., 0]
+    all_rots[..., 2, 2] = alpha[..., 1]
+    all_frames = default.compose(Frame(all_rots, torch.zeros_like(default.translation)))
+
+    chi1 = all_frames[..., 4]
+    chi2 = chi1.compose(all_frames[..., 5])
+    chi3 = chi2.compose(all_frames[..., 6])
+    chi4 = chi3.compose(all_frames[..., 7])
+    frames_to_bb = _frame_cat([all_frames[..., :5], chi2.unsqueeze(-1), chi3.unsqueeze(-1), chi4.unsqueeze(-1)])
+    return backbone_frames.unsqueeze(-1).compose(frames_to_bb)
+
+
+def frames_and_literature_positions_to_atom14_pos(
+    frames: Frame,
+    *,
+    atom14_to_rigid_group: Tensor,
+    atom14_rigid_group_positions: Tensor,
+    atom14_mask: Tensor,
+) -> Tensor:
+    r"""
+    Place literature atom14 positions using the global rigid-group frames.
+
+    Args:
+        frames: Eight global rigid-group frames with batch shape ``(B, L, 8)``.
+        atom14_to_rigid_group: Pre-indexed rigid-group indices with shape ``(B, L, 14)``.
+        atom14_rigid_group_positions: Pre-indexed literature positions with shape ``(B, L, 14, 3)``.
+        atom14_mask: Pre-indexed atom14 existence mask with shape ``(B, L, 14)``.
+
+    Returns:
+        Atom14 coordinates with shape ``(B, L, 14, 3)``.
+
+    Examples:
+        >>> coords = frames_and_literature_positions_to_atom14_pos(  # doctest: +SKIP
+        ...     frames,
+        ...     atom14_to_rigid_group=atom14_to_rigid_group,
+        ...     atom14_rigid_group_positions=atom14_rigid_group_positions,
+        ...     atom14_mask=atom14_mask,
+        ... )
+    """
+
+    group_mask = torch.nn.functional.one_hot(atom14_to_rigid_group, num_classes=8).to(frames.rotation.dtype)
+
+    rotation = (frames.rotation[..., None, :, :, :] * group_mask[..., None, None]).sum(dim=-3)
+    translation = (frames.translation[..., None, :, :] * group_mask[..., None]).sum(dim=-2)
+    atom_frames = Frame(rotation, translation)
+
+    return atom_frames.apply(atom14_rigid_group_positions) * atom14_mask.unsqueeze(-1)
+
+
+def _frame_cat(frames: list[Frame]) -> Frame:
+    r"""Concatenate frames along their last shared dimension."""
+
+    rotation = torch.cat([frame.rotation for frame in frames], dim=-3)
+    translation = torch.cat([frame.translation for frame in frames], dim=-2)
+    return Frame(rotation, translation)

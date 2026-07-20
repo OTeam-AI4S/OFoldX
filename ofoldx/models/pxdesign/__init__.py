@@ -1,42 +1,32 @@
-r"""
-Public API of the OFoldX-native PxDesign backbone design-generator family.
-
-Public surface of the OFoldX-native PxDesign family: the diffusion generator
-[`PxDesignDesigner`][ofoldx.models.pxdesign.model.PxDesignDesigner]
-and its [`PxDesignInput`][ofoldx.models.pxdesign.model.PxDesignInput], the
-[`PxDesignConfig`][ofoldx.models.pxdesign.config.PxDesignConfig] hierarchy, the
-[`PxDesignProcessor`][ofoldx.models.pxdesign.processor.PxDesignProcessor], and the all-atom design stages
-([`assign_sequences`][ofoldx.models.pxdesign.stages.assign_sequences] /
-[`filter_candidates`][ofoldx.models.pxdesign.stages.filter_candidates]) an
-[`AllAtomDesignPipeline`][ofoldx.pipelines.design.AllAtomDesignPipeline] injects as its stage callables.
-"""
+r"""Public tensor-level API of the PxDesign family."""
 
 from __future__ import annotations
 
+from ..registry import register_model as _register_model
 from .config import (
     PxDesignConditionEmbedderConfig,
     PxDesignConfig,
     PxDesignDenoiserConfig,
-    PxDesignDiffusionTrainingConfig,
-    PxDesignDistogramConfig,
+    PxDesignProcessorConfig,
     PxDesignSamplerConfig,
-    PxDesignTemplateConfig,
 )
-from .model import PxDesignDesigner, PxDesignInput
-from .processor import PxDesignProcessor
-from .stages import assign_sequences, filter_candidates
+from .model import (
+    PxDesignCandidate,
+    PxDesignConditionalTemplateEmbedder,
+    PxDesignConditionEmbedder,
+    PxDesignInput,
+    PxDesignLayout,
+    PxDesignModel,
+    PxDesignOutput,
+    PxDesignResult,
+    PxDesignSampler,
+)
+from .pipeline import PxDesignPipeline, PxDesignSuitePipeline
+from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
-__all__ = [
-    "PxDesignConditionEmbedderConfig",
-    "PxDesignConfig",
-    "PxDesignDenoiserConfig",
-    "PxDesignDesigner",
-    "PxDesignDiffusionTrainingConfig",
-    "PxDesignDistogramConfig",
-    "PxDesignInput",
-    "PxDesignProcessor",
-    "PxDesignSamplerConfig",
-    "PxDesignTemplateConfig",
-    "assign_sequences",
-    "filter_candidates",
-]
+_register_model(
+    "ofoldx.pxdesign",
+    model=PxDesignModel,
+    processor=PxDesignProcessor,
+    standard_tasks=(),
+)

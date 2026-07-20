@@ -4,11 +4,11 @@ Triangle update modules for Pairformer blocks.
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor, nn
 
 from ..backend import LayerNorm, resolve_config_operator_backend
 from ..backend import triangle_multiplication as dispatch_triangle_multiplication
+from ..backend.attention import triangle_attention as dispatch_triangle_attention
 from .multihead import GatedMultiheadAttention
 
 
@@ -25,8 +25,16 @@ class TriangleAttention(nn.Module):
         pair_size: Width of the pair-representation channel (query/key/value and output width).
         head_dim: Per-head dimension of the attention.
         num_attention_heads: Number of attention heads.
+        transpose_bias: If ``True`` the per-head bias is read from the pre-transpose pair (the DeepMind
+            AlphaFold 3 ending-node ``GridSelfAttention(transpose=True)`` convention); if ``False`` from
+            the pair as fed (OpenFold/AlphaFold 2, and every starting node). See the note below.
+        output_bias: Whether the attention output projection carries a learnable bias (AlphaFold 2).
+        gate_bias: Whether the output-gate projection carries a learnable bias (AlphaFold 2).
+        gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set (AlphaFold 2 uses
+            ``1.0`` to open the gate near init).
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``sdpa`` reference otherwise.
+            to the ``sdpa`` reference otherwise. A bias-free module on the ``oops`` backend uses the
+            dedicated flash ``triangle_attention`` kernel.
 
     Examples:
         >>> import torch
@@ -44,16 +52,30 @@ class TriangleAttention(nn.Module):
         pair_size: int = 128,
         head_dim: int = 32,
         num_attention_heads: int = 4,
+        *,
+        transpose_bias: bool = False,
+        output_bias: bool = False,
+        gate_bias: bool = False,
+        gate_bias_init: float = 0.0,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.norm_pair = LayerNorm(pair_size)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
+        # DeepMind AlphaFold 3's ending-node ``GridSelfAttention`` derives its pair bias from the
+        # *pre-transpose* pair, whereas the OpenFold-style ending node (this module, fed the already
+        # transposed pair by the caller) derives it from the transposed pair. When ``transpose_bias``
+        # is set, the bias is taken from the other orientation so the two conventions agree. Defaults
+        # off to preserve the OpenFold behaviour other model families depend on.
+        self.transpose_bias = transpose_bias
         self.attention = GatedMultiheadAttention(
             pair_size,
             num_attention_heads=num_attention_heads,
             head_dim=head_dim,
             query_bias=False,
+            output_bias=output_bias,
+            gate_bias=gate_bias,
+            gate_bias_init=gate_bias_init,
             operator_backend=operator_backend,
         )
 
@@ -87,16 +109,19 @@ class TriangleAttention(nn.Module):
         normalized = self.norm_pair(pair)
         # Triangle bias term b_{jk} = Linear(z_{jk}): a per-head function of the two attended columns, shared across
         # the starting-node row/batch axis. Project the pair, then move heads ahead of the (query, key) axes and add
-        # a singleton row axis so the same bias broadcasts over every row.
-        projected_bias = self.bias_projection(normalized)  # (..., n_query, n_key, num_heads)
+        # a singleton row axis so the same bias broadcasts over every row. ``transpose_bias`` reads the bias from the
+        # opposite token orientation (AlphaFold 3 ending-node convention; see ``__init__``).
+        bias_source = normalized.transpose(-3, -2) if self.transpose_bias else normalized
+        projected_bias = self.bias_projection(bias_source)  # (..., n_query, n_key, num_heads)
         triangle_bias = projected_bias.movedim(-1, -3).unsqueeze(-4)  # (..., 1, num_heads, n_query, n_key)
-        biases: list[Tensor] = [triangle_bias]
-        if pair_mask is not None:
-            pair_mask = pair_mask.to(device=normalized.device).bool()
-            mask_bias = torch.zeros_like(pair_mask, dtype=normalized.dtype)
-            mask_bias = mask_bias.masked_fill(~pair_mask, torch.finfo(normalized.dtype).min)
-            biases.insert(0, mask_bias[..., None, None, :])  # (..., n_row, 1, 1, n_key)
-        return self.attention(normalized, biases=biases)
+        return dispatch_triangle_attention(
+            normalized,
+            triangle_bias,
+            pair_mask,
+            projection=self.attention.projection,
+            operator_backend=self.attention.operator_backend,
+            torch_backend=self.attention.torch_backend,
+        )
 
 
 class TriangleMultiplication(nn.Module):
@@ -201,4 +226,10 @@ class TriangleMultiplication(nn.Module):
             output_gate_weight=self.gate_projection.weight,
             eps=self.norm_input.eps,
             operator_backend=self.operator_backend,
+            left_value_bias=self.left_projection.bias,
+            left_gate_bias=self.left_gate_projection.bias,
+            right_value_bias=self.right_projection.bias,
+            right_gate_bias=self.right_gate_projection.bias,
+            output_bias=self.output_projection.bias,
+            output_gate_bias=self.gate_projection.bias,
         )

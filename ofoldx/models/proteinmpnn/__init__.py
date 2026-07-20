@@ -1,23 +1,22 @@
-r"""
-ProteinMPNN design-generator model.
-
-Public surface for the OFoldX-native ProteinMPNN: the
-[`ProteinMPNNConfig`][ofoldx.models.proteinmpnn.config.ProteinMPNNConfig],
-the [`ProteinMPNNDesigner`][ofoldx.models.proteinmpnn.model.ProteinMPNNDesigner] and its typed
-[`ProteinMPNNInput`][ofoldx.models.proteinmpnn.model.ProteinMPNNInput], and the
-[`ProteinMPNNProcessor`][ofoldx.models.proteinmpnn.processor.ProteinMPNNProcessor].
-"""
+r"""OFoldX-native ProteinMPNN architecture."""
 
 from __future__ import annotations
 
-from .config import ProteinMPNNConfig
-from .model import ProteinMPNNDesigner, ProteinMPNNInput, ProteinMPNNRepresentations
-from .processor import ProteinMPNNProcessor
+from ...modules.mpnn import MpnnProteinFeatures
+from ...pipelines.registry import register_pipeline as _register_pipeline
+from ..registry import register_model as _register_model
+from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
+from .model import CaProteinMpnnFeatures, ProteinMpnnDesignResult, ProteinMpnnInput, ProteinMpnnModel
+from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
+from .processor import ProteinMpnnProcessor
 
-__all__ = [
-    "ProteinMPNNConfig",
-    "ProteinMPNNDesigner",
-    "ProteinMPNNInput",
-    "ProteinMPNNRepresentations",
-    "ProteinMPNNProcessor",
-]
+_register_model(
+    "ofoldx.proteinmpnn",
+    model=ProteinMpnnModel,
+    processor=ProteinMpnnProcessor,
+    standard_tasks=(),
+)
+_register_pipeline(
+    "ofoldx.proteinmpnn",
+    pipeline=ProteinMpnnPipeline,
+)

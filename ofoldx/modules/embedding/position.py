@@ -9,7 +9,6 @@ weight instead of materialising the dense ``[..., N, N, input_size]`` one-hot.
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 from typing import Literal
 
@@ -45,75 +44,6 @@ class RelativePositionBuckets:
     residue_size: int  # width of each of the residue & token one-hot blocks: 2 * (max_relative_residue + 1)
     chain_size: int  # width of the chain one-hot block: 2 * (max_relative_chain + 1)
     dtype: torch.dtype  # dtype of the embedder output (the buckets themselves stay integer)
-
-    def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> RelativePositionBuckets:
-        r"""
-        Return a copy moved to ``device`` with output dtype metadata updated.
-
-        Only the (integer) bucket tensors are moved; ``dtype`` updates the output-dtype metadata used
-        when the buckets are later embedded, it does not cast the bucket tensors themselves.
-
-        Args:
-            device: Optional destination device for bucket tensors.
-            dtype: Optional output dtype metadata.
-
-        Returns:
-            Updated bucket container.
-
-        Examples:
-            >>> import torch
-            >>> buckets = RelativePositionBuckets(
-            ...     residue_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     token_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     same_entity=torch.ones(2, 2, dtype=torch.bool),
-            ...     chain_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     residue_size=6,
-            ...     chain_size=4,
-            ...     dtype=torch.float32,
-            ... )
-            >>> buckets.to(dtype=torch.float64).dtype
-            torch.float64
-        """
-
-        move = (lambda t: t.to(device=device)) if device is not None else (lambda t: t)
-        return dataclasses.replace(
-            self,
-            residue_bucket=move(self.residue_bucket),
-            token_bucket=move(self.token_bucket),
-            same_entity=move(self.same_entity),
-            chain_bucket=move(self.chain_bucket),
-            dtype=dtype if dtype is not None else self.dtype,
-        )
-
-    def detach(self) -> RelativePositionBuckets:
-        r"""
-        Return a copy whose bucket tensors are detached from autograd.
-
-        Returns:
-            Detached bucket container with the same bucket values and metadata.
-
-        Examples:
-            >>> import torch
-            >>> buckets = RelativePositionBuckets(
-            ...     residue_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     token_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     same_entity=torch.ones(2, 2, dtype=torch.bool),
-            ...     chain_bucket=torch.zeros(2, 2, dtype=torch.long),
-            ...     residue_size=6,
-            ...     chain_size=4,
-            ...     dtype=torch.float32,
-            ... )
-            >>> buckets.detach().residue_bucket.requires_grad
-            False
-        """
-
-        return dataclasses.replace(
-            self,
-            residue_bucket=self.residue_bucket.detach(),
-            token_bucket=self.token_bucket.detach(),
-            same_entity=self.same_entity.detach(),
-            chain_bucket=self.chain_bucket.detach(),
-        )
 
 
 class RelativePositionEmbedder(nn.Module):
@@ -215,10 +145,10 @@ def generate_relative_position_features(
     r"""
     Build the pairwise relative-position buckets from token metadata.
 
-    When ``cyclic_period`` (shape ``(..., N)``) is supplied and any entry is positive, the raw
-    residue offset is wrapped modulo the period before bucketing. This is inactive when ``cyclic_period`` is
-    ``None`` or all zero. Only same-chain pairs survive the chain gate, and a cyclic chain has a constant period,
-    so broadcasting the period over the key axis matches the per-pair period for every pair that counts.
+    When ``cyclic_period`` (shape ``(..., N)``) is supplied, positive entries wrap the raw residue
+    offset modulo the period before bucketing. Zero entries leave the linear offset unchanged. Only same-chain
+    pairs survive the chain gate, and a cyclic chain has a constant period, so broadcasting the period over the
+    key axis matches the per-pair period for every pair that counts.
 
     ``chain_gate`` selects which pairs keep their real ``chain_offset`` bucket (the rest get the out-of-range
     sentinel): ``"same_entity"`` (default) keeps same-entity pairs, ``"not_same_chain"`` (the Boltz-1 variant)
@@ -265,13 +195,12 @@ def generate_relative_position_features(
     same_entity = entity_index[..., :, None] == entity_index[..., None, :]
 
     residue_difference = residue_index[..., :, None] - residue_index[..., None, :]
-    if cyclic_period is not None and bool(torch.any(cyclic_period > 0)):
-        period = torch.where(
-            cyclic_period > 0,
-            cyclic_period,
-            torch.full_like(cyclic_period, 10000),
-        )[..., None, :]
-        residue_difference = (residue_difference - period * torch.round(residue_difference / period)).long()
+    if cyclic_period is not None:
+        period = cyclic_period[..., None, :]
+        cyclic = period > 0
+        safe_period = torch.where(cyclic, period, torch.ones_like(period))
+        wrapped = (residue_difference - safe_period * torch.round(residue_difference / safe_period)).long()
+        residue_difference = torch.where(cyclic, wrapped, residue_difference)
     residue_offset = torch.clamp(
         residue_difference + max_relative_residue,
         min=0,

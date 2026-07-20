@@ -1,108 +1,103 @@
 ---
-library_name: ofoldx
+language: protein
 tags:
-  - design
-  - protein-design
-  - biology
-pipeline_tag: other
-license: mit
-base_model: boltz-community/boltz-2
+  - Biology
+  - Protein
+  - Protein Design
+  - Inverse Folding
+license: agpl-3.0
 datasets:
   - boltzgen/boltzgen1_train
   - boltzgen/inference-data
+base_model: boltz-community/boltz-2
+library_name: ofoldx
+pipeline_tag: other
 ---
 
 # BoltzGen
 
-BoltzGen is a structure-based biomolecular design family with two generators: a
-diffusion structure designer that samples complex coordinates under design
-conditioning, and an inverse-folding designer that decodes per-token residue
-types from an input backbone.
+> [!IMPORTANT]
+Structure-based biomolecular design family for universal binder design, controllable protein design, and inverse folding.
 
-The structure designer adds a v1 template module, a token-distance module, and
-binding / design-mask / secondary-structure conditioning in the input embedder,
-with opt-in confidence and affinity scoring heads. The inverse-folding path
-encodes the structure into a kNN token graph and autoregressively samples
-sequences.
+> [!NOTE]
+> This family registers two Model/Processor pairs (`ofoldx.boltzgen`, `ofoldx.boltzgen_ifold`) and exposes the
+> canonical Processors (`BoltzGenProcessor`, `BoltzGenIFoldProcessor`), a family-owned result
+> (`BoltzGenResult` / `BoltzGenCandidate` — a coordinate-producing, variable-topology result that does **not**
+> reuse the frozen coordinate-free `DesignResult`), and the multi-stage `BoltzGenPipeline`. The released system
+> is a 7-stage pipeline (`design -> inverse_folding -> design_folding -> folding -> affinity -> analysis ->
+> filtering`); `BoltzGenPipeline.design(...)` runs design + inverse folding and composes the folding/affinity
+> stages with the Boltz-2 family by **read-only** import (inject a `Boltz2Model`/`Boltz2Processor` for refold and
+> a `Boltz2AffinityModel`/`Boltz2AffinityProcessor` for affinity — BoltzGen never adds a verb to boltz2). Whole-
+> assembly topology is the family-owned `total_len` argument on `BoltzGenProcessor`. Fully-generated `total_len`
+> assemblies are realized under the frozen §3.7 placement core (X1-B): a `BoltzGenPlacements` (or, absent one,
+> a single `total_len`-long generated chain) declares ONE whole-assembly group whose inner placements are its
+> chains; per-chain lengths are drawn from the `total_len` budget and the realized topology is exposed as
+> `BoltzGenLayout.placement_map` (`declaration_group -> placement_id -> ordered ComponentReference occurrences`),
+> resolved with `ofoldx.data.placement.resolve`. Extending an EXISTING input system with generated rows (the
+> released `Structure.concatenate` X1-A path) and `BoltzGenStructureGroup` conditioning are now implemented; the
+> structure-group lowering to `token_distance_mask` is ratified/frozen under §3.7.2, validated exact-equal
+> against the released featurizer (2026-07-19). Neither raises.
+>
+> The `design` verb resolves through `BoltzGenPipeline`, not the generic single-Model `design` standard task
+> (`standard_tasks=()` on both registered pairs). The released Lightning `.ckpt` files pickle upstream BoltzGen
+> objects, so the path-based converter needs an upstream `boltzgen` + `pydssp` deserialization environment;
+> otherwise export a plain state dict or safetensors with the upstream code and pass it to the state-dict
+> converter (`convert_boltzgen_checkpoint` / `convert_boltzgen_ifold_checkpoint`).
 
-## Usage
+## Disclaimer
 
-```python
-import ofoldx
+This is an UNOFFICIAL OFoldX conversion of [BoltzGen: Toward Universal Binder Design](https://doi.org/10.1101/2025.11.20.689494) by Hannes Stark, Felix Faltings, MinGyu Choi, et al.
 
-# Structure-conditioned generation with a diffusion design checkpoint.
-result = ofoldx.design("seed_structure.cif", model="oteam/boltzgen-diverse", num_designs=8)
+The OFFICIAL repository of BoltzGen is at [HannesStark/boltzgen](https://github.com/HannesStark/boltzgen).
 
-# Inverse folding: design sequences for a fixed backbone.
-seqs = ofoldx.design("backbone.cif", model="oteam/boltzgen-inversefolding", design_chains="A")
-```
-
-The structure generators load through
-[`BoltzGenDesigner`][ofoldx.models.boltzgen.model.BoltzGenDesigner] and the
-inverse-folding generator through
-[`BoltzGenInverseFoldDesigner`][ofoldx.models.boltzgen.model.BoltzGenInverseFoldDesigner];
-`AutoModel` resolves the right class from the checkpoint's architecture key:
-
-```python
-from ofoldx.models import AutoModel
-
-model = AutoModel.from_pretrained("oteam/boltzgen-diverse")
-```
+**The team releasing BoltzGen did not write this model card, so this model card has been written by the OFoldX team.**
 
 ## Model Details
 
-- **Task:** design
-- **Upstream project:** [BoltzGen](https://github.com/HannesStark/boltzgen)
-- **Source release:** [boltzgen/boltzgen-1](https://huggingface.co/boltzgen/boltzgen-1)
-- **Paper:** [BoltzGen: Toward Universal Binder Design](https://doi.org/10.1101/2025.11.20.689494)
-- **License:** MIT for upstream BoltzGen code.
+BoltzGen is a structure-based biomolecular design family with two architectures. `BoltzGenModel` refines single and pair representations with a Pairformer / MSA trunk, adds a v1 template module, token-distance conditioning, and binding / design-mask / secondary-structure conditioning, then samples complex coordinates with EDM diffusion. `BoltzGenIFoldModel` instead encodes a backbone into a k-nearest-neighbour token graph and autoregressively decodes residue types with amino-acid and symmetry constraints. The released structure checkpoints do not contain confidence or affinity heads; those belong to the Boltz-2 families.
+
+### Model Specification
+
+Structure-generating designers (diffusion):
+
+| Architecture             | Trunk Blocks   | Single Size | Pair Size | Diffusion Token Blocks | Recycling Steps | Sampler Steps |
+| ------------------------ | -------------- | ----------- | --------- | ---------------------- | --------------- | ------------- |
+| boltzgen                 | 64             | 384         | 128       | 24                     | 3               | 200           |
+| diverse         | 64             | 384         | 128       | 24                     | 3               | 200           |
+| adherence       | 64             | 384         | 128       | 24                     | 3               | 200           |
+| structuretrained-small | 12 (Miniformer) | 384        | 128       | 8                      | 3               | 200           |
+
+Inverse-folding designer (kNN graph):
+
+| Architecture            | Encoder Layers | Decoder Layers | Node Size | Hidden Size | k-Neighbors |
+| ----------------------- | -------------- | -------------- | --------- | ----------- | ----------- |
+| boltzgen_ifold | 6              | 3              | 128       | 128         | 30          |
+
+> [!NOTE]
+> `diverse`, `adherence`, and `structuretrained-small` are parameter/weight variants of `BoltzGenModel`, not separate
+> Python architecture classes. The small checkpoint uses 12 Miniformer trunk blocks, 3 Miniformer MSA blocks, 8
+> diffusion token blocks, a Miniformer template, and no token-distance or design-conditioning channels.
+
+### Links
+
+- **Code**: [ofoldx.models.boltzgen](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltzgen)
+- **Paper**: [BoltzGen: Toward Universal Binder Design](https://doi.org/10.1101/2025.11.20.689494)
+- **Developed by**: Hannes Stark, Felix Faltings, MinGyu Choi, et al.
+- **Model type**: Structure-conditioned diffusion design generator with an EDM sampler, plus an inverse-folding kNN graph decoder
+- **Base model**: [boltz-community/boltz-2](https://huggingface.co/boltz-community/boltz-2)
+- **Original Repository**: [HannesStark/boltzgen](https://github.com/HannesStark/boltzgen)
+
+## Training Details
+
+BoltzGen is trained with a diffusion objective for structure-conditioned biomolecular design, building on the Boltz-2 data pipeline. This describes the released weights; it is not an OFoldX training contract.
 
 ### Training Data
 
-BoltzGen builds on the Boltz-2 data pipeline. The public training release
-includes `targets.zip` and `msa.zip` in the `boltzgen/boltzgen1_train` dataset
-and molecule dictionaries in `boltzgen/inference-data`; the full large-model
-recipe may also use additional distillation data. Per-artifact training-data
-notes are given in [Variants](#variants).
+BoltzGen builds on the Boltz-2 data pipeline. The public training release includes `targets.zip` and `msa.zip` in the `boltzgen/boltzgen1_train` dataset and molecule dictionaries in `boltzgen/inference-data`; the full large-model recipe may also use additional distillation data. The `boltzgen_ifold` artifact corresponds to a distinct upstream inverse-folding training target, and `structuretrained-small` corresponds to the released small structure-trained checkpoint. OFoldX does not redistribute the training corpus.
 
 ### Training Procedure
 
-Upstream BoltzGen trains a diffusion objective over randomly cropped
-biomolecular structures with randomly selected design and conditioning regions,
-covering a model suite that spans folding, design, and inverse folding. OFoldX
-converts the released checkpoints; it does not run BoltzGen training.
-
-## Variants
-
-The published `boltzgen-1` release ships four checkpoints. The base `boltzgen`
-key is the umbrella structure-design configuration that the published variants
-inherit from; it carries no separately published weights of its own.
-
-| Architecture key                  | Public name              | What differs                                                                                                                                        |
-| --------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `boltzgen`                        | boltzgen                 | Base structure-design configuration; registry/umbrella key inherited by the published variants. No separate published checkpoint.                   |
-| `boltzgen_diverse`                | boltzgen-diverse         | Diffusion design generator optimized for diverse structure-conditioned generation (`boltzgen1_diverse.ckpt`).                                       |
-| `boltzgen_adherence`              | boltzgen-adherence       | Diffusion design generator optimized for adherence to conditioning signals for controllable binder and protein design (`boltzgen1_adherence.ckpt`). |
-| `boltzgen_structuretrained_small` | boltzgen-structure-small | Small structure-conditioned generation checkpoint using the compact Miniformer trunk (`boltzgen1_structuretrained_small.ckpt`).                     |
-| `boltzgen_ifold`                  | boltzgen-inversefolding  | Inverse-folding generator that designs sequences from backbone or structure inputs (`boltzgen1_ifold.ckpt`).                                        |
-
-**boltzgen-diverse** — Converted BoltzGen diverse generator checkpoint for
-diverse structure-conditioned design. OFoldX converts the released diverse
-checkpoint; it does not run BoltzGen training.
-
-**boltzgen-adherence** — Converted BoltzGen adherence generator checkpoint for
-controllable binder and protein design. OFoldX converts the released adherence
-checkpoint; it does not run BoltzGen training.
-
-**boltzgen-structure-small** — Converted small BoltzGen structure-trained
-checkpoint for structure-conditioned generation; corresponds to the released
-small structure-trained checkpoint. OFoldX converts the released BoltzGen
-structure-trained checkpoint; it does not run BoltzGen training.
-
-**boltzgen-inversefolding** — Converted BoltzGen inverse-folding checkpoint for
-designing sequences from structure inputs; inverse folding is released as a
-distinct upstream training target. OFoldX converts the released inverse-folding
-checkpoint; it does not run BoltzGen training.
+Upstream BoltzGen trains a diffusion objective over randomly cropped biomolecular structures with randomly selected design and conditioning regions, covering a model suite that spans folding, design, and inverse folding. OFoldX converts state dicts from the released checkpoints into strict-loaded native models in memory; loading the original pickled Lightning artifact requires the upstream deserialization environment described above. Repository publication still requires the corresponding Processors and `DesignResult` decoders. Matching the upstream training loop is not a Model Hub registration requirement.
 
 ## Citation
 
@@ -116,23 +111,48 @@ checkpoint; it does not run BoltzGen training.
 }
 ```
 
-## Conversion
+> [!NOTE]
+> The artifacts distributed in this repository are part of the OFoldX project.
+> If OFoldX supports your research, please cite the OFoldX project as follows:
 
-These weights are converted from the upstream BoltzGen release. `convert.py`
-ports a BoltzGen `.ckpt` into an OFoldX pretrained directory with OFoldX
-parameter names, routing the three top-level prefixes (`input_embedder` /
-`inverse_folding_encoder` / `structure_module`) to the matching OFoldX modules
-and reusing the Boltz-2 atom converters for the input embedder.
-
-```bash
-# Structure-design checkpoints (auto-detected):
-python -m ofoldx.models.boltzgen.convert boltzgen1_diverse.ckpt out/boltzgen_diverse
-
-# Inverse-folding checkpoint (requires --kind ifold):
-python -m ofoldx.models.boltzgen.convert boltzgen1_ifold.ckpt out/boltzgen_ifold --kind ifold
+```bibtex
+@software{chen2026ofoldx,
+  author = {Chen, Zhiyuan},
+  title  = {OFoldX},
+  year   = {2026},
+  url    = {https://github.com/OTeam-AI4S/OFoldX},
+}
 ```
 
-Options: `--architecture` (one of the five architecture keys), `--kind`
-(`auto` / `structure-design` / `ifold`), `--state-key` (`auto`, `state_dict`,
-`model_state_dict`, `model`, or `root`), and `--dtype` (`keep`, `float32`,
-`float16`, `bfloat16`), plus the shared hub-upload arguments.
+## Contact
+
+Please use GitHub issues of [OFoldX](https://github.com/OTeam-AI4S/OFoldX/issues) for questions or comments on the model card.
+
+Please contact the authors of the [BoltzGen paper](https://doi.org/10.1101/2025.11.20.689494) for questions or comments on the paper/model.
+
+## License
+
+This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.html).
+
+```spdx
+SPDX-License-Identifier: AGPL-3.0-or-later
+```
+
+## Limitations & intentional upstream divergences
+
+- The diffusion noise schedule keeps the upstream-faithful `noise_scale**2` form
+  rather than a simplified linear scale; this is an intentional faithfulness choice,
+  not a bug.
+- The release inventory carries several checkpoints (`boltzgen1_adherence`,
+  `boltzgen1_diverse`, `boltzgen1_ifold`, `boltzgen1_structuretrained_small`);
+  publication must state which variants are qualified. The sampler is stochastic.
+- A parity run applies only to the checkpoint and settings supplied to the script.
+
+## Licensing & redistribution
+
+- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
+- **Upstream code & weights:** MIT
+  ([boltzgen LICENSE](https://github.com/HannesStark/BoltzGen/blob/main/LICENSE),
+  Copyright (c) 2025 Hannes Stärk).
+- **Redistribution status: GREEN.** BoltzGen checkpoints are permissively licensed
+  and freely redistributable with the upstream MIT notice preserved.

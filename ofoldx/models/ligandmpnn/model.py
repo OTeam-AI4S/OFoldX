@@ -1,891 +1,1057 @@
 r"""
-Message-passing graph model that scores and samples protein sequences over backbone and ligand context.
+LigandMpnn context-aware sequence-design model.
 
-The OFoldX-native reimplementation of LigandMPNN: a message-passing graph model that scores or
-autoregressively samples protein sequences conditioned on backbone geometry and nearby ligand/context atoms.
-The public surface is [`LigandMPNNDesigner`]
-[ofoldx.models.ligandmpnn.model.LigandMPNNDesigner] and its typed input
-[`LigandMPNNInput`][ofoldx.models.ligandmpnn.model.LigandMPNNInput]; the remaining classes are the graph
-encoder, autoregressive decoder, and the tensor helpers they share with the side-chain
-[`LigandMPNNPacker`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker].
+The OFoldX-native reimplementation of LigandMPNN: a message-passing graph model that designs protein
+sequences conditioned on backbone geometry and nearby ligand/context atoms. The public surface is
+[`LigandMpnnModel`][ofoldx.models.ligandmpnn.model.LigandMpnnModel] and its typed input
+[`LigandMpnnInput`][ofoldx.models.ligandmpnn.model.LigandMpnnInput]. Raw forward and sampling return
+the shared [`MpnnOutput`][ofoldx.models.mpnn.MpnnOutput] and
+[`MpnnSamplingOutput`][ofoldx.models.mpnn.MpnnSamplingOutput]; the four probability operations return the
+shared [`MpnnProbabilityResult`][ofoldx.models.mpnn.MpnnProbabilityResult]; ``design`` returns the shared
+[`DesignResult`][ofoldx.results.DesignResult]. The root Model owns the released feature Module directly:
+there is no ``LigandMpnnBackbone`` checkpoint-prefix wrapper.
 """
 
 from __future__ import annotations
 
 import itertools
-from collections.abc import Mapping
+import math
 from dataclasses import dataclass
-from typing import Any, ClassVar
 
 import torch
-import torch.distributions as distributions
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ...data import residue_constants as rc
-from ...modules.representation import Single
-from ..contract import BaseInput, SequenceDesignCandidate, register_pytree_dataclass
-from ..mixin import ModelMixin
-from ..registry import DESIGN_MODELS, MODELS, SIDE_CHAIN_PACKING_MODELS
-from .chemical import periodic_group_period, side_chain_atom_types
-from .config import LigandMPNNConfig, LigandMPNNPackerConfig
+from ...data.components import get_component
+from ...data.molecular import (
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+)
+from ...data.structure import Structure
+from ...modules.mpnn import (
+    AMINO_ACID_COMPONENT_IDS,
+    MpnnDecoderLayer,
+    MpnnEncoderLayer,
+    MpnnOutput,
+    MpnnProteinFeatures,
+    MpnnSamplingOutput,
+    _autoregressive_masks,
+    _decoding_order_to_ranks,
+    _radial_basis,
+    _virtual_beta_carbon,
+    cat_neighbors_nodes,
+    gather_nodes,
+    periodic_group_period,
+)
+from ...results import DesignCandidate, DesignResult, MpnnProbabilityResult, Score
+from .config import LigandMpnnConfig
+
+_VOCABULARY = len(AMINO_ACID_COMPONENT_IDS) + 1
+_GENERATABLE = len(AMINO_ACID_COMPONENT_IDS)
 
 
-@MODELS.register("ligandmpnn")
-@DESIGN_MODELS.register("ligandmpnn")
-class LigandMPNNDesigner(ModelMixin):
-    r"""
-    Message-passing model that designs and scores sequences for a protein-ligand complex
-    (LigandMPNN inverse folding).
+def side_chain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
+    r"""Build LigandMPNN's 32-slot side-chain element lookup for atom37 slots ``5:37``."""
 
-    The training path is [`forward`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.forward]
-    (teacher-forced log-probabilities over a random decode order); inference is exposed through the house
-    capability verbs [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design] (autoregressive
-    sequence generation), [`score`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.score]
-    (log-likelihood of a given sequence), and [`single_residue_score`]
-    [ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.single_residue_score] (one masked position at a
-    time). Each verb returns a
-    [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate].
+    return torch.tensor(
+        [6, 6, 6, 8, 8, 16, 6, 6, 6, 7, 7, 8, 8, 16, 6, 6, 6, 6, 7, 7, 7, 8, 8, 6, 7, 7, 8, 6, 6, 6, 7, 8],
+        dtype=torch.long,
+        device=device,
+    )
 
-    Args:
-        config: Model configuration; a default
-            [`LigandMPNNConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNConfig] is used when ``None``.
 
-    Examples:
-        >>> from ofoldx import AutoModel, AutoProcessor  # doctest: +SKIP
-        >>> processor = AutoProcessor.from_pretrained("ofoldx/ligandmpnn")  # doctest: +SKIP
-        >>> model = AutoModel.from_pretrained("ofoldx/ligandmpnn")  # doctest: +SKIP
-        >>> model.design(processor("complex.pdb"))  # doctest: +SKIP
+def _backbone_atoms(coordinates: Tensor) -> dict[str, Tensor]:
+    r"""Split N/CA/C/O coordinates and add the idealized virtual Cβ atom."""
+
+    nitrogen = coordinates[:, :, 0]
+    alpha_carbon = coordinates[:, :, 1]
+    carbon = coordinates[:, :, 2]
+    oxygen = coordinates[:, :, 3]
+    beta_carbon = _virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
+    return {"N": nitrogen, "CA": alpha_carbon, "C": carbon, "O": oxygen, "CB": beta_carbon}
+
+
+def _local_angle_features(
+    nitrogen: Tensor,
+    alpha_carbon: Tensor,
+    carbon: Tensor,
+    points: Tensor,
+) -> Tensor:
+    r"""Direction features of ``points`` expressed in each residue's local backbone frame."""
+
+    first_axis = F.normalize(nitrogen - alpha_carbon, dim=-1)
+    carbon_vector = carbon - alpha_carbon
+    projected = torch.einsum("bli,bli->bl", first_axis, carbon_vector)[..., None]
+    second_axis = F.normalize(carbon_vector - first_axis * projected, dim=-1)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
+    local = torch.einsum("blqp,blyq->blyp", frame, points - alpha_carbon[:, :, None])
+    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
+    spatial_radius = torch.norm(local, dim=-1) + 1e-8
+    return torch.stack(
+        (
+            local[..., 0] / planar_radius,
+            local[..., 1] / planar_radius,
+            planar_radius / spatial_radius,
+            local[..., 2] / spatial_radius,
+        ),
+        dim=-1,
+    )
+
+
+def _decode_groups(decode_order: Tensor, tied_groups: list[list[int]]) -> list[list[int]]:
+    r"""Order tied groups by the first time any member appears in the decode order."""
+
+    ordered: list[list[int]] = []
+    seen: set[int] = set()
+    for residue in decode_order.detach().cpu().tolist():
+        residue = int(residue)
+        if residue in seen:
+            continue
+        group = next((candidate for candidate in tied_groups if residue in candidate), None)
+        selected = list(group) if group is not None else [residue]
+        ordered.append(selected)
+        seen.update(selected)
+    return ordered
+
+
+def _collapse_tied_order(
+    decode_order_row: Tensor,
+    tied_groups: tuple[tuple[int, ...], ...],
+) -> Tensor:
+    r"""Collapse a drawn order so every tied group decodes consecutively from its first member."""
+
+    ordered = _decode_groups(decode_order_row, [list(group) for group in tied_groups])
+    return torch.tensor(
+        list(itertools.chain.from_iterable(ordered)),
+        device=decode_order_row.device,
+        dtype=torch.long,
+    )
+
+
+def _realize_designed_system(
+    system: MolecularSystem,
+    component_references: tuple[ComponentReference | None, ...],
+    sampled_tokens: list[int],
+    design_mask: list[bool],
+) -> MolecularSystem:
+    r"""Realize one candidate while preserving entity, instance, and bond identity.
+
+    Designed protein occurrences take their sampled generatable identity; every untouched entity,
+    instance, and resolvable stored bond is preserved. Changed copies of a shared entity partition by
+    their complete output component-ID sequence exactly as frozen for ProteinMpnn, and entities from
+    different originals never merge.
     """
 
-    input_class: ClassVar[type[BaseInput]]
+    replacements = {
+        reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
+        for reference, token, selected in zip(component_references, sampled_tokens, design_mask)
+        if reference is not None and selected
+    }
+    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            realized_by_instance[instance_id] = PolymerSequence(
+                entity.polymer_type,
+                tuple(
+                    replacements.get((instance_id, index), component)
+                    for index, component in enumerate(entity.components)
+                ),
+            )
+        else:
+            realized_by_instance[instance_id] = entity
 
-    config_class = LigandMPNNConfig
+    # TODO(§3.4.1 reopened): family-owned canonical entity splitting is still reopened for LigandMpnn.
+    # Until it freezes we partition changed copies within each original entity by complete output
+    # component-ID sequence, exactly as frozen for ProteinMpnn (§4.7); this is the minimal current
+    # behavior and never merges entities from different originals.
+    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
+        entity_id: [] for entity_id in system.entities
+    }
+    for instance_id, entity_id in system.instances.items():
+        entity = realized_by_instance[instance_id]
+        signature = tuple(component.component_id for component in entity.components)
+        partition = next(
+            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
+            None,
+        )
+        if partition is None:
+            partitions[entity_id].append((signature, entity, [instance_id]))
+        else:
+            partition[2].append(instance_id)
 
-    def __init__(self, config: LigandMPNNConfig | None = None) -> None:
-        config = LigandMPNNConfig() if config is None else config
-        super().__init__(config)
-        self.backbone = LigandMPNNBackbone(config)
-        self.post_init()
+    used_ids = set(system.entities)
+    new_entities: dict[str, PolymerSequence | Molecule] = {}
+    instance_entities: dict[str, str] = {}
+    for entity_id, original in system.entities.items():
+        values = partitions[entity_id]
+        original_signature = tuple(component.component_id for component in original.components)
+        primary_index = next(
+            (index for index, value in enumerate(values) if value[0] == original_signature),
+            0,
+        )
+        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
+            signature, entity, instance_ids = values[partition_index]
+            if partition_index == primary_index:
+                output_id = entity_id
+            else:
+                suffix = 2
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+            new_entities[output_id] = original if signature == original_signature else entity
+            for instance_id in instance_ids:
+                instance_entities[instance_id] = output_id
+    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
+    candidate = MolecularSystem(new_entities, new_instances)
+    retained_bonds = []
+    for bond in system.bonds:
+        try:
+            candidate.atom(bond.site_a)
+            candidate.atom(bond.site_b)
+            if bond.stereo_sites is not None:
+                candidate.atom(bond.stereo_sites[0])
+                candidate.atom(bond.stereo_sites[1])
+        except KeyError:
+            continue
+        retained_bonds.append(bond)
+    return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
 
-    def _init_module_weights(self, module: nn.Module) -> None:
-        return None
 
-    def reset_parameters(self) -> None:
-        r"""
-        Re-initialize backbone weights to match the released LigandMPNN scheme.
+class LigandMpnnFeatures(MpnnProteinFeatures):
+    r"""
+    Input featurizer for the LigandMPNN backbone graph and ligand/side-chain context.
 
-        Applies Xavier-uniform initialization to every weight matrix (parameters with more than one
-        dimension), leaving biases and normalization scales untouched. Called for freshly-created models so
-        their initialization matches the reference implementation rather than PyTorch defaults.
-        """
+    Derives the virtual Cβ atom, builds the k-nearest-neighbor residue graph and pairwise edge features
+    (through the shared full-protein edge graph), and in parallel featurizes the nonprotein context atoms
+    (per-atom RBF distances to backbone atoms, periodic-table element one-hots, and local-frame angle
+    features). When ``use_side_chain_context`` is set at call time, the observed side-chain atoms of the
+    nearest fixed residues are folded into that context and the nearest atoms are reselected.
 
-        for parameter in self.backbone.parameters():
-            if parameter.dim() > 1:
-                nn.init.xavier_uniform_(parameter)
+    Args:
+        hidden_size: Width of the per-residue edge features and per-atom context node features.
+        num_neighbors: Number of nearest-neighbor residues in the graph.
+        num_positional_embeddings: Width of the relative-position embedding.
+        num_rbf: Number of radial basis functions per distance feature.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_neighbors: int,
+        *,
+        num_positional_embeddings: int = 16,
+        num_rbf: int = 16,
+    ) -> None:
+        super().__init__(
+            hidden_size,
+            num_neighbors,
+            num_positional_embeddings=num_positional_embeddings,
+            num_rbf=num_rbf,
+        )
+        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
+        self.atom_norm = nn.LayerNorm(hidden_size)
+        self.element_projection = nn.Linear(147, 64)
+        self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
+        self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
+        self.context_edge_norm = nn.LayerNorm(hidden_size)
+        self.context_node_norm = nn.LayerNorm(hidden_size)
+        buffer_device = self.element_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        group, period = periodic_group_period(device=buffer_device)
+        self.register_buffer("periodic_group", group, persistent=False)
+        self.register_buffer("periodic_period", period, persistent=False)
+        self.register_buffer(
+            "side_chain_atom_types",
+            side_chain_atom_types(device=buffer_device),
+            persistent=False,
+        )
 
     def forward(
         self,
-        batch: LigandMPNNInput,
+        backbone_coordinates: Tensor,
+        valid_mask: Tensor,
+        residue_indices: Tensor,
+        chain_indices: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+        residue_context_coordinates: Tensor,
+        residue_context_mask: Tensor,
+        design_mask: Tensor,
         *,
-        use_sequence: bool = True,
-        num_samples: int | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Training path: teacher-forced per-token log-probabilities over a decode order.
+        use_side_chain_context: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        r"""Featurize backbone geometry and context atoms into graph inputs.
 
-        Mirrors the upstream LigandMPNN training objective: encode the backbone/ligand graph once, draw a
-        decode order (random noise while ``self.training``, deterministic otherwise), and run a single
-        teacher-forced decoder pass whose gradients flow back to every weight. The returned logits are the
-        input to an external cross-entropy loss against the true sequence. This is a compile-clean,
-        symmetry-free single pass (the autoregressive sampling loop lives on the inference verb
-        [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design]).
-
-        Args:
-            batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            use_sequence: Whether the decoder may condition on the teacher-forced sequence context.
-            num_samples: Number of decode orders to evaluate; defaults to the value on ``batch``.
+        Coordinate noise, when requested, is already applied by the caller to ``backbone_coordinates`` and
+        ``context_coordinates``; the fixed side-chain coordinates are never perturbed.
 
         Returns:
-            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with grad-carrying
-            per-token logits, the true tokens, and per-token/per-sequence log-likelihood scores.
-
-        Examples:
-            >>> model(batch)  # doctest: +SKIP
+            Tuple ``(atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask)``:
+            per-residue context node features, residue-graph edges and neighbor indices, and the
+            context-atom node/edge features and validity mask.
         """
 
-        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False, training=self.training)
-        logits, tokens = self.backbone.teacher_forced_logits(features, use_sequence=use_sequence)
-        log_probs = F.log_softmax(logits, dim=-1)
-        return SequenceDesignCandidate(
-            sequence_logits=logits,
-            sequence_tokens=tokens,
-            scores={
-                "log_probs": log_probs,
-                "sequence_log_likelihood": _sequence_log_likelihood(tokens, log_probs, features["mask"]),
-            },
-            metadata={
-                "architecture": "ligandmpnn",
-                "backend": "native_ligandmpnn",
-                "mode": "training",
-                "use_sequence": use_sequence,
-            },
+        num_context_atoms = context_coordinates.shape[2]
+        atoms = _backbone_atoms(backbone_coordinates)
+        edges, neighbor_indices = super().forward(
+            backbone_coordinates,
+            valid_mask,
+            residue_indices,
+            chain_indices,
         )
+        if use_side_chain_context:
+            context_coordinates, context_atomic_numbers, context_mask = self._append_side_chain_context(
+                atoms["CB"],
+                context_coordinates,
+                context_atomic_numbers,
+                context_mask,
+                residue_context_coordinates,
+                residue_context_mask,
+                design_mask,
+                valid_mask,
+                neighbor_indices,
+                num_context_atoms,
+            )
 
-    def score(
-        self,
-        batch: LigandMPNNInput,
-        *,
-        use_sequence: bool = True,
-        num_samples: int | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Score a given sequence with the full-context autoregressive protocol.
+        context_atomic_numbers = context_atomic_numbers.long()
+        element_features = self._element_features(context_atomic_numbers)
+        element_projection = self.element_projection(element_features.to(dtype=backbone_coordinates.dtype))
 
-        Runs one forward pass of the encoder and decoder over the whole sequence, returning the per-token
-        logits and the masked-average sequence log-likelihood. When ``use_sequence`` is ``False`` the decoder
-        sees only the encoder context (no teacher-forced tokens), giving a structure-only score.
-
-        Args:
-            batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            use_sequence: Whether the decoder may condition on the ground-truth sequence context.
-            num_samples: Number of decode orders to evaluate; defaults to the value on ``batch``.
-
-        Returns:
-            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] whose ``scores``
-            hold per-token ``log_probs`` and a ``sequence_log_likelihood``, with LigandMPNN metadata.
-
-        Examples:
-            >>> model.score(batch, use_sequence=False)  # doctest: +SKIP
-        """
-
-        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
-        scored = self.backbone.score(features, use_sequence=use_sequence)
-        log_probs = scored["log_probs"]
-        return SequenceDesignCandidate(
-            sequence_logits=scored["logits"],
-            sequence_tokens=scored["S"],
-            scores={
-                "log_probs": log_probs,
-                "sequence_log_likelihood": _sequence_log_likelihood(scored["S"], log_probs, features["mask"]),
-            },
-            metadata={
-                "architecture": "ligandmpnn",
-                "backend": "native_ligandmpnn",
-                "num_edges": self.config.k_neighbors,
-                "atom_context_num": self.config.atom_context_num,
-                "use_sequence": use_sequence,
-            },
+        backbone_atoms = torch.stack(
+            (atoms["N"], atoms["CA"], atoms["C"], atoms["O"], atoms["CB"]),
+            dim=2,
         )
-
-    def single_residue_score(
-        self,
-        batch: LigandMPNNInput,
-        *,
-        use_sequence: bool = True,
-        num_samples: int | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Score each residue independently with the official single-position protocol.
-
-        Unlike [`score`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.score], which decodes
-        the whole sequence in one order, this masks one position at a time (revealing all others when
-        ``use_sequence`` is set) and reads off that position's log-probabilities. It reproduces LigandMPNN's
-        per-residue "conditional probabilities" mode and is proportionally more expensive (one pass per
-        residue).
-
-        Args:
-            batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            use_sequence: Whether the surrounding ground-truth sequence is visible when scoring a position.
-            num_samples: Number of decode-order replicas to evaluate; defaults to the value on ``batch``.
-
-        Returns:
-            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with per-residue
-            logits, ``log_probs``, and the aggregate ``sequence_log_likelihood``.
-
-        Examples:
-            >>> model.single_residue_score(batch)  # doctest: +SKIP
-        """
-
-        features = self._feature_dict(batch, num_samples=num_samples, for_sampling=False)
-        scored = self.backbone.single_residue_score(features, use_sequence=use_sequence)
-        log_probs = scored["log_probs"]
-        return SequenceDesignCandidate(
-            sequence_logits=scored["logits"],
-            sequence_tokens=scored["S"],
-            scores={
-                "log_probs": log_probs,
-                "sequence_log_likelihood": _sequence_log_likelihood(scored["S"], log_probs, features["mask"]),
-            },
-            metadata={
-                "architecture": "ligandmpnn",
-                "backend": "native_ligandmpnn",
-                "num_edges": self.config.k_neighbors,
-                "atom_context_num": self.config.atom_context_num,
-                "score_mode": "single_residue",
-                "use_sequence": use_sequence,
-            },
+        atom_context_distances = torch.sqrt(
+            torch.sum((backbone_atoms[:, :, :, None] - context_coordinates[:, :, None]) ** 2, dim=-1) + 1e-6
         )
+        atom_context_features = _radial_basis(atom_context_distances.movedim(2, 3), self.num_rbf).flatten(start_dim=-2)
+        atom_features = torch.cat(
+            (
+                atom_context_features,
+                element_projection,
+                _local_angle_features(atoms["N"], atoms["CA"], atoms["C"], context_coordinates),
+            ),
+            dim=-1,
+        )
+        atom_features = self.atom_norm(self.atom_projection(atom_features))
+        context_distances = torch.sqrt(
+            torch.sum((context_coordinates[:, :, :, None] - context_coordinates[:, :, None, :]) ** 2, dim=-1) + 1e-6
+        )
+        context_edges = self.context_edge_norm(
+            self.context_edge_projection(_radial_basis(context_distances, self.num_rbf))
+        )
+        context_nodes = self.context_node_norm(
+            self.context_node_projection(element_features.to(dtype=backbone_coordinates.dtype))
+        )
+        return atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask
 
-    @torch.no_grad()
-    def design(
+    def _append_side_chain_context(
         self,
-        batch: LigandMPNNInput,
-        *,
-        temperature: float | Tensor | None = None,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Design sequences by autoregressive sampling (the house design verb, no gradient tracking).
+        beta_carbon: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+        residue_context_coordinates: Tensor,
+        residue_context_mask: Tensor,
+        design_mask: Tensor,
+        valid_mask: Tensor,
+        neighbor_indices: Tensor,
+        num_context_atoms: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Append the observed side-chain atoms of the nearest fixed residues, then reselect atoms.
 
-        The inference entry point for generation: samples new sequences for the input backbone under
-        ``torch.no_grad``. Returns the raw typed
-        [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate]; the design facade wraps
-        it into a design output.
-
-        Args:
-            batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            temperature: Softmax temperature for sampling; ``None`` uses the value on ``batch``.
-            num_samples: Number of independent sequences to sample; defaults to the value on ``batch``.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] with sampled tokens,
-            logits, and per-token log-probabilities and sampling probabilities.
-
-        Examples:
-            >>> model.design(batch, temperature=0.1)  # doctest: +SKIP
+        Only source-fixed rows contribute side-chain atoms; the first sixteen residue KNN neighbors
+        supply their observed 32-slot side chains, which are concatenated with the nonprotein context
+        before the nearest ``num_context_atoms`` atoms are reselected around the virtual Cβ.
         """
 
-        return self._sample(batch, temperature=temperature, num_samples=num_samples, generator=generator)
-
-    def _sample(
-        self,
-        batch: LigandMPNNInput,
-        *,
-        temperature: float | Tensor | None = None,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> SequenceDesignCandidate:
-        r"""
-        Autoregressively sample new sequences for the input backbone (internal inference core).
-
-        The gradient-tracked sampling core behind
-        [`design`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.design]. Decodes residues in a
-        noise-perturbed order, sampling each token from the temperature-scaled, bias-adjusted logits while
-        honoring the design mask (fixed positions keep their input token) and any symmetry residue groups
-        (tied positions share one draw). Follows the official single-backbone batch contract: the input must
-        carry exactly one backbone, replicated ``num_samples`` times internally.
-
-        Args:
-            batch: Typed LigandMPNN input carrying backbone, sequence, and ligand-context tensors.
-            temperature: Softmax temperature for sampling; ``None`` uses the value on ``batch``.
-            num_samples: Number of independent sequences to sample; defaults to the value on ``batch``.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            A [`SequenceDesignCandidate`][ofoldx.models.contract.SequenceDesignCandidate] whose
-            ``sequence_tokens`` are the sampled sequences and whose ``scores`` hold ``log_probs`` and
-            ``sampling_probs``.
-
-        Examples:
-            >>> model.design(batch, num_samples=8)  # doctest: +SKIP
-        """
-
-        features = self._feature_dict(
+        batch, length = context_mask.shape[:2]
+        fixed_mask = residue_context_mask * (1 - design_mask[:, :, None])
+        neighbor_subset = neighbor_indices[:, :, :16]
+        side_chain_mask = gather_nodes(fixed_mask, neighbor_subset).reshape(batch, length, -1)
+        side_chain_coordinates = gather_nodes(
+            residue_context_coordinates.reshape(batch, length, -1),
+            neighbor_subset,
+        ).reshape(batch, length, -1, 3)
+        side_chain_types = self.side_chain_atom_types[None, None, None, :].expand(
             batch,
-            num_samples=num_samples,
-            temperature=temperature,
-            generator=generator,
-            for_sampling=True,
+            length,
+            neighbor_subset.shape[2],
+            -1,
         )
-        sampled = self.backbone.sample(features)
-        return SequenceDesignCandidate(
-            sequence_logits=sampled["logits"],
-            sequence_tokens=sampled["S"],
-            scores={
-                "log_probs": sampled["log_probs"],
-                "sampling_probs": sampled["sampling_probs"],
-            },
-            metadata={
-                "architecture": "ligandmpnn",
-                "backend": "native_ligandmpnn",
-                "num_edges": self.config.k_neighbors,
-                "atom_context_num": self.config.atom_context_num,
-            },
+        side_chain_types = side_chain_types.reshape(batch, length, -1)
+        context_coordinates = torch.cat((side_chain_coordinates, context_coordinates), dim=2)
+        context_mask = torch.cat((side_chain_mask, context_mask), dim=2)
+        context_atomic_numbers = torch.cat((side_chain_types, context_atomic_numbers), dim=2)
+        distances = torch.sum((beta_carbon[:, :, None] - context_coordinates) ** 2, dim=-1)
+        valid = valid_mask[:, :, None] * context_mask
+        adjusted = distances * valid + (1.0 - valid) * 10000.0
+        atom_count = min(num_context_atoms, adjusted.shape[-1])
+        atom_indices = torch.topk(adjusted, atom_count, dim=-1, largest=False).indices
+        context_coordinates = torch.gather(context_coordinates, 2, atom_indices[:, :, :, None].expand(-1, -1, -1, 3))
+        context_atomic_numbers = torch.gather(context_atomic_numbers, 2, atom_indices)
+        context_mask = torch.gather(context_mask, 2, atom_indices)
+        return context_coordinates, context_atomic_numbers, context_mask
+
+    def _element_features(self, atomic_numbers: Tensor) -> Tensor:
+        r"""One-hot-encode each context atom by element, periodic group, and period."""
+
+        group = self.periodic_group[atomic_numbers]
+        period = self.periodic_period[atomic_numbers]
+        return torch.cat(
+            (
+                F.one_hot(atomic_numbers, 120),
+                F.one_hot(group, 19),
+                F.one_hot(period, 8),
+            ),
+            dim=-1,
         )
 
-    def encode(self, batch: LigandMPNNInput | Mapping[str, Any]) -> LigandMPNNRepresentations:  # type: ignore[override]
-        r"""
-        Run only the encoder, returning the typed graph representations.
 
-        Exposes the encoder output (before autoregressive decoding) for downstream consumers such as the
-        side-chain LigandMPNNPacker or embedding extraction. Accepts either a typed input, which is featurized
-        first, or a raw pre-built feature dict. The per-residue node states are wrapped in the
-        [`Single`][ofoldx.modules.representation.Single] carrier at this boundary; unwrap ``single.tensor``
-        before feeding the decoder.
-
-        Args:
-            batch: A [`LigandMPNNInput`][ofoldx.models.ligandmpnn.model.LigandMPNNInput] or an
-                already-featurized mapping of encoder inputs.
-
-        Returns:
-            A [`LigandMPNNRepresentations`][ofoldx.models.ligandmpnn.model.LigandMPNNRepresentations] carrying
-            the node ``single`` carrier, the sparse KNN ``edges``, and the ``neighbor_idx``.
-
-        Examples:
-            >>> model.encode(batch)  # doctest: +SKIP
-        """
-
-        features = self._feature_dict(batch, for_sampling=False) if isinstance(batch, LigandMPNNInput) else batch
-        node_states, edge_states, neighbor_idx = self.backbone.encode(features)
-        return LigandMPNNRepresentations(single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx)
-
-    def _feature_dict(
-        self,
-        batch: LigandMPNNInput,
-        *,
-        num_samples: int | None = None,
-        temperature: float | Tensor | None = None,
-        generator: torch.Generator | None = None,
-        for_sampling: bool,
-        training: bool = False,
-    ) -> dict[str, Any]:
-        r"""
-        Assemble the backbone feature dict from a typed input.
-
-        Validates the input, fills in optional fields (design mask, amino-acid bias), and resolves the
-        decode-order noise: an explicit ``decoding_order_noise`` is reshaped to the requested sample count,
-        otherwise fresh Gaussian noise is drawn for sampling (or ``training``, so the teacher-forced pass sees
-        a random decode order) and zeros for deterministic scoring.
-
-        Args:
-            batch: Typed LigandMPNN input to featurize.
-            num_samples: Requested number of samples / decode orders; ``None`` falls back to the input.
-            temperature: Sampling temperature override; ``None`` keeps the input value.
-            generator: Optional RNG used when drawing decode-order noise.
-            for_sampling: Whether the features are for autoregressive sampling (vs. scoring).
-            training: Whether the features drive the teacher-forced training ``forward`` (random decode order).
-
-        Returns:
-            Feature mapping consumed by the backbone encoder/decoder.
-
-        Raises:
-            ValueError: If any input tensor violates the LigandMPNN shape contract, or the supplied
-                ``decoding_order_noise`` does not match the requested sample count.
-        """
-
-        _validate_ligandmpnn_input(batch, require_sampling=for_sampling)
-        batch_count, residue_count = batch.sequence_tokens.shape
-        device = batch.sequence_tokens.device
-        num_samples_requested = num_samples is not None or batch.num_samples is not None
-        num_samples = int(num_samples if num_samples is not None else (batch.num_samples or 1))
-        chain_mask = batch.design_mask if batch.design_mask is not None else torch.ones_like(batch.token_mask)
-        bias = batch.amino_acid_bias
-        if bias is None:
-            bias = torch.zeros(batch_count, residue_count, self.config.vocab_size, device=device)
-        if batch.decoding_order_noise is not None:
-            randn = batch.decoding_order_noise
-            if not num_samples_requested:
-                num_samples = int(randn.shape[0] if batch_count == 1 else max(randn.shape[0] // batch_count, 1))
-            if randn.shape[0] == num_samples:
-                if batch_count > 1 and not for_sampling:
-                    randn = randn[:, None, :].expand(num_samples, batch_count, residue_count)
-                    randn = randn.reshape(num_samples * batch_count, residue_count)
-            elif not (not for_sampling and randn.shape[0] == num_samples * batch_count):
-                expected = (
-                    num_samples if batch_count == 1 or for_sampling else f"{num_samples} or {num_samples * batch_count}"
-                )
-                raise ValueError(f"decoding_order_noise first dimension must match num_samples ({expected})")
-        elif for_sampling:
-            randn = torch.randn(num_samples, residue_count, device=device, generator=generator)
-        elif training:
-            randn = torch.randn(num_samples * batch_count, residue_count, device=device, generator=generator)
-        else:
-            randn = torch.zeros(num_samples * batch_count, residue_count, device=device)
-        features: dict[str, Any] = {
-            "X": batch.backbone_coords,
-            "S": batch.sequence_tokens,
-            "mask": batch.token_mask,
-            "residue_index": batch.residue_index,
-            "chain_labels": batch.chain_index,
-            "Y": batch.ligand_atom_coords,
-            "Y_t": batch.ligand_atom_types,
-            "Y_m": batch.ligand_atom_mask,
-            "chain_mask": chain_mask,
-            "bias": bias,
-            "randn": randn,
-            "generator": generator,
-            "temperature": batch.temperature if temperature is None else temperature,
-            "batch_size": num_samples,
-            "symmetry_residues": batch.symmetry_residue_groups if batch.symmetry_residue_groups is not None else [[]],
-            "symmetry_weights": batch.symmetry_weights if batch.symmetry_weights is not None else [[]],
-        }
-        if batch.all_atom_coords is not None:
-            features["xyz_37"] = batch.all_atom_coords
-        if batch.all_atom_mask is not None:
-            features["xyz_37_m"] = batch.all_atom_mask
-        return features
-
-
-class LigandMPNNBackbone(nn.Module):
+class LigandMpnnModel(nn.Module):
     r"""
-    LigandMPNN graph encoder and autoregressive sequence decoder.
+    Message-passing model that designs protein sequences for a protein-ligand complex.
 
-    Holds the full message-passing stack: a [`LigandBackboneFeatures`]
-    [ofoldx.models.ligandmpnn.model.LigandBackboneFeatures] encoder that fuses backbone geometry with
-    ligand-context atoms, and encoder/decoder layer stacks operating on the k-nearest-neighbor residue graph.
-    The three public methods ([`score`][ofoldx.models.ligandmpnn.model.LigandMPNNBackbone.score],
-    [`single_residue_score`][ofoldx.models.ligandmpnn.model.LigandMPNNBackbone.single_residue_score],
-    [`sample`][ofoldx.models.ligandmpnn.model.LigandMPNNBackbone.sample]) operate on the feature dict
-    built by the enclosing generator and return raw token tensors, not typed outputs.
+    ``forward`` is the ordinary differentiable sequence-conditioned teacher-forced graph. ``sample`` and
+    the four probability operations expose the released tensor protocols through the shared MPNN carriers,
+    and ``design`` returns self-contained canonical candidates. ``coordinate_noise``,
+    ``use_side_chain_context``, and the stochastic controls are per-operation arguments rather than
+    persistent configuration.
 
     Args:
-        config: Model configuration supplying the widths, depths, and graph/context sizes.
+        config: Model configuration; a default
+            [`LigandMpnnConfig`][ofoldx.models.ligandmpnn.config.LigandMpnnConfig] is used when ``None``.
     """
 
-    def __init__(self, config: LigandMPNNConfig) -> None:
+    config_class = LigandMpnnConfig
+
+    def __init__(self, config: LigandMpnnConfig | None = None) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.dropout = nn.Dropout(config.dropout)
-        self.feature_encoder = LigandBackboneFeatures(
-            node_size=config.node_size,
-            edge_size=config.edge_size,
-            num_positional_embeddings=16,
-            num_rbf=16,
-            k_neighbors=config.k_neighbors,
-            coord_noise_scale=config.coord_noise_scale,
-            atom_context_num=config.atom_context_num,
-            use_side_chain_context=config.use_side_chain_context,
-        )
-        self.edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
-        self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.atom_context_embedding = nn.Linear(config.node_size, config.hidden_size)
-        self.residue_context_input = nn.Linear(config.hidden_size, config.hidden_size)
-        self.atom_node_embedding = nn.Linear(config.node_size, config.hidden_size)
-        self.atom_edge_embedding = nn.Linear(config.node_size, config.hidden_size)
-        self.context_output = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.context_norm = nn.LayerNorm(config.hidden_size)
+        self.config = LigandMpnnConfig() if config is None else config
+        hidden_size = self.config.hidden_size
+        # Cache the one live width as a plain int: the encoder hot path reads it under
+        # torch.compile(..., fullgraph=True), where chanfig's Config attribute access does not trace.
+        self.hidden_size = hidden_size
+        self.dropout = nn.Dropout(self.config.dropout)
+        self.feature_encoder = LigandMpnnFeatures(hidden_size, self.config.num_neighbors)
+        self.edge_embedding = nn.Linear(hidden_size, hidden_size)
+        self.token_embedding = nn.Embedding(_VOCABULARY, hidden_size)
+        self.atom_context_embedding = nn.Linear(hidden_size, hidden_size)
+        self.residue_context_input = nn.Linear(hidden_size, hidden_size)
+        self.atom_node_embedding = nn.Linear(hidden_size, hidden_size)
+        self.atom_edge_embedding = nn.Linear(hidden_size, hidden_size)
+        self.context_output = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.context_norm = nn.LayerNorm(hidden_size)
         self.context_layers = nn.ModuleList(
-            [LigandDecoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout) for _ in range(2)]
+            MpnnDecoderLayer(hidden_size, hidden_size * 2, dropout=self.config.dropout) for _ in range(2)
         )
         self.atom_context_layers = nn.ModuleList(
-            [LigandAtomLayer(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(2)]
+            MpnnDecoderLayer(hidden_size, hidden_size, dropout=self.config.dropout) for _ in range(2)
         )
         self.encoder_layers = nn.ModuleList(
-            [
-                LigandEncoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
-                for _ in range(config.num_encoder_layers)
-            ]
+            MpnnEncoderLayer(hidden_size, hidden_size * 2, dropout=self.config.dropout)
+            for _ in range(self.config.num_encoder_layers)
         )
         self.decoder_layers = nn.ModuleList(
-            [
-                LigandDecoderLayer(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
-                for _ in range(config.num_decoder_layers)
-            ]
+            MpnnDecoderLayer(hidden_size, hidden_size * 3, dropout=self.config.dropout)
+            for _ in range(self.config.num_decoder_layers)
         )
-        self.output_projection = nn.Linear(config.hidden_size, config.vocab_size)
+        self.output_projection = nn.Linear(hidden_size, _VOCABULARY)
+        self.reset_parameters()
 
-    def encode(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Encode backbone geometry and ligand context into residue node/edge states.
+    def reset_parameters(self) -> None:
+        r"""Apply the released Xavier-uniform initialization to every matrix parameter."""
 
-        Builds the k-nearest-neighbor graph, runs the encoder layers, then folds in the ligand-context
-        atom graph so each residue node carries information about nearby ligand atoms.
+        for parameter in self.parameters():
+            if parameter.ndim > 1:
+                nn.init.xavier_uniform_(parameter)
 
-        Args:
-            features: Feature mapping from the generator (backbone coords, masks, ligand context, ...).
+    # -- stochastic and validation controls ------------------------------------------------------
 
-        Returns:
-            Tuple ``(node_states, edge_states, neighbor_idx)``: per-residue node states `[B, L, H]`, per-edge
-            states `[B, L, K, H]`, and neighbor indices `[B, L, K]`.
+    @staticmethod
+    def _validate_coordinate_noise(coordinate_noise: float) -> float:
+        r"""Coerce and validate the inference-time coordinate perturbation."""
+
+        coordinate_noise = float(coordinate_noise)
+        if not math.isfinite(coordinate_noise) or coordinate_noise < 0:
+            raise ValueError("coordinate_noise must be a finite nonnegative number")
+        return coordinate_noise
+
+    @staticmethod
+    def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
+        r"""Validate the independent decoding-order evaluation count."""
+
+        if type(num_decoding_orders) is not int or num_decoding_orders <= 0:
+            raise ValueError("num_decoding_orders must be a positive integer")
+        return num_decoding_orders
+
+    @staticmethod
+    def _require_single_target(input: LigandMpnnInput) -> None:
+        r"""Reject an execution-batch axis on one-target biological operations."""
+
+        if input.backbone_coordinates.shape[0] != 1:
+            raise ValueError("this LigandMpnn operation returns one target and therefore accepts one input")
+
+    @staticmethod
+    def _repeat_input(input: LigandMpnnInput, count: int) -> LigandMpnnInput:
+        r"""Repeat one biological input into ``count`` aligned evaluation rows."""
+
+        def repeat(value: Tensor | None) -> Tensor | None:
+            return None if value is None else value.repeat_interleave(count, dim=0)
+
+        return LigandMpnnInput(
+            backbone_coordinates=repeat(input.backbone_coordinates),
+            sequence_tokens=repeat(input.sequence_tokens),
+            valid_mask=repeat(input.valid_mask),
+            residue_indices=repeat(input.residue_indices),
+            chain_indices=repeat(input.chain_indices),
+            context_coordinates=repeat(input.context_coordinates),
+            context_atomic_numbers=repeat(input.context_atomic_numbers),
+            context_mask=repeat(input.context_mask),
+            residue_context_coordinates=repeat(input.residue_context_coordinates),
+            residue_context_mask=repeat(input.residue_context_mask),
+            design_mask=repeat(input.design_mask),
+            ligand_interface_mask=repeat(input.ligand_interface_mask),
+            structure=input.structure,
+            component_references=input.component_references,
+            tied_group_ids=repeat(input.tied_group_ids),
+            tied_weights=repeat(input.tied_weights),
+            allowed_token_mask=repeat(input.allowed_token_mask),
+            logit_bias=repeat(input.logit_bias),
+        )
+
+    def _probability_result(
+        self,
+        input: LigandMpnnInput,
+        logits: Tensor,
+        decoding_ranks: Tensor,
+    ) -> MpnnProbabilityResult:
+        r"""Wrap aligned per-evaluation logits with the one target's canonical identity."""
+
+        return MpnnProbabilityResult(
+            target=input.structure,
+            component_references=input.component_references,
+            sequence_tokens=input.sequence_tokens[0],
+            valid_mask=input.valid_mask[0],
+            design_mask=input.design_mask[0],
+            logits=logits,
+            decoding_ranks=decoding_ranks,
+        )
+
+    # -- decode-order generation -----------------------------------------------------------------
+
+    @staticmethod
+    def _draw_decode_orders(
+        valid_mask: Tensor,
+        design_mask: Tensor,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        r"""Draw the released fixed-first decoding orders directly from aligned masks.
+
+        Fixed rows receive a near-zero weight and therefore decode before every designed row; each row
+        of the returned ``[B, L]`` permutation is an independent order.
         """
 
-        atom_features, edges, neighbor_idx, atom_nodes, atom_edges, atom_mask = self.feature_encoder(features)
-        mask = features["mask"]
+        chain_mask = valid_mask.to(dtype=torch.float32) * design_mask.to(dtype=torch.float32)
+        randn = torch.randn(chain_mask.shape, device=chain_mask.device, generator=generator)
+        return torch.argsort((chain_mask + 0.0001) * randn.abs(), dim=-1)
+
+    def _generate_ranks(self, input: LigandMpnnInput, generator: torch.Generator | None) -> Tensor:
+        r"""Draw fixed-first causal ranks, collapsing every tied group to one consecutive unit."""
+
+        decode_order = self._draw_decode_orders(input.valid_mask, input.design_mask, generator)
+        tied_groups = tied_groups_from_ids(input.tied_group_ids)
+        if tied_groups:
+            collapsed = _collapse_tied_order(decode_order[0], tied_groups)
+            decode_order = collapsed.unsqueeze(0).repeat(decode_order.shape[0], 1)
+        return _decoding_order_to_ranks(decode_order)
+
+    # -- shared graph passes ---------------------------------------------------------------------
+
+    def _encode(
+        self,
+        input: LigandMpnnInput,
+        *,
+        coordinate_noise: float,
+        use_side_chain_context: bool,
+        generator: torch.Generator | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Run the coordinate/context encoder shared by every official operation.
+
+        Coordinate noise perturbs the backbone coordinates and the already selected nonprotein context
+        coordinates before residue-neighbor and atom-context features; fixed side-chain coordinates are
+        never perturbed.
+        """
+
+        backbone_coordinates = input.backbone_coordinates
+        context_coordinates = input.context_coordinates
+        if coordinate_noise:
+            backbone_coordinates = backbone_coordinates + coordinate_noise * torch.randn(
+                backbone_coordinates.shape,
+                device=backbone_coordinates.device,
+                dtype=backbone_coordinates.dtype,
+                generator=generator,
+            )
+            context_coordinates = context_coordinates + coordinate_noise * torch.randn(
+                context_coordinates.shape,
+                device=context_coordinates.device,
+                dtype=context_coordinates.dtype,
+                generator=generator,
+            )
+        mask = input.valid_mask.to(dtype=backbone_coordinates.dtype)
+        atom_features, edges, neighbor_indices, atom_nodes, atom_edges, atom_mask = self.feature_encoder(
+            backbone_coordinates,
+            mask,
+            input.residue_indices,
+            input.chain_indices,
+            context_coordinates,
+            input.context_atomic_numbers,
+            input.context_mask.to(dtype=backbone_coordinates.dtype),
+            input.residue_context_coordinates,
+            input.residue_context_mask.to(dtype=backbone_coordinates.dtype),
+            input.design_mask.to(dtype=backbone_coordinates.dtype),
+            use_side_chain_context=use_side_chain_context,
+        )
         node_states = edges.new_zeros(edges.shape[0], edges.shape[1], self.hidden_size)
         edge_states = self.edge_embedding(edges)
         atom_context = self.atom_context_embedding(atom_features)
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_idx).squeeze(-1)
+        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = mask.unsqueeze(-1) * attend_mask
         for layer in self.encoder_layers:
-            node_states, edge_states = layer(node_states, edge_states, neighbor_idx, mask, attend_mask)
+            node_states, edge_states = layer(node_states, edge_states, neighbor_indices, mask, attend_mask)
         residue_context = self.residue_context_input(node_states)
         atom_pair_mask = atom_mask[:, :, :, None] * atom_mask[:, :, None, :]
         atom_nodes = self.atom_node_embedding(atom_nodes)
         atom_edges = self.atom_edge_embedding(atom_edges)
-        for layer_idx, layer in enumerate(self.context_layers):
-            atom_nodes = self.atom_context_layers[layer_idx](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
+        for layer_index, layer in enumerate(self.context_layers):
+            atom_nodes = self.atom_context_layers[layer_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
             residue_context = layer(residue_context, torch.cat((atom_context, atom_nodes), dim=-1), mask, atom_mask)
         node_states = node_states + self.context_norm(self.dropout(self.context_output(residue_context)))
-        return node_states, edge_states, neighbor_idx
+        return node_states, edge_states, neighbor_indices
 
-    def score(self, features: Mapping[str, Any], *, use_sequence: bool) -> dict[str, Tensor]:
-        r"""
-        Score a sequence in one decode pass over the whole graph.
+    def _decode_logits(
+        self,
+        node_states: Tensor,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+        sequence_tokens: Tensor,
+        valid_mask: Tensor,
+        decoding_ranks: Tensor,
+    ) -> Tensor:
+        r"""Return raw teacher-forced sequence-conditioned logits for one exact causal ranking."""
 
-        Encodes the backbone once, derives a decode order from the chain mask and noise, builds the causal
-        backward/forward attention masks, and runs the decoder. With ``use_sequence`` the decoder mixes
-        teacher-forced token embeddings into the backward context; without it, only the encoder forward
-        context is used. Symmetry groups, when present, collapse tied residues into a single decode step.
-
-        Args:
-            features: Feature mapping from the generator.
-            use_sequence: Whether the decoder conditions on the ground-truth sequence context.
-
-        Returns:
-            Mapping with ``S`` (the scored tokens, replicated per sample), ``logits`` `[B*, L, vocab]`, and
-            ``log_probs``.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = mask * features["chain_mask"]
-        randn = features["randn"]
-        num_samples = int(features["batch_size"])
-        batch, length = sequence.shape
-        device = sequence.device
-
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        chain_mask_order = chain_mask if randn.shape[0] == chain_mask.shape[0] else chain_mask.repeat(num_samples, 1)
-        decode_order = torch.argsort((chain_mask_order + 0.0001) * randn.abs())
-        symmetry_groups = features["symmetry_residues"]
-
-        if _has_no_symmetry(symmetry_groups):
-            neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-            mask_decode = mask.repeat(num_samples, 1)
-            backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask_decode)
-        else:
-            ordered_groups = _decode_groups(decode_order[0], symmetry_groups)
-            decode_order = torch.tensor(list(itertools.chain(*ordered_groups)), device=device)[None, :].repeat(batch, 1)
-            backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-            neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-            backward_mask = backward_mask.repeat(num_samples, 1, 1, 1)
-            forward_mask = forward_mask.repeat(num_samples, 1, 1, 1)
-            decode_order = decode_order.repeat(num_samples, 1)
-
-        sequence = sequence.repeat(num_samples, 1)
-        node_states = node_states.repeat(num_samples, 1, 1)
-        edge_states = edge_states.repeat(num_samples, 1, 1, 1)
-        mask = mask.repeat(num_samples, 1)
-
-        token_states = self.token_embedding(sequence)
-        edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
-        empty_token_states = torch.zeros_like(token_states)
-        encoder_edges = cat_neighbors_nodes(empty_token_states, edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
+        mask = valid_mask.to(dtype=node_states.dtype)
+        token_states = self.token_embedding(sequence_tokens)
+        sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
+        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
+        backward_mask, forward_mask = _autoregressive_masks(decoding_ranks, neighbor_indices, mask)
         forward_context = forward_mask * encoder_context
+        for layer in self.decoder_layers:
+            decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
+            node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+        return self.output_projection(node_states)
 
-        if use_sequence:
-            for layer in self.decoder_layers:
-                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
-                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
-        else:
-            for layer in self.decoder_layers:
-                node_states = layer(node_states, forward_context, mask)
+    def _decode_sequence_free_logits(
+        self,
+        node_states: Tensor,
+        edge_states: Tensor,
+        neighbor_indices: Tensor,
+        valid_mask: Tensor,
+        decoding_ranks: Tensor,
+    ) -> Tensor:
+        r"""Return raw order-dependent sequence-free logits under one causal ranking."""
 
-        logits = self.output_projection(node_states)
-        return {
-            "S": sequence,
-            "logits": logits,
-            "log_probs": F.log_softmax(logits, dim=-1),
-        }
+        mask = valid_mask.to(dtype=node_states.dtype)
+        token_states = torch.zeros_like(node_states)
+        encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
+        _, forward_mask = _autoregressive_masks(decoding_ranks, neighbor_indices, mask)
+        forward_context = forward_mask * encoder_context
+        states = node_states
+        for layer in self.decoder_layers:
+            states = layer(states, forward_context, mask)
+        return self.output_projection(states)
 
-    def teacher_forced_logits(self, features: Mapping[str, Any], *, use_sequence: bool) -> tuple[Tensor, Tensor]:
-        r"""
-        Compute teacher-forced logits in one decode pass (the compile-clean training core).
+    # -- public operations -----------------------------------------------------------------------
 
-        The symmetry-free single pass behind
-        [`LigandMPNNDesigner.forward`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.forward]: encode the
-        graph once, wrap the node states in the [`Single`][ofoldx.modules.representation.Single] carrier at the
-        representation boundary, derive the decode order, build the causal masks, and run the decoder. It omits
-        the symmetry-group handling (only used at inference) so the whole pass stays free of data-dependent
-        Python control flow and compiles under ``torch.compile(..., fullgraph=True)``.
+    def encode(
+        self,
+        input: LigandMpnnInput,
+        *,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Return the shared node states, edge states, and neighbor indices."""
 
-        Args:
-            features: Feature mapping from the generator.
-            use_sequence: Whether the decoder conditions on the teacher-forced sequence context.
-
-        Returns:
-            Tuple ``(logits, tokens)``: grad-carrying per-token logits `[B*, L, vocab]` and the (replicated)
-            true tokens `[B*, L]`.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = mask * features["chain_mask"]
-        randn = features["randn"]
-        num_samples = int(features["batch_size"])
-
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        # Adopt the typed node carrier at the representation boundary, then unwrap before the decoder.
-        representations = LigandMPNNRepresentations(
-            single=Single(node_states), edges=edge_states, neighbor_idx=neighbor_idx
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        return self._encode(
+            input,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
         )
-        node_states = representations.single.tensor
-        edge_states = representations.edges
-        neighbor_idx = representations.neighbor_idx
 
-        chain_mask_order = chain_mask if randn.shape[0] == chain_mask.shape[0] else chain_mask.repeat(num_samples, 1)
-        decode_order = torch.argsort((chain_mask_order + 0.0001) * randn.abs())
-        neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-        mask_decode = mask.repeat(num_samples, 1)
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask_decode)
+    def forward(
+        self,
+        input: LigandMpnnInput,
+        *,
+        decoding_ranks: Tensor | None = None,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> MpnnOutput:
+        r"""Return the single teacher-forced differentiable sequence-conditioned pass."""
 
-        sequence = sequence.repeat(num_samples, 1)
-        node_states = node_states.repeat(num_samples, 1, 1)
-        edge_states = edge_states.repeat(num_samples, 1, 1, 1)
-        mask = mask.repeat(num_samples, 1)
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        node_states, edge_states, neighbor_indices = self._encode(
+            input,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+        )
+        if decoding_ranks is None:
+            decoding_ranks = _decoding_order_to_ranks(
+                self._draw_decode_orders(input.valid_mask, input.design_mask, generator)
+            )
+        logits = self._decode_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            input.sequence_tokens,
+            input.valid_mask,
+            decoding_ranks,
+        )
+        return MpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
 
-        token_states = self.token_embedding(sequence)
-        edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
-        empty_token_states = torch.zeros_like(token_states)
-        encoder_edges = cat_neighbors_nodes(empty_token_states, edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
-        forward_context = forward_mask * encoder_context
+    def autoregressive_probabilities(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        decoding_ranks: Tensor | None = None,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return native-sequence-conditioned autoregressive probabilities over decoding orders."""
 
-        if use_sequence:
-            for layer in self.decoder_layers:
-                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
-                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+        self._require_single_target(input)
+        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        repeated = self._repeat_input(input, num_decoding_orders)
+        node_states, edge_states, neighbor_indices = self._encode(
+            repeated,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+        )
+        ranks = decoding_ranks if decoding_ranks is not None else self._generate_ranks(repeated, generator)
+        logits = self._decode_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            repeated.sequence_tokens,
+            repeated.valid_mask,
+            ranks,
+        )
+        return self._probability_result(input, logits, ranks)
+
+    def sequence_free_autoregressive_probabilities(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        decoding_ranks: Tensor | None = None,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return order-dependent sequence-free autoregressive probabilities over decoding orders."""
+
+        self._require_single_target(input)
+        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        repeated = self._repeat_input(input, num_decoding_orders)
+        node_states, edge_states, neighbor_indices = self._encode(
+            repeated,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+        )
+        ranks = decoding_ranks if decoding_ranks is not None else self._generate_ranks(repeated, generator)
+        logits = self._decode_sequence_free_logits(
+            node_states,
+            edge_states,
+            neighbor_indices,
+            repeated.valid_mask,
+            ranks,
+        )
+        return self._probability_result(input, logits, ranks)
+
+    def _single_residue_probabilities(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_decoding_orders: int,
+        base_decoding_ranks: Tensor | None,
+        coordinate_noise: float,
+        use_side_chain_context: bool,
+        generator: torch.Generator | None,
+        move_last: bool,
+    ) -> MpnnProbabilityResult:
+        r"""Evaluate every target moved exactly last or first under one base decoding order."""
+
+        self._require_single_target(input)
+        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        repeated = self._repeat_input(input, num_decoding_orders)
+        device = repeated.backbone_coordinates.device
+        node_states, edge_states, neighbor_indices = self._encode(
+            repeated,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+        )
+        length = repeated.sequence_tokens.shape[1]
+        if base_decoding_ranks is None:
+            base_priorities = torch.randn(num_decoding_orders, length, device=device, generator=generator).abs()
         else:
-            for layer in self.decoder_layers:
-                node_states = layer(node_states, forward_context, mask)
-
-        return self.output_projection(node_states), sequence
-
-    def single_residue_score(self, features: Mapping[str, Any], *, use_sequence: bool) -> dict[str, Tensor]:
-        r"""
-        Score each residue independently, one masked position per decode pass.
-
-        Loops over positions: for each, builds a decode order that isolates that residue (masked when
-        ``use_sequence``, or the only visible one otherwise), runs the decoder, and records that position's
-        logits and log-probabilities. Reproduces LigandMPNN's per-residue conditional-probability mode.
-
-        Args:
-            features: Feature mapping from the generator.
-            use_sequence: Whether the surrounding ground-truth sequence is visible when scoring a position.
-
-        Returns:
-            Mapping with ``S`` (replicated tokens), ``logits`` `[B*, L, 21]`, and ``log_probs`` `[B*, L, 21]`.
-        """
-
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = features["chain_mask"]
-        randn = features["randn"]
-        num_samples = int(features["batch_size"])
-        batch, length = sequence.shape
-        device = sequence.device
-        node_states_ref, edge_states_ref, neighbor_idx_ref = self.encode(features)
-        total_decodes = batch * num_samples
-        log_probs_out = torch.zeros(total_decodes, length, 21, device=device)
-        logits_out = torch.zeros(total_decodes, length, 21, device=device)
-
-        for residue_position in range(length):
-            neighbor_idx = neighbor_idx_ref.repeat(num_samples, 1, 1)
-            if use_sequence:
-                order_mask = torch.ones(chain_mask.shape[1], device=device)
-                order_mask[residue_position] = 0.0
+            if base_decoding_ranks.shape != (num_decoding_orders, length):
+                raise ValueError("base_decoding_ranks has the wrong exact shape")
+            if base_decoding_ranks.dtype != torch.long:
+                raise TypeError("base_decoding_ranks must have dtype torch.long")
+            sorted_ranks, sorted_indices = torch.sort(base_decoding_ranks, dim=-1)
+            rank_starts = torch.cat(
+                (
+                    torch.ones_like(sorted_ranks[:, :1], dtype=torch.bool),
+                    sorted_ranks[:, 1:] != sorted_ranks[:, :-1],
+                ),
+                dim=-1,
+            )
+            base_ranks = torch.empty_like(base_decoding_ranks)
+            base_ranks.scatter_(1, sorted_indices, rank_starts.cumsum(dim=-1) - 1)
+            last_ranks = base_ranks.amax(dim=-1) + 1
+        logits = node_states.new_zeros(num_decoding_orders, length, _VOCABULARY)
+        effective_ranks = torch.empty(num_decoding_orders, length, length, dtype=torch.long, device=device)
+        for target in range(length):
+            if base_decoding_ranks is None:
+                order_mask = torch.full((length,), 0.0 if move_last else 1.0, device=device)
+                order_mask[target] = 1.0 if move_last else 0.0
+                decode_order = torch.argsort((order_mask + 0.0001) * base_priorities, dim=-1)
+                ranks = _decoding_order_to_ranks(decode_order)
             else:
-                order_mask = torch.zeros(chain_mask.shape[1], device=device)
-                order_mask[residue_position] = 1.0
-            decode_order = torch.argsort((order_mask + 0.0001) * randn.abs())
-            mask_decode = mask.repeat(num_samples, 1)
-            backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask_decode)
+                ranks = base_ranks.clone()
+                ranks[:, target] = last_ranks if move_last else -1
+            logits[:, target] = self._decode_logits(
+                node_states,
+                edge_states,
+                neighbor_indices,
+                repeated.sequence_tokens,
+                repeated.valid_mask,
+                ranks,
+            )[:, target]
+            effective_ranks[:, target] = ranks
+        return self._probability_result(input, logits, effective_ranks)
 
-            sequence_decode = sequence.repeat(num_samples, 1)
-            node_states = node_states_ref.repeat(num_samples, 1, 1)
-            edge_states = edge_states_ref.repeat(num_samples, 1, 1, 1)
-            token_states = self.token_embedding(sequence_decode)
-            edge_token_states = cat_neighbors_nodes(token_states, edge_states, neighbor_idx)
-            encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_idx)
-            encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
-            forward_context = forward_mask * encoder_context
-            for layer in self.decoder_layers:
-                decoder_context = cat_neighbors_nodes(node_states, edge_token_states, neighbor_idx)
-                node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask_decode)
-            logits = self.output_projection(node_states)
-            log_probs = F.log_softmax(logits, dim=-1)
-            log_probs_out[:, residue_position, :] = log_probs[:, residue_position, :]
-            logits_out[:, residue_position, :] = logits[:, residue_position, :]
+    def conditional_probabilities(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        base_decoding_ranks: Tensor | None = None,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return target-last conditional probabilities for every row."""
 
-        return {
-            "S": sequence.repeat(num_samples, 1),
-            "logits": logits_out,
-            "log_probs": log_probs_out,
-        }
+        return self._single_residue_probabilities(
+            input,
+            num_decoding_orders=num_decoding_orders,
+            base_decoding_ranks=base_decoding_ranks,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+            move_last=True,
+        )
 
-    def sample(self, features: Mapping[str, Any]) -> dict[str, Tensor]:
-        r"""
-        Autoregressively sample tokens along a noise-perturbed decode order.
+    def unconditional_probabilities(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        base_decoding_ranks: Tensor | None = None,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> MpnnProbabilityResult:
+        r"""Return target-first unconditional probabilities for every row."""
 
-        Encodes the backbone, derives the decode order, then dispatches to the independent-position sampler
-        or, when symmetry groups are present, the symmetric sampler that ties grouped residues to a single
-        weighted draw.
+        return self._single_residue_probabilities(
+            input,
+            num_decoding_orders=num_decoding_orders,
+            base_decoding_ranks=base_decoding_ranks,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+            move_last=False,
+        )
 
-        Args:
-            features: Feature mapping from the generator.
+    # -- sampling --------------------------------------------------------------------------------
 
-        Returns:
-            Mapping with ``S`` (sampled tokens), ``sampling_probs``, ``logits``, and ``log_probs``.
-        """
+    @staticmethod
+    def _sampling_bias(input: LigandMpnnInput) -> Tensor:
+        r"""Assemble the aligned generatable logit bias, folding hard support in as large negatives."""
 
-        sequence = features["S"]
-        mask = features["mask"]
-        chain_mask = mask * features["chain_mask"]
-        bias = features["bias"]
-        randn = features["randn"]
-        temperature = features["temperature"]
-        symmetry_groups = features["symmetry_residues"]
-        symmetry_weights_groups = features["symmetry_weights"]
-        generator = features.get("generator")
-        num_samples = int(features["batch_size"])
-        batch, length = sequence.shape
-        device = sequence.device
+        if input.logit_bias is None:
+            bias = torch.zeros(
+                input.sequence_tokens.shape[0],
+                input.sequence_tokens.shape[1],
+                _VOCABULARY,
+                device=input.sequence_tokens.device,
+                dtype=input.backbone_coordinates.dtype,
+            )
+        else:
+            bias = input.logit_bias
+        if input.allowed_token_mask is not None:
+            bias = bias + torch.where(
+                input.allowed_token_mask,
+                torch.zeros((), dtype=bias.dtype, device=bias.device),
+                torch.full((), -1e8, dtype=bias.dtype, device=bias.device),
+            )
+        return bias
 
-        node_states, edge_states, neighbor_idx = self.encode(features)
-        decode_order = torch.argsort((chain_mask + 0.0001) * randn.abs())
-        if _has_no_symmetry(symmetry_groups):
-            return self._sample_independent(
-                sequence,
-                mask,
+    @torch.inference_mode()
+    def sample(
+        self,
+        input: LigandMpnnInput,
+        *,
+        num_samples: int = 1,
+        temperature: float = 0.1,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        decoding_ranks: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> MpnnSamplingOutput:
+        r"""Run the complete released autoregressive tensor sampler."""
+
+        self._require_single_target(input)
+        if type(num_samples) is not int or num_samples <= 0:
+            raise ValueError("num_samples must be a positive integer")
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be a finite positive number")
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+
+        repeated = self._repeat_input(input, num_samples)
+        node_states, edge_states, neighbor_indices = self._encode(
+            repeated,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
+        )
+        valid_mask = repeated.valid_mask.to(dtype=node_states.dtype)
+        chain_mask = valid_mask * repeated.design_mask.to(dtype=node_states.dtype)
+        bias = self._sampling_bias(repeated)
+        if decoding_ranks is None:
+            decode_order = self._draw_decode_orders(repeated.valid_mask, repeated.design_mask, generator)
+        else:
+            decode_order = torch.argsort(decoding_ranks, dim=-1)
+
+        tied_groups = tied_groups_from_ids(input.tied_group_ids)
+        if not tied_groups:
+            result = self._sample_independent(
+                node_states,
+                edge_states,
+                neighbor_indices,
+                repeated.sequence_tokens,
+                valid_mask,
                 chain_mask,
                 bias,
                 temperature,
                 decode_order,
-                node_states,
-                edge_states,
-                neighbor_idx,
-                num_samples,
                 generator,
             )
-
-        ordered_groups = _decode_groups(decode_order[0], symmetry_groups)
-        symmetry_weights = torch.ones(length, device=device)
-        for group_idx, residue_group in enumerate(symmetry_groups):
-            for residue_position, residue in enumerate(residue_group):
-                symmetry_weights[residue] = symmetry_weights_groups[group_idx][residue_position]
-        decode_order = torch.tensor(list(itertools.chain(*ordered_groups)), device=device)[None, :].repeat(batch, 1)
-        return self._sample_symmetric(
-            sequence,
-            mask,
-            chain_mask,
-            bias,
-            temperature,
-            decode_order,
-            ordered_groups,
-            symmetry_weights,
-            node_states,
-            edge_states,
-            neighbor_idx,
-            num_samples,
-            generator,
+        else:
+            collapsed = _collapse_tied_order(decode_order[0], tied_groups)
+            decode_order = collapsed.unsqueeze(0).repeat(num_samples, 1)
+            if repeated.tied_weights is None:
+                weights = torch.ones_like(chain_mask)
+            else:
+                weights = repeated.tied_weights.to(dtype=node_states.dtype)
+            result = self._sample_symmetric(
+                node_states,
+                edge_states,
+                neighbor_indices,
+                repeated.sequence_tokens,
+                valid_mask,
+                chain_mask,
+                bias,
+                temperature,
+                decode_order,
+                tied_groups,
+                weights,
+                generator,
+            )
+        return MpnnSamplingOutput(
+            sequences=result["S"],
+            log_probabilities=result["log_probs"],
+            sampling_probabilities=result["sampling_probs"],
+            decoding_ranks=_decoding_order_to_ranks(result["decoding_order"]),
         )
-
-    def _init_decode_state(
-        self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
-    ) -> dict[str, Any]:
-        r"""
-        Build the order-independent decode setup shared by the sampling paths.
-        """
-
-        _, length = sequence.shape
-        device = sequence.device
-        neighbor_idx = neighbor_idx.repeat(num_samples, 1, 1)
-        node_states = node_states.repeat(num_samples, 1, 1)
-        return {
-            "sequence_true": sequence.repeat(num_samples, 1),
-            "node_states": node_states,
-            "edge_states": edge_states.repeat(num_samples, 1, 1, 1),
-            "neighbor_idx": neighbor_idx,
-            "chain_mask": chain_mask.repeat(num_samples, 1),
-            "mask": mask.repeat(num_samples, 1),
-            "bias": bias.repeat(num_samples, 1, 1),
-            "sampled": 20 * torch.ones(num_samples, length, dtype=torch.long, device=device),
-            "token_states": torch.zeros_like(node_states),
-            "layer_states": [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers],
-            "probabilities": torch.zeros(num_samples, length, 20, device=device),
-            "log_probs_out": torch.zeros(num_samples, length, 21, device=device),
-            "logits_out": torch.zeros(num_samples, length, 21, device=device),
-        }
 
     def _sample_independent(
         self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        temperature: float | Tensor,
-        decode_order: Tensor,
         node_states: Tensor,
         edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
+        neighbor_indices: Tensor,
+        sequence_true: Tensor,
+        valid_mask: Tensor,
+        chain_mask: Tensor,
+        bias: Tensor,
+        temperature: float,
+        decode_order: Tensor,
         generator: torch.Generator | None,
     ) -> dict[str, Tensor]:
-        r"""
-        Sample tokens position-by-position with no symmetry constraints.
+        r"""Sample tokens position-by-position with no tied constraints."""
 
-        Walks the decode order one residue at a time, gathering that residue's cached decoder state, sampling
-        a token from the temperature-scaled bias-adjusted probabilities, and scattering the new token
-        embedding back so later positions can attend to it. Fixed positions (chain mask ``0``) keep their
-        input token.
-
-        Args:
-            sequence: Input sequence tokens `[1, L]`.
-            mask: Valid-residue mask `[1, L]`.
-            chain_mask: Design mask marking positions to sample `[1, L]`.
-            bias: Per-position amino-acid logit bias `[1, L, vocab]`.
-            temperature: Softmax sampling temperature.
-            decode_order: Residue decode order `[num_samples, L]`.
-            node_states: Encoder node states `[1, L, H]`.
-            edge_states: Encoder edge states `[1, L, K, H]`.
-            neighbor_idx: Neighbor indices `[1, L, K]`.
-            num_samples: Number of independent sequences to sample.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            Mapping with ``S`` (sampled tokens), ``sampling_probs``, ``logits``, and ``log_probs``.
-        """
-
-        state = self._init_decode_state(
-            sequence, mask, chain_mask, bias, node_states, edge_states, neighbor_idx, num_samples
+        num_samples, length = sequence_true.shape
+        device = sequence_true.device
+        sampled = _GENERATABLE * torch.ones(num_samples, length, dtype=torch.long, device=device)
+        token_states = torch.zeros_like(node_states)
+        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        probabilities = node_states.new_zeros(num_samples, length, _GENERATABLE)
+        log_probs_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
+        logits_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
+        backward_mask, forward_mask = _autoregressive_masks(
+            _decoding_order_to_ranks(decode_order),
+            neighbor_indices,
+            valid_mask,
         )
-        sequence_true = state["sequence_true"]
-        node_states = state["node_states"]
-        edge_states = state["edge_states"]
-        neighbor_idx = state["neighbor_idx"]
-        chain_mask = state["chain_mask"]
-        mask = state["mask"]
-        bias = state["bias"]
-        sampled = state["sampled"]
-        token_states = state["token_states"]
-        layer_states = state["layer_states"]
-        probabilities = state["probabilities"]
-        log_probs_out = state["log_probs_out"]
-        logits_out = state["logits_out"]
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
+        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = forward_mask * encoder_context
 
-        length = sequence.shape[1]
         for step in range(length):
             residue = decode_order[:, step]
             chain_mask_t = torch.gather(chain_mask, 1, residue[:, None])[:, 0]
-            mask_t = torch.gather(mask, 1, residue[:, None])[:, 0]
+            mask_t = torch.gather(valid_mask, 1, residue[:, None])
             bias_t = torch.gather(bias, 1, residue[:, None, None].repeat(1, 1, bias.shape[-1]))[:, 0, :]
-            neighbor_idx_t = torch.gather(neighbor_idx, 1, residue[:, None, None].repeat(1, 1, neighbor_idx.shape[-1]))
+            neighbor_idx_t = torch.gather(
+                neighbor_indices,
+                1,
+                residue[:, None, None].repeat(1, 1, neighbor_indices.shape[-1]),
+            )
             edge_t = torch.gather(
                 edge_states,
                 1,
@@ -902,15 +1068,15 @@ class LigandMPNNBackbone(nn.Module):
                 1,
                 residue[:, None, None, None].repeat(1, 1, backward_mask.shape[-2], backward_mask.shape[-1]),
             )
-            for layer_idx, layer in enumerate(self.decoder_layers):
-                decoder_context = cat_neighbors_nodes(layer_states[layer_idx], edge_token_t, neighbor_idx_t)
+            for layer_index, layer in enumerate(self.decoder_layers):
+                decoder_context = cat_neighbors_nodes(layer_states[layer_index], edge_token_t, neighbor_idx_t)
                 node_t = torch.gather(
-                    layer_states[layer_idx],
+                    layer_states[layer_index],
                     1,
-                    residue[:, None, None].repeat(1, 1, layer_states[layer_idx].shape[-1]),
+                    residue[:, None, None].repeat(1, 1, layer_states[layer_index].shape[-1]),
                 )
                 updated = layer(node_t, backward_t * decoder_context + forward_t, mask_t)
-                layer_states[layer_idx + 1].scatter_(
+                layer_states[layer_index + 1].scatter_(
                     1,
                     residue[:, None, None].repeat(1, 1, node_states.shape[-1]),
                     updated,
@@ -924,21 +1090,22 @@ class LigandMPNNBackbone(nn.Module):
             logits = self.output_projection(final_t)
             log_probs = F.log_softmax(logits, dim=-1)
             sample_probs = F.softmax((logits + bias_t) / temperature, dim=-1)
-            sample_probs = sample_probs[:, :20] / sample_probs[:, :20].sum(dim=-1, keepdim=True)
+            sample_probs = sample_probs[:, :_GENERATABLE]
+            sample_probs = sample_probs / sample_probs.sum(dim=-1, keepdim=True)
             sampled_t = torch.multinomial(sample_probs, 1, generator=generator)[:, 0]
             probabilities.scatter_(
                 1,
-                residue[:, None, None].repeat(1, 1, 20),
+                residue[:, None, None].repeat(1, 1, _GENERATABLE),
                 chain_mask_t[:, None, None] * sample_probs[:, None, :],
             )
             log_probs_out.scatter_(
                 1,
-                residue[:, None, None].repeat(1, 1, 21),
+                residue[:, None, None].repeat(1, 1, _VOCABULARY),
                 chain_mask_t[:, None, None] * log_probs[:, None, :],
             )
             logits_out.scatter_(
                 1,
-                residue[:, None, None].repeat(1, 1, 21),
+                residue[:, None, None].repeat(1, 1, _VOCABULARY),
                 chain_mask_t[:, None, None] * logits[:, None, :],
             )
             true_t = torch.gather(sequence_true, 1, residue[:, None])[:, 0]
@@ -955,101 +1122,73 @@ class LigandMPNNBackbone(nn.Module):
             "sampling_probs": probabilities,
             "logits": logits_out,
             "log_probs": log_probs_out,
+            "decoding_order": decode_order,
         }
 
     def _sample_symmetric(
         self,
-        sequence: Tensor,
-        mask: Tensor,
-        chain_mask: Tensor,
-        bias: Tensor,
-        temperature: float | Tensor,
-        decode_order: Tensor,
-        ordered_groups: list[list[int]],
-        symmetry_weights: Tensor,
         node_states: Tensor,
         edge_states: Tensor,
-        neighbor_idx: Tensor,
-        num_samples: int,
+        neighbor_indices: Tensor,
+        sequence_true: Tensor,
+        valid_mask: Tensor,
+        chain_mask: Tensor,
+        bias: Tensor,
+        temperature: float,
+        decode_order: Tensor,
+        tied_groups: tuple[tuple[int, ...], ...],
+        tied_weights: Tensor,
         generator: torch.Generator | None,
     ) -> dict[str, Tensor]:
-        r"""
-        Sample tokens with tied symmetry groups drawn as one weighted decision.
+        r"""Sample tokens with each tied group drawn as one weighted decision.
 
-        Like [`_sample_independent`][ofoldx.models.ligandmpnn.model.LigandMPNNBackbone._sample_independent]
-        but decodes residues group-by-group: within a group the per-residue logits are combined with the
-        symmetry weights, a single token is sampled, and every group member is assigned that token so tied
-        positions stay identical.
-
-        Args:
-            sequence: Input sequence tokens `[1, L]`.
-            mask: Valid-residue mask `[1, L]`.
-            chain_mask: Design mask marking positions to sample `[1, L]`.
-            bias: Per-position amino-acid logit bias `[1, L, vocab]`.
-            temperature: Softmax sampling temperature.
-            decode_order: Residue decode order `[1, L]` derived from the ordered groups.
-            ordered_groups: Symmetry groups in decode order, each a list of residue indices.
-            symmetry_weights: Per-residue logit weights `[L]` combining tied positions.
-            node_states: Encoder node states `[1, L, H]`.
-            edge_states: Encoder edge states `[1, L, K, H]`.
-            neighbor_idx: Neighbor indices `[1, L, K]`.
-            num_samples: Number of independent sequences to sample.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            Mapping with ``S`` (sampled tokens), ``sampling_probs``, ``logits``, and ``log_probs``.
+        Neural logits combine as ``sum(tied_weight[i] * logits[i])`` with a default coefficient of one;
+        the aligned bias applies once at the shared group value and hard support is folded into that
+        bias. One group distribution is copied to every member, and every member receives the same token.
         """
 
-        backward_mask, forward_mask = _autoregressive_masks(decode_order, neighbor_idx, mask)
-        backward_mask = backward_mask.repeat(num_samples, 1, 1, 1)
-        forward_mask = forward_mask.repeat(num_samples, 1, 1, 1)
-        state = self._init_decode_state(
-            sequence, mask, chain_mask, bias, node_states, edge_states, neighbor_idx, num_samples
+        num_samples, length = sequence_true.shape
+        device = sequence_true.device
+        sampled = _GENERATABLE * torch.ones(num_samples, length, dtype=torch.long, device=device)
+        token_states = torch.zeros_like(node_states)
+        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        probabilities = node_states.new_zeros(num_samples, length, _GENERATABLE)
+        log_probs_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
+        logits_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
+        backward_mask, forward_mask = _autoregressive_masks(
+            _decoding_order_to_ranks(decode_order),
+            neighbor_indices,
+            valid_mask,
         )
-        node_states = state["node_states"]
-        edge_states = state["edge_states"]
-        neighbor_idx = state["neighbor_idx"]
-        chain_mask = state["chain_mask"]
-        mask = state["mask"]
-        bias = state["bias"]
-        sequence_true = state["sequence_true"]
-        sampled = state["sampled"]
-        token_states = state["token_states"]
-        layer_states = state["layer_states"]
-        probabilities = state["probabilities"]
-        log_probs_out = state["log_probs_out"]
-        logits_out = state["logits_out"]
-        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_idx)
-        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_idx)
+        encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
+        encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = forward_mask * encoder_context
 
+        ordered_groups = _decode_groups(decode_order[0], [list(group) for group in tied_groups])
         for residue_group in ordered_groups:
-            total_logits = 0.0
-            bias_t = bias[:, residue_group[0]]
+            total_logits = node_states.new_zeros(num_samples, _VOCABULARY)
+            bias_group = bias[:, residue_group[-1]]
             for residue in residue_group:
                 chain_mask_t = chain_mask[:, residue]
-                mask_t = mask[:, residue]
+                mask_t = valid_mask[:, residue]
                 edge_t = edge_states[:, residue : residue + 1]
-                neighbor_idx_t = neighbor_idx[:, residue : residue + 1]
+                neighbor_idx_t = neighbor_indices[:, residue : residue + 1]
                 edge_token_t = cat_neighbors_nodes(token_states, edge_t, neighbor_idx_t)
                 forward_t = forward_context[:, residue : residue + 1]
-                for layer_idx, layer in enumerate(self.decoder_layers):
-                    decoder_context = cat_neighbors_nodes(layer_states[layer_idx], edge_token_t, neighbor_idx_t)
-                    node_t = layer_states[layer_idx][:, residue : residue + 1]
+                for layer_index, layer in enumerate(self.decoder_layers):
+                    decoder_context = cat_neighbors_nodes(layer_states[layer_index], edge_token_t, neighbor_idx_t)
+                    node_t = layer_states[layer_index][:, residue : residue + 1]
                     context_t = backward_mask[:, residue : residue + 1] * decoder_context + forward_t
-                    layer_states[layer_idx + 1][:, residue : residue + 1] = layer(
-                        node_t,
-                        context_t,
-                        mask_t[:, None],
-                    )
+                    layer_states[layer_index + 1][:, residue : residue + 1] = layer(node_t, context_t, mask_t[:, None])
                 logits = self.output_projection(layer_states[-1][:, residue])
                 log_probs = F.log_softmax(logits, dim=-1)
                 log_probs_out[:, residue] = chain_mask_t[:, None] * log_probs
                 logits_out[:, residue] = chain_mask_t[:, None] * logits
-                total_logits = total_logits + symmetry_weights[residue] * logits
+                total_logits = total_logits + tied_weights[:, residue, None] * logits
 
-            sample_probs = F.softmax((total_logits + bias_t) / temperature, dim=-1)
-            sample_probs = sample_probs[:, :20] / sample_probs[:, :20].sum(dim=-1, keepdim=True)
+            sample_probs = F.softmax((total_logits + bias_group) / temperature, dim=-1)
+            sample_probs = sample_probs[:, :_GENERATABLE]
+            sample_probs = sample_probs / sample_probs.sum(dim=-1, keepdim=True)
             sampled_t = torch.multinomial(sample_probs, 1, generator=generator)[:, 0]
             for residue in residue_group:
                 chain_mask_t = chain_mask[:, residue]
@@ -1064,1551 +1203,157 @@ class LigandMPNNBackbone(nn.Module):
             "sampling_probs": probabilities,
             "logits": logits_out,
             "log_probs": log_probs_out,
+            "decoding_order": decode_order,
         }
 
+    # -- design ----------------------------------------------------------------------------------
 
-class LigandBackboneFeatures(nn.Module):
-    r"""
-    Input featurizer for the LigandMPNN backbone graph and ligand context.
-
-    Turns raw backbone coordinates into the graph the encoder consumes: it derives the virtual CB atom,
-    builds the k-nearest-neighbor residue graph, and computes pairwise RBF distance edges plus
-    relative-position features. In parallel it featurizes the ligand/context atoms (per-atom RBF distances to
-    backbone atoms, element one-hots, and local-frame angle features) and, when enabled, folds observed
-    side-chain atoms into that context.
-
-    Args:
-        node_size: Width of the per-atom context node features.
-        edge_size: Width of the per-residue-edge features.
-        num_positional_embeddings: Width of the relative-position embedding.
-        num_rbf: Number of radial basis functions per distance feature.
-        k_neighbors: Number of nearest-neighbor residues in the graph.
-        coord_noise_scale: Standard deviation of Gaussian coordinate noise; ``0`` disables it.
-        atom_context_num: Number of ligand/context atoms kept per residue.
-        use_side_chain_context: Whether to append observed side-chain atoms to the ligand context.
-    """
-
-    def __init__(
+    @torch.inference_mode()
+    def design(
         self,
+        input: LigandMpnnInput,
         *,
-        node_size: int,
-        edge_size: int,
-        num_positional_embeddings: int,
-        num_rbf: int,
-        k_neighbors: int,
-        coord_noise_scale: float,
-        atom_context_num: int,
-        use_side_chain_context: bool,
-    ) -> None:
-        super().__init__()
-        self.k_neighbors = k_neighbors
-        self.coord_noise_scale = coord_noise_scale
-        self.num_rbf = num_rbf
-        self.atom_context_num = atom_context_num
-        self.use_side_chain_context = use_side_chain_context
-        self.relative_position = RelativePositionEncoding(num_positional_embeddings)
-        self.edge_projection = nn.Linear(num_positional_embeddings + 25 * num_rbf, edge_size, bias=False)
-        self.edge_norm = nn.LayerNorm(edge_size)
-        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
-        self.atom_norm = nn.LayerNorm(node_size)
-        self.element_projection = nn.Linear(147, 64)
-        self.context_node_projection = nn.Linear(147, node_size, bias=False)
-        self.context_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
-        self.context_edge_norm = nn.LayerNorm(node_size)
-        self.context_node_norm = nn.LayerNorm(node_size)
-        group, period = periodic_group_period()
-        self.register_buffer("periodic_group", group, persistent=False)
-        self.register_buffer("periodic_period", period, persistent=False)
-        self.register_buffer("side_chain_atom_types", side_chain_atom_types(), persistent=False)
+        num_candidates: int = 1,
+        temperature: float = 0.1,
+        coordinate_noise: float = 0.0,
+        use_side_chain_context: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> DesignResult:
+        r"""Autoregressively design complete canonical candidates and score each in-pass."""
 
-    def forward(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Featurize backbone geometry and ligand context into graph inputs.
-
-        Args:
-            features: Feature mapping with backbone coords ``X``, ligand context ``Y``/``Y_t``/``Y_m``, the
-                residue/chain indices, and the validity ``mask``.
-
-        Returns:
-            Tuple ``(atom_features, edges, neighbor_idx, context_nodes, context_edges, context_mask)``:
-            per-residue ligand-context node features, residue-graph edges, neighbor indices, and the
-            context-atom node/edge features and mask.
-        """
-
-        coords = features["X"]
-        context_coords = features["Y"]
-        context_mask = features["Y_m"]
-        context_types = features["Y_t"]
-        if self.coord_noise_scale > 0:
-            generator = features.get("generator")
-            coords = coords + self.coord_noise_scale * _randn_like(coords, generator)
-            context_coords = context_coords + self.coord_noise_scale * _randn_like(context_coords, generator)
-        atoms = _backbone_atoms(coords)
-        _, neighbor_idx = _knn(atoms["CA"], features["mask"], self.k_neighbors)
-        pair_features = _backbone_pair_rbf(atoms, neighbor_idx, self.num_rbf)
-        residue_offset = features["residue_index"][:, :, None] - features["residue_index"][:, None, :]
-        residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        same_chain = (features["chain_labels"][:, :, None] == features["chain_labels"][:, None, :]).long()
-        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        position_features = self.relative_position(residue_offset.long(), same_chain)
-        edge_input = torch.cat((position_features, pair_features), dim=-1)
-        edges = self.edge_norm(self.edge_projection(edge_input))
-
-        if self.use_side_chain_context:
-            context_coords, context_types, context_mask = self._append_side_chain_context(
-                features,
-                atoms["CB"],
-                context_coords,
-                context_types,
-                context_mask,
-                neighbor_idx,
-            )
-
-        context_types = context_types.long()
-        element_features = self._element_features(context_types)
-        element_projection = self.element_projection(element_features.to(dtype=coords.dtype))
-
-        def atom_context_rbf(atom: Tensor) -> Tensor:
-            r"""
-            RBF-expand the distances from one backbone atom to every ligand-context atom.
-
-            Args:
-                atom: Coordinates of a single backbone atom per residue `[B, L, 3]`.
-
-            Returns:
-                Radial-basis distance features to each context atom `[B, L, A, num_rbf]`.
-            """
-
-            distance = torch.sqrt(torch.sum((atom[:, :, None] - context_coords) ** 2, dim=-1) + 1e-6)
-            return _rbf(distance, self.num_rbf)
-
-        atom_features = torch.cat(
-            (
-                atom_context_rbf(atoms["N"]),
-                atom_context_rbf(atoms["CA"]),
-                atom_context_rbf(atoms["C"]),
-                atom_context_rbf(atoms["O"]),
-                atom_context_rbf(atoms["CB"]),
-                element_projection,
-                _local_angle_features(atoms["N"], atoms["CA"], atoms["C"], context_coords),
-            ),
-            dim=-1,
+        self._require_single_target(input)
+        if type(num_candidates) is not int or num_candidates <= 0:
+            raise ValueError("num_candidates must be a positive integer")
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be a finite positive number")
+        coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
+        sampled = self.sample(
+            input,
+            num_samples=num_candidates,
+            temperature=temperature,
+            coordinate_noise=coordinate_noise,
+            use_side_chain_context=use_side_chain_context,
+            generator=generator,
         )
-        atom_features = self.atom_norm(self.atom_projection(atom_features))
-        context_distances = torch.sqrt(
-            torch.sum((context_coords[:, :, :, None] - context_coords[:, :, None, :]) ** 2, dim=-1) + 1e-6
-        )
-        context_edges = self.context_edge_norm(self.context_edge_projection(_rbf(context_distances, self.num_rbf)))
-        context_nodes = self.context_node_norm(self.context_node_projection(element_features.to(dtype=coords.dtype)))
-        return atom_features, edges, neighbor_idx, context_nodes, context_edges, context_mask
-
-    def _append_side_chain_context(
-        self,
-        features: Mapping[str, Tensor],
-        cb: Tensor,
-        context_coords: Tensor,
-        context_types: Tensor,
-        context_mask: Tensor,
-        neighbor_idx: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Append observed neighbor side-chain atoms to the ligand context, then re-select the nearest atoms.
-
-        Args:
-            features: Feature mapping; must include atom37 side-chain coords ``xyz_37`` and mask ``xyz_37_m``.
-            cb: Virtual CB coordinates `[B, L, 3]` used as the distance reference.
-            context_coords: Existing ligand-context coordinates `[B, L, A, 3]`.
-            context_types: Existing context atomic numbers `[B, L, A]`.
-            context_mask: Existing context validity mask `[B, L, A]`.
-            neighbor_idx: Residue neighbor indices `[B, L, K]`.
-
-        Returns:
-            The context ``(coords, types, mask)`` after adding side-chain atoms and keeping the nearest
-            ``atom_context_num`` per residue.
-
-        Raises:
-            ValueError: If ``xyz_37``/``xyz_37_m`` are absent from ``features``.
-        """
-
-        if "xyz_37" not in features or "xyz_37_m" not in features:
-            raise ValueError("LigandMPNN side-chain context requires xyz_37 and xyz_37_m")
-        xyz_37 = features["xyz_37"]
-        xyz_37_m = features["xyz_37_m"] * (1 - features["chain_mask"][:, :, None])
-        batch, length = context_mask.shape[:2]
-        neighbor_subset = neighbor_idx[:, :, :16]
-        side_chain_mask = gather_nodes(xyz_37_m[:, :, 5:], neighbor_subset).reshape(batch, length, -1)
-        side_chain_coords = gather_nodes(xyz_37[:, :, 5:].reshape(batch, length, -1), neighbor_subset)
-        side_chain_coords = side_chain_coords.reshape(batch, length, -1, 3)
-        side_chain_types = self.side_chain_atom_types[None, None, None, :].expand(
-            batch,
-            length,
-            neighbor_subset.shape[2],
+        losses = -torch.gather(
+            sampled.log_probabilities,
             -1,
+            sampled.sequences.unsqueeze(-1),
+        ).squeeze(-1)
+        designed = (input.valid_mask & input.design_mask)[0]
+        interface = designed & input.ligand_interface_mask[0].bool()
+        designed_row = designed.to(dtype=losses.dtype)
+        interface_row = interface.to(dtype=losses.dtype)
+        designed_nll = (losses * designed_row).sum(dim=-1) / designed_row.sum(dim=-1)
+        interface_nll = (losses * interface_row).sum(dim=-1) / interface_row.sum(dim=-1)
+        designed_confidence = torch.exp(-designed_nll)
+        interface_confidence = torch.exp(-interface_nll)
+        recovery = (
+            (sampled.sequences == input.sequence_tokens.repeat(num_candidates, 1)).to(dtype=losses.dtype) * designed_row
+        ).sum(dim=-1) / designed_row.sum(dim=-1)
+
+        references = input.component_references
+        designed_host = designed.detach().cpu().tolist()
+        interface_host = interface.detach().cpu().tolist()
+        designed_scope = frozenset(
+            reference for reference, selected in zip(references, designed_host) if reference is not None and selected
         )
-        side_chain_types = side_chain_types.reshape(batch, length, -1)
-        context_coords = torch.cat((side_chain_coords, context_coords), dim=2)
-        context_mask = torch.cat((side_chain_mask, context_mask), dim=2)
-        context_types = torch.cat((side_chain_types, context_types), dim=2)
-        distances = torch.sum((cb[:, :, None] - context_coords) ** 2, dim=-1)
-        valid = features["mask"][:, :, None] * context_mask
-        adjusted = distances * valid + (1.0 - valid) * 10000.0
-        atom_count = min(self.atom_context_num, adjusted.shape[-1])
-        atom_idx = torch.topk(adjusted, atom_count, dim=-1, largest=False).indices
-        context_coords = torch.gather(context_coords, 2, atom_idx[:, :, :, None].expand(-1, -1, -1, 3))
-        context_types = torch.gather(context_types, 2, atom_idx)
-        context_mask = torch.gather(context_mask, 2, atom_idx)
-        return context_coords, context_types, context_mask
-
-    def _element_features(self, atomic_numbers: Tensor) -> Tensor:
-        r"""One-hot-encode each context atom by element, periodic group, and period.
-
-        Args:
-            atomic_numbers: Context atom atomic numbers `[B, L, A]`.
-
-        Returns:
-            Concatenated one-hot element features `[B, L, A, 147]` (120 element + 19 group + 8 period).
-        """
-
-        # Note: atomic numbers must lie in [0, 119]; the range is enforced upstream in the processor / input
-        # validation rather than with a data-dependent guard here, so this stays free of a host sync and
-        # compiles under torch.compile(..., fullgraph=True).
-        group = self.periodic_group[atomic_numbers]
-        period = self.periodic_period[atomic_numbers]
-        return torch.cat(
-            (
-                F.one_hot(atomic_numbers, 120),
-                F.one_hot(group, 19),
-                F.one_hot(period, 8),
-            ),
-            dim=-1,
+        interface_scope = frozenset(
+            reference for reference, selected in zip(references, interface_host) if reference is not None and selected
         )
+        host_sequences = sampled.sequences.detach().cpu().tolist()
+        designed_confidence_host = designed_confidence.detach().cpu().tolist()
+        interface_confidence_host = interface_confidence.detach().cpu().tolist()
+        recovery_host = recovery.detach().cpu().tolist()
 
-
-class LigandEncoderLayer(nn.Module):
-    r"""
-    One encoder message-passing layer updating both node and edge states.
-
-    Aggregates neighbor messages into each node (with a feed-forward residual), then recomputes edge
-    messages from the updated nodes. Messages are summed over neighbors and divided by ``scale`` to keep the
-    residual magnitude stable, matching the reference LigandMPNN encoder block.
-
-    Args:
-        hidden_size: Node/edge feature width.
-        edge_input_size: Width of the concatenated edge context feeding the message MLPs.
-        dropout: Dropout probability on the message and feed-forward residuals.
-        scale: Divisor applied to the summed neighbor messages.
-    """
-
-    def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
-        super().__init__()
-        self.scale = scale
-        self.node_message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.node_dropout = nn.Dropout(dropout)
-        self.node_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = FeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
-        self.edge_message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.edge_dropout = nn.Dropout(dropout)
-        self.edge_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self,
-        node_states: Tensor,
-        edge_states: Tensor,
-        neighbor_idx: Tensor,
-        node_mask: Tensor | None,
-        attend_mask: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        r"""
-        Update node states from neighbor messages, then refresh edge states.
-
-        Args:
-            node_states: Per-residue node states `[B, L, H]`.
-            edge_states: Per-edge states `[B, L, K, H]`.
-            neighbor_idx: Neighbor indices `[B, L, K]`.
-            node_mask: Optional per-node validity mask `[B, L]` zeroing invalid nodes.
-            attend_mask: Optional per-edge attention mask `[B, L, K]` zeroing invalid messages.
-
-        Returns:
-            Tuple ``(node_states, edge_states)`` with the updated node and edge states.
-        """
-
-        neighbor_states = cat_neighbors_nodes(node_states, edge_states, neighbor_idx)
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, neighbor_states.shape[-2], -1)
-        node_message = self.node_message(torch.cat((source_states, neighbor_states), dim=-1))
-        if attend_mask is not None:
-            node_message = node_message * attend_mask.unsqueeze(-1)
-        node_states = self.node_norm(node_states + self.node_dropout(node_message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
-        if node_mask is not None:
-            node_states = node_states * node_mask.unsqueeze(-1)
-
-        neighbor_states = cat_neighbors_nodes(node_states, edge_states, neighbor_idx)
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, neighbor_states.shape[-2], -1)
-        edge_message = self.edge_message(torch.cat((source_states, neighbor_states), dim=-1))
-        edge_states = self.edge_norm(edge_states + self.edge_dropout(edge_message))
-        return node_states, edge_states
-
-
-class LigandDecoderLayer(nn.Module):
-    r"""
-    One node-only message-passing layer over a precomputed edge context.
-
-    Aggregates messages from a supplied ``edge_context`` (already carrying neighbor node and edge state) into
-    each node, followed by a feed-forward residual. Unlike the encoder layer it does not update edge states;
-    it is reused for the autoregressive decoder and the ligand-context mixing stack.
-
-    Args:
-        hidden_size: Node feature width.
-        edge_input_size: Width of the supplied edge context feeding the message MLP.
-        dropout: Dropout probability on the message and feed-forward residuals.
-        scale: Divisor applied to the summed neighbor messages.
-    """
-
-    def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
-        super().__init__()
-        self.scale = scale
-        self.message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.message_dropout = nn.Dropout(dropout)
-        self.message_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = FeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self,
-        node_states: Tensor,
-        edge_context: Tensor,
-        node_mask: Tensor | None = None,
-        attend_mask: Tensor | None = None,
-    ) -> Tensor:
-        r"""
-        Update node states from messages over the supplied edge context.
-
-        Args:
-            node_states: Per-residue node states `[B, L, H]`.
-            edge_context: Concatenated neighbor context `[B, L, K, edge_input_size]`.
-            node_mask: Optional per-node validity mask zeroing invalid nodes.
-            attend_mask: Optional per-edge attention mask zeroing invalid messages.
-
-        Returns:
-            The updated node states `[B, L, H]`.
-        """
-
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, edge_context.shape[-2], -1)
-        message = self.message(torch.cat((source_states, edge_context), dim=-1))
-        if attend_mask is not None:
-            message = message * attend_mask.unsqueeze(-1)
-        node_states = self.message_norm(node_states + self.message_dropout(message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
-        if node_mask is not None:
-            node_states = node_states * node_mask.unsqueeze(-1)
-        return node_states
-
-
-class LigandAtomLayer(nn.Module):
-    r"""
-    Message-passing layer over the per-residue ligand-atom graph.
-
-    Structurally the decoder layer applied one axis deeper: it mixes ligand/context atom nodes among
-    themselves within each residue (an extra ``L`` axis) before those context nodes are folded into the
-    residue graph. Nodes are updated from an all-pairs atom edge context with a feed-forward residual.
-
-    Args:
-        hidden_size: Atom-node feature width.
-        edge_input_size: Width of the supplied atom-edge context feeding the message MLP.
-        dropout: Dropout probability on the message and feed-forward residuals.
-        scale: Divisor applied to the summed atom messages.
-    """
-
-    def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
-        super().__init__()
-        self.scale = scale
-        self.message = MessageMLP(hidden_size + edge_input_size, hidden_size)
-        self.message_dropout = nn.Dropout(dropout)
-        self.message_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = FeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
-
-    def forward(
-        self,
-        node_states: Tensor,
-        edge_context: Tensor,
-        node_mask: Tensor | None = None,
-        attend_mask: Tensor | None = None,
-    ) -> Tensor:
-        r"""
-        Update ligand-atom node states from all-pairs atom messages.
-
-        Args:
-            node_states: Per-residue atom-node states `[B, L, A, H]`.
-            edge_context: Concatenated atom-pair context `[B, L, A, A, edge_input_size]`.
-            node_mask: Optional per-atom validity mask zeroing invalid atoms.
-            attend_mask: Optional per-atom-pair mask zeroing invalid messages.
-
-        Returns:
-            The updated atom-node states `[B, L, A, H]`.
-        """
-
-        source_states = node_states.unsqueeze(-2).expand(-1, -1, -1, edge_context.shape[-2], -1)
-        message = self.message(torch.cat((source_states, edge_context), dim=-1))
-        if attend_mask is not None:
-            message = message * attend_mask.unsqueeze(-1)
-        node_states = self.message_norm(node_states + self.message_dropout(message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
-        if node_mask is not None:
-            node_states = node_states * node_mask.unsqueeze(-1)
-        return node_states
-
-
-class MessageMLP(nn.Module):
-    r"""
-    Three-layer GELU MLP that computes a message from concatenated node/edge features.
-
-    Args:
-        input_size: Width of the concatenated source-node, neighbor-node, and edge input.
-        hidden_size: Width of the two hidden layers and the message output.
-    """
-
-    def __init__(self, input_size: int, hidden_size: int) -> None:
-        super().__init__()
-        self.input = nn.Linear(input_size, hidden_size)
-        self.middle = nn.Linear(hidden_size, hidden_size)
-        self.output = nn.Linear(hidden_size, hidden_size)
-        self.activation = nn.GELU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        r"""
-        Compute the message for ``x``.
-
-        Args:
-            x: Concatenated message input `[..., input_size]`.
-
-        Returns:
-            The message `[..., hidden_size]`.
-        """
-
-        return self.output(self.activation(self.middle(self.activation(self.input(x)))))
-
-
-class FeedForward(nn.Module):
-    r"""
-    Position-wise GELU feed-forward block used as the layer residual.
-
-    Args:
-        hidden_size: Input/output width.
-        intermediate_size: Width of the expanded inner layer.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        super().__init__()
-        self.input = nn.Linear(hidden_size, intermediate_size)
-        self.output = nn.Linear(intermediate_size, hidden_size)
-        self.activation = nn.GELU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        r"""
-        Apply the expand-activate-project feed-forward transform.
-
-        Args:
-            x: Input `[..., hidden_size]`.
-
-        Returns:
-            The transformed tensor `[..., hidden_size]`.
-        """
-
-        return self.output(self.activation(self.input(x)))
-
-
-class RelativePositionEncoding(nn.Module):
-    r"""
-    Relative sequence-position edge embedding with a distinct cross-chain bucket.
-
-    Clips the residue-index offset to ``[-max_relative_feature, max_relative_feature]`` into one-hot buckets;
-    edges between different chains are routed to a single extra bucket so cross-chain contacts are encoded as
-    "far / different chain" rather than by their (meaningless) index difference.
-
-    Args:
-        num_embeddings: Output embedding width.
-        max_relative_feature: Maximum absolute residue offset kept before clipping.
-    """
-
-    def __init__(self, num_embeddings: int, max_relative_feature: int = 32) -> None:
-        super().__init__()
-        self.max_relative_feature = max_relative_feature
-        self.linear = nn.Linear(2 * max_relative_feature + 2, num_embeddings)
-
-    def forward(self, offset: Tensor, same_chain: Tensor) -> Tensor:
-        r"""
-        Embed the per-edge relative position.
-
-        Args:
-            offset: Signed residue-index offsets `[B, L, K]`.
-            same_chain: Binary same-chain indicator `[B, L, K]` (``1`` if the pair shares a chain).
-
-        Returns:
-            The relative-position edge embedding `[B, L, K, num_embeddings]`.
-        """
-
-        clipped = torch.clamp(offset + self.max_relative_feature, 0, 2 * self.max_relative_feature)
-        bucket = clipped * same_chain + (1 - same_chain) * (2 * self.max_relative_feature + 1)
-        return self.linear(F.one_hot(bucket, 2 * self.max_relative_feature + 2).to(dtype=self.linear.weight.dtype))
-
-
-def _randn_like(tensor: Tensor, generator: torch.Generator | None) -> Tensor:
-    r"""Draw standard-normal noise shaped like ``tensor``, honoring an optional RNG.
-
-    Args:
-        tensor: Template tensor providing shape/dtype/device.
-        generator: Optional RNG; when ``None`` uses the global default.
-
-    Returns:
-        Gaussian noise with the same shape, dtype, and device as ``tensor``.
-    """
-
-    if generator is None:
-        return torch.randn_like(tensor)
-    return torch.randn(tensor.shape, dtype=tensor.dtype, device=tensor.device, generator=generator)
-
-
-def _validate_ligandmpnn_input(batch: LigandMPNNInput, *, require_sampling: bool) -> None:
-    r"""Assert that a typed input satisfies the LigandMPNN tensor shape contract.
-
-    Args:
-        batch: The input to validate.
-        require_sampling: When ``True``, additionally enforce the single-backbone (``B == 1``) contract.
-
-    Raises:
-        ValueError: If any field has an inconsistent shape, or ``require_sampling`` and ``B != 1``.
-    """
-
-    if batch.backbone_coords.ndim != 4 or batch.backbone_coords.shape[2:] != (4, 3):
-        raise ValueError(
-            "backbone_coords must have shape (B, L, 4, 3) for N/CA/C/O atoms, "
-            f"got {tuple(batch.backbone_coords.shape)}"
+        candidates = tuple(
+            DesignCandidate(
+                system=_realize_designed_system(
+                    input.structure.system,
+                    references,
+                    host_sequences[index],
+                    designed_host,
+                ),
+                scores={
+                    "designed_sequence_confidence": Score(
+                        float(designed_confidence_host[index]),
+                        preferred="higher",
+                        scope=designed_scope,
+                    ),
+                    "ligand_interface_confidence": Score(
+                        float(interface_confidence_host[index]),
+                        preferred="higher",
+                        scope=interface_scope,
+                    ),
+                    "sequence_recovery": Score(
+                        float(recovery_host[index]),
+                        preferred="higher",
+                        scope=designed_scope,
+                    ),
+                },
+            )
+            for index in range(num_candidates)
         )
-    if batch.sequence_tokens.shape != batch.token_mask.shape:
-        raise ValueError("sequence_tokens and token_mask must have matching shape (B, L)")
-    if batch.backbone_coords.shape[:2] != batch.sequence_tokens.shape:
-        raise ValueError("backbone_coords and sequence_tokens/token_mask must share batch and residue axes")
-    if (
-        batch.ligand_atom_coords.ndim != 4
-        or batch.ligand_atom_coords.shape[:2] != batch.sequence_tokens.shape
-        or batch.ligand_atom_coords.shape[-1] != 3
-    ):
-        raise ValueError("ligand_atom_coords must have shape (B, L, M, 3)")
-    if (
-        batch.ligand_atom_types.shape != batch.ligand_atom_mask.shape
-        or batch.ligand_atom_types.shape != batch.ligand_atom_coords.shape[:3]
-    ):
-        raise ValueError("ligand_atom_types and ligand_atom_mask must have shape (B, L, M)")
-    if (
-        batch.residue_index.shape != batch.sequence_tokens.shape
-        or batch.chain_index.shape != batch.sequence_tokens.shape
-    ):
-        raise ValueError("residue_index and chain_index must have shape (B, L)")
-    if batch.design_mask is not None and batch.design_mask.shape != batch.sequence_tokens.shape:
-        raise ValueError("design_mask must have shape (B, L)")
-    if batch.amino_acid_bias is not None and batch.amino_acid_bias.shape != (*batch.sequence_tokens.shape, 21):
-        raise ValueError("amino_acid_bias must have shape (B, L, 21)")
-    if batch.decoding_order_noise is not None and (
-        batch.decoding_order_noise.ndim != 2 or batch.decoding_order_noise.shape[1] != batch.sequence_tokens.shape[1]
-    ):
-        raise ValueError("decoding_order_noise must have shape (num_samples, L)")
-    if require_sampling and batch.sequence_tokens.shape[0] != 1:
-        raise ValueError("LigandMPNN sampling follows the official single-backbone batch contract")
-    if batch.all_atom_coords is not None and (
-        batch.all_atom_coords.ndim != 4 or batch.all_atom_coords.shape[:2] != batch.sequence_tokens.shape
-    ):
-        raise ValueError("all_atom_coords must have shape (B, L, A, 3)")
-    if batch.all_atom_mask is not None and (
-        batch.all_atom_mask.ndim != 3 or batch.all_atom_mask.shape[:2] != batch.sequence_tokens.shape
-    ):
-        raise ValueError("all_atom_mask must have shape (B, L, A)")
+        return DesignResult(candidates=candidates)
 
 
-def _sequence_log_likelihood(sequence: Tensor, log_probs: Tensor, mask: Tensor) -> Tensor:
-    r"""Mask-averaged per-token log-likelihood of ``sequence`` under ``log_probs``.
+# ---------------------------------------------------------------------------
+# Family-owned tensor boundary (folded from contract.py)
+# ---------------------------------------------------------------------------
 
-    Args:
-        sequence: Token ids `[B*, L]`.
-        log_probs: Per-token log-probabilities `[B*, L, vocab]`.
-        mask: Valid-residue mask `[B, L]`; tiled to the sample count when needed.
 
-    Returns:
-        Per-sequence mean log-likelihood over valid residues `[B*]`.
+@dataclass(eq=False)
+class LigandMpnnInput:
+    r"""Tensors and canonical identities consumed by LigandMPNN operations.
+
+    The canonical Processor operation owns one Structure, so the tensor batch is
+    one. ``backbone_coordinates`` is ``[1, L, 4, 3]`` in N/CA/C/O order. The
+    ``context_*`` tensors are ``[1, L, A, ...]`` for the padded nearest-context
+    extent ``A``. The ``residue_context_*`` tensors are the released ``[1, L, 32]``
+    side-chain slots at atom37 indices ``5:37`` (CG through OXT, deliberately
+    excluding CB), which the Model consumes directly instead of a redundant full
+    atom37 array. ``tied_group_ids`` is aligned ``long [1, L]`` dense causal-unit
+    identity in first-row order; every untied row owns its identity. ``tied_weights``
+    is aligned ``[1, L]`` when present, and ``None`` selects coefficient one.
+    Optional evidence remains ``None`` on the common path rather than allocating
+    neutral per-position masks or bias tensors.
     """
 
-    token_log_probs = torch.gather(log_probs, -1, sequence[..., None]).squeeze(-1)
-    mask = mask.to(dtype=token_log_probs.dtype)
-    if mask.shape[0] != token_log_probs.shape[0]:
-        mask = mask.repeat(token_log_probs.shape[0] // mask.shape[0], 1)
-    return (token_log_probs * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
-
-
-def _has_no_symmetry(groups: list[list[int]]) -> bool:
-    r"""Return whether ``groups`` is the sentinel meaning "no symmetry constraints" (``[[]]``)."""
-
-    return len(groups) == 1 and len(groups[0]) == 0
-
-
-def _decode_groups(decode_order: Tensor, symmetry_groups: list[list[int]]) -> list[list[int]]:
-    r"""Order the symmetry groups by the first time any member appears in the decode order.
-
-    Args:
-        decode_order: A 1-D residue decode order.
-        symmetry_groups: Groups of tied residue indices.
-
-    Returns:
-        The symmetry groups (and singletons for ungrouped residues) in decode order, each residue once.
-    """
-
-    ordered: list[list[int]] = []
-    seen: set[int] = set()
-    for residue in decode_order.detach().cpu().tolist():
-        residue = int(residue)
-        if residue in seen:
-            continue
-        group = next((candidate for candidate in symmetry_groups if residue in candidate), None)
-        selected = list(group) if group is not None else [residue]
-        ordered.append(selected)
-        seen.update(selected)
-    return ordered
-
-
-def _autoregressive_masks(decode_order: Tensor, neighbor_idx: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Build the causal backward/forward neighbor masks for a decode order.
-
-    A neighbor is "backward" (already decoded) when it precedes the current residue in ``decode_order``, and
-    "forward" otherwise. The two masks partition the valid neighbors so the decoder mixes teacher-forced
-    tokens only from already-decoded positions.
-
-    Args:
-        decode_order: Residue decode order `[B, L]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-        mask: Valid-residue mask `[B, L]`.
-
-    Returns:
-        Tuple ``(backward_mask, forward_mask)``, each `[B, L, K, 1]`.
-    """
-
-    length = decode_order.shape[1]
-    device = decode_order.device
-    reverse_permutation = F.one_hot(decode_order, num_classes=length).float()
-    backward_order = torch.einsum(
-        "ij,biq,bjp->bqp",
-        1 - torch.triu(torch.ones(length, length, device=device)),
-        reverse_permutation,
-        reverse_permutation,
-    )
-    attend = torch.gather(backward_order, 2, neighbor_idx).unsqueeze(-1)
-    mask = mask.view(mask.shape[0], length, 1, 1)
-    return mask * attend, mask * (1.0 - attend)
-
-
-def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> Tensor:
-    r"""Direction features of ``points`` expressed in each residue's local backbone frame.
-
-    Builds a per-residue orthonormal frame from N/CA/C, projects the context points into it, and returns
-    scale-invariant planar/spatial direction cosines (the LigandMPNN local-angle context features).
-
-    Args:
-        n: Nitrogen coordinates `[B, L, 3]`.
-        ca: Alpha-carbon coordinates `[B, L, 3]`.
-        c: Carbon coordinates `[B, L, 3]`.
-        points: Context atom coordinates `[B, L, A, 3]`.
-
-    Returns:
-        Direction features `[B, L, A, 4]`.
-    """
-
-    first_axis = F.normalize(n - ca, dim=-1)
-    c_vector = c - ca
-    projected = torch.einsum("bli,bli->bl", first_axis, c_vector)[..., None]
-    second_axis = F.normalize(c_vector - first_axis * projected, dim=-1)
-    third_axis = torch.cross(first_axis, second_axis, dim=-1)
-    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
-    local = torch.einsum("blqp,blyq->blyp", frame, points - ca[:, :, None])
-    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
-    spatial_radius = torch.norm(local, dim=-1) + 1e-8
-    return torch.stack(
-        (
-            local[..., 0] / planar_radius,
-            local[..., 1] / planar_radius,
-            planar_radius / spatial_radius,
-            local[..., 2] / spatial_radius,
-        ),
-        dim=-1,
-    )
-
-
-def _backbone_atoms(coords: Tensor) -> dict[str, Tensor]:
-    r"""Split N/CA/C/O coordinates and add the idealized virtual CB atom.
-
-    Args:
-        coords: Backbone coordinates `[B, L, 4, 3]` ordered N, CA, C, O.
-
-    Returns:
-        Mapping ``{"N", "CA", "C", "O", "CB"}`` of `[B, L, 3]` coordinate tensors.
-    """
-
-    n = coords[:, :, 0]
-    ca = coords[:, :, 1]
-    c = coords[:, :, 2]
-    o = coords[:, :, 3]
-    b = ca - n
-    c_vec = c - ca
-    a = torch.cross(b, c_vec, dim=-1)
-    cb = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c_vec + ca
-    return {"N": n, "CA": ca, "C": c, "O": o, "CB": cb}
-
-
-def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""Find the ``k_neighbors`` nearest residues by CA distance, pushing invalid pairs to the far end.
-
-    Args:
-        points: Reference (CA) coordinates `[B, L, 3]`.
-        mask: Valid-residue mask `[B, L]`.
-        k_neighbors: Number of neighbors to keep (capped at ``L``).
-        eps: Numerical floor under the distance square root.
-
-    Returns:
-        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
-    """
-
-    pair_mask = mask[:, None, :] * mask[:, :, None]
-    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
-    distances = pair_mask * distances
-    max_distance = distances.max(dim=-1, keepdim=True).values
-    adjusted = distances + (1.0 - pair_mask) * max_distance
-    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
-
-
-def _rbf(distances: Tensor, num_bins: int) -> Tensor:
-    r"""Expand distances into Gaussian radial basis features over the fixed range ``[2, 22]`` angstrom.
-
-    Args:
-        distances: Distance tensor `[...]`.
-        num_bins: Number of evenly-spaced RBF centers.
-
-    Returns:
-        RBF features `[..., num_bins]`.
-    """
-
-    centers = torch.linspace(2.0, 22.0, num_bins, device=distances.device, dtype=distances.dtype)
-    centers = centers.view(*((1,) * distances.ndim), num_bins)
-    width = (22.0 - 2.0) / num_bins
-    return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
-
-
-def gather_edges(edges: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Select each residue's neighbor edge features from a dense edge tensor.
-
-    Args:
-        edges: Dense per-pair edge features `[B, L, L, C]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-
-    Returns:
-        The gathered neighbor edges `[B, L, K, C]`.
-
-    Examples:
-        >>> import torch
-        >>> edges = torch.zeros(1, 6, 6, 3)
-        >>> idx = torch.tensor([[[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 0]]])
-        >>> gather_edges(edges, idx).shape
-        torch.Size([1, 6, 2, 3])
-    """
-
-    neighbors = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, edges.shape[-1])
-    return torch.gather(edges, 2, neighbors)
-
-
-def gather_nodes(nodes: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Gather neighbor node features indexed by a residue-neighbor map.
-
-    Args:
-        nodes: Per-residue node features `[B, L, C]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-
-    Returns:
-        The gathered neighbor node features `[B, L, K, C]`.
-
-    Examples:
-        >>> import torch
-        >>> nodes = torch.arange(12).float().reshape(1, 6, 2)
-        >>> idx = torch.tensor([[[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 0]]])
-        >>> out = gather_nodes(nodes, idx)
-        >>> out.shape
-        torch.Size([1, 6, 2, 2])
-        >>> out[0, 0].tolist()
-        [[0.0, 1.0], [2.0, 3.0]]
-    """
-
-    flat_idx = neighbor_idx.reshape(neighbor_idx.shape[0], -1)
-    flat_idx = flat_idx.unsqueeze(-1).expand(-1, -1, nodes.shape[-1])
-    gathered = torch.gather(nodes, 1, flat_idx)
-    return gathered.view(*neighbor_idx.shape, nodes.shape[-1])
-
-
-def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Concatenate gathered neighbor node states onto an existing edge/neighbor context.
-
-    Args:
-        node_states: Per-residue node states `[B, L, C]` to gather by neighbor.
-        neighbor_states: Existing neighbor context `[B, L, K, D]` to append to.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-
-    Returns:
-        The concatenated context `[B, L, K, D + C]`.
-
-    Examples:
-        >>> import torch
-        >>> nodes = torch.arange(12).float().reshape(1, 6, 2)
-        >>> ctx = torch.zeros(1, 6, 2, 5)
-        >>> idx = torch.tensor([[[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 0]]])
-        >>> cat_neighbors_nodes(nodes, ctx, idx).shape
-        torch.Size([1, 6, 2, 7])
-    """
-
-    return torch.cat((neighbor_states, gather_nodes(node_states, neighbor_idx)), dim=-1)
-
-
-def _gather_pair_rbf(source: Tensor, target: Tensor, neighbor_idx: Tensor, num_bins: int) -> Tensor:
-    r"""RBF-expand the neighbor distances between two backbone-atom sets.
-
-    Args:
-        source: Source atom coordinates `[B, L, 3]`.
-        target: Target atom coordinates `[B, L, 3]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-        num_bins: Number of RBF centers.
-
-    Returns:
-        Per-edge RBF distance features `[B, L, K, num_bins]`.
-    """
-
-    distances = torch.sqrt(torch.sum((source[:, :, None] - target[:, None, :]) ** 2, dim=-1) + 1e-6)
-    neighbor_distances = gather_edges(distances[:, :, :, None], neighbor_idx)[:, :, :, 0]
-    return _rbf(neighbor_distances, num_bins)
-
-
-def _backbone_pair_rbf(atoms: Mapping[str, Tensor], neighbor_idx: Tensor, num_bins: int) -> Tensor:
-    r"""Concatenate RBF distance features for all 25 ordered backbone-atom pairs per edge.
-
-    Args:
-        atoms: Mapping of backbone atom coordinates from
-            [`_backbone_atoms`][ofoldx.models.ligandmpnn.model._backbone_atoms].
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-        num_bins: Number of RBF centers per pair.
-
-    Returns:
-        Concatenated pair RBF edge features `[B, L, K, 25 * num_bins]`.
-    """
-
-    atom_pairs = (
-        ("CA", "CA"),
-        ("N", "N"),
-        ("C", "C"),
-        ("O", "O"),
-        ("CB", "CB"),
-        ("CA", "N"),
-        ("CA", "C"),
-        ("CA", "O"),
-        ("CA", "CB"),
-        ("N", "C"),
-        ("N", "O"),
-        ("N", "CB"),
-        ("CB", "C"),
-        ("CB", "O"),
-        ("O", "C"),
-        ("N", "CA"),
-        ("C", "CA"),
-        ("O", "CA"),
-        ("CB", "CA"),
-        ("C", "N"),
-        ("O", "N"),
-        ("CB", "N"),
-        ("C", "CB"),
-        ("O", "CB"),
-        ("C", "O"),
-    )
-    return torch.cat([_gather_pair_rbf(atoms[a], atoms[b], neighbor_idx, num_bins) for a, b in atom_pairs], dim=-1)
-
-
-@register_pytree_dataclass
-@dataclass(slots=True)
-class LigandMPNNRepresentations:
-    r"""
-    Typed encoder representations for the LigandMPNN graph.
-
-    The boundary object returned by
-    [`LigandMPNNDesigner.encode`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner.encode] and built inside
-    the teacher-forced training pass. The per-residue node states are wrapped in the
-    [`Single`][ofoldx.modules.representation.Single] carrier, the same way ``Coords`` is carried on
-    ``StructurePredictionOutput``; unwrap ``single.tensor`` before feeding the decoder. The sparse k-nearest
-    neighbor ``edges`` `[B, L, K, H]` are kept as a raw pytree-leaf tensor because their ``K`` axis is not the
-    square ``(i, j)`` grid that the [`Pair`][ofoldx.modules.representation.Pair] carrier requires. The whole
-    dataclass is pytree-registered, so it flows through ``tree_map`` / ``torch.compile`` with no graph break.
-
-    Attributes:
-        single: Per-residue node states carrier `[B, L, H]`.
-        edges: Sparse per-edge states `[B, L, K, H]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-    """
-
-    single: Single
-    edges: Tensor
-    neighbor_idx: Tensor
-
-
-@register_pytree_dataclass
-@dataclass(slots=True, kw_only=True)
-class LigandMPNNInput(BaseInput):
-    r"""
-    Typed tensor input for the native LigandMPNN design generator.
-
-    Bundles the backbone geometry, sequence, and ligand context that
-    [`LigandMPNNDesigner`][ofoldx.models.ligandmpnn.model.LigandMPNNDesigner] scores or
-    samples over. All tensors share the batch ``B`` and residue ``L`` axes; ``A`` is the per-residue
-    ligand/context atom budget. Optional fields tailor generation (design mask, amino-acid bias, decode-order
-    noise, symmetry ties) and default to no constraint when omitted.
-
-    Attributes:
-        backbone_coords: Backbone N/CA/C/O coords with shape ``(B, L, 4, 3)``.
-        sequence_tokens: Residue tokens in the LigandMPNN alphabet with shape ``(B, L)``.
-        token_mask: Valid-residue mask with shape ``(B, L)``.
-        residue_index: Residue numbers used for relative-position features with shape ``(B, L)``.
-        chain_index: Integer chain ids with shape ``(B, L)``.
-        ligand_atom_coords: Ligand/context atom coords with shape ``(B, L, A, 3)``.
-        ligand_atom_types: Ligand/context atom atomic numbers with shape ``(B, L, A)``.
-        ligand_atom_mask: Valid ligand/context atom mask with shape ``(B, L, A)``.
-        design_mask: Optional mask where one marks positions to design and zero marks fixed positions.
-        amino_acid_bias: Optional per-position amino-acid logit bias with shape ``(B, L, 21)``.
-        decoding_order_noise: Optional decoding-order noise with shape ``(num_samples, L)``.
-        temperature: Sampling temperature used by ``design``.
-        num_samples: Number of autoregressive samples or decode orders.
-        symmetry_residue_groups: Optional groups of residue indices tied to share one sampled token.
-        symmetry_weights: Optional per-residue logit weights aligned with ``symmetry_residue_groups``.
-        all_atom_coords: Optional atom37 coordinates ``(B, L, 37, 3)`` supplying side-chain context.
-        all_atom_mask: Optional atom37 existence mask ``(B, L, 37)`` for the side-chain context.
-    """
-
-    backbone_coords: Tensor
+    backbone_coordinates: Tensor
     sequence_tokens: Tensor
-    token_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    ligand_atom_coords: Tensor
-    ligand_atom_types: Tensor
-    ligand_atom_mask: Tensor
-    design_mask: Tensor | None = None
-    amino_acid_bias: Tensor | None = None
-    decoding_order_noise: Tensor | None = None
-    temperature: float | Tensor = 0.1
-    num_samples: int | None = None
-    symmetry_residue_groups: list[list[int]] | None = None
-    symmetry_weights: list[list[float]] | None = None
-    all_atom_coords: Tensor | None = None
-    all_atom_mask: Tensor | None = None
+    valid_mask: Tensor
+    residue_indices: Tensor
+    chain_indices: Tensor
+    context_coordinates: Tensor
+    context_atomic_numbers: Tensor
+    context_mask: Tensor
+    residue_context_coordinates: Tensor
+    residue_context_mask: Tensor
+    design_mask: Tensor
+    ligand_interface_mask: Tensor
+    structure: Structure
+    component_references: tuple[ComponentReference, ...]
+    tied_group_ids: Tensor
+    tied_weights: Tensor | None = None
+    allowed_token_mask: Tensor | None = None
+    logit_bias: Tensor | None = None
 
 
-# Bound after the class so the keyword-tensor call path model(**inputs) can build the typed batch
-# (LigandMPNNInput is defined below LigandMPNNDesigner).
-LigandMPNNDesigner.input_class = LigandMPNNInput
+def tied_groups_from_ids(
+    tied_group_ids: Tensor,
+) -> tuple[tuple[int, ...], ...]:
+    r"""Reconstruct tied member groups from one row of dense causal-unit IDs.
 
-
-_ATOM14 = 14
-
-
-@MODELS.register("ligandmpnn_packer")
-@SIDE_CHAIN_PACKING_MODELS.register("ligandmpnn_packer")
-class LigandMPNNPacker(ModelMixin):
-    r"""
-    Predicts side-chain chi angles as a Von Mises mixture and denoises them into atom coordinates.
-
-    Encodes the backbone graph and ligand context, then decodes a mixture-of-Von-Mises
-    distribution over the four side-chain chi angles per residue. Sampling denoises random
-    torsions into atom14 coordinates (see [`pack_side_chains`][]).
-
-    Args:
-        config: Side-chain packer configuration; a default
-            [`LigandMPNNPackerConfig`][ofoldx.models.ligandmpnn.config.LigandMPNNPackerConfig] is used when ``None``.
+    The sampling and probability hot paths consume ``tied_group_ids`` directly; this
+    helper serves non-compiled orchestration that still reasons about explicit
+    member groups. Every returned group holds more than one row and lists members in
+    ascending row order, matching the dense first-row identity assignment; untied
+    singleton units are omitted. ``tied_group_ids`` is the aligned ``[1, L]`` tensor,
+    whose single batch row is the only Processor-owned structure.
     """
 
-    config_class = LigandMPNNPackerConfig
-
-    def __init__(self, config: LigandMPNNPackerConfig | None = None) -> None:
-        config = LigandMPNNPackerConfig() if config is None else config
-        super().__init__(config)
-        self.hidden_size = config.hidden_size
-        self.num_mix = config.num_mix
-        self.atom_context_num = config.atom_context_num
-        self.features = LigandMPNNPackerFeatures(
-            node_size=config.hidden_size,
-            edge_size=config.hidden_size,
-            num_positional_embeddings=config.num_positional_embeddings,
-            num_rbf=config.num_rbf,
-            k_neighbors=config.k_neighbors,
-            atom_context_num=config.atom_context_num,
-            lower_bound=config.lower_bound,
-            upper_bound=config.upper_bound,
-        )
-        self.softplus = nn.Softplus(beta=1, threshold=20)
-        self.dropout = nn.Dropout(config.dropout)
-
-        self.edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.decode_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.side_chain_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.linear_down = nn.Linear(2 * config.hidden_size, config.hidden_size)
-        self.torsion_projection = nn.Linear(config.hidden_size, 4 * 3 * config.num_mix)
-
-        self.encoder_layers = nn.ModuleList(
-            [
-                LigandEncoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
-                for _ in range(config.num_encoder_layers)
-            ]
-        )
-        self.residue_context_input = nn.Linear(config.hidden_size, config.hidden_size)
-        self.context_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.atom_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.atom_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.context_layers = nn.ModuleList(
-            [LigandDecoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout) for _ in range(2)]
-        )
-        self.context_output = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.context_norm = nn.LayerNorm(config.hidden_size)
-        self.atom_context_layers = nn.ModuleList(
-            [LigandAtomLayer(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(2)]
-        )
-        self.context_dropout = nn.Dropout(config.dropout)
-        self.decoder_layers = nn.ModuleList(
-            [
-                LigandDecoderLayer(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
-                for _ in range(config.num_decoder_layers)
-            ]
-        )
-
-        self.post_init()
-
-    def _init_module_weights(self, module: nn.Module) -> None:
-        return None
-
-    def reset_parameters(self) -> None:
-        r"""
-        Re-initialize LigandMPNNPacker weights to match the released LigandMPNN scheme.
-        """
-
-        for parameter in self.parameters():
-            if parameter.dim() > 1:
-                nn.init.xavier_uniform_(parameter)
-
-    def encode(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Encode the backbone graph and ligand context into node/edge states.
-
-        Runs the encoder message-passing stack over the k-nearest-neighbor residue graph, then folds the
-        ligand-context atom graph into each residue node. The result feeds
-        [`decode`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker.decode] via the cached ``h_V``/``h_E``/``E_idx``
-        features.
-
-        Args:
-            features: Feature mapping with backbone coords ``X``, sequence ``S``, masks, and ligand context.
-
-        Returns:
-            Tuple ``(node_states, edge_states, neighbor_idx)`` of per-residue node states, per-edge states,
-            and neighbor indices.
-        """
-
-        mask = features["mask"]
-        node_features, edges, neighbor_idx, atom_nodes, atom_edges, context_nodes, atom_mask = (
-            self.features.features_encode(features)
-        )
-        context = self.context_edge_embedding(context_nodes)
-        node_states = self.node_embedding(node_features)
-        edge_states = self.edge_embedding(edges)
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_idx).squeeze(-1)
-        attend_mask = mask.unsqueeze(-1) * attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(node_states, edge_states, neighbor_idx, mask, attend_mask)
-
-        residue_context = self.residue_context_input(node_states)
-        atom_pair_mask = atom_mask[:, :, :, None] * atom_mask[:, :, None, :]
-        atom_nodes = self.atom_node_embedding(atom_nodes)
-        atom_edges = self.atom_edge_embedding(atom_edges)
-        for layer_idx, layer in enumerate(self.context_layers):
-            atom_nodes = self.atom_context_layers[layer_idx](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
-            residue_context = layer(residue_context, torch.cat([context, atom_nodes], dim=-1), mask, atom_mask)
-        residue_context = self.context_output(residue_context)
-        node_states = node_states + self.context_norm(self.context_dropout(residue_context))
-        return node_states, edge_states, neighbor_idx
-
-    def decode(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Decode the Von Mises torsion mixture parameters from the encoded graph.
-
-        Adds explicit atom14-atom and atom14-ligand distance features (from
-        [`features_decode`][LigandMPNNPackerFeatures.features_decode]), runs the
-        decoder layers, and projects to per-chi mixture parameters. The concentration is soft-plus-clamped to
-        stay positive.
-
-        Args:
-            features: Feature mapping carrying the cached encoder outputs ``h_V``/``h_E``/``E_idx`` plus the
-                per-residue atom coordinates and masks.
-
-        Returns:
-            Tuple of ``(mean, concentration, mix_logits)``, each with shape ``(B, L, 4, num_mix)``.
-        """
-
-        node_states = features["h_V"]
-        edge_states = features["h_E"]
-        neighbor_idx = features["E_idx"]
-        mask = features["mask"]
-        side_chain_nodes, decode_edges = self.features.features_decode(features)
-
-        decode_edges = self.decode_edge_embedding(decode_edges)
-        edge_context = torch.cat([edge_states, decode_edges], dim=-1)
-        side_chain_states = self.side_chain_node_embedding(side_chain_nodes)
-        node_states = self.linear_down(torch.cat([node_states, side_chain_states], dim=-1))
-
-        for layer in self.decoder_layers:
-            neighbor_states = cat_neighbors_nodes(node_states, edge_context, neighbor_idx)
-            node_states = layer(node_states, neighbor_states, mask)
-
-        torsions = self.torsion_projection(node_states)
-        torsions = torsions.reshape(node_states.shape[0], node_states.shape[1], 4, self.num_mix, 3)
-        mean = torsions[:, :, :, :, 0].float()
-        concentration = 0.1 + self.softplus(torsions[:, :, :, :, 1]).float()
-        mix_logits = torsions[:, :, :, :, 2].float()
-        return mean, concentration, mix_logits
-
-    def forward(self, features: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Training path: predict the per-chi Von Mises torsion-mixture parameters in one pass.
-
-        Seeds random side-chain torsions into atom14 coordinates, encodes the backbone graph and ligand
-        context, then decodes the mixture parameters for the four side-chain chi angles. The parameters carry
-        gradients back to every weight, so an external negative-log-likelihood loss against the observed
-        torsions trains the packer. This is a single denoising step (compile-clean, no Python loop); the
-        inference-time N-step denoising into atom14 coordinates is the
-        [`pack`][ofoldx.models.ligandmpnn.model.LigandMPNNPacker.pack] verb, whose loop stays Python around
-        this per-step decoder.
-
-        Args:
-            features: Feature mapping carrying backbone coords ``X`` `(B, L, 4, 3)`, sequence ``S``, validity
-                ``mask``, and the ligand context ``Y``/``Y_t``/``Y_m``.
-
-        Returns:
-            Tuple ``(mean, concentration, mix_logits)``, each `[B, L, 4, num_mix]`.
-        """
-
-        torsion_dict = _make_torsion_features(features, repack_everything=True)
-        work: dict[str, Any] = {**features, "X": torsion_dict["xyz14_noised"], "X_m": torsion_dict["xyz14_m"]}
-        node_states, edge_states, neighbor_idx = self.encode(work)
-        work["h_V"], work["h_E"], work["E_idx"] = node_states, edge_states, neighbor_idx
-        return self.decode(work)
-
-    @torch.no_grad()
-    def pack(self, features: dict[str, Any], **packer_kwargs: Any) -> dict[str, Any]:
-        r"""
-        Pack side chains: denoise random torsions into atom14 coordinates (the house pack verb).
-
-        The inference capability verb; delegates to
-        [`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains] with this packer, returning the
-        feature dict updated in place with atom14 coordinates, masks, torsion-mixture parameters, and
-        side-chain confidence features.
-
-        Args:
-            features: Mutable feature dict carrying ``X``/``S``/``mask`` (and optional ligand context).
-            **packer_kwargs: Forwarded to
-                [`pack_side_chains`][ofoldx.models.ligandmpnn.model.pack_side_chains].
-
-        Returns:
-            The feature dict updated with the packed side-chain outputs.
-
-        Examples:
-            >>> packer.pack(features)  # doctest: +SKIP
-        """
-
-        return pack_side_chains(features, self, **packer_kwargs)
-
-
-class LigandMPNNPackerFeatures(nn.Module):
-    r"""
-    Turns backbone coordinates and ligand context into the graph and distance features the LigandMPNNPacker consumes.
-
-    Builds the backbone graph, ligand-context, and side-chain atom-distance features used by the
-    LigandMPNNPacker encoder and decoder. Mirrors the reference LigandMPNN ``ProteinFeatures`` used by the
-    LigandMPNNPacker (note: distinct from the sequence-model feature encoder).
-
-    Args:
-        node_size: Width of the per-node features.
-        edge_size: Width of the per-edge features.
-        num_positional_embeddings: Width of the relative-position embedding.
-        num_rbf: Number of radial basis functions per distance feature.
-        k_neighbors: Number of nearest-neighbor residues in the graph.
-        atom_context_num: Number of ligand context atoms per residue used by the decoder.
-        lower_bound: Lower distance bound for the context RBF expansion.
-        upper_bound: Upper distance bound for the context RBF expansion.
-    """
-
-    def __init__(
-        self,
-        *,
-        node_size: int,
-        edge_size: int,
-        num_positional_embeddings: int,
-        num_rbf: int,
-        k_neighbors: int,
-        atom_context_num: int,
-        lower_bound: float,
-        upper_bound: float,
-    ) -> None:
-        super().__init__()
-        self.num_rbf = num_rbf
-        self.k_neighbors = k_neighbors
-        self.atom_context_num = atom_context_num
-        self.lower_bound = lower_bound
-        self.upper_bound = upper_bound
-        self.relative_position = RelativePositionEncoding(num_positional_embeddings)
-
-        self.edge_projection = nn.Linear(num_positional_embeddings + num_rbf * 25, edge_size, bias=False)
-        self.edge_norm = nn.LayerNorm(edge_size)
-        self.node_projection = nn.Linear(21, node_size, bias=False)
-        self.node_norm = nn.LayerNorm(node_size)
-
-        self.context_down_projection = nn.Linear(num_rbf + 120, num_rbf)
-        self.decode_edge_projection = nn.Linear(num_rbf * _ATOM14 * _ATOM14 + 42, edge_size, bias=False)
-        self.decode_edge_norm = nn.LayerNorm(edge_size)
-        self.decode_node_projection = nn.Linear(_ATOM14 * atom_context_num * num_rbf, node_size, bias=False)
-        self.decode_node_norm = nn.LayerNorm(node_size)
-
-        self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
-        self.context_node_norm = nn.LayerNorm(node_size)
-        self.element_projection = nn.Linear(147, 64)
-        self.atom_node_projection = nn.Linear(147, node_size, bias=False)
-        self.atom_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
-        self.atom_edge_norm = nn.LayerNorm(node_size)
-        self.atom_node_norm = nn.LayerNorm(node_size)
-
-        group, period = periodic_group_period()
-        self.register_buffer("periodic_group", group, persistent=False)
-        self.register_buffer("periodic_period", period, persistent=False)
-
-    def _context_rbf(self, distances: Tensor) -> Tensor:
-        r"""RBF-expand distances over the configured ``[lower_bound, upper_bound]`` range."""
-
-        return _rbf_bounds(distances, self.num_rbf, self.lower_bound, self.upper_bound)
-
-    def _graph_rbf(self, source: Tensor, target: Tensor, neighbor_idx: Tensor) -> Tensor:
-        r"""RBF-expand the neighbor distances between two atom sets.
-
-        Args:
-            source: Source atom coordinates `[B, L, 3]`.
-            target: Target atom coordinates `[B, L, 3]`.
-            neighbor_idx: Neighbor indices `[B, L, K]`.
-
-        Returns:
-            Per-edge RBF distance features `[B, L, K, num_rbf]`.
-        """
-
-        distances = torch.sqrt(torch.sum((source[:, :, None] - target[:, None, :]) ** 2, dim=-1) + 1e-6)
-        neighbor_distances = gather_edges(distances[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        return _rbf_bounds(neighbor_distances, self.num_rbf, self.lower_bound, self.upper_bound)
-
-    def _element_features(self, atomic_numbers: Tensor) -> Tensor:
-        r"""One-hot-encode atoms by element, periodic group, and period `[..., 147]`."""
-
-        atomic_numbers = atomic_numbers.long()
-        group = self.periodic_group[atomic_numbers]
-        period = self.periodic_period[atomic_numbers]
-        return torch.cat([F.one_hot(atomic_numbers, 120), F.one_hot(group, 19), F.one_hot(period, 8)], dim=-1).float()
-
-    def features_encode(
-        self, features: Mapping[str, Tensor]
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Build the encoder inputs: backbone-graph edges, sequence nodes, and ligand-context features.
-
-        Args:
-            features: Feature mapping with backbone coords ``X``, sequence ``S``, residue/chain indices,
-                validity ``mask``, and ligand context ``Y``/``Y_t``/``Y_m``.
-
-        Returns:
-            Tuple ``(nodes, edges, neighbor_idx, atom_nodes, atom_edges, context_nodes, context_mask)``.
-        """
-
-        sequence = features["S"]
-        coords = features["X"]
-        context_coords = features["Y"]
-        context_mask = features["Y_m"]
-        context_types = features["Y_t"].long()
-        mask = features["mask"]
-        residue_index = features["R_idx"]
-        chain_labels = features["chain_labels"]
-
-        n, ca, c, o = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2], coords[:, :, 3]
-        b, c_vec = ca - n, c - ca
-        cb = -0.58273431 * torch.cross(b, c_vec, dim=-1) + 0.56802827 * b - 0.54067466 * c_vec + ca
-        _, neighbor_idx = _knn(ca, mask, self.k_neighbors)
-
-        backbone_atoms = [n, ca, c, o, cb]
-        pair_rbf = torch.cat(
-            [self._graph_rbf(a, b_atom, neighbor_idx) for a in backbone_atoms for b_atom in backbone_atoms], dim=-1
-        )
-        offset = residue_index[:, :, None] - residue_index[:, None, :]
-        offset = gather_edges(offset[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        same_chain = (chain_labels[:, :, None] == chain_labels[:, None, :]).long()
-        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_idx)[:, :, :, 0]
-        edges = self.edge_norm(
-            self.edge_projection(torch.cat([self.relative_position(offset.long(), same_chain), pair_rbf], dim=-1))
-        )
-        nodes = self.node_norm(self.node_projection(F.one_hot(sequence.long(), 21).float()))
-
-        element_features = self._element_features(context_types)
-        element_projection = self.element_projection(element_features)
-        context_distances = [
-            self._context_rbf(torch.sqrt(torch.sum((atom[:, :, None] - context_coords) ** 2, dim=-1) + 1e-6))
-            for atom in backbone_atoms
-        ]
-        angle_features = _local_angle_features(n, ca, c, context_coords)
-        context = torch.cat([*context_distances, element_projection, angle_features], dim=-1)
-        context_nodes = self.context_node_norm(self.context_node_projection(context))
-
-        atom_pair_distances = torch.sqrt(
-            torch.sum((context_coords[:, :, :, None] - context_coords[:, :, None, :]) ** 2, dim=-1) + 1e-6
-        )
-        atom_edges = self.atom_edge_norm(self.atom_edge_projection(self._context_rbf(atom_pair_distances)))
-        atom_nodes = self.atom_node_norm(self.atom_node_projection(element_features))
-        return nodes, edges, neighbor_idx, atom_nodes, atom_edges, context_nodes, context_mask
-
-    def features_decode(self, features: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-        r"""
-        Build the decoder inputs: explicit atom14-atom and atom14-ligand distance features.
-
-        Args:
-            features: Feature mapping carrying the current atom14 coords ``X``, atom mask ``X_m``, cached
-                neighbor indices ``E_idx``, sequence ``S``, and ligand context.
-
-        Returns:
-            Tuple ``(side_chain_nodes, decode_edges)`` of per-residue side-chain node features and the
-            decoder edge context.
-        """
-
-        sequence = features["S"]
-        coords = features["X"]
-        atom_mask = features["X_m"] * features["mask"][:, :, None]
-        neighbor_idx = features["E_idx"]
-        context_coords = features["Y"][:, :, : self.atom_context_num]
-        context_mask = features["Y_m"][:, :, : self.atom_context_num]
-        context_types = features["Y_t"][:, :, : self.atom_context_num].long()
-        batch, length = coords.shape[:2]
-
-        gathered_mask = gather_nodes(atom_mask, neighbor_idx)
-        side_chain_rbf = []
-        for i in range(_ATOM14):
-            for j in range(_ATOM14):
-                pair = self._graph_rbf(coords[:, :, i], coords[:, :, j], neighbor_idx)
-                pair = pair * atom_mask[:, :, i, None, None] * gathered_mask[:, :, :, j, None]
-                side_chain_rbf.append(pair)
-
-        atom_context_distances = torch.sqrt(
-            torch.sum((coords[:, :, :, None, :] - context_coords[:, :, None, :, :]) ** 2, dim=-1) + 1e-6
-        )
-        atom_context_features = self._context_rbf(atom_context_distances)
-        atom_context_features = (
-            atom_context_features * atom_mask[:, :, :, None, None] * context_mask[:, :, None, :, None]
-        )
-        context_types_1hot = F.one_hot(context_types, 120).float()
-        combined = torch.cat(
-            [atom_context_features, context_types_1hot[:, :, None].repeat(1, 1, _ATOM14, 1, 1)], dim=-1
-        )
-        node_features = self.context_down_projection(combined).view(batch, length, -1)
-        side_chain_nodes = self.decode_node_norm(self.decode_node_projection(node_features))
-
-        sequence_1hot = F.one_hot(sequence.long(), 21).float()
-        gathered_sequence = gather_nodes(sequence_1hot, neighbor_idx)
-        sequence_features = torch.cat(
-            [sequence_1hot[:, :, None].repeat(1, 1, neighbor_idx.shape[2], 1), gathered_sequence], dim=-1
-        )
-        decode_edges = torch.cat([*side_chain_rbf, sequence_features], dim=-1)
-        decode_edges = self.decode_edge_norm(self.decode_edge_projection(decode_edges))
-        return side_chain_nodes, decode_edges
-
-
-@torch.no_grad()
-def pack_side_chains(
-    features: dict[str, Any],
-    packer: LigandMPNNPacker,
-    *,
-    num_denoising_steps: int = 3,
-    num_samples: int = 10,
-    repack_everything: bool = True,
-    num_context_atoms: int = 16,
-) -> dict[str, Any]:
-    r"""
-    Denoise random side-chain torsions into atom14 coordinates with the LigandMPNNPacker.
-
-    Faithful port of the reference LigandMPNN ``sc_utils.pack_side_chains``. Requires the input
-    ``features`` to carry ``X`` (backbone N/CA/C/O, shape ``(B, L, 4, 3)``), ``S`` (LigandMPNN
-    sequence tokens), and ``mask``; ligand context (``Y``/``Y_t``/``Y_m``) is optional and zeroed
-    when absent. When ``repack_everything`` is ``False`` the true side chains at fixed positions
-    (``chain_mask`` == 0) are retained and ``xyz_37`` must be present.
-
-    Args:
-        features: Mutable feature dict; updated in place and returned.
-        packer: The LigandMPNNPacker model.
-        num_denoising_steps: Number of Von Mises denoising iterations.
-        num_samples: Number of Von Mises samples drawn per step (best log-prob kept).
-        repack_everything: Repack all side chains if ``True``; otherwise keep fixed ones.
-        num_context_atoms: Number of ligand context atoms to allocate when ``Y`` is absent.
-
-    Returns:
-        The feature dict updated with ``X`` (atom14 coords), ``X_m`` (atom14 mask),
-        ``b_factors``, and the raw mixture parameters ``mean``/``concentration``/``mix_logits``.
-
-    Raises:
-        ValueError: If ``num_denoising_steps`` is less than 1.
-
-    Examples:
-        >>> from ofoldx.models.ligandmpnn import LigandMPNNPacker, pack_side_chains  # doctest: +SKIP
-        >>> packed = pack_side_chains(features, LigandMPNNPacker())  # doctest: +SKIP
-    """
-
-    from .processor import frames_and_literature_positions_to_atom14_pos, torsion_angles_to_frames
-
-    device = features["X"].device
-    torsion_dict = _make_torsion_features(features, repack_everything=repack_everything)
-    features["X"] = torsion_dict["xyz14_noised"]
-    features["X_m"] = torsion_dict["xyz14_m"]
-    if "Y" not in features:
-        batch, length = features["X"].shape[:2]
-        features["Y"] = torch.zeros(batch, length, num_context_atoms, 3, device=device)
-        features["Y_t"] = torch.zeros(batch, length, num_context_atoms, device=device)
-        features["Y_m"] = torch.zeros(batch, length, num_context_atoms, device=device)
-
-    if num_denoising_steps < 1:
-        raise ValueError("num_denoising_steps must be at least 1")
-
-    node_states, edge_states, neighbor_idx = packer.encode(features)
-    features["h_V"], features["h_E"], features["E_idx"] = node_states, edge_states, neighbor_idx
-
-    sample = features["X"].new_zeros(features["X"].shape[:2] + (4,))
-    predicted_distribution: distributions.MixtureSameFamily | None = None
-    mean = concentration = mix_logits = features["X"].new_zeros(0)
-    xyz14_noised = features["X"]
-    for _ in range(num_denoising_steps):
-        mean, concentration, mix_logits = packer.decode(features)
-        mixture = distributions.Categorical(logits=mix_logits)
-        component = distributions.VonMises(mean, concentration)
-        predicted_distribution = distributions.MixtureSameFamily(mixture, component)
-        candidates = predicted_distribution.sample([num_samples])
-        candidate_log_probs = predicted_distribution.log_prob(candidates)
-        best = torch.argmax(candidate_log_probs, dim=0)[None]
-        sample = torch.gather(candidates, dim=0, index=best)[0]
-
-        torsions_unit = torch.cat([torch.sin(sample[:, :, :, None]), torch.cos(sample[:, :, :, None])], dim=-1)
-        torsion_dict["torsions_noised"][:, :, 3:] = torsions_unit * torsion_dict["mask_fix_sc"] + torsion_dict[
-            "torsions_true"
-        ] * (1 - torsion_dict["mask_fix_sc"])
-        frames = torsion_angles_to_frames(
-            torsion_dict["backbone_frames"], torsion_dict["torsions_noised"], torsion_dict["aatype"]
-        )
-        xyz14_noised = frames_and_literature_positions_to_atom14_pos(frames, torsion_dict["aatype"])
-        xyz14_noised = xyz14_noised * features["X_m"][:, :, :, None]
-        features["X"] = xyz14_noised
-
-    features["X"] = xyz14_noised
-    aatype = torsion_dict["aatype"]
-    assert predicted_distribution is not None  # num_denoising_steps >= 1 guarantees at least one step
-    log_prob = predicted_distribution.log_prob(sample) * torsion_dict["mask_fix_sc"][..., 0] + 2.0 * (
-        1 - torsion_dict["mask_fix_sc"][..., 0]
-    )
-
-    group = torch.tensor(rc.restype_atom14_to_rigid_group, device=device)[aatype].clamp(min=4) - 4
-    atom_types_for_b_factor = F.one_hot(group, 4)
-    features["b_factors"] = (log_prob[:, :, None, :] * atom_types_for_b_factor).sum(-1)
-    features["mean"], features["concentration"], features["mix_logits"] = mean, concentration, mix_logits
-    features["log_prob"], features["sample"] = log_prob, sample
-    features["true_torsion_sin_cos"] = torsion_dict["torsions_true"]
-    return features
-
-
-def _make_torsion_features(features: Mapping[str, Any], *, repack_everything: bool) -> dict[str, Tensor]:
-    r"""Build noised/true torsion angles and initial atom14 coordinates for packing.
-
-    Reconstructs backbone frames from the input coordinates, converts them to torsion sin/cos, and seeds the
-    side-chain chi angles with random values. When ``repack_everything`` is ``False`` the true torsions at
-    fixed positions (from ``xyz_37``) are retained instead of noise.
-
-    Args:
-        features: Feature mapping with backbone coords ``X``, sequence ``S``, and (when not repacking
-            everything) the observed side-chain coords ``xyz_37`` and the ``chain_mask``.
-        repack_everything: Repack all side chains from random torsions if ``True``; otherwise keep fixed ones.
-
-    Returns:
-        Mapping with the atom14 mask/coords, backbone frames, noised/true torsion sin/cos, the fixed-side-chain
-        mask, and the AF2 restype integers.
-    """
-
-    from .processor import (
-        MPNN_TO_AF2_RESTYPE,
-        Frame,
-        atom37_to_torsion_angles,
-        frames_and_literature_positions_to_atom14_pos,
-        make_atom14_masks,
-        torsion_angles_to_frames,
-    )
-
-    device = features["mask"].device
-    mask = features["mask"]
-    batch, length = mask.shape
-
-    xyz37 = torch.zeros(batch, length, 37, 3, device=device, dtype=torch.float32)
-    xyz37[:, :, :3] = features["X"][:, :, :3]
-    xyz37[:, :, 4] = features["X"][:, :, 3]
-
-    aatype = MPNN_TO_AF2_RESTYPE.to(device)[features["S"].long()]
-    atom_masks = make_atom14_masks(aatype)
-    torsion = atom37_to_torsion_angles(aatype, xyz37, atom_masks["atom37_atom_exists"])
-    backbone_frames = Frame.make_transform_from_reference(xyz37[:, :, 0], xyz37[:, :, 1], xyz37[:, :, 2], eps=1e-9)
-
-    if not repack_everything:
-        true_torsion = atom37_to_torsion_angles(aatype, features["xyz_37"], atom_masks["atom37_atom_exists"])
-        torsions_true = true_torsion["torsion_angles_sin_cos"].clone()[:, :, 3:]
-        mask_fix_sc = features["chain_mask"][:, :, None, None]
-    else:
-        torsions_true = torch.zeros(batch, length, 4, 2, device=device)
-        mask_fix_sc = torch.ones(batch, length, 1, 1, device=device)
-
-    random_angle = 2 * torch.pi * torch.rand(batch, length, 4, device=device)
-    random_sin_cos = torch.cat([torch.sin(random_angle)[..., None], torch.cos(random_angle)[..., None]], dim=-1)
-    torsions_noised = torsion["torsion_angles_sin_cos"].clone()
-    torsions_noised[:, :, 3:] = random_sin_cos * mask_fix_sc + torsions_true * (1 - mask_fix_sc)
-
-    frames = torsion_angles_to_frames(backbone_frames, torsions_noised, aatype)
-    xyz14_noised = frames_and_literature_positions_to_atom14_pos(frames, aatype)
-    xyz14_m = atom_masks["atom14_atom_exists"] * mask[:, :, None]
-    xyz14_noised = xyz14_noised * xyz14_m[:, :, :, None]
-
-    return {
-        "xyz14_m": xyz14_m,
-        "xyz14_noised": xyz14_noised,
-        "backbone_frames": backbone_frames,
-        "torsions_noised": torsions_noised,
-        "mask_fix_sc": mask_fix_sc,
-        "torsions_true": torsions_true,
-        "aatype": aatype,
-    }
-
-
-def _rbf_bounds(distances: Tensor, num_bins: int, lower_bound: float, upper_bound: float) -> Tensor:
-    r"""Radial basis expansion with explicit bounds (LigandMPNNPacker uses [0, 20] for context features)."""
-
-    centers = torch.linspace(lower_bound, upper_bound, num_bins, device=distances.device, dtype=distances.dtype)
-    centers = centers.view(*((1,) * distances.ndim), num_bins)
-    width = (upper_bound - lower_bound) / num_bins
-    return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
+    members_by_id: dict[int, list[int]] = {}
+    for index, group_id in enumerate(tied_group_ids[0].tolist()):
+        members_by_id.setdefault(group_id, []).append(index)
+    return tuple(tuple(members) for members in members_by_id.values() if len(members) > 1)

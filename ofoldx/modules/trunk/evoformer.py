@@ -13,10 +13,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..attention import GatedMultiheadAttention
+from ..attention import GatedMultiheadAttention, TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
-from ..functional import checkpoint_blocks
 from ..transition import RowwiseDropout
+from .msa import OuterProductMean
 
 
 class EvoformerStack(nn.Module):
@@ -42,10 +42,8 @@ class EvoformerStack(nn.Module):
         pair_dropout: float,
         is_extra_msa: bool,
         operator_backend: str,
-        blocks_per_checkpoint: int | None,
     ) -> None:
         super().__init__()
-        self.blocks_per_checkpoint = blocks_per_checkpoint
         self.blocks = nn.ModuleList(
             [
                 EvoformerBlock(
@@ -82,11 +80,8 @@ class EvoformerStack(nn.Module):
             msa_mask = msa.new_ones(msa.shape[:-1])
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
-        blocks = [
-            lambda msa, pair, block=block: block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-            for block in self.blocks
-        ]
-        msa, pair = checkpoint_blocks(blocks, (msa, pair), self.blocks_per_checkpoint)
+        for block in self.blocks:
+            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -115,7 +110,7 @@ class EvoformerBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.outer_product_first = outer_product_first
-        self.outer_product_mean = OuterProductMean(
+        self.outer_product_mean = AlphaFold2OuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
@@ -216,28 +211,26 @@ class PairStack(nn.Module):
         operator_backend: str,
     ) -> None:
         super().__init__()
-        self.triangle_multiplication_outgoing = TriangleMultiplication(
+        self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
-            equation="outgoing",
+            outgoing=True,
         )
-        self.triangle_multiplication_incoming = TriangleMultiplication(
+        self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
-            equation="incoming",
+            outgoing=False,
         )
-        self.triangle_attention_starting_node = TriangleAttention(
+        self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            orientation="per_row",
             operator_backend=operator_backend,
         )
-        self.triangle_attention_ending_node = TriangleAttention(
+        self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            orientation="per_column",
             operator_backend=operator_backend,
         )
         self.feed_forward = EvoformerTransition(pair_size, expansion=transition_expansion)
@@ -247,7 +240,13 @@ class PairStack(nn.Module):
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
-        pair = pair + self.rowwise_dropout(self.triangle_attention_ending_node(pair, pair_mask))
+        # The unified TriangleAttention never transposes internally (TRUNK_EINSUM_LOCK.md §3): the
+        # ending node attends over the transposed residue axes, so the caller flips ``(-3, -2)`` (and
+        # the mask's last two) around the call and flips the output back.
+        end_pair_mask = pair_mask.transpose(-2, -1)
+        pair = pair + self.rowwise_dropout(
+            self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2),
+        )
         return pair + self.feed_forward(pair, pair_mask)
 
 
@@ -403,100 +402,91 @@ class EvoformerTransition(nn.Module):
         return output * mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
-class OuterProductMean(nn.Module):
+class AlphaFold2OuterProductMean(OuterProductMean):
     r"""
     AF2 outer-product mean.
+
+    AlphaFold 2 variant of the shared bias-free
+    [`OuterProductMean`][ofoldx.modules.trunk.msa.OuterProductMean]: the left/right MSA
+    projections carry a learned bias (all AF3-lineage checkpoints leave them bias-free). The
+    biased projections force the ``eager`` backend, since the fused ``oops`` kernel takes no bias
+    tensors. Everything else — pre-LayerNorm, divide-after-projection (``count + eps``) normalisation
+    and the affine output projection — is inherited unchanged from the shared module, whose ``forward``
+    already forwards ``left_projection.bias`` / ``right_projection.bias`` to the eager backend path.
     """
 
     def __init__(self, *, msa_size: int, pair_size: int, hidden_size: int, eps: float = 1e-3) -> None:
-        super().__init__()
-        self.eps = eps
-        self.layer_norm_input = LayerNorm(msa_size)
+        super().__init__(
+            msa_size=msa_size,
+            hidden_size=hidden_size,
+            pair_size=pair_size,
+            eps=eps,
+            divide_before_projection=False,
+            operator_backend="eager",
+        )
         self.left_projection = nn.Linear(msa_size, hidden_size)
         self.right_projection = nn.Linear(msa_size, hidden_size)
-        self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
-
-    def forward(self, msa: Tensor, msa_mask: Tensor) -> Tensor:
-        mask = msa_mask.unsqueeze(-1).to(dtype=msa.dtype)
-        msa = self.layer_norm_input(msa)
-        left = self.left_projection(msa) * mask
-        right = self.right_projection(msa) * mask
-        outer = torch.einsum("...sic,...sjd->...ijcd", left, right)
-        norm = torch.einsum("...si,...sj->...ij", msa_mask.to(dtype=msa.dtype), msa_mask.to(dtype=msa.dtype))
-        projected = self.output_projection(outer.flatten(-2))
-        return projected / (norm.unsqueeze(-1) + self.eps)
 
 
-class TriangleMultiplication(nn.Module):
+class AlphaFold2TriangleMultiplication(TriangleMultiplication):
     r"""
-    AF2 triangle multiplication update.
+    AlphaFold 2 triangle multiplicative update.
+
+    AlphaFold 2 variant of the shared bias-free
+    [`TriangleMultiplication`][ofoldx.modules.attention.triangle.TriangleMultiplication]: all six
+    projections (left/right value, left/right gate, output, and the input gate) carry a learned bias,
+    where every AF3-lineage checkpoint leaves them bias-free. The biased projections force the
+    ``eager`` backend, since the fused ``oops`` kernel takes no bias tensors. Everything else — the
+    canonical incoming/outgoing contraction ``"...kih,...kjh->...ijh"`` / ``"...ikh,...jkh->...ijh"``
+    (left owns row ``i``, right owns column ``j``), the input/output LayerNorms and the gated output
+    projection — is inherited unchanged from the shared module, whose ``forward`` already forwards
+    each projection's ``.bias`` to the eager backend path.
+
+    Because the shared module fixes the operand order (left→``i``, right→``j``) for both directions,
+    the AlphaFold 2 *incoming* converter must load DeepMind/OpenFold ``left_projection``/``left_gate``
+    into this module's **right** slot and ``right_projection``/``right_gate`` into the **left** slot
+    (value and gate move together). The outgoing converter loads raw. See
+    ``ofoldx/models/alphafold2/converters``.
     """
 
-    def __init__(self, *, pair_size: int, hidden_size: int, equation: str) -> None:
-        super().__init__()
-        self.equation = equation
-        self.layer_norm_input = LayerNorm(pair_size)
+    def __init__(self, *, pair_size: int, hidden_size: int, outgoing: bool) -> None:
+        super().__init__(
+            pair_size=pair_size,
+            hidden_size=hidden_size,
+            outgoing=outgoing,
+            operator_backend="eager",
+        )
         self.left_projection = nn.Linear(pair_size, hidden_size)
+        self.left_gate_projection = nn.Linear(pair_size, hidden_size)
         self.right_projection = nn.Linear(pair_size, hidden_size)
-        self.left_gate = nn.Linear(pair_size, hidden_size)
-        self.right_gate = nn.Linear(pair_size, hidden_size)
-        self.center_layer_norm = LayerNorm(hidden_size)
+        self.right_gate_projection = nn.Linear(pair_size, hidden_size)
         self.output_projection = nn.Linear(hidden_size, pair_size)
-        self.gating_linear = nn.Linear(pair_size, pair_size)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, pair: Tensor, pair_mask: Tensor) -> Tensor:
-        mask = pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
-        normalized = self.layer_norm_input(pair)
-        left = self.left_projection(normalized) * self.sigmoid(self.left_gate(normalized)) * mask
-        right = self.right_projection(normalized) * self.sigmoid(self.right_gate(normalized)) * mask
-        if self.equation == "outgoing":
-            update = torch.einsum("...ikc,...jkc->...ijc", left, right)
-        else:
-            # Incoming pairs left->i and right->j over the contracted k (AF2/OpenFold
-            # combine order). The prior "...kjc,...kic->..." swapped i<->j, yielding the
-            # transpose of the update; whole-model parity vs upstream OpenFold caught it.
-            update = torch.einsum("...kic,...kjc->...ijc", left, right)
-        update = self.output_projection(self.center_layer_norm(update))
-        return update * self.sigmoid(self.gating_linear(normalized))
+        self.gate_projection = nn.Linear(pair_size, pair_size)
 
 
-class TriangleAttention(nn.Module):
+class AlphaFold2TriangleAttention(TriangleAttention):
     r"""
-    AF2 triangle attention update.
+    AlphaFold 2 triangle self-attention update.
+
+    AlphaFold 2 variant of the shared bias-free
+    [`TriangleAttention`][ofoldx.modules.attention.triangle.TriangleAttention]: the attention output
+    projection and the output gate carry a learned bias (``gate_bias_init=1.0`` opens the gate near
+    init), where every AF3-lineage checkpoint leaves them bias-free. The biased gate/output keep the
+    module off the flash ``triangle_attention`` kernel, which requires bias-free projections; the
+    attention core still dispatches to whatever ``operator_backend`` resolves to, applying the gate and
+    output bias in the (backend-agnostic) head merge. ``transpose_bias`` stays ``False`` — the OpenFold
+    convention, matching DeepMind's own AlphaFold 2 ending node — and the row/column direction is set by
+    the caller orienting ``pair`` (never inside this module). See TRUNK_EINSUM_LOCK.md §3.
     """
 
-    def __init__(
-        self,
-        *,
-        pair_size: int,
-        head_dim: int,
-        num_attention_heads: int,
-        orientation: str,
-        operator_backend: str,
-    ) -> None:
-        super().__init__()
-        self.orientation = orientation
-        self.query_norm = LayerNorm(pair_size)
-        self.feat_2d_weights = nn.Linear(pair_size, num_attention_heads, bias=False)
-        self.attention = GatedMultiheadAttention(
-            pair_size,
-            num_attention_heads=num_attention_heads,
+    def __init__(self, *, pair_size: int, head_dim: int, num_attention_heads: int, operator_backend: str) -> None:
+        super().__init__(
+            pair_size=pair_size,
             head_dim=head_dim,
-            query_bias=False,
+            num_attention_heads=num_attention_heads,
+            transpose_bias=False,
             output_bias=True,
             gate_bias=True,
             gate_bias_init=1.0,
             operator_backend=operator_backend,
         )
-
-    def forward(self, pair: Tensor, pair_mask: Tensor) -> Tensor:
-        if self.orientation == "per_column":
-            pair = pair.transpose(-3, -2)
-            pair_mask = pair_mask.transpose(-2, -1)
-        normalized = self.query_norm(pair)
-        pair_bias = self.feat_2d_weights(normalized).movedim(-1, -3).unsqueeze(-4)
-        output = self.attention(normalized, biases=(pair_bias,), attention_mask=pair_mask.unsqueeze(-2).bool())
-        if self.orientation == "per_column":
-            output = output.transpose(-3, -2)
-        return output

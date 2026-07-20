@@ -1,10 +1,8 @@
 r"""
 Backend dispatch for the position-wise transition (SwiGLU) operator.
 
-The dispatcher owns everything backend-specific for this operator in one place: the supported
-backends, ``"auto"`` resolution, and each backend's calling convention. Modules pass normalized
-inputs plus their requested ``operator_backend`` and stay backend-agnostic. New backends
-(cuEquivariance / NVIDIA) are added as a branch here, not in every caller.
+The dispatcher owns backend selection and calling-convention adaptation. Modules
+pass the ordinary tensor arguments without a second validation layer.
 """
 
 from __future__ import annotations

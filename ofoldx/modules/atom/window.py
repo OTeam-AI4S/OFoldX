@@ -11,17 +11,51 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
-def gather_key_windows(single: Tensor, num_query_atoms: int, num_key_atoms: int) -> Tensor:
+def key_window_starts(
+    num_windows: int, num_query_atoms: int, num_key_atoms: int, num_valid_atoms: int, device: torch.device
+) -> Tensor:
+    r"""
+    Per-window start offset of the DeepMind AF3 clamped/shifted key neighbourhood.
+
+    Each key window is centred on its query window (``num_query_atoms`` wide) and reaches
+    ``(num_key_atoms - num_query_atoms) / 2`` atoms to either side, then is **shifted inwards** so it
+    lies fully inside the ``[0, num_valid_atoms)`` real-atom range (upstream
+    ``AtomCrossAtt.compute_features``: ``if left < 0: shift right`` / ``elif right > num_atoms-1: shift left``).
+    Boundary windows therefore keep a full ``num_key_atoms`` of *real* keys instead of padding, which is what
+    the released model attends over. Requires ``num_valid_atoms >= num_key_atoms``.
+
+    Args:
+        num_windows: Number of query windows.
+        num_query_atoms: Query atoms per window.
+        num_key_atoms: Key atoms gathered per window.
+        num_valid_atoms: Number of real (non-padding) atoms, packed contiguously at the front.
+        device: Device for the returned index tensor.
+
+    Returns:
+        ``[num_windows]`` integer start offsets, each in ``[0, num_valid_atoms - num_key_atoms]``.
+    """
+    key_padding_left = (num_key_atoms - num_query_atoms) // 2
+    base = torch.arange(num_windows, device=device) * num_query_atoms - key_padding_left
+    return base.clamp(0, num_valid_atoms - num_key_atoms)
+
+
+def gather_key_windows(
+    single: Tensor, num_query_atoms: int, num_key_atoms: int, num_valid_atoms: int | None = None
+) -> Tensor:
     r"""
     Gather each query window's overlapping key-atom neighbourhood from a flat ``(B, N, D)`` atom tensor.
 
-    Uses a strided ``unfold`` view (O(N), no matmul) instead of a one-hot indexing-matrix einsum (O(num_windows²)),
-    producing exactly the same result.
+    With ``num_valid_atoms`` unset (or below ``num_key_atoms``) the legacy zero-padded fixed window is used:
+    a strided ``unfold`` view (O(N), no matmul) equivalent to a one-hot indexing-matrix einsum, with slots
+    past the atom range read as zero. With ``num_valid_atoms`` given (and ``>= num_key_atoms``) the DeepMind
+    AF3 **clamped/shifted** window is used instead: boundary windows are slid inwards so every key is a real
+    atom (see [`key_window_starts`][ofoldx.modules.atom.window.key_window_starts]).
 
     Args:
         single: ``[..., N_atom, C]`` atom features.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
+        num_valid_atoms: Number of real atoms (contiguous at the front); enables the clamped layout.
 
     Returns:
         ``[..., N_window, num_key_atoms, C]`` key windows.
@@ -35,13 +69,17 @@ def gather_key_windows(single: Tensor, num_query_atoms: int, num_key_atoms: int)
     """
     num_atoms = single.shape[-2]
     num_windows = (num_atoms + num_query_atoms - 1) // num_query_atoms
+    if num_valid_atoms is not None and num_valid_atoms >= num_key_atoms:
+        starts = key_window_starts(num_windows, num_query_atoms, num_key_atoms, num_valid_atoms, single.device)
+        key_index = starts[:, None] + torch.arange(num_key_atoms, device=single.device)[None, :]
+        return single[..., key_index, :]
     key_padding_left = (num_key_atoms - num_query_atoms) // 2
     key_padding_right = int((num_windows - 0.5) * num_query_atoms + num_key_atoms / 2 - num_atoms + 0.5)
     padded = F.pad(single, (0, 0, key_padding_left, key_padding_right))
     return padded.unfold(-2, num_key_atoms, num_query_atoms).movedim(-1, -2)
 
 
-@dataclass(slots=True)
+@dataclass
 class LocalAtomWindowInfo:
     r"""
     Padding and masking metadata describing one local-window partition of an atom axis.
@@ -68,9 +106,10 @@ class LocalAtomWindowInfo:
     query_padding: int
     key_padding_left: int
     key_padding_right: int
+    num_valid_atoms: int | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class LocalAtomWindows:
     r"""
     Query and key windows carved from a single atom-axis tensor, plus their padding metadata.
@@ -93,7 +132,7 @@ class LocalAtomWindows:
     info: LocalAtomWindowInfo
 
 
-@dataclass(slots=True)
+@dataclass
 class LocalAtomGeometry:
     r"""
     Windowed atom-pair geometry (displacements and same-space mask) for atom attention blocks.
@@ -144,13 +183,17 @@ class LocalAtomGeometryBuilder(nn.Module):
         super().__init__()
         self.windowing = LocalAtomWindowing(num_query_atoms=num_query_atoms, num_key_atoms=num_key_atoms)
 
-    def forward(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+    def forward(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
         r"""
         Build local displacement vectors and same-space masks.
 
         Args:
             reference_positions: ``[..., N_atom, 3]`` reference coords.
             reference_space_id: ``[..., N_atom]`` reference-space ids.
+            num_valid_atoms: Number of real atoms; enables the DeepMind clamped key window (see
+                [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]).
 
         Returns:
             Local atom geometry for atom-pair encoding.
@@ -164,9 +207,8 @@ class LocalAtomGeometryBuilder(nn.Module):
             torch.Size([1, 3, 2, 4, 3])
         """
 
-        reference_space_id = reference_space_id.to(device=reference_positions.device)
-        position_windows = self.windowing(reference_positions)
-        space_windows = self.windowing(reference_space_id.unsqueeze(-1).to(dtype=reference_positions.dtype))
+        position_windows = self.windowing(reference_positions, num_valid_atoms)
+        space_windows = self.windowing(reference_space_id.unsqueeze(-1), num_valid_atoms)
         distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
         distance_mask = (space_windows.query.unsqueeze(-2).int() == space_windows.key.unsqueeze(-3).int()).to(
             dtype=reference_positions.dtype
@@ -214,12 +256,16 @@ class LocalAtomWindowing(nn.Module):
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
 
-    def forward(self, tensor: Tensor) -> LocalAtomWindows:
+    def forward(self, tensor: Tensor, num_valid_atoms: int | None = None) -> LocalAtomWindows:
         r"""
         Split an atom-axis tensor into query and key windows.
 
         Args:
             tensor: ``[..., N_atom, C]`` atom-axis tensor.
+            num_valid_atoms: Number of real atoms (contiguous at the front). When given (and
+                ``>= num_key_atoms``) the DeepMind AF3 clamped/shifted key window is used, so boundary
+                windows carry a full ``num_key_atoms`` of real keys; otherwise the legacy zero-padded window
+                is used. See [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows].
 
         Returns:
             Local query/key windows and padding metadata.
@@ -242,19 +288,30 @@ class LocalAtomWindowing(nn.Module):
 
         key_padding_left = (self.num_key_atoms - self.num_query_atoms) // 2
         key_padding_right = int((num_windows - 0.5) * self.num_query_atoms + self.num_key_atoms / 2 - num_atoms + 0.5)
-        key_windows = gather_key_windows(tensor, self.num_query_atoms, self.num_key_atoms)
+        key_windows = gather_key_windows(tensor, self.num_query_atoms, self.num_key_atoms, num_valid_atoms)
         # Build the window attention mask directly in windowed (num_windows, query, key) layout. Deriving it from
         # a dense (num_atoms, num_atoms) pad mask is quadratic in the atom count (costly memory at large N); this
-        # form is linear in num_windows and is exactly equal to the dense-derived mask. A pair is valid iff the
-        # query atom is real and the key atom (the query window shifted left by the key padding) lies in
-        # [0, num_atoms).
+        # form is linear in num_windows and is exactly equal to the dense-derived mask.
         device = tensor.device
         window_start = torch.arange(num_windows, device=device).unsqueeze(-1) * self.num_query_atoms
         query_index = window_start + torch.arange(self.num_query_atoms, device=device)
-        key_index = window_start - key_padding_left + torch.arange(self.num_key_atoms, device=device)
-        window_mask = (
-            (query_index[:, :, None] < num_atoms) & (key_index[:, None, :] >= 0) & (key_index[:, None, :] < num_atoms)
-        ).reshape(*((1,) * len(tensor.shape[:-2])), num_windows, self.num_query_atoms, self.num_key_atoms)
+        clamped = num_valid_atoms is not None and num_valid_atoms >= self.num_key_atoms
+        if clamped:
+            # Clamped/shifted keys are all real, so a pair is valid iff its query atom is real.
+            query_valid = query_index < num_valid_atoms
+            window_mask = query_valid[:, :, None].expand(-1, -1, self.num_key_atoms)
+        else:
+            # A pair is valid iff the query atom is real and the key atom (the query window shifted left by the
+            # key padding) lies in [0, num_atoms).
+            key_index = window_start - key_padding_left + torch.arange(self.num_key_atoms, device=device)
+            window_mask = (
+                (query_index[:, :, None] < num_atoms)
+                & (key_index[:, None, :] >= 0)
+                & (key_index[:, None, :] < num_atoms)
+            )
+        window_mask = window_mask.reshape(
+            *((1,) * len(tensor.shape[:-2])), num_windows, self.num_query_atoms, self.num_key_atoms
+        )
         return LocalAtomWindows(
             query=query_windows,
             key=key_windows,
@@ -263,5 +320,6 @@ class LocalAtomWindowing(nn.Module):
                 query_padding=query_padding,
                 key_padding_left=key_padding_left,
                 key_padding_right=key_padding_right,
+                num_valid_atoms=num_valid_atoms,
             ),
         )

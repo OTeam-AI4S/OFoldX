@@ -16,13 +16,13 @@ from ..atom import LocalAtomGeometry
 from ..embedding.position import RelativePositionBuckets
 
 
-@dataclass(slots=True)
+@dataclass
 class CoordinateDenoisingInput:
     r"""
     Typed input bundle for a single coordinate-denoising step.
 
     Groups the static conditioning tensors together with the step-specific ``noisy_coords`` and ``noise_level`` that a
-    [`CoordinateDenoiseFn`][ofoldx.modules.diffusion.sampling.CoordinateDenoiseFn] consumes. Built per step by
+    a coordinate denoiser consumes. Built per step by
     [`CoordinateDenoiseContext.to_denoising_input`][ofoldx.modules.diffusion.sampling.CoordinateDenoiseContext].
 
     Attributes:
@@ -34,7 +34,8 @@ class CoordinateDenoisingInput:
         relative_features: Relative-position feature bundle.
         noise_level: EDM noise level for the denoising step.
         reference_positions: Centered reference-conformer atom coords.
-        reference_charges: Per-atom reference formal charges.
+        reference_charges: Per-atom reference formal charges, shape `[..., N_atom, 1]`.
+        reference_mask: Boolean mask for atoms with valid reference-conformer coordinates.
         atom_mask: Boolean atom validity mask.
         noisy_coords: Noisy atom coords to denoise.
         local_geometry: Optional local atom-pair geometry.
@@ -49,6 +50,7 @@ class CoordinateDenoisingInput:
     noise_level: Tensor
     reference_positions: Tensor
     reference_charges: Tensor
+    reference_mask: Tensor
     atom_mask: Tensor
     noisy_coords: Tensor
     local_geometry: LocalAtomGeometry | None

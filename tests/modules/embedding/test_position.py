@@ -90,3 +90,10 @@ def test_cyclic_period(period):
         # None or all-zero period leaves the linear offset untouched.
         expected = torch.tensor([[[32, 27], [37, 32]]])
     assert torch.equal(buckets.residue_bucket, expected)
+
+
+def test_cyclic_period_is_applied_per_token():
+    idx = torch.tensor([[0, 5]])
+    buckets = features(idx, cyclic_period=torch.tensor([[0.0, 5.0]]))
+
+    assert torch.equal(buckets.residue_bucket, torch.tensor([[[32, 32], [37, 32]]]))

@@ -4,6 +4,8 @@ EDM noise schedules.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
 
@@ -52,6 +54,7 @@ class EdmScheduler(nn.Module):
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype,
+        max_noise_level: float | None = None,
     ) -> Tensor:
         r"""
         Return ``num_sampling_steps + 1`` descending EDM noise levels, ending at zero.
@@ -63,6 +66,7 @@ class EdmScheduler(nn.Module):
             num_sampling_steps: Number of denoising steps; the schedule has one more entry than this.
             device: Device to place the schedule on.
             dtype: Floating dtype of the returned schedule.
+            max_noise_level: Optional per-call initial noise override.
 
         Returns:
             Descending noise levels of shape `[num_sampling_steps + 1]`, with the last entry equal to ``0``.
@@ -81,7 +85,15 @@ class EdmScheduler(nn.Module):
             raise ValueError(f"num_sampling_steps must be positive, got {num_sampling_steps}")
         step_size = 1 / num_sampling_steps
         step_indices = torch.arange(num_sampling_steps + 1, device=device, dtype=dtype)
-        max_root = self.max_noise_level ** (1 / self.rho)
+        maximum = self.max_noise_level if max_noise_level is None else max_noise_level
+        if (
+            isinstance(maximum, bool)
+            or not isinstance(maximum, int | float)
+            or not math.isfinite(maximum)
+            or maximum <= 0
+        ):
+            raise ValueError("max_noise_level must be a finite positive number")
+        max_root = maximum ** (1 / self.rho)
         min_root = self.min_noise_level ** (1 / self.rho)
         schedule_base = max_root + step_indices * step_size * (min_root - max_root)
         schedule = self.sigma_data * schedule_base**self.rho

@@ -8,41 +8,23 @@ Euler and Heun solvers, stochastic churn, per-step center-random augmentation, a
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal
 
 import torch
 from torch import Tensor, nn
 
 from ..atom import LocalAtomGeometry
 from ..embedding import RelativePositionBuckets
-from ..geometry import uniform_random_rotation
+from ..geometry import uniform_random_rotation, weighted_rigid_align
 from .schedule import EdmScheduler
 from .types import CoordinateDenoisingInput
 
-
-class CoordinateDenoiseFn(Protocol):
-    r"""
-    Structural type for the coordinate denoiser consumed by
-    [`CoordinateEdmSampler`][ofoldx.modules.diffusion.sampling.CoordinateEdmSampler].
-
-    Any callable that maps a
-    [`CoordinateDenoisingInput`][ofoldx.modules.diffusion.types.CoordinateDenoisingInput] to denoised coords of
-    shape `[..., N_sample, N_atom, 3]` satisfies this protocol; the sampler never constructs it, only calls it.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.diffusion.types import CoordinateDenoisingInput
-        >>> def denoise(inputs: CoordinateDenoisingInput) -> torch.Tensor:
-        ...     return inputs.noisy_coords  # a trivial identity denoiser satisfies the protocol
-        >>> callable(denoise)
-        True
-    """
-
-    def __call__(self, inputs: CoordinateDenoisingInput) -> Tensor: ...
+_CoordinateDenoiseFn = Callable[[CoordinateDenoisingInput], Tensor]
 
 
-@dataclass(slots=True)
+@dataclass
 class CoordinateDenoiseContext:
     r"""
     Step-invariant conditioning tensors shared across every coordinate-denoising step.
@@ -57,7 +39,8 @@ class CoordinateDenoiseContext:
         atom_features: Per-atom input features.
         atom_to_token: Token index for each atom.
         reference_positions: Centered reference-conformer atom coords.
-        reference_charges: Per-atom reference formal charges.
+        reference_charges: Per-atom reference formal charges, shape `[..., N_atom, 1]`.
+        reference_mask: Boolean mask for atoms with valid reference-conformer coordinates.
         atom_mask: Boolean atom validity mask.
         token_embedding: Token embedding before trunk updates.
         single: Token single representation.
@@ -70,6 +53,7 @@ class CoordinateDenoiseContext:
     atom_to_token: Tensor
     reference_positions: Tensor
     reference_charges: Tensor
+    reference_mask: Tensor
     atom_mask: Tensor
     token_embedding: Tensor
     single: Tensor
@@ -102,6 +86,7 @@ class CoordinateDenoiseContext:
             ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
             ...     reference_positions=torch.zeros(1, 3, 3),
             ...     reference_charges=torch.zeros(1, 3),
+            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     token_embedding=torch.zeros(1, 2, 4),
             ...     single=torch.zeros(1, 2, 4),
@@ -139,6 +124,7 @@ class CoordinateDenoiseContext:
             ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
             ...     reference_positions=torch.zeros(1, 3, 3),
             ...     reference_charges=torch.zeros(1, 3),
+            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     token_embedding=torch.zeros(1, 2, 4),
             ...     single=torch.zeros(1, 2, 4),
@@ -166,6 +152,7 @@ class CoordinateDenoiseContext:
             ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
             ...     reference_positions=torch.zeros(1, 3, 3),
             ...     reference_charges=torch.zeros(1, 3),
+            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     token_embedding=torch.zeros(1, 2, 4),
             ...     single=torch.zeros(1, 2, 4),
@@ -193,6 +180,7 @@ class CoordinateDenoiseContext:
             ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
             ...     reference_positions=torch.zeros(1, 3, 3),
             ...     reference_charges=torch.zeros(1, 3),
+            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     token_embedding=torch.zeros(1, 2, 4),
             ...     single=torch.zeros(1, 2, 4),
@@ -227,6 +215,7 @@ class CoordinateDenoiseContext:
             ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
             ...     reference_positions=torch.zeros(1, 3, 3),
             ...     reference_charges=torch.zeros(1, 3),
+            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
             ...     token_embedding=torch.zeros(1, 2, 4),
             ...     single=torch.zeros(1, 2, 4),
@@ -248,30 +237,11 @@ class CoordinateDenoiseContext:
             noise_level=noise_level,
             reference_positions=self.reference_positions,
             reference_charges=self.reference_charges,
+            reference_mask=self.reference_mask,
             atom_mask=self.atom_mask,
             noisy_coords=noisy_coords,
             local_geometry=self.local_geometry,
         )
-
-
-@dataclass(slots=True)
-class CoordinateSamplingTrace:
-    r"""
-    Structured coordinate-sampling diagnostics returned by
-    [`CoordinateEdmSampler.trace`][ofoldx.modules.diffusion.sampling.CoordinateEdmSampler.trace].
-
-    Bundles the final sampled coords with the noise schedule that produced them and the full per-step trajectory, for
-    inspecting or visualizing the reverse-diffusion path.
-
-    Attributes:
-        coords: Final sampled coords.
-        noise_schedule: EDM noise levels used during sampling.
-        trajectory: Per-step coordinate trajectory.
-    """
-
-    coords: Tensor
-    noise_schedule: Tensor
-    trajectory: Tensor
 
 
 class CoordinateEdmSampler(nn.Module):
@@ -279,7 +249,7 @@ class CoordinateEdmSampler(nn.Module):
     EDM reverse-diffusion coordinate sampler with its noise schedule and stochastic update rule.
 
     Wraps an [`EdmScheduler`][ofoldx.modules.diffusion.schedule.EdmScheduler] and repeatedly applies a
-    caller-supplied [`CoordinateDenoiseFn`][ofoldx.modules.diffusion.sampling.CoordinateDenoiseFn] over the noise
+    caller-supplied denoising callable over the noise
     schedule. Each step optionally injects stochastic "churn" noise, then advances the coords with either the Euler
     or Heun solver; per-step center-random augmentation and chunked multi-sample draws are supported.
 
@@ -299,6 +269,9 @@ class CoordinateEdmSampler(nn.Module):
         reverse_augmentation: If ``True``, reverse each per-step random rigid augmentation after the solver update.
         sample_noise_before_augmentation: If ``True``, draw the churn noise before augmenting the coords rather
             than after.
+        alignment_reverse_diff: If ``True``, weighted-rigid-align the churned (noisy) coords onto the denoised
+            coords mid-step (before the ODE derivative), as the Boltz-family reverse-diffusion loops do. Defaults
+            to ``False`` so existing callers (ODesign / AlphaFold3 / Protenix) keep their exact behavior.
 
     Raises:
         ValueError: If ``solver`` is not ``"euler"`` or ``"heun"``.
@@ -327,6 +300,7 @@ class CoordinateEdmSampler(nn.Module):
         center_random_augmentation: bool = True,
         reverse_augmentation: bool = False,
         sample_noise_before_augmentation: bool = False,
+        alignment_reverse_diff: bool = False,
     ) -> None:
         super().__init__()
         if solver not in {"euler", "heun"}:
@@ -343,6 +317,7 @@ class CoordinateEdmSampler(nn.Module):
         self.center_random_augmentation = center_random_augmentation
         self.reverse_augmentation = reverse_augmentation
         self.sample_noise_before_augmentation = sample_noise_before_augmentation
+        self.alignment_reverse_diff = alignment_reverse_diff
 
     def augment_target(
         self,
@@ -378,17 +353,18 @@ class CoordinateEdmSampler(nn.Module):
             [[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
         """
 
-        return self._center_random_augmentation(
+        augmented, _ = self._center_random_augmentation(
             coords,
             num_samples=num_samples,
             center_only=not self.center_random_augmentation,
             atom_mask=atom_mask,
             generator=generator,
         )
+        return augmented
 
     def forward(
         self,
-        denoise: CoordinateDenoiseFn,
+        denoise: _CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         num_samples: int = 1,
@@ -397,6 +373,7 @@ class CoordinateEdmSampler(nn.Module):
         initial_coords: Tensor | None = None,
         condition_coords: Tensor | None = None,
         condition_mask: Tensor | None = None,
+        max_noise_level: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
@@ -417,6 +394,7 @@ class CoordinateEdmSampler(nn.Module):
                 fresh Gaussian noise is drawn when ``None``.
             condition_coords: Optional fixed coordinates pinned after every denoising step.
             condition_mask: Optional atom mask selecting coordinates to pin from ``condition_coords``.
+            max_noise_level: Optional per-call initial scheduler noise override.
             generator: Optional RNG for reproducible sampling.
 
         Returns:
@@ -430,7 +408,7 @@ class CoordinateEdmSampler(nn.Module):
             torch.Size([1, 4, 128, 3])
         """
 
-        coords, _noise_schedule, _trajectory = self._sample(
+        return self._sample(
             denoise,
             context=context,
             num_samples=num_samples,
@@ -439,81 +417,13 @@ class CoordinateEdmSampler(nn.Module):
             initial_coords=initial_coords,
             condition_coords=condition_coords,
             condition_mask=condition_mask,
+            max_noise_level=max_noise_level,
             generator=generator,
-            collect_trace=False,
-        )
-        return coords
-
-    def trace(
-        self,
-        denoise: CoordinateDenoiseFn,
-        *,
-        context: CoordinateDenoiseContext,
-        num_samples: int = 1,
-        num_sampling_steps: int = 200,
-        sample_chunk_size: int | None = None,
-        initial_coords: Tensor | None = None,
-        condition_coords: Tensor | None = None,
-        condition_mask: Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> CoordinateSamplingTrace:
-        r"""
-        Run the EDM coordinate sampling loop and return the coords together with sampling diagnostics.
-
-        Same reverse-diffusion loop as
-        [`forward`][ofoldx.modules.diffusion.sampling.CoordinateEdmSampler.forward], but also records the noise
-        schedule and the per-step coordinate trajectory.
-
-        Args:
-            denoise: Denoiser mapping a
-                [`CoordinateDenoisingInput`][ofoldx.modules.diffusion.types.CoordinateDenoisingInput] to denoised
-                coords.
-            context: Static conditioning tensors shared across steps.
-            num_samples: Number of samples to draw per batch element.
-            num_sampling_steps: Number of reverse-diffusion steps.
-            sample_chunk_size: If set, sample in chunks of this many draws to cap peak memory.
-            initial_coords: Optional starting coords of shape `[..., N_atom, 3]` or `[..., num_samples, N_atom, 3]`;
-                fresh Gaussian noise is drawn when ``None``.
-            generator: Optional RNG for reproducible sampling.
-
-        Returns:
-            A [`CoordinateSamplingTrace`][ofoldx.modules.diffusion.sampling.CoordinateSamplingTrace] holding the
-            final coords, the noise schedule, and the stacked per-step trajectory.
-
-        Raises:
-            RuntimeError: If the internal sampler returns no trajectory despite a trace being requested.
-
-        Examples:
-            >>> import torch  # doctest: +SKIP
-            >>> sampler = CoordinateEdmSampler()  # doctest: +SKIP
-            >>> result = sampler.trace(denoise, context=context, num_sampling_steps=200)  # doctest: +SKIP
-            >>> result.trajectory.shape[0]  # num_sampling_steps + 1 snapshots  # doctest: +SKIP
-            201
-        """
-
-        coords, noise_schedule, trajectory = self._sample(
-            denoise,
-            context=context,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            sample_chunk_size=sample_chunk_size,
-            initial_coords=initial_coords,
-            condition_coords=condition_coords,
-            condition_mask=condition_mask,
-            generator=generator,
-            collect_trace=True,
-        )
-        if trajectory is None:
-            raise RuntimeError("internal sampler error: trace was requested but no trajectory was collected")
-        return CoordinateSamplingTrace(
-            coords=coords,
-            noise_schedule=noise_schedule,
-            trajectory=trajectory,
         )
 
     def _sample(
         self,
-        denoise: CoordinateDenoiseFn,
+        denoise: _CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         num_samples: int,
@@ -522,11 +432,11 @@ class CoordinateEdmSampler(nn.Module):
         initial_coords: Tensor | None,
         condition_coords: Tensor | None,
         condition_mask: Tensor | None,
+        max_noise_level: float | None,
         generator: torch.Generator | None,
-        collect_trace: bool,
-    ) -> tuple[Tensor, Tensor, Tensor | None]:
+    ) -> Tensor:
         r"""
-        Drive the reverse-diffusion loop, optionally chunked, and return coords, schedule, and trajectory.
+        Drive the reverse-diffusion loop, optionally chunked, and return coordinates.
 
         Args:
             denoise: Denoiser called at each step.
@@ -537,11 +447,10 @@ class CoordinateEdmSampler(nn.Module):
             initial_coords: Optional starting coords.
             condition_coords: Optional fixed coordinates pinned after each step.
             condition_mask: Optional atom mask selecting fixed coordinates.
+            max_noise_level: Optional per-call initial scheduler noise override.
             generator: Optional RNG.
-            collect_trace: Whether to accumulate the per-step trajectory.
-
         Returns:
-            ``(coords, noise_schedule, trajectory)`` where ``trajectory`` is ``None`` unless ``collect_trace``.
+            Sampled coordinates.
 
         Raises:
             ValueError: If ``num_samples`` or ``sample_chunk_size`` is not positive.
@@ -552,7 +461,10 @@ class CoordinateEdmSampler(nn.Module):
         if sample_chunk_size is not None and sample_chunk_size < 1:
             raise ValueError(f"sample_chunk_size must be positive, got {sample_chunk_size}")
         noise_schedule = self.scheduler(
-            num_sampling_steps=num_sampling_steps, device=context.device, dtype=context.dtype
+            num_sampling_steps=num_sampling_steps,
+            device=context.device,
+            dtype=context.dtype,
+            max_noise_level=max_noise_level,
         )
 
         def denoise_chunk(
@@ -560,7 +472,7 @@ class CoordinateEdmSampler(nn.Module):
             chunk_initial_coords: Tensor | None,
             *,
             sample_start: int = 0,
-        ) -> tuple[Tensor, Tensor | None]:
+        ) -> Tensor:
             r"""
             Run the full reverse-diffusion loop for one chunk of ``chunk_num_samples`` samples.
 
@@ -575,10 +487,7 @@ class CoordinateEdmSampler(nn.Module):
                     first noise level when ``None``.
 
             Returns:
-                ``(coords, trajectory)`` where ``coords`` is `[..., chunk_num_samples, N_atom, 3]` and
-                ``trajectory`` is the stacked per-step coords
-                `[num_sampling_steps + 1, ..., chunk_num_samples, N_atom, 3]` when ``collect_trace`` is set,
-                else ``None``.
+                Coordinates shaped `[..., chunk_num_samples, N_atom, 3]`.
             """
 
             coords = self._initial_coords(
@@ -588,16 +497,16 @@ class CoordinateEdmSampler(nn.Module):
                 initial_coords=chunk_initial_coords,
                 generator=generator,
             )
-            chunk_condition_coords = self._condition_coords_chunk(
+            chunk_condition_coords = self._coords_chunk(
                 condition_coords,
+                context=context,
                 num_samples=num_samples,
                 sample_start=sample_start,
                 chunk_num_samples=chunk_num_samples,
+                name="condition_coords",
             )
             if condition_mask is not None and chunk_condition_coords is not None:
                 coords = self._apply_condition(coords, chunk_condition_coords, condition_mask)
-            trajectory = [coords] if collect_trace else None
-
             num_transitions = noise_schedule.size(0) - 1
             for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
                 noise = None
@@ -605,7 +514,7 @@ class CoordinateEdmSampler(nn.Module):
                 if self.sample_noise_before_augmentation:
                     noise = torch.empty_like(coords).normal_(generator=generator)
                 if self.center_random_augmentation:
-                    coords, augmentation_transform = self._center_random_augmentation_with_transform(
+                    coords, augmentation_transform = self._center_random_augmentation(
                         coords,
                         num_samples=1,
                         generator=generator,
@@ -639,39 +548,27 @@ class CoordinateEdmSampler(nn.Module):
                     coords = self._reverse_augmentation(coords, augmentation_transform)
                 if condition_mask is not None and chunk_condition_coords is not None:
                     coords = self._apply_condition(coords, chunk_condition_coords, condition_mask)
-                if trajectory is not None:
-                    trajectory.append(coords)
-
-            return coords, None if trajectory is None else torch.stack(trajectory, dim=0)
+            return coords
 
         if sample_chunk_size is None:
-            coords, trajectory = denoise_chunk(num_samples, initial_coords, sample_start=0)
-            return coords, noise_schedule, trajectory
+            return denoise_chunk(num_samples, initial_coords, sample_start=0)
 
         chunks = []
-        trajectories = []
         num_chunks = num_samples // sample_chunk_size + (num_samples % sample_chunk_size != 0)
         for i in range(num_chunks):
             chunk_num_samples = sample_chunk_size if i < num_chunks - 1 else num_samples - i * sample_chunk_size
-            chunk_initial_coords = self._initial_coords_chunk(
+            chunk_initial_coords = self._coords_chunk(
                 initial_coords,
                 context=context,
                 num_samples=num_samples,
                 sample_start=i * sample_chunk_size,
                 chunk_num_samples=chunk_num_samples,
+                name="initial_coords",
             )
-            coords, trajectory = denoise_chunk(
-                chunk_num_samples,
-                chunk_initial_coords,
-                sample_start=i * sample_chunk_size,
-            )
+            coords = denoise_chunk(chunk_num_samples, chunk_initial_coords, sample_start=i * sample_chunk_size)
             chunks.append(coords)
-            if trajectory is not None:
-                trajectories.append(trajectory)
 
-        coords = torch.cat(chunks, dim=-3)
-        trajectory = None if not trajectories else torch.cat(trajectories, dim=-3)
-        return coords, noise_schedule, trajectory
+        return torch.cat(chunks, dim=-3)
 
     @staticmethod
     def _initial_coords(
@@ -708,74 +605,61 @@ class CoordinateEdmSampler(nn.Module):
                     f"initial_coords must have shape {expected_shape} or {unsampled_shape}, "
                     f"got {tuple(initial_coords.shape)}"
                 )
-            return initial_coords.to(device=context.device, dtype=context.dtype)
+            return initial_coords
         # Derive the noise shape from a real conditioning tensor (reference_positions is
         # [..., N_atom, 3]) rather than a literal that embeds the symbolic atom count, so
         # torch.compile with dynamic shapes can trace this. Insert the sample axis at -3.
-        reference = context.reference_positions.to(device=context.device, dtype=context.dtype)
+        reference = context.reference_positions
         noise_template = reference.unsqueeze(-3).expand(*context.batch_shape, num_samples, reference.shape[-2], 3)
         noise = torch.empty_like(noise_template).normal_(generator=generator)
         return noise_level * noise
 
     @staticmethod
-    def _initial_coords_chunk(
-        initial_coords: Tensor | None,
+    def _coords_chunk(
+        coords: Tensor | None,
         *,
         context: CoordinateDenoiseContext,
         num_samples: int,
         sample_start: int,
         chunk_num_samples: int,
+        name: str,
     ) -> Tensor | None:
         r"""
-        Slice the sample axis of ``initial_coords`` for one chunk, or pass unsampled coords through.
+        Slice sampled coordinates for one chunk, or pass unsampled coordinates through.
 
         Args:
-            initial_coords: Optional user-provided starting coords.
+            coords: Optional sampled or unsampled coordinates.
             context: Static conditioning tensors.
             num_samples: Total number of samples across all chunks.
             sample_start: Index of this chunk's first sample.
             chunk_num_samples: Number of samples in this chunk.
+            name: Argument name used in shape errors.
 
         Returns:
-            The chunk's starting coords, or ``None`` when ``initial_coords`` is ``None``.
+            The chunk's coordinates, or ``None`` when ``coords`` is ``None``.
 
         Raises:
-            ValueError: If ``initial_coords`` has an unexpected shape.
+            ValueError: If ``coords`` has an unexpected shape.
         """
-        if initial_coords is None:
+        if coords is None:
             return None
 
         unsampled_shape = (*context.batch_shape, context.num_atoms, 3)
-        if tuple(initial_coords.shape) == tuple(unsampled_shape):
-            return initial_coords
+        if tuple(coords.shape) == tuple(unsampled_shape):
+            return coords
 
         sampled_shape = (*context.batch_shape, num_samples, context.num_atoms, 3)
-        if tuple(initial_coords.shape) != tuple(sampled_shape):
+        if tuple(coords.shape) != tuple(sampled_shape):
             raise ValueError(
-                f"initial_coords must have shape {sampled_shape} or {unsampled_shape}, "
-                f"got {tuple(initial_coords.shape)}"
+                f"{name} must have shape {sampled_shape} or {unsampled_shape}, " f"got {tuple(coords.shape)}"
             )
 
         sample_end = sample_start + chunk_num_samples
-        return initial_coords[..., sample_start:sample_end, :, :]
-
-    @staticmethod
-    def _condition_coords_chunk(
-        condition_coords: Tensor | None,
-        *,
-        num_samples: int,
-        sample_start: int,
-        chunk_num_samples: int,
-    ) -> Tensor | None:
-        if condition_coords is None:
-            return None
-        if condition_coords.dim() >= 3 and condition_coords.shape[-3] == num_samples:
-            return condition_coords[..., sample_start : sample_start + chunk_num_samples, :, :]
-        return condition_coords
+        return coords[..., sample_start:sample_end, :, :]
 
     def _step(
         self,
-        denoise: CoordinateDenoiseFn,
+        denoise: _CoordinateDenoiseFn,
         coords: Tensor,
         sigma_prev: Tensor,
         sigma_next: Tensor,
@@ -818,8 +702,12 @@ class CoordinateEdmSampler(nn.Module):
         if noise is None:
             noise = torch.randn_like(coords)
         if condition_mask is not None:
-            noise = self._zero_condition_noise(noise, condition_mask)
-        noisy_coords = coords + self.noise_scale * delta_noise * noise
+            noise = torch.where(
+                _atom_mask_for_coords(condition_mask, noise).bool(),
+                torch.zeros_like(noise),
+                noise,
+            )
+        noisy_coords = coords + self._churn_increment(delta_noise, noise)
         if condition_mask is not None and condition_coords is not None:
             noisy_coords = self._apply_condition(noisy_coords, condition_coords, condition_mask)
 
@@ -834,6 +722,9 @@ class CoordinateEdmSampler(nn.Module):
             noisy_coords=noisy_coords,
             noise_level=noise_level,
         )
+
+        if self.alignment_reverse_diff:
+            noisy_coords = self._align_reverse_diff(noisy_coords, denoised_coords, context)
 
         delta = self._derivative(noisy_coords, denoised_coords, noise_level)
         dt = sigma_next - sigma_hat
@@ -859,6 +750,50 @@ class CoordinateEdmSampler(nn.Module):
             coords_next = self._apply_condition(coords_next, condition_coords, condition_mask)
         return coords_next
 
+    def _churn_increment(self, delta_noise: Tensor, noise: Tensor) -> Tensor:
+        r"""
+        Return the stochastic-churn coordinate increment added before denoising.
+
+        The base EDM rule injects ``noise_scale * sqrt(sigma_hat^2 - sigma_prev^2) * epsilon``. Subclasses that
+        follow a different churn convention (for example BoltzGen's faithful ``noise_scale^2`` factor) override
+        this single hook so the rest of the step loop stays shared.
+
+        Args:
+            delta_noise: The churn standard deviation ``sqrt(sigma_hat^2 - sigma_prev^2)`` for this step.
+            noise: Pre-drawn standard-normal churn noise, shape `[..., N_sample, N_atom, 3]`.
+
+        Returns:
+            The coordinate increment to add to the current coords.
+        """
+        return self.noise_scale * delta_noise * noise
+
+    def _align_reverse_diff(
+        self, noisy_coords: Tensor, denoised_coords: Tensor, context: CoordinateDenoiseContext
+    ) -> Tensor:
+        r"""
+        Weighted-rigid-align the churned coords onto the denoised coords (Boltz-family reverse-diffusion step).
+
+        Mirrors the Boltz loops' ``weighted_rigid_align(source=noisy, target=denoised, weight=atom_mask)`` run in
+        fp32 and cast back, so the ODE derivative is taken against the aligned frame. Only reached when
+        ``alignment_reverse_diff`` is ``True``.
+
+        Args:
+            noisy_coords: Churned coords, shape `[..., N_sample, N_atom, 3]`.
+            denoised_coords: Denoised coords, same shape.
+            context: Static conditioning tensors (source of ``atom_mask``).
+
+        Returns:
+            The aligned ``noisy_coords``.
+        """
+        num_samples = noisy_coords.shape[-3]
+        weight = _expand_at_dim(context.atom_mask, dim=-2, size=num_samples)
+        aligned = weighted_rigid_align(
+            source=noisy_coords.float(),
+            target=denoised_coords.float(),
+            weight=weight.float(),
+        )
+        return aligned.to(noisy_coords)
+
     @staticmethod
     def _derivative(noisy_coords: Tensor, denoised_coords: Tensor, noise_level: Tensor) -> Tensor:
         r"""Return the EDM ODE derivative ``(noisy - denoised) / sigma`` used by the solver step."""
@@ -874,7 +809,7 @@ class CoordinateEdmSampler(nn.Module):
 
     def _denoise(
         self,
-        denoise: CoordinateDenoiseFn,
+        denoise: _CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         noisy_coords: Tensor,
@@ -892,74 +827,9 @@ class CoordinateEdmSampler(nn.Module):
         atom_mask: Tensor | None = None,
         generator: torch.Generator | None = None,
         eps: float = 1e-12,
-    ) -> Tensor:
-        r"""
-        Center coords (optionally mask-weighted) and apply ``num_samples`` random rigid augmentations.
-
-        Args:
-            coords: Coords of shape `[..., N_atom, 3]`.
-            num_samples: Number of augmented copies to draw along a new sample axis.
-            translation_scale: Standard deviation of the random translation.
-            center_only: If ``True``, only center and expand; skip rotation/translation.
-            atom_mask: Optional `[..., N_atom]` mask for weighted centering and output masking.
-            generator: Optional RNG.
-            eps: Floor for the masked-centroid denominator.
-
-        Returns:
-            Augmented coords of shape `[..., num_samples, N_atom, 3]`.
-        """
-
-        num_atoms = coords.size(-2)
-        device = coords.device
-
-        if atom_mask is None:
-            coords = coords - torch.mean(input=coords, dim=-2, keepdim=True)
-        else:
-            atom_mask = _atom_mask_for_coords(atom_mask, coords)
-            center = (coords * atom_mask).sum(dim=-2) / atom_mask.sum(dim=-2).clamp_min(eps)
-            coords = coords - center.unsqueeze(dim=-2)
-
-        coords = _expand_at_dim(coords, dim=-3, size=num_samples)
-        if center_only:
-            return coords
-
-        num_augmentations = torch.numel(coords[..., 0, 0])
-        batch_size_shape = coords.shape[:-3]
-        rotation = uniform_random_rotation(
-            num_samples=num_augmentations,
-            device=device,
-            dtype=coords.dtype,
-            generator=generator,
-        ).reshape(*batch_size_shape, num_samples, 3, 3)
-        translation = translation_scale * torch.randn(
-            size=(*batch_size_shape, num_samples, 3),
-            generator=generator,
-            device=device,
-            dtype=coords.dtype,
-        )
-        augmented = _rot_vec_mul(
-            rotation=_expand_at_dim(rotation, dim=-3, size=num_atoms),
-            vectors=coords,
-        )
-        augmented = augmented + translation[..., None, :]
-
-        if atom_mask is not None:
-            # ``atom_mask`` is aligned to the pre-expansion coords ``(..., n_atom, 1)``; insert the
-            # sample axis that ``_expand_at_dim`` added so it broadcasts over ``n_sample`` instead of
-            # colliding with a real batch dimension (which errors for batch > 1, n_sample > 1).
-            augmented = augmented * atom_mask.unsqueeze(-3)
-        return augmented
-
-    @staticmethod
-    def _center_random_augmentation_with_transform(
-        coords: Tensor,
-        num_samples: int = 1,
-        translation_scale: float = 1.0,
-        center_only: bool = False,
-        atom_mask: Tensor | None = None,
-        generator: torch.Generator | None = None,
-        eps: float = 1e-12,
     ) -> tuple[Tensor, tuple[Tensor, Tensor, Tensor] | None]:
+        r"""Center and optionally rigidly augment coordinates, retaining the inverse transform."""
+
         num_atoms = coords.size(-2)
         device = coords.device
 
@@ -1028,7 +898,7 @@ class CoordinateEdmSampler(nn.Module):
             rotation = rotation.squeeze(-3)
             translation = translation.squeeze(-2)
             center = center.squeeze(-2)
-        coords = coords.to(target) - center[..., None, :]
+        coords = coords.to(dtype=target.dtype) - center[..., None, :]
         augmented = _rot_vec_mul(
             rotation=_expand_at_dim(rotation, dim=-3, size=coords.shape[-2]),
             vectors=coords,
@@ -1039,21 +909,40 @@ class CoordinateEdmSampler(nn.Module):
     def _apply_condition(coords: Tensor, condition_coords: Tensor, condition_mask: Tensor) -> Tensor:
         if condition_coords.dim() == coords.dim() - 1:
             condition_coords = condition_coords.unsqueeze(-3)
-        mask = condition_mask
-        if mask.dim() == coords.dim() - 2:
-            mask = mask.unsqueeze(-2)
-        while mask.dim() < coords.dim() - 1:
-            mask = mask.unsqueeze(-2)
-        return torch.where(mask.unsqueeze(-1).to(dtype=torch.bool), condition_coords.to(coords), coords)
+        return torch.where(
+            _atom_mask_for_coords(condition_mask, coords).bool(),
+            condition_coords.to(dtype=coords.dtype),
+            coords,
+        )
 
-    @staticmethod
-    def _zero_condition_noise(noise: Tensor, condition_mask: Tensor) -> Tensor:
-        mask = condition_mask
-        if mask.dim() == noise.dim() - 2:
-            mask = mask.unsqueeze(-2)
-        while mask.dim() < noise.dim() - 1:
-            mask = mask.unsqueeze(-2)
-        return torch.where(mask.unsqueeze(-1).to(dtype=torch.bool), torch.zeros_like(noise), noise)
+
+class BoltzGenCoordinateEdmSampler(CoordinateEdmSampler):
+    r"""
+    [`CoordinateEdmSampler`][ofoldx.modules.diffusion.sampling.CoordinateEdmSampler] with BoltzGen's churn factor.
+
+    BoltzGen's released reverse-diffusion loop injects the churn noise with an extra ``noise_scale`` factor: it
+    computes ``noise_var = noise_scale^2 * (sigma_hat^2 - sigma_prev^2)`` and then adds
+    ``noise_scale * sqrt(noise_var) * epsilon``, i.e. ``noise_scale^2 * sqrt(sigma_hat^2 - sigma_prev^2) *
+    epsilon`` -- one more ``noise_scale`` than the standard EDM rule. That factor is faithful to upstream (it must
+    stay to keep BoltzGen structure-diffusion parity), so it lives here as a single-hook override rather than a
+    branch in the shared step. Everything else -- schedule walking, augmentation, alignment, the Euler/Heun update
+    -- is inherited unchanged. Pair this subclass with a dilated
+    [`EdmScheduler`][ofoldx.modules.diffusion.schedule.EdmScheduler] variant to reproduce the released design
+    inference schedule.
+
+    Examples:
+        >>> import torch
+        >>> sampler = BoltzGenCoordinateEdmSampler(noise_scale=0.95, step_scale=1.8)
+        >>> delta_noise = torch.tensor(2.0)
+        >>> noise = torch.ones(1, 1, 1, 3)
+        >>> increment = sampler._churn_increment(delta_noise, noise)  # noise_scale**2 * delta_noise
+        >>> bool(torch.allclose(increment, torch.full((1, 1, 1, 3), 0.95**2 * 2.0)))
+        True
+    """
+
+    def _churn_increment(self, delta_noise: Tensor, noise: Tensor) -> Tensor:
+        r"""Inject churn with BoltzGen's faithful ``noise_scale^2 * sqrt(sigma_hat^2 - sigma_prev^2)`` factor."""
+        return (self.noise_scale**2) * delta_noise * noise
 
 
 def _rot_vec_mul(rotation: Tensor, vectors: Tensor) -> Tensor:
@@ -1107,17 +996,9 @@ def _atom_mask_for_coords(atom_mask: Tensor, coords: Tensor) -> Tensor:
         coords: Coordinate tensor of shape `[..., N_atom, 3]`.
 
     Returns:
-        The mask reshaped to `[..., N_atom, 1]` on ``coords``'s device/dtype.
+        The mask reshaped to `[..., N_atom, 1]`.
 
-    Raises:
-        ValueError: If ``atom_mask``'s last dimension does not match the atom axis.
     """
-    atom_mask = atom_mask.to(device=coords.device, dtype=coords.dtype)
-    if atom_mask.shape[-1] != coords.shape[-2]:
-        raise ValueError(
-            "atom_mask's last dimension must match the atom axis, got "
-            f"{tuple(atom_mask.shape)} and {tuple(coords.shape)}"
-        )
     while atom_mask.dim() < coords.dim() - 1:
         atom_mask = atom_mask.unsqueeze(-2)
     return atom_mask.unsqueeze(-1)

@@ -18,21 +18,10 @@ Examples:
 from __future__ import annotations
 
 from .attention import GatedMultiheadAttention, MultiheadAttentionProjection
-from .geometry import align_coords, random_rotation_frames, uniform_random_rotation, weighted_rigid_align
-from .representation import Coords, Frames, Pair, Single
+from .geometry import uniform_random_rotation, weighted_rigid_align
+from .mpnn import (
+    AMINO_ACID_COMPONENT_IDS,
+    AMINO_ACID_TOKEN_BY_COMPONENT,
+    AMINO_ACID_UNKNOWN_TOKEN,
+)
 from .transition import ConditionedTransition, Transition
-
-__all__ = [
-    "ConditionedTransition",
-    "Coords",
-    "Frames",
-    "GatedMultiheadAttention",
-    "MultiheadAttentionProjection",
-    "Pair",
-    "Single",
-    "Transition",
-    "align_coords",
-    "random_rotation_frames",
-    "uniform_random_rotation",
-    "weighted_rigid_align",
-]

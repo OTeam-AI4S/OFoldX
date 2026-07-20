@@ -7,8 +7,6 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .representation import Coords, Frames
-
 
 def weighted_rigid_align(*, source: Tensor, target: Tensor, weight: Tensor, eps: float = 1e-8) -> Tensor:
     r"""
@@ -114,64 +112,3 @@ def uniform_random_rotation(
         ],
         dim=-2,
     )
-
-
-def align_coords(source: Coords, target: Coords, *, weight: Tensor, eps: float = 1e-8) -> Coords:
-    r"""
-    Typed [`Coords`][ofoldx.modules.representation.Coords] wrapper over
-    [`weighted_rigid_align`][ofoldx.modules.geometry.weighted_rigid_align].
-
-    Args:
-        source: Coordinates to align.
-        target: Target coordinates.
-        weight: `[..., N]` non-negative per-point weights.
-        eps: Weighted-centroid denominator floor.
-
-    Returns:
-        The aligned ``source`` coords, detached from autograd.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.representation import Coords
-        >>> src = Coords(torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
-        >>> torch.allclose(align_coords(src, src, weight=torch.ones(3)).tensor, src.tensor, atol=1e-5)
-        True
-    """
-
-    return Coords(weighted_rigid_align(source=source.tensor, target=target.tensor, weight=weight, eps=eps))
-
-
-def random_rotation_frames(
-    num_samples: int = 1,
-    *,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = None,
-    generator: torch.Generator | None = None,
-) -> Frames:
-    r"""
-    Sample Haar-uniform rotation-only rigid [`Frames`][ofoldx.modules.representation.Frames] (zero translation).
-
-    A typed companion to [`uniform_random_rotation`][ofoldx.modules.geometry.uniform_random_rotation] for
-    coordinate augmentation: ``frames.apply(coords)`` rotates a point cloud without hand-rolling the einsum.
-
-    Args:
-        num_samples: Number of frames to draw.
-        device: Device for the sampled tensors.
-        dtype: Floating dtype for the sampled tensors.
-        generator: Optional random generator for reproducible sampling.
-
-    Returns:
-        Rotation-only frames of batch shape `[num_samples]`.
-
-    Examples:
-        >>> import torch
-        >>> frames = random_rotation_frames(2, generator=torch.Generator().manual_seed(0))
-        >>> frames.rotations.shape
-        torch.Size([2, 3, 3])
-        >>> bool((frames.translations == 0).all())
-        True
-    """
-
-    rotations = uniform_random_rotation(num_samples, device=device, dtype=dtype, generator=generator)
-    translations = torch.zeros(num_samples, 3, device=rotations.device, dtype=rotations.dtype)
-    return Frames(rotations, translations)

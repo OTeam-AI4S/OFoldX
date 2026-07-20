@@ -4,7 +4,6 @@ Shared fixtures for OFoldX tests.
 
 from __future__ import annotations
 
-import os
 import random
 import sys
 from pathlib import Path
@@ -13,17 +12,11 @@ import numpy as np
 import pytest
 import torch
 
-# Keep the committed suite self-contained (DESIGN philosophy: no external data, no large checkpoints):
-# point the default CCD provider at a non-existent file so it stays empty. Tests that need reference
-# components inject a fake provider instead. This also avoids the RDKit-Mol interpreter-teardown crash
-# on dev machines where the real ~0.13 GB pickle exists.
-os.environ["OFOLDX_CCD_RDKIT_MOL_FILE"] = "/nonexistent-ccd-for-tests.pkl"
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ofoldx.models import AlphaFold3Input  # noqa: E402
+from ofoldx.models.alphafold3 import AlphaFold3Input  # noqa: E402
 
 # The seed every test starts from. Arbitrary but fixed: the point is that a test's numeric behaviour is
 # independent of how many random draws the preceding tests consumed, not that this value is special.
@@ -63,8 +56,7 @@ def _isolate_global_rng():
         torch.set_rng_state(torch_state)
 
 
-def _atom_token_fields(atom_to_token: torch.Tensor, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    representative_atom_mask = torch.zeros(atom_to_token.shape[0], dtype=torch.bool)
+def _atom_token_fields(atom_to_token: torch.Tensor, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     atom_token_index = torch.zeros(atom_to_token.shape[0], dtype=torch.long)
     token_to_rep_atom = torch.zeros(num_tokens, dtype=torch.long)
     counts = torch.zeros(num_tokens, dtype=torch.long)
@@ -74,10 +66,9 @@ def _atom_token_fields(atom_to_token: torch.Tensor, num_tokens: int) -> tuple[to
         atom_token_index[atom_index] = counts[token_index]
         counts[token_index] += 1
         if not seen[token_index]:
-            representative_atom_mask[atom_index] = True
             token_to_rep_atom[token_index] = atom_index
             seen[token_index] = True
-    return representative_atom_mask, atom_token_index, token_to_rep_atom
+    return atom_token_index, token_to_rep_atom
 
 
 def _dummy_model_input(
@@ -91,12 +82,7 @@ def _dummy_model_input(
     token_index = residue_index.clone()
     atom_to_token_1d = torch.arange(num_atoms, dtype=torch.long).remainder(num_tokens)
     atom_to_token = atom_to_token_1d.expand(batch_size, num_atoms).clone()
-    representative_atom_mask, atom_token_index, token_to_rep_atom_1d = _atom_token_fields(atom_to_token_1d, num_tokens)
-    token_arange = torch.arange(num_tokens, dtype=torch.long)
-    frame_atom_index_1d = torch.stack(
-        [token_arange % num_atoms, (token_arange + 1) % num_atoms, (token_arange + 2) % num_atoms],
-        dim=-1,
-    )
+    atom_token_index, token_to_rep_atom_1d = _atom_token_fields(atom_to_token_1d, num_tokens)
 
     return AlphaFold3Input(
         token_features=torch.zeros(batch_size, num_tokens, token_feature_size),
@@ -113,18 +99,9 @@ def _dummy_model_input(
         symmetry_index=torch.zeros(batch_size, num_tokens, dtype=torch.long),
         token_index=token_index,
         reference_space_id=torch.zeros(batch_size, num_atoms, dtype=torch.long),
-        representative_atom_mask=representative_atom_mask,
         atom_token_index=atom_token_index,
         token_to_rep_atom=token_to_rep_atom_1d.expand(batch_size, num_tokens).clone(),
-        molecule_type=torch.zeros(batch_size, num_tokens, dtype=torch.long),
-        frame_atom_index=frame_atom_index_1d.expand(batch_size, num_tokens, 3).clone(),
-        frame_mask=torch.ones(batch_size, num_tokens, dtype=torch.bool),
         token_bonds=torch.zeros(batch_size, num_tokens, num_tokens),
-        # trailing dims are the AF3 constraint feature widths: contact_feature_size=2, num_distogram_bins=39
-        contact_constraints=torch.zeros(batch_size, num_tokens, num_tokens, 2),
-        constraint_distogram=torch.zeros(batch_size, num_tokens, num_tokens, 39),
-        target_positions=torch.zeros(batch_size, num_atoms, 3),
-        target_mask=torch.ones(batch_size, num_atoms, dtype=torch.bool),
     )
 
 

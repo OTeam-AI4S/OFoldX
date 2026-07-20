@@ -3,24 +3,17 @@ Coordinate denoising networks.
 
 The coordinate denoiser is the diffusion-model score network: given noisy atom coords and an
 EDM ``noise_level``, it conditions the token single/pair representations, refines them through an
-atom-encoder/token-refiner/atom-decoder stack, and returns denoised coords. This module holds the
-single-head base variant; multi-head forks live in the model families.
+atom-encoder/token-refiner/atom-decoder stack, and returns denoised coords.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 
 from ..atom import (
-    AtomContext,
     AtomToTokenOutput,
-    AttentionLayout,
     CoordinateAtomToTokenEncoder,
     LocalAtomGeometry,
     LocalAtomWindowInfo,
@@ -36,65 +29,6 @@ from ..embedding.position import RelativePositionBuckets, RelativePositionEmbedd
 from ..transition import Transition
 
 
-@dataclass(slots=True)
-class DenoisingConditioning:
-    r"""
-    Single and pair conditioning tensors produced for one coordinate-denoising step.
-
-    Bundles the two representations the token refiner consumes: the noise-conditioned single
-    (carrying a per-sample axis) and the relative-position-augmented pair.
-
-    Attributes:
-        denoising_single: Conditioned token single representation, shape
-            `[..., num_samples, num_tokens, single_size]`.
-        denoising_pair: Conditioned token pair representation, shape
-            `[..., num_tokens, num_tokens, pair_size]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.denoiser.coordinate import DenoisingConditioning
-        >>> cond = DenoisingConditioning(
-        ...     denoising_single=torch.zeros(1, 5, 384),
-        ...     denoising_pair=torch.zeros(5, 5, 128),
-        ... )
-        >>> cond.denoising_single.shape, cond.denoising_pair.shape
-        (torch.Size([1, 5, 384]), torch.Size([5, 5, 128]))
-    """
-
-    denoising_single: Tensor
-    denoising_pair: Tensor
-
-
-@dataclass(slots=True)
-class _TokenRefinementInput:
-    r"""
-    Internal atom-to-token refinement bundle.
-
-    Attributes:
-        atom_features: Per-atom input features.
-        atom_to_token: Token index for each atom.
-        single: Token single representation.
-        denoising_single: Conditioned token single representation.
-        denoising_pair: Conditioned token pair representation.
-        reference_positions: Centered reference-conformer atom coords.
-        reference_charges: Per-atom reference formal charges.
-        atom_mask: Boolean atom validity mask.
-        noisy_coords: Noisy atom coords to refine.
-        local_geometry: Optional local atom-pair geometry.
-    """
-
-    atom_features: Tensor
-    atom_to_token: Tensor
-    single: Tensor
-    denoising_single: Tensor
-    denoising_pair: Tensor
-    reference_positions: Tensor
-    reference_charges: Tensor
-    atom_mask: Tensor
-    noisy_coords: Tensor
-    local_geometry: LocalAtomGeometry | None
-
-
 class CoordinateDenoiser(nn.Module):
     r"""
     EDM coordinate denoiser with atom-level encoder/decoder blocks.
@@ -108,10 +42,6 @@ class CoordinateDenoiser(nn.Module):
     refines the token states, and a
     [`TokenToAtomDecoder`][ofoldx.modules.atom.TokenToAtomDecoder] projects back to a
     per-atom coordinate update that the preconditioner combines into the denoised coords.
-
-    This is the single-head base variant; the ``_build_*`` / ``_decode_head_type`` hooks let
-    multi-head forks (e.g. in the model families) swap the refiner and decoder without
-    reimplementing ``forward``.
 
     Args:
         num_encoder_blocks: Number of token-refiner attention blocks.
@@ -130,8 +60,6 @@ class CoordinateDenoiser(nn.Module):
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_query_atoms: Query window size for local atom attention.
         num_key_atoms: Key window size for local atom attention.
-        blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables
-            checkpointing.
         operator_backend: Backend selector passed to the attention/transition operators.
 
     Examples:
@@ -164,11 +92,9 @@ class CoordinateDenoiser(nn.Module):
         num_atom_decoder_attention_heads: int = 4,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        blocks_per_checkpoint: int | None = None,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.blocks_per_checkpoint = blocks_per_checkpoint
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
         self.conditioner = DenoisingConditioner(
             pair_input_size=2 * pair_size if embed_relative_position else pair_size + 139,
@@ -191,16 +117,15 @@ class CoordinateDenoiser(nn.Module):
             atom_feature_size=atom_feature_size,
             operator_backend=operator_backend,
         )
-        self.token_refiner = self._build_token_refiner(
+        self.token_refiner = DenoisingTokenRefiner(
             num_blocks=num_encoder_blocks,
             num_attention_heads=num_encoder_attention_heads,
             token_hidden_size=token_hidden_size,
             single_size=single_size,
             pair_size=pair_size,
-            blocks_per_checkpoint=blocks_per_checkpoint,
             operator_backend=operator_backend,
         )
-        self._build_atom_decoder(
+        self.atom_decoder = TokenToAtomDecoder(
             token_hidden_size=token_hidden_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -211,94 +136,9 @@ class CoordinateDenoiser(nn.Module):
             operator_backend=operator_backend,
         )
 
-    def _build_token_refiner(self, **kwargs: Any) -> DenoisingTokenRefiner:
-        r"""
-        Build the single-head token refiner; the multi-head fork overrides this.
-
-        Args:
-            **kwargs: Keyword arguments forwarded to
-                [`DenoisingTokenRefiner`][ofoldx.modules.denoiser.coordinate.DenoisingTokenRefiner].
-
-        Returns:
-            The constructed token refiner.
-        """
-
-        return DenoisingTokenRefiner(**kwargs)
-
-    @staticmethod
-    def _new_atom_decoder(
-        *,
-        token_hidden_size: int,
-        atom_hidden_size: int,
-        atom_pair_hidden_size: int,
-        num_blocks: int,
-        num_attention_heads: int,
-        num_query_atoms: int,
-        num_key_atoms: int,
-        operator_backend: str,
-    ) -> TokenToAtomDecoder:
-        r"""
-        Construct a token-to-atom decoder from explicit width/head/window arguments.
-
-        Args:
-            token_hidden_size: Width of the refined token hidden channel.
-            atom_hidden_size: Width of the per-atom hidden channel.
-            atom_pair_hidden_size: Width of the per-atom-pair hidden channel.
-            num_blocks: Number of atom-decoder attention blocks.
-            num_attention_heads: Number of attention heads per block.
-            num_query_atoms: Query window size for local atom attention.
-            num_key_atoms: Key window size for local atom attention.
-            operator_backend: Backend selector passed to the operators.
-
-        Returns:
-            The constructed [`TokenToAtomDecoder`][ofoldx.modules.atom.TokenToAtomDecoder].
-        """
-
-        return TokenToAtomDecoder(
-            token_hidden_size=token_hidden_size,
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            num_blocks=num_blocks,
-            num_attention_heads=num_attention_heads,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
-        )
-
-    def _build_atom_decoder(self, **kwargs: Any) -> None:
-        r"""
-        Build the single-head atom decoder and store it as ``self.atom_decoder``.
-
-        The multi-head fork overrides this to register several head-specific decoders.
-
-        Args:
-            **kwargs: Keyword arguments forwarded to `_new_atom_decoder`.
-        """
-
-        self.atom_decoder = self._new_atom_decoder(**kwargs)
-
-    def _decode_head_type(self) -> str | None:
-        r"""
-        Return the head key passed to the token refiner / decoder.
-
-        Returns:
-            ``None`` for the single-head base; a head-name string in multi-head forks.
-        """
-
-        return None
-
-    def _select_atom_decoder(self) -> TokenToAtomDecoder:
-        r"""
-        Return the atom decoder to run for the current head.
-
-        Returns:
-            The single [`TokenToAtomDecoder`][ofoldx.modules.atom.TokenToAtomDecoder] of
-            the base variant.
-        """
-
-        return self.atom_decoder
-
-    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
         r"""
         Build local atom-pair geometry using the denoising atom-encoder window layout.
 
@@ -310,6 +150,8 @@ class CoordinateDenoiser(nn.Module):
             reference_positions: Centered reference-conformer atom coords, shape `[..., num_atoms, 3]`.
             reference_space_id: Per-atom conformer/space identifier used to gate cross-window pairs,
                 shape `[..., num_atoms]`.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window so
+                the diffusion atom transformer attends over the same key neighbourhoods as the reference.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.LocalAtomGeometry] describing the local
@@ -323,7 +165,7 @@ class CoordinateDenoiser(nn.Module):
             ... )
         """
 
-        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id)
+        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
 
     def predict_coordinate_update(self, inputs: CoordinateDenoisingInput) -> Tensor:
         r"""
@@ -341,29 +183,24 @@ class CoordinateDenoiser(nn.Module):
         Returns:
             Per-atom coordinate update, shape `[..., num_samples, num_atoms, 3]`.
 
-        Raises:
-            ValueError: If the last dimension of ``inputs.noise_level`` does not match the sample
-                axis of ``inputs.noisy_coords``.
-
         Examples:
             >>> denoiser = CoordinateDenoiser(num_encoder_blocks=1)  # doctest: +SKIP
             >>> update = denoiser.predict_coordinate_update(inputs)  # doctest: +SKIP
         """
 
-        num_samples = inputs.noisy_coords.shape[-3]
-        if inputs.noise_level.shape[-1] != num_samples:
-            raise ValueError(
-                "noise_level's last dimension must match the sample axis, got "
-                f"{inputs.noise_level.shape[-1]} and {num_samples}"
-            )
-        conditioning = self._condition(inputs)
-        denoising_single = conditioning.denoising_single
-        denoising_pair = conditioning.denoising_pair
+        denoising_single, denoising_pair = self.conditioner(
+            inputs.noise_level,
+            token_embedding=inputs.token_embedding,
+            single=inputs.single,
+            pair=inputs.pair,
+            relative_features=inputs.relative_features,
+        )
 
         target_prefix = tuple(denoising_single.shape[:-2])
         single = _broadcast_prefix(inputs.single, target_prefix, tail_dims=2)
         denoising_pair = _broadcast_prefix(denoising_pair, target_prefix, tail_dims=3)
-        refinement_input = _TokenRefinementInput(
+        atom_encoder_output, token_hidden, atom_mask = self.token_refiner(
+            self.atom_encoder,
             atom_features=inputs.atom_features,
             atom_to_token=inputs.atom_to_token,
             single=single,
@@ -371,179 +208,20 @@ class CoordinateDenoiser(nn.Module):
             denoising_pair=denoising_pair,
             reference_positions=inputs.reference_positions,
             reference_charges=inputs.reference_charges,
+            reference_mask=inputs.reference_mask,
             atom_mask=inputs.atom_mask,
             noisy_coords=inputs.noisy_coords,
             local_geometry=inputs.local_geometry,
         )
-        atom_encoder_output, token_hidden, atom_mask = self.token_refiner(
-            self.atom_encoder,
-            refinement_input,
-            decode_head_type=self._decode_head_type(),
-        )
-        return self._decode_atoms(
-            self._select_atom_decoder(),
+        num_valid_atoms = None if inputs.local_geometry is None else inputs.local_geometry.window_info.num_valid_atoms
+        return self.atom_decoder(
             atom_to_token=inputs.atom_to_token,
             token_hidden=token_hidden,
-            atom_encoder_output=atom_encoder_output,
+            atom_query=atom_encoder_output.atom_query,
+            atom_context=atom_encoder_output.atom_context,
             atom_mask=atom_mask,
             attention_layout="dense" if inputs.local_geometry is None else "local",
-        )
-
-    def _checkpoint_enabled(self) -> bool:
-        r"""
-        Report whether gradient checkpointing should wrap the sub-blocks.
-
-        Returns:
-            ``True`` when ``blocks_per_checkpoint`` is set and grad is enabled.
-        """
-
-        return self.blocks_per_checkpoint is not None and torch.is_grad_enabled()
-
-    def _condition(self, inputs: CoordinateDenoisingInput) -> DenoisingConditioning:
-        r"""
-        Run the conditioner, optionally under a gradient checkpoint.
-
-        Args:
-            inputs: The coordinate-denoising input bundle.
-
-        Returns:
-            The [`DenoisingConditioning`][ofoldx.modules.denoiser.coordinate.DenoisingConditioning]
-            produced by the conditioner (rebuilt from tensors when checkpointed).
-        """
-
-        if not self._checkpoint_enabled():
-            return self.conditioner(
-                inputs.noise_level,
-                token_embedding=inputs.token_embedding,
-                single=inputs.single,
-                pair=inputs.pair,
-                relative_features=inputs.relative_features,
-            )
-
-        def run(
-            noise_level: Tensor,
-            token_embedding: Tensor,
-            single: Tensor,
-            pair: Tensor,
-            relative_features: RelativePositionBuckets,
-        ) -> tuple[Tensor, Tensor]:
-            r"""
-            Checkpoint wrapper running ``self.conditioner`` and returning its tensor fields as a
-            ``(denoising_single, denoising_pair)`` tuple (checkpoint cannot save the dataclass output).
-
-            Args:
-                noise_level: Per-sample noise level fed to the conditioner.
-                token_embedding: Trunk token embedding.
-                single: Token single representation.
-                pair: Token pair representation.
-                relative_features: Relative-position bucket features for pair conditioning.
-
-            Returns:
-                ``(denoising_single, denoising_pair)`` tensors from the conditioner output.
-            """
-
-            output = self.conditioner(
-                noise_level,
-                token_embedding=token_embedding,
-                single=single,
-                pair=pair,
-                relative_features=relative_features,
-            )
-            return output.denoising_single, output.denoising_pair
-
-        denoising_single, denoising_pair = checkpoint(
-            run,
-            inputs.noise_level,
-            inputs.token_embedding,
-            inputs.single,
-            inputs.pair,
-            inputs.relative_features,
-            use_reentrant=False,
-        )
-        return DenoisingConditioning(denoising_single=denoising_single, denoising_pair=denoising_pair)
-
-    def _decode_atoms(
-        self,
-        atom_decoder: TokenToAtomDecoder,
-        *,
-        atom_to_token: Tensor,
-        token_hidden: Tensor,
-        atom_encoder_output: AtomToTokenOutput,
-        atom_mask: Tensor | None,
-        attention_layout: AttentionLayout,
-    ) -> Tensor:
-        r"""
-        Decode refined token states back to a per-atom coordinate update.
-
-        Runs ``atom_decoder`` directly, or under a gradient checkpoint (flattening/rebuilding the
-        [`AtomContext`][ofoldx.modules.atom.AtomContext] and encoding a ``None`` mask as an
-        empty tensor, since checkpoint cannot save ``None`` or dataclasses).
-
-        Args:
-            atom_decoder: The token-to-atom decoder to run.
-            atom_to_token: Token index for each atom.
-            token_hidden: Refined per-token hidden states.
-            atom_encoder_output: Output of the atom encoder providing atom queries and context.
-            atom_mask: Boolean atom validity mask, or ``None`` when the decoder rebuilds its own.
-            attention_layout: ``"dense"`` for full attention or ``"local"`` for windowed attention.
-
-        Returns:
-            Per-atom coordinate update, shape `[..., num_atoms, 3]`.
-        """
-
-        if not self._checkpoint_enabled():
-            return atom_decoder(
-                atom_to_token=atom_to_token,
-                token_hidden=token_hidden,
-                atom_query=atom_encoder_output.atom_query,
-                atom_context=atom_encoder_output.atom_context,
-                atom_mask=atom_mask,
-                attention_layout=attention_layout,
-            )
-
-        context = atom_encoder_output.atom_context
-        if atom_mask is None:
-            atom_mask = context.conditioning.new_empty(0)
-
-        def run(
-            token_hidden: Tensor,
-            atom_query: Tensor,
-            context_pair: Tensor,
-            context_conditioning: Tensor,
-            atom_mask: Tensor,
-        ) -> Tensor:
-            r"""
-            Checkpoint wrapper running ``atom_decoder`` on plain tensors, rebuilding the [`AtomContext`][]
-            from ``context_pair``/``context_conditioning`` and treating an empty ``atom_mask`` as ``None``.
-
-            Args:
-                token_hidden: Refined per-token hidden states.
-                atom_query: Per-atom query features from the atom encoder.
-                context_pair: Atom-context pair tensor to rebuild the [`AtomContext`][].
-                context_conditioning: Atom-context conditioning tensor to rebuild the [`AtomContext`][].
-                atom_mask: Boolean atom validity mask, empty tensor standing in for ``None``.
-
-            Returns:
-                Per-atom coordinate update, shape `[..., num_atoms, 3]`.
-            """
-
-            return atom_decoder(
-                atom_to_token=atom_to_token,
-                token_hidden=token_hidden,
-                atom_query=atom_query,
-                atom_context=AtomContext(pair=context_pair, conditioning=context_conditioning),
-                atom_mask=None if atom_mask.numel() == 0 else atom_mask,
-                attention_layout=attention_layout,
-            )
-
-        return checkpoint(
-            run,
-            token_hidden,
-            atom_encoder_output.atom_query,
-            context.pair,
-            context.conditioning,
-            atom_mask,
-            use_reentrant=False,
+            num_valid_atoms=num_valid_atoms,
         )
 
     def forward(self, inputs: CoordinateDenoisingInput) -> Tensor:
@@ -588,6 +266,7 @@ class CoordinateDenoiser(nn.Module):
             noise_level=inputs.noise_level,
             reference_positions=inputs.reference_positions,
             reference_charges=inputs.reference_charges,
+            reference_mask=inputs.reference_mask,
             atom_mask=inputs.atom_mask.to(dtype=dtype),
             noisy_coords=scaled_noisy_coords,
             local_geometry=inputs.local_geometry,
@@ -664,7 +343,7 @@ class DenoisingConditioner(nn.Module):
         single: Tensor,
         pair: Tensor,
         relative_features: RelativePositionBuckets,
-    ) -> DenoisingConditioning:
+    ) -> tuple[Tensor, Tensor]:
         r"""
         Condition the token single and pair on the noise level and token embedding.
 
@@ -680,9 +359,9 @@ class DenoisingConditioner(nn.Module):
             relative_features: Relative-position feature bundle indexing the pair embedding.
 
         Returns:
-            A [`DenoisingConditioning`][ofoldx.modules.denoiser.coordinate.DenoisingConditioning]
-            whose ``denoising_single`` is `[..., num_samples, num_tokens, single_size]` and
-            ``denoising_pair`` is `[..., num_tokens, num_tokens, pair_size]`.
+            ``(denoising_single, denoising_pair)`` with shapes
+            `[..., num_samples, num_tokens, single_size]` and
+            `[..., num_tokens, num_tokens, pair_size]`.
 
         Examples:
             >>> conditioner = DenoisingConditioner()  # doctest: +SKIP
@@ -716,7 +395,7 @@ class DenoisingConditioner(nn.Module):
             transitions=[self.single_feed_forward_1, self.single_feed_forward_2],
             sample_axis=True,
         )
-        return DenoisingConditioning(denoising_single=denoising_single, denoising_pair=denoising_pair)
+        return denoising_single, denoising_pair
 
 
 def _relative_position_one_hot(buckets: RelativePositionBuckets) -> Tensor:
@@ -746,17 +425,12 @@ class DenoisingTokenRefiner(nn.Module):
     encoder output and the decoder atom mask. Handles both the dense (samples flattened into the
     batch) and local-windowed (samples carried structurally) atom regimes.
 
-    This is the single-head base variant; the ``_build_token_encoder`` hook lets multi-head forks
-    swap the encoder.
-
     Args:
         num_blocks: Number of token-encoder attention blocks.
         token_hidden_size: Width of the token hidden channel.
         single_size: Width of the single conditioning representation.
         pair_size: Width of the pair conditioning representation.
         num_attention_heads: Number of attention heads per token-encoder block.
-        blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables
-            checkpointing.
         operator_backend: Backend selector passed to the attention operators.
 
     Examples:
@@ -773,81 +447,36 @@ class DenoisingTokenRefiner(nn.Module):
         single_size: int = 384,
         pair_size: int = 128,
         num_attention_heads: int = 16,
-        blocks_per_checkpoint: int | None = None,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.blocks_per_checkpoint = blocks_per_checkpoint
         self.single_norm = LayerNorm(single_size, bias=False)
         self.single_to_token_projection = nn.Linear(single_size, token_hidden_size, bias=False)
-        self._build_token_encoder(
-            num_blocks=num_blocks,
-            num_attention_heads=num_attention_heads,
-            token_hidden_size=token_hidden_size,
-            single_size=single_size,
-            pair_size=pair_size,
-            blocks_per_checkpoint=blocks_per_checkpoint,
-            operator_backend=operator_backend,
-        )
-        self.token_norm = LayerNorm(token_hidden_size, bias=False)
-
-    @staticmethod
-    def _new_token_encoder(
-        *,
-        num_blocks: int,
-        num_attention_heads: int,
-        token_hidden_size: int,
-        single_size: int,
-        pair_size: int,
-        blocks_per_checkpoint: int | None,
-        operator_backend: str,
-    ) -> DenoisingTokenEncoder:
-        r"""
-        Construct a denoising token encoder from explicit width/head/depth arguments.
-
-        Args:
-            num_blocks: Number of token-encoder attention blocks.
-            num_attention_heads: Number of attention heads per block.
-            token_hidden_size: Width of the token hidden channel.
-            single_size: Width of the single conditioning (passed as ``conditioning_size``).
-            pair_size: Width of the pair conditioning representation.
-            blocks_per_checkpoint: Blocks per gradient-checkpoint segment; ``None`` disables it.
-            operator_backend: Backend selector passed to the attention operators.
-
-        Returns:
-            The constructed
-            [`DenoisingTokenEncoder`][ofoldx.modules.attention.DenoisingTokenEncoder].
-        """
-
-        return DenoisingTokenEncoder(
+        self.token_encoder = DenoisingTokenEncoder(
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
             token_hidden_size=token_hidden_size,
             conditioning_size=single_size,
             pair_size=pair_size,
-            blocks_per_checkpoint=blocks_per_checkpoint,
             operator_backend=operator_backend,
         )
-
-    def _build_token_encoder(self, *, num_blocks: int, **kwargs: Any) -> None:
-        r"""
-        Build the single-head token encoder and store it as ``self.token_encoder``.
-
-        The multi-head fork overrides this to register several head-specific encoders.
-
-        Args:
-            num_blocks: Number of token-encoder attention blocks.
-            **kwargs: Remaining keyword arguments forwarded to `_new_token_encoder`.
-        """
-
-        self.token_encoder = self._new_token_encoder(num_blocks=num_blocks, **kwargs)
+        self.token_norm = LayerNorm(token_hidden_size, bias=False)
 
     def forward(
         self,
         atom_encoder: CoordinateAtomToTokenEncoder,
-        inputs: _TokenRefinementInput,
         *,
-        decode_head_type: str | None = None,
+        atom_features: Tensor,
+        atom_to_token: Tensor,
+        single: Tensor,
+        denoising_single: Tensor,
+        denoising_pair: Tensor,
+        reference_positions: Tensor,
+        reference_charges: Tensor,
+        reference_mask: Tensor,
+        atom_mask: Tensor,
+        noisy_coords: Tensor,
+        local_geometry: LocalAtomGeometry | None,
     ) -> tuple[AtomToTokenOutput, Tensor, Tensor | None]:
         r"""
         Encode atoms, refine the token states, and return the decoder inputs.
@@ -863,9 +492,17 @@ class DenoisingTokenRefiner(nn.Module):
 
         Args:
             atom_encoder: The atom-to-token encoder to run.
-            inputs: Internal refinement bundle of atom features and token conditioning.
-            decode_head_type: Head key forwarded to the token encoder; ``None`` for the base variant.
-
+            atom_features: Per-atom input features.
+            atom_to_token: Token index for each atom.
+            single: Token single representation.
+            denoising_single: Conditioned token single representation.
+            denoising_pair: Conditioned token pair representation.
+            reference_positions: Centered reference-conformer atom coordinates.
+            reference_charges: Per-atom reference formal charges.
+            reference_mask: Boolean mask for atoms with valid reference conformers.
+            atom_mask: Boolean atom validity mask.
+            noisy_coords: Noisy atom coordinates to refine.
+            local_geometry: Optional local atom-pair geometry.
         Returns:
             A tuple of the atom-encoder output, the refined token hidden states of shape
             `[..., num_tokens, token_hidden_size]`, and the decoder atom mask (a flattened mask in
@@ -874,49 +511,51 @@ class DenoisingTokenRefiner(nn.Module):
         Examples:
             >>> refiner = DenoisingTokenRefiner(num_blocks=1)  # doctest: +SKIP
             >>> atom_output, token_hidden, atom_mask = refiner(  # doctest: +SKIP
-            ...     atom_encoder, inputs, decode_head_type=None
+            ...     atom_encoder, atom_features=atom_features, atom_to_token=atom_to_token,
+            ...     single=single, denoising_single=denoising_single,
+            ...     denoising_pair=denoising_pair, reference_positions=reference_positions,
+            ...     reference_charges=reference_charges, reference_mask=reference_mask,
+            ...     atom_mask=atom_mask,
+            ...     noisy_coords=noisy_coords, local_geometry=None,
             ... )
         """
-        target_prefix = tuple(inputs.denoising_single.shape[:-2])
-        num_tokens = inputs.denoising_single.shape[-2]
-        reference_charges = _reference_charges_with_channel(inputs.reference_charges, inputs.reference_positions)
-        denoising_single = _flatten_prefix(inputs.denoising_single, tail_dims=2)
-        denoising_pair = _flatten_prefix(
-            _broadcast_prefix(inputs.denoising_pair, target_prefix, tail_dims=3), tail_dims=3
+        target_prefix = tuple(denoising_single.shape[:-2])
+        num_tokens = denoising_single.shape[-2]
+        flat_denoising_single = _flatten_prefix(denoising_single, tail_dims=2)
+        flat_denoising_pair = _flatten_prefix(
+            _broadcast_prefix(denoising_pair, target_prefix, tail_dims=3), tail_dims=3
         )
 
         decoder_atom_mask: Tensor | None
         restore_prefix: tuple[int, ...] | None
-        if inputs.local_geometry is None:
-            atom_mask = _flatten_broadcast(inputs.atom_mask, target_prefix, tail_dims=1)
-            atom_encoder_output = self._encode_atoms(
-                atom_encoder,
-                atom_features=_flatten_broadcast(inputs.atom_features, target_prefix, tail_dims=2),
-                reference_positions=_flatten_broadcast(inputs.reference_positions, target_prefix, tail_dims=2),
+        if local_geometry is None:
+            atom_mask = _flatten_broadcast(atom_mask, target_prefix, tail_dims=1)
+            atom_encoder_output = atom_encoder(
+                atom_features=_flatten_broadcast(atom_features, target_prefix, tail_dims=2),
+                reference_positions=_flatten_broadcast(reference_positions, target_prefix, tail_dims=2),
                 reference_charges=torch.arcsinh(_flatten_broadcast(reference_charges, target_prefix, tail_dims=2)),
-                reference_mask=atom_mask,
-                single=_flatten_broadcast(inputs.single, target_prefix, tail_dims=2),
-                pair=denoising_pair,
-                noisy_coords=_flatten_broadcast(inputs.noisy_coords, target_prefix, tail_dims=2),
+                reference_mask=_flatten_broadcast(reference_mask, target_prefix, tail_dims=1),
+                single=_flatten_broadcast(single, target_prefix, tail_dims=2),
+                pair=flat_denoising_pair,
+                noisy_coords=_flatten_broadcast(noisy_coords, target_prefix, tail_dims=2),
                 atom_mask=atom_mask,
-                atom_to_token=_flatten_broadcast(inputs.atom_to_token, target_prefix, tail_dims=1),
+                atom_to_token=_flatten_broadcast(atom_to_token, target_prefix, tail_dims=1),
                 num_tokens=num_tokens,
             )
             decoder_atom_mask = atom_mask
             restore_prefix = None
         else:
-            local_geometry = _broadcast_local_geometry(inputs.local_geometry, target_prefix)
-            atom_encoder_output = self._encode_atoms(
-                atom_encoder,
-                atom_features=_broadcast_prefix(inputs.atom_features, target_prefix, tail_dims=2),
-                reference_positions=_broadcast_prefix(inputs.reference_positions, target_prefix, tail_dims=2),
+            local_geometry = _broadcast_local_geometry(local_geometry, target_prefix)
+            atom_encoder_output = atom_encoder(
+                atom_features=_broadcast_prefix(atom_features, target_prefix, tail_dims=2),
+                reference_positions=_broadcast_prefix(reference_positions, target_prefix, tail_dims=2),
                 reference_charges=torch.arcsinh(_broadcast_prefix(reference_charges, target_prefix, tail_dims=2)),
-                reference_mask=_broadcast_prefix(inputs.atom_mask, target_prefix, tail_dims=1),
-                single=_broadcast_prefix(inputs.single, target_prefix, tail_dims=2),
-                pair=_broadcast_prefix(inputs.denoising_pair, target_prefix, tail_dims=3),
-                noisy_coords=inputs.noisy_coords,
-                atom_mask=_broadcast_prefix(inputs.atom_mask, target_prefix, tail_dims=1),
-                atom_to_token=_broadcast_prefix(inputs.atom_to_token, target_prefix, tail_dims=1),
+                reference_mask=_broadcast_prefix(reference_mask, target_prefix, tail_dims=1),
+                single=_broadcast_prefix(single, target_prefix, tail_dims=2),
+                pair=_broadcast_prefix(denoising_pair, target_prefix, tail_dims=3),
+                noisy_coords=noisy_coords,
+                atom_mask=_broadcast_prefix(atom_mask, target_prefix, tail_dims=1),
+                atom_to_token=_broadcast_prefix(atom_to_token, target_prefix, tail_dims=1),
                 num_tokens=num_tokens,
                 local_geometry=local_geometry,
             )
@@ -924,193 +563,12 @@ class DenoisingTokenRefiner(nn.Module):
             restore_prefix = target_prefix
 
         token_hidden = _flatten_prefix(atom_encoder_output.token_hidden, tail_dims=2)
-        token_hidden = token_hidden + self.single_to_token_projection(self.single_norm(denoising_single))
-        token_hidden = self._encode_tokens(
-            token_hidden, denoising_single, denoising_pair, decode_head_type=decode_head_type
-        )
+        token_hidden = token_hidden + self.single_to_token_projection(self.single_norm(flat_denoising_single))
+        token_hidden = self.token_encoder(token_hidden, flat_denoising_single, flat_denoising_pair)
         token_hidden = self.token_norm(token_hidden)
         if restore_prefix is not None:
             token_hidden = token_hidden.reshape(*restore_prefix, *token_hidden.shape[-2:])
         return atom_encoder_output, token_hidden, decoder_atom_mask
-
-    def _checkpoint_enabled(self) -> bool:
-        r"""
-        Report whether gradient checkpointing should wrap the atom encoder.
-
-        Returns:
-            ``True`` when ``blocks_per_checkpoint`` is set and grad is enabled.
-        """
-
-        return self.blocks_per_checkpoint is not None and torch.is_grad_enabled()
-
-    def _encode_atoms(
-        self,
-        atom_encoder: CoordinateAtomToTokenEncoder,
-        *,
-        atom_features: Tensor,
-        reference_positions: Tensor,
-        reference_charges: Tensor,
-        reference_mask: Tensor,
-        single: Tensor,
-        pair: Tensor,
-        noisy_coords: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-        local_geometry: LocalAtomGeometry | None = None,
-    ) -> AtomToTokenOutput:
-        r"""
-        Run the atom encoder, optionally under a gradient checkpoint.
-
-        When checkpointed, the [`AtomToTokenOutput`][ofoldx.modules.atom.AtomToTokenOutput] is
-        flattened into saveable tensors and rebuilt after, since checkpoint cannot save dataclasses.
-
-        Args:
-            atom_encoder: The atom-to-token encoder to run.
-            atom_features: Per-atom input features.
-            reference_positions: Centered reference-conformer atom coords.
-            reference_charges: Per-atom reference charges (already ``arcsinh``-compressed).
-            reference_mask: Boolean reference atom validity mask.
-            single: Token single representation.
-            pair: Conditioned token pair representation.
-            noisy_coords: Noisy atom coords to encode.
-            atom_mask: Boolean atom validity mask.
-            atom_to_token: Token index for each atom.
-            num_tokens: Number of tokens the atoms map onto.
-            local_geometry: Optional local atom-pair geometry enabling windowed attention.
-
-        Returns:
-            The [`AtomToTokenOutput`][ofoldx.modules.atom.AtomToTokenOutput] of the encoder.
-        """
-
-        if not self._checkpoint_enabled():
-            return atom_encoder(
-                atom_features,
-                reference_positions=reference_positions,
-                reference_charges=reference_charges,
-                reference_mask=reference_mask,
-                single=single,
-                pair=pair,
-                noisy_coords=noisy_coords,
-                atom_mask=atom_mask,
-                atom_to_token=atom_to_token,
-                num_tokens=num_tokens,
-                local_geometry=local_geometry,
-            )
-
-        def run(
-            atom_features: Tensor,
-            reference_positions: Tensor,
-            reference_charges: Tensor,
-            reference_mask: Tensor,
-            single: Tensor,
-            pair: Tensor,
-            noisy_coords: Tensor,
-            atom_mask: Tensor,
-            atom_to_token: Tensor,
-        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-            r"""
-            Checkpoint wrapper running ``atom_encoder`` and flattening its [`AtomToTokenOutput`][] into a
-            ``(token_hidden, atom_query, context_pair, context_conditioning)`` tuple of saveable tensors.
-
-            Args:
-                atom_features: Per-atom input features.
-                reference_positions: Centered reference-conformer atom coords.
-                reference_charges: Per-atom reference charges (already ``arcsinh``-compressed).
-                reference_mask: Boolean reference atom validity mask.
-                single: Token single representation.
-                pair: Conditioned token pair representation.
-                noisy_coords: Noisy atom coords to encode.
-                atom_mask: Boolean atom validity mask.
-                atom_to_token: Token index for each atom.
-
-            Returns:
-                ``(token_hidden, atom_query, context_pair, context_conditioning)`` tensors from the encoder
-                output.
-            """
-
-            output = atom_encoder(
-                atom_features,
-                reference_positions=reference_positions,
-                reference_charges=reference_charges,
-                reference_mask=reference_mask,
-                single=single,
-                pair=pair,
-                noisy_coords=noisy_coords,
-                atom_mask=atom_mask,
-                atom_to_token=atom_to_token,
-                num_tokens=num_tokens,
-                local_geometry=local_geometry,
-            )
-            return (
-                output.token_hidden,
-                output.atom_query,
-                output.atom_context.pair,
-                output.atom_context.conditioning,
-            )
-
-        token_hidden, atom_query, context_pair, context_conditioning = checkpoint(
-            run,
-            atom_features,
-            reference_positions,
-            reference_charges,
-            reference_mask,
-            single,
-            pair,
-            noisy_coords,
-            atom_mask,
-            atom_to_token,
-            use_reentrant=False,
-        )
-        return AtomToTokenOutput(
-            token_hidden=token_hidden,
-            atom_query=atom_query,
-            atom_context=AtomContext(pair=context_pair, conditioning=context_conditioning),
-        )
-
-    def _encode_tokens(
-        self,
-        token_hidden: Tensor,
-        conditioning: Tensor,
-        pair: Tensor,
-        *,
-        decode_head_type: str | None = None,
-    ) -> Tensor:
-        r"""
-        Run the token encoder on the conditioned token states.
-
-        The base variant ignores ``decode_head_type`` and runs its single encoder; multi-head forks
-        override this to route to a head-specific encoder.
-
-        Args:
-            token_hidden: Per-token hidden states to refine.
-            conditioning: Single conditioning representation used as attention conditioning.
-            pair: Pair conditioning representation used as attention bias.
-            decode_head_type: Head key; unused in the base variant.
-
-        Returns:
-            Refined token hidden states with the same shape as ``token_hidden``.
-        """
-
-        return self.token_encoder(token_hidden, conditioning, pair)
-
-
-def _reference_charges_with_channel(reference_charges: Tensor, reference_positions: Tensor) -> Tensor:
-    r"""
-    Normalize scalar per-atom charges to `[..., N_atom, 1]`.
-
-    Some family inputs store formal charges as `[..., N_atom]`; the atom conditioner projects
-    a one-channel charge feature, so add the channel before sample-axis broadcasting.
-    """
-
-    if reference_charges.shape == reference_positions.shape[:-1]:
-        return reference_charges.unsqueeze(-1)
-    expected = (*reference_positions.shape[:-1], 1)
-    if tuple(reference_charges.shape) == expected:
-        return reference_charges
-    if reference_charges.ndim == reference_positions.ndim - 1:
-        return reference_charges.unsqueeze(-1)
-    return reference_charges
 
 
 def _broadcast_prefix(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims: int) -> Tensor:
@@ -1211,5 +669,6 @@ def _broadcast_local_geometry(geometry: LocalAtomGeometry, target_prefix: tuple[
             query_padding=info.query_padding,
             key_padding_left=info.key_padding_left,
             key_padding_right=info.key_padding_right,
+            num_valid_atoms=info.num_valid_atoms,
         ),
     )

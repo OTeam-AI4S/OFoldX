@@ -26,8 +26,6 @@ class DenoisingTokenEncoder(nn.Module):
         conditioning_size: Width of the conditioning signal driving the adaptive norm.
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per block.
-        blocks_per_checkpoint: Number of blocks per gradient-checkpoint segment; ``None`` disables
-            checkpointing.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
             to the ``sdpa`` reference otherwise.
 
@@ -56,7 +54,6 @@ class DenoisingTokenEncoder(nn.Module):
         conditioning_size: int = 384,
         pair_size: int = 128,
         num_attention_heads: int = 16,
-        blocks_per_checkpoint: int | None = None,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -71,7 +68,6 @@ class DenoisingTokenEncoder(nn.Module):
             conditioning_size=conditioning_size,
             cross_attention_mode=False,
             transition="double",
-            blocks_per_checkpoint=blocks_per_checkpoint,
             operator_backend=operator_backend,
         )
 

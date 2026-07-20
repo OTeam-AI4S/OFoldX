@@ -9,28 +9,28 @@ from ofoldx.modules.diffusion import (
     CoordinateDenoiseContext,
     CoordinateDenoisingInput,
     CoordinateEdmSampler,
-    CoordinateSamplingTrace,
     EdmScheduler,
 )
 from ofoldx.modules.embedding.position import generate_relative_position_features
 
 
-def _make_context() -> CoordinateDenoiseContext:
+def _make_context(batch_size: int = 1) -> CoordinateDenoiseContext:
     return CoordinateDenoiseContext(
-        atom_features=torch.zeros(1, 5, 5),
-        atom_to_token=torch.tensor([[0, 0, 1, 2, 2]]),
-        reference_positions=torch.zeros(1, 5, 3),
-        reference_charges=torch.zeros(1, 5, 1),
-        atom_mask=torch.ones(1, 5, dtype=torch.bool),
-        token_embedding=torch.zeros(1, 3, 8),
-        single=torch.zeros(1, 3, 6),
-        pair=torch.zeros(1, 3, 3, 4),
+        atom_features=torch.zeros(batch_size, 5, 5),
+        atom_to_token=torch.tensor([[0, 0, 1, 2, 2]]).expand(batch_size, -1),
+        reference_positions=torch.zeros(batch_size, 5, 3),
+        reference_charges=torch.zeros(batch_size, 5, 1),
+        reference_mask=torch.ones(batch_size, 5, dtype=torch.bool),
+        atom_mask=torch.ones(batch_size, 5, dtype=torch.bool),
+        token_embedding=torch.zeros(batch_size, 3, 8),
+        single=torch.zeros(batch_size, 3, 6),
+        pair=torch.zeros(batch_size, 3, 3, 4),
         relative_features=generate_relative_position_features(
-            residue_index=torch.arange(3).unsqueeze(0),
-            chain_index=torch.zeros(1, 3, dtype=torch.long),
-            entity_index=torch.zeros(1, 3, dtype=torch.long),
-            symmetry_index=torch.zeros(1, 3, dtype=torch.long),
-            token_index=torch.arange(3).unsqueeze(0),
+            residue_index=torch.arange(3).expand(batch_size, -1),
+            chain_index=torch.zeros(batch_size, 3, dtype=torch.long),
+            entity_index=torch.zeros(batch_size, 3, dtype=torch.long),
+            symmetry_index=torch.zeros(batch_size, 3, dtype=torch.long),
+            token_index=torch.arange(3).expand(batch_size, -1),
             dtype=torch.float32,
         ),
     )
@@ -90,13 +90,6 @@ def test_sample_shapes_fixed_point_and_determinism(context: CoordinateDenoiseCon
     )
     assert torch.equal(first, second)
 
-    trace = sampler.trace(_zeros, context=context, num_samples=2, num_sampling_steps=2)
-    assert isinstance(trace, CoordinateSamplingTrace)
-    assert trace.coords.shape == (1, 2, 5, 3)
-    assert trace.noise_schedule.shape == (3,)  # num_sampling_steps + 1 schedule points
-    assert trace.trajectory is not None
-    assert trace.trajectory.shape == (3, 1, 2, 5, 3)
-
 
 def test_chunking(context: CoordinateDenoiseContext) -> None:
     sampler = _make_sampler()
@@ -117,18 +110,25 @@ def test_chunking(context: CoordinateDenoiseContext) -> None:
     assert torch.equal(output[:, 0], unsampled)
     assert torch.equal(output[:, -1], unsampled)
 
-    trace = sampler.trace(
+
+def test_unsampled_condition_coords_when_batch_equals_num_samples() -> None:
+    context = _make_context(batch_size=2)
+    sampler = _make_sampler()
+    condition_coords = torch.arange(2 * 5 * 3, dtype=torch.float32).reshape(2, 5, 3)
+
+    output = sampler(
         _identity,
         context=context,
-        num_samples=4,
-        num_sampling_steps=2,
-        sample_chunk_size=2,
-        initial_coords=torch.ones(1, 4, 5, 3),
+        num_samples=2,
+        num_sampling_steps=1,
+        sample_chunk_size=1,
+        initial_coords=torch.zeros(2, 5, 3),
+        condition_coords=condition_coords,
+        condition_mask=torch.ones(2, 5, dtype=torch.bool),
     )
-    assert isinstance(trace, CoordinateSamplingTrace)
-    assert trace.coords.shape == (1, 4, 5, 3)
-    assert trace.trajectory is not None
-    assert trace.trajectory.shape == (3, 1, 4, 5, 3)
+
+    assert torch.equal(output[:, 0], condition_coords)
+    assert torch.equal(output[:, 1], condition_coords)
 
 
 def test_augment_and_heun(context: CoordinateDenoiseContext) -> None:

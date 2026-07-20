@@ -98,7 +98,9 @@ class AtomToTokenEncoderBase(nn.Module):
         self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
         self.relu = nn.ReLU()
 
-    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
         r"""
         Precompute the windowed atom-pair geometry for local-layout attention.
 
@@ -109,6 +111,9 @@ class AtomToTokenEncoderBase(nn.Module):
         Args:
             reference_positions: `[..., N_atom, 3]` reference coordinates.
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window
+                (see [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]). Left unset by the
+                non-diffusion input-embedder path, which keeps the legacy zero-padded window.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] carrying per-window
@@ -128,7 +133,7 @@ class AtomToTokenEncoderBase(nn.Module):
             torch.Size([1, 2, 2, 4, 3])
         """
 
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id)
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
 
     def aggregate_to_tokens(
         self,
@@ -228,7 +233,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
         Args:
             atom_features: `[..., N_atom, atom_feature_size]` raw reference atom features.
             reference_positions: `[..., N_atom, 3]` reference coordinates.
-            reference_charges: `[..., N_atom]` (or `[..., N_atom, 1]`) reference charges.
+            reference_charges: `[..., N_atom, 1]` reference charges.
             reference_mask: `[..., N_atom]` validity mask zeroing conditioning for absent atoms.
             atom_mask: Optional `[..., N_atom]` attention/aggregation mask.
             atom_to_token: `[..., N_atom]` integer index mapping each atom to its token.
@@ -251,7 +256,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
             >>> output = encoder(
             ...     torch.randn(1, 4, 6),
             ...     reference_positions=torch.randn(1, 4, 3),
-            ...     reference_charges=torch.randn(1, 4),
+            ...     reference_charges=torch.randn(1, 4, 1),
             ...     reference_mask=torch.ones(1, 4),
             ...     atom_to_token=torch.tensor([[0, 0, 1, 1]]),
             ...     num_tokens=2,
@@ -275,7 +280,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
         )
         attention_layout = "dense" if local_geometry is None else "local"
         atom_query = self.atom_attention_stack(
-            atom_conditioning.clone(),
+            atom_conditioning,
             atom_conditioning,
             atom_pair,
             atom_mask=atom_mask,
@@ -385,7 +390,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         Args:
             atom_features: `[..., N_atom, atom_feature_size]` raw reference atom features.
             reference_positions: `[..., N_atom, 3]` reference coordinates.
-            reference_charges: `[..., N_atom]` (or `[..., N_atom, 1]`) reference charges.
+            reference_charges: `[..., N_atom, 1]` reference charges.
             reference_mask: `[..., N_atom]` validity mask zeroing conditioning for absent atoms.
             single: `[..., N_token, single_size]` trunk single representation, broadcast onto atoms.
             pair: `[..., N_token, N_token, pair_size]` trunk pair representation, fused into the atom pair.
@@ -411,7 +416,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             >>> output = encoder(
             ...     torch.randn(1, 4, 6),
             ...     reference_positions=torch.randn(1, 4, 3),
-            ...     reference_charges=torch.randn(1, 4),
+            ...     reference_charges=torch.randn(1, 4, 1),
             ...     reference_mask=torch.ones(1, 4),
             ...     single=torch.randn(1, 2, 6),
             ...     pair=torch.randn(1, 2, 2, 5),
@@ -429,6 +434,10 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             reference_charges=reference_charges,
             reference_mask=reference_mask,
         )
+        # The clamped/shifted key window (DeepMind AF3) is selected by the valid-atom count carried on the
+        # precomputed geometry; the pair broadcast and the attention key gather must use the same count so
+        # their key panes stay aligned. ``None`` (dense layout or legacy geometry) keeps the padded window.
+        num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
         atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
         atom_pair = self._build_atom_pair(
             atom_conditioning,
@@ -445,6 +454,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
         )
         return self.aggregate_to_tokens(
             atom_query=atom_query,
@@ -468,8 +478,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             carries one that the conditioning does not).
         """
         single_conditioning = self.single_to_atom_projection(self.single_norm(single))
-        if single_conditioning.shape[-2] != atom_conditioning.shape[-2]:
-            single_conditioning = self.token_to_atom_broadcast(single_conditioning, atom_to_token)
+        single_conditioning = self.token_to_atom_broadcast(single_conditioning, atom_to_token)
         if single_conditioning.dim() == atom_conditioning.dim() + 1:
             return atom_conditioning.unsqueeze(-3) + single_conditioning
         return atom_conditioning + single_conditioning
@@ -499,14 +508,15 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         """
         pair = self.pair_projection(self.norm_pair(pair))
         if local_geometry is None:
-            if pair.shape[-3:-1] != atom_conditioning.shape[-2:-1] * 2:
-                pair = self.token_pair_to_atom_pair_broadcast(pair, atom_to_token)
+            pair = self.token_pair_to_atom_pair_broadcast(pair, atom_to_token)
             return self.atom_pair_encoder(
                 atom_conditioning,
                 reference_positions=reference_positions,
                 pair=pair,
             )
-        local_pair = self.token_pair_to_local_atom_pair_broadcast(pair, atom_to_token)
+        local_pair = self.token_pair_to_local_atom_pair_broadcast(
+            pair, atom_to_token, num_valid_atoms=local_geometry.window_info.num_valid_atoms
+        )
         return self.atom_pair_encoder(atom_conditioning, local_geometry=local_geometry, pair=local_pair)
 
 
@@ -528,7 +538,7 @@ class AtomConditioner(nn.Module):
         >>> conditioning = conditioner(
         ...     torch.randn(2, 6),
         ...     reference_positions=torch.randn(2, 3),
-        ...     reference_charges=torch.randn(2),
+        ...     reference_charges=torch.randn(2, 1),
         ...     reference_mask=torch.ones(2),
         ... )
         >>> conditioning.shape
@@ -558,8 +568,7 @@ class AtomConditioner(nn.Module):
         Args:
             atom_features: `[..., N_atom, atom_feature_size]` raw reference atom features.
             reference_positions: `[..., N_atom, 3]` reference coordinates.
-            reference_charges: `[..., N_atom]` (or `[..., N_atom, 1]`) reference charges; a scalar-per-atom
-                tensor is unsqueezed automatically.
+            reference_charges: `[..., N_atom, 1]` reference charges.
             reference_mask: `[..., N_atom]` validity mask; absent atoms are zeroed.
 
         Returns:
@@ -573,15 +582,13 @@ class AtomConditioner(nn.Module):
             >>> conditioning = conditioner(
             ...     torch.randn(2, 6),
             ...     reference_positions=torch.randn(2, 3),
-            ...     reference_charges=torch.randn(2),
+            ...     reference_charges=torch.randn(2, 1),
             ...     reference_mask=reference_mask,
             ... )
             >>> conditioning[1].abs().sum().tolist()
             0.0
         """
 
-        if reference_charges.shape == reference_positions.shape[:-1]:
-            reference_charges = reference_charges.unsqueeze(-1)
         conditioning = self.reference_position_projection(reference_positions)
         conditioning = conditioning + self.reference_charge_projection(reference_charges)
         conditioning = conditioning + self.atom_feature_projection(atom_features.to(dtype=conditioning.dtype))
@@ -644,13 +651,16 @@ class AtomPairEncoder(nn.Module):
         )
         self.relu = nn.ReLU()
 
-    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
         r"""
         Precompute the windowed atom-pair geometry for the local encoding layout.
 
         Args:
             reference_positions: `[..., N_atom, 3]` reference coordinates.
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] to pass to
@@ -668,7 +678,7 @@ class AtomPairEncoder(nn.Module):
             torch.Size([1, 2, 2, 4, 3])
         """
 
-        return self.local_geometry_builder(reference_positions, reference_space_id)
+        return self.local_geometry_builder(reference_positions, reference_space_id, num_valid_atoms)
 
     def forward(
         self,
@@ -809,7 +819,9 @@ class AtomPairEncoder(nn.Module):
         window_mask = local_geometry.window_info.attention_mask.to(
             device=distance_vectors.device, dtype=distance_vectors.dtype
         ).unsqueeze(-1)
-        conditioning_windows = self.local_geometry_builder.windowing(atom_conditioning)
+        conditioning_windows = self.local_geometry_builder.windowing(
+            atom_conditioning, local_geometry.window_info.num_valid_atoms
+        )
         return encode_atom_pair(
             self,
             distance_vectors,
@@ -886,6 +898,7 @@ class PackedAtomAttention(nn.Module):
         *,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
+        num_valid_atoms: int | None = None,
     ) -> Tensor:
         r"""
         Apply atom attention in the dense or local-window layout.
@@ -902,6 +915,8 @@ class PackedAtomAttention(nn.Module):
                 `[..., N_window, num_query_atoms, num_key_atoms, depth * heads]`.
             atom_mask: Optional `[..., N_atom]` attention mask; defaults to all-valid.
             attention_layout: Either ``"dense"`` (global) or ``"local"`` (windowed).
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather so the
+                windowed key panes match the pair-bias windows. Unset keeps the legacy zero-padded gather.
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
@@ -960,6 +975,7 @@ class PackedAtomAttention(nn.Module):
             gather_key_windows,
             num_query_atoms=num_query_atoms,
             num_key_atoms=self.num_key_atoms,
+            num_valid_atoms=num_valid_atoms,
         )
 
         def to_keys_windowed(hidden: Tensor) -> Tensor:
@@ -1045,20 +1061,6 @@ class AtomSelfAttentionStack(nn.Module):
             transition="double",
         )
 
-    def _packed_bias(self, pair: Tensor) -> Tensor:
-        r"""
-        Project the (windowed or dense) pair into one packed per-block bias tensor.
-
-        Args:
-            pair: Pair representation whose last axis is ``pair_size``; dense or windowed leading dims.
-
-        Returns:
-            The concatenated per-block bias with a final axis of size ``num_blocks * num_attention_heads``.
-        """
-        return torch.cat(
-            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)], dim=-1
-        )
-
     def forward(
         self,
         atom_hidden: Tensor,
@@ -1066,6 +1068,7 @@ class AtomSelfAttentionStack(nn.Module):
         pair: Tensor,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
+        num_valid_atoms: int | None = None,
     ) -> Tensor:
         r"""
         Project the ``pair`` to a packed per-block bias and run the atom self-attention stack.
@@ -1077,6 +1080,7 @@ class AtomSelfAttentionStack(nn.Module):
                 per block into per-head bias logits.
             atom_mask: Optional `[..., N_atom]` attention mask.
             attention_layout: Either ``"dense"`` or ``"local"`` execution.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather.
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
@@ -1096,12 +1100,17 @@ class AtomSelfAttentionStack(nn.Module):
             torch.Size([1, 4, 8])
         """
 
+        packed_bias = torch.cat(
+            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
+            dim=-1,
+        )
         return self.atom_attention(
             atom_hidden,
             conditioning,
-            self._packed_bias(pair),
+            packed_bias,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
         )
 
 
@@ -1169,6 +1178,7 @@ class TokenToAtomDecoder(nn.Module):
         atom_context: AtomContext,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
+        num_valid_atoms: int | None = None,
     ) -> Tensor:
         r"""
         Decode token hidden states into per-atom coordinate updates.
@@ -1185,6 +1195,8 @@ class TokenToAtomDecoder(nn.Module):
                 pair representation and conditioning to reuse.
             atom_mask: Optional `[..., N_atom]` attention mask.
             attention_layout: Either ``"dense"`` or ``"local"`` execution.
+            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather so the
+                decoder attends over the same key panes the encoder built the reused pair bias for.
 
         Returns:
             Per-atom coordinate updates of shape `[..., N_atom, 3]`.
@@ -1215,6 +1227,7 @@ class TokenToAtomDecoder(nn.Module):
             pair=atom_context.pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
         )
         return self.output_projection(self.query_norm(atom_query))
 

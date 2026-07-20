@@ -1,728 +1,844 @@
-r"""
-Featurize structures and PxDesign JSON design inputs into the model's tensor contract.
-
-Converts either a pre-tokenized structure or a PxDesign JSON input into a [`PxDesignInput`][]. On top of the
-model-agnostic structural fields, this processor preserves the Protenix-coupled featurization that a generic
-residue processor would lossily substitute: the AF3 ``distogram_rep_atom_mask``, the reference-space uid
-(``ref_space_uid``), and per-token frames. It also restores the PxDesign design annotations
-(``conditional_label`` / ``is_resolved``) rather than dropping them.
-"""
+r"""Canonical target-and-binder lowering for the released PXDesign-d model."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Sequence
 from os import PathLike
-from typing import Any, cast
+from pathlib import Path
+from typing import cast
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
+from typing_extensions import Self
 
-from ...data.ccd import CcdProvider, default_ccd_provider
-from ...data.structure import ResidueKey, Structure
-from ...processors.registry import PROCESSORS
-from ...processors.structure import StructureProcessor, default_residue_vocabulary
-from ...processors.utils import StructuralFields, StructureInput, structure_from_input
-from .io import DesignInput, read_pxdesign_json
-from .model import PxDesignInput
+# The placement core is frozen (DESIGN §3.7 "placement core", ratified
+# 2026-07-18). PXDesign imports the shared records — the nested ``PlacementSpec`` mapping,
+# ``GeneratedSegment`` / ``ExistingSpan`` values, the two-field ``SymbolicResidueSite``
+# reference, and the ``validate_placement`` global-uniqueness check — from ``ofoldx.data``.
+# ``Hotspot`` is the frozen §3.7.4 distance-free per-residue target label PXDesign consumes.
+from ...data import (
+    ExistingSpan,
+    GeneratedSegment,
+    InstanceIdAllocator,
+    PlacementSpec,
+    SymbolicResidueSite,
+    validate_placement,
+)
+from ...data.components import get_component
+from ...data.evidence import MSA, MSACollection, Template
+from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
+from ...data.structure import Structure
+from ...io.structure import read_structure
+from .config import PxDesignProcessorConfig
+from .model import Hotspot, PxDesignInput, PxDesignLayout
 
-_PXDESIGN_NAMES = frozenset({"xpb", "xpa", "rbb", "raa"})
-_PXDESIGN_DESIGN_RESTYPE_IDS = {"xpb": 32, "xpa": 33, "rbb": 34, "raa": 35}
+_RESTYPE_INDEX = {
+    "ALA": 0,
+    "ARG": 1,
+    "ASN": 2,
+    "ASP": 3,
+    "CYS": 4,
+    "GLN": 5,
+    "GLU": 6,
+    "GLY": 7,
+    "HIS": 8,
+    "ILE": 9,
+    "LEU": 10,
+    "LYS": 11,
+    "MET": 12,
+    "PHE": 13,
+    "PRO": 14,
+    "SER": 15,
+    "THR": 16,
+    "TRP": 17,
+    "TYR": 18,
+    "VAL": 19,
+    "UNK": 20,
+    "A": 21,
+    "G": 22,
+    "C": 23,
+    "U": 24,
+    "N": 25,
+    "DA": 26,
+    "DG": 27,
+    "DC": 28,
+    "DT": 29,
+    "DN": 30,
+}
+_GENERATED_RESTYPE = 32
+_GENERATED_ATOM_IDS = frozenset(atom.atom_id for atom in get_component("GLY").atoms if atom.element != "H")
 
-# AF3 SI 4.4 distogram representative-atom rule. Purines use C4, pyrimidines C2, unknown nucleotides C1'.
-# Protein residues use CB except glycine and design ("xpb") tokens which use CA. Ligands are single-atom
-# tokens and are all selected.
-_PURINE_NAMES = frozenset({"DA", "DG", "A", "G"})
-_PYRIMIDINE_NAMES = frozenset({"DC", "DT", "C", "U"})
-_UNKNOWN_NUCLEOTIDE_NAMES = frozenset({"DN", "N"})
 
-PxDesignProcessorInput = StructureInput | DesignInput | Mapping[str, Any]
+class PxDesignProcessor:
+    r"""Lower one released target-conditioned binder-design problem to tensors."""
 
-
-@PROCESSORS.register("pxdesign")
-class PxDesignProcessor(StructureProcessor):
-    r"""
-    Convert structure or PxDesign JSON inputs into [`PxDesignInput`][].
-
-    The processor emits the PxDesign condition schema for structures that already contain condition/design
-    tokens. Design positions can be supplied three ways, in priority order: a [`DesignInput`][] (or JSON
-    path / dict) carrying per-atom ``conditional_label`` design annotations; residues renamed to the PxDesign
-    ``xpb`` placeholder; or the ``design_residues`` selector. ``hotspot_residues`` sets PxDesign hotspot
-    features when a JSON input does not already carry them.
-
-    Args:
-        single_size: Width of the single (token) representation the model expects.
-        token_feature_size: Width of the per-token feature vector.
-        atom_feature_size: Width of the per-atom reference feature vector.
-        residue_vocabulary: Residue names in vocabulary order; defaults to the standard set.
-        element_vocabulary: Element symbols for element features, or ``None`` for the default.
-        element_channels: Number of element-embedding channels.
-        atom_name_characters_count: Number of atom-name characters featurized per atom.
-        atom_name_character_channels: Number of channels per atom-name character.
-        ccd: Chemical Component Dictionary provider, or ``None`` for the default provider.
-        reference_conformer_augment: Whether to randomly augment reference conformers.
-        augment_seed: Optional seed for reference-conformer augmentation.
-        ligand_atom_rename: Whether to rename ligand atoms to canonical names.
-        materialize_missing_atoms: Whether to add placeholder atoms for missing ones.
-        vocab_size: Restype vocabulary size, including PxDesign design placeholders.
-        design_residues: ``(chain_id, residue_number)`` selectors marking design positions.
-        hotspot_residues: ``(chain_id, residue_number)`` selectors marking hotspot positions.
-        design_protein_token_id: Restype id assigned to selector-marked protein design tokens.
-        restype_one_hot: Whether to emit restype features as one-hot instead of ids.
-    """
-
-    input_class = PxDesignInput
-
-    @classmethod
-    def from_config(cls, config: Any, **kwargs: Any) -> PxDesignProcessor:
-        r"""
-        Build a PxDesign processor from a model config.
-
-        Reads the width fields (and the condition-embedder ``vocab_size``) off the model
-        config, applies them as processor defaults, and lets ``kwargs`` override any of them.
-
-        Args:
-            config: A model config (or config-like object) exposing the PxDesign width fields.
-            **kwargs: Overrides passed through to the processor constructor.
-
-        Returns:
-            A configured [`PxDesignProcessor`][ofoldx.models.pxdesign.processor.PxDesignProcessor].
-
-        Examples:
-            >>> from ofoldx.models.pxdesign.config import PxDesignConfig
-            >>> processor = PxDesignProcessor.from_config(PxDesignConfig())  # doctest: +SKIP
-        """
-
-        condition_embedder = getattr(config, "condition_embedder", None)
-        parameters: dict[str, Any] = {
-            "single_size": int(_config_scalar(config, "single_size", 384)),
-            "token_feature_size": int(_config_scalar(config, "token_feature_size", 449)),
-            "atom_feature_size": int(_config_scalar(config, "atom_feature_size", 385)),
-            "vocab_size": int(_config_scalar(condition_embedder, "vocab_size", 36)),
-        }
-        parameters.update(kwargs)
-        return cls(**parameters)
+    config_class = PxDesignProcessorConfig
 
     def __init__(
         self,
+        config: PxDesignProcessorConfig | None = None,
         *,
-        single_size: int = 384,
-        token_feature_size: int = 449,
-        atom_feature_size: int = 385,
-        residue_vocabulary: Sequence[str] | None = None,
-        element_vocabulary: Sequence[str] | None = None,
-        element_channels: int = 128,
-        atom_name_characters_count: int = 4,
-        atom_name_character_channels: int = 64,
-        ccd: CcdProvider | None = None,
-        reference_conformer_augment: bool = False,
-        augment_seed: int | None = None,
-        ligand_atom_rename: bool = False,
-        materialize_missing_atoms: bool = False,
-        vocab_size: int = 36,
-        design_residues: Iterable[Sequence[Any]] = (),
-        hotspot_residues: Iterable[Sequence[Any]] = (),
-        design_protein_token_id: int = 32,
-        restype_one_hot: bool = True,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__(
-            single_size=single_size,
-            token_feature_size=token_feature_size,
-            atom_feature_size=atom_feature_size,
-            residue_vocabulary=default_residue_vocabulary() if residue_vocabulary is None else residue_vocabulary,
-            element_vocabulary=element_vocabulary,
-            element_channels=element_channels,
-            atom_name_characters_count=atom_name_characters_count,
-            atom_name_character_channels=atom_name_character_channels,
-            ccd=ccd,
-            reference_conformer_augment=reference_conformer_augment,
-            augment_seed=augment_seed,
-            ligand_atom_rename=ligand_atom_rename,
-            materialize_missing_atoms=materialize_missing_atoms,
-        )
-        self.vocab_size = vocab_size
-        self.design_residues = _normalize_residue_set(design_residues)
-        self.hotspot_residues = _normalize_residue_set(hotspot_residues)
-        self.design_protein_token_id = design_protein_token_id
-        self.restype_one_hot = restype_one_hot
+        self.config = PxDesignProcessorConfig() if config is None else config
+        self.device = torch.device("cpu" if device is None else device)
+        self.dtype = torch.float32 if dtype is None else dtype
 
-    def __call__(self, structure: PxDesignProcessorInput) -> PxDesignInput:  # type: ignore[override]
-        r"""
-        Return a batched PxDesign input for one structure or JSON design input.
-
-        Args:
-            structure: A parsed [`Structure`][ofoldx.data.structure.Structure], a structure file path, a
-                [`DesignInput`][ofoldx.models.pxdesign.io.DesignInput], a PxDesign JSON file path, or a
-                decoded JSON sample dict.
-
-        Returns:
-            Batched PxDesign model input with leading batch size 1.
-
-        Examples:
-            >>> processor = PxDesignProcessor()  # doctest: +SKIP
-            >>> batch = processor("design.json")  # doctest: +SKIP
-        """
-
-        design_input = self._resolve_design_input(structure)
-        parsed = (
-            design_input.structure
-            if design_input is not None
-            else structure_from_input(cast(StructureInput, structure))
-        )
-        ccd = self._ccd if self._ccd is not None else default_ccd_provider()
-        fields = self._structural_fields(parsed, ccd)
-        # Materialization may have expanded the structure; re-align annotations to fields.structure.
-        parsed = fields.structure
-        residues = fields.residues
-        token_mask = fields.token_mask
-
-        conditional_label = self._conditional_label(design_input, parsed)
-        design_token_mask = self._design_token_mask(fields, residues, conditional_label)
-        condition_token_mask = token_mask & ~design_token_mask
-        distogram_rep_atom_mask = _distogram_rep_atom_mask(parsed, fields, design_token_mask)
-        condition_atom_mask = condition_token_mask[fields.atom_to_token] & fields.target_mask
-        conditional_templ, conditional_templ_mask = _conditional_template(fields, condition_token_mask, design_input)
-        hotspot = self._hotspot_feature(design_input, residues)
-        is_resolved = self._is_resolved(design_input, fields)
-        condition_coords = self._condition_coords(design_input, fields, condition_atom_mask)
-
-        return PxDesignInput(
-            token_mask=token_mask.unsqueeze(0),
-            residue_index=torch.tensor(
-                [residue.residue_number for residue in residues],
-                dtype=torch.long,
-            ).unsqueeze(0),
-            chain_index=torch.tensor(
-                [fields.chain_to_index[residue.chain_id] for residue in residues],
-                dtype=torch.long,
-            ).unsqueeze(0),
-            entity_index=torch.tensor(fields.entity_values, dtype=torch.long).unsqueeze(0),
-            symmetry_index=torch.zeros(1, fields.num_tokens, dtype=torch.long),
-            token_index=torch.arange(fields.num_tokens, dtype=torch.long).unsqueeze(0),
-            atom_features=self._atom_features(parsed, self._atom_names(parsed)).unsqueeze(0),
-            atom_to_token=fields.atom_to_token.unsqueeze(0),
-            atom_mask=fields.atom_mask.unsqueeze(0),
-            reference_positions=fields.reference_positions.unsqueeze(0),
-            reference_space_id=torch.tensor(fields.reference_space_values, dtype=torch.long).unsqueeze(0),
-            reference_mask=fields.reference_mask.unsqueeze(0),
-            reference_charges=fields.reference_charges.unsqueeze(0),
-            restype=self._restype_features(residues, fields.residue_names, design_token_mask).unsqueeze(0),
-            conditional_templ=conditional_templ.unsqueeze(0),
-            conditional_templ_mask=conditional_templ_mask.unsqueeze(0),
-            design_token_mask=design_token_mask.unsqueeze(0),
-            condition_token_mask=condition_token_mask.unsqueeze(0),
-            condition_atom_mask=condition_atom_mask.unsqueeze(0),
-            condition_coords=condition_coords.unsqueeze(0),
-            backbone_atom_indices=_backbone_atom_indices(fields, parsed).unsqueeze(0),
-            plddt=torch.zeros(1, fields.num_tokens, dtype=torch.float32),
-            hotspot=hotspot.unsqueeze(0),
-            distogram_rep_atom_mask=distogram_rep_atom_mask.unsqueeze(0),
-            frame_atom_index=torch.tensor(fields.frame_atom_index_values, dtype=torch.long)
-            .reshape(fields.num_tokens, 3)
-            .unsqueeze(0),
-            frame_mask=torch.tensor(fields.frame_mask_values, dtype=torch.bool).unsqueeze(0),
-            conditional_label=torch.from_numpy(conditional_label).unsqueeze(0),
-            is_resolved=is_resolved.unsqueeze(0),
-        )
-
-    def _resolve_design_input(self, structure: PxDesignProcessorInput) -> DesignInput | None:
-        r"""
-        Return a [`DesignInput`][] when the input is a JSON design input, else ``None``.
-
-        A plain structure or structure file path returns ``None`` and follows the legacy naming-based path.
-
-        Args:
-            structure: A structure, structure path, [`DesignInput`][], JSON path, or JSON dict.
-
-        Returns:
-            The parsed [`DesignInput`][] for JSON/mapping inputs, otherwise ``None``.
-        """
-
-        ccd = self._ccd if self._ccd is not None else None
-        if isinstance(structure, DesignInput):
-            return structure
-        if isinstance(structure, Mapping):
-            return read_pxdesign_json(structure, ccd=ccd)
-        if isinstance(structure, (str, PathLike)) and str(structure).lower().endswith(".json"):
-            return read_pxdesign_json(structure, ccd=ccd)
-        return None
-
-    def _processor_config(self) -> dict[str, object]:
-        r"""
-        Return the serializable processor configuration.
-
-        Extends the base structure-processor config with the PxDesign-specific fields
-        (vocabulary size, design/hotspot selectors, and restype encoding flags) so the
-        processor round-trips through ``save``/``from_pretrained``.
-
-        Returns:
-            A dict of processor settings suitable for serialization.
-        """
-
-        config = super()._processor_config()
-        config.update(
-            {
-                "vocab_size": self.vocab_size,
-                "design_residues": [list(value) for value in sorted(self.design_residues)],
-                "hotspot_residues": [list(value) for value in sorted(self.hotspot_residues)],
-                "design_protein_token_id": self.design_protein_token_id,
-                "restype_one_hot": self.restype_one_hot,
-            }
-        )
-        return config
-
-    def _conditional_label(self, design_input: DesignInput | None, structure: Structure) -> np.ndarray:
-        r"""
-        Return the per-atom ``conditional_label`` (``True`` = condition, ``False`` = design).
-
-        JSON inputs carry it directly; otherwise every atom is a condition atom unless its residue is a
-        PxDesign ``xpb``-family design placeholder.
-
-        Args:
-            design_input: Optional parsed JSON design input.
-            structure: The parsed structure whose atoms are labeled.
-
-        Returns:
-            A ``[N_atom]`` boolean array; ``True`` marks condition atoms.
-        """
-
-        if design_input is not None and design_input.conditional_label.shape[0] == len(structure.atoms):
-            return design_input.conditional_label.astype(np.bool_)
-        values = [atom.residue_name.lower() not in _PXDESIGN_NAMES for atom in structure.atoms]
-        return np.asarray(values, dtype=np.bool_)
-
-    def _design_token_mask(
+    def to(
         self,
-        fields: StructuralFields,
-        residues: tuple[ResidueKey, ...],
-        conditional_label: np.ndarray,
-    ) -> Tensor:
-        r"""
-        Return the per-token design mask, merging JSON design annotations with the legacy selectors.
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Update runtime tensor placement in place and return this Processor."""
 
-        A token is a design token when any of its atoms is a design atom (from
-        ``conditional_label``) or when the residue matches a ``design_residues`` selector.
+        if device is not None:
+            self.device = torch.device(device)
+        if dtype is not None:
+            self.dtype = dtype
+        return self
 
-        Args:
-            fields: Structural fields carrying the atom-to-token mapping.
-            residues: Per-token residue keys, in token order.
-            conditional_label: Per-atom condition/design labels (``True`` = condition).
+    def __call__(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
+        *,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template | str | PathLike[str]] = (),
+        # Frozen §3.7 placement core (``PlacementSpec``) plus the frozen §3.7.4 ``Hotspot``
+        # target-conditioning label; PXDesign consumes both directly from ``ofoldx.data``.
+        conditions: Sequence[PlacementSpec | Hotspot] = (),
+    ) -> PxDesignInput:
+        r"""Encode the released single, fixed-length protein-binder design contract."""
 
-        Returns:
-            A ``[N_token]`` boolean tensor; ``True`` marks design tokens.
-        """
+        if msa is not None:
+            raise ValueError("PXDesign-d does not consume MSA evidence; MSA belongs to the downstream filter")
+        if tuple(templates):
+            raise ValueError("PXDesign-d does not consume Template evidence")
+        if isinstance(input, str | PathLike):
+            input = read_structure(Path(input).expanduser())
+        if input is not None and type(input) not in (MolecularSystem, Structure):
+            raise TypeError("input must be a MolecularSystem, Structure, local path, or None")
 
-        atom_design = torch.from_numpy(~conditional_label)
-        token_design = torch.zeros(fields.num_tokens, dtype=torch.bool)
-        token_design[fields.atom_to_token[atom_design]] = True
-        selector_values = [
-            (residue.chain_id, int(residue.residue_number)) in self.design_residues for residue in residues
+        condition_values = tuple(conditions)
+        # A frozen PlacementSpec is the nested ``group -> placement_id -> value`` mapping (a plain
+        # dict); a frozen ``Hotspot`` is the distance-free per-residue label. Discriminate
+        # structurally. The released hotspot channel is unweighted, soft, and distance-free, so
+        # the frozen ``Hotspot`` (no ``weight`` / ``intent`` / ``cutoff`` fields) makes the former
+        # weighted/hard/cutoff rejections structurally impossible rather than runtime checks.
+        if any(not isinstance(condition, (dict, Hotspot)) for condition in condition_values):
+            unsupported = next(
+                condition for condition in condition_values if not isinstance(condition, (dict, Hotspot))
+            )
+            raise TypeError(f"PXDesign cannot consume {type(unsupported).__name__}")
+        placements = tuple(condition for condition in condition_values if isinstance(condition, dict))
+        if len(placements) != 1:
+            raise ValueError("PXDesign requires exactly one PlacementSpec containing its generated binder")
+        # The remaining family-owned semantic checks live inline in ``_hotspots`` (§3.7.1).
+
+        structure = input if type(input) is Structure else None
+        source = input.system if structure is not None else input
+        # Released PXDesign applies the AlphaFold3-SI-§2.1 modified-polymer transform BEFORE
+        # tokenization/featurization: MSE (selenomethionine) is canonicalized to MET. Do it
+        # here, on the input, so every downstream check and feature sees the standard residue.
+        source, structure = _canonicalize_modified_polymers(source, structure)
+        placement = placements[0]
+        # Enforce the frozen construction-time invariant: placement_id globally unique.
+        validate_placement(placement)
+        # Each outer key is a declaration group (a chain); each inner key is a globally
+        # unique placement_id. Identity rides the inner key, not a value field: the binder
+        # placement is KEYED by ``generated_id``, while its realized instance id is minted by the
+        # shared allocator (``chain_0``, below) per the uniform realized-id convention.
+        generated_items = [
+            (group, placement_id, part)
+            for group, placements in placement.items()
+            for placement_id, part in placements.items()
+            if type(part) is GeneratedSegment
         ]
-        return token_design | torch.tensor(selector_values, dtype=torch.bool)
+        if len(generated_items) != 1:
+            raise ValueError("released PXDesign generates exactly one binder chain")
+        generated_group, generated_id, generated = generated_items[0]
+        if generated.polymer_type != "protein":
+            raise ValueError("released PXDesign generates protein binders only")
+        if generated.min_length != generated.max_length:
+            raise ValueError("released PXDesign requires one fixed binder length")
+        if tuple(placement[generated_group].values()) != (generated,):
+            raise ValueError("the PXDesign binder must be a separate generated chain")
+        if next(reversed(placement)) != generated_group:
+            raise ValueError("released PXDesign requires the generated binder after its target chains")
+        existing_chains = tuple(
+            tuple(placements.values()) for group, placements in placement.items() if group != generated_group
+        )
+        if any(not all(type(part) is ExistingSpan for part in chain) for chain in existing_chains):
+            raise ValueError("every non-binder PXDesign PlacementSpec chain must contain only ExistingSpan values")
+        if source is None and existing_chains:
+            raise ValueError("ExistingSpan target chains require molecular input")
+        if structure is None and source is not None:
+            raise ValueError("PXDesign target conditioning requires observed Structure coordinates")
+        if source is not None:
+            if not existing_chains:
+                raise ValueError("PXDesign target input must be declared by its PlacementSpec")
+            declared_instances = set()
+            for chain in existing_chains:
+                if len(chain) != 1:
+                    raise ValueError("PXDesign target PlacementSpec chains currently require one complete ExistingSpan")
+                span = chain[0]
+                entity = cast(PolymerSequence, source.entities[source.instances[span.instance_id]])
+                if span.start != 0 or span.stop != len(entity):
+                    raise ValueError(
+                        "PXDesign target cropping requires canonical chain materialization before lowering"
+                    )
+                if span.instance_id in declared_instances:
+                    raise ValueError("a PXDesign target instance may appear only once in PlacementSpec")
+                declared_instances.add(span.instance_id)
 
-    def _hotspot_feature(self, design_input: DesignInput | None, residues: tuple[ResidueKey, ...]) -> Tensor:
-        r"""
-        Return the per-token hotspot feature.
+        system, sites, generated_map, selected_residues = _materialize_problem(
+            source,
+            structure,
+            existing_chains,
+            generated,
+            generated_id,
+        )
+        modeled_residues = {
+            (site.instance_id, site.component_index)
+            for site in sites
+            if type(system.entities[system.instances[site.instance_id]]) is not Molecule
+        }
+        unsupported_components = set()
+        for instance_id, component_index in modeled_residues:
+            entity = cast(PolymerSequence, system.entities[system.instances[instance_id]])
+            component_id = entity.components[component_index].component_id
+            if component_id not in _RESTYPE_INDEX:
+                unsupported_components.add(component_id)
+        if unsupported_components:
+            raise ValueError(
+                "PXDesign modified-polymer lowering canonicalizes MSE to MET (AlphaFold3 SI §2.1) but "
+                "otherwise requires the CCD canonical-parent mapping the package component value does "
+                f"not carry; unsupported components: {sorted(unsupported_components)!r}"
+            )
+        token_sites, token_residues, token_components, representative_sites = _tokens(
+            system,
+            sites,
+            frozenset(generated_map.values()),
+        )
+        site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
+        hotspot_residues = _hotspots(
+            condition_values,
+            selected_residues,
+            token_residues,
+        )
 
-        Uses the JSON hotspot flags (reduced to per-residue) when present, otherwise the
-        ``hotspot_residues`` selectors.
+        reference_positions, reference_mask, reference_space_id = _reference_features(
+            system,
+            sites,
+            frozenset(generated_map.values()),
+        )
+        atom_features, reference_charges = _atom_features(system, sites, reference_mask)
+        atom_to_token = torch.tensor([site_to_token[site] for site in sites], dtype=torch.int64)
+        token_count = len(token_sites)
+        restype = torch.zeros(token_count, 36, dtype=torch.float32)
+        generated_residues = frozenset(generated_map.values())
+        for token_index, (residue, component_id) in enumerate(zip(token_residues, token_components)):
+            index = (
+                _GENERATED_RESTYPE
+                if residue in generated_residues
+                else _RESTYPE_INDEX.get(component_id, _RESTYPE_INDEX["UNK"])
+            )
+            restype[token_index, index] = 1.0
 
-        Args:
-            design_input: Optional parsed JSON design input.
-            residues: Per-token residue keys, in token order.
+        observed = {} if structure is None else {site: row for row, site in enumerate(structure.sites)}
+        representative_coordinates = torch.zeros(token_count, 3, dtype=torch.float32)
+        representative_mask = torch.zeros(token_count, dtype=torch.bool)
+        for token_index, site in enumerate(representative_sites):
+            row = observed.get(site)
+            if row is None or not bool(structure.coordinate_mask[row]):  # type: ignore[union-attr]
+                continue
+            coordinates = cast(Structure, structure).coordinates[row]
+            representative_coordinates[token_index] = torch.from_numpy(coordinates.copy())
+            representative_mask[token_index] = True
+        conditional_templ = torch.zeros(token_count, token_count, dtype=torch.int64)
+        conditional_templ_mask = representative_mask[:, None] & representative_mask[None, :]
+        if bool(representative_mask.any()):
+            rows = torch.nonzero(representative_mask, as_tuple=True)[0]
+            distances = torch.cdist(
+                representative_coordinates.index_select(0, rows),
+                representative_coordinates.index_select(0, rows),
+            )
+            bins = torch.sum(
+                distances.unsqueeze(-1) > torch.linspace(2.0, 22.0, 63),
+                dim=-1,
+            )
+            ii, jj = torch.meshgrid(rows, rows, indexing="ij")
+            conditional_templ[ii, jj] = bins
 
-        Returns:
-            A ``[N_token]`` float tensor of hotspot indicators.
-        """
+        chain_index, entity_index, symmetry_index, residue_index = _token_indices(
+            system,
+            token_sites,
+            token_residues,
+        )
+        return PxDesignInput(
+            residue_index=residue_index.unsqueeze(0).to(self.device),
+            chain_index=chain_index.unsqueeze(0).to(self.device),
+            entity_index=entity_index.unsqueeze(0).to(self.device),
+            symmetry_index=symmetry_index.unsqueeze(0).to(self.device),
+            token_index=torch.arange(token_count, dtype=torch.int64, device=self.device).unsqueeze(0),
+            atom_features=atom_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            atom_to_token=atom_to_token.unsqueeze(0).to(self.device),
+            atom_mask=torch.ones(1, len(sites), dtype=torch.bool, device=self.device),
+            reference_positions=reference_positions.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            reference_space_id=reference_space_id.unsqueeze(0).to(self.device),
+            reference_mask=reference_mask.unsqueeze(0).to(self.device),
+            reference_charges=reference_charges.reshape(1, len(sites), 1).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            restype=restype.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            plddt=torch.zeros(1, token_count, 1, dtype=self.dtype, device=self.device),
+            hotspot=torch.tensor(
+                [residue in hotspot_residues for residue in token_residues],
+                dtype=self.dtype,
+                device=self.device,
+            ).reshape(1, token_count, 1),
+            conditional_templ=conditional_templ.unsqueeze(0).to(self.device),
+            conditional_templ_mask=conditional_templ_mask.unsqueeze(0).to(self.device),
+            layout=PxDesignLayout(
+                system=system,
+                sites=sites,
+                conditions=condition_values,
+                # Frozen output surface: group -> placement_id -> ordered realized
+                # occurrence tuple (offset-indexed; negative offsets resolve natively).
+                # Exhaustive coverage (X1-B witness rule): the single binder placement covers
+                # every realized generated residue (offsets 0..max_length-1) with no
+                # unaddressable tail. Target ExistingSpans stay source-addressed and out of
+                # the map, matching the sibling generated-only convention (odesign/boltzgen).
+                # Each ComponentReference[0] carries the shared-allocator realized id
+                # (``chain_0``), not the ``placement_id``.
+                placement_map={generated_group: {generated_id: tuple(generated_map.values())}},
+            ),
+        )
 
-        if design_input is not None and design_input.hotspot.any():
-            # Reduce per-atom hotspot to per-token via first-atom order; residues carry the JSON flag.
-            hotspot_by_residue = _per_residue_hotspot(design_input)
-            values = [hotspot_by_residue.get((r.chain_id, int(r.residue_number)), False) for r in residues]
-            return torch.tensor(values, dtype=torch.float32)
-        values = [(residue.chain_id, int(residue.residue_number)) in self.hotspot_residues for residue in residues]
-        return torch.tensor(values, dtype=torch.float32)
 
-    def _is_resolved(self, design_input: DesignInput | None, fields: StructuralFields) -> Tensor:
-        r"""
-        Return the per-atom resolved mask (atoms with a real experimental coordinate).
+def _canonicalize_modified_polymers(
+    source: MolecularSystem | None,
+    structure: Structure | None,
+) -> tuple[MolecularSystem | None, Structure | None]:
+    r"""Apply the released AlphaFold3-SI-§2.1 MSE->MET modified-polymer transform.
 
-        Args:
-            design_input: Optional parsed JSON design input carrying the resolved flags.
-            fields: Structural fields whose target mask is the fallback.
+    Released PXDesign canonicalizes selenomethionine before it tokenizes or featurizes
+    (reference ``pxdesign/data/parser.py::mse_to_met`` and
+    ``json_to_feature.py::mse_to_met``): every ``MSE`` residue becomes ``MET``, its
+    selenium ``SE`` atom is renamed to the sulfur ``SD`` (element ``S``), and the residue
+    is relabeled a standard (non-hetero) MET. ``MSE`` and ``MET`` are otherwise the exact
+    same heavy-atom graph in the wwPDB CCD (``N CA C O CB CG {SE|SD} CE`` plus terminal
+    ``OXT``), so this is an exact canonicalization, not a lossy guess: rewriting the
+    residue to the audited ``MET`` component and renaming its ``SE`` occurrence to ``SD``
+    makes an ``MSE`` residue byte-identical to the equivalent ``MET`` residue.
 
-        Returns:
-            A ``[N_atom]`` boolean tensor; ``True`` marks resolved atoms.
-        """
+    Any *other* modified polymer residue would need the CCD canonical-parent mapping that
+    the package :class:`ChemicalComponent` value does not carry; those are left unchanged
+    here and rejected precisely by the modeled-residue guard in :meth:`PxDesignProcessor.__call__`.
+    """
 
-        if design_input is not None and design_input.coord_from_cif_is_resolved.shape[0] == fields.num_atoms:
-            return torch.from_numpy(design_input.coord_from_cif_is_resolved.astype(np.bool_))
-        return fields.target_mask.to(dtype=torch.bool)
+    system = structure.system if structure is not None else source
+    if system is None:
+        return source, structure
 
-    def _condition_coords(
-        self, design_input: DesignInput | None, fields: StructuralFields, condition_atom_mask: Tensor
-    ) -> Tensor:
-        r"""
-        Return the ``[N_atom, 3]`` condition coords, zeroed outside resolved condition atoms.
-
-        Prefers the JSON ``coord_from_cif`` coordinates when present, otherwise the
-        structure's target positions.
-
-        Args:
-            design_input: Optional parsed JSON design input carrying condition coords.
-            fields: Structural fields whose target positions are the fallback.
-            condition_atom_mask: ``[N_atom]`` mask selecting condition atoms.
-
-        Returns:
-            A ``[N_atom, 3]`` float tensor with non-condition atoms zeroed.
-        """
-
-        if design_input is not None and design_input.coord_from_cif.shape[0] == fields.num_atoms:
-            coords = torch.from_numpy(design_input.coord_from_cif.astype(np.float32))
+    met = get_component("MET")
+    new_entities: dict[str, PolymerSequence | Molecule] = {}
+    modified_entities: set[str] = set()
+    for entity_id, entity in system.entities.items():
+        if type(entity) is PolymerSequence and any(component.component_id == "MSE" for component in entity.components):
+            new_entities[entity_id] = PolymerSequence(
+                entity.polymer_type,
+                tuple(met if component.component_id == "MSE" else component for component in entity.components),
+            )
+            modified_entities.add(entity_id)
         else:
-            coords = fields.target_positions
-        return coords * condition_atom_mask.to(dtype=coords.dtype).unsqueeze(-1)
+            new_entities[entity_id] = entity
+    if not modified_entities:
+        return source, structure
 
-    def _restype_features(
-        self,
-        residues: tuple[ResidueKey, ...],
-        residue_names: dict[ResidueKey, str],
-        design_token_mask: Tensor,
-    ) -> Tensor:
-        r"""
-        Return the per-token restype features (ids or one-hot).
+    # ``(instance_id, component_index)`` of every residue rewritten from MSE to MET; only the
+    # selenium ``SE`` occurrence in exactly those residues is renamed to the sulfur ``SD``.
+    modified_residues = {
+        (instance_id, index)
+        for instance_id, entity_id in system.instances.items()
+        if entity_id in modified_entities
+        for index, component in enumerate(system.entities[entity_id].components)
+        if component.component_id == "MSE"
+    }
 
-        Args:
-            residues: Per-token residue keys, in token order.
-            residue_names: Mapping from residue key to residue name.
-            design_token_mask: ``[N_token]`` mask marking design tokens.
+    def rename(site: AtomSite) -> AtomSite:
+        if site.atom_id == "SE" and (site.instance_id, site.component_index) in modified_residues:
+            return AtomSite(site.instance_id, site.component_index, "SD")
+        return site
 
-        Returns:
-            Restype ids ``[N_token]`` when ``restype_one_hot`` is ``False``, otherwise a
-            one-hot ``[N_token, vocab_size]`` float tensor.
-        """
-
-        restype_ids = self._restype_ids(residues, residue_names, design_token_mask)
-        if not self.restype_one_hot:
-            return restype_ids
-        return F.one_hot(restype_ids, num_classes=self.vocab_size).to(dtype=torch.float32)
-
-    def _restype_ids(
-        self,
-        residues: tuple[ResidueKey, ...],
-        residue_names: dict[ResidueKey, str],
-        design_token_mask: Tensor,
-    ) -> Tensor:
-        r"""
-        Return the per-token restype ids.
-
-        Assigns the PxDesign design placeholder ids to ``xpb``-family residues, the
-        ``design_protein_token_id`` to other design tokens, and the vocabulary index
-        otherwise.
-
-        Args:
-            residues: Per-token residue keys, in token order.
-            residue_names: Mapping from residue key to residue name.
-            design_token_mask: ``[N_token]`` mask marking design tokens.
-
-        Returns:
-            A ``[N_token]`` long tensor of restype ids clamped into vocabulary range.
-        """
-
-        values = []
-        for index, residue in enumerate(residues):
-            residue_name = residue_names[residue]
-            design_id = _PXDESIGN_DESIGN_RESTYPE_IDS.get(residue_name.lower())
-            if design_id is not None:
-                values.append(design_id)
-            elif bool(design_token_mask[index]):
-                values.append(self.design_protein_token_id)
-            else:
-                values.append(self._residue_index(residue_name))
-        return torch.tensor(values, dtype=torch.long).clamp(min=0, max=self.vocab_size - 1)
-
-    def _atom_names(self, structure: Any) -> list[str]:
-        r"""
-        Return atom names used for atom-name character features.
-
-        Uses the raw structure atom names unless ligand renaming is enabled, in which
-        case it defers to the base processor's canonicalized names.
-
-        Args:
-            structure: The parsed structure whose atom names are read.
-
-        Returns:
-            A list of atom-name strings in atom order.
-        """
-
-        if not self._ligand_atom_rename:
-            return [atom.name for atom in structure.atoms]
-        return cast(list[str], super()._atom_names(structure))
+    new_bonds = frozenset(
+        SystemBond(
+            rename(bond.site_a),
+            rename(bond.site_b),
+            order=bond.order,
+            aromatic=bond.aromatic,
+            stereo=bond.stereo,
+            stereo_sites=(
+                None if bond.stereo_sites is None else (rename(bond.stereo_sites[0]), rename(bond.stereo_sites[1]))
+            ),
+            origin=bond.origin,
+        )
+        for bond in system.bonds
+    )
+    new_system = MolecularSystem(new_entities, dict(system.instances), new_bonds)
+    if structure is None:
+        return new_system, None
+    new_structure = Structure(
+        new_system,
+        tuple(rename(site) for site in structure.sites),
+        structure.coordinates,
+        structure.coordinate_mask,
+        structure.occupancy,
+        structure.residue_numbers,
+    )
+    return new_system, new_structure
 
 
-def _distogram_rep_atom_mask(structure: Structure, fields: StructuralFields, design_token_mask: Tensor) -> Tensor:
-    r"""
-    Return the AF3 distogram representative-atom mask (``[N_atom]`` bool).
+def _materialize_problem(
+    source: MolecularSystem | None,
+    structure: Structure | None,
+    existing_chains: tuple[tuple[ExistingSpan, ...], ...],
+    generated: GeneratedSegment,
+    generated_id: str,
+) -> tuple[
+    MolecularSystem,
+    tuple[AtomSite, ...],
+    dict[SymbolicResidueSite, tuple[str, int]],
+    frozenset[tuple[str, int]],
+]:
+    explicit_instances = [part.instance_id for chain in existing_chains for part in chain]
+    if source is None:
+        selected_instances: list[tuple[str, str]] = []
+    elif explicit_instances:
+        selected_ids = set(explicit_instances)
+        selected_instances = [
+            (instance_id, source.instances[instance_id]) for instance_id in dict.fromkeys(explicit_instances)
+        ]
+        selected_instances.extend(
+            (instance_id, entity_id)
+            for instance_id, entity_id in source.instances.items()
+            if type(source.entities[entity_id]) is Molecule and instance_id not in selected_ids
+        )
+    else:
+        selected_instances = list(source.instances.items())
 
-    Faithful port of Protenix ``add_distogram_rep_atom_mask``: CB for protein (CA for glycine and design
-    tokens), C4 for purines, C2 for pyrimidines, C1' for unknown nucleotides, and all atoms for ligand/atom
-    tokens. A design token is a protein residue flagged in ``design_token_mask`` (OFoldX carries the
-    design status via ``conditional_label`` rather than the upstream ``xpb`` residue rename). Residues that
-    end up without a representative atom fall back to the token representative atom so every token keeps
-    exactly one distogram atom.
+    selected_instance_ids = {instance_id for instance_id, _ in selected_instances}
+    selected_entity_ids = {entity_id for _, entity_id in selected_instances}
+    entities: dict[str, PolymerSequence | Molecule] = (
+        {} if source is None else {entity_id: source.entities[entity_id] for entity_id in selected_entity_ids}
+    )
 
-    Args:
-        structure: The parsed structure supplying per-atom residue names.
-        fields: Structural fields carrying token definitions and atom counts.
-        design_token_mask: ``[N_token]`` mask marking design tokens.
+    # Uniform realized-id convention (owner "one correct way"): the realized INSTANCE id is
+    # minted by the single shared allocator (``ofoldx.data.placement.InstanceIdAllocator`` ->
+    # ``chain_{n}``) and surfaces only inside ``ComponentReference[0]``; all four families call
+    # the same helper. Entity ids remain family-owned (``{family}_entity_{N}``). PXDesign
+    # realizes exactly one generated chain — the binder — so it allocates ``chain_0`` (below).
+    # The placement is still KEYED by its globally-unique ``generated_id``; only the realized id
+    # is minted.
+    entity_id = "pxdesign_entity_0"
+    suffix = 1
+    while entity_id in selected_entity_ids:
+        entity_id = f"pxdesign_entity_0_{suffix}"
+        suffix += 1
+    entities[entity_id] = PolymerSequence("protein", (get_component("UNK"),) * generated.max_length)
 
-    Returns:
-        A ``[N_atom]`` boolean mask selecting one distogram representative atom per token.
-    """
+    # Realized instance ids are minted by the shared declaration-order allocator
+    # (``ofoldx.data.placement``) per the canonical ``chain_{n}`` convention. PXDesign realizes
+    # exactly one generated output chain — the binder — so it allocates a single id (``chain_0``).
+    # The placement stays KEYED by its globally-unique ``generated_id``; only the realized id is
+    # minted here. ``chain_{n}`` is disjoint by construction from every SOURCE instance id
+    # (author chain ids, symmetry ``A#1``, ``molecule_...``), so no collision guard is needed.
+    instance_id = InstanceIdAllocator().allocate()
+    instances = dict(selected_instances)
+    instances[instance_id] = entity_id
 
-    from ...processors.utils import _STANDARD_RESIDUE_NAMES  # local import avoids widening the public surface
+    bonds = (
+        frozenset()
+        if source is None
+        else frozenset(
+            bond
+            for bond in source.bonds
+            if bond.site_a.instance_id in selected_instance_ids and bond.site_b.instance_id in selected_instance_ids
+        )
+    )
+    system = MolecularSystem(entities, instances, bonds)
 
-    standard = _STANDARD_RESIDUE_NAMES
-    mask = torch.zeros(fields.num_atoms, dtype=torch.bool)
-    for token_index, token in enumerate(fields.tokens):
-        residue_name = structure.atoms[token.atom_indices[0]].residue_name
-        upper = residue_name.upper()
-        is_design = residue_name.lower() in _PXDESIGN_NAMES or bool(design_token_mask[token_index])
-        is_protein = len(upper) == 3 and upper in standard
-        if upper not in standard:
-            # Non-standard / ligand token: every atom is its own distogram atom.
-            for atom_index in token.atom_indices:
-                mask[atom_index] = True
+    if existing_chains:
+        selected_residues = frozenset(
+            (part.instance_id, monomer_index)
+            for chain in existing_chains
+            for part in chain
+            for monomer_index in range(part.start, part.stop)
+        )
+    else:
+        selected_residues = frozenset(
+            (instance_id, monomer_index)
+            for instance_id, entity_id in selected_instances
+            if type(entity := system.entities[entity_id]) is PolymerSequence
+            for monomer_index in range(len(entity))
+        )
+    if structure is None:
+        observed_residues: frozenset[tuple[str, int]] = frozenset()
+        observed_molecules: frozenset[str] = frozenset()
+    else:
+        molecule_instances = {
+            instance_id
+            for instance_id, entity_id in structure.system.instances.items()
+            if type(structure.system.entities[entity_id]) is Molecule
+        }
+        observed_residues = frozenset(
+            (site.instance_id, site.component_index)
+            for site, present in zip(structure.sites, structure.coordinate_mask)
+            if present and site.instance_id not in molecule_instances
+        )
+        observed_molecules = frozenset(
+            site.instance_id
+            for site, present in zip(structure.sites, structure.coordinate_mask)
+            if present and site.instance_id in molecule_instances
+        )
+    # One canonical, offset-indexed key per generated residue (offsets 0..max_length-1, in
+    # order). The former positive/negative double-key alias table is deleted: a
+    # from-the-end reference is resolved by native negative indexing into the ordered
+    # placement_map occurrence tuple, not by pre-keying a second SymbolicResidueSite.
+    generated_map = {}
+    for offset in range(generated.max_length):
+        residue = (instance_id, offset)
+        generated_map[SymbolicResidueSite(generated_id, offset)] = residue
+    generated_residues = frozenset(generated_map.values())
+    sites = []
+    for site, atom in system.iter_atoms():
+        if atom.element == "H":
             continue
-        if is_design and is_protein:
-            _select_atom_named(structure, token.atom_indices, "CA", mask, token.representative_atom_index)
+        entity = system.entities[system.instances[site.instance_id]]
+        residue = None if type(entity) is Molecule else (site.instance_id, site.component_index)
+        if residue in generated_residues:
+            if site.atom_id in _GENERATED_ATOM_IDS:
+                sites.append(site)
+        elif residue is not None:
+            if residue in selected_residues and residue in observed_residues:
+                sites.append(site)
+        elif site.instance_id in observed_molecules:
+            sites.append(site)
+    if not sites:
+        raise ValueError("PXDesign requires at least one modeled atom")
+    return system, tuple(sites), generated_map, selected_residues
+
+
+def _tokens(
+    system: MolecularSystem,
+    sites: tuple[AtomSite, ...],
+    generated_residues: frozenset[tuple[str, int]],
+) -> tuple[
+    tuple[tuple[AtomSite, ...], ...],
+    tuple[tuple[str, int] | None, ...],
+    tuple[str, ...],
+    tuple[AtomSite, ...],
+]:
+    groups: list[tuple[AtomSite, ...]] = []
+    residues: list[tuple[str, int] | None] = []
+    components: list[str] = []
+    representatives: list[AtomSite] = []
+    by_residue: dict[tuple[str, int], list[AtomSite]] = {}
+    for site in sites:
+        if type(system.entities[system.instances[site.instance_id]]) is not Molecule:
+            by_residue.setdefault((site.instance_id, site.component_index), []).append(site)
+    emitted_residues: set[tuple[str, int]] = set()
+    for site in sites:
+        entity = system.entities[system.instances[site.instance_id]]
+        if type(entity) is Molecule:
+            groups.append((site,))
+            residues.append(None)
+            components.append("UNK")
+            representatives.append(site)
             continue
-        target = _standard_distogram_atom(upper)
-        _select_atom_named(structure, token.atom_indices, target, mask, token.representative_atom_index)
-    return mask
+        polymer = cast(PolymerSequence, entity)
+        residue = (site.instance_id, site.component_index)
+        if residue in emitted_residues:
+            continue
+        emitted_residues.add(residue)
+        component_id = polymer.components[site.component_index].component_id
+        group = tuple(by_residue[residue])
+        if polymer.polymer_type == "protein":
+            representative_id = "CA" if component_id == "GLY" or residue in generated_residues else "CB"
+        elif component_id in {"DA", "DG", "A", "G"}:
+            representative_id = "C4"
+        elif component_id in {"DC", "DT", "C", "U"}:
+            representative_id = "C2"
+        else:
+            representative_id = "C1'"
+        representative = next(atom_site for atom_site in group if atom_site.atom_id == representative_id)
+        groups.append(group)
+        residues.append(residue)
+        components.append(component_id)
+        representatives.append(representative)
+    return tuple(groups), tuple(residues), tuple(components), tuple(representatives)
 
 
-def _standard_distogram_atom(residue_name: str) -> str:
-    r"""
-    Return the AF3 distogram representative-atom name for a standard residue.
+def _hotspots(
+    conditions: tuple[PlacementSpec | Hotspot, ...],
+    selected_residues: frozenset[tuple[str, int]],
+    token_residues: tuple[tuple[str, int] | None, ...],
+) -> frozenset[tuple[str, int]]:
+    r"""Collect the released per-token hotspot target residues (frozen §3.7.4 ``Hotspot``).
 
-    Applies the AF3 SI 4.4 rule: glycine uses ``CA``, purines ``C4``, pyrimidines
-    ``C2``, unknown nucleotides ``C1'``, other three-letter protein residues ``CB``,
-    and everything else falls back to ``C1'``.
-
-    Args:
-        residue_name: Upper-cased residue name.
-
-    Returns:
-        The representative atom name.
-
-    Examples:
-        >>> _standard_distogram_atom("GLY")
-        'CA'
-        >>> _standard_distogram_atom("ALA")
-        'CB'
-        >>> _standard_distogram_atom("DA")
-        'C4'
+    The frozen :class:`~ofoldx.data.Hotspot` is single-sided and distance-free: ``residues``
+    name the EXISTING target residues to condition on and the generated partner is implicit
+    (the whole binder). Each named residue must be a materialized target
+    ``ComponentReference`` — a ``(instance_id, component_index)`` tuple present in the selected,
+    tokenized target — so a generated-binder endpoint (a bare ``placement_id`` / a
+    :class:`~ofoldx.data.SymbolicResidueSite` / a :class:`~ofoldx.data.SymbolicAtomSite`) is
+    rejected: PXDesign hotspots its target, not its binder. This mirrors the previous
+    two-sided ``Contact`` lowering (which required one all-existing target side); the cutoff
+    it validated-then-ignored is gone with the record.
     """
 
-    if residue_name == "GLY":
-        return "CA"
-    if residue_name in _PURINE_NAMES:
-        return "C4"
-    if residue_name in _PYRIMIDINE_NAMES:
-        return "C2"
-    if residue_name in _UNKNOWN_NUCLEOTIDE_NAMES:
-        return "C1'"
-    if len(residue_name) == 3:  # standard protein residue
-        return "CB"
-    return "C1'"
+    hotspots: set[tuple[str, int]] = set()
+    token_residue_set = {residue for residue in token_residues if residue is not None}
+    for condition in conditions:
+        if type(condition) is not Hotspot:
+            continue
+        for reference in condition.residues:
+            if type(reference) is not tuple:
+                raise ValueError(
+                    "PXDesign hotspot names an existing target residue (ComponentReference); "
+                    f"the generated binder is implicit and cannot be a hotspot: {reference!r}"
+                )
+            residue = cast(tuple[str, int], reference)
+            if residue not in selected_residues or residue not in token_residue_set:
+                raise ValueError(f"PXDesign hotspot residue is absent from the modeled target: {residue!r}")
+            hotspots.add(residue)
+    return frozenset(hotspots)
 
 
-def _select_atom_named(
-    structure: Structure,
-    atom_indices: tuple[int, ...],
-    target_name: str,
-    mask: Tensor,
-    fallback_index: int,
-) -> None:
-    r"""
-    Set the mask bit for the atom named ``target_name`` within a token, else the fallback.
-
-    Args:
-        structure: The parsed structure supplying atom names.
-        atom_indices: Atom indices belonging to the token.
-        target_name: Atom name to select.
-        mask: ``[N_atom]`` boolean mask mutated in place.
-        fallback_index: Atom index selected when no atom matches ``target_name``.
-    """
-
-    for atom_index in atom_indices:
-        if structure.atoms[atom_index].name == target_name:
-            mask[atom_index] = True
-            return
-    mask[fallback_index] = True
+def _component_reference(component: ChemicalComponent) -> dict[str, tuple[float, float, float]]:
+    return {
+        atom.atom_id: coordinate
+        for atom, coordinate in zip(component.atoms, component.reference_coordinates)
+        if coordinate is not None
+    }
 
 
-def _per_residue_hotspot(design_input: DesignInput) -> dict[tuple[str, int], bool]:
-    r"""
-    Reduce per-atom JSON hotspot flags to a per-residue mapping.
+def _reference_features(
+    system: MolecularSystem,
+    sites: tuple[AtomSite, ...],
+    generated_residues: frozenset[tuple[str, int]],
+) -> tuple[Tensor, Tensor, Tensor]:
+    glycine_coordinates = _component_reference(get_component("GLY"))
+    positions = torch.zeros(len(sites), 3, dtype=torch.float32)
+    mask = torch.zeros(len(sites), dtype=torch.bool)
+    spaces: dict[tuple[str, int | None], int] = {}
+    space_ids: list[int] = []
+    for row, site in enumerate(sites):
+        entity = system.entities[system.instances[site.instance_id]]
+        residue = (site.instance_id, site.component_index)
+        if type(entity) is not Molecule and residue in generated_residues:
+            coordinate = glycine_coordinates.get(site.atom_id)
+        else:
+            coordinate = _component_reference(entity.components[site.component_index]).get(site.atom_id)
+        if coordinate is not None:
+            positions[row] = torch.tensor(coordinate)
+            mask[row] = True
+        space: tuple[str, int | None] = (
+            (site.instance_id, None) if type(entity) is Molecule else (site.instance_id, site.component_index)
+        )
+        if space not in spaces:
+            spaces[space] = len(spaces)
+        space_ids.append(spaces[space])
+    space_id = torch.tensor(space_ids, dtype=torch.int64)
+    for value in range(len(spaces)):
+        selected = space_id == value
+        positions[selected] -= positions[selected].mean(dim=0)
+    return positions, mask, space_id
 
-    Args:
-        design_input: Parsed JSON design input with per-atom hotspot flags.
 
-    Returns:
-        A mapping from ``(chain_id, residue_number)`` to whether any of its atoms is a hotspot.
-    """
-
-    hotspot: dict[tuple[str, int], bool] = {}
-    for atom, flag in zip(design_input.structure.atoms, design_input.hotspot):
-        key = (atom.residue.chain_id, int(atom.residue.residue_number))
-        hotspot[key] = hotspot.get(key, False) or bool(flag)
-    return hotspot
-
-
-def _conditional_template(
-    fields: StructuralFields,
-    condition_token_mask: Tensor,
-    design_input: DesignInput | None,
+def _atom_features(
+    system: MolecularSystem,
+    sites: tuple[AtomSite, ...],
+    reference_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    r"""
-    Build the condition-condition distance-bin template over resolved condition tokens.
+    from rdkit.Chem import GetPeriodicTable
 
-    Condition coords come from the JSON ``coord_from_cif`` when available (so an unresolved condition
-    residue is excluded), otherwise from the structure's target coords.
+    periodic_table = GetPeriodicTable()
+    element = torch.zeros(len(sites), 128)
+    names = torch.zeros(len(sites), 4, 64)
+    charges = torch.zeros(len(sites), dtype=torch.float32)
+    for row, site in enumerate(sites):
+        atom = system.atom(site)
+        element[row, int(periodic_table.GetAtomicNumber(atom.element)) - 1] = 1.0
+        charges[row] = atom.formal_charge
+        if len(site.atom_id) > 4:
+            raise ValueError(f"PXDesign cannot encode atom name longer than four characters: {site.atom_id!r}")
+        for column, character in enumerate(site.atom_id.ljust(4)):
+            index = ord(character) - 32
+            if not 0 <= index < 64:
+                raise ValueError(f"PXDesign cannot encode atom-name character {character!r}")
+            names[row, column, index] = 1.0
+    features = torch.cat((reference_mask.float().unsqueeze(-1), element, names.flatten(-2)), dim=-1)
+    return features, charges
 
-    Args:
-        fields: Structural fields carrying token/atom mappings and target coords.
-        condition_token_mask: ``[N_token]`` mask marking condition tokens.
-        design_input: Optional parsed JSON design input carrying condition coords.
 
-    Returns:
-        A ``(conditional_templ, conditional_templ_mask)`` pair of ``[N_token, N_token]`` tensors:
-        distance-bin ids (long) and the boolean mask of conditioned pairs.
+def _token_indices(
+    system: MolecularSystem,
+    token_sites: tuple[tuple[AtomSite, ...], ...],
+    token_residues: tuple[tuple[str, int] | None, ...],
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    chain = {instance_id: index for index, instance_id in enumerate(system.instances)}
+    entity = {value: index for index, value in enumerate(sorted(set(system.instances.values())))}
+    seen: dict[str, int] = {}
+    symmetry: dict[str, int] = {}
+    for instance_id, entity_id in system.instances.items():
+        symmetry[instance_id] = seen.get(entity_id, 0)
+        seen[entity_id] = symmetry[instance_id] + 1
+    chain_values = []
+    entity_values = []
+    symmetry_values = []
+    residue_values = []
+    for group, residue in zip(token_sites, token_residues):
+        instance_id = group[0].instance_id
+        entity_id = system.instances[instance_id]
+        chain_values.append(chain[instance_id])
+        entity_values.append(entity[entity_id])
+        symmetry_values.append(symmetry[instance_id])
+        residue_values.append(0 if residue is None else residue[1])
+    return tuple(
+        torch.tensor(values, dtype=torch.int64)
+        for values in (chain_values, entity_values, symmetry_values, residue_values)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Binder ⇄ placement-core projection (folded from projection.py;
+# CONTIG_GENERALITY_AUDIT §3, "pxdesign").
+#
+# The frozen §3.7 placement core (``PlacementSpec``) is the shared canonical form; each
+# family keeps its own native surface and needs a lossless declaration-side projection
+# to/from it. PXDesign's native surface is a *target-and-binder* problem: a fixed protein
+# binder of one length designed against a set of existing target chains.
+#
+# * ``from_binder`` lowers the native binder problem to a ``PlacementSpec``: every target
+#   chain becomes a declaration group of ordered ``ExistingSpan`` values (a discontinuous
+#   crop → several half-open spans), and the binder becomes ONE trailing ``GeneratedSegment``
+#   group (the released processor requires the binder last).
+# * ``to_binder`` recovers ``(binder_length, target chains, count)`` from a ``PlacementSpec``.
+#
+# **Named losses (both by construction, per the audit):**
+#
+# * ``count`` (N symmetric copies) has **no home in the declaration** — it is a family
+#   realization argument (parallel to how length re-homes), recovered only from a realized
+#   ``placement_map`` where one declared binder placement spans N occurrences. A bare
+#   ``PlacementSpec`` therefore always round-trips to ``count == 1``; ``from_binder`` accepts
+#   ``count`` for API symmetry but deliberately does NOT encode it.
+# * The released ``PxDesignProcessor`` narrows *further* than the core: it consumes one
+#   complete span per target chain and no interleaved binder. The core (and this projection)
+#   represent a discontinuous crop losslessly; the released path simply chooses not to
+#   consume it yet. So ``from_binder`` can emit a multi-span target that round-trips through
+#   ``to_binder`` even though the processor would reject it — an impl narrowing, not a core
+#   loss.
+# ---------------------------------------------------------------------------
+
+#: One target chain: its source ``instance_id`` and an ordered list of half-open
+#: ``[start, stop)`` crop intervals. A single complete-chain crop is the common (released)
+#: case; several intervals express a discontinuous crop the core represents losslessly.
+TargetChain = tuple[str, list[tuple[int, int]]]
+
+_BINDER_LABEL = "binder"
+
+
+def from_binder(
+    binder_length: int,
+    target: Sequence[TargetChain] = (),
+    *,
+    count: int = 1,
+) -> PlacementSpec:
+    r"""Project a native target-and-binder problem onto the shared :data:`PlacementSpec`.
+
+    ``binder_length`` fixes the single generated protein binder (``min == max``). Each
+    ``target`` chain becomes a declaration group of ordered :class:`~ofoldx.data.ExistingSpan`
+    values; the binder is appended as the trailing generated group. ``count`` is a family
+    realization argument and is validated but NOT stored (see the module named-loss note).
     """
 
-    num_tokens = fields.num_tokens
-    conditional_templ = torch.zeros(num_tokens, num_tokens, dtype=torch.long)
-    conditional_templ_mask = torch.zeros(num_tokens, num_tokens, dtype=torch.bool)
-    if num_tokens == 0:
-        return conditional_templ, conditional_templ_mask
+    if binder_length < 0:
+        raise ValueError("binder_length must be non-negative")
+    if count < 1:
+        raise ValueError("count (symmetric copies) must be a positive integer")
 
-    rep_index = fields.token_to_rep_atom.to(dtype=torch.long)
-    if design_input is not None and design_input.coord_from_cif.shape[0] == fields.num_atoms:
-        atom_coords = torch.from_numpy(design_input.coord_from_cif.astype(np.float32))
-        atom_resolved = torch.from_numpy(design_input.coord_from_cif_is_resolved.astype(np.bool_))
-    else:
-        atom_coords = fields.target_positions
-        atom_resolved = fields.target_mask.to(dtype=torch.bool)
-    rep_coords = atom_coords[rep_index]
-    rep_mask = atom_resolved[rep_index]
-    valid = condition_token_mask & rep_mask
-    if not bool(valid.any()):
-        return conditional_templ, conditional_templ_mask
+    placement: PlacementSpec = {}
+    for instance_id, crops in target:
+        crop_intervals = tuple(crops)
+        if not crop_intervals:
+            raise ValueError(f"target chain {instance_id!r} needs at least one crop interval")
+        if instance_id in placement:
+            raise ValueError(f"target instance {instance_id!r} declared more than once")
+        group: dict[str, ExistingSpan] = {}
+        for start, stop in crop_intervals:
+            if not 0 <= start < stop:
+                raise ValueError(
+                    f"target chain {instance_id!r} crop must be a half-open [start, stop) with "
+                    f"0 <= start < stop; got ({start}, {stop})"
+                )
+            placement_id = instance_id if len(crop_intervals) == 1 else f"{instance_id}#{start}_{stop}"
+            if placement_id in group:
+                raise ValueError(f"target chain {instance_id!r} has a duplicate crop {(start, stop)!r}")
+            group[placement_id] = ExistingSpan(instance_id, start, stop)
+        placement[instance_id] = group
 
-    coords = rep_coords[valid]
-    distances = torch.cdist(coords, coords)
-    boundaries = torch.linspace(start=2.0, end=22.0, steps=63, dtype=distances.dtype)
-    bins = torch.sum(distances.unsqueeze(dim=-1) > boundaries, dim=-1).to(dtype=torch.long)
-    indices = torch.nonzero(valid, as_tuple=True)[0]
-    row, col = torch.meshgrid(indices, indices, indexing="ij")
-    conditional_templ[row, col] = bins
-    conditional_templ_mask[row, col] = True
-    return conditional_templ, conditional_templ_mask
+    existing_ids = {placement_id for chain in placement.values() for placement_id in chain}
+    binder_label = _BINDER_LABEL
+    while binder_label in placement or binder_label in existing_ids:
+        binder_label += "_"
+    placement[binder_label] = {binder_label: GeneratedSegment("protein", binder_length, binder_length)}
+
+    # Enforce the frozen construction-time invariant (globally-unique placement_id).
+    validate_placement(placement)
+    return placement
 
 
-def _normalize_residue_set(values: Iterable[Sequence[Any]] | Mapping[Any, Any]) -> set[tuple[str, int]]:
-    r"""
-    Normalize residue selectors into a set of ``(chain_id, residue_number)`` tuples.
+def to_binder(placement: PlacementSpec) -> tuple[int, list[TargetChain], int]:
+    r"""Recover ``(binder_length, target chains, count)`` from a :data:`PlacementSpec`.
 
-    Args:
-        values: Iterable of selectors, or a mapping of ``chain_id -> residue_number`` as produced by
-            ``chanfig`` for saved selector lists.
-
-    Returns:
-        A set of ``(str chain_id, int residue_number)`` tuples.
-
-    Raises:
-        ValueError: If any selector has fewer than two elements.
-
-    Examples:
-        >>> sorted(_normalize_residue_set([("A", 10), ("B", "20")]))
-        [('A', 10), ('B', 20)]
+    The trailing declaration group must be exactly one fixed-length protein
+    :class:`~ofoldx.data.GeneratedSegment` (the binder); every earlier group must contain
+    only :class:`~ofoldx.data.ExistingSpan` values addressing one source instance. ``count``
+    is not declaration-recoverable and is always returned as ``1`` (module named-loss note).
     """
 
-    normalized: set[tuple[str, int]] = set()
-    if isinstance(values, Mapping):
-        for chain_id, residue_number in values.items():
-            normalized.add((str(chain_id), int(residue_number)))
-        return normalized
-    for value in values:
-        if isinstance(value, Mapping):
-            for chain_id, residue_number in value.items():
-                normalized.add((str(chain_id), int(residue_number)))
-            continue
-        if len(value) < 2:
-            raise ValueError("residue selectors must contain at least chain id and residue number")
-        normalized.add((str(value[0]), int(value[1])))
-    return normalized
+    validate_placement(placement)
+    groups = list(placement.items())
+    if not groups:
+        raise ValueError("an empty PlacementSpec declares no binder")
 
+    _, binder_placements = groups[-1]
+    binder_values = tuple(binder_placements.values())
+    if len(binder_values) != 1 or type(binder_values[0]) is not GeneratedSegment:
+        raise ValueError("the trailing PlacementSpec group must be exactly one generated binder")
+    binder = binder_values[0]
+    if binder.polymer_type != "protein":
+        raise ValueError("PXDesign binder must be a protein GeneratedSegment")
+    if binder.min_length != binder.max_length:
+        raise ValueError("PXDesign binder must have one fixed length (min_length == max_length)")
+    binder_length = binder.max_length
 
-def _backbone_atom_indices(fields: StructuralFields, structure: Structure) -> Tensor:
-    r"""
-    Return the ``N/CA/C/O`` backbone atom indices per token for ProteinMPNN.
+    targets: list[TargetChain] = []
+    for group, placements in groups[:-1]:
+        instance_id: str | None = None
+        crops: list[tuple[int, int]] = []
+        for part in placements.values():
+            if type(part) is not ExistingSpan:
+                raise ValueError(f"target group {group!r} must contain only ExistingSpan values")
+            if instance_id is None:
+                instance_id = part.instance_id
+            elif part.instance_id != instance_id:
+                raise ValueError(f"target group {group!r} must address one source instance")
+            crops.append((part.start, part.stop))
+        targets.append((instance_id, crops))  # type: ignore[arg-type]
 
-    Args:
-        fields: Structural fields carrying the atom-to-token mapping and token count.
-        structure: The parsed structure supplying atom names.
-
-    Returns:
-        A ``[N_token, 4]`` long tensor of atom indices in ``(N, CA, C, O)`` slot order,
-        with ``-1`` marking a missing backbone atom.
-    """
-
-    atom_name_to_slot = {"N": 0, "CA": 1, "C": 2, "O": 3}
-    indices = torch.full((fields.num_tokens, 4), -1, dtype=torch.long)
-    for atom_index, atom in enumerate(structure.atoms):
-        slot = atom_name_to_slot.get(str(atom.name).strip().upper())
-        if slot is None:
-            continue
-        token_index = int(fields.atom_to_token_values[atom_index])
-        if 0 <= token_index < fields.num_tokens:
-            indices[token_index, slot] = atom_index
-    return indices
-
-
-def _config_scalar(config: Any, name: str, default: Any) -> Any:
-    r"""
-    Read a scalar field from a config object or mapping, with a default.
-
-    Treats an empty-mapping value (a chanfig placeholder) as absent and returns the default.
-
-    Args:
-        config: A config object, mapping, or ``None``.
-        name: Field/key to read.
-        default: Value returned when the field is absent or an empty mapping.
-
-    Returns:
-        The field value, or ``default``.
-
-    Examples:
-        >>> _config_scalar({"single_size": 128}, "single_size", 0)
-        128
-        >>> _config_scalar(None, "single_size", 384)
-        384
-    """
-
-    if config is None:
-        return default
-    if isinstance(config, Mapping):
-        value = config.get(name, default)
-    else:
-        value = getattr(config, name, default)
-    if isinstance(value, Mapping) and not value:
-        return default
-    return value
-
-
-__all__ = ["PxDesignProcessor"]
+    # count is a realization argument with no home in the declaration; a bare PlacementSpec
+    # declares one binder placement, so it recovers as 1.
+    return binder_length, targets, 1

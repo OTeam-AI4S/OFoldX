@@ -1,386 +1,993 @@
-r"""
-RfDiffusion input processing.
-
-Holds the structure-to-[`RfDiffusionInput`][] processor, the RoseTTAFold atom14 PDB file readers
-([`parse_pdb`][] / [`parse_pdb_lines`][] / [`read_pickle`][]), the PDB featurizer
-([`process_target`][]), and the config spec-string parsers (``_parse_*``) the sampler consumes.
-The readers resolve the atom14 layout from `.chemical`, so they are RfDiffusion-specific and live
-with the model family rather than in the shared [`io`][ofoldx.io].
-"""
+r"""Lower canonical molecular inputs and Conditions for RFdiffusion."""
 
 from __future__ import annotations
 
-import pickle
-from collections.abc import Iterable, Sequence
+import math
+from collections.abc import Mapping, Sequence
+from os import PathLike
 from pathlib import Path
-from typing import Any
 
-import numpy as np
 import torch
+import torch.nn.functional as F
+from torch import Tensor
+from typing_extensions import Self
 
-from ...data.ccd import CcdProvider
-from ...processors.mixin import ProcessorMixin
-from ...processors.registry import PROCESSORS
-from ...processors.utils import _PROTEIN_RESIDUE_NAMES, StructureInput, structure_from_input, tokenize_structure
-from .chemical import ATOM14_NAMES, residue_token
-from .model import RfDiffusionInput
+# AllowedResidueIdentities stays shared: it is the frozen §3.7.1 identity record.
+from ...data.conditions import AllowedResidueIdentities
+from ...data.evidence import MSA, MSACollection, Template
+from ...data.molecular import (
+    AtomSite,
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+)
+from ...data.placement import (
+    InstanceIdAllocator,
+    PlacementMap,
+    PlacementSpec,
+    PlacementValue,
+)
+from ...data.placement import instance_of as derive_instance_of
+from ...data.placement import validate_placement
+from ...data.structure import Structure
+from ...io.structure import read_structure
+from .chemistry import ATOM14_NAMES, MASK_TOKEN, NUM2AA, residue_token
+from .config import RFdiffusionProcessorConfig
 
-PdbIndex = tuple[str, int]
-
-
-def parse_pdb(filename: str | Path, *, parse_hetatom: bool = False, ignore_het_h: bool = True) -> dict[str, Any]:
-    r"""
-    Parse a PDB file into RFdiffusion's atom14 target representation.
-
-    Thin file wrapper around [`parse_pdb_lines`][ofoldx.models.rfdiffusion.processor.parse_pdb_lines].
-
-    Args:
-        filename: Path to a PDB file.
-        parse_hetatom: Whether to also collect HETATM (ligand) records.
-        ignore_het_h: Whether to drop hydrogen HETATM atoms when ``parse_hetatom`` is set.
-
-    Returns:
-        The target dictionary described in
-        [`parse_pdb_lines`][ofoldx.models.rfdiffusion.processor.parse_pdb_lines].
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.processor import parse_pdb
-        >>> target = parse_pdb("target.pdb")  # doctest: +SKIP
-    """
-
-    with Path(filename).open() as handle:
-        return parse_pdb_lines(handle.readlines(), parse_hetatom=parse_hetatom, ignore_het_h=ignore_het_h)
-
-
-def parse_pdb_lines(
-    lines: Iterable[str],
-    *,
-    parse_hetatom: bool = False,
-    ignore_het_h: bool = True,
-) -> dict[str, Any]:
-    r"""
-    Parse PDB text lines into the official RFdiffusion inference target dictionary.
-
-    Reads one residue per CA record (first occurrence wins), then scatters each ATOM into its atom14 slot for
-    the residue's amino-acid type. Missing atoms stay masked; their coords are zero-filled. Optionally collects
-    HETATM records for ligand-aware potentials.
-
-    Args:
-        lines: Iterable of raw PDB text lines.
-        parse_hetatom: Whether to also collect HETATM (ligand) records into ``xyz_het``/``info_het``.
-        ignore_het_h: Whether to drop hydrogen HETATM atoms when ``parse_hetatom`` is set.
-
-    Returns:
-        A dict with keys ``xyz`` (`[L, 14, 3]` coords), ``mask`` (`[L, 14]` atom-present mask), ``idx``
-        (residue numbers), ``seq`` (residue ids), and ``pdb_idx`` (``(chain, number)`` pairs); plus
-        ``xyz_het``/``info_het`` when ``parse_hetatom`` is set.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.processor import parse_pdb_lines
-        >>> lines = [
-        ...     "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N",
-        ...     "ATOM      2  CA  ALA A   1       1.000   0.000   0.000  1.00  0.00           C",
-        ... ]
-        >>> target = parse_pdb_lines(lines)
-        >>> target["xyz"].shape
-        (1, 14, 3)
-        >>> target["pdb_idx"]
-        [('A', 1)]
-    """
-
-    line_list = list(lines)
-    pdb_idx: list[PdbIndex] = []
-    residue_names: list[str] = []
-    seen: set[PdbIndex] = set()
-    for line in line_list:
-        if line.startswith("ATOM") and line[12:16].strip() == "CA":
-            chain_id = line[21:22].strip()
-            residue_number = int(line[22:26].strip())
-            key = (chain_id, residue_number)
-            if key in seen:
-                continue
-            seen.add(key)
-            pdb_idx.append(key)
-            residue_names.append(line[17:20].strip().upper())
-
-    seq = np.asarray([residue_token(name) for name in residue_names], dtype=np.int64)
-    coords = np.full((len(pdb_idx), 14, 3), np.nan, dtype=np.float32)
-    index_lookup = {key: index for index, key in enumerate(pdb_idx)}
-    for line in line_list:
-        if not line.startswith("ATOM"):
-            continue
-        chain_id = line[21:22].strip()
-        residue_number = int(line[22:26].strip())
-        residue_idx = index_lookup.get((chain_id, residue_number))
-        if residue_idx is None:
-            continue
-        aa = seq[residue_idx]
-        atom_name = line[12:16].strip().upper()
-        atom_names = ATOM14_NAMES[int(aa)]
-        try:
-            atom_idx = atom_names.index(atom_name)
-        except ValueError:
-            continue
-        coords[residue_idx, atom_idx] = (
-            float(line[30:38]),
-            float(line[38:46]),
-            float(line[46:54]),
-        )
-
-    mask = ~np.isnan(coords[..., 0])
-    coords = np.nan_to_num(coords, nan=0.0)
-    out: dict[str, Any] = {
-        "xyz": coords,
-        "mask": mask,
-        "idx": np.asarray([residue_number for _chain, residue_number in pdb_idx], dtype=np.int64),
-        "seq": seq,
-        "pdb_idx": pdb_idx,
-    }
-    if parse_hetatom:
-        hetatm_coords: list[list[float]] = []
-        info_het: list[dict[str, Any]] = []
-        for line in line_list:
-            if not line.startswith("HETATM"):
-                continue
-            atom_type = line[76:78].strip()
-            if ignore_het_h and atom_type == "H":
-                continue
-            hetatm_coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
-            info_het.append(
-                {
-                    "idx": int(line[6:11]),
-                    "atom_id": line[12:16],
-                    "atom_type": atom_type,
-                    "name": line[17:20],
-                }
-            )
-        out["xyz_het"] = np.asarray(hetatm_coords, dtype=np.float32)
-        out["info_het"] = info_het
-    return out
+# Every record below is a family-owned RFdiffusion spatial/placement condition, re-homed
+# family-locally in .conditions after the data-model migration. §3.7.2 keeps the positive API
+# family-owned and still under investigation. The covalent-link and target-conditioning records
+# are now the FROZEN §3.7.4 core imported through .conditions: the frozen ``SymbolicBond`` (the
+# covalent link; the processor collapses a terminal N->C bond to ``cyclic_mask``), the frozen
+# distance-free single-sided ``Hotspot`` (owner verdict D3; realized as ``hotspot_mask``), and the
+# frozen geometric ``Contact`` (carried to the layout for the family scorer; no released input-side
+# potential). The requested covalent link is spelled directly as ``SymbolicBond`` (no alias).
+from .model import (
+    Contact,
+    Coordination,
+    Distance,
+    ExistingSpan,
+    GeneratedSegment,
+    Hotspot,
+    PointGroupSymmetry,
+    RadiusOfGyration,
+    ReferenceCoordinates,
+    RFdiffusionInput,
+    RFdiffusionLayout,
+    RFdiffusionPlacements,
+    SecondaryStructure,
+    SubstrateInteraction,
+    SymbolicAtomSite,
+    SymbolicBond,
+    SymbolicResidueSite,
+    symbolic_residue_aliases,
+)
 
 
-def read_pickle(path: str | Path) -> object:
-    r"""
-    Load a pickled object from disk.
+class RFdiffusionProcessor:
+    r"""Lower one canonical design problem to RFdiffusion tensors."""
 
-    Used to read the cached IGSO3 schedule tables the sampler precomputes.
-
-    Args:
-        path: Path to a pickle file.
-
-    Returns:
-        The unpickled object.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.processor import read_pickle
-        >>> value = read_pickle("igso3_schedule.pkl")  # doctest: +SKIP
-    """
-
-    with Path(path).open("rb") as handle:
-        return pickle.load(handle)
-
-
-@PROCESSORS.register("rfdiffusion")
-class RfDiffusionProcessor(ProcessorMixin):
-    r"""
-    Convert structure inputs into the RfDiffusion backbone-design schema.
-
-    Args:
-        preserve_input_motif: If ``True``, mark all input residues as motif constraints.
-        hotspot_residues: Optional ``(chain_id, residue_number)`` residue ids to mark as hotspots.
-        ccd: Accepted for API symmetry with structure processors; currently unused.
-    """
-
-    input_class = RfDiffusionInput
+    config_class = RFdiffusionProcessorConfig
 
     def __init__(
         self,
+        config: RFdiffusionProcessorConfig | None = None,
         *,
-        preserve_input_motif: bool = True,
-        hotspot_residues: tuple[tuple[str, int], ...] = (),
-        ccd: CcdProvider | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
-        self.preserve_input_motif = preserve_input_motif
-        self.hotspot_residues = tuple(
-            (str(chain_id), int(residue_number)) for chain_id, residue_number in hotspot_residues
-        )
-        self._ccd = ccd
+        config = RFdiffusionProcessorConfig() if config is None else config
+        self.config = config
+        self.device = torch.device("cpu" if device is None else device)
+        self.dtype = torch.float32 if dtype is None else dtype
 
-    def __call__(self, structure: StructureInput) -> RfDiffusionInput:
-        r"""
-        Tokenize a structure into a batched RfDiffusion input.
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Update runtime placement in place and return this Processor."""
 
-        Reads one token per residue, records the representative-atom (CA) coords as the motif positions, and
-        derives the token/motif/design masks from ``preserve_input_motif``. The returned tensors carry a
-        leading batch dimension of 1.
+        if device is not None:
+            self.device = torch.device(device)
+        if dtype is not None:
+            self.dtype = dtype
+        return self
 
-        Args:
-            structure: A structure input accepted by
-                [`structure_from_input`][ofoldx.processors.utils.structure_from_input] (path, parsed
-                structure, or mapping).
+    def __call__(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
+        *,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template | str | PathLike[str]] = (),
+        conditions: Sequence[
+            AllowedResidueIdentities
+            | Contact
+            | Hotspot
+            | RFdiffusionPlacements
+            | Coordination
+            | Distance
+            | PointGroupSymmetry
+            | RadiusOfGyration
+            | ReferenceCoordinates
+            | SecondaryStructure
+            | SubstrateInteraction
+            | SymbolicBond
+        ] = (),
+        inpaint_sequence: Sequence[ComponentReference] = (),
+        length: tuple[int, int] | None = None,
+        timestep: int = 50,
+    ) -> RFdiffusionInput:
+        r"""Lower base, complex, inpainting, active-site, or fold conditioning.
 
-        Returns:
-            An [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput] batched to size 1.
-
-        Raises:
-            ValueError: If the structure yields no residue tokens.
-
-        Examples:
-            >>> from ofoldx import AutoProcessor  # doctest: +SKIP
-            >>> processor = AutoProcessor.from_pretrained("oteam/rfdiffusion")  # doctest: +SKIP
-            >>> batch = processor("target.cif")  # doctest: +SKIP
+        ``length`` is the family-owned §3.7 topology argument (RFdiffusion ``ContigMap.length``):
+        the combined generated-length bounds across all inpaint chains, excluding receptor
+        ``ExistingSpan`` rows. It is a concrete family operation argument (distinct from ODesign
+        per-chain lengths and BoltzGen ``total_len``), NOT a shared placement-core invariant; it is
+        threaded onto :class:`RFdiffusionLayout` so ``_sample_variable_lengths`` can honor the
+        cross-segment total when drawing per-``GeneratedSegment`` lengths.
         """
 
-        parsed = structure_from_input(structure)
-        tokens = tokenize_structure(parsed)
-        if not tokens:
-            raise ValueError("RfDiffusion processing requires at least one residue token")
-        residues = tuple(token.residue for token in tokens)
-        chain_to_index = {chain_id: index for index, chain_id in enumerate(dict.fromkeys(r.chain_id for r in residues))}
-        residue_type = torch.tensor(
-            [_residue_type_id(parsed.atoms[token.atom_indices[0]].residue_name) for token in tokens],
-            dtype=torch.long,
-        )
-        motif_positions = torch.tensor(
-            [
-                [
-                    parsed.atoms[token.representative_atom_index].x,
-                    parsed.atoms[token.representative_atom_index].y,
-                    parsed.atoms[token.representative_atom_index].z,
-                ]
-                for token in tokens
-            ],
-            dtype=torch.float32,
-        )
-        token_mask = torch.ones(len(tokens), dtype=torch.bool)
-        motif_mask = torch.full((len(tokens),), self.preserve_input_motif, dtype=torch.bool)
-        design_mask = token_mask & ~motif_mask
-        return RfDiffusionInput(
-            token_mask=token_mask.unsqueeze(0),
-            residue_index=torch.tensor([residue.residue_number for residue in residues], dtype=torch.long).unsqueeze(0),
-            chain_index=torch.tensor(
-                [chain_to_index[residue.chain_id] for residue in residues], dtype=torch.long
-            ).unsqueeze(0),
-            residue_type=residue_type.unsqueeze(0),
-            motif_positions=motif_positions.unsqueeze(0),
-            motif_mask=motif_mask.unsqueeze(0),
-            design_mask=design_mask.unsqueeze(0),
-            sequence_tokens=residue_type.unsqueeze(0),
-        )
+        if msa is not None:
+            raise ValueError("RFdiffusion does not consume MSA evidence")
+        if length is not None:
+            if (
+                type(length) is not tuple
+                or len(length) != 2
+                or any(type(bound) is not int for bound in length)
+                or any(bound < 0 for bound in length)
+                or length[0] > length[1]
+            ):
+                raise ValueError("length must be a (min, max) tuple of non-negative ints with min <= max")
+        template_values = tuple(templates)
+        if len(template_values) > 1:
+            raise ValueError("RFdiffusion accepts at most one fold-conditioning Template")
+        if template_values and type(template_values[0]) is not Template:
+            raise TypeError("RFdiffusion fold conditioning requires an explicit Template with a canonical alignment")
+        if isinstance(input, str | PathLike):
+            input = read_structure(Path(input).expanduser())
+        if input is not None and type(input) not in (MolecularSystem, Structure):
+            raise TypeError("input must be a MolecularSystem, Structure, local path, or None")
+        if type(timestep) is not int or timestep <= 0:
+            raise ValueError("timestep must be a positive integer")
+        condition_values = tuple(conditions)
+        for index, condition in enumerate(condition_values):
+            if type(condition) not in (
+                AllowedResidueIdentities,
+                Contact,
+                Hotspot,
+                RFdiffusionPlacements,
+                Coordination,
+                Distance,
+                PointGroupSymmetry,
+                RadiusOfGyration,
+                ReferenceCoordinates,
+                SecondaryStructure,
+                SubstrateInteraction,
+                SymbolicBond,
+            ):
+                raise TypeError(f"conditions[{index}] is not a condition RFdiffusion can consume")
+            if type(condition) is AllowedResidueIdentities:
+                if len(condition.component_ids) != 1:
+                    raise ValueError(
+                        "RFdiffusion sequence conditioning represents one known residue identity or an "
+                        "unknown residue, not a set of alternative identities"
+                    )
+                component_id = next(iter(condition.component_ids))
+                if component_id not in NUM2AA[:MASK_TOKEN]:
+                    raise ValueError(
+                        "RFdiffusion AllowedResidueIdentities must name one residue in its released alphabet"
+                    )
+            if type(condition) is Distance and condition.intent != "soft":
+                raise ValueError(f"RFdiffusion consumes {type(condition).__name__} only with intent='soft'")
+            if type(condition) is ReferenceCoordinates and condition.intent != "hard":
+                raise ValueError("RFdiffusion consumes ReferenceCoordinates only with intent='hard'")
+            if type(condition) is PointGroupSymmetry and condition.intent != "hard":
+                raise ValueError("RFdiffusion PointGroupSymmetry must have intent='hard'")
 
-    def _processor_config(self) -> dict[str, object]:
-        r"""
-        Return the JSON-serializable processor configuration for saving.
+        system = input.system if type(input) is Structure else input
+        structure = input if type(input) is Structure else None
+        placements = tuple(condition for condition in condition_values if type(condition) is RFdiffusionPlacements)
+        if len(placements) > 1:
+            raise ValueError("RFdiffusion accepts exactly one RFdiffusionPlacements condition")
+        if sum(type(condition) is PointGroupSymmetry for condition in condition_values) > 1:
+            raise ValueError("RFdiffusion accepts at most one PointGroupSymmetry condition")
+        if placements:
+            placement = placements[0]
+        elif system is not None:
+            placements: dict[str, dict[str, ExistingSpan]] = {}
+            for instance_id, entity_id in system.instances.items():
+                entity = system.entities[entity_id]
+                if type(entity) is PolymerSequence and entity.polymer_type == "protein":
+                    placements[instance_id] = {instance_id: ExistingSpan(instance_id, 0, len(entity))}
+            placement = RFdiffusionPlacements(placements=placements) if placements else None
+        else:
+            placement = None
+        if placement is None:
+            raise ValueError("input=None requires one RFdiffusionPlacements condition with GeneratedSegment values")
+        # Frozen §3.7: every placement_id must be globally unique across the whole PlacementSpec.
+        validate_placement(placement.placements)
+        for group in placement.placements.values():
+            for part in group.values():
+                if type(part) is GeneratedSegment:
+                    if part.polymer_type != "protein":
+                        raise ValueError("RFdiffusion generates protein backbones only")
+                    if (
+                        template_values
+                        and template_values[0].target_instance_id is None  # type: ignore[union-attr]
+                        and part.min_length != part.max_length
+                    ):
+                        raise ValueError(
+                            "RFdiffusion fold-conditioned Template evidence requires fixed generated lengths"
+                        )
+                    continue
+                if system is None:
+                    raise ValueError("RFdiffusion ExistingSpan requires molecular input")
+                entity = system.entities[system.instances[part.instance_id]]
+                if type(entity) is not PolymerSequence or entity.polymer_type != "protein":
+                    raise ValueError("RFdiffusion ExistingSpan must reference a protein polymer")
 
-        Raises:
-            ValueError: If a custom CCD provider is attached, which cannot be serialized.
-        """
+        target_rows = _protein_rows(system)
+        target_residues = tuple(row[0] for row in target_rows)
+        target_index = {residue: index for index, residue in enumerate(target_residues)}
+        target_coords, target_mask = _atom14_target(structure, target_rows)
+        output_residues, output_instances = _resolve_placement(placement)
+        # Preserve the caller's family-owned (min, max) combined-length tuple (§3.7)
+        # before rebinding ``length`` to the concrete residue count below; the Layout
+        # carries the tuple, not the int.
+        combined_length = length
+        length = len(output_residues)
+        output_index = {reference: row for row, reference in enumerate(output_residues)}
+        output_index.update(
+            {alias: output_index[reference] for alias, reference in symbolic_residue_aliases(output_residues).items()}
+        )
+        inpainted_residues = set(inpaint_sequence)
+        if inpainted_residues:
+            if system is None:
+                raise ValueError("inpaint_sequence requires a molecular input system")
+            if not inpainted_residues <= set(output_index):
+                raise ValueError("inpaint_sequence residues must belong to the RFdiffusion output placement")
 
-        if self._ccd is not None:
-            raise ValueError("processors with custom CCD providers cannot be saved")
-        return {
-            "preserve_input_motif": self.preserve_input_motif,
-            "hotspot_residues": [list(value) for value in self.hotspot_residues],
+        cyclic_mask = torch.zeros(length, dtype=torch.bool)
+        for condition in condition_values:
+            if type(condition) is not SymbolicBond:
+                continue
+            instance_id = terminal_cyclization_instance(
+                condition,
+                output_index,
+                output_instances,
+            )
+            cyclic_mask |= torch.tensor([value == instance_id for value in output_instances])
+
+        reference_sites = {
+            site
+            for condition in condition_values
+            if type(condition) is ReferenceCoordinates
+            for site in condition.sites
         }
+        if any(
+            type(system.entities[system.instances[site.instance_id]]) is Molecule  # type: ignore[union-attr]
+            for site in reference_sites
+        ):
+            raise ValueError("RFdiffusion ReferenceCoordinates must identify protein residue atoms")
+        referenced_residues = {
+            (site.instance_id, site.component_index)
+            for site in reference_sites
+            if type(system.entities[system.instances[site.instance_id]]) is not Molecule  # type: ignore[union-attr]
+        }
+        for instance_id, component_index in referenced_residues:
+            if (instance_id, component_index) not in output_index:
+                raise ValueError("ReferenceCoordinates sites must belong to an RFdiffusion output residue")
+            backbone = {
+                site.atom_id
+                for site in reference_sites
+                if site.instance_id == instance_id and site.component_index == component_index
+            }
+            if not {"N", "CA", "C"} <= backbone:
+                raise ValueError(
+                    "RFdiffusion ReferenceCoordinates works at residue granularity and requires N/CA/C "
+                    f"for {instance_id}:{component_index}"
+                )
+        fixed_structure = torch.tensor(
+            [
+                type(reference) is tuple
+                and any(
+                    site.instance_id == reference[0] and site.component_index == reference[1]
+                    for site in reference_sites
+                )
+                for reference in output_residues
+            ],
+            dtype=torch.bool,
+        )
+        guided_atoms: list[AtomSite | SymbolicAtomSite] = []
+        for condition in condition_values:
+            if type(condition) is Coordination:
+                guided_atoms.extend(
+                    reference
+                    for reference in (*condition.side_a, *condition.side_b)
+                    if type(reference) in (AtomSite, SymbolicAtomSite)
+                )
+            elif (type(condition) is Distance and condition.intent == "soft") or type(condition) is SymbolicBond:
+                guided_atoms.extend((condition.site_a, condition.site_b))
+        structure_index = {} if structure is None else {site: index for index, site in enumerate(structure.sites)}
+        for site in guided_atoms:
+            if type(site) is SymbolicAtomSite:
+                if site.atom_id not in {"N", "CA", "C"}:
+                    raise ValueError("RFdiffusion guidance supports N/CA/C on generated residues")
+                continue
+            residue = (
+                None
+                if type(system.entities[system.instances[site.instance_id]]) is Molecule  # type: ignore[union-attr]
+                else (site.instance_id, site.component_index)
+            )
+            row = None if residue is None else output_index.get(residue)
+            if row is not None and site.atom_id in {"N", "CA", "C"}:
+                continue
+            if row is not None:
+                entity = system.entities[system.instances[site.instance_id]]  # type: ignore[union-attr]
+                atom_names = ATOM14_NAMES[residue_token(entity.components[site.component_index].component_id)]
+                if site.atom_id not in atom_names or not bool(fixed_structure[row]):
+                    raise ValueError("RFdiffusion guidance supports sidechain/O atoms only on fixed protein residues")
+            source = structure_index.get(site)
+            if source is None or not bool(structure.coordinate_mask[source]):  # type: ignore[union-attr]
+                raise ValueError(f"RFdiffusion guidance atom lacks an observed coordinate: {site!r}")
+        external_guidance = [
+            site
+            for site in guided_atoms
+            if type(site) is AtomSite
+            and (
+                type(system.entities[system.instances[site.instance_id]]) is Molecule  # type: ignore[union-attr]
+                or (site.instance_id, site.component_index) not in output_index
+            )
+        ]
+        if external_guidance and not bool(fixed_structure.any()):
+            raise ValueError(
+                "guidance to atoms outside the RFdiffusion output requires fixed ReferenceCoordinates "
+                "to define their coordinate frame"
+            )
+        fixed_sequence = torch.tensor(
+            [type(reference) is tuple and reference not in inpainted_residues for reference in output_residues],
+            dtype=torch.bool,
+        )
+        tokens = torch.full((length,), MASK_TOKEN, dtype=torch.int64)
+        for row, reference in enumerate(output_residues):
+            if fixed_sequence[row]:
+                tokens[row] = residue_token(target_rows[target_index[reference]][1])
+        conditioned_tokens: dict[int, int] = {}
+        for condition in condition_values:
+            if type(condition) is not AllowedResidueIdentities:
+                continue
+            component_id = next(iter(condition.component_ids))
+            token = residue_token(component_id)
+            rows: list[int] = []
+            for target in condition.positions:
+                if type(target) is str:
+                    rows.extend(
+                        row
+                        for row, reference in enumerate(output_residues)
+                        if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                    )
+                else:
+                    rows.append(output_index[target])
+            for row in rows:
+                previous = conditioned_tokens.get(row)
+                if previous is not None and previous != token:
+                    raise ValueError("AllowedResidueIdentities conditions assign conflicting identities")
+                conditioned_tokens[row] = token
+                fixed_sequence[row] = True
+                tokens[row] = token
+
+        hotspots: set[tuple[str, int]] = set()
+        for condition in condition_values:
+            if type(condition) is not Hotspot:
+                continue
+            # Frozen §3.7.4 ``Hotspot`` is single-sided and distance-free (owner verdict D3): its
+            # ``residues`` name the EXISTING target residues to condition on and the generated binder
+            # partner is implicit (the whole design). RFdiffusion realizes them as the per-token
+            # ``hotspot_mask``; the released ppi head reads no cutoff, so ``Hotspot`` carries none.
+            for reference in condition.residues:
+                if type(reference) is not tuple or reference not in output_index:
+                    raise ValueError("RFdiffusion hotspot residues must be existing residues in the output placement")
+                hotspots.add(reference)
+        hotspot = torch.tensor([type(reference) is tuple and reference in hotspots for reference in output_residues])
+        if bool((hotspot & ~fixed_structure).any()):
+            raise ValueError("RFdiffusion hotspot residues must have fixed ReferenceCoordinates")
+
+        coords = torch.full((length, 14, 3), float("nan"))
+        for output_row, reference in enumerate(output_residues):
+            if type(reference) is not tuple:
+                continue
+            target_row = target_index[reference]
+            present = target_mask[target_row]
+            if fixed_structure[output_row]:
+                coords[output_row] = float("nan")
+                selected_atoms = {
+                    site.atom_id
+                    for site in reference_sites
+                    if site.instance_id == reference[0] and site.component_index == reference[1]
+                }
+                atom_names = ATOM14_NAMES[residue_token(target_rows[target_row][1])]
+                present = present & torch.tensor(
+                    [atom_name in selected_atoms for atom_name in atom_names],
+                    dtype=torch.bool,
+                )
+            coords[output_row, present] = target_coords[target_row, present]
+
+        for condition in condition_values:
+            if type(condition) is not SubstrateInteraction:
+                continue
+            external_atoms = [
+                site
+                for site in condition.substrate_atoms
+                if type(system.entities[system.instances[site.instance_id]]) is Molecule  # type: ignore[union-attr]
+                or (site.instance_id, site.component_index) not in output_index
+            ]
+            if external_atoms and not bool(fixed_structure.any()):
+                raise ValueError(
+                    "SubstrateInteraction with external atoms requires fixed ReferenceCoordinates to "
+                    "define the substrate frame"
+                )
+
+        secondary_structure, block_adjacency = _fold_features(
+            template_values[0] if template_values else None,
+            system,
+            output_residues,
+            output_instances,
+        )
+        secondary_labels = secondary_structure.argmax(dim=-1)
+        label_by_kind = {"helix": 0, "strand": 1, "loop": 2}
+        for condition in condition_values:
+            if type(condition) is not SecondaryStructure:
+                continue
+            rows: list[int] = []
+            for target in condition.targets:
+                if type(target) is str:
+                    rows.extend(
+                        row
+                        for row, reference in enumerate(output_residues)
+                        if type(reference) is SymbolicResidueSite and reference.placement_id == target
+                    )
+                else:
+                    rows.append(output_index[target])
+            row_tensor = torch.tensor(rows, dtype=torch.int64)
+            if bool(fixed_structure[row_tensor].any()):
+                raise ValueError("SecondaryStructure targets must be structure-inpainted, not fixed")
+            label = label_by_kind[condition.kind]
+            existing = secondary_labels[row_tensor]
+            if bool(((existing != 3) & (existing != label)).any()):
+                raise ValueError("SecondaryStructure contradicts template evidence")
+            secondary_labels[row_tensor] = label
+        secondary_structure = F.one_hot(secondary_labels, num_classes=4).to(torch.float32)
+        residue_indices: list[int] = []
+        chain_index = -1
+        previous_instance = None
+        chain_start = 0
+        for row, instance_id in enumerate(output_instances):
+            if instance_id != previous_instance:
+                chain_index += 1
+                chain_start = row
+                previous_instance = instance_id
+            residue_indices.append(200 * chain_index + row - chain_start)
+        residue_index = torch.tensor(residue_indices, dtype=torch.int64)
+        return RFdiffusionInput(
+            noisy_coords=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            sequence=F.one_hot(tokens, num_classes=22).to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            residue_index=residue_index.to(self.device).unsqueeze(0),
+            fixed_structure_mask=fixed_structure.to(self.device).unsqueeze(0),
+            fixed_sequence_mask=fixed_sequence.to(self.device).unsqueeze(0),
+            hotspot_mask=hotspot.to(self.device).unsqueeze(0),
+            cyclic_mask=cyclic_mask.to(self.device).unsqueeze(0),
+            secondary_structure=secondary_structure.to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            block_adjacency=block_adjacency.to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            timestep=torch.tensor([timestep], dtype=torch.int64, device=self.device),
+            layout=RFdiffusionLayout(
+                system=system,
+                structure=structure,
+                templates=template_values,  # type: ignore[arg-type]
+                conditions=condition_values,
+                output_residues=output_residues,
+                output_instance_ids=output_instances,
+                combined_length=combined_length,
+            ),
+        )
 
 
-def _residue_type_id(residue_name: str) -> int:
-    r"""Return the amino-acid type id for ``residue_name``; non-protein residues map to the unknown id (20)."""
+def _protein_rows(
+    system: MolecularSystem | None,
+) -> tuple[tuple[tuple[str, int], str], ...]:
+    if system is None:
+        return ()
+    rows: list[tuple[tuple[str, int], str]] = []
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if type(entity) is not PolymerSequence or entity.polymer_type != "protein":
+            continue
+        rows.extend(((instance_id, index), component.component_id) for index, component in enumerate(entity.components))
+    return tuple(rows)
 
-    if residue_name not in _PROTEIN_RESIDUE_NAMES:
-        return 20
-    return _PROTEIN_ORDER[residue_name]
+
+def _atom14_target(
+    structure: Structure | None,
+    rows: tuple[tuple[tuple[str, int], str], ...],
+) -> tuple[Tensor, Tensor]:
+    coords = torch.zeros((len(rows), 14, 3), dtype=torch.float32)
+    mask = torch.zeros((len(rows), 14), dtype=torch.bool)
+    if structure is None:
+        return coords, mask
+    source_index = {site: index for index, site in enumerate(structure.sites)}
+    source_coordinates = torch.tensor(structure.coordinates, dtype=torch.float32)
+    for row_index, (residue, component_id) in enumerate(rows):
+        atom_names = ATOM14_NAMES[residue_token(component_id)]
+        for atom_index, atom_name in enumerate(atom_names):
+            if atom_name is None:
+                continue
+            source = source_index.get(AtomSite(residue[0], residue[1], atom_name))
+            if source is None or not bool(structure.coordinate_mask[source]):
+                continue
+            coords[row_index, atom_index] = source_coordinates[source]
+            mask[row_index, atom_index] = True
+    return coords, mask
 
 
-_PROTEIN_ORDER = {name: index for index, name in enumerate(sorted(_PROTEIN_RESIDUE_NAMES))}
+def _resolve_placement(
+    placement: RFdiffusionPlacements,
+) -> tuple[
+    tuple[tuple[str, int] | SymbolicResidueSite, ...],
+    tuple[str, ...],
+]:
+    residues: list[tuple[str, int] | SymbolicResidueSite] = []
+    instance_ids: list[str] = []
+    # Frozen §3.7 canonical realized-instance-id convention (W6 caveat b): mint the realized
+    # OUTPUT instance ids with the shared `InstanceIdAllocator`, walking declaration groups in
+    # order and calling `allocate()` once per realized output chain with >=1 occurrence — the
+    # canonical `chain_{n}` (uniform, 0-based, no family prefix). A declaration group that
+    # realizes to zero residues mints no chain and consumes no index. Identical to the
+    # post-sample re-lowering in `RFdiffusionModel._sample_variable_lengths`. Numerically inert:
+    # `residue_index` is computed from chain boundaries below, not from this id string.
+    allocator = InstanceIdAllocator()
+    for group in placement.placements.values():
+        group_residues: list[tuple[str, int] | SymbolicResidueSite] = []
+        for placement_id, part in group.items():
+            if type(part) is ExistingSpan:
+                references = [(part.instance_id, index) for index in range(part.start, part.stop)]
+            else:
+                # Processor lowering is deterministic. Variable lengths are sampled by
+                # RFdiffusionModel.design, where the user RNG is available.
+                references = [SymbolicResidueSite(placement_id, index) for index in range(part.min_length)]
+            group_residues.extend(references)
+        if not group_residues:
+            continue  # zero-length declaration group mints no realized chain, consumes no index
+        instance_id = allocator.allocate()
+        residues.extend(group_residues)
+        instance_ids.extend([instance_id] * len(group_residues))
+    return tuple(residues), tuple(instance_ids)
 
 
-def process_target(
-    pdb_path: str | Path,
+def _fold_features(
+    template: Template | None,
+    system: MolecularSystem | None,
+    output_residues: tuple[tuple[str, int] | SymbolicResidueSite, ...],
+    output_instances: tuple[str, ...],
+) -> tuple[Tensor, Tensor]:
+    length = len(output_residues)
+    if template is None:
+        secondary = F.one_hot(torch.full((length,), 3), num_classes=4).to(torch.float32)
+        adjacency = F.one_hot(torch.full((length, length), 2), num_classes=3).to(torch.float32)
+        return secondary, adjacency
+    if template.target_instance_id is not None:
+        if system is None:
+            raise ValueError("Template.target_instance_id requires a molecular input system")
+        if system.entities[system.instances[template.target_instance_id]] != template.target:
+            raise ValueError("Template.target does not match target_instance_id in the input system")
+
+    generated_rows = [row for row, reference in enumerate(output_residues) if type(reference) is SymbolicResidueSite]
+    generated_target_rows = generated_rows if template.target_instance_id is None else []
+    if generated_target_rows and len(generated_target_rows) != len(template.target):
+        raise ValueError(
+            "RFdiffusion fold conditioning requires the generated scaffold length to match Template.target"
+        )
+    if len({output_instances[row] for row in generated_target_rows}) > 1:
+        raise ValueError("one Template.target cannot describe multiple generated chains")
+
+    target_index_by_output: dict[int, int] = {}
+    if generated_target_rows:
+        target_index_by_output.update({row: target_index for target_index, row in enumerate(generated_target_rows)})
+    if template.target_instance_id is not None:
+        target_index_by_output.update(
+            {
+                row: reference[1]
+                for row, reference in enumerate(output_residues)
+                if type(reference) is tuple and reference[0] == template.target_instance_id
+            }
+        )
+    if not target_index_by_output:
+        raise ValueError("Template.target does not identify any RFdiffusion output residue")
+
+    alignment = dict(template.alignment)
+    template_entity = template.structure.system.entities[
+        template.structure.system.instances[template.template_instance_id]
+    ]
+    mapped: list[tuple[int, int, int]] = []
+    for output_row, target_index in sorted(target_index_by_output.items()):
+        template_index = alignment.get(target_index)
+        if template_index is None:
+            continue
+        mapped.append((output_row, target_index, template_index))
+    if not mapped:
+        raise ValueError("Template.alignment does not cover any RFdiffusion output residue")
+    template_rows = tuple(
+        (
+            (template.template_instance_id, template_index),
+            component.component_id,
+        )
+        for template_index, component in enumerate(template_entity.components)
+    )
+    template_coords, template_mask = _atom14_target(template.structure, template_rows)
+    template_indices = torch.tensor([value[2] for value in mapped], dtype=torch.int64)
+    coords = template_coords[template_indices]
+    mask = template_mask[template_indices]
+    if not bool(mask[:, :3].all()):
+        raise ValueError("RFdiffusion Template requires complete aligned N/CA/C coordinates")
+
+    template_labels = torch.full((len(template_rows),), 2, dtype=torch.int64)
+    observed_backbone = template_mask[:, :3].all(dim=-1)
+    start = 0
+    while start < len(template_rows):
+        if not bool(observed_backbone[start]):
+            start += 1
+            continue
+        stop = start + 1
+        while stop < len(template_rows) and bool(observed_backbone[stop]):
+            stop += 1
+        template_labels[start:stop] = rfdiffusion_secondary_structure(template_coords[start:stop, 1])
+        start = stop
+    secondary_labels = torch.full((length,), 3, dtype=torch.int64)
+    output_rows = torch.tensor([value[0] for value in mapped], dtype=torch.int64)
+    secondary_labels[output_rows] = template_labels[template_indices]
+    secondary = F.one_hot(secondary_labels, num_classes=4).to(torch.float32)
+    nitrogen, calpha, carbon = coords[:, :3].unbind(dim=1)
+    ca_to_n = calpha - nitrogen
+    c_to_ca = carbon - calpha
+    cbeta = -0.57910144 * torch.cross(ca_to_n, c_to_ca, dim=-1) + 0.5689693 * ca_to_n - 0.5441217 * c_to_ca + calpha
+    distances = torch.cdist(cbeta, cbeta)
+    mapped_adjacent = distances < 6.0
+    mapped_adjacent.fill_diagonal_(False)
+    adjacent = torch.zeros((length, length), dtype=torch.bool)
+    adjacent[output_rows[:, None], output_rows[None, :]] = mapped_adjacent
+    block = torch.zeros((length, length), dtype=torch.int64)
+    segments: list[tuple[int, int, int]] = []
+    start = 0
+    for index in range(1, length + 1):
+        if (
+            index == length
+            or secondary_labels[index] != secondary_labels[start]
+            or output_instances[index] != output_instances[start]
+        ):
+            segments.append((int(secondary_labels[start]), start, index))
+            start = index
+    for left, (left_label, left_start, left_stop) in enumerate(segments):
+        if left_label == 2:
+            continue
+        for right_label, right_start, right_stop in segments[left + 1 :]:
+            if right_label == 2:
+                continue
+            if bool(adjacent[left_start:left_stop, right_start:right_stop].any()):
+                block[left_start:left_stop, right_start:right_stop] = 1
+                block[right_start:right_stop, left_start:left_stop] = 1
+    known = secondary_labels != 3
+    block = block.masked_fill(~(known[:, None] & known[None, :]), 2)
+    return secondary, F.one_hot(block, num_classes=3).to(torch.float32)
+
+
+def terminal_cyclization_instance(
+    condition: SymbolicBond,
+    row_by_reference: dict[object, int],
+    output_instances: tuple[str, ...],
+) -> str:
+    endpoints: list[tuple[int, str]] = []
+    for site in (condition.site_a, condition.site_b):
+        if type(site) is SymbolicAtomSite:
+            reference, atom_name = site.residue, site.atom_id
+        elif type(site) is AtomSite:
+            # component_index is always an int (§3.3): a non-residue Molecule endpoint is
+            # rejected below by row_by_reference, which only holds protein output residues.
+            reference, atom_name = (site.instance_id, site.component_index), site.atom_id
+        else:
+            raise ValueError("RFdiffusion supports only terminal peptide cyclization")
+        row = row_by_reference.get(reference)
+        if row is None:
+            raise ValueError("SymbolicBond endpoints must belong to RFdiffusion output residues")
+        endpoints.append((row, atom_name))
+    left, right = endpoints
+    if output_instances[left[0]] != output_instances[right[0]]:
+        raise ValueError("RFdiffusion supports only intrachain terminal peptide cyclization")
+    instance_id = output_instances[left[0]]
+    rows = [row for row, value in enumerate(output_instances) if value == instance_id]
+    if set(endpoints) != {(rows[0], "N"), (rows[-1], "C")}:
+        raise ValueError("RFdiffusion cyclic mode requires the terminal N-to-C peptide link")
+    return instance_id
+
+
+def rfdiffusion_secondary_structure(calpha: Tensor) -> Tensor:
+    r"""Assign the released helper's P-SEA helix/strand/loop labels."""
+
+    length = calpha.shape[0]
+    labels = torch.full((length,), 2, dtype=torch.int64, device=calpha.device)
+    if length < 5:
+        return labels
+
+    d2 = calpha.new_full((length,), float("nan"))
+    d3 = calpha.new_full((length,), float("nan"))
+    d4 = calpha.new_full((length,), float("nan"))
+    radius_angle = calpha.new_full((length,), float("nan"))
+    torsion = calpha.new_full((length,), float("nan"))
+    for index in range(1, length - 1):
+        d2[index] = torch.linalg.vector_norm(calpha[index + 1] - calpha[index - 1])
+        left = calpha[index - 1] - calpha[index]
+        right = calpha[index + 1] - calpha[index]
+        radius_angle[index] = torch.acos(
+            torch.dot(left, right) / (torch.linalg.vector_norm(left) * torch.linalg.vector_norm(right))
+        )
+    for index in range(1, length - 2):
+        d3[index] = torch.linalg.vector_norm(calpha[index + 2] - calpha[index - 1])
+        first = calpha[index] - calpha[index - 1]
+        second = calpha[index + 1] - calpha[index]
+        third = calpha[index + 2] - calpha[index + 1]
+        normal_first = torch.cross(first, second, dim=-1)
+        normal_second = torch.cross(second, third, dim=-1)
+        torsion[index] = torch.atan2(
+            torch.dot(torch.cross(normal_first, normal_second, dim=-1), second / torch.linalg.vector_norm(second)),
+            torch.dot(normal_first, normal_second),
+        )
+    for index in range(1, length - 3):
+        d4[index] = torch.linalg.vector_norm(calpha[index + 3] - calpha[index - 1])
+
+    degrees = math.pi / 180
+    potential_helix = ((d3 >= 4.8) & (d3 <= 5.8) & (d4 >= 5.8) & (d4 <= 7.0)) | (
+        (radius_angle >= 77 * degrees)
+        & (radius_angle <= 101 * degrees)
+        & (torsion >= 30 * degrees)
+        & (torsion <= 70 * degrees)
+    )
+    helix = torch.zeros(length, dtype=torch.bool, device=calpha.device)
+    consecutive = 0
+    for index in range(length):
+        if bool(potential_helix[index]):
+            consecutive += 1
+        else:
+            if consecutive >= 5:
+                helix[index - consecutive : index] = True
+            consecutive = 0
+    for index in torch.where(helix)[0].tolist():
+        labels[index] = 0
+        if index > 0 and (
+            4.8 <= float(d3[index - 1]) <= 5.8 or 77 * degrees <= float(radius_angle[index - 1]) <= 101 * degrees
+        ):
+            labels[index - 1] = 0
+        if index + 1 < length and (
+            4.8 <= float(d3[index + 1]) <= 5.8 or 77 * degrees <= float(radius_angle[index + 1]) <= 101 * degrees
+        ):
+            labels[index + 1] = 0
+
+    potential_strand = ((d2 >= 6.1) & (d2 <= 7.3) & (d3 >= 9.0) & (d3 <= 10.8) & (d4 >= 11.3) & (d4 <= 13.5)) | (
+        (radius_angle >= 110 * degrees)
+        & (radius_angle <= 138 * degrees)
+        & (
+            ((torsion >= -180 * degrees) & (torsion <= -125 * degrees))
+            | ((torsion >= 145 * degrees) & (torsion <= 180 * degrees))
+        )
+    )
+    strand = torch.zeros(length, dtype=torch.bool, device=calpha.device)
+    consecutive = 0
+    contacts = 0
+    for index in range(length):
+        if bool(potential_strand[index]):
+            consecutive += 1
+            distances = torch.linalg.vector_norm(calpha - calpha[index], dim=-1)
+            contacts += int(((distances >= 4.2) & (distances <= 5.2)).sum())
+        else:
+            if consecutive >= 4 or (consecutive == 3 and contacts >= 5):
+                strand[index - consecutive : index] = True
+            consecutive = 0
+            contacts = 0
+    for index in torch.where(strand)[0].tolist():
+        labels[index] = 1
+        if index > 0 and 9.0 <= float(d3[index - 1]) <= 10.8:
+            labels[index - 1] = 1
+        if index + 1 < length and 9.0 <= float(d3[index + 1]) <= 10.8:
+            labels[index + 1] = 1
+    return labels
+
+
+def from_contig_string(
+    contigs: str,
     *,
-    parse_hetatom: bool = False,
-    center: bool = True,
-) -> dict[str, Any]:
-    r"""
-    Build RFdiffusion atom27 target features from a PDB file.
+    source_instances: Mapping[str, int] | None = None,
+) -> tuple[PlacementSpec, tuple[int, int] | None]:
+    r"""Parse an RFdiffusion ``ContigMap.contigs`` string into a core ``PlacementSpec``.
 
-    Reads the PDB with [`parse_pdb`][ofoldx.models.rfdiffusion.processor.parse_pdb], optionally recenters
-    on the mean CA, then lifts the raw atom14 arrays into the atom27 coord/mask tensors the sampler consumes.
+    ``contigs`` is the space/``/``-delimited DSL, e.g. ``"10-40/A163-181/10-40 B1-100/0"``.
+    Each space-separated block becomes one declaration group (``chain_1``, ``chain_2``,
+    …); each ``/``-subcon becomes one placement:
 
-    Args:
-        pdb_path: Path to the target PDB file.
-        parse_hetatom: Whether to carry HETATM (ligand) records through into the output.
-        center: Whether to subtract the mean CA position from the coords.
+    * ``A163-181`` → ``ExistingSpan("A", 163, 182)`` (inclusive → half-open), ``A5`` →
+      ``ExistingSpan("A", 5, 6)``, a bare ``A`` → the whole source chain
+      ``ExistingSpan("A", 0, source_instances["A"])``;
+    * ``10-40`` → ``GeneratedSegment("protein", 10, 40)``; ``10`` → ``min == max == 10``;
+      ``0`` → ``min == max == 0`` (chain break / receptor terminator).
 
-    Returns:
-        A dict with ``xyz_27`` (`[L, 27, 3]` coords), ``mask_27`` (`[L, 27]` mask), ``seq`` (residue ids), and
-        ``pdb_idx``; plus ``xyz_het``/``info_het`` when ``parse_hetatom`` is set.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.processor import process_target
-        >>> target = process_target("target.pdb")  # doctest: +SKIP
+    Returns ``(PlacementSpec, combined_length)``. ``combined_length`` is the family-owned
+    ``ContigMap.length`` argument — the combined generated-length bounds ``(Σ min, Σ max)``
+    across every generated subcon (excluding ``ExistingSpan`` rows), which the core cannot
+    hold and RFdiffusion re-homes onto :class:`RFdiffusionLayout.combined_length`; it is
+    ``None`` when the string generates nothing. ``source_instances`` (source chain-letter →
+    length) resolves the bare-chain ``A`` form to ``ExistingSpan("A", 0, length)``; explicit
+    ``A163-181`` extents are carried literally (the upstream 1-based residue numbering is NOT
+    re-based to the core's 0-based index). Lossless into ``(PlacementSpec, combined_length)``
+    (the precise ``ref_idx/hal_idx`` permutation, when needed, projects to ordered length-1
+    spans).
     """
 
-    target = parse_pdb(pdb_path, parse_hetatom=parse_hetatom)
-    ca_center: float | np.ndarray = target["xyz"][:, :1, :].mean(axis=0, keepdims=True) if center else 0.0
-    coords = torch.from_numpy(target["xyz"] - ca_center).float()
-    seq = torch.from_numpy(target["seq"]).long()
-    atom_mask = torch.from_numpy(target["mask"]).bool()
-    coords27 = torch.full((coords.shape[0], 27, 3), float("nan"), dtype=torch.float32)
-    coords27[:, :14] = coords[:, :14]
-    mask_27 = torch.zeros((coords.shape[0], 27), dtype=torch.bool)
-    mask_27[:, :14] = atom_mask
-    out = {
-        "xyz_27": coords27,
-        "mask_27": mask_27,
-        "seq": seq,
-        "pdb_idx": target["pdb_idx"],
-    }
-    if parse_hetatom:
-        out["xyz_het"] = target.get("xyz_het", np.empty((0, 3), dtype=np.float32))
-        out["info_het"] = target.get("info_het", [])
-    return out
+    placement: PlacementSpec = {}
+    generated_min = 0
+    generated_max = 0
+    has_generated = False
+    blocks = contigs.split()
+    for block_index, block in enumerate(blocks):
+        group_key = f"chain_{block_index + 1}"
+        group: dict[str, PlacementValue] = {}
+        for sub_index, raw in enumerate(block.split("/")):
+            sub = raw.strip()
+            if not sub:
+                continue
+            placement_id = f"{group_key}:{sub_index}"
+            if sub[0].isalpha():
+                split = 0
+                while split < len(sub) and sub[split].isalpha():
+                    split += 1
+                instance_id = sub[:split]
+                extent = sub[split:]
+                if extent == "":
+                    if source_instances is None or instance_id not in source_instances:
+                        raise ValueError(f"bare source chain {instance_id!r} needs its length in source_instances")
+                    start, stop = 0, source_instances[instance_id]
+                else:
+                    bounds = extent.split("-")
+                    if len(bounds) == 1:
+                        start = stop = int(bounds[0])
+                    elif len(bounds) == 2:
+                        start, stop = int(bounds[0]), int(bounds[1])
+                    else:
+                        raise ValueError(f"malformed existing subcon {sub!r}")
+                    stop += 1  # inclusive upstream bound -> half-open core stop
+                if start < 0 or stop < start:
+                    raise ValueError(f"malformed existing subcon {sub!r}")
+                # NB: RFdiffusion ``contig`` residue numbers are the upstream (often 1-based) PDB
+                # numbers and are carried LITERALLY into the ExistingSpan (audit §3:
+                # ``A163-181 -> ExistingSpan("A", 163, 182)``), so no upper-bound check against
+                # source length is applied — the numbering base is not the core's 0-based index.
+                group[placement_id] = ExistingSpan(instance_id, start, stop)
+            else:
+                bounds = sub.split("-")
+                if len(bounds) == 1:
+                    low = high = int(bounds[0])
+                elif len(bounds) == 2:
+                    low, high = int(bounds[0]), int(bounds[1])
+                else:
+                    raise ValueError(f"malformed generated subcon {sub!r}")
+                if low < 0 or high < low:
+                    raise ValueError(f"malformed generated subcon {sub!r}")
+                group[placement_id] = GeneratedSegment("protein", low, high)
+                generated_min += low
+                generated_max += high
+                has_generated = True
+        placement[group_key] = group
+    # Frozen §3.7: reject a duplicate placement_id at construction (globally-unique inner key).
+    derive_instance_of(placement)
+    combined_length = (generated_min, generated_max) if has_generated else None
+    return placement, combined_length
 
 
-def _parse_length(length: str | None) -> list[int] | None:
-    r"""
-    Parse a length spec string into a half-open ``[low, high)`` bound.
+def to_contig_string(
+    placement: PlacementSpec,
+    combined_length: tuple[int, int] | None = None,
+) -> str:
+    r"""Re-emit an RFdiffusion ``contigs`` string from a core ``PlacementSpec``.
 
-    Args:
-        length: A single value (`"100"`) or a range (`"90-110"`); `None` passes through.
-
-    Returns:
-        A two-element ``[low, high)`` list, or `None`.
+    Each declaration group → one space-separated block; each placement → one ``/``-subcon
+    (``ExistingSpan("A", 163, 182)`` → ``A163-181`` half-open → inclusive;
+    ``GeneratedSegment(min, max)`` → ``min-max`` or the bare ``min`` when fixed, so a
+    zero-length placement emits ``0``). ``combined_length`` is accepted for signature
+    symmetry with :func:`from_contig_string` and is NOT re-serialized into the string: it
+    is the family-owned ``ContigMap.length`` argument, carried out-of-band on the Layout,
+    not part of the ``contigs`` grammar. The re-emission is lossless for TOPOLOGY (fixed vs
+    generated, order, lengths) and lossy for RF-index spacing / receptor-vs-inpaint role —
+    the family lowering flags the string never carried, exactly as the audit states.
     """
 
-    if length is None:
-        return None
-    if "-" not in length:
-        value = int(length)
-        return [value, value + 1]
-    start, stop = length.split("-", maxsplit=1)
-    return [int(start), int(stop) + 1]
+    blocks: list[str] = []
+    for group in placement.values():
+        subcons: list[str] = []
+        for value in group.values():
+            if type(value) is ExistingSpan:
+                subcons.append(f"{value.instance_id}{value.start}-{value.stop - 1}")
+            else:
+                if value.min_length == value.max_length:
+                    subcons.append(str(value.min_length))
+                else:
+                    subcons.append(f"{value.min_length}-{value.max_length}")
+        blocks.append("/".join(subcons))
+    return " ".join(blocks)
 
 
-def _parse_mask_segments(value: Sequence[str] | None) -> list[str] | None:
-    r"""Flatten a sequence of slash-joined inpaint segment specs into a single list of segment tokens."""
+def materialize_placement_map(
+    placement: RFdiffusionPlacements,
+    output_residues: Sequence[ComponentReference | SymbolicResidueSite],
+    residue_map: Mapping[ComponentReference | SymbolicResidueSite, ComponentReference],
+) -> tuple[PlacementMap, dict[str, str]]:
+    r"""Lift the sampled flat surface into the shared ``placement_map`` (W6 caveat a).
 
-    return "/".join(value).split("/") if value is not None else None
+    ``placement`` is the declared :class:`RFdiffusionPlacements` condition; ``output_residues``
+    is the post-sample flat identity tuple (each entry a source ``ComponentReference`` for an
+    ``ExistingSpan`` row or a :class:`SymbolicResidueSite` for a generated row);
+    ``residue_map`` maps each declared output residue to its realized OUTPUT
+    ``ComponentReference`` (as built while decoding the Structure). Returns
+    ``(placement_map, instance_of)`` where ``instance_of`` is the derived
+    ``placement_id -> declaration_group`` index (which also re-validates global
+    ``placement_id`` uniqueness).
 
-
-def _parse_range(value: object) -> list[int]:
-    r"""
-    Parse a scaffold length spec into an inclusive ``[low, high]`` pair.
-
-    Args:
-        value: A single value or a `"low-high"` range; a bare value ``n`` becomes ``[0, n]``.
-
-    Returns:
-        A two-element ``[low, high]`` list.
+    Lossless-ness: reconstruction is exact — a generated placement's occurrences are its
+    ``SymbolicResidueSite`` rows in ascending offset order, an existing placement's are its
+    source components in ``[start, stop)`` order, both projected through ``residue_map``;
+    outer/inner iteration is the declared order. The realized id rides per-occurrence in
+    ``ComponentReference[0]`` (so a placement MAY span multiple realized instances).
+    EXHAUSTIVE coverage is enforced: the union of all placement occurrences is a full
+    partition of the realized output surface (no gap, no double-cover, no unaddressed tail).
     """
 
-    value_str = str(value)
-    if "-" in value_str:
-        start, stop = value_str.split("-", maxsplit=1)
-        return [int(start), int(stop)]
-    return [0, int(value_str)]
+    spec = placement.placements
+    instance_of = derive_instance_of(spec)
+
+    generated: dict[str, list[tuple[int, ComponentReference]]] = {}
+    for reference in output_residues:
+        if type(reference) is SymbolicResidueSite:
+            generated.setdefault(reference.placement_id, []).append((reference.offset, residue_map[reference]))
+
+    placement_map: PlacementMap = {}
+    for group_key, placements in spec.items():
+        realized: dict[str, tuple[ComponentReference, ...]] = {}
+        for placement_id, value in placements.items():
+            if type(value) is GeneratedSegment:
+                occurrences = tuple(reference for _, reference in sorted(generated.get(placement_id, ())))
+            else:
+                occurrences = tuple(residue_map[(value.instance_id, index)] for index in range(value.start, value.stop))
+            realized[placement_id] = occurrences
+        placement_map[group_key] = realized
+
+    _check_exhaustive(placement_map, output_residues, residue_map)
+    return placement_map, instance_of
+
+
+def _check_exhaustive(
+    placement_map: PlacementMap,
+    output_residues: Sequence[ComponentReference | SymbolicResidueSite],
+    residue_map: Mapping[ComponentReference | SymbolicResidueSite, ComponentReference],
+) -> None:
+    r"""Enforce the adopted §3.7 exhaustion invariant on a materialized ``placement_map``."""
+
+    addressed = [
+        reference for group in placement_map.values() for occurrences in group.values() for reference in occurrences
+    ]
+    if len(set(addressed)) != len(addressed):
+        raise ValueError("rfdiffusion placement_map double-covers a realized output residue")
+    realized = [residue_map[reference] for reference in output_residues]
+    addressed_set = set(addressed)
+    realized_set = set(realized)
+    if addressed_set != realized_set:
+        missing = sorted(realized_set - addressed_set)
+        extra = sorted(addressed_set - realized_set)
+        raise ValueError(
+            "rfdiffusion placement_map is not exhaustive over the realized output surface: "
+            f"unaddressed_tail={missing} phantom={extra}"
+        )

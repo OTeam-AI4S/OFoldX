@@ -1,542 +1,674 @@
-r"""
-ESMFold2 protein-sequence processing.
-"""
+r"""Lower canonical molecular systems and MSA evidence to ESMFold2 tensors."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Sequence
 from os import PathLike
+from pathlib import Path
+from typing import cast
 
+import numpy as np
 import torch
-from torch import Tensor
+from multimolecule import ProteinTokenizer
+from multimolecule.io import read_fasta_records
+from typing_extensions import Self
 
-from ...processors.mixin import ProcessorMixin
-from ...processors.registry import PROCESSORS
-from .io import normalize_protein_sequence, sequence_from_input
-from .model import ESMFold2Input
+from ...data.evidence import MSA, MSACollection
+from ...data.molecular import (
+    AtomSite,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+    one_letter_to_component,
+    restype_3to1,
+)
+from ...data.structure import Structure
+from ...references import classify_reference
+from .config import ESMFold2ProcessorConfig
+from .model import ESMFold2Input, ESMFold2Layout
+
+_PROTEIN_RESIDUE_TYPES = {
+    component_id: index
+    for index, component_id in enumerate(
+        (
+            "ALA",
+            "ARG",
+            "ASN",
+            "ASP",
+            "CYS",
+            "GLN",
+            "GLU",
+            "GLY",
+            "HIS",
+            "ILE",
+            "LEU",
+            "LYS",
+            "MET",
+            "PHE",
+            "PRO",
+            "SER",
+            "THR",
+            "TRP",
+            "TYR",
+            "VAL",
+        ),
+        start=2,
+    )
+}
+_RNA_RESIDUE_TYPES = {"A": 23, "G": 24, "C": 25, "U": 26, "N": 27}
+_DNA_RESIDUE_TYPES = {"DA": 28, "DG": 29, "DC": 30, "DT": 31, "DN": 32}
+_STANDARD_COMPONENTS = {
+    "protein": frozenset(_PROTEIN_RESIDUE_TYPES),
+    "rna": frozenset(_RNA_RESIDUE_TYPES),
+    "dna": frozenset(_DNA_RESIDUE_TYPES),
+}
+_MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
+_PROTEIN_UNKNOWN = 22
+_MSA_GAP = 1
 
 
-@PROCESSORS.register("esmfold2")
-class ESMFold2Processor(ProcessorMixin):
-    r"""
-    Build an ESMFold2 tensor batch from a protein sequence or FASTA file.
+class ESMFold2Processor:
+    r"""Lower complete canonical ESMFold2 inputs without changing their chemistry."""
 
-    Implements the protein-only input path used by the released ESMFold2
-    checkpoint: a single chain with no external MSA, no modifications, and no
-    covalent bonds. All-atom complex inputs are out of scope for this processor.
-    """
+    config_class = ESMFold2ProcessorConfig
 
-    input_class = ESMFold2Input
+    def __init__(
+        self,
+        config: ESMFold2ProcessorConfig | None = None,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.config = ESMFold2ProcessorConfig() if config is None else config
+        self.device = torch.device("cpu" if device is None else device)
+        self.dtype = torch.float32 if dtype is None else dtype
+        self.tokenizer = ProteinTokenizer()
 
-    def __call__(self, sequence_or_path: str | PathLike[str]) -> ESMFold2Input:
-        r"""Return a batched [`ESMFold2Input`][ofoldx.models.esmfold2.model.ESMFold2Input]."""
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Update output placement in place and return this Processor."""
 
-        sequence = sequence_from_input(sequence_or_path)
-        features = prepare_protein_features(sequence)
-        return ESMFold2Input(**features)
+        if device is not None:
+            self.device = torch.device(device)
+        if dtype is not None:
+            self.dtype = dtype
+        return self
 
-    def source_structure(self, inputs: str | PathLike[str]):
-        r"""
-        Return the unpadded heavy-atom reference structure this processor's predicted coordinates overlay onto.
+    def __call__(
+        self,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        *,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+    ) -> ESMFold2Input:
+        r"""Lower one molecular system and optional released MSA evidence."""
 
-        Rebuilds, from the same sequence, the per-residue heavy-atom layout the featurizer emits -- each residue's
-        atoms in [`PROTEIN_HEAVY_ATOMS`][ofoldx.models.esmfold2.processor.PROTEIN_HEAVY_ATOMS] order -- with
-        placeholder coordinates. The model predicts one coordinate per real atom in this order (its atom axis is
-        padded to a block multiple, which [`coords_to_structure`][ofoldx.data.structure.coords_to_structure] drops), so
-        overlaying the predicted coordinates onto this reference yields the folded structure. Non-sequence inputs
-        (e.g. a parsed structure) yield ``None``.
+        if msa is not None and not self.config.msa_conditioning:
+            raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
+        if isinstance(input, Structure):
+            raise ValueError(
+                "released ESMFold2 cannot consume observed coordinates; pass input.system " "for topology-only folding"
+            )
 
-        Args:
-            inputs: Protein sequence string or FASTA path.
+        system = input if isinstance(input, MolecularSystem) else molecular_system(input)
+        normalized_msa = normalize_msa(msa, system)
+        return prepare_esmfold2_features(
+            system,
+            msa=normalized_msa,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
-        Returns:
-            The unpadded heavy-atom reference structure, or ``None`` when ``inputs`` is not a protein sequence.
-        """
 
-        from ...data.structure import AtomRecord, ResidueKey, Structure
+def molecular_system(
+    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
+) -> MolecularSystem:
+    r"""Construct the polymer-only convenience input accepted by the fold boundary."""
 
-        try:
-            sequence = normalize_protein_sequence(sequence_from_input(inputs))
-        except (OSError, ValueError, TypeError):
-            return None  # a parsed structure / unreadable path is not a sequence this processor can reference
-        atoms: list[AtomRecord] = []
-        for position, letter in enumerate(sequence, start=1):
-            residue_name = PROTEIN_1TO3.get(letter, "UNK")
-            residue = ResidueKey("A", position, "")
-            for name in PROTEIN_HEAVY_ATOMS[residue_name]:
-                # Protein heavy atoms are all single-letter C/N/O/S, matching the featurizer's element = name[0].
-                atoms.append(
-                    AtomRecord(
-                        name=name,
-                        element=name[0],
-                        residue_name=residue_name,
-                        residue=residue,
-                        x=0.0,
-                        y=0.0,
-                        z=0.0,
-                        mol_type="protein",
-                    )
+    named: list[tuple[str, PolymerSequence]]
+    if isinstance(input, str | PathLike):
+        classified = classify_reference(input)
+        if isinstance(classified, Path):
+            records = read_fasta_records(classified)
+            named = [
+                (
+                    record.id or f"chain_{index + 1}",
+                    PolymerSequence.from_one_letter(record.sequence.strip().upper()),
                 )
-        return Structure(tuple(atoms)) if atoms else None
+                for index, record in enumerate(records)
+            ]
+        else:
+            named = [("protein", PolymerSequence.from_one_letter(classified.strip().upper()))]
+    elif isinstance(input, PolymerSequence):
+        named = [("A", input)]
+    elif isinstance(input, Sequence):
+        sequences = tuple(input)
+        if not sequences or not all(isinstance(sequence, PolymerSequence) for sequence in sequences):
+            raise TypeError("ESMFold2 sequence collections must contain PolymerSequence values")
+        named = [
+            (_default_chain_id(index), cast(PolymerSequence, sequence)) for index, sequence in enumerate(sequences)
+        ]
+    else:
+        raise TypeError(
+            "ESMFold2 input must be a sequence string, FASTA path, PolymerSequence, "
+            "sequence of PolymerSequence values, MolecularSystem, or Structure"
+        )
 
-    def _processor_config(self) -> Mapping[str, object]:
-        return {}
-
-
-MOL_TYPE_PROTEIN = 0
-PROTEIN_UNK_RES_TYPE = 22
-
-PROTEIN_RESIDUE_TO_RES_TYPE: dict[str, int] = {
-    "ALA": 2,
-    "ARG": 3,
-    "ASN": 4,
-    "ASP": 5,
-    "CYS": 6,
-    "GLN": 7,
-    "GLU": 8,
-    "GLY": 9,
-    "HIS": 10,
-    "ILE": 11,
-    "LEU": 12,
-    "LYS": 13,
-    "MET": 14,
-    "PHE": 15,
-    "PRO": 16,
-    "SER": 17,
-    "THR": 18,
-    "TRP": 19,
-    "TYR": 20,
-    "VAL": 21,
-}
-
-PROTEIN_1TO3: dict[str, str] = {
-    "A": "ALA",
-    "R": "ARG",
-    "N": "ASN",
-    "D": "ASP",
-    "C": "CYS",
-    "Q": "GLN",
-    "E": "GLU",
-    "G": "GLY",
-    "H": "HIS",
-    "I": "ILE",
-    "L": "LEU",
-    "K": "LYS",
-    "M": "MET",
-    "F": "PHE",
-    "P": "PRO",
-    "S": "SER",
-    "T": "THR",
-    "W": "TRP",
-    "Y": "TYR",
-    "V": "VAL",
-    "X": "UNK",
-}
-
-ESM_PROTEIN_VOCAB: dict[str, int] = {
-    "A": 6,
-    "C": 7,
-    "D": 8,
-    "E": 9,
-    "F": 10,
-    "G": 11,
-    "H": 12,
-    "I": 13,
-    "K": 14,
-    "L": 15,
-    "M": 16,
-    "N": 17,
-    "P": 18,
-    "Q": 19,
-    "R": 20,
-    "S": 21,
-    "T": 22,
-    "V": 23,
-    "W": 24,
-    "Y": 25,
-    "X": 26,
-    "Z": 27,
-    "B": 28,
-    "J": 29,
-    "U": 30,
-    "O": 31,
-}
-
-# Heavy atoms per canonical residue, in training-time order.
-PROTEIN_HEAVY_ATOMS: dict[str, list[str]] = {
-    "ALA": ["N", "CA", "C", "O", "CB"],
-    "ARG": ["N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2"],
-    "ASN": ["N", "CA", "C", "O", "CB", "CG", "OD1", "ND2"],
-    "ASP": ["N", "CA", "C", "O", "CB", "CG", "OD1", "OD2"],
-    "CYS": ["N", "CA", "C", "O", "CB", "SG"],
-    "GLN": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2"],
-    "GLU": ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2"],
-    "GLY": ["N", "CA", "C", "O"],
-    "HIS": ["N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2"],
-    "ILE": ["N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1"],
-    "LEU": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2"],
-    "LYS": ["N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ"],
-    "MET": ["N", "CA", "C", "O", "CB", "CG", "SD", "CE"],
-    "PHE": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
-    "PRO": ["N", "CA", "C", "O", "CB", "CG", "CD"],
-    "SER": ["N", "CA", "C", "O", "CB", "OG"],
-    "THR": ["N", "CA", "C", "O", "CB", "OG1", "CG2"],
-    "TRP": [
-        "N",
-        "CA",
-        "C",
-        "O",
-        "CB",
-        "CG",
-        "CD1",
-        "CD2",
-        "NE1",
-        "CE2",
-        "CE3",
-        "CZ2",
-        "CZ3",
-        "CH2",
-    ],
-    "TYR": ["N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH"],
-    "VAL": ["N", "CA", "C", "O", "CB", "CG1", "CG2"],
-    "UNK": ["N", "CA", "C", "O"],
-}
-
-PROTEIN_REF_POS: dict[str, dict[str, tuple[float, float, float]]] = {
-    "ALA": {
-        "N": (-0.01003183238208294, -1.2073018550872803, -1.0555061101913452),
-        "CA": (-0.04190138354897499, 0.17447763681411743, -0.5729365348815918),
-        "C": (1.2127548456192017, 0.4737588167190552, 0.19521640241146088),
-        "O": (1.9390329122543335, 1.4484562873840332, -0.13759790360927582),
-        "CB": (-1.276943325996399, 0.4288230538368225, 0.29937705397605896),
-    },
-    "ARG": {
-        "N": (-2.0170421600341797, 0.6717798113822937, -1.1794233322143555),
-        "CA": (-2.0503084659576416, -0.5735036730766296, -0.4097220301628113),
-        "C": (-3.469440460205078, -1.0612813234329224, -0.2755832374095917),
-        "O": (-3.8218462467193604, -2.1369943618774414, -0.8294969797134399),
-        "CB": (-1.4193516969680786, -0.3735991418361664, 0.9852858781814575),
-        "CG": (0.11878877878189087, -0.3112654983997345, 0.963895857334137),
-        "CD": (0.6643245816230774, 1.0068185329437256, 0.3963329493999481),
-        "NE": (2.1090238094329834, 1.0977025032043457, 0.6120952367782593),
-        "CZ": (3.098905324935913, 0.3215920031070709, -0.09047172218561172),
-        "NH1": (4.461230278015137, 0.3844667971134186, 0.34141138195991516),
-        "NH2": (2.7856509685516357, -0.4166366159915924, -1.1148239374160767),
-    },
-    "ASN": {
-        "N": (-0.7595629096031189, 0.7503494620323181, 1.1369825601577759),
-        "CA": (-0.76087886095047, 0.23876343667507172, -0.23573364317417145),
-        "C": (-1.9211044311523438, -0.6982439160346985, -0.42196929454803467),
-        "O": (-2.677666187286377, -0.5753439664840698, -1.4223182201385498),
-        "CB": (0.5504899024963379, -0.5078350305557251, -0.5390339493751526),
-        "CG": (1.7250099182128906, 0.4264017939567566, -0.5778228640556335),
-        "OD1": (1.9470350742340088, 1.1086392402648926, -1.613560438156128),
-        "ND2": (2.57365345954895, 0.5730618834495544, 0.5608599781990051),
-    },
-    "ASP": {
-        "N": (-1.8452696800231934, -1.2169504165649414, 0.19437327980995178),
-        "CA": (-0.6379959583282471, -0.41974392533302307, 0.41681644320487976),
-        "C": (-0.9431572556495667, 1.0356197357177734, 0.18555717170238495),
-        "O": (-1.5183608531951904, 1.4045922756195068, -0.8739855885505676),
-        "CB": (0.48594576120376587, -0.8970447778701782, -0.5209363698959351),
-        "CG": (1.780342936515808, -0.19918935000896454, -0.2310730367898941),
-        "OD1": (2.5202910900115967, -0.6044584512710571, 0.7049641013145447),
-        "OD2": (2.1454880237579346, 0.9208861589431763, -0.9712985157966614),
-    },
-    "CYS": {
-        "N": (0.0469963513314724, 1.190075159072876, -1.1607273817062378),
-        "CA": (0.11344368755817413, -0.09400428831577301, -0.45952197909355164),
-        "C": (-1.2652032375335693, -0.6832379698753357, -0.3594406247138977),
-        "O": (-1.4631439447402954, -1.8851220607757568, -0.6826791763305664),
-        "CB": (0.6919880509376526, 0.09034398198127747, 0.952482283115387),
-        "SG": (2.4619927406311035, 0.5235707759857178, 0.9020372629165649),
-    },
-    "GLN": {
-        "N": (-2.370004653930664, -0.9637529850006104, -0.7942749261856079),
-        "CA": (-1.370002269744873, -0.6000258922576904, 0.2103111445903778),
-        "C": (-1.7545503377914429, 0.7091967463493347, 0.8433493971824646),
-        "O": (-1.8520662784576416, 0.7999289631843567, 2.0964975357055664),
-        "CB": (0.02040259726345539, -0.5004461407661438, -0.44764479994773865),
-        "CG": (1.1377512216567993, -0.28680720925331116, 0.582992434501648),
-        "CD": (2.4745187759399414, -0.24800164997577667, -0.09364881366491318),
-        "OE1": (3.1685523986816406, -1.2966246604919434, -0.1717153936624527),
-        "NE2": (2.947425603866577, 0.9601329565048218, -0.6888364553451538),
-    },
-    "GLU": {
-        "N": (-1.5850872993469238, -1.337684154510498, 0.9490851163864136),
-        "CA": (-1.0560977458953857, 0.027459044009447098, 1.0306966304779053),
-        "C": (-1.7741456031799316, 0.9664392471313477, 0.09259600937366486),
-        "O": (-1.9012441635131836, 2.181349992752075, 0.402479350566864),
-        "CB": (0.4706551432609558, 0.048803869634866714, 0.8114414811134338),
-        "CG": (0.9133604764938354, -0.4219329059123993, -0.5830985307693481),
-        "CD": (2.398822069168091, -0.3097084164619446, -0.7210537791252136),
-        "OE1": (3.1389315128326416, -1.274524450302124, -0.39029765129089355),
-        "OE2": (2.9647817611694336, 0.8781346082687378, -1.1732689142227173),
-    },
-    "GLY": {
-        "N": (-1.3942985534667969, -0.39875128865242004, -0.3370324671268463),
-        "CA": (-0.39974430203437805, 0.5488945245742798, 0.15242962539196014),
-        "C": (0.9440054893493652, -0.10314033925533295, 0.19859643280506134),
-        "O": (1.3352899551391602, -0.669218122959137, 1.2541258335113525),
-    },
-    "HIS": {
-        "N": (-1.4532867670059204, -1.0689626932144165, 0.881072461605072),
-        "CA": (-1.3396095037460327, 0.24797579646110535, 0.24960045516490936),
-        "C": (-2.675257921218872, 0.6571555733680725, -0.30441102385520935),
-        "O": (-3.1311378479003906, 1.8079776763916016, -0.06785715371370316),
-        "CB": (-0.3041955828666687, 0.21721023321151733, -0.8885309100151062),
-        "CG": (1.0887513160705566, 0.028941065073013306, -0.36419469118118286),
-        "ND1": (1.840459942817688, 1.0411773920059204, 0.29804590344429016),
-        "CD2": (1.780855417251587, -1.1011489629745483, -0.3814258575439453),
-        "CE1": (2.9566943645477295, 0.4924798905849457, 0.6477115750312805),
-        "NE2": (3.0280203819274902, -0.8751969337463379, 0.26084381341934204),
-    },
-    "ILE": {
-        "N": (-0.7167549729347229, -1.5426139831542969, -0.9983330368995667),
-        "CA": (-1.0636085271835327, -0.35169270634651184, -0.21393552422523499),
-        "C": (-1.3896740674972534, 0.8142145276069641, -1.1164065599441528),
-        "O": (-1.2377792596817017, 0.7302915453910828, -2.3656840324401855),
-        "CB": (0.061667006462812424, 0.01599610224366188, 0.8057394623756409),
-        "CG1": (1.502519965171814, -0.08899776637554169, 0.24154816567897797),
-        "CG2": (-0.053174979984760284, -0.8521055579185486, 2.0702083110809326),
-        "CD1": (1.7929610013961792, 0.899773120880127, -0.8863027691841125),
-    },
-    "LEU": {
-        "N": (1.9657520055770874, -1.9763224124908447, -0.18391533195972443),
-        "CA": (1.3077669143676758, -0.6677430868148804, -0.19492436945438385),
-        "C": (1.9905058145523071, 0.24182087182998657, 0.7879968285560608),
-        "O": (2.06896710395813, -0.07880014181137085, 2.0048046112060547),
-        "CB": (-0.20306941866874695, -0.8093230128288269, 0.11243502795696259),
-        "CG": (-0.9916267395019531, 0.5234957337379456, 0.06723011285066605),
-        "CD1": (-2.4228057861328125, 0.29949337244033813, 0.573042094707489),
-        "CD2": (-1.0282856225967407, 1.1250264644622803, -1.346014380455017),
-    },
-    "LYS": {
-        "N": (2.4221372604370117, -0.6473312377929688, 0.6370573043823242),
-        "CA": (2.0314927101135254, 0.2786507308483124, -0.4298512041568756),
-        "C": (2.7168593406677246, 1.595757246017456, -0.20924785733222961),
-        "O": (3.397681713104248, 2.116427421569824, -1.1332510709762573),
-        "CB": (0.5018402934074402, 0.4873858690261841, -0.49062973260879517),
-        "CG": (-0.25062066316604614, -0.7894009947776794, -0.9055535793304443),
-        "CD": (-1.769762635231018, -0.5552700161933899, -1.040329933166504),
-        "CE": (-2.576533555984497, -1.0221366882324219, 0.18493641912937164),
-        "NZ": (-2.269151210784912, -0.24293844401836395, 1.3849012851715088),
-    },
-    "MET": {
-        "N": (1.8903918266296387, -1.5252995491027832, -0.42638593912124634),
-        "CA": (1.2630571126937866, -0.24417810142040253, -0.7626462578773499),
-        "C": (2.30391001701355, 0.8367712497711182, -0.7254616618156433),
-        "O": (2.465414524078369, 1.5928632020950317, -1.7207728624343872),
-        "CB": (0.10567972809076309, 0.10861825942993164, 0.19741646945476532),
-        "CG": (-1.0658042430877686, -0.8736631274223328, 0.08811883628368378),
-        "SD": (-2.4557132720947266, -0.3332225978374481, 1.1461700201034546),
-        "CE": (-3.265165090560913, 0.7033554911613464, -0.11588376015424728),
-    },
-    "PHE": {
-        "N": (-2.8484435081481934, -1.525790810585022, 0.01789816841483116),
-        "CA": (-1.591969609260559, -0.8545162677764893, 0.35214468836784363),
-        "C": (-1.8900631666183472, 0.45833414793014526, 1.0232222080230713),
-        "O": (-1.3424992561340332, 0.74432373046875, 2.121629476547241),
-        "CB": (-0.760358452796936, -0.6342853307723999, -0.9257160425186157),
-        "CG": (0.604112982749939, -0.07200468331575394, -0.6148118376731873),
-        "CD1": (0.8468314409255981, 1.2480632066726685, -0.7146694660186768),
-        "CD2": (1.6827683448791504, -0.9758077263832092, -0.1423054188489914),
-        "CE1": (2.1801748275756836, 1.7875733375549316, -0.3744623064994812),
-        "CE2": (2.888307809829712, -0.48277512192726135, 0.16804970800876617),
-        "CZ": (3.149812936782837, 0.9656873941421509, 0.04440271109342575),
-    },
-    "PRO": {
-        "N": (-0.836250364780426, -0.9899801015853882, 0.5561304688453674),
-        "CA": (0.32722190022468567, -0.6164458394050598, -0.25072571635246277),
-        "C": (1.6121541261672974, -1.1711241006851196, 0.31082412600517273),
-        "O": (1.6127740144729614, -2.2771971225738525, 0.9156193733215332),
-        "CB": (0.3248198926448822, 0.9028244018554688, -0.33368146419525146),
-        "CG": (-1.1425083875656128, 1.2730128765106201, -0.2590600252151489),
-        "CD": (-1.8495968580245972, 0.026575811207294464, 0.2681289613246918),
-    },
-    "SER": {
-        "N": (0.674650251865387, 1.5018702745437622, -0.5367295145988464),
-        "CA": (0.00013792862591799349, 0.4966467022895813, 0.28510504961013794),
-        "C": (0.9941009879112244, -0.5374617576599121, 0.73505038022995),
-        "O": (1.0545241832733154, -0.8683545589447021, 1.9495396614074707),
-        "CB": (-1.1279288530349731, -0.1659376323223114, -0.5160963535308838),
-        "OG": (-1.8135979175567627, -1.085249662399292, 0.28947514295578003),
-    },
-    "THR": {
-        "N": (-1.325830340385437, -1.3728225231170654, 0.6882233023643494),
-        "CA": (-0.5433306097984314, -0.16364754736423492, 0.41697052121162415),
-        "C": (-1.294381856918335, 0.7077372074127197, -0.5549946427345276),
-        "O": (-1.6939635276794434, 0.23654410243034363, -1.6540418863296509),
-        "CB": (0.853203296661377, -0.5363803505897522, -0.14109353721141815),
-        "OG1": (1.5220820903778076, -1.379003643989563, 0.7635167837142944),
-        "CG2": (1.7225933074951172, 0.7054727077484131, -0.3651331067085266),
-    },
-    "TRP": {
-        "N": (3.686030864715576, 0.7599999904632568, 0.496155709028244),
-        "CA": (2.384092092514038, 0.09079249948263168, 0.5325262546539307),
-        "C": (2.1113572120666504, -0.6121063232421875, -0.7733646035194397),
-        "O": (1.796526312828064, -1.8323148488998413, -0.7775964140892029),
-        "CB": (1.281521201133728, 1.1139036417007446, 0.8559791445732117),
-        "CG": (-0.04292375594377518, 0.44645074009895325, 1.0942792892456055),
-        "CD1": (-0.42329534888267517, -0.15470874309539795, 2.2227554321289062),
-        "CD2": (-1.1023900508880615, 0.2158389836549759, 0.11529432237148285),
-        "NE1": (-1.7030320167541504, -0.7665823101997375, 2.0595016479492188),
-        "CE2": (-2.045644998550415, -0.4881173074245453, 0.710669219493866),
-        "CE3": (-1.2173502445220947, 0.6102271676063538, -1.300106406211853),
-        "CZ2": (-3.256009340286255, -0.9164394736289978, -0.00984987337142229),
-        "CZ3": (-2.315925121307373, 0.2306906282901764, -1.9776310920715332),
-        "CH2": (-3.3817875385284424, -0.5677337646484375, -1.3032053709030151),
-    },
-    "TYR": {
-        "N": (-1.7900604009628296, -0.8409399390220642, 1.3180142641067505),
-        "CA": (-1.913882851600647, 0.23552845418453217, 0.330669641494751),
-        "C": (-3.347280740737915, 0.3588399887084961, -0.09830684959888458),
-        "O": (-3.967811346054077, -0.6449354290962219, -0.5423302054405212),
-        "CB": (-1.0093992948532104, 0.0004731413209810853, -0.8981552124023438),
-        "CG": (0.4520410895347595, 0.021162061020731926, -0.5305932760238647),
-        "CD1": (1.0992432832717896, 1.1877919435501099, -0.3579142987728119),
-        "CD2": (1.1803174018859863, -1.253401279449463, -0.31122180819511414),
-        "CE1": (2.5253450870513916, 1.1990256309509277, 0.029804613441228867),
-        "CE2": (2.471151113510132, -1.240687608718872, 0.043534230440855026),
-        "CZ": (3.180687665939331, 0.04672492295503616, 0.2214856892824173),
-        "OH": (4.523719787597656, 0.0671030730009079, 0.5877485871315002),
-    },
-    "VAL": {
-        "N": (0.5987519025802612, -1.569443702697754, -0.7379124760627747),
-        "CA": (0.6014357209205627, -0.10503966361284256, -0.6336286664009094),
-        "C": (1.8391697406768799, 0.4067850410938263, 0.06351757049560547),
-        "O": (2.3952062129974365, -0.2666190266609192, 0.9731166958808899),
-        "CB": (-0.694736897945404, 0.4259096384048462, 0.03581475466489792),
-        "CG1": (-1.9276031255722046, 0.09515828639268875, -0.8172357082366943),
-        "CG2": (-0.8938426971435547, -0.08640842139720917, 1.472349762916565),
-    },
-    "UNK": {
-        "N": (0.0, 0.0, 0.0),
-        "CA": (0.0, 0.0, 0.0),
-        "C": (0.0, 0.0, 0.0),
-        "O": (0.0, 0.0, 0.0),
-    },
-}
-
-# Protonated nitrogens at physiological pH (matches CHARGED_ATOMS in the
-# opensource constants for the protein subset).
-PROTEIN_CHARGED_ATOMS: dict[tuple[str, str], int] = {
-    ("LYS", "NZ"): 1,
-    ("ARG", "NH2"): 1,
-    ("HIS", "ND1"): 1,
-}
-
-# Only the elements that appear in canonical protein heavy atoms.
-_PROTEIN_ELEMENT_TO_ATOMIC_NUM: dict[str, int] = {"C": 6, "N": 7, "O": 8, "S": 16}
+    entities: dict[str, PolymerSequence | Molecule] = {}
+    instances: dict[str, str] = {}
+    for base_id, sequence in named:
+        key = base_id
+        suffix = 1
+        while key in entities:
+            suffix += 1
+            key = f"{base_id}_{suffix}"
+        entities[key] = sequence
+        instances[key] = key
+    return MolecularSystem(entities=entities, instances=instances)
 
 
-def _encode_atom_name(name: str) -> list[int]:
-    padded = name.ljust(4)[:4]
-    return [ord(c) - 32 if c != " " else 0 for c in padded]
+def _default_chain_id(index: int) -> str:
+    r"""Assign a default entity/instance key when the input carries none (§3.1)."""
+
+    return chr(ord("A") + index) if index < 26 else f"chain_{index + 1}"
 
 
-def prepare_protein_features(sequence: str) -> dict[str, Tensor]:
-    """Featurize a single protein sequence for ``ESMFold2Model.forward``.
+def normalize_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""Bind MSA evidence to the exact polymer definitions in ``system``."""
 
-    Returns the protein-only subset of the ESMFold2 tensor contract:
-    single-chain, no external MSA, no modifications, no distogram
-    conditioning, and no covalent bonds. All tensors have a leading batch dim
-    of 1; the caller is responsible for moving them to the model device.
-    """
-    sequence = normalize_protein_sequence(sequence)
+    if msa is None:
+        return None
+    if isinstance(msa, MSA | MSACollection):
+        values = (msa,) if isinstance(msa, MSA) else msa.msas
+        for value in values:
+            if value.entity_id not in system.entities:
+                raise ValueError("MSA entity disagrees with ESMFold2 input")
+            entity = system.entities[value.entity_id]
+            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+                raise ValueError("released ESMFold2 consumes MSA evidence only for protein entities")
+            if len(value.unpaired_sequences[0]) != len(entity):
+                raise ValueError("MSA query width disagrees with the ESMFold2 entity length")
+        return msa
 
-    res_3letter = [PROTEIN_1TO3.get(c, "UNK") for c in sequence]
-    L = len(sequence)
+    path = Path(msa).expanduser()
+    proteins = [
+        (entity_id, entity)
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    ]
+    if len(proteins) != 1:
+        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity; pass MSACollection")
+    records = read_fasta_records(path)
+    if not records:
+        raise ValueError("MSA FASTA contains no rows")
+    entity_id, _ = proteins[0]
+    a3m = ".a3m" in {suffix.lower() for suffix in path.suffixes}
+    parsed = tuple(aligned_protein_row(record.sequence, a3m=a3m) for record in records)
+    aligned_rows = tuple(row for row, _ in parsed)
+    deletion_rows = tuple(deletions for _, deletions in parsed)
+    width = len(aligned_rows[0])
+    # The FASTA is a plain single-chain alignment: every row goes to the unpaired pool (row 0 is the
+    # ungapped query), and the paired pool carries only the shared query row so both pools validate.
+    return MSA(
+        entity_id=entity_id,
+        unpaired_sequences=aligned_rows,
+        unpaired_deletion_counts=np.array(deletion_rows, dtype=np.uint32).reshape(len(aligned_rows), width),
+        paired_sequences=(aligned_rows[0],),
+        paired_deletion_counts=np.zeros((1, width), dtype=np.uint32),
+    )
 
-    token_atom_starts: list[int] = []
-    atom_records: list[tuple[int, str, str, int, tuple[float, float, float]]] = []
-    res_type_vals: list[int] = []
-    input_id_vals: list[int] = []
-    distogram_rep_atom_idx: list[int] = []
 
+def aligned_protein_row(
+    sequence: str,
+    *,
+    a3m: bool = False,
+) -> tuple[str, tuple[int, ...]]:
+    r"""Convert one aligned FASTA/A3M row to a query-width symbol string plus insertion counts."""
+
+    symbols: list[str] = []
+    deletion_counts: list[int] = []
+    insertion_count = 0
+    for symbol in sequence.strip():
+        if a3m and (symbol.islower() or symbol == "."):
+            insertion_count += 1
+            continue
+        symbols.append("-" if symbol in "-." else symbol.upper())
+        deletion_counts.append(insertion_count)
+        insertion_count = 0
+    return "".join(symbols), tuple(deletion_counts)
+
+
+def _msa_residue_type(symbol: str) -> int:
+    r"""Map one uppercase MSA symbol (or ``-`` gap) to a released residue-type index."""
+
+    if symbol == "-":
+        return _MSA_GAP
+    component_id = one_letter_to_component(symbol, "protein", policy="permissive")
+    return _PROTEIN_RESIDUE_TYPES.get(component_id, _PROTEIN_UNKNOWN)
+
+
+def prepare_esmfold2_features(
+    system: MolecularSystem,
+    *,
+    msa: MSA | MSACollection | None,
+    tokenizer: ProteinTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ESMFold2Input:
+    r"""Build the released token/atom layout from canonical identity and topology."""
+
+    token_groups: list[tuple[AtomSite, ...]] = []
+    token_sites: list[AtomSite | tuple[str, int]] = []
+    token_instance_ids: list[str] = []
+    token_entity_ids: list[str] = []
+    token_monomer_indices: list[int | None] = []
+    residue_indices: list[int] = []
+    asym_ids: list[int] = []
+    entity_ids: list[int] = []
+    sym_ids: list[int] = []
+    molecule_types: list[int] = []
+    residue_types: list[int] = []
+    reference_space_ids: list[int] = []
+
+    available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
+    entity_index_by_id: dict[str, int] = {}
+    instance_count_by_entity: dict[str, int] = {}
+    reference_space = 0
+
+    for asym_id, (instance_id, entity_key) in enumerate(system.instances.items()):
+        entity = system.entities[entity_key]
+        entity_id = entity_index_by_id.setdefault(entity_key, len(entity_index_by_id))
+        sym_id = instance_count_by_entity.get(entity_key, 0)
+        instance_count_by_entity[entity_key] = sym_id + 1
+
+        if isinstance(entity, PolymerSequence):
+            molecule_type = _MOLECULE_TYPES[entity.polymer_type]
+            standards = _STANDARD_COMPONENTS[entity.polymer_type]
+            for component_index, component in enumerate(entity.components):
+                component_id = component.component_id
+                sites = tuple(
+                    site
+                    for atom in component.atoms
+                    if atom.element != "H"
+                    and atom.atom_id not in {"OXT", "OP3"}
+                    and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available_sites
+                )
+                if not sites:
+                    raise ValueError(
+                        f"ESMFold2 component {component_id!r} at {instance_id}:{component_index} "
+                        "has no model-visible heavy atoms"
+                    )
+                is_standard = component_id in standards
+                groups = (sites,) if is_standard else tuple((site,) for site in sites)
+                if entity.polymer_type == "protein":
+                    residue_type = _PROTEIN_RESIDUE_TYPES.get(component_id, _PROTEIN_UNKNOWN)
+                elif entity.polymer_type == "rna":
+                    residue_type = _RNA_RESIDUE_TYPES.get(component_id, _PROTEIN_UNKNOWN)
+                else:
+                    residue_type = _DNA_RESIDUE_TYPES.get(component_id, _PROTEIN_UNKNOWN)
+                for group in groups:
+                    token_groups.append(group)
+                    token_sites.append((instance_id, component_index) if is_standard else group[0])
+                    token_instance_ids.append(instance_id)
+                    token_entity_ids.append(entity_key)
+                    token_monomer_indices.append(component_index)
+                    residue_indices.append(component_index)
+                    asym_ids.append(asym_id)
+                    entity_ids.append(entity_id)
+                    sym_ids.append(sym_id)
+                    molecule_types.append(molecule_type)
+                    residue_types.append(residue_type)
+                    reference_space_ids.extend([reference_space] * len(group))
+                reference_space += 1
+        else:
+            sites = tuple(
+                site
+                for component_index, component in enumerate(entity.components)
+                for atom in component.atoms
+                if atom.element != "H"
+                and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available_sites
+            )
+            if not sites:
+                raise ValueError(f"ESMFold2 molecule {instance_id!r} has no heavy atoms")
+            for site in sites:
+                token_groups.append((site,))
+                token_sites.append(site)
+                token_instance_ids.append(instance_id)
+                token_entity_ids.append(entity_key)
+                token_monomer_indices.append(None)
+                residue_indices.append(0)
+                asym_ids.append(asym_id)
+                entity_ids.append(entity_id)
+                sym_ids.append(sym_id)
+                molecule_types.append(3)
+                residue_types.append(_PROTEIN_UNKNOWN)
+                reference_space_ids.append(reference_space)
+            reference_space += 1
+
+    atom_sites = tuple(site for group in token_groups for site in group)
+    site_to_atom = {site: index for index, site in enumerate(atom_sites)}
+    site_to_token = {site: token_index for token_index, group in enumerate(token_groups) for site in group}
+    real_atom_count = len(atom_sites)
+    padded_atom_count = max(32, math.ceil(real_atom_count / 32) * 32)
+
+    optional_reference_coordinates = [reference_coordinate(system, site) for site in atom_sites]
+    for space_id in set(reference_space_ids):
+        indices = [index for index, value in enumerate(reference_space_ids) if value == space_id]
+        if len(indices) > 1 and any(optional_reference_coordinates[index] is None for index in indices):
+            raise ValueError(f"ESMFold2 reference conformer is incomplete for {atom_sites[indices[0]].instance_id!r}")
+    reference_coordinates: list[tuple[float, float, float]] = []
+    atomic_numbers: list[int] = []
+    formal_charges: list[int] = []
+    encoded_atom_names: list[list[int]] = []
+    molecule_atom_counts: dict[tuple[str, str], int] = {}
+    from rdkit.Chem import GetPeriodicTable
+
+    periodic_table = GetPeriodicTable()
     atom_cursor = 0
-    for t_idx, (letter, res_3) in enumerate(zip(sequence, res_3letter)):
-        atom_names = PROTEIN_HEAVY_ATOMS[res_3]
-        res_type_id = PROTEIN_RESIDUE_TO_RES_TYPE.get(res_3, PROTEIN_UNK_RES_TYPE)
-        input_id = ESM_PROTEIN_VOCAB.get(letter, ESM_PROTEIN_VOCAB["X"])
-
-        token_atom_starts.append(atom_cursor)
-        for name in atom_names:
-            charge = PROTEIN_CHARGED_ATOMS.get((res_3, name), 0)
-            element = name[0]  # protein heavy atoms are all single-letter C/N/O/S
-            reference_position = PROTEIN_REF_POS[res_3][name]
-            atom_records.append((t_idx, name, element, charge, reference_position))
+    for group in token_groups:
+        for site in group:
+            coordinate = optional_reference_coordinates[atom_cursor]
             atom_cursor += 1
+            atom = system.atom(site)
+            reference_coordinates.append((0.0, 0.0, 0.0) if coordinate is None else coordinate)
+            atomic_numbers.append(int(periodic_table.GetAtomicNumber(atom.element)))
+            formal_charges.append(atom.formal_charge)
+            entity = system.entities[system.instances[site.instance_id]]
+            atom_name = site.atom_id
+            if isinstance(entity, Molecule) and not valid_atom_name(atom_name):
+                key = (site.instance_id, atom.element.upper())
+                molecule_atom_counts[key] = molecule_atom_counts.get(key, 0) + 1
+                atom_name = f"{atom.element.upper()}{molecule_atom_counts[key]}"
+            if not valid_atom_name(atom_name):
+                raise ValueError(f"ESMFold2 atom name cannot be encoded in four 6-bit characters: {atom_name!r}")
+            encoded_atom_names.append(
+                [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
+            )
 
-        rep_name = "CB" if "CB" in atom_names else "CA"
-        distogram_rep_atom_idx.append(token_atom_starts[t_idx] + atom_names.index(rep_name))
+    ref_pos = torch.zeros(padded_atom_count, 3, dtype=torch.float32)
+    ref_element = torch.zeros(padded_atom_count, dtype=torch.long)
+    ref_charge = torch.zeros(padded_atom_count, dtype=torch.int8)
+    ref_atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    ref_space_uid = torch.zeros(padded_atom_count, dtype=torch.long)
+    atom_attention_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
+    atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
+    ref_pos[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
+    ref_element[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
+    ref_charge[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
+    ref_atom_name_chars[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
+    ref_space_uid[:real_atom_count] = torch.tensor(reference_space_ids, dtype=torch.long)
+    atom_attention_mask[:real_atom_count] = True
+    atom_to_token[:real_atom_count] = torch.tensor(
+        [token_index for token_index, group in enumerate(token_groups) for _ in group],
+        dtype=torch.long,
+    )
 
-        res_type_vals.append(res_type_id)
-        input_id_vals.append(input_id)
-
-    n_real_atoms = len(atom_records)
-    n_atoms = math.ceil(n_real_atoms / 32) * 32 if n_real_atoms > 0 else 32
-
-    ref_positions = torch.zeros(n_atoms, 3, dtype=torch.float32)
-    ref_element = torch.zeros(n_atoms, dtype=torch.int64)
-    ref_charge = torch.zeros(n_atoms, dtype=torch.int8)
-    ref_atom_name_chars = torch.zeros(n_atoms, 4, dtype=torch.int64)
-    ref_space_uid = torch.zeros(n_atoms, dtype=torch.int64)
-    atom_attention_mask = torch.zeros(n_atoms, dtype=torch.bool)
-    atom_to_token = torch.zeros(n_atoms, dtype=torch.int64)
-
-    for i, (t_idx, name, element, charge, pos) in enumerate(atom_records):
-        ref_positions[i] = torch.tensor(pos, dtype=torch.float32)
-        ref_element[i] = _PROTEIN_ELEMENT_TO_ATOMIC_NUM[element]
-        ref_charge[i] = charge
-        ref_atom_name_chars[i] = torch.tensor(_encode_atom_name(name), dtype=torch.int64)
-        ref_space_uid[i] = t_idx
-        atom_attention_mask[i] = True
-        atom_to_token[i] = t_idx
-
-    token_index = torch.arange(L, dtype=torch.int64)
-    residue_index = torch.arange(L, dtype=torch.int64)
-    asym_id = torch.zeros(L, dtype=torch.int64)
-    sym_id = torch.zeros(L, dtype=torch.int64)
-    entity_id = torch.ones(L, dtype=torch.int64)
-    mol_type = torch.full((L,), MOL_TYPE_PROTEIN, dtype=torch.int64)
-    res_type_tensor = torch.tensor(res_type_vals, dtype=torch.int64)
-    input_ids = torch.tensor(input_id_vals, dtype=torch.int64)
-    token_bonds = torch.zeros(L, L, 1, dtype=torch.float32)
-    token_attention_mask = torch.ones(L, dtype=torch.bool)
-    distogram_atom_idx = torch.tensor(distogram_rep_atom_idx, dtype=torch.int64)
-
-    # Single-sequence MSA: depth 1, row 0 is the sequence itself.
-    msa = res_type_tensor.unsqueeze(0)
-    msa_attention_mask = torch.ones(1, L, dtype=torch.bool)
-    has_deletion = torch.zeros(1, L, dtype=torch.bool)
-    deletion_value = torch.zeros(1, L, dtype=torch.float32)
-    deletion_mean = torch.zeros(L, dtype=torch.float32)
+    token_count = len(token_groups)
+    representative_atoms = [
+        representative_atom(group, molecule_types[index], residue_types[index], site_to_atom)
+        for index, group in enumerate(token_groups)
+    ]
+    token_bonds = token_bond_matrix(system, site_to_token, token_count)
+    msa_features = msa_tensors(
+        msa,
+        system=system,
+        token_entity_ids=token_entity_ids,
+        token_monomer_indices=token_monomer_indices,
+        residue_types=residue_types,
+    )
+    esmc_input_ids, esmc_attention_mask, token_to_esmc, token_has_esmc = esmc_tensors(
+        system,
+        token_instance_ids=token_instance_ids,
+        token_monomer_indices=token_monomer_indices,
+        molecule_types=molecule_types,
+        tokenizer=tokenizer,
+    )
 
     features = {
-        "token_index": token_index,
-        "residue_index": residue_index,
-        "asym_id": asym_id,
-        "sym_id": sym_id,
-        "entity_id": entity_id,
-        "mol_type": mol_type,
-        "res_type": res_type_tensor,
-        "input_ids": input_ids,
+        "token_index": torch.arange(token_count, dtype=torch.long),
+        "residue_index": torch.tensor(residue_indices, dtype=torch.long),
+        "chain_index": torch.tensor(asym_ids, dtype=torch.long),
+        "symmetry_index": torch.tensor(sym_ids, dtype=torch.long),
+        "entity_index": torch.tensor(entity_ids, dtype=torch.long),
+        "mol_type": torch.tensor(molecule_types, dtype=torch.long),
+        "res_type": torch.tensor(residue_types, dtype=torch.long),
         "token_bonds": token_bonds,
-        "token_attention_mask": token_attention_mask,
-        "ref_pos": ref_positions,
+        "token_attention_mask": torch.ones(token_count, dtype=torch.bool),
+        "ref_pos": ref_pos,
         "ref_element": ref_element,
         "ref_charge": ref_charge,
         "ref_atom_name_chars": ref_atom_name_chars,
         "ref_space_uid": ref_space_uid,
         "atom_attention_mask": atom_attention_mask,
         "atom_to_token": atom_to_token,
-        "distogram_atom_idx": distogram_atom_idx,
-        "msa": msa,
-        "msa_attention_mask": msa_attention_mask,
+        "distogram_atom_idx": torch.tensor(representative_atoms, dtype=torch.long),
+        "token_has_esmc": token_has_esmc,
+        **msa_features,
+    }
+    placed = {
+        name: tensor.to(device=device, dtype=dtype) if tensor.is_floating_point() else tensor.to(device=device)
+        for name, tensor in features.items()
+    }
+    return ESMFold2Input(
+        **{name: value.unsqueeze(0) for name, value in placed.items()},
+        esmc_input_ids=esmc_input_ids.to(device=device),
+        esmc_attention_mask=esmc_attention_mask.to(device=device),
+        token_to_esmc=token_to_esmc.unsqueeze(0).to(device=device),
+        layout=ESMFold2Layout(
+            system=system,
+            atom_sites=atom_sites,
+            token_sites=tuple(token_sites),
+            msa=msa,
+        ),
+    )
+
+
+def reference_coordinate(
+    system: MolecularSystem,
+    site: AtomSite,
+) -> tuple[float, float, float] | None:
+    r"""Return the canonical atom-aligned reference coordinate for one site."""
+
+    entity = system.entities[system.instances[site.instance_id]]
+    component = entity.components[site.component_index]
+    if not component.reference_coordinates:
+        return None
+    index = next(index for index, atom in enumerate(component.atoms) if atom.atom_id == site.atom_id)
+    return component.reference_coordinates[index]
+
+
+def valid_atom_name(atom_name: str) -> bool:
+    r"""Return whether the released four-character atom encoding is lossless."""
+
+    return len(atom_name) <= 4 and all(32 <= ord(character) < 96 for character in atom_name)
+
+
+def representative_atom(
+    group: tuple[AtomSite, ...],
+    molecule_type: int,
+    residue_type: int,
+    site_to_atom: dict[AtomSite, int],
+) -> int:
+    r"""Select the released representative atom for one structure token."""
+
+    by_name = {site.atom_id: site_to_atom[site] for site in group}
+    fallback = site_to_atom[group[0]]
+    if molecule_type == 0:
+        return by_name.get("CB", by_name.get("CA", fallback))
+    if molecule_type in (1, 2):
+        if residue_type in (27, 32):
+            return by_name.get("C1'", fallback)
+        if residue_type in (23, 24, 28, 29):
+            return by_name.get("C4", by_name.get("C1'", fallback))
+        return by_name.get("C2", by_name.get("C1'", fallback))
+    return fallback
+
+
+def token_bond_matrix(
+    system: MolecularSystem,
+    site_to_token: dict[AtomSite, int],
+    token_count: int,
+) -> torch.Tensor:
+    r"""Project canonical intrinsic, polymer, and assembly bonds onto token pairs."""
+
+    edges: set[tuple[int, int]] = set()
+
+    def add(site_a: AtomSite, site_b: AtomSite) -> None:
+        token_a = site_to_token.get(site_a)
+        token_b = site_to_token.get(site_b)
+        if token_a is not None and token_b is not None and token_a != token_b:
+            edges.add((min(token_a, token_b), max(token_a, token_b)))
+
+    protein_standards = _STANDARD_COMPONENTS["protein"]
+    for bond in system.iter_bonds():
+        if bond.origin == "polymer_rule":
+            # Released ESMFold2 encodes an explicit token bond only for a protein backbone
+            # link at a non-standard junction; standard peptide adjacency and every nucleic
+            # backbone link stay implicit in the token/residue index and are skipped here.
+            entity = system.entities[system.instances[bond.site_a.instance_id]]
+            if isinstance(entity, PolymerSequence):
+                left_id = entity.components[bond.site_a.component_index].component_id
+                right_id = entity.components[bond.site_b.component_index].component_id
+                if entity.polymer_type != "protein" or (left_id in protein_standards and right_id in protein_standards):
+                    continue
+        add(bond.site_a, bond.site_b)
+
+    values = torch.zeros(token_count, token_count, 1, dtype=torch.float32)
+    for left, right in edges:
+        values[left, right, 0] = 1.0
+        values[right, left, 0] = 1.0
+    return values
+
+
+def msa_tensors(
+    msa: MSA | MSACollection | None,
+    *,
+    system: MolecularSystem,
+    token_entity_ids: list[str],
+    token_monomer_indices: list[int | None],
+    residue_types: list[int],
+) -> dict[str, torch.Tensor]:
+    r"""Construct released paired/unpaired MSA rows over structure tokens."""
+
+    token_count = len(residue_types)
+    if msa is None:
+        tokens = torch.tensor([residue_types], dtype=torch.long)
+        deletion_counts = torch.zeros(1, token_count, dtype=torch.float32)
+    else:
+        # The MSA holds no PolymerSequence: column ``c`` binds ``columns[c].entity_id`` to a system
+        # entity, and query_to_entity is the identity map, so a token's monomer index is directly the
+        # aligned-row column. A bare MSA is a single-chain plan over its unpaired pool; a collection
+        # replays its dense row_pairing/row_is_paired plan across the paired and unpaired pools.
+        columns = (msa,) if isinstance(msa, MSA) else msa.msas
+        if isinstance(msa, MSA):
+            plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
+                ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
+            ]
+        else:
+            plan_rows = [
+                tuple(
+                    (column_index, int(msa.row_pairing[plan_index, column_index]), bool(is_paired))
+                    for column_index, is_paired in enumerate(msa.row_is_paired[plan_index])
+                    if msa.row_pairing[plan_index, column_index] != -1
+                )
+                for plan_index in range(msa.row_pairing.shape[0])
+            ]
+        rows: list[torch.Tensor] = []
+        deletions: list[torch.Tensor] = []
+        for selections in plan_rows:
+            row = torch.full((token_count,), _MSA_GAP, dtype=torch.long)
+            deletion_row = torch.zeros(token_count, dtype=torch.float32)
+            for column_index, source_row, is_paired in selections:
+                value = columns[column_index]
+                aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
+                deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
+                    source_row
+                ]
+                for token_index, (entity_id, monomer_index) in enumerate(zip(token_entity_ids, token_monomer_indices)):
+                    if entity_id != value.entity_id or monomer_index is None:
+                        continue
+                    row[token_index] = _msa_residue_type(aligned[monomer_index])
+                    deletion_row[token_index] = float(deletion_source[monomer_index])
+            rows.append(row)
+            deletions.append(deletion_row)
+        tokens = torch.stack(rows)
+        deletion_counts = torch.stack(deletions)
+        tokens[0] = torch.tensor(residue_types, dtype=torch.long)
+
+    has_deletion = deletion_counts > 0
+    deletion_value = (math.pi / 2) * torch.atan(deletion_counts / 3)
+    return {
+        "msa": tokens,
         "has_deletion": has_deletion,
         "deletion_value": deletion_value,
-        "deletion_mean": deletion_mean,
+        "deletion_mean": deletion_value.mean(dim=0),
+        "msa_attention_mask": torch.ones_like(tokens, dtype=torch.bool),
     }
-    return {k: v.unsqueeze(0) for k, v in features.items()}
+
+
+def esmc_tensors(
+    system: MolecularSystem,
+    *,
+    token_instance_ids: list[str],
+    token_monomer_indices: list[int | None],
+    molecule_types: list[int],
+    tokenizer: ProteinTokenizer,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Build one isolated MultiMolecule ESMC row per protein chain."""
+
+    proteins: list[tuple[str, PolymerSequence]] = []
+    for instance_id, entity_key in system.instances.items():
+        entity = system.entities[entity_key]
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
+            proteins.append((instance_id, entity))
+
+    if proteins:
+        max_length = max(len(entity) for _, entity in proteins) + 2
+        input_ids = torch.full(
+            (len(proteins), max_length),
+            tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        attention_mask = torch.zeros(len(proteins), max_length, dtype=torch.bool)
+        row_by_instance: dict[str, int] = {}
+        for row, (instance_id, entity) in enumerate(proteins):
+            row_by_instance[instance_id] = row
+            letters = [restype_3to1.get(component.component_id, "X") for component in entity.components]
+            residue_ids = tokenizer.convert_tokens_to_ids(letters)
+            chain_ids = torch.tensor(
+                [tokenizer.bos_token_id, *residue_ids, tokenizer.eos_token_id],
+                dtype=torch.long,
+            )
+            input_ids[row, : len(chain_ids)] = chain_ids
+            attention_mask[row, : len(chain_ids)] = True
+    else:
+        max_length = 2
+        row_by_instance = {}
+        input_ids = torch.tensor([[tokenizer.bos_token_id, tokenizer.eos_token_id]], dtype=torch.long)
+        attention_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    token_to_esmc: list[int] = []
+    token_has_esmc: list[bool] = []
+    for instance_id, monomer_index, molecule_type in zip(
+        token_instance_ids,
+        token_monomer_indices,
+        molecule_types,
+    ):
+        has_esmc = molecule_type == 0
+        token_has_esmc.append(has_esmc)
+        token_to_esmc.append(
+            row_by_instance[instance_id] * max_length + cast(int, monomer_index) + 1 if has_esmc else 0
+        )
+    return (
+        input_ids,
+        attention_mask,
+        torch.tensor(token_to_esmc, dtype=torch.long),
+        torch.tensor(token_has_esmc, dtype=torch.bool),
+    )

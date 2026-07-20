@@ -10,7 +10,7 @@ from ofoldx.modules.trunk import PairformerBlock, PairformerStack
 
 @pytest.fixture
 def kwargs() -> dict[str, Any]:
-    r"""Shared small Pairformer config (CPU-friendly eager/sdpa backend)."""
+    r"""Shared small Pairformer config using the family-wide PyTorch reference."""
     return {
         "single_size": 8,
         "pair_size": 4,
@@ -19,7 +19,7 @@ def kwargs() -> dict[str, Any]:
         "num_triangle_attention_heads": 2,
         "num_pair_attention_heads": 2,
         "dropout": 0.0,
-        "operator_backend": "sdpa",
+        "operator_backend": "eager",
     }
 
 
@@ -63,7 +63,7 @@ def test_forward(kwargs: dict[str, Any], single_size: int) -> None:
         assert not torch.allclose(masked_single, block_single, atol=1e-6)  # partial mask flows through
 
     torch.manual_seed(2)
-    stack = PairformerStack(num_blocks=2, blocks_per_checkpoint=None, **kwargs).eval()
+    stack = PairformerStack(num_blocks=2, **kwargs).eval()
     stack_single, stack_pair = stack(single, pair)
     assert stack_pair.shape == (1, 3, 3, 4)
     assert (stack_single is None) is (single_size == 0)
@@ -71,14 +71,8 @@ def test_forward(kwargs: dict[str, Any], single_size: int) -> None:
     redo_stack_single, redo_stack_pair = stack(single, pair)
     torch.testing.assert_close(redo_stack_pair, stack_pair, rtol=0, atol=0)
 
-    one_block_stack = PairformerStack(num_blocks=1, blocks_per_checkpoint=None, **kwargs).eval()
+    one_block_stack = PairformerStack(num_blocks=1, **kwargs).eval()
     one_block_stack.blocks[0].load_state_dict(stack.blocks[0].state_dict())
     _, one_pair = one_block_stack(single, pair)
     # 2-block output must diverge from the 1-block result: the second block actually runs.
     assert not torch.allclose(stack_pair, one_pair, atol=1e-6)
-
-
-def test_invalid_inputs(kwargs: dict[str, Any]) -> None:
-    # single_size>0 builds pair_attention; a missing single representation is a documented error
-    with pytest.raises(ValueError, match="single representation is required"):
-        PairformerBlock(**kwargs)(None, torch.zeros(1, 3, 3, 4))

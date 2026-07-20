@@ -1,10 +1,9 @@
 r"""
 Backend dispatch for the outer-product-mean operator.
 
-The dispatcher owns everything backend-specific for this operator in one place: the supported
-backends, ``"auto"`` resolution, the CUDA guard, and each backend's calling convention. Modules pass
-their gathered parameters plus the requested ``operator_backend`` and stay backend-agnostic. New
-backends (cuEquivariance / NVIDIA) are added as a branch here, not in every caller.
+The dispatcher owns backend selection, availability, and calling-convention
+adaptation. Modules pass the ordinary tensor arguments without a second
+validation layer.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ def outer_product_mean(
     denom_eps: float,
     divide_before_projection: bool,
     operator_backend: str,
+    proj_left_bias: Tensor | None = None,
+    proj_right_bias: Tensor | None = None,
 ) -> Tensor:
     r"""
     Form the mask-weighted mean over sequence rows of the outer product of the left/right MSA
@@ -43,8 +44,12 @@ def outer_product_mean(
         msa: ``(B, S, N, msa_size)`` MSA representation.
         msa_mask: Optional ``(B, S, N)`` mask zeroing invalid rows and counting valid pairs.
         norm_weight, norm_bias, norm_eps: LayerNorm parameters for the pre-normalization.
-        proj_left_weight, proj_right_weight: Bias-free left/right projection weights.
+        proj_left_weight, proj_right_weight: Left/right projection weights.
         proj_out_weight, proj_out_bias: Output projection (affine).
+        proj_left_bias, proj_right_bias: Optional left/right projection biases; ``None`` keeps the
+            projections bias-free (the AF3-lineage path). The AlphaFold 2 outer-product mean supplies
+            both. The fused ``oops`` kernel has no bias support, so a non-``None`` bias forces the
+            ``eager`` path.
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
@@ -85,7 +90,8 @@ def outer_product_mean(
         supported=_SUPPORTED,
         public_default="eager",
     )
-    if backend == "oops":
+    has_projection_bias = proj_left_bias is not None or proj_right_bias is not None
+    if backend == "oops" and not has_projection_bias:
         if not msa.is_cuda:
             raise OOpsUnsupportedError(
                 "OuterProductMean backend 'oops' requires CUDA tensors; use operator_backend='eager'"
@@ -109,11 +115,11 @@ def outer_product_mean(
         )
 
     msa = torch.nn.functional.layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps)
-    left = torch.nn.functional.linear(msa, proj_left_weight)
-    right = torch.nn.functional.linear(msa, proj_right_weight)
+    left = torch.nn.functional.linear(msa, proj_left_weight, proj_left_bias)
+    right = torch.nn.functional.linear(msa, proj_right_weight, proj_right_bias)
     if msa_mask is None:
         msa_mask = msa.new_ones(msa.shape[:-1])
-    msa_mask = msa_mask.to(dtype=msa.dtype, device=msa.device)
+    msa_mask = msa_mask.to(dtype=msa.dtype)
     left = left * msa_mask[..., None]
     right = right * msa_mask[..., None]
 

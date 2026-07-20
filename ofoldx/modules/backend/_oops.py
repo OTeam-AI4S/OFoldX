@@ -22,7 +22,9 @@ try:
     from oops import LayerNorm, OOpsUnsupportedError
 
     OOPS_AVAILABLE = True
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "oops":
+        raise
     _oops = None
     OOPS_AVAILABLE = False
 

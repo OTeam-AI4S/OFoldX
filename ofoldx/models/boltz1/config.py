@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from chanfig import Config
 
-from ..registry import MODEL_CONFIGS
-
 
 class Boltz1TrunkConfig(Config):
     r"""
@@ -24,7 +22,7 @@ class Boltz1TrunkConfig(Config):
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
         num_pair_attention_heads: Head count for the single-track pair-biased attention.
         num_msa_blocks: Number of MSA-module blocks.
-        msa_size: Number of MSA sequences retained per token.
+        msa_size: Width of the MSA representation channel.
         msa_feature_size: Width of the raw per-MSA feature vector (one-hot + deletion + pairing flags).
         msa_head_dim: Per-head dimension inside the MSA attention.
         num_msa_attention_heads: Head count for the MSA pair-weighted-averaging.
@@ -32,7 +30,6 @@ class Boltz1TrunkConfig(Config):
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Head count for the triangle attention.
         use_paired_feature: Whether the MSA carries the cross-chain pairing feature.
-        operator_backend: Selector for the fused-operator backend (``"auto"`` uses OOps when available).
         dropout: Dropout applied to the Pairformer pair track.
         msa_dropout: Dropout applied inside the MSA module.
 
@@ -53,7 +50,6 @@ class Boltz1TrunkConfig(Config):
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
     use_paired_feature: bool = False
-    operator_backend: str = "auto"
     dropout: float = 0.0
     msa_dropout: float = 0.0
 
@@ -67,7 +63,6 @@ class Boltz1InputEmbedderConfig(Config):
         num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
         vocab_size: Residue-type vocabulary size feeding the one-hot residue feature.
         pocket_feature_size: Width of the token-level pocket one-hot conditioning feature.
-        include_atom_mask_feature: Whether to splice the atom pad-mask in as an extra atom feature channel.
         no_atom_encoder: When ``True``, skip the atom encoder and emit zeroed token-from-atom states.
 
     Examples:
@@ -80,7 +75,6 @@ class Boltz1InputEmbedderConfig(Config):
     num_atom_encoder_attention_heads: int = 4
     vocab_size: int = 33
     pocket_feature_size: int = 4
-    include_atom_mask_feature: bool = True
     no_atom_encoder: bool = False
 
 
@@ -101,7 +95,6 @@ class Boltz1DiffusionConfig(Config):
         num_conditioning_transitions: Number of transition blocks in each diffusion-conditioning stack.
         sigma_data: EDM data-scale hyperparameter used by the preconditioner and noise schedule.
         alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step to the denoised coords.
-        operator_backend: Selector for the fused-operator backend (``"auto"`` uses OOps when available).
 
     Examples:
         >>> config = Boltz1DiffusionConfig()
@@ -121,7 +114,6 @@ class Boltz1DiffusionConfig(Config):
     num_conditioning_transitions: int = 2
     sigma_data: float = 16.0
     alignment_reverse_diff: bool = True
-    operator_backend: str = "auto"
 
 
 class Boltz1SamplerConfig(Config):
@@ -129,7 +121,6 @@ class Boltz1SamplerConfig(Config):
     Reverse-diffusion sampler parameters for the Boltz-1 EDM schedule.
 
     Attributes:
-        solver: Reverse-diffusion integrator (Boltz-1 uses the Euler solver).
         num_sampling_steps: Number of reverse-diffusion steps.
         rho: Karras schedule power controlling the sigma spacing.
         max_noise_level: Highest noise level (start of the schedule), in ``sigma_data`` units.
@@ -145,7 +136,6 @@ class Boltz1SamplerConfig(Config):
         200
     """
 
-    solver: str = "euler"
     num_sampling_steps: int = 200
     rho: float = 7.0
     max_noise_level: float = 160.0
@@ -205,48 +195,15 @@ class Boltz1ConfidenceConfig(Config):
     ranking_ptm_weight: float = 1.0
 
 
-class Boltz1SteeringConfig(Config):
-    r"""
-    Boltz-1x inference-time steering surface.
-
-    The flags mirror official Boltz-1x prediction arguments. ``guidance_update`` is the Boltz-1.0 name;
-    ``physical_guidance_update`` is the newer Boltz CLI name for the same physical-potential update path.
-
-    Attributes:
-        fk_steering: Whether to enable Feynman-Kac particle steering during sampling.
-        num_particles: Number of FK particles carried per requested sample.
-        fk_lambda: Temperature on the FK resampling log-weights.
-        fk_resampling_interval: How often (in steps) FK resampling is applied.
-        guidance_update: Whether to apply physical-potential gradient guidance (Boltz-1.0 name).
-        physical_guidance_update: Newer Boltz CLI alias for ``guidance_update``; kept in sync at normalization.
-        num_gd_steps: Number of inner gradient-descent steps per guidance update.
-
-    Examples:
-        >>> config = Boltz1SteeringConfig()
-        >>> config.fk_steering
-        False
-    """
-
-    fk_steering: bool = False
-    num_particles: int = 3
-    fk_lambda: float = 4.0
-    fk_resampling_interval: int = 3
-    guidance_update: bool = False
-    physical_guidance_update: bool = False
-    num_gd_steps: int = 16
-
-
-@MODEL_CONFIGS.register("boltz1")
 class Boltz1Config(Config):
     r"""
     Top-level configuration for the Boltz-1 structure-prediction model.
 
     Instantiating with the defaults reproduces the public Boltz-1 inference entry point. The nested sub-configs
-    hold the trunk, input-embedder, diffusion, sampler, confidence, and steering knobs; the top-level fields
+    hold the trunk, input-embedder, diffusion, sampler, and confidence values; the top-level fields
     below set the shared representation widths and the recycling/distogram parameters.
 
     Attributes:
-        architecture: Registry key selecting this architecture (``"boltz1"``).
         single_size: Width of the single (token) representation.
         pair_size: Width of the pair representation.
         atom_hidden_size: Width of the atom single representation.
@@ -255,28 +212,19 @@ class Boltz1Config(Config):
         num_distogram_bins: Number of bins for the trunk distogram head.
         fourier_embedding_size: Width of the frozen Fourier noise embedding.
         relative_position_size: Width of the relative-position feature fed to the position embedder.
-        initializer_range: Standard deviation used when initializing weight matrices.
         recycling_steps: Number of extra trunk recycles run after the initial pass.
-        recycling_detach: Whether to detach gradients across all but the final recycle during training.
         no_msa: When ``True``, build the model without the MSA module.
-        min_distance: Lower distance bound (Angstrom) used by distance featurization.
-        max_distance: Upper distance bound (Angstrom) used by distance featurization.
         input_embedder: Nested input-embedder configuration.
         trunk: Nested representation-trunk configuration.
         diffusion: Nested EDM denoising-module configuration.
         sampler: Nested reverse-diffusion sampler configuration.
         confidence: Nested confidence/ranking configuration.
-        steering: Nested Boltz-1x inference-time steering configuration.
 
     Examples:
         >>> config = Boltz1Config()
-        >>> config.architecture
-        'boltz1'
         >>> from ofoldx.models.boltz1.model import Boltz1Model
         >>> model = Boltz1Model(config)  # doctest: +SKIP
     """
-
-    architecture: str = "boltz1"
 
     single_size: int = 384
     pair_size: int = 128
@@ -286,18 +234,11 @@ class Boltz1Config(Config):
     num_distogram_bins: int = 64
     fourier_embedding_size: int = 256
     relative_position_size: int = 139
-    initializer_range: float = 0.02
-
     recycling_steps: int = 3
-    recycling_detach: bool = True
     no_msa: bool = False
-
-    min_distance: float = 2.0
-    max_distance: float = 22.0
 
     input_embedder: Boltz1InputEmbedderConfig = Boltz1InputEmbedderConfig()
     trunk: Boltz1TrunkConfig = Boltz1TrunkConfig()
     diffusion: Boltz1DiffusionConfig = Boltz1DiffusionConfig()
     sampler: Boltz1SamplerConfig = Boltz1SamplerConfig()
     confidence: Boltz1ConfidenceConfig = Boltz1ConfidenceConfig()
-    steering: Boltz1SteeringConfig = Boltz1SteeringConfig()

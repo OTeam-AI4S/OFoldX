@@ -1,98 +1,30 @@
-r"""
-RfDiffusion design-generator configuration.
-"""
+r"""OFoldX-native implementation of the released RFdiffusion architecture."""
 
 from __future__ import annotations
 
-from importlib import import_module
-from typing import Any
-
-from .config import (
-    RfDiffusionConfig,
-    RfDiffusionContigMapConfig,
-    RfDiffusionDenoiserConfig,
-    RfDiffusionDiffuserConfig,
-    RfDiffusionInferenceConfig,
-    RfDiffusionLoggingConfig,
-    RfDiffusionModelConfig,
-    RfDiffusionPotentialsConfig,
-    RfDiffusionPPIConfig,
-    RfDiffusionPreprocessConfig,
-    RfDiffusionScaffoldGuidedConfig,
-    RfDiffusionSE3Config,
-    RfDiffusionTopKSE3Config,
-)
+from ..registry import register_model as _register_model
+from .config import RFdiffusionConfig, RFdiffusionProcessorConfig
 from .model import (
-    ContigMap,
-    Denoiser,
-    Diffuser,
-    EuclideanDiffuser,
-    IGSO3Diffuser,
-    NativeRfDiffusionSampler,
-    PotentialManager,
-    RfDiffusionDesigner,
-    RfDiffusionInput,
-    RfDiffusionRepresentations,
-    RoseTTAFoldModule,
-    SymmetryGenerator,
-    coords_to_t2d,
-    get_beta_schedule,
+    ComputeAllAtomCoords,
+    RFdiffusionDesignCandidate,
+    RFdiffusionInput,
+    RFdiffusionModel,
+    RFdiffusionOutput,
+    RFdiffusionResult,
 )
-from .processor import RfDiffusionProcessor
+from .pipeline import RFdiffusionPipeline
+from .processor import RFdiffusionProcessor
 
-_CONVERT_EXPORTS = {
-    "config_from_rfdiffusion_checkpoint",
-    "convert_rfdiffusion_checkpoint",
-    "convert_rfdiffusion_state_dict",
-    "load_rfdiffusion_checkpoint",
-}
+_register_model(
+    "ofoldx.rfdiffusion",
+    model=RFdiffusionModel,
+    processor=RFdiffusionProcessor,
+    standard_tasks=(),
+)
 
-# PDB readers, parsing, and featurization all live in the processor; resolved lazily so importing this
-# package stays free of an import cycle through the processor's heavier dependencies.
-_PROCESSOR_EXPORTS = {"parse_pdb", "parse_pdb_lines", "process_target"}
-
-__all__ = [
-    "RfDiffusionConfig",
-    "RfDiffusionContigMapConfig",
-    "RfDiffusionDenoiserConfig",
-    "RfDiffusionDiffuserConfig",
-    "RfDiffusionDesigner",
-    "RfDiffusionInferenceConfig",
-    "RfDiffusionInput",
-    "RfDiffusionLoggingConfig",
-    "RfDiffusionModelConfig",
-    "RfDiffusionPPIConfig",
-    "RfDiffusionPotentialsConfig",
-    "RfDiffusionPreprocessConfig",
-    "RfDiffusionProcessor",
-    "RfDiffusionRepresentations",
-    "RfDiffusionSE3Config",
-    "RfDiffusionScaffoldGuidedConfig",
-    "RfDiffusionTopKSE3Config",
-    "RoseTTAFoldModule",
-    "ContigMap",
-    "Denoiser",
-    "Diffuser",
-    "EuclideanDiffuser",
-    "IGSO3Diffuser",
-    "NativeRfDiffusionSampler",
-    "PotentialManager",
-    "SymmetryGenerator",
-    "config_from_rfdiffusion_checkpoint",
-    "convert_rfdiffusion_checkpoint",
-    "convert_rfdiffusion_state_dict",
-    "get_beta_schedule",
-    "load_rfdiffusion_checkpoint",
-    "parse_pdb",
-    "parse_pdb_lines",
-    "process_target",
-    "coords_to_t2d",
-]
-
-
-def __getattr__(name: str) -> Any:
-    if name in _CONVERT_EXPORTS:
-        return getattr(import_module(f"{__name__}.convert"), name)
-    if name in _PROCESSOR_EXPORTS:
-        return getattr(import_module(f"{__name__}.processor"), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+# `standard_tasks` stays empty (§6.1): the root pair must NOT be wrapped by the generic
+# standard "design" Pipeline, because `design` returns the family-owned `RFdiffusionResult`,
+# which is not losslessly the shared `DesignResult` (§7). The concrete `RFdiffusionPipeline`
+# registration (`register_pipeline("ofoldx.rfdiffusion", ...)` + `pipeline.json` marker) is
+# deferred under Principle 13 / §7.2 until real-weight sampled-output acceptance passes, exactly
+# as `ESMFold2Pipeline` defers; this wave freezes its signature and family Result type only.

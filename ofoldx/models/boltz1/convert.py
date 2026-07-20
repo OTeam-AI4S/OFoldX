@@ -9,72 +9,64 @@ parameter names.
 
 from __future__ import annotations
 
-import argparse
-import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import Tensor
 
-from ...hub import add_hub_upload_arguments, upload_artifact_from_args
-from ..boltz2 import convert as boltz2_convert
 from .config import Boltz1Config
 from .model import Boltz1Model
 
-_DTYPES = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
+_TIED_OUTPUT_PROJECTION = re.compile(
+    r"(?:\.diffusion_transformer\.layers\.\d+|\.token_transformer(?:_layers\.0)?\.layers\.\d+)"
+    r"\.(?:transition\.)?output_projection\.0\.(?:weight|bias)$"
+)
+
+
+def is_tied_output_projection(key: str) -> bool:
+    r"""Return whether ``key`` is a released Boltz checkpoint's tied projection duplicate."""
+
+    return _TIED_OUTPUT_PROJECTION.search(key) is not None
 
 
 def convert_boltz1_state_dict(
-    state_dict: Mapping[str, object],
+    state_dict: Mapping[str, Tensor],
     *,
     dtype: torch.dtype | None = None,
-    strict: bool = True,
-) -> dict[str, object]:
+) -> dict[str, Tensor]:
     r"""
     Convert a full Boltz-1 ``state_dict`` to [`Boltz1Model`][ofoldx.models.boltz1.model.Boltz1Model] keys.
 
     Every source key is stripped of a leading ``module.`` and routed through
     [`convert_boltz1_key`][ofoldx.models.boltz1.convert.convert_boltz1_key]; unrecognized, non-ignorable
-    keys are collected and (under ``strict``) reported. Adaptive-layer-norm parameters are then packed and the
-    zero atom-projection biases are synthesized so the OFoldX module tree loads without missing keys.
+    keys fail immediately. Adaptive-layer-norm parameters are packed into the OFoldX layout.
 
     Args:
         state_dict: The source Boltz-1 parameter mapping (checkpoint ``state_dict``).
         dtype: Optional dtype to cast floating-point tensors to; leaves them unchanged when ``None``.
-        strict: When ``True``, raise if any non-ignorable source key fails to map.
 
     Returns:
         Mapping from OFoldX parameter name to tensor (plus any packed/synthesized entries).
 
     Raises:
-        KeyError: If ``strict`` is set and one or more source keys are unmapped.
+        KeyError: If a source key is unmapped.
     """
 
-    converted: dict[str, object] = {}
-    unmapped: list[str] = []
+    converted: dict[str, Tensor] = {}
     for source_key, value in state_dict.items():
         key = source_key.removeprefix("module.")
         items = convert_boltz1_key(key, value)
-        if not items and not _is_ignorable_key(key):
-            unmapped.append(key)
+        if not items and not is_tied_output_projection(key):
+            raise KeyError(f"unmapped Boltz-1 checkpoint key: {key}")
         for target_key, target_value in items:
-            if dtype is not None and isinstance(target_value, Tensor) and target_value.is_floating_point():
+            target_value = cast(Tensor, target_value)
+            if dtype is not None and target_value.is_floating_point():
                 target_value = target_value.to(dtype=dtype)
             converted[target_key] = target_value
-    if strict and unmapped:
-        preview = ", ".join(unmapped[:20])
-        suffix = "" if len(unmapped) <= 20 else f", ... (+{len(unmapped) - 20} more)"
-        raise KeyError(f"unmapped Boltz-1 checkpoint keys: {preview}{suffix}")
-    converted = boltz2_convert.pack_adaptive_layer_norm_state(converted)
-    _add_zero_atom_projection_biases(converted)
     return converted
 
 
@@ -98,16 +90,16 @@ def convert_boltz1_key(key: str, tensor: object) -> list[tuple[str, object]]:
         input_inner = convert_input_embedder_key(key[len("input_embedder.") :], tensor)
         return [] if input_inner is None else [(input_inner[0], input_inner[1])]
     if key.startswith("msa_module."):
-        msa_items = boltz2_convert.convert_msa_module(key[len("msa_module.") :], tensor)
+        msa_items = convert_msa_module(key[len("msa_module.") :], tensor)
         return [(f"msa_module.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = boltz2_convert.convert_pairformer_layer(remainder, tensor)
+        pairformer_items = convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
     if key.startswith("distogram_module."):
-        new_key = boltz2_convert.convert_keys(key[len("distogram_module.") :], boltz2_convert.DISTOGRAM_RULES)
+        new_key = convert_keys(key[len("distogram_module.") :], DISTOGRAM_RULES)
         return [] if new_key is None else [(f"distogram_head.{new_key}", tensor)]
     if key.startswith("structure_module.score_model."):
         return convert_score_model_key(key[len("structure_module.score_model.") :], tensor)
@@ -177,12 +169,10 @@ def convert_score_model_key(key: str, tensor: object) -> list[tuple[str, object]
 
     score_prefix = "structure_module.score_model."
     if key.startswith("single_conditioner."):
-        new = boltz2_convert.convert_keys(key[len("single_conditioner.") :], boltz2_convert.SINGLE_CONDITIONING_RULES)
+        new = convert_keys(key[len("single_conditioner.") :], SINGLE_CONDITIONING_RULES)
         return [] if new is None else [(score_prefix + "single_conditioner." + new, tensor)]
     if key.startswith("pairwise_conditioner."):
-        new = boltz2_convert.convert_keys(
-            key[len("pairwise_conditioner.") :], boltz2_convert.PAIRWISE_CONDITIONING_RULES
-        )
+        new = convert_keys(key[len("pairwise_conditioner.") :], PAIRWISE_CONDITIONING_RULES)
         return [] if new is None else [("diffusion_conditioning.pairwise_conditioner." + new, tensor)]
     if key.startswith("atom_attention_encoder."):
         return _convert_score_atom_encoder_key(key[len("atom_attention_encoder.") :], tensor)
@@ -253,17 +243,17 @@ def convert_confidence_head_key(key: str, tensor: object) -> list[tuple[str, obj
             else [(f"input_embedder.{input_inner[0].removeprefix('input_embedder.')}", input_inner[1])]
         )
     if key.startswith("msa_module."):
-        msa_items = boltz2_convert.convert_msa_module(key[len("msa_module.") :], tensor)
+        msa_items = convert_msa_module(key[len("msa_module.") :], tensor)
         return [(f"msa_module.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = boltz2_convert.convert_pairformer_layer(remainder, tensor)
+        pairformer_items = convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
     if key.startswith("pairformer_stack.layers."):
         index, _, remainder = key[len("pairformer_stack.layers.") :].partition(".")
-        pairformer_items = boltz2_convert.convert_pairformer_layer(remainder, tensor)
+        pairformer_items = convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
@@ -284,107 +274,40 @@ def convert_confidence_head_key(key: str, tensor: object) -> list[tuple[str, obj
 
 def convert_boltz1_checkpoint(
     checkpoint_path: str | PathLike[str],
-    output_dir: str | PathLike[str],
     *,
-    config: Boltz1Config | Mapping[str, Any] | None = None,
+    config: Boltz1Config | None = None,
     dtype: torch.dtype | None = None,
-    strict: bool = True,
-) -> dict[str, object]:
+) -> Boltz1Model:
     r"""
-    Convert an original Boltz-1 ``.ckpt`` into an OFoldX pretrained directory.
+    Convert an original Boltz-1 ``.ckpt`` into a strict-loaded model.
 
     Loads the checkpoint (taking its ``state_dict`` entry when present), remaps the parameters via
-    [`convert_boltz1_state_dict`][ofoldx.models.boltz1.convert.convert_boltz1_state_dict], and writes the
-    OFoldX single-model-file artifacts: ``manifest.json``, ``config.json``, and ``model.safetensors``.
+    [`convert_boltz1_state_dict`][ofoldx.models.boltz1.convert.convert_boltz1_state_dict], and strict-loads the
+    resulting tensors into a native model. With the family's canonical Processor and ``FoldResult`` decoder now in
+    place, persistence via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model] is unblocked; the converter
+    itself saves nothing implicitly and declares no dtype policy beyond the optional cast.
 
     Args:
         checkpoint_path: Path to the original Boltz-1 ``.ckpt`` file.
-        output_dir: Directory to create and write the ``config.json`` / ``model.safetensors`` into.
-        config: Optional Boltz-1 config (or mapping) to persist; defaults to [`Boltz1Config`][].
+        config: Optional Boltz-1 config (or mapping); defaults to [`Boltz1Config`][].
         dtype: Optional dtype to cast floating-point tensors to during conversion.
-        strict: When ``True``, raise if any non-ignorable source key fails to map.
 
     Returns:
-        A summary dict with the source ``checkpoint`` path, ``output_dir``, converted ``tensor_count``, and
-        the ``dtype`` string (or ``None``).
+        The converted, strict-loaded model.
 
     Raises:
-        TypeError: If the loaded checkpoint does not contain a mapping state dict.
-        KeyError: If ``strict`` is set and one or more source keys are unmapped.
+        KeyError: If a source key is unmapped.
 
     Examples:
-        >>> convert_boltz1_checkpoint("boltz1_conf.ckpt", "boltz1")  # doctest: +SKIP
+        >>> model = convert_boltz1_checkpoint("boltz1_conf.ckpt")  # doctest: +SKIP
     """
 
-    checkpoint_path = Path(checkpoint_path)
-    output_dir = Path(output_dir)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    raw_state = checkpoint.get("state_dict", checkpoint)
-    if not isinstance(raw_state, Mapping):
-        raise TypeError("checkpoint does not contain a mapping state_dict")
-    converted = convert_boltz1_state_dict(raw_state, dtype=dtype, strict=strict)
-
-    model_config = Boltz1Config() if config is None else Boltz1Config(config)
-    model = Boltz1Model(model_config)
-    if dtype is not None:
-        model.to(dtype=dtype)
-    tensor_state: dict[str, Tensor] = {}
-    for key, value in converted.items():
-        if not isinstance(value, Tensor):
-            raise TypeError(f"converted Boltz-1 state contains a non-tensor value at {key!r}")
-        tensor_state[key] = value
-    model.load_state_dict(tensor_state, strict=True)
-    model.save_pretrained(output_dir)
-    return {
-        "checkpoint": str(checkpoint_path),
-        "output_dir": str(output_dir),
-        "tensor_count": len(tensor_state),
-        "dtype": str(dtype) if dtype is not None else None,
-    }
-
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    r"""Parse command-line arguments for the checkpoint-conversion entry point."""
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path, help="Path to an original Boltz-1 .ckpt file")
-    parser.add_argument("output_dir", type=Path, help="Output pretrained directory")
-    parser.add_argument("--dtype", choices=("keep", "float32", "float16", "bfloat16"), default="keep")
-    parser.add_argument(
-        "--no-strict",
-        dest="strict",
-        action="store_false",
-        default=True,
-        help="Allow non-ignorable source checkpoint keys to remain unmapped",
-    )
-    add_hub_upload_arguments(parser)
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    r"""
-    Command-line entry point for Boltz-1 checkpoint conversion.
-
-    Examples:
-        >>> main(["boltz1_conf.ckpt", "out/boltz1"])  # doctest: +SKIP
-    """
-
-    args = _parse_args(argv)
-    dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
-    report = convert_boltz1_checkpoint(
-        args.checkpoint,
-        args.output_dir,
-        dtype=dtype,
-        strict=args.strict,
-    )
-    print(json.dumps(report, indent=2, sort_keys=True))
-    upload_result = upload_artifact_from_args(
-        args.output_dir,
-        args,
-        commit_message="Upload converted Boltz-1 checkpoint",
-    )
-    if upload_result is not None:
-        print(f"hub_upload: {upload_result}")
+    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    converted = convert_boltz1_state_dict(checkpoint["state_dict"], dtype=dtype)
+    with torch.device("meta"):
+        model = Boltz1Model(config)
+    model.load_state_dict(converted, strict=True, assign=True)
+    return model
 
 
 _TRUNK_FLAT = {
@@ -435,25 +358,11 @@ _CONFIDENCE_PREFIXES = (
 
 
 def _convert_score_atom_encoder_key(key: str, tensor: object) -> list[tuple[str, object]]:
-    r"""
-    Convert a score-model ``atom_attention_encoder.*`` key, splitting invariant atom-encoder
-    parameters into ``diffusion_conditioning`` and keeping the noisy-position projection in the score model.
-
-    Args:
-        key: The ``atom_attention_encoder``-relative key.
-        tensor: The associated parameter value.
-
-    Returns:
-        List of ``(target_key, value)`` pairs; empty when no rule matches.
-    """
-
     atom_key = _convert_atom_encoder_base_key(key)
     if atom_key is not None:
         if atom_key.startswith("atom_attention_encoder.noisy_position_projection."):
             if key == "r_to_q_trans.weight":
-                if not isinstance(tensor, Tensor):
-                    raise TypeError("r_to_q_trans.weight must be a tensor")
-                tensor = tensor[:, :3]
+                tensor = cast(Tensor, tensor)[:, :3]
             return [("structure_module.score_model." + atom_key, tensor)]
         return [("diffusion_conditioning." + atom_key, tensor)]
     routed = _convert_transformer_layer_key(
@@ -477,18 +386,6 @@ def _convert_score_atom_encoder_key(key: str, tensor: object) -> list[tuple[str,
 
 
 def _convert_score_atom_decoder_key(key: str, tensor: object) -> list[tuple[str, object]]:
-    r"""
-    Convert a score-model ``atom_attention_decoder.*`` key (per-layer transformer, token projection,
-    and the atom position-update projection), routing the pair bias into ``diffusion_conditioning``.
-
-    Args:
-        key: The ``atom_attention_decoder``-relative key.
-        tensor: The associated parameter value.
-
-    Returns:
-        List of ``(target_key, value)`` pairs; empty when no rule matches.
-    """
-
     routed = _convert_transformer_layer_key(
         key,
         old_prefix="atom_decoder.diffusion_transformer.layers.",
@@ -518,17 +415,7 @@ def _convert_score_atom_decoder_key(key: str, tensor: object) -> list[tuple[str,
 
 
 def _convert_atom_encoder_base_key(key: str) -> str | None:
-    r"""
-    Map a base atom-encoder key via the shared Boltz-2 rules, plus the noisy-position projection rename.
-
-    Args:
-        key: An atom-encoder-relative key.
-
-    Returns:
-        The renamed key (prefixed with ``atom_encoder.``), or ``None`` when no rule matches.
-    """
-
-    new = boltz2_convert.convert_keys(key, boltz2_convert._ATOM_ENCODER_RULES)
+    new = convert_keys(key, _ATOM_ENCODER_RULES)
     if new is not None and new != key:
         return "atom_encoder." + new
     if key.startswith("r_to_q_trans."):
@@ -544,67 +431,30 @@ def _convert_transformer_layer_key(
     pair_bias_prefix: str,
     tensor: object,
 ) -> tuple[str, object] | None:
-    r"""
-    Convert one per-layer conditioned-transformer key, splitting the pair-bias projection out to its own
-    per-block namespace and remapping the remaining layer parameters via the shared Boltz-2 rules.
-
-    Args:
-        key: The full key to inspect (must start with ``old_prefix`` to match).
-        old_prefix: The checkpoint layer prefix ending in ``layers.`` before the block index.
-        layer_prefix: Target prefix for the transformer-layer parameters, indexed by block.
-        pair_bias_prefix: Target prefix for the extracted pair-bias projection, indexed by block.
-        tensor: The associated parameter value.
-
-    Returns:
-        A single ``(target_key, value)`` pair, or ``None`` when the key does not match this layer family.
-    """
-
     if not key.startswith(old_prefix):
         return None
     index, _, remainder = key[len(old_prefix) :].partition(".")
     pair_bias = _convert_pair_bias_projection_suffix(remainder)
     if pair_bias is not None:
         return (f"{pair_bias_prefix}{index}.{pair_bias}", tensor)
-    new = boltz2_convert.convert_keys(remainder, boltz2_convert.CONDITIONED_TRANSFORMER_LAYER_RULES)
+    new = convert_keys(remainder, CONDITIONED_TRANSFORMER_LAYER_RULES)
     return None if new is None else (f"{layer_prefix}{index}.{new}", tensor)
 
 
 def _convert_boltz1_confidence_heads_key(key: str) -> str | None:
-    r"""
-    Rename a ``confidence_heads.*`` projection key (pLDDT/PAE/PDE/resolved logits).
-
-    Args:
-        key: A ``confidence_heads``-relative key.
-
-    Returns:
-        The renamed key, or ``None`` when no rule matches.
-    """
-
-    rules = {
+    replacements = {
         "to_pde_logits.": "pde_projection.",
         "to_plddt_logits.": "plddt_projection.",
         "to_resolved_logits.": "resolved_projection.",
         "to_pae_logits.": "pae_projection.",
     }
-    for old, new in rules.items():
+    for old, new in replacements.items():
         if key.startswith(old):
             return key.replace(old, new, 1)
     return None
 
 
 def _convert_conditioned_transition_block_key(key: str) -> str | None:
-    r"""
-    Rename a conditioned-transition-block key (AdaLN scale/bias, swish gate, expand/output projections).
-
-    The affine-free ``adaln.a_norm.*`` parameters carry no learnable weights and are intentionally dropped.
-
-    Args:
-        key: A ``transition_block``-relative key.
-
-    Returns:
-        The renamed key, or ``None`` when the key is dropped or unmatched.
-    """
-
     if key.startswith("adaln.a_norm."):
         return None
     replacements = (
@@ -623,16 +473,6 @@ def _convert_conditioned_transition_block_key(key: str) -> str | None:
 
 
 def _convert_pair_bias_projection_suffix(key: str) -> str | None:
-    r"""
-    Extract the pair-bias projection suffix (``proj_z.0``/``proj_z.1``) from a pair-biased-attention key.
-
-    Args:
-        key: A per-layer transformer remainder key.
-
-    Returns:
-        The ``0.``/``1.``-prefixed projection suffix, or ``None`` when the key is not a pair-bias projection.
-    """
-
     if key.startswith("pair_bias_attn.proj_z.0."):
         return "0." + key[len("pair_bias_attn.proj_z.0.") :]
     if key.startswith("pair_bias_attn.proj_z.1."):
@@ -641,63 +481,475 @@ def _convert_pair_bias_projection_suffix(key: str) -> str | None:
 
 
 def _prefix_index(index: str, items: list[tuple[str, object]]) -> list[tuple[str, object]]:
-    r"""
-    Prepend a block-index component to each key in ``items``.
-
-    Args:
-        index: The block index string to prepend.
-        items: ``(key, value)`` pairs to re-key.
-
-    Returns:
-        The same values keyed as ``"{index}.{key}"``.
-    """
-
     return [(f"{index}.{key}", value) for key, value in items]
 
 
-def _add_zero_atom_projection_biases(state: dict[str, object]) -> None:
-    r"""
-    Synthesize zero biases for atom-feature projections that the checkpoint stored bias-free.
+# ---------------------------------------------------------------------------
+# Boltz-1 checkpoint-name conversion helpers.
+#
+# Relocated verbatim from the former shared models-root Boltz converter; Boltz-1 is now the sole
+# owner (Boltz-2 / BoltzGen carry their own copies). Only the definitions this converter uses are
+# kept; the same-named ``is_tied_output_projection`` / ``convert_input_embedder_key`` are NOT
+# duplicated here -- Boltz-1's own versions above are the ones in use.
+# ---------------------------------------------------------------------------
 
-    OFoldX's atom-feature ``Linear`` carries a bias while the Boltz-1 checkpoint does not; this adds a
-    matching zero bias in place so ``load_state_dict`` finds no missing key.
+Rule = tuple[re.Pattern[str], str | None]
+Converter = list[Rule] | Callable[[str], "str | None"]
+
+
+def _rules(pairs: Iterable[tuple[str, str | None]]) -> list[Rule]:
+    r"""
+    Compile ``(pattern, replacement)`` string pairs into a rule list.
 
     Args:
-        state: The (mutated) converted parameter mapping to backfill zero biases into.
-    """
-
-    for prefix in (
-        "input_embedder.atom_encoder.atom_feature_projection",
-        "diffusion_conditioning.atom_encoder.atom_feature_projection",
-    ):
-        weight_key = f"{prefix}.weight"
-        bias_key = f"{prefix}.bias"
-        weight = state.get(weight_key)
-        if bias_key not in state and isinstance(weight, Tensor):
-            state[bias_key] = torch.zeros(weight.shape[0], dtype=weight.dtype, device=weight.device)
-
-
-def _is_ignorable_key(key: str) -> bool:
-    r"""
-    Report whether a source key is a non-parameter checkpoint artifact safe to drop.
-
-    Args:
-        key: A source checkpoint key.
+        pairs: Iterable of ``(regex_pattern, replacement_or_None)`` string pairs.
 
     Returns:
-        ``True`` for EMA/loss/metric buffers and container keys that carry no model parameters.
+        Rule list with each pattern compiled to a [`re.Pattern`][re.Pattern].
     """
 
-    if key.startswith(("ema.", "loss.", "train_", "val_", "test_")):
-        return True
-    if key in {"state_dict", "hyper_parameters"}:
-        return True
-    # The per-layer ``output_projection.0`` is a tied duplicate of ``output_projection_linear``
-    # (Boltz-2 drops it too); dropping it here is intentional, not an unmapped key.
-    if re.search(r"\.layers\.\d+\.output_projection\.0\.(weight|bias)$", key):
-        return True
-    return False
+    return [(re.compile(pattern), replacement) for pattern, replacement in pairs]
 
 
-if __name__ == "__main__":
-    main()
+# A single Boltz ``ConditionedTransformerLayer`` (AdaLN + gated pair-bias attention + triple-product
+# transition). Applied to keys already stripped to the per-layer suffix (e.g. ``adaln.s_scale.weight``).
+# Transition rules come before the layer-level rules so ``transition.output_projection.0`` is handled
+# before the layer-level ``output_projection.0`` drop.
+CONDITIONED_TRANSFORMER_LAYER_RULES: list[Rule] = _rules(
+    [
+        (r"^transition\.adaln\.s_norm\.", "transition.conditioned_norm.conditioning_norm."),
+        (r"^transition\.adaln\.s_scale\.", "transition.conditioned_norm.gate_projection."),
+        (r"^transition\.adaln\.s_bias\.", "transition.conditioned_norm.shift_projection."),
+        (r"^transition\.swish_gate\.0\.", "transition.gate_value_projection."),
+        (r"^transition\.a_to_b\.", "transition.expand_projection."),
+        (r"^transition\.b_to_a\.", "transition.output_projection."),
+        (r"^transition\.output_projection\.0\.", "transition.conditioning_gate_projection."),
+        (r"^adaln\.s_norm\.", "conditioned_norm.conditioning_norm."),
+        (r"^adaln\.s_scale\.", "conditioned_norm.gate_projection."),
+        (r"^adaln\.s_bias\.", "conditioned_norm.shift_projection."),
+        (r"^pair_bias_attn\.proj_q\.", "attention.projection.query_projection."),
+        (r"^pair_bias_attn\.proj_k\.", "attention.projection.key_projection."),
+        (r"^pair_bias_attn\.proj_v\.", "attention.projection.value_projection."),
+        (r"^pair_bias_attn\.proj_g\.", "attention.projection.gate_projection."),
+        (r"^pair_bias_attn\.proj_o\.", "attention.projection.output_projection."),
+        (r"^output_projection_linear\.", "output_gate_projection."),
+        # output_projection.0 is the tied duplicate of output_projection_linear — drop it.
+        (r"^output_projection\.0\.", None),
+    ]
+)
+
+# Boltz DistogramModule.distogram (a single Linear) -> OFoldX DistogramHead.linear.
+DISTOGRAM_RULES: list[Rule] = _rules([(r"^distogram\.", "linear.")])
+
+# Boltz AtomEncoder -> OFoldX AtomEncoder (clean names). Applied to the per-encoder suffix. The
+# s_to_c_trans / z_to_p_trans rules only fire for the diffusion (structure_prediction=True) encoder.
+_ATOM_ENCODER_RULES: list[Rule] = _rules(
+    [
+        (r"^embed_atom_features\.", "atom_feature_projection."),
+        (r"^embed_atompair_ref_pos\.", "distance_vector_projection."),
+        (r"^embed_atompair_ref_dist\.", "inverse_distance_projection."),
+        (r"^embed_atompair_mask\.", "distance_mask_projection."),
+        (r"^c_to_p_trans_q\.", "left_atom_projection."),
+        (r"^c_to_p_trans_k\.", "right_atom_projection."),
+        (r"^p_mlp\.", "feed_forward."),
+        (r"^s_to_c_trans\.", "single_trunk_projection."),
+        (r"^z_to_p_trans\.", "pair_trunk_projection."),
+    ]
+)
+
+
+def _transition_index_rules() -> list[tuple[str, str | None]]:
+    r"""
+    Rename rules for a Boltz Transition inside an indexed ``transitions.N.*`` ModuleList.
+
+    Returns:
+        String ``(pattern, replacement)`` pairs mapping each indexed transition submodule to its OFoldX name.
+    """
+
+    # Boltz Transition inside an indexed ModuleList (transitions.N.*) -> transition module.
+    return [
+        (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.norm_input."),
+        (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
+        (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.value_projection."),
+        (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.output_projection."),
+    ]
+
+
+SINGLE_CONDITIONING_RULES: list[Rule] = _rules(
+    [
+        (r"^norm_single\.", "single_norm."),
+        (r"^single_embed\.", "single_projection."),
+        (r"^fourier_embed\.proj\.", "noise_fourier.projection."),
+        (r"^norm_fourier\.", "fourier_norm."),
+        (r"^fourier_to_single\.", "fourier_projection."),
+        *_transition_index_rules(),
+    ]
+)
+
+PAIRWISE_CONDITIONING_RULES: list[Rule] = _rules(
+    [(r"^dim_pairwise_init_proj\.", "init_projection."), *_transition_index_rules()]
+)
+
+
+def _triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+    r"""
+    Rename rules for one Boltz triangle-attention block.
+
+    Args:
+        boltz: The Boltz submodule prefix (e.g. ``"tri_att_start"``).
+        clean: The OFoldX submodule prefix to substitute.
+
+    Returns:
+        String ``(pattern, replacement)`` pairs mapping the norm / bias / q,k,v,o,g projections.
+    """
+
+    return [
+        (rf"^{boltz}\.layer_norm\.", f"{clean}.norm_pair."),
+        (rf"^{boltz}\.linear\.", f"{clean}.bias_projection."),
+        (rf"^{boltz}\.mha\.linear_q\.", f"{clean}.attention.projection.query_projection."),
+        (rf"^{boltz}\.mha\.linear_k\.", f"{clean}.attention.projection.key_projection."),
+        (rf"^{boltz}\.mha\.linear_v\.", f"{clean}.attention.projection.value_projection."),
+        (rf"^{boltz}\.mha\.linear_o\.", f"{clean}.attention.projection.output_projection."),
+        (rf"^{boltz}\.mha\.linear_g\.", f"{clean}.attention.projection.gate_projection."),
+    ]
+
+
+def _transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+    r"""
+    Rename rules for one Boltz Transition block.
+
+    Args:
+        boltz: The Boltz submodule prefix (e.g. ``"transition_z"``).
+        clean: The OFoldX submodule prefix to substitute.
+
+    Returns:
+        String ``(pattern, replacement)`` pairs mapping ``norm``/``fc1``/``fc2``/``fc3`` to their OFoldX names.
+    """
+
+    # Boltz Transition (norm/fc1/fc2/fc3) -> OFoldX Transition.
+    return [
+        (rf"^{boltz}\.norm\.", f"{clean}.norm_input."),
+        (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
+        (rf"^{boltz}\.fc2\.", f"{clean}.value_projection."),
+        (rf"^{boltz}\.fc3\.", f"{clean}.output_projection."),
+    ]
+
+
+def _triangle_mult_rename_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+    r"""
+    Rename rules for the non-fused keys of one Boltz triangle-multiplication block.
+
+    The fused ``p_in``/``g_in`` projections are split separately (tensor-aware); only the remaining
+    rename-only keys are covered here.
+
+    Args:
+        boltz: The Boltz submodule prefix (e.g. ``"tri_mul_out"``).
+        clean: The OFoldX submodule prefix to substitute.
+
+    Returns:
+        String ``(pattern, replacement)`` pairs mapping the input/output norms and output/gate projections.
+    """
+
+    # Non-fused triangle-multiplication keys (p_in/g_in are split separately, tensor-aware).
+    return [
+        (rf"^{boltz}\.norm_in\.", f"{clean}.norm_input."),
+        (rf"^{boltz}\.norm_out\.", f"{clean}.norm_output."),
+        (rf"^{boltz}\.p_out\.", f"{clean}.output_projection."),
+        (rf"^{boltz}\.g_out\.", f"{clean}.gate_projection."),
+    ]
+
+
+# Boltz trunk PairformerLayer -> OFoldX PairformerBlock (rename-only keys; the fused p_in/g_in are
+# handled tensor-aware by [`convert_pairformer_layer`][]).
+PAIRFORMER_LAYER_RULES: list[Rule] = _rules(
+    [
+        (r"^pre_norm_s\.", "pair_attention.hidden_norm."),
+        # Boltz-1 keeps the single-input norm inside AttentionPairBias (``attention.norm_s``); Boltz-2 pulls
+        # it out into ``pre_norm_s``. Both land on the same OFoldX ``hidden_norm``.
+        (r"^attention\.norm_s\.", "pair_attention.hidden_norm."),
+        (r"^attention\.proj_q\.", "pair_attention.attention.projection.query_projection."),
+        (r"^attention\.proj_k\.", "pair_attention.attention.projection.key_projection."),
+        (r"^attention\.proj_v\.", "pair_attention.attention.projection.value_projection."),
+        (r"^attention\.proj_g\.", "pair_attention.attention.projection.gate_projection."),
+        (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
+        (r"^attention\.proj_z\.0\.", "pair_attention.norm_pair."),
+        (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
+        *_triangle_mult_rename_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_mult_rename_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("transition_s", "single_feed_forward"),
+        *_transition_rules("transition_z", "pair_feed_forward"),
+    ]
+)
+
+# Boltz fuses the left/right (and their gates) into one 2*hidden Linear; OFoldX keeps them split.
+_FUSED_SPLIT = {
+    "tri_mul_out.p_in.weight": ("triangle_multiplication_outgoing", "left_projection", "right_projection"),
+    "tri_mul_out.g_in.weight": ("triangle_multiplication_outgoing", "left_gate_projection", "right_gate_projection"),
+    "tri_mul_in.p_in.weight": ("triangle_multiplication_incoming", "left_projection", "right_projection"),
+    "tri_mul_in.g_in.weight": ("triangle_multiplication_incoming", "left_gate_projection", "right_gate_projection"),
+}
+
+
+def _split_fused(key: str, tensor: Any) -> list[tuple[str, object]] | None:
+    r"""
+    Split a fused Boltz triangle-multiplication projection into its OFoldX left/right halves.
+
+    Args:
+        key: The Boltz key; must be one of the fused ``p_in``/``g_in`` weights.
+        tensor: The fused weight tensor whose first axis is split in half.
+
+    Returns:
+        Two ``(key, tensor)`` pairs for the left and right halves, or ``None`` when ``key`` is not fused.
+    """
+
+    if key not in _FUSED_SPLIT:
+        return None
+    block, left, right = _FUSED_SPLIT[key]
+    half = tensor.shape[0] // 2
+    return [(f"{block}.{left}.weight", tensor[:half]), (f"{block}.{right}.weight", tensor[half:])]
+
+
+def convert_pairformer_layer(key: str, tensor: object) -> list[tuple[str, object]]:
+    r"""
+    Tensor-aware converter for one PairformerLayer: split fused projections, rename the rest.
+
+    Args:
+        key: A PairformerLayer-relative Boltz key.
+        tensor: The associated weight tensor.
+
+    Returns:
+        A list of ``(key, tensor)`` pairs (two when the fused projection is split, one after a rename, or empty
+        when the key is dropped).
+    """
+
+    split = _split_fused(key, tensor)
+    if split is not None:
+        return split
+    new_key = convert_keys(key, PAIRFORMER_LAYER_RULES)
+    return [] if new_key is None else [(new_key, tensor)]
+
+
+# Boltz PairformerNoSeqLayer (pair-only) -> OFoldX TrianglePairUpdateBlock. Same triangle ops as the
+# full layer, but the pair FF is named ``feed_forward`` (not ``pair_feed_forward``) and there is no
+# single track.
+PAIR_ONLY_LAYER_RULES: list[Rule] = _rules(
+    [
+        *_triangle_mult_rename_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_mult_rename_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("transition_z", "feed_forward"),
+    ]
+)
+
+
+def convert_pair_only_layer(key: str, tensor: object) -> list[tuple[str, object]]:
+    r"""
+    Tensor-aware converter for one pair-only triangle layer (MSA / template).
+
+    Args:
+        key: A pair-only-layer-relative Boltz key.
+        tensor: The associated weight tensor.
+
+    Returns:
+        A list of ``(key, tensor)`` pairs (two when a fused projection is split, one after a rename, or empty
+        when the key is dropped).
+    """
+
+    split = _split_fused(key, tensor)
+    if split is not None:
+        return split
+    new_key = convert_keys(key, PAIR_ONLY_LAYER_RULES)
+    return [] if new_key is None else [(new_key, tensor)]
+
+
+# Boltz-1's MSA layer holds its triangle ops as direct attributes (with the pair transition named
+# ``z_transition``); Boltz-2 nests the same ops under ``pairformer_layer.``.
+MSA_DIRECT_TRIANGLE_RULES: list[Rule] = _rules(
+    [
+        *_triangle_mult_rename_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_mult_rename_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("z_transition", "feed_forward"),
+    ]
+)
+
+
+def convert_msa_direct_triangle(key: str, tensor: object) -> list[tuple[str, object]]:
+    r"""
+    Tensor-aware converter for one Boltz-1 MSA-layer direct triangle-op key.
+
+    Args:
+        key: A ``tri_mul_out.`` / ``tri_mul_in.`` / ``tri_att_start.`` / ``tri_att_end.`` /
+            ``z_transition.`` key relative to one MSA layer.
+        tensor: The associated weight tensor.
+
+    Returns:
+        A list of ``(key, tensor)`` pairs under the OFoldX ``triangle_pair_update`` submodule names.
+    """
+
+    split = _split_fused(key, tensor)
+    if split is not None:
+        return split
+    new_key = convert_keys(key, MSA_DIRECT_TRIANGLE_RULES)
+    return [] if new_key is None else [(new_key, tensor)]
+
+
+# Boltz MSALayer submodule inner-rule sets (relative to each submodule).
+_PWA_INNER = _rules(
+    [
+        (r"^norm_m\.", "norm_msa."),
+        (r"^norm_z\.", "norm_pair."),
+        (r"^proj_m\.", "value_projection."),
+        (r"^proj_g\.", "gate_projection."),
+        (r"^proj_z\.", "pair_projection."),
+        (r"^proj_o\.", "output_projection."),
+    ]
+)
+_SWIGLU_INNER = _rules(
+    [
+        (r"^norm\.", "norm_input."),
+        (r"^fc1\.", "gate_projection."),
+        (r"^fc2\.", "value_projection."),
+        (r"^fc3\.", "output_projection."),
+    ]
+)
+_OPM_INNER = _rules(
+    [
+        (r"^norm\.", "norm_msa."),
+        (r"^proj_a\.", "left_projection."),
+        (r"^proj_b\.", "right_projection."),
+        (r"^proj_o\.", "output_projection."),
+    ]
+)
+
+
+def convert_msa_layer(key: str, tensor: object) -> list[tuple[str, object]]:
+    r"""
+    Tensor-aware converter for one MSALayer (suffix relative to ``msa_module.layers.N.``).
+
+    Args:
+        key: A key relative to one MSA layer (``pair_weighted_averaging.``, ``msa_transition.``,
+            ``outer_product_mean.``, or ``pairformer_layer.``).
+        tensor: The associated weight tensor.
+
+    Returns:
+        A list of ``(key, tensor)`` pairs under the OFoldX MSA-layer names.
+
+    Raises:
+        KeyError: If ``key`` does not belong to a known MSA-layer submodule.
+    """
+
+    if key.startswith("pair_weighted_averaging."):
+        return [(cast(str, reprefix(key, "pair_weighted_averaging.", "pair_weighted_averaging.", _PWA_INNER)), tensor)]
+    if key.startswith("msa_transition."):
+        return [(cast(str, reprefix(key, "msa_transition.", "msa_transition.", _SWIGLU_INNER)), tensor)]
+    if key.startswith("outer_product_mean."):
+        return [(cast(str, reprefix(key, "outer_product_mean.", "outer_product_mean.", _OPM_INNER)), tensor)]
+    if key.startswith("pairformer_layer."):
+        inner = convert_pair_only_layer(key[len("pairformer_layer.") :], tensor)
+        return [(f"triangle_pair_update.{nk}", nv) for nk, nv in inner]
+    if key.startswith(("tri_mul_out.", "tri_mul_in.", "tri_att_start.", "tri_att_end.", "z_transition.")):
+        return [(f"triangle_pair_update.{nk}", nv) for nk, nv in convert_msa_direct_triangle(key, tensor)]
+    raise KeyError(f"unmapped MSA layer key: {key}")
+
+
+def convert_msa_module(key: str, tensor: object) -> list[tuple[str, object]]:
+    r"""
+    Tensor-aware converter for the whole ``msa_module.*`` (prefix-stripped).
+
+    Args:
+        key: An ``msa_module``-relative Boltz key.
+        tensor: The associated weight tensor.
+
+    Returns:
+        A list of ``(key, tensor)`` pairs under the OFoldX MSA-module names.
+
+    Raises:
+        KeyError: If ``key`` does not belong to a known MSA-module submodule.
+    """
+
+    if key.startswith("s_proj."):
+        return [(key.replace("s_proj.", "token_projection.", 1), tensor)]
+    if key.startswith("msa_proj."):
+        return [(key.replace("msa_proj.", "msa_projection.", 1), tensor)]
+    if key.startswith("layers."):
+        index, _, remainder = key[len("layers.") :].partition(".")
+        return [(f"layers.{index}.{nk}", nv) for nk, nv in convert_msa_layer(remainder, tensor)]
+    raise KeyError(f"unmapped MSA module key: {key}")
+
+
+def convert_keys(key: str, rules: list[Rule]) -> str | None:
+    r"""
+    Rewrite ``key`` by the first matching rule; return ``None`` to drop the key.
+
+    Rules are tried in order, so more specific patterns must be listed first. An unmatched key passes through
+    unchanged, while a rule with a ``None`` replacement drops it.
+
+    Args:
+        key: The state-dict key to rewrite.
+        rules: An ordered rule list of ``(compiled_regex, replacement_or_None)``.
+
+    Returns:
+        The rewritten key, the original key when no rule matches, or ``None`` when a matching rule drops it.
+
+    Examples:
+        >>> import re
+        >>> rules = [(re.compile(r"^distogram\."), "linear.")]
+        >>> convert_keys("distogram.weight", rules)
+        'linear.weight'
+        >>> convert_keys("other.weight", rules)
+        'other.weight'
+        >>> convert_keys("drop.weight", [(re.compile(r"^drop\."), None)]) is None
+        True
+    """
+
+    for pattern, replacement in rules:
+        if pattern.search(key):
+            return None if replacement is None else pattern.sub(replacement, key)
+    return key
+
+
+def apply_converter(key: str, converter: Converter) -> str | None:
+    r"""
+    Apply a :data:`Converter` (rule list or callable) to a single key.
+
+    Args:
+        key: The state-dict key to convert.
+        converter: Either an ordered rule list or a callable ``key -> key_or_None``.
+
+    Returns:
+        The converted key, or ``None`` to drop it.
+
+    Examples:
+        >>> import re
+        >>> apply_converter("distogram.weight", [(re.compile(r"^distogram\."), "linear.")])
+        'linear.weight'
+        >>> apply_converter("a.b", lambda key: key.upper())
+        'A.B'
+    """
+
+    if callable(converter):
+        return converter(key)
+    return convert_keys(key, converter)
+
+
+def reprefix(key: str, old_prefix: str, new_prefix: str, sub: Converter) -> str | None:
+    r"""
+    Convert the remainder of ``key`` after ``old_prefix`` with ``sub`` and re-prefix it.
+
+    Args:
+        key: The full key beginning with ``old_prefix``.
+        old_prefix: The prefix to strip before applying ``sub``.
+        new_prefix: The prefix to prepend to the converted remainder.
+        sub: Converter applied to the stripped remainder.
+
+    Returns:
+        ``new_prefix`` + converted remainder, or ``None`` when ``sub`` drops the remainder.
+    """
+
+    converted = apply_converter(key[len(old_prefix) :], sub)
+    return None if converted is None else new_prefix + converted
