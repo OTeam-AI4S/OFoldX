@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from multimolecule import EsmCConfig, EsmCModel
+from multimolecule import EsmCConfig, EsmCForMaskedLM, EsmCModel
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 from transformers.masking_utils import create_bidirectional_mask
@@ -2680,6 +2680,38 @@ def compute_esmc_hidden_states(
     return gathered * token_has_esmc[:, :, None, None].to(gathered.dtype)
 
 
+def compute_esmc_masked_lm_logits(
+    esmc: nn.Module,
+    lm_head: nn.Module,
+    input_onehot: Tensor,
+    attention_mask: Tensor,
+) -> Tensor:
+    r"""Differentiable ESMC masked-LM logits for the Algorithm 14 pseudo-perplexity regulariser.
+
+    Mirrors [`compute_esmc_hidden_states`][ofoldx.models.esmfold2.model.compute_esmc_hidden_states]
+    but embeds a soft one-hot input (``input_onehot @ word_embeddings``) and applies the frozen
+    masked-LM head, so gradient flows to ``input_onehot`` through the frozen ESMC trunk.
+    ``input_onehot`` is ``[rows, seq, vocab]`` (a differentiable distribution over the ESMC
+    vocabulary per position) and ``attention_mask`` is ``[rows, seq]``. Returns ``[rows, seq,
+    vocab]`` masked-LM logits.
+    """
+
+    embed_weight = esmc.get_input_embeddings().weight
+    inputs_embeds = input_onehot.to(embed_weight.dtype) @ embed_weight
+    with torch.autocast(device_type="cuda", enabled=inputs_embeds.is_cuda, dtype=torch.bfloat16):
+        attention_bias = create_bidirectional_mask(
+            config=esmc.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        hidden = inputs_embeds
+        for layer in esmc.encoder.layer:
+            hidden = layer(hidden, attention_bias)
+        hidden = esmc.encoder.layer_norm(hidden)
+        logits = lm_head({"last_hidden_state": hidden}).logits
+    return logits
+
+
 class TriangleMultiplicativeBlock(nn.Module):
     """Triangle multiplicative update block with gated signal routing."""
 
@@ -3811,13 +3843,30 @@ class ESMFold2ExperimentalModel(nn.Module):
             )
 
         self.esmc: EsmCModel | None = None
+        # Optional frozen ESMC masked-LM head for the Algorithm 14 pseudo-perplexity design
+        # regulariser. Left unset unless an ``EsmCForMaskedLM`` is attached via ``load_esmc``;
+        # kept off the strict-loaded experimental head state dict exactly like ``esmc``.
+        self.esmc_lm_head: nn.Module | None = None
         if esmc is not None:
             self.load_esmc(esmc)
         self.set_backend("torch")
 
-    def load_esmc(self, esmc: EsmCModel) -> EsmCModel:
-        r"""Attach the shared frozen MultiMolecule ESMC child used for the pair projection."""
+    def load_esmc(self, esmc: EsmCModel | EsmCForMaskedLM) -> EsmCModel:
+        r"""Attach the shared frozen MultiMolecule ESMC child used for the pair projection.
 
+        Accepts either a bare ``EsmCModel`` trunk or an ``EsmCForMaskedLM``. Given the latter,
+        its ``model`` trunk drives the folding pair projection and its ``lm_head`` is retained
+        for the Algorithm 14 ESMC pseudo-perplexity design regulariser — the released
+        ``REUSE_ESMC`` sharing where one frozen ESMC trunk feeds both the folding pair
+        projection and the masked-LM sequence prior. A bare trunk leaves ``esmc_lm_head``
+        unset and ``ESMFold2Pipeline.design`` falls back to the structure-only objective.
+        """
+
+        if isinstance(esmc, EsmCForMaskedLM):
+            lm_head = esmc.lm_head
+            lm_head.requires_grad_(False)
+            self.esmc_lm_head = lm_head.eval()
+            esmc = esmc.model
         esmc.requires_grad_(False)
         self.esmc = esmc.eval()
         return self.esmc

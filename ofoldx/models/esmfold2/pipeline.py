@@ -8,7 +8,8 @@ graph, then a discrete refold) and returns the family-owned, coordinate-producin
 ``ESMFold2DesignResult``. Upstream provenance:
 ``biohub_esm/cookbook/tutorials/binder_design.py`` (Algorithm 11 gradient-guided sequence
 optimisation L828, Algorithm 12 contact losses L260, Algorithm 13 globularity L323,
-Algorithm 15 distogram ipTM proxy L423, binder prompt ``'#'`` mutable positions L110).
+Algorithm 14 ESMC pseudo-perplexity sequence regulariser L715, Algorithm 15 distogram ipTM
+proxy L423, binder prompt ``'#'`` mutable positions L110).
 
 One Pipeline binds one Model/Processor pair. ``fold`` requires the released
 ``ESMFold2Model``; ``design`` requires the experimental inversion model
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from functools import cache
 from os import PathLike
 from pathlib import Path
 
@@ -40,6 +42,8 @@ from .model import (
     ESMFold2ExperimentalModel,
     ESMFold2Input,
     ESMFold2Model,
+    _experimental_seed_context,
+    compute_esmc_masked_lm_logits,
 )
 from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor
 
@@ -60,6 +64,150 @@ _MUTABLE_TOKEN = "#"
 _LOSS_WEIGHTS = {"intra_contact": 0.5, "inter_contact": 0.5, "glob": 0.2}
 _LEARNING_RATE = 0.1
 _TEMPERATURE_MIN = 1e-2
+
+# Algorithm 14 ESMC pseudo-perplexity sequence-regulariser constants (binder_design.py
+# L96-L98, L764, L948-L950). The released design objective adds a masked-LM sequence prior
+# to the structure objective; ``_LM_LOSS_WEIGHT`` is the released non-antibody gradient
+# weighting (the antibody framework path uses 0.05, unused here — single-chain protein
+# targets take the general-binder weight).
+_ESMC_MASK_FRACTION = 0.15
+_LM_MASK_PASSES = 4
+_LM_LOSS_CHUNK = 128
+_LM_LOSS_WEIGHT = 0.15
+
+
+@cache
+def _lm_aa_layout() -> tuple[int, int, tuple[int, ...]]:
+    r"""Locate the 20 standard amino acids in the MultiMolecule ESMC vocabulary.
+
+    Returns ``(aa_lo, aa_hi, permutation)`` where ``aa_lo:aa_hi`` is the contiguous vocab
+    block holding the 20 standard amino acids and ``permutation[ft_idx]`` is the column of
+    the folding-trunk amino acid ``ft_idx`` (``_AA3_ORDER`` order) inside that block. This is
+    the folding-trunk-to-LM vocabulary permutation of Algorithm 14
+    (``_folding_trunk_to_lm_aa_vocab_matrix``), derived from the ESMC tokenizer rather than
+    hard-coded — the released reference targets the BioHub ESMC alphabet (amino acids at
+    ids 4:24) whereas MultiMolecule ESMC places them at ids 6:26.
+    """
+
+    from multimolecule import ProteinTokenizer
+
+    vocabulary = ProteinTokenizer().get_vocab()
+    amino_acid_ids = {amino_acid: vocabulary[amino_acid] for amino_acid in _IDX_TO_AA1.values()}
+    aa_lo = min(amino_acid_ids.values())
+    aa_hi = max(amino_acid_ids.values()) + 1
+    if aa_hi - aa_lo != _AA_DIMS:
+        raise ValueError("ESMC standard amino-acid vocabulary ids are not contiguous")
+    lm_order = [amino_acid for amino_acid, _ in sorted(amino_acid_ids.items(), key=lambda item: item[1])]
+    permutation = tuple(lm_order.index(_IDX_TO_AA1[index]) for index in range(_AA_DIMS))
+    return aa_lo, aa_hi, permutation
+
+
+def _folding_trunk_to_lm_aa_matrix(device: torch.device) -> torch.Tensor:
+    r"""``[20, 20]`` permutation from folding-trunk amino-acid order to ESMC LM order."""
+
+    _, _, permutation = _lm_aa_layout()
+    matrix = torch.zeros(_AA_DIMS, _AA_DIMS, device=device)
+    for ft_index, lm_index in enumerate(permutation):
+        matrix[ft_index, lm_index] = 1.0
+    return matrix
+
+
+def _one_hot_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    return F.one_hot(torch.argmax(probs, dim=-1), num_classes=probs.size(-1)).to(probs.dtype)
+
+
+def _straight_through(discrete: torch.Tensor, continuous: torch.Tensor) -> torch.Tensor:
+    r"""Discrete value on the forward pass, continuous gradient on the backward pass."""
+
+    return continuous + (discrete - continuous).detach()
+
+
+def _esmc_pseudo_perplexity_nll(
+    model: ESMFold2ExperimentalModel,
+    design: torch.Tensor,
+    score_mask: torch.Tensor,
+    *,
+    seed: int | None,
+    n_passes: int = _LM_MASK_PASSES,
+    mask_fraction: float = _ESMC_MASK_FRACTION,
+    chunk_size: int = _LM_LOSS_CHUNK,
+) -> torch.Tensor:
+    r"""Algorithm 14 — approximate ESMC pseudo-perplexity NLL of a soft designed sequence.
+
+    ``design`` is ``[B, L, 20]`` soft amino-acid probabilities in folding-trunk order (the
+    binder's per-position softmax). ``score_mask`` is ``[B, L]`` marking the mutable
+    positions eligible for masking. Builds a differentiable one-hot ESMC input (with a
+    straight-through discretisation), samples ``n_passes`` random ``mask_fraction`` masks over
+    the mutable positions, and returns the per-sample mean masked-token NLL of the designed
+    distribution under the frozen ESMC masked-LM head. Gradient flows back to ``design``
+    through the frozen trunk, giving the released sequence-naturalness prior.
+    """
+
+    device = design.device
+    esmc = model.esmc
+    lm_head = model.esmc_lm_head
+    if esmc is None or lm_head is None:
+        raise RuntimeError("ESMC pseudo-perplexity regulariser requires an attached ESMC masked-LM head")
+    esmc_config = model.config.esmc
+    vocabulary_size = esmc_config.vocab_size
+    embed_dtype = esmc.get_input_embeddings().weight.dtype
+    aa_lo, aa_hi, _ = _lm_aa_layout()
+    folding_trunk_to_lm = _folding_trunk_to_lm_aa_matrix(device)
+
+    batch_size, binder_length = design.shape[0], design.shape[1]
+    target_esm = design @ folding_trunk_to_lm
+    input_esm = _straight_through(_one_hot_from_probs(target_esm), target_esm)
+
+    input_onehot = torch.zeros(batch_size, binder_length + 2, vocabulary_size, dtype=embed_dtype, device=device)
+    input_onehot[:, 0, esmc_config.bos_token_id] = 1
+    input_onehot[:, -1, esmc_config.eos_token_id] = 1
+    input_onehot[:, 1:-1, aa_lo:aa_hi] = input_esm.to(embed_dtype)
+
+    if score_mask.ndim == 1:
+        score_mask = score_mask.unsqueeze(0).expand(batch_size, -1)
+    score_mask = score_mask.to(device=device, dtype=torch.bool)
+
+    mask_token = torch.zeros(vocabulary_size, dtype=embed_dtype, device=device)
+    mask_token[esmc_config.mask_token_id] = 1
+
+    all_masked_rows: list[torch.Tensor] = []
+    all_pass_masks: list[torch.Tensor] = []
+    with _experimental_seed_context(seed):
+        for sample in range(batch_size):
+            position_indices = score_mask[sample].nonzero(as_tuple=False).flatten()
+            num_positions = int(position_indices.numel())
+            if num_positions == 0:
+                raise ValueError("ESMC pseudo-perplexity score mask selected zero positions")
+            num_masked = max(1, math.ceil(mask_fraction * num_positions))
+            random_scores = torch.rand((n_passes, num_positions), device=device)
+            masked_offsets = random_scores.topk(num_masked, dim=-1, largest=False).indices
+            pass_masks = torch.zeros((n_passes, binder_length), dtype=torch.bool, device=device)
+            pass_masks[torch.arange(n_passes, device=device)[:, None], position_indices[masked_offsets]] = True
+            masked = input_onehot[sample : sample + 1].repeat(n_passes, 1, 1)
+            mask_rows, mask_cols = pass_masks.nonzero(as_tuple=True)
+            masked[mask_rows, mask_cols + 1] = mask_token
+            all_masked_rows.append(masked)
+            all_pass_masks.append(pass_masks)
+
+    masked_sequences = torch.cat(all_masked_rows, dim=0)
+    attention_mask = torch.ones(masked_sequences.shape[0], masked_sequences.shape[1], device=device)
+    logit_chunks: list[torch.Tensor] = []
+    for start in range(0, masked_sequences.shape[0], chunk_size):
+        chunk = masked_sequences[start : start + chunk_size]
+        logit_chunks.append(
+            compute_esmc_masked_lm_logits(esmc, lm_head, chunk, attention_mask[start : start + chunk_size])
+        )
+    logits = torch.cat(logit_chunks, dim=0)
+
+    losses: list[torch.Tensor] = []
+    for sample, pass_masks in enumerate(all_pass_masks):
+        start = sample * n_passes
+        stop = start + n_passes
+        target_weights = target_esm[sample]
+        log_probs = logits[start:stop].log_softmax(dim=-1)[:, 1:-1, aa_lo:aa_hi]
+        nlls = -(log_probs * target_weights.to(log_probs.dtype).unsqueeze(0)).sum(dim=-1)
+        losses.append(nlls[pass_masks].mean())
+    return torch.stack(losses, dim=0)
 
 
 def _get_mid_points(device: torch.device) -> torch.Tensor:
@@ -318,8 +466,11 @@ class ESMFold2Pipeline:
         but varies across calls — the coordinate-producing, variable-length property carried
         by ``ESMFold2DesignResult``.
 
-        The ESMC pseudo-perplexity sequence regulariser (Algorithm 14) is not applied here;
-        this runs the structure objective, which is the released gradient-inversion primitive.
+        When the bound model carries an attached ESMC masked-LM head (``load_esmc`` given an
+        ``EsmCForMaskedLM``), the released ESMC pseudo-perplexity sequence regulariser
+        (Algorithm 14) is added to the structure objective at the released non-antibody
+        weighting, so the total objective matches released. With only a bare ESMC trunk
+        attached the design falls back to the structure-only objective.
         """
 
         if not isinstance(self.model, ESMFold2ExperimentalModel):
@@ -378,8 +529,22 @@ class ESMFold2Pipeline:
                 )
                 distogram = output["distogram_logits"].float()
                 losses = _structure_losses(distogram, binder_length)
-                grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
-                logits.grad = _normalized_gradient(grad, gradient_mask)
+                structure_grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
+                combined_grad = _normalized_gradient(structure_grad, gradient_mask)
+
+                # Algorithm 14 ESMC pseudo-perplexity sequence regulariser: added to the
+                # structure objective whenever a masked-LM head is attached (the released
+                # configuration). Each gradient is length-normalised over the mutable
+                # positions before the weighted sum, matching binder_design.py L948-L950.
+                if model.esmc_lm_head is not None:
+                    design_lm = F.softmax(logits / temperature, dim=-1)
+                    score_mask = gradient_mask.sum(dim=-1) > 0
+                    step_seed = None if seed is None else int(seed) + step
+                    plm_loss = _esmc_pseudo_perplexity_nll(model, design_lm, score_mask, seed=step_seed)
+                    plm_grad = torch.autograd.grad(plm_loss.mean(), logits)[0]
+                    combined_grad = combined_grad + _LM_LOSS_WEIGHT * _normalized_gradient(plm_grad, gradient_mask)
+
+                logits.grad = combined_grad
                 for group in optimizer.param_groups:
                     group["lr"] = _LEARNING_RATE * temperature
                 optimizer.step()
