@@ -49,6 +49,7 @@ from typing_extensions import Self
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...pipelines import resolve_generator
+from ...pipelines._composite import _CompositePair, _CompositePipeline
 from ...results import Score
 from ..ligandmpnn import LigandMpnnPipeline
 from ..proteinmpnn import ProteinMpnnPipeline
@@ -133,7 +134,7 @@ def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str,
     return mapped
 
 
-class ODesignPipeline:
+class ODesignPipeline(_CompositePipeline):
     r"""Compose the ODesign backbone designer with the OInvFold (MPNN) sequence step.
 
     This is the full released protein deliverable (§4.11.6): ODesign generates backbones over
@@ -143,9 +144,20 @@ class ODesignPipeline:
     :meth:`to` — rather than the single-pair ``_PairedPipeline``, because the sequence network
     is a *separately registered* family loaded read-only, never re-vendored.
 
-    It is intentionally **not** registered while the family gate is closed (see
-    ``__init__.py`` / README: de-novo ligand/NA generation remains a quality blocker).
+    It is a DESIGN §7.4 multi-pair concrete Pipeline (see ``_PAIR_LAYOUT`` below) and is registered
+    so the working protein deliverable routes through the repository factory. The remaining
+    de-novo ligand/NA generation gap is a runtime capability limit (see ``__init__.py`` / README),
+    not a registration gate.
     """
+
+    # DESIGN §7.4/§7.3 pair-layout: the ODesign backbone pair owns the runnable root, and the
+    # two read-only OInvFold sequence designers live at fixed sub-directories. Each designer is a
+    # single-pair child Pipeline, so its reloaded pair is wrapped back into its Pipeline class.
+    _PAIR_LAYOUT = (
+        _CompositePair("", "model", "processor"),
+        _CompositePair("protein_designer", "protein_designer", None, wrap=ProteinMpnnPipeline),
+        _CompositePair("ligand_designer", "ligand_designer", None, wrap=LigandMpnnPipeline),
+    )
 
     def __init__(
         self,

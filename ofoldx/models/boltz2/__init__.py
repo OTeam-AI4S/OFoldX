@@ -2,6 +2,7 @@ r"""Boltz-2 folding and two-stage affinity family, its Processors, Pipeline, and
 
 from __future__ import annotations
 
+from ...pipelines.registry import register_pipeline as _register_pipeline
 from ..registry import register_model as _register_model
 from .chemistry import standardize_boltz2_affinity_smiles
 from .config import (
@@ -23,14 +24,11 @@ from .processor import Boltz2AffinityProcessor, Boltz2Processor
 # resolves through the generic standard fold Pipeline (standard_tasks=("fold",)) and is fully published.
 #
 # The ``ofoldx.boltz2_affinity`` pair has no lossless standard task (its score is the concrete two-stage op),
-# so standard_tasks=(). Its concrete ``Boltz2AffinityPipeline`` is intentionally NOT ``register_pipeline``-ed
-# this wave -- deferred, matching the reserved-id contract in ``ofoldx/pipelines/registry.py``
-# (``_RESERVED_PIPELINE_IDS``). The routed factory (``api/tasks.py``) builds every registered pipeline through
-# the ``(model, processor)`` path, but this Pipeline binds two checkpoints (a 4-arg
-# ``model``/``processor``/``structure_model``/``structure_processor`` ctor) and has no multi-pair loader/factory
-# nor a ``.save()``, so a routed ``score`` would crash on construction. Registration is withheld until it gains
-# that two-checkpoint loader + ``.save()`` (see the registry TODO). ``Boltz2AffinityPipeline`` stays importable
-# and exported for manual construction; the id remains reserved so no third party can squat it.
+# so standard_tasks=(). Its concrete ``Boltz2AffinityPipeline`` is a DESIGN §7.4 multi-pair Pipeline: it binds
+# the affinity root pair and the ``structure/`` structure/confidence pair, declares a class-level
+# ``_PAIR_LAYOUT``, and carries the shared ``save`` / ``from_repository`` (``ofoldx/pipelines/_composite.py``).
+# It is registered below, so a marked repository's ``score`` routes through the factory's multi-pair loader
+# (``api/tasks.py`` dispatches to ``from_repository``) instead of the one-pair ``(model, processor)`` call.
 _register_model(
     "ofoldx.boltz2",
     model=Boltz2Model,
@@ -42,4 +40,8 @@ _register_model(
     model=Boltz2AffinityModel,
     processor=Boltz2AffinityProcessor,
     standard_tasks=(),
+)
+_register_pipeline(
+    "ofoldx.boltz2_affinity",
+    pipeline=Boltz2AffinityPipeline,
 )

@@ -9,13 +9,14 @@ import torch
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
+from ...pipelines._composite import _CompositePair, _CompositePipeline
 from ...pipelines._generator import resolve_generator
 from ...results import AffinityResult
 from .model import Boltz2AffinityModel, Boltz2Model
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
 
-class Boltz2AffinityPipeline:
+class Boltz2AffinityPipeline(_CompositePipeline):
     r"""Bind the released Boltz-2 folding and affinity pairs into one two-stage affinity op.
 
     The Pipeline holds two distinct concrete Models over two distinct checkpoints (a composite Model is never
@@ -54,6 +55,13 @@ class Boltz2AffinityPipeline:
     processor: Boltz2AffinityProcessor
     structure_model: Boltz2Model
     structure_processor: Boltz2Processor
+
+    # DESIGN §7.4/§7.3 pair-layout: the affinity pass owns the runnable root pair and the
+    # structure/confidence pass lives at the fixed ``structure/`` sub-directory (§6.2/§7.5).
+    _PAIR_LAYOUT = (
+        _CompositePair("", "model", "processor"),
+        _CompositePair("structure", "structure_model", "structure_processor"),
+    )
 
     def __init__(
         self,

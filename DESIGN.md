@@ -5735,8 +5735,9 @@ the application calls explicitly. A repository never names Python to import.
 ### 7.3 Repository format
 
 Status: reopened — the ordinary pair schema and one-field marker are frozen for
-standard and one-pair concrete repositories. Additional-pair ownership, paths, and
-loading remain candidates pending a complete multi-pair vertical.
+standard and one-pair concrete repositories. Additional-pair ownership, fixed
+sub-directory paths, writing, and loading are frozen in Section 7.4's multi-pair
+subsection; the pair format and one-field marker are unchanged there.
 
 Every serializable repository has one runnable root Model–Processor pair:
 
@@ -5835,9 +5836,10 @@ runtime compatibility branches.
 ### 7.4 Loading and pairing
 
 Status: reopened — strict physical-key loading and snapshot pairing are specified
-below. The exact standard root algorithm is frozen in Section 7.6 and one-pair
-concrete construction is frozen below. Multi-pair placement and family publication
-remain open.
+below. The exact standard root algorithm is frozen in Section 7.6, one-pair concrete
+construction is frozen below, and the multi-pair concrete-repository pair-layout,
+writer, snapshot loader, and factory routing are frozen in the multi-pair subsection
+below. Multi-pair placement (Section 6.3) and complete family publication remain open.
 
 `AutoModel(repository, device=..., dtype=...)` reads root `model.json`, resolves its
 exact registration and constructs `ModelConfig`. The allocation-free construction,
@@ -5942,6 +5944,69 @@ which first removes a stale marker, and writes its exact registered one-field
 marker only after the pair succeeds. It adds no Pipeline config, task field,
 component list, source state, or second manifest.
 
+#### Multi-pair concrete Pipeline repositories
+
+Status: frozen — the multi-pair pair-layout, writer, snapshot loader, and factory
+routing below are proven by three materially different verticals
+(`Boltz2AffinityPipeline`, `ODesignPipeline`, `BoltzGenPipeline`). This freezes only
+repository construction and routing; multi-pair *placement* stays reopened in Section
+6.3, and complete family checkpoint publication stays reopened in Sections 7.5/7.6.
+
+A concrete Pipeline whose live constructor binds more than one Model–Processor pair
+cannot be built by the one-pair `pipeline_class(model=..., processor=...)` call. Such
+a class instead declares its layout as ordinary Python: a class-level ordered
+**pair-layout**. Each entry is one class-owned pair and fixes
+
+- its repository-relative directory — the empty string is the independently runnable
+  root pair that scientifically owns the operation (Section 6.2), any other value is a
+  fixed class-owned sub-directory (`structure/`, `protein_designer/`, `ligand_designer/`,
+  `ifold/`, `fold/`, `affinity/`);
+- the exact constructor keyword(s) the reloaded pair fills — either the two keywords
+  carrying the Model and the Processor, or, when the pair is itself a read-only
+  single-pair child Pipeline (the ODesign OInvFold sequence designers), the one keyword
+  that receives that reloaded pair rewrapped in its own concrete Pipeline class; and
+- whether the pair is required or optional. An optional pair (BoltzGen's injected
+  boltz2 `fold/` / `affinity/` stages) is written only when present and reloaded only
+  when its directory exists.
+
+The pair-layout lives in the class, never in the repository. `pipeline.json` remains
+the frozen one-field marker of Section 7.3; it gains no component list, path map,
+order, or options. Sub-pairs use the ordinary pair format of Section 7.3 and carry no
+marker of their own. The registry stores no layout either — the class alone owns its
+named components and their directories, exactly as required by Section 6.4.
+
+A registered multi-pair concrete Pipeline exposes the symmetric writer
+`save(directory, *, max_shard_size="5GB", repo_id=None, ...)`. It writes every
+present class-owned pair with the ordinary single-pair repository writer of Section
+7.5 — the root pair at the repository root and each named pair in its fixed
+sub-directory — and then writes its exact registered one-field marker only after all
+pairs succeed. Because the ordinary pair writer first removes a stale root marker, and
+the marker is written last, a failed write never advertises a complete multi-pair
+layout. A missing required pair fails the write. Optional Hub upload reuses the same
+uploader as the one-pair writer.
+
+It also exposes the classmethod `from_repository(directory, *, revision=None,
+device=None, dtype=None)`. This is the multi-pair counterpart the one-pair path
+explicitly does not use. It resolves the reference to one immutable snapshot, loads
+every class-owned pair from that single snapshot through the ordinary root-pair
+loaders of Section 7.6, maps each to its declared constructor keyword — rewrapping a
+child-Pipeline pair in its concrete class — skips an absent optional pair, and
+constructs the Pipeline through its ordinary multi-pair constructor. A missing
+required pair fails without a standard-root fallback. Device and dtype are the
+ordinary co-location loading arguments applied to every reloaded pair; whether a
+concrete class instead exposes stage-wise placement remains the Section 6.3 question.
+
+The repository routing algorithm of this subsection is unchanged for one-pair classes.
+When the marker resolves to a class that declares a pair-layout, the factory dispatches
+to that class's `from_repository` on the pinned snapshot instead of the one-pair
+`(model, processor)` call; when it does not, the one-pair call is used exactly as
+frozen above. Both routes resolve the exact registered class and require a callable
+public method named by the requested task before any weight download. `Boltz2AffinityPipeline`
+therefore reloads the affinity root pair and the `structure/` pair; `ODesignPipeline`
+reloads its backbone root pair and the `protein_designer/` and `ligand_designer/`
+sequence designers; and `BoltzGenPipeline` reloads its design root pair, the `ifold/`
+pair, and any present optional boltz2 `fold/` / `affinity/` stages.
+
 ### 7.5 Writing and conversion
 
 Status: reopened — ordinary writing and marker order are specified below. The
@@ -6022,8 +6087,9 @@ versions whose exact helpers implement the selected behavior.
 Status: reopened — the root schema, registration indexes, strict JSON, standard
 materialization algorithm, shard ownership checks, writer postconditions, standard
 task delegation, and one-pair concrete marker loading have bounded contracts below
-and in Section 7.4. Multi-pair repositories, complete family publication, and
-dependency-floor claims remain reopened. The shared materialization algorithm
+and in Section 7.4. Multi-pair repository construction and routing are now frozen in
+Section 7.4's multi-pair subsection; multi-pair placement, complete family publication,
+and dependency-floor claims remain reopened. The shared materialization algorithm
 is frozen independently of family eligibility: RFdiffusion and PXDesign prove it
 with real checkpoints. AlphaFold 3, the LigandMpnn sequence pair, and the independent
 MpnnPacker pair have the bounded

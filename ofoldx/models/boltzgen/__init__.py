@@ -2,6 +2,7 @@ r"""BoltzGen structure-design and inverse-folding family, its Processors, Pipeli
 
 from __future__ import annotations
 
+from ...pipelines.registry import register_pipeline as _register_pipeline
 from ..registry import register_model as _register_model
 from .config import (
     BoltzGenConfig,
@@ -49,8 +50,11 @@ from .projection import DesignMaskResidue, from_design_mask, to_design_mask
 #
 # ``standard_tasks=()`` for both: BoltzGen design is a multi-stage family operation, not a
 # single-Model standard verb. The ``design`` verb resolves through the concrete family
-# ``BoltzGenPipeline`` (exported here, not registered under the generic route until the
-# concrete-Pipeline registry route freezes, §7.2 — mirroring the ``boltz1`` note).
+# ``BoltzGenPipeline``, a DESIGN §7.4 multi-pair Pipeline: the structure-design pair owns the
+# runnable root, the inverse-fold pair lives at ``ifold/``, and the optional read-only boltz2
+# ``fold/`` / ``affinity/`` stages are optional sub-pairs (declared in its ``_PAIR_LAYOUT``). It is
+# registered below, so a marked repository's ``design`` routes through the factory's multi-pair
+# loader (``from_repository``) instead of the one-pair ``(model, processor)`` call.
 _register_model(
     "ofoldx.boltzgen",
     model=BoltzGenModel,
@@ -62,4 +66,8 @@ _register_model(
     model=BoltzGenIFoldModel,
     processor=BoltzGenIFoldProcessor,
     standard_tasks=(),
+)
+_register_pipeline(
+    "ofoldx.boltzgen",
+    pipeline=BoltzGenPipeline,
 )

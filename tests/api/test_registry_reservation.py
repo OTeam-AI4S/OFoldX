@@ -3,9 +3,10 @@ r"""Lock built-in id reservation for the model and pipeline registries.
 DESIGN §9.2 requires that a built-in architecture/pipeline id can be claimed only by its owner
 package: a pre-import ``register_*("ofoldx.<builtin>", Fake)`` must be rejected (otherwise a squatter
 would win first-writer-wins before the official owner is ever imported), the official owner must still
-resolve, and a genuinely new third-party id must still register freely. The ``boltz2_affinity``
-pipeline is deliberately *not* routable yet -- its ``register_pipeline`` is deferred until it grows a
-two-checkpoint loader -- so the pipeline registry must reject that id.
+resolve, and a genuinely new third-party id must still register freely. The three DESIGN §7.4
+multi-pair pipeline ids (``ofoldx.boltz2_affinity`` / ``ofoldx.odesign`` / ``ofoldx.boltzgen``) are now
+routable built-ins that resolve to their owner concrete Pipeline while staying owner-reserved against a
+squatter.
 """
 
 from __future__ import annotations
@@ -75,36 +76,34 @@ def test_pipeline_registry_accepts_new_third_party_id():
     assert _pipeline_class("thirdparty.tiny") is ThirdPartyPipeline
 
 
-def test_boltz2_affinity_pipeline_is_not_routable():
-    r"""The deferred boltz2_affinity id must not resolve through the pipeline registry."""
+@pytest.mark.parametrize(
+    ("pipeline_id", "owner_module"),
+    [
+        ("ofoldx.boltz2_affinity", "ofoldx.models.boltz2"),
+        ("ofoldx.odesign", "ofoldx.models.odesign"),
+        ("ofoldx.boltzgen", "ofoldx.models.boltzgen"),
+    ],
+)
+def test_multipair_pipeline_id_routes_to_owner(pipeline_id, owner_module):
+    r"""Each DESIGN §7.4 multi-pair id resolves to its owner concrete Pipeline and declares a layout."""
 
-    with pytest.raises(ValueError, match="unknown pipeline"):
-        _pipeline_class("ofoldx.boltz2_affinity")
+    resolved = _pipeline_class(pipeline_id)
+
+    assert resolved.__module__.startswith(owner_module)
+    # The class-level pair-layout is the signal the factory uses to route to from_repository.
+    assert getattr(resolved, "_PAIR_LAYOUT", None) is not None
+    assert callable(getattr(resolved, "from_repository", None))
 
 
-def test_deferred_boltz2_affinity_id_rejects_non_owner_squatter():
-    r"""A deferred-but-reserved built-in id stays protected: a non-owner class cannot squat it.
-
-    ``ofoldx.boltz2_affinity`` is absent from ``_BUILTIN_PIPELINE_MODULES`` (its registration is
-    deferred until it grows a two-checkpoint loader), but it must remain reserved for the owner
-    package so a third party cannot claim the id before the official owner is ready.
-    """
+@pytest.mark.parametrize(
+    "pipeline_id",
+    ["ofoldx.boltz2_affinity", "ofoldx.odesign", "ofoldx.boltzgen"],
+)
+def test_multipair_pipeline_id_rejects_non_owner_squatter(pipeline_id):
+    r"""A routable multi-pair built-in id stays owner-reserved: a non-owner class cannot squat it."""
 
     class ThirdPartyPipeline:
         pass
 
     with pytest.raises(ValueError, match="reserved built-in id"):
-        register_pipeline("ofoldx.boltz2_affinity", pipeline=ThirdPartyPipeline)
-
-
-def test_deferred_boltz2_affinity_id_accepts_owner_registration():
-    r"""The owner package may still register the deferred, reserved id under its own module."""
-
-    class OwnerPipeline:
-        pass
-
-    OwnerPipeline.__module__ = "ofoldx.models.boltz2.pipeline"
-
-    register_pipeline("ofoldx.boltz2_affinity", pipeline=OwnerPipeline)
-
-    assert _pipeline_class("ofoldx.boltz2_affinity") is OwnerPipeline
+        register_pipeline(pipeline_id, pipeline=ThirdPartyPipeline)

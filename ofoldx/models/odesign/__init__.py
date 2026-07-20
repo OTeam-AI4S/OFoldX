@@ -2,6 +2,7 @@ r"""OFoldX implementation of the released ODesign core architecture."""
 
 from __future__ import annotations
 
+from ...pipelines.registry import register_pipeline as _register_pipeline
 from ..registry import register_model as _register_model
 from .config import (
     ODesignConfig,
@@ -32,18 +33,15 @@ from .processor import ODesignProcessor
 # coordinate-free shared ``DesignResult``) cannot losslessly carry — exactly as rfdiffusion /
 # pxdesign / boltzgen keep ``standard_tasks=()``.
 #
-# The working protein deliverable IS published, by export of the concrete ``ODesignPipeline``
-# (§4.11.6): it generates backbones (S seeds × M diffusion samples) and assigns sequences by
-# composing the already-registered ``ofoldx/proteinmpnn`` / ``ofoldx/ligandmpnn`` Pipelines
-# read-only, yielding the M×S×K ``ODesignDesignResult``. Protein binder design and existing
-# ligand / nucleic-context design all work today. Publication is by EXPORT (importable +
-# manually constructible) rather than routed ``register_pipeline`` — mirroring the composition
-# families ``BoltzGenPipeline`` / ``PxDesignSuitePipeline`` / ``ProteinMpnnDesignAndPackPipeline``:
-# ODesignPipeline is a multi-child composition (a 4-arg
-# ``(model, processor, protein_designer, ligand_designer)`` ctor), and the ``api.tasks.pipeline``
-# factory builds registered pipelines with only ``(model, processor)`` — so routing it would
-# break, exactly as the ``boltz2_affinity`` reservation note forbids for a multi-arg ctor. The
-# routed concrete-Pipeline registration is therefore honestly deferred, NOT gated.
+# The working protein deliverable IS published, by the concrete ``ODesignPipeline`` (§4.11.6): it
+# generates backbones (S seeds × M diffusion samples) and assigns sequences by composing the
+# already-registered ``ofoldx/proteinmpnn`` / ``ofoldx/ligandmpnn`` Pipelines read-only, yielding
+# the M×S×K ``ODesignDesignResult``. Protein binder design and existing ligand / nucleic-context
+# design all work today. It is a DESIGN §7.4 multi-pair Pipeline: the ODesign backbone pair owns the
+# runnable root and the two read-only sequence designers live at the ``protein_designer/`` /
+# ``ligand_designer/`` sub-directories (declared in its ``_PAIR_LAYOUT``). It is registered below,
+# so a marked repository's ``design`` routes through the factory's multi-pair loader
+# (``from_repository``) instead of the one-pair ``(model, processor)`` call.
 #
 # Honest remaining CAPABILITY gap: de-novo *ligand / NA* generation. A designed non-core-polymer
 # run (odesign ``{"chain_type": "ligand", "sequence": "N-N"}`` = ``num_atoms``) is GAP-1 in
@@ -58,4 +56,8 @@ _register_model(
     model=ODesignModel,
     processor=ODesignProcessor,
     standard_tasks=(),
+)
+_register_pipeline(
+    "ofoldx.odesign",
+    pipeline=ODesignPipeline,
 )

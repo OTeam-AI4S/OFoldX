@@ -625,8 +625,29 @@ The current worktree has built-in registrations for ProteinMpnn and MpnnPacker.
 Only the independently frozen MpnnPacker registration currently represents a
 complete bounded vertical; ProteinMpnn registration is implementation material
 under its reopened family audit. Neither state implies that weights have been
-published to the Hub. Remaining families and the multi-pair concrete repository
-lifecycle stay open until their own complete surfaces provide affirmative evidence.
+published to the Hub. Remaining families stay open until their own complete surfaces
+provide affirmative evidence.
+
+The multi-pair concrete repository lifecycle is now RATIFIED and frozen (DESIGN §7.4
+"Multi-pair concrete Pipeline repositories"). A multi-pair Pipeline declares a
+class-level pair-layout — an ordered set of named Model/Processor pairs (a runnable
+root pair plus fixed sub-directories such as `structure/`, `protein_designer/`,
+`ligand_designer/`, `ifold/`, and optional `fold/` / `affinity/`) mapping to its
+constructor keywords — and carries a shared `save` / `from_repository`
+(`ofoldx/pipelines/_composite.py`) built on the ordinary single-pair writer/loader.
+`pipeline.json` stays the frozen one-field marker (the layout lives in Python, never
+serialized), sub-pairs carry no marker, and the repository factory (`api/tasks.py`)
+now routes a marked multi-pair repository to `from_repository` on the pinned snapshot
+instead of the one-pair `(model, processor)` call, with one-pair routing unchanged.
+`Boltz2AffinityPipeline`, `ODesignPipeline`, and `BoltzGenPipeline` are the three
+materially different verticals that prove it; all three are promoted from
+owner-reserved-but-deferred ids to routable `_BUILTIN_PIPELINE_MODULES` entries and
+`register_pipeline`-ed, with owner squat-reservation preserved. A node4 run exercised
+`save` → on-disk root + named sub-pairs + one-field marker → factory `from_repository`
+reconstruction with per-pair weight round-trip through a fresh interpreter for each of
+the three; this is implementation evidence, not a committed test or publication gate.
+Multi-pair *placement* (DESIGN §6.3) and complete family checkpoint publication stay
+open.
 
 Shared Hub infrastructure has substantial implementation, but no overall percentage
 is defensible until every official family surface has a complete inventory.

@@ -19,6 +19,7 @@ from ..hub import (
     _load_registered_processor,
     _model_config,
     _read_json,
+    _resolve_hub_repository,
     _resolve_repository,
 )
 from ..pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
@@ -67,6 +68,21 @@ def pipeline(
         selected_pipeline_class = _pipeline_class(pipeline_id)
         if not callable(getattr(selected_pipeline_class, task, None)):
             raise ValueError(f"pipeline {pipeline_id!r} does not support {task}")
+        if getattr(selected_pipeline_class, "_PAIR_LAYOUT", None) is not None:
+            # DESIGN §7.4 multi-pair: the concrete class owns several class-owned pairs and must load
+            # every one of them from the same immutable snapshot, so the factory dispatches to the
+            # class's own multi-pair loader instead of the one-pair (model, processor) call. Pin the
+            # full snapshot at the commit the marker was read from; for a local directory that same
+            # directory already holds every pair.
+            if metadata_repository.repository is None:
+                snapshot = metadata_repository.path
+            else:
+                snapshot = _resolve_hub_repository(
+                    metadata_repository.repository,
+                    revision=metadata_repository.commit,
+                    allow_patterns=None,
+                ).path
+            return selected_pipeline_class.from_repository(snapshot, device=device, dtype=dtype)
     else:
         selected_pipeline_class = standard_pipeline_class
 

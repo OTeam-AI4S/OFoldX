@@ -13,32 +13,26 @@ _BUILTIN_PIPELINE_MODULES = {
     "ofoldx.nampnn": "ofoldx.models.nampnn",
     "ofoldx.proteinmpnn": "ofoldx.models.proteinmpnn",
     "ofoldx.rfdiffusion": "ofoldx.models.rfdiffusion",
-}
-
-# Deferred-but-reserved built-in ids: their pipeline registration is not wired up yet, so they are
-# intentionally absent from _BUILTIN_PIPELINE_MODULES (i.e. not auto-imported / not routable via
-# _pipeline_class). They must nonetheless stay RESERVED for their owner package so a third party
-# cannot squat the id before the official owner is ready to register it.
-#
-# All three are multi-child / multi-pair composition Pipelines whose live constructors do NOT match
-# the frozen §7.4 one-pair `(*, model, processor)` route the factory (api/tasks.py) drives with
-# `pipeline_class(model=model, processor=processor)`. §7.4 keeps such compositions live-only ("A
-# composition with no single root owner remains live-only ... and cannot acquire a marker"), so each
-# publishes by EXPORT (importable + reexported concrete Pipeline), not by a routed pipeline.json.
-# Routing any of them would drive the (model, processor) factory path into a non-matching ctor and
-# raise at construction with no standard-root fallback -- the exact landmine §7.4 forbids:
-#   * ofoldx.boltz2_affinity -> Boltz2AffinityPipeline (two-checkpoint; promote into
-#     _BUILTIN_PIPELINE_MODULES once §7.4 freezes a multi-pair loader/factory + .save(); its
-#     register_pipeline is deferred in ofoldx/models/boltz2/__init__.py until then).
-#   * ofoldx.odesign -> ODesignPipeline (4-arg ctor: model, processor, protein_designer,
-#     ligand_designer -- composes the read-only proteinmpnn/ligandmpnn Pipelines).
-#   * ofoldx.boltzgen -> BoltzGenPipeline (two required pairs: design + inverse-fold, plus optional
-#     injected boltz2 fold/affinity stages).
-_RESERVED_PIPELINE_IDS = {
+    # DESIGN §7.4 multi-pair concrete Pipelines. Each declares a class-level ``_PAIR_LAYOUT`` and a
+    # ``from_repository`` loader (``ofoldx/pipelines/_composite.py``), so the repository factory
+    # (``api/tasks.py``) routes their marked repositories to that multi-pair loader instead of the
+    # one-pair ``(model, processor)`` call. They remain owner-reserved by their presence here: a
+    # third-party ``register_pipeline`` under these ids is rejected unless the class is defined in
+    # the owner module.
+    #   * ofoldx.boltz2_affinity -> Boltz2AffinityPipeline (affinity root pair + ``structure/`` pair).
+    #   * ofoldx.odesign -> ODesignPipeline (ODesign root pair + ``protein_designer/`` +
+    #     ``ligand_designer/`` read-only sequence-designer pairs).
+    #   * ofoldx.boltzgen -> BoltzGenPipeline (design root pair + ``ifold/`` pair + optional injected
+    #     boltz2 ``fold/`` / ``affinity/`` stages).
     "ofoldx.boltz2_affinity": "ofoldx.models.boltz2",
     "ofoldx.odesign": "ofoldx.models.odesign",
     "ofoldx.boltzgen": "ofoldx.models.boltzgen",
 }
+
+# No pipeline id is currently deferred-but-reserved: every owner-reserved built-in id is a routable
+# entry in _BUILTIN_PIPELINE_MODULES above. The map is retained so a future concrete Pipeline can be
+# reserved for its owner before its loader/factory route lands (see register_pipeline).
+_RESERVED_PIPELINE_IDS: dict[str, str] = {}
 
 
 def register_pipeline(id: str, *, pipeline: type) -> None:

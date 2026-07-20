@@ -46,6 +46,7 @@ from typing_extensions import Self
 from ...data.components import get_component
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...pipelines._composite import _CompositePair, _CompositePipeline
 from ...pipelines._generator import resolve_generator
 from ...results import Metric, Score
 from .model import (
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
     from ..boltz2 import Boltz2AffinityModel, Boltz2AffinityProcessor, Boltz2Model, Boltz2Processor
 
 
-class BoltzGenPipeline:
+class BoltzGenPipeline(_CompositePipeline):
     r"""Bind the BoltzGen design/inverse-fold pairs and composed boltz2 stages.
 
     Args:
@@ -78,6 +79,16 @@ class BoltzGenPipeline:
         affinity: Optional injected boltz2 affinity Model (read-only composition).
         affinity_processor: Optional injected boltz2 affinity Processor.
     """
+
+    # DESIGN §7.4/§7.3 pair-layout: the structure-design pair owns the runnable root, the
+    # inverse-fold pair lives at ``ifold/``, and the read-only boltz2 fold/affinity stages are
+    # optional sub-pairs — written and reloaded only when they were injected.
+    _PAIR_LAYOUT = (
+        _CompositePair("", "design_model", "design_processor"),
+        _CompositePair("ifold", "ifold_model", "ifold_processor"),
+        _CompositePair("fold", "fold", "fold_processor", required=False),
+        _CompositePair("affinity", "affinity", "affinity_processor", required=False),
+    )
 
     def __init__(
         self,
