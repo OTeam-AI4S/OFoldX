@@ -9,11 +9,11 @@ import torch
 from ..data.molecular import MolecularSystem
 from ..data.structure import Structure
 from ..results import ScoreResult
-from ._generator import inputs_device, resolve_generator
-from ._paired import _PairedPipeline
+from ._paired import PairedPipeline
+from .generator import inputs_device, resolve_generator
 
 
-class ScorePipeline(_PairedPipeline):
+class ScorePipeline(PairedPipeline):
     r"""Bind one scoring Model to its paired Processor."""
 
     def score(

@@ -34,6 +34,10 @@ class Runner(dl.Runner):
         if not isinstance(config, RunnerConfig):
             config = RunnerConfig(config)
         super().__init__(config)
+        # Config-only construction can skip chanfig's ``boot`` (which runs ``post``), so run the
+        # curated ``RunnerConfig.post`` validation here before ``build_model`` -- otherwise a missing
+        # ``model.name`` surfaces as ``MODELS.lookup(None)``'s opaque "unknown model architecture".
+        self.config.post()
         self._architecture = ""
         self.model = self.build_model()
         from .objectives import diffusion, mpnn  # noqa: F401 — register the built-in objectives

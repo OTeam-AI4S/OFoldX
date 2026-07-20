@@ -2,8 +2,11 @@ r"""The four standard one-shot tasks and their repository-backed factory."""
 
 from __future__ import annotations
 
+import inspect
+import os
 from collections.abc import Mapping, Sequence
 from os import PathLike
+from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import chanfig
@@ -32,6 +35,66 @@ PackInput: TypeAlias = Structure | str | PathLike[str]
 MSAInput: TypeAlias = MSA | MSACollection
 TemplateInput: TypeAlias = Template
 
+_STANDARD_PIPELINE_CLASSES = {
+    "fold": FoldPipeline,
+    "design": DesignPipeline,
+    "score": ScorePipeline,
+    "pack": PackPipeline,
+}
+
+
+def _validate_input(input: object) -> None:
+    r"""Reject a malformed one-shot input at the API boundary with a clear error.
+
+    The one-shot task functions accept an in-memory carrier (:class:`Structure`,
+    :class:`MolecularSystem`, :class:`PolymerSequence`) or a path to an existing structure file.
+    Anything else — ``None``, an empty string, a directory, an arbitrary object — is caught here
+    so the caller gets a clear ``TypeError`` / ``ValueError`` instead of an opaque failure deep
+    inside a Processor. A path that simply does not exist is left to the Processor's own
+    ``FileNotFoundError``.
+    """
+
+    if isinstance(input, (Structure, MolecularSystem, PolymerSequence)):
+        return
+    if isinstance(input, (str, PathLike)):
+        text = os.fspath(input)
+        if not text:
+            raise ValueError("input path is empty; pass a path to a structure file")
+        if Path(text).expanduser().is_dir():
+            raise ValueError(f"input path {text!r} is a directory, not a structure file")
+        return
+    raise TypeError(
+        "input must be a Structure, MolecularSystem, PolymerSequence, or a path to a structure "
+        f"file, not {type(input).__name__}"
+    )
+
+
+def _accepts_keyword(method: object, name: str) -> bool:
+    r"""Report whether ``method`` accepts the keyword ``name`` (directly or via ``**kwargs``)."""
+
+    parameters = inspect.signature(method).parameters.values()
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return True
+    return any(parameter.name == name for parameter in parameters)
+
+
+def _guard_evidence(method: object, model: object, *, msa: object, templates: Sequence[object]) -> None:
+    r"""Fail clearly when evidence is supplied to a model whose task cannot consume it.
+
+    ``fold`` / ``design`` advertise ``msa=`` / ``templates=``, but a structure-only concrete
+    pipeline (ProteinMPNN, ...) does not accept them. Rather than forwarding into a raw
+    ``TypeError: ... unexpected keyword argument 'msa'`` deep in the call, name the model and the
+    evidence its task ignores.
+    """
+
+    unsupported: list[str] = []
+    if msa is not None and not _accepts_keyword(method, "msa"):
+        unsupported.append("MSA")
+    if templates and not _accepts_keyword(method, "templates"):
+        unsupported.append("templates")
+    if unsupported:
+        raise TypeError(f"model {model!r} does not consume {'/'.join(unsupported)}")
+
 
 def pipeline(
     task: Literal["fold", "design", "score", "pack"],
@@ -43,12 +106,11 @@ def pipeline(
 ) -> Any:
     r"""Load one paired Model and Processor into an explicit task Pipeline."""
 
-    standard_pipeline_class = {
-        "fold": FoldPipeline,
-        "design": DesignPipeline,
-        "score": ScorePipeline,
-        "pack": PackPipeline,
-    }[task]
+    try:
+        standard_pipeline_class = _STANDARD_PIPELINE_CLASSES[task]
+    except KeyError:
+        valid = ", ".join(repr(name) for name in _STANDARD_PIPELINE_CLASSES)
+        raise ValueError(f"unknown task {task!r}; valid tasks are {valid}") from None
     metadata_repository = _resolve_repository(
         model,
         revision=revision,
@@ -123,6 +185,9 @@ def fold(
 ) -> Any:
     r"""Fold a biological input with one repository-backed Model/Processor pair."""
 
+    _validate_input(input)
+    fold_pipeline = pipeline("fold", model=model, revision=revision, device=device, dtype=dtype)
+    _guard_evidence(fold_pipeline.fold, model, msa=msa, templates=templates)
     arguments: dict[str, object] = {"num_samples": num_samples}
     if msa is not None:
         arguments["msa"] = msa
@@ -132,13 +197,7 @@ def fold(
         arguments["seed"] = seed
     if generator is not None:
         arguments["generator"] = generator
-    return pipeline(
-        "fold",
-        model=model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-    ).fold(input, **arguments)
+    return fold_pipeline.fold(input, **arguments)
 
 
 def design(
@@ -157,6 +216,9 @@ def design(
 ) -> Any:
     r"""Design candidates with one repository-backed Model/Processor pair."""
 
+    _validate_input(input)
+    design_pipeline = pipeline("design", model=model, revision=revision, device=device, dtype=dtype)
+    _guard_evidence(design_pipeline.design, model, msa=msa, templates=templates)
     arguments: dict[str, object] = {"num_candidates": num_candidates}
     if msa is not None:
         arguments["msa"] = msa
@@ -168,13 +230,7 @@ def design(
         arguments["seed"] = seed
     if generator is not None:
         arguments["generator"] = generator
-    return pipeline(
-        "design",
-        model=model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-    ).design(input, **arguments)
+    return design_pipeline.design(input, **arguments)
 
 
 def score(
@@ -189,6 +245,7 @@ def score(
 ) -> Any:
     r"""Score a molecular input with one repository-backed Model/Processor pair."""
 
+    _validate_input(input)
     arguments: dict[str, object] = {}
     if seed is not None:
         arguments["seed"] = seed
@@ -218,6 +275,7 @@ def pack(
 ) -> Any:
     r"""Pack side chains with one repository-backed Model/Processor pair."""
 
+    _validate_input(input)
     arguments: dict[str, object] = {
         "sequence": sequence,
         "positions": positions,

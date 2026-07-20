@@ -11,11 +11,11 @@ from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import MolecularSystem, PolymerSequence
 from ..data.structure import Structure
 from ..results import FoldResult
-from ._generator import inputs_device, resolve_generator
-from ._paired import _PairedPipeline
+from ._paired import PairedPipeline
+from .generator import inputs_device, resolve_generator
 
 
-class FoldPipeline(_PairedPipeline):
+class FoldPipeline(PairedPipeline):
     r"""Bind one folding Model to its paired Processor."""
 
     def fold(

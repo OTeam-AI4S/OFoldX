@@ -48,8 +48,7 @@ from typing_extensions import Self
 
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines import resolve_generator
-from ...pipelines._composite import _CompositePair, _CompositePipeline
+from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import Score
 from ..ligandmpnn import LigandMpnnPipeline
 from ..proteinmpnn import ProteinMpnnPipeline
@@ -134,14 +133,14 @@ def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str,
     return mapped
 
 
-class ODesignPipeline(_CompositePipeline):
+class ODesignPipeline(CompositePipeline):
     r"""Compose the ODesign backbone designer with the OInvFold (MPNN) sequence step.
 
     This is the full released protein deliverable (§4.11.6): ODesign generates backbones over
     S seeds × M diffusion samples, and each backbone is assigned K sequence variants by the
     read-only ProteinMPNN / LigandMPNN Pipelines. It mirrors the ``ProteinMpnnDesignAndPack``
     composition structure — a coordinating object holding child Pipelines with a shared
-    :meth:`to` — rather than the single-pair ``_PairedPipeline``, because the sequence network
+    :meth:`to` — rather than the single-pair ``PairedPipeline``, because the sequence network
     is a *separately registered* family loaded read-only, never re-vendored.
 
     It is a DESIGN §7.4 multi-pair concrete Pipeline (see ``_PAIR_LAYOUT`` below) and is registered
@@ -154,9 +153,9 @@ class ODesignPipeline(_CompositePipeline):
     # two read-only OInvFold sequence designers live at fixed sub-directories. Each designer is a
     # single-pair child Pipeline, so its reloaded pair is wrapped back into its Pipeline class.
     _PAIR_LAYOUT = (
-        _CompositePair("", "model", "processor"),
-        _CompositePair("protein_designer", "protein_designer", None, wrap=ProteinMpnnPipeline),
-        _CompositePair("ligand_designer", "ligand_designer", None, wrap=LigandMpnnPipeline),
+        CompositePair("", "model", "processor"),
+        CompositePair("protein_designer", "protein_designer", None, wrap=ProteinMpnnPipeline),
+        CompositePair("ligand_designer", "ligand_designer", None, wrap=LigandMpnnPipeline),
     )
 
     def __init__(
@@ -189,6 +188,7 @@ class ODesignPipeline(_CompositePipeline):
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         *,
+        num_candidates: int | None = None,
         num_seeds: int = 1,
         num_backbones: int = 1,
         num_sequences: int = 1,
@@ -202,10 +202,24 @@ class ODesignPipeline(_CompositePipeline):
         partial_diffusion_snr: float | None = None,
         use_beam: bool = False,
     ) -> ODesignDesignResult:
-        r"""Generate the released M×S×K backbone-and-sequence design grid."""
+        r"""Generate the released M×S×K backbone-and-sequence design grid.
+
+        ``num_candidates`` is the standard OFoldX design-count entry (what
+        :func:`ofoldx.design` forwards). ODesign natively splits generation over three axes —
+        ``num_seeds`` (S) × ``num_backbones`` (M diffusion samples) × ``num_sequences`` (K
+        top-k sequence variants). ``num_candidates`` maps onto the primary backbone-generation
+        axis: when given it sets ``num_backbones`` (each generated backbone is one design), so
+        with the default S=1, K=1 the pipeline returns exactly ``num_candidates`` candidates. It
+        takes precedence over an explicit ``num_backbones``; the 3-axis knobs remain available
+        for the richer native grid.
+        """
 
         if seed is not None and generator is not None:
             raise ValueError("seed and generator are mutually exclusive")
+        if num_candidates is not None:
+            # Standard single-axis entry: map the OFoldX design count onto the primary
+            # backbone-generation axis (see the method docstring).
+            num_backbones = num_candidates
         if num_seeds <= 0 or num_backbones <= 0 or num_sequences <= 0:
             raise ValueError("num_seeds, num_backbones, and num_sequences must be positive")
         # §4.11.6: use_beam is inert on the released protein path (upstream `_ = use_beam`).

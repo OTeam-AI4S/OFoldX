@@ -14,8 +14,13 @@ from ..artifacts import save_model
 from .registry import PIPELINES
 
 
-class _PairedPipeline:
-    r"""Shared implementation for a direct Model–Processor pair."""
+class PairedPipeline:
+    r"""Shared implementation for a direct Model–Processor pair.
+
+    This is a PUBLIC pipeline-authoring extension point: a concrete single-pair Pipeline
+    (a model family's ``pipeline.py`` or a standard task Pipeline) subclasses it to inherit
+    the frozen ``to`` / ``save`` behavior. Re-exported from :mod:`ofoldx.pipelines`.
+    """
 
     def __init__(self, *, model: nn.Module, processor: object) -> None:
         self.model = model

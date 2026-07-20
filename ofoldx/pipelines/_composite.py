@@ -31,7 +31,7 @@ from ..hub import _ResolvedRepository, _load_model, _load_processor, _resolve_re
 from .registry import PIPELINES
 
 
-class _CompositePair(NamedTuple):
+class CompositePair(NamedTuple):
     r"""One class-owned Model/Processor pair in a multi-pair Pipeline's fixed layout.
 
     Attributes:
@@ -56,18 +56,21 @@ class _CompositePair(NamedTuple):
     required: bool = True
 
 
-class _CompositePipeline:
+class CompositePipeline:
     r"""Mixin: DESIGN §7.4 multi-pair repository ``save`` / ``from_repository``.
 
     A concrete multi-pair Pipeline subclasses this and declares ``_PAIR_LAYOUT``. The
     presence of ``_PAIR_LAYOUT`` (equivalently, ``from_repository``) is the signal the
     repository factory uses to route to :meth:`from_repository` instead of the frozen
     one-pair ``(model, processor)`` call.
+
+    This is a PUBLIC pipeline-authoring extension point (re-exported from
+    :mod:`ofoldx.pipelines`): a model family's multi-pair ``pipeline.py`` subclasses it.
     """
 
-    _PAIR_LAYOUT: tuple[_CompositePair, ...]
+    _PAIR_LAYOUT: tuple[CompositePair, ...]
 
-    def _composite_pair_source(self, pair: _CompositePair) -> tuple[nn.Module, object] | None:
+    def _composite_pair_source(self, pair: CompositePair) -> tuple[nn.Module, object] | None:
         r"""Return the ``(model, processor)`` a layout slot serializes, or ``None`` when absent."""
 
         bound = getattr(self, pair.model_attribute, None)
@@ -109,7 +112,7 @@ class _CompositePipeline:
 
         # Resolve every slot's source first so a missing required pair aborts the save
         # before the destination is mutated.
-        plan: list[tuple[_CompositePair, tuple[nn.Module, object] | None]] = []
+        plan: list[tuple[CompositePair, tuple[nn.Module, object] | None]] = []
         for pair in self._PAIR_LAYOUT:
             source = self._composite_pair_source(pair)
             if source is None and pair.required:

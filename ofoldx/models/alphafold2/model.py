@@ -1016,6 +1016,7 @@ def _summarize_clusters(
     num_seq = msa_tokens.shape[0]
 
     def cluster_sum(values: Tensor) -> Tensor:
+        r"""Sum extra-MSA rows into their assigned cluster centers (segment sum over ``assignment``)."""
         return _unsorted_segment_sum(values, assignment, num_seq)
 
     mask_counts = 1e-6 + msa_mask + cluster_sum(extra_mask)
@@ -1745,6 +1746,11 @@ class InvariantPointAttention(nn.Module):
 
 
 class StructureTransition(nn.Module):
+    r"""
+    Point-wise MLP transition on the structure-module single representation (ReLU between
+    linear layers, none after the last; the final layer is zero-initialized).
+    """
+
     def __init__(self, *, num_channel: int, num_layer_in_transition: int) -> None:
         super().__init__()
         self.layers = nn.ModuleList(nn.Linear(num_channel, num_channel) for _ in range(num_layer_in_transition))
@@ -1796,6 +1802,11 @@ class MultiRigidSidechain(nn.Module):
 
 
 class SidechainResidualBlock(nn.Module):
+    r"""
+    Two-layer residual block (ReLU pre-activations, zero-initialized final layer) used by
+    :class:`MultiRigidSidechain` to refine the side-chain activations.
+    """
+
     def __init__(self, num_channel: int) -> None:
         super().__init__()
         self.resblock1 = nn.Linear(num_channel, num_channel)
@@ -1811,6 +1822,8 @@ class SidechainResidualBlock(nn.Module):
 
 
 def quat_to_rot(normalized_quat: Tensor) -> Tensor:
+    r"""Convert a normalized ``(w, x, y, z)`` quaternion to its ``(..., 3, 3)`` rotation matrix."""
+
     w, x, y, z = normalized_quat.unbind(dim=-1)
     return torch.stack(
         [
@@ -1823,6 +1836,8 @@ def quat_to_rot(normalized_quat: Tensor) -> Tensor:
 
 
 def quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
+    r"""Hamilton-multiply a quaternion by the pure quaternion ``(0, vec)``, returning the 4-vector product."""
+
     r, i, j, k = quat.unbind(dim=-1)
     x, y, z = vec.unbind(dim=-1)
     return torch.stack(
@@ -1837,6 +1852,12 @@ def quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
 
 
 def torsion_angles_to_frames(aatype: Tensor, backb_to_global: Rigid, torsion_angles_sin_cos: Tensor) -> Rigid:
+    r"""Build the 8 global side-chain rigid-group frames from the backbone frame and per-residue torsions.
+
+    Rotates each residue type's default rigid groups by the ``(sin, cos)`` torsion angles and chains the
+    dependent chi frames, returning a ``(..., 8)`` :class:`Rigid` in global coordinates.
+    """
+
     default_frames = Rigid.from_tensor4x4(
         _gather_restype(residue_constants.restype_rigid_group_default_frame, aatype, dtype=torsion_angles_sin_cos.dtype)
     )
@@ -1883,6 +1904,12 @@ def torsion_angles_to_frames(aatype: Tensor, backb_to_global: Rigid, torsion_ang
 
 
 def frames_and_literature_positions_to_atom14_pos(aatype: Tensor, all_frames_to_global: Rigid) -> Tensor:
+    r"""Place each residue's 14 literature atom positions into global coordinates via its rigid-group frames.
+
+    Applies the per-atom group frame to the reference (literature) atom14 positions and masks nonexistent
+    atoms, returning ``(..., 14, 3)`` predicted coordinates.
+    """
+
     group_index = _gather_restype(residue_constants.restype_atom14_to_rigid_group, aatype, dtype=torch.long)
     group_mask = F.one_hot(group_index, num_classes=8).to(dtype=all_frames_to_global.rotation.dtype)
     atom_frames = Rigid(
@@ -1899,6 +1926,12 @@ def frames_and_literature_positions_to_atom14_pos(aatype: Tensor, all_frames_to_
 
 
 def atom14_to_atom37(atom14_positions: Tensor, aatype: Tensor, token_mask: Tensor) -> tuple[Tensor, Tensor]:
+    r"""Scatter dense ``atom14`` coordinates into the ``atom37`` layout.
+
+    Returns ``(atom37_positions, atom37_mask)`` where the mask combines the per-residue-type atom37
+    existence table with ``token_mask``.
+    """
+
     atom37_to_atom14 = _gather_restype(_RESTYPE_ATOM37_TO_ATOM14, aatype, dtype=torch.long)
     gather_index = atom37_to_atom14.unsqueeze(-1).expand(*atom37_to_atom14.shape, atom14_positions.shape[-1])
     atom37_positions = torch.gather(atom14_positions, dim=-2, index=gather_index)
@@ -1908,6 +1941,8 @@ def atom14_to_atom37(atom14_positions: Tensor, aatype: Tensor, token_mask: Tenso
 
 
 def restype_atom14_mask(aatype: Tensor, *, dtype: torch.dtype) -> Tensor:
+    r"""Gather the per-residue ``atom14`` existence mask for each token in ``aatype``."""
+
     return _gather_restype(residue_constants.restype_atom14_mask, aatype, dtype=dtype)
 
 
@@ -2140,6 +2175,11 @@ class AlphaFold2TemplatePairStack(nn.Module):
 
 
 class AlphaFold2TemplatePairStackBlock(nn.Module):
+    r"""
+    One block of the template pair stack; a thin wrapper delegating to a single
+    :class:`AlphaFold2TemplatePairStackLayer`.
+    """
+
     def __init__(
         self,
         *,
@@ -2169,6 +2209,12 @@ class AlphaFold2TemplatePairStackBlock(nn.Module):
 
 
 class AlphaFold2TemplatePairStackLayer(nn.Module):
+    r"""
+    Triangle update layer over the template pair representation: triangle attention (starting and
+    ending node), triangle multiplication (outgoing and incoming), and a transition. ``tri_mul_first``
+    applies the multiplications before attention (AF-Multimer ordering) instead of after (monomer).
+    """
+
     def __init__(
         self,
         *,
@@ -2484,6 +2530,11 @@ class AlphaFold2ExtraMsaEmbedding(nn.Module):
 
 
 class AlphaFold2PredictedLDDTHead(nn.Module):
+    r"""
+    Predict per-residue pLDDT confidence bin logits from the structure-module single
+    representation (layer norm, two ReLU projections, zero-initialized ``num_bins`` logits).
+    """
+
     def __init__(self, *, input_size: int, hidden_size: int, num_bins: int) -> None:
         super().__init__()
         self.input_layer_norm = LayerNorm(input_size)
@@ -2501,6 +2552,11 @@ class AlphaFold2PredictedLDDTHead(nn.Module):
 
 
 class AlphaFold2PredictedAlignedErrorHead(nn.Module):
+    r"""
+    Predict predicted-aligned-error bin logits per residue pair from the pair representation
+    (a single zero-initialized ``num_bins`` linear projection).
+    """
+
     def __init__(self, *, pair_size: int, num_bins: int) -> None:
         super().__init__()
         self.logits = nn.Linear(pair_size, num_bins)
@@ -2512,6 +2568,11 @@ class AlphaFold2PredictedAlignedErrorHead(nn.Module):
 
 
 class AlphaFold2ExperimentallyResolvedHead(nn.Module):
+    r"""
+    Predict per-atom experimentally-resolved logits from the single representation
+    (one zero-initialized linear projection over ``num_atom_types``).
+    """
+
     def __init__(self, *, input_size: int, num_atom_types: int) -> None:
         super().__init__()
         self.logits = nn.Linear(input_size, num_atom_types)
@@ -2523,6 +2584,11 @@ class AlphaFold2ExperimentallyResolvedHead(nn.Module):
 
 
 class AlphaFold2MaskedMSAHead(nn.Module):
+    r"""
+    Predict masked-MSA token logits from the MSA representation for the BERT-style reconstruction
+    objective (one zero-initialized linear projection over ``num_output`` token classes).
+    """
+
     def __init__(self, *, msa_channel: int, num_output: int) -> None:
         super().__init__()
         self.logits = nn.Linear(msa_channel, num_output)
@@ -2534,6 +2600,9 @@ class AlphaFold2MaskedMSAHead(nn.Module):
 
 
 def clipped_relative_position(residue_index: Tensor, max_relative_feature: int) -> Tensor:
+    r"""One-hot encode the relative sequence separation of each residue pair, clipped to
+    ``+/- max_relative_feature`` (``2 * max_relative_feature + 1`` bins)."""
+
     offset = residue_index.unsqueeze(-1) - residue_index.unsqueeze(-2)
     clipped = torch.clamp(offset + max_relative_feature, min=0, max=2 * max_relative_feature)
     return F.one_hot(clipped.long(), num_classes=2 * max_relative_feature + 1)

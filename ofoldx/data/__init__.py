@@ -2,11 +2,6 @@ r"""Canonical public molecular data values."""
 
 from __future__ import annotations
 
-from .bonds import (
-    SymbolicBond,
-    SymbolicBondSite,
-    resolve_bond_site,
-)
 from .components import get_component
 from .conditions import (
     AllowedResidueIdentities,
@@ -41,12 +36,7 @@ from .placement import (
     InstanceIdAllocator,
     PlacementMap,
     PlacementSpec,
-    PlacementValue,
-    SymbolicAtomSite,
     SymbolicResidueSite,
-    instance_of,
-    realized_instance_id,
-    resolve,
     validate_placement,
 )
 from .structure import ResidueNumber, Structure

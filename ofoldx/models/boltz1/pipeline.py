@@ -11,7 +11,7 @@ from typing_extensions import Self
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
-from ...pipelines._generator import resolve_generator
+from ...pipelines import resolve_generator
 from ...results import FoldResult
 from .model import Boltz1Model, Boltz1Pocket
 from .processor import Boltz1Processor

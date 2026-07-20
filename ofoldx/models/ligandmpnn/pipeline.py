@@ -14,8 +14,7 @@ from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io import read_pdb
-from ...pipelines._generator import resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, PackResult
 from .model import LigandMpnnModel
 from .processor import LigandMpnnProcessor
@@ -45,7 +44,7 @@ def _candidate_protein_sequences(
     return sequences
 
 
-class LigandMpnnPipeline(_PairedPipeline):
+class LigandMpnnPipeline(PairedPipeline):
     r"""Bind one LigandMpnn Model-Processor pair for biological operations."""
 
     model: LigandMpnnModel

@@ -10,11 +10,11 @@ import torch
 from ..data.molecular import ComponentReference
 from ..data.structure import Structure
 from ..results import PackResult
-from ._generator import inputs_device, resolve_generator
-from ._paired import _PairedPipeline
+from ._paired import PairedPipeline
+from .generator import inputs_device, resolve_generator
 
 
-class PackPipeline(_PairedPipeline):
+class PackPipeline(PairedPipeline):
     r"""Bind one side-chain packing Model to its paired Processor."""
 
     def pack(

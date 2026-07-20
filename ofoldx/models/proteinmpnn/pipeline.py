@@ -19,8 +19,7 @@ from ...modules.mpnn import (
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
-from ...pipelines._generator import resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import MpnnProbabilityResult, PackResult, ScoreResult
 from .model import ProteinMpnnDesignResult, ProteinMpnnModel
 from .processor import ProteinMpnnProcessor
@@ -76,7 +75,7 @@ def _candidate_protein_sequences(
     return sequences
 
 
-class ProteinMpnnPipeline(_PairedPipeline):
+class ProteinMpnnPipeline(PairedPipeline):
     r"""Bind one ProteinMpnn Model–Processor pair for biological operations."""
 
     model: ProteinMpnnModel

@@ -12,11 +12,11 @@ from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import MolecularSystem
 from ..data.structure import Structure
 from ..results import DesignResult
-from ._generator import inputs_device, resolve_generator
-from ._paired import _PairedPipeline
+from ._paired import PairedPipeline
+from .generator import inputs_device, resolve_generator
 
 
-class DesignPipeline(_PairedPipeline):
+class DesignPipeline(PairedPipeline):
     r"""Reusable binding of one design Model and its paired Processor."""
 
     def design(

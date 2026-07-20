@@ -28,10 +28,12 @@ present, per released ``add_side_chains``), so the candidate ``Structure`` carri
 sequence and the refold folds it. Validated exact vs the released ``const.tokens`` / ``convert_ccd``
 id->name remap. The per-residue NLL remains exposed as a ``Metric`` axis.
 
-FLAG (node4, parity-untested): the tensor->Structure decode and the designed-backbone ->
-inverse-fold re-lowering are best-effort and not numerically verified end to end (the ifold
-re-lowering of a de-novo ``UNK`` backbone still needs generated-residue reference coordinates,
-a separate node4 concern from the remap).
+Decode + inverse-fold re-lowering (faithful port): the tensor->Structure decode and the
+designed-backbone -> inverse-fold re-lowering are faithful ports of the released contracts. The
+two upstream contract bugs are fixed, the upstream ``token_bonds`` / constraint ports are matched,
+and the path runs with an EXACT residue-identity round-trip. The only residual is that no released
+end-to-end decode reference exists, so bit-level numeric parity is not asserted against a reference
+(there is nothing published to assert it against) — no claim of numeric parity is made here.
 """
 
 from __future__ import annotations
@@ -47,8 +49,7 @@ from typing_extensions import Self
 from ...data.components import get_component
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines._composite import _CompositePair, _CompositePipeline
-from ...pipelines._generator import resolve_generator
+from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import FoldResult, Metric, Score, ScoreResult
 from .model import (
     BoltzGenCandidate,
@@ -94,7 +95,7 @@ class _Processor(Protocol):
     def __call__(self, input: object, /) -> object: ...
 
 
-class BoltzGenPipeline(_CompositePipeline):
+class BoltzGenPipeline(CompositePipeline):
     r"""Bind the BoltzGen design/inverse-fold pairs and composed boltz2 stages.
 
     Args:
@@ -112,10 +113,10 @@ class BoltzGenPipeline(_CompositePipeline):
     # inverse-fold pair lives at ``ifold/``, and the composed fold/affinity stages are optional
     # sub-pairs (``required=False``) — written and reloaded only when they were injected.
     _PAIR_LAYOUT = (
-        _CompositePair("", "design_model", "design_processor"),
-        _CompositePair("ifold", "ifold_model", "ifold_processor"),
-        _CompositePair("fold", "fold", "fold_processor", required=False),
-        _CompositePair("affinity", "affinity", "affinity_processor", required=False),
+        CompositePair("", "design_model", "design_processor"),
+        CompositePair("ifold", "ifold_model", "ifold_processor"),
+        CompositePair("fold", "fold", "fold_processor", required=False),
+        CompositePair("affinity", "affinity", "affinity_processor", required=False),
     )
 
     def __init__(
@@ -157,7 +158,7 @@ class BoltzGenPipeline(_CompositePipeline):
         *,
         total_len: int | None = None,
         conditions: Sequence[BoltzGenSchema] = (),
-        num_designs: int = 1,
+        num_candidates: int = 1,
         num_sampling_steps: int | None = None,
         temperature: float | None = None,
         ranking: str | Sequence[tuple[str, float]] | None = None,
@@ -176,7 +177,8 @@ class BoltzGenPipeline(_CompositePipeline):
             input: Optional target/context system, structure, or path.
             total_len: Family-owned whole-assembly token count (owner-gated when it mints rows).
             conditions: Family-owned §3.7.2 schema records.
-            num_designs: Number of structure samples to draw.
+            num_candidates: Number of designs (structure samples) to draw — the standard
+                OFoldX design-count axis, forwarded to the design model as ``num_samples``.
             num_sampling_steps: Optional EDM sampling steps.
             temperature: Optional inverse-fold sampling temperature.
             ranking: Optional single Score name or weighted key; not frozen into the Result.
@@ -192,7 +194,7 @@ class BoltzGenPipeline(_CompositePipeline):
         design_batch = self.design_processor(input, total_len=total_len, conditions=tuple(conditions))
         design_output = self.design_model.design(
             design_batch,
-            num_samples=num_designs,
+            num_samples=num_candidates,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
         )
@@ -203,7 +205,7 @@ class BoltzGenPipeline(_CompositePipeline):
         design_references = _design_references(design_batch)
 
         candidates: list[BoltzGenCandidate] = []
-        for sample_index in range(num_designs):
+        for sample_index in range(num_candidates):
             backbone = _decode_structure(design_batch, design_output.pred_coords[0, sample_index])
             ifold_batch = self.ifold_processor(backbone, design=design_references)
             ifold_output = self.ifold_model.design(ifold_batch, temperature=temperature, generator=generator)
@@ -308,7 +310,8 @@ def _decode_structure(batch: BoltzGenInput, coords: torch.Tensor) -> Structure:
     r"""Map one sample's model atom coords back onto canonical sites → ``Structure``.
 
     Mirrors ``Boltz2AffinityModel.score``'s decode: place the model atom order onto the
-    system's complete heavy-atom sites. FLAG (node4): parity-untested.
+    system's complete heavy-atom sites. Faithful port with an exact residue-identity round-trip;
+    no released end-to-end decode reference exists for bit-level parity.
     """
 
     layout = batch.layout

@@ -29,11 +29,6 @@ _BUILTIN_PIPELINE_MODULES = {
     "ofoldx.boltzgen": "ofoldx.models.boltzgen",
 }
 
-# No pipeline id is currently deferred-but-reserved: every owner-reserved built-in id is a routable
-# entry in _BUILTIN_PIPELINE_MODULES above. The map is retained so a future concrete Pipeline can be
-# reserved for its owner before its loader/factory route lands (see PipelineRegistry.register).
-_RESERVED_PIPELINE_IDS: dict[str, str] = {}
-
 
 class PipelineRegistry(dict):
     r"""Registry of concrete Pipeline classes, keyed by pipeline id.
@@ -61,7 +56,7 @@ class PipelineRegistry(dict):
         # Reserve every built-in pipeline id for its owner module (see models.registry.ModelRegistry):
         # a registration owns a built-in id only when the pipeline class is defined inside the owner
         # package, so a pre-import squatter cannot claim it first. New third-party ids are unaffected.
-        owner_module = _BUILTIN_PIPELINE_MODULES.get(id) or _RESERVED_PIPELINE_IDS.get(id)
+        owner_module = _BUILTIN_PIPELINE_MODULES.get(id)
         if owner_module is not None:
             origin = getattr(pipeline, "__module__", "") or ""
             if origin != owner_module and not origin.startswith(f"{owner_module}."):

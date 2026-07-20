@@ -26,13 +26,12 @@ import torch
 from ...data import PlacementSpec
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
-from ...pipelines import resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, resolve_generator
 from .model import Hotspot, PxDesignModel, PxDesignResult
 from .processor import PxDesignProcessor
 
 
-class PxDesignPipeline(_PairedPipeline):
+class PxDesignPipeline(PairedPipeline):
     r"""Bind one PXDesign-d Model--Processor pair and own the ``design`` verb."""
 
     model: PxDesignModel

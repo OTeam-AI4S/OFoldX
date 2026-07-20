@@ -26,14 +26,13 @@ import torch
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines._generator import inputs_device, resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, inputs_device, resolve_generator
 from ...results import FoldResult
 from .model import ProtenixAtomContact, ProtenixConstraintModel, ProtenixPocket, ProtenixTokenContact
 from .processor import ProtenixConstraintProcessor
 
 
-class ProtenixConstraintPipeline(_PairedPipeline):
+class ProtenixConstraintPipeline(PairedPipeline):
     r"""Bind the Protenix constraint Model--Processor pair and own the constraint ``fold`` verb."""
 
     model: ProtenixConstraintModel

@@ -10,14 +10,13 @@ import torch
 from ...data.molecular import ComponentReference
 from ...data.structure import Structure
 from ...io import read_pdb
-from ...pipelines._generator import resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import PackPrediction, PackResult
 from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, _pack_candidate
 from .processor import MpnnPackerProcessor
 
 
-class MpnnPackerPipeline(_PairedPipeline):
+class MpnnPackerPipeline(PairedPipeline):
     r"""Bind the released side-chain packer Model and Processor."""
 
     model: MpnnPackerModel

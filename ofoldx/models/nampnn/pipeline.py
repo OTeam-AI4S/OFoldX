@@ -11,14 +11,13 @@ from torch import Tensor
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
-from ...pipelines._generator import resolve_generator
-from ...pipelines._paired import _PairedPipeline
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, ScoreResult
 from .model import NaMpnnModel
 from .processor import NaMpnnProcessor
 
 
-class NaMpnnPipeline(_PairedPipeline):
+class NaMpnnPipeline(PairedPipeline):
     r"""Bind one NaMpnn Model-Processor pair for released biological operations."""
 
     model: NaMpnnModel

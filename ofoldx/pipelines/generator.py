@@ -51,6 +51,19 @@ def inputs_device(inputs: object) -> torch.device | None:
     return None
 
 
+def _device_mismatch(source: torch.device, target: torch.device) -> bool:
+    r"""Report whether a caller generator on ``source`` cannot sample inputs on ``target``.
+
+    A ``cuda`` generator with no explicit index is compatible with any ``cuda`` input (and
+    vice versa) — only differing device *types*, or two explicit indices that differ, are a
+    genuine mismatch that would crash deep in sampling.
+    """
+
+    if source.type != target.type:
+        return True
+    return source.index is not None and target.index is not None and source.index != target.index
+
+
 def resolve_generator(
     seed: int | None,
     generator: torch.Generator | None,
@@ -62,19 +75,28 @@ def resolve_generator(
     Args:
         seed: Optional integer seed; mutually exclusive with ``generator``.
         generator: Optional caller-supplied RNG; mutually exclusive with ``seed``.
-        device: Device the seeded generator is bound to when ``seed`` is given.
+        device: Device the seeded generator is bound to when ``seed`` is given, and the
+            device a caller-supplied ``generator`` is validated against.
 
     Returns:
         ``generator`` when supplied; a fresh ``Generator(device).manual_seed(seed)`` when only
         ``seed`` is given; ``None`` (ambient RNG) when neither is given.
 
     Raises:
-        ValueError: If both ``seed`` and ``generator`` are supplied.
+        ValueError: If both ``seed`` and ``generator`` are supplied, or if a caller-supplied
+            ``generator`` lives on a different device than the pipeline inputs (which would
+            otherwise crash deep in sampling with an opaque device-mismatch error).
     """
 
     if seed is not None and generator is not None:
         raise ValueError("seed and generator are mutually exclusive")
     if generator is not None:
+        if device is not None and _device_mismatch(generator.device, torch.device(device)):
+            raise ValueError(
+                f"generator is on device {generator.device} but the pipeline inputs are on "
+                f"{torch.device(device)}; create the generator on the inputs device, or pass "
+                "seed= instead to let the pipeline bind one to that device"
+            )
         return generator
     if seed is not None:
         return torch.Generator(device=device).manual_seed(seed)
