@@ -59,390 +59,6 @@ from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import DesignCandidate, Metric
 from .config import ODesignConfig
 
-# ======================================================================================
-# Family-owned ODesign spatial and placement condition records (folded from the former
-# ``.conditions`` submodule) and the ODesign hotspot target record (folded from the former
-# ``.hotspot`` submodule). Defined ABOVE ``from .processor import _realize_ranges`` because
-# ``processor`` imports these records back from ``.model`` — the names must already be bound
-# when that submodule loads.
-#
-# DESIGN 3.7.2 ("Spatial conditioning is family-owned") freezes only the *negative*
-# cross-family contract: there is no shared ``Condition`` base, union endpoint, or generic
-# condition bag. Each concrete family owns its exact positive records. The data-model
-# migration removed these records from the shared ``ofoldx.data.conditions`` module (which now
-# keeps only the frozen 3.7.1 identity records ``AllowedResidueIdentities`` /
-# ``TiedResidueIdentities``), so the ones ODesign consumes are re-homed here as
-# ODesign-family-owned dataclasses. This mirrors the already-wired ``rfdiffusion`` /
-# ``pxdesign`` families.
-#
-# The generation-topology placement records (:class:`~ofoldx.data.placement.GeneratedSegment`,
-# :class:`~ofoldx.data.placement.ExistingSpan`, :class:`~ofoldx.data.placement.SymbolicResidueSite`,
-# :class:`~ofoldx.data.placement.SymbolicAtomSite`) now come from the FROZEN §3.7 PlacementSpec
-# placement core in ``ofoldx.data.placement`` (owner verdicts ratified 2026-07-18). Identity is
-# placement-keyed: a placement's identity is the globally-unique ``placement_id`` inner key of
-# the core :data:`~ofoldx.data.placement.PlacementSpec` mapping, so :class:`GeneratedSegment` carries NO
-# embedded id and a pre-realization reference is exactly the two fields
-# ``SymbolicResidueSite(placement_id, offset)``. This family only wraps that core with its own
-# :class:`ODesignPlacements` condition, which re-homes the family-owned per-chain
-# ``chain_lengths`` and the hard/soft ``intent`` (DESIGN 3.7.3 rejects both as shared
-# invariants) alongside the core placement mapping.
-#
-# §3.7.4 constraint freeze: the covalent-link core (:class:`~ofoldx.data.bonds.SymbolicBond`
-# over the promoted :data:`~ofoldx.data.bonds.SymbolicBondSite` endpoint union) and the
-# target-conditioning core (the distance-free :class:`~ofoldx.data.conditions.Hotspot` label
-# and the strictly-larger geometric :class:`~ofoldx.data.conditions.Contact`) are frozen and
-# shared. This family imports them rather than re-declaring the placeholders it used to own
-# (the deleted ``DesiredCovalentLink(site_a, site_b)`` two-atom record and the two-sided
-# ``Contact`` that conflated the learned hotspot label with the §B verification cutoff).
-#
-# ``@dataclass(frozen=True)`` denotes runtime immutability, not DESIGN-frozen status.
-# ======================================================================================
-
-
-# --------------------------------------------------------------------------------------
-# Family-owned PlacementSpec condition (wraps the FROZEN §3.7 core placement mapping).
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ODesignPlacements:
-    r"""One ODesign generation-topology request over the frozen §3.7 PlacementSpec core.
-
-    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
-    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
-    unique across the whole mapping and is the SOLE pre-realization reference target
-    (validated at construction). Each declaration group is one ODesign output chain and its
-    declared order is the chain layout order.
-
-    ``chain_lengths`` is a family-owned per-chain exact-length field (DESIGN 3.7.3 rejects it
-    as a shared invariant) aligned with ``placements`` group order; ``intent`` is read by the
-    family hard-condition gate in ``model._require_hard_conditions``. Both re-home here as
-    family-owned fields, never on the shared core.
-    """
-
-    placements: PlacementSpec
-    chain_lengths: tuple[int | None, ...] | None = None
-    intent: Literal["hard", "soft"] = "hard"
-
-    def __post_init__(self) -> None:
-        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
-        # the construction-time uniqueness check (raises ValueError on any duplicate).
-        validate_placement(self.placements)
-
-
-# --------------------------------------------------------------------------------------
-# Family-owned spatial conditions (DESIGN 3.7.2, family-owned & freezable target).
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ReferenceCoordinates:
-    r"""Fixed/constraint coordinates for a set of EXISTING input atoms (§A1).
-
-    ``intent == "hard"`` fixes the coordinates during EDM sampling; the constraint mask
-    always feeds the learned constraint distogram. ``weight`` must be ``None`` / ``1.0``
-    (the released signal is unweighted); the processor enforces that inline. Owner target
-    name: ``ODesignFixedCoordinates``.
-    """
-
-    sites: tuple[AtomSite, ...]
-    tolerance_angstrom: float
-    intent: Literal["hard", "soft", "preference"] = "hard"
-    weight: float | None = None
-
-
-@dataclass(frozen=True)
-class Hotspot(_Hotspot):
-    r"""The §A2 learned per-residue hotspot label (family envelope over the frozen record).
-
-    Extends the frozen distance-free :class:`~ofoldx.data.conditions.Hotspot` (owner verdict
-    D3): ``residues`` names the EXISTING target residues written to
-    ``token_features[..., 452]`` by ``processor._hotspot_tokens``; the generated partner is
-    implicit (the whole design). This is the record the released two-sided ``Contact``
-    soft-hotspot lowering is split onto — it carries NO ``cutoff``/``tolerance`` (those live
-    on the geometric :class:`Contact`). The hard/soft ``intent`` rides on this family
-    envelope, never on the frozen record; the released channel is always ``"soft"`` (the
-    processor enforces it inline).
-
-    An endpoint is a ``ComponentReference`` (existing residue), a bare ``placement_id``
-    (whole generated placement), a :class:`SymbolicResidueSite` / :class:`SymbolicAtomSite`
-    (generated residue/atom), or an :class:`~ofoldx.data.molecular.AtomSite` (existing atom).
-    """
-
-    intent: Literal["hard", "soft"] = "soft"
-
-
-@dataclass(frozen=True)
-class Contact(_GeometricContact):
-    r"""The §B geometric hard-distance verification record (family envelope over the frozen
-    :class:`~ofoldx.data.conditions.Contact`).
-
-    Extends the frozen two-sided geometric ``Contact`` (owner verdict D3, identity is the
-    real ``cutoff_angstrom``): ``model._require_hard_conditions`` reads ``side_a`` /
-    ``side_b`` / ``cutoff_angstrom`` / ``tolerance_angstrom`` and requires the min
-    cross-side distance to satisfy the cutoff. ``weight`` and hard/soft ``intent`` are the
-    family-owned envelope fields the frozen record deliberately omits; ``weight`` is kept
-    only so the processor can assert the released ``None`` / ``1.0`` no-weight contract.
-
-    Endpoints are the shared :data:`~ofoldx.data.conditions.Endpoint` union (existing
-    ``ComponentReference`` / :class:`~ofoldx.data.molecular.AtomSite`, a bare generated
-    ``placement_id``, a :class:`SymbolicResidueSite` / :class:`SymbolicAtomSite`). This
-    record is NO LONGER the learned hotspot signal — that is now :class:`Hotspot`.
-    """
-
-    weight: float | None = None
-    intent: Literal["hard", "soft"] = "soft"
-
-
-# --------------------------------------------------------------------------------------
-# Covalent link envelope over the frozen §3.7.4 SymbolicBond core.
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class DesiredCovalentLink:
-    r"""A requested covalent bond (head-to-tail cyclization) as a family envelope.
-
-    The structural payload is the frozen :class:`~ofoldx.data.bonds.SymbolicBond` (owner
-    verdicts D1/D2): its endpoints reference the placement model through the promoted
-    :data:`~ofoldx.data.bonds.SymbolicBondSite` union, and its chemistry
-    (``order``/``aromatic``/``stereo``) lowers losslessly to a
-    :class:`~ofoldx.data.molecular.SystemBond`. ``intent`` (hard/soft) rides on THIS family
-    envelope, never on the frozen record. ``_materialize_cyclic_links`` resolves the bond,
-    synthesizes the ``SystemBond`` for a legal head-to-tail closure, and marks
-    ``cyclic_instances`` → ``cyclic_period`` (behavior unchanged from the deleted two-atom
-    placeholder — ODesign's previously hardcoded order ``1.0`` / aromatic ``False`` are now
-    carried explicitly by the ``SymbolicBond`` defaults).
-    """
-
-    bond: SymbolicBond
-    intent: Literal["hard", "soft"] = "hard"
-
-
-# --------------------------------------------------------------------------------------
-# design_mask <-> PlacementSpec projection (CONTIG_GENERALITY_AUDIT.md §3, family boundary).
-# --------------------------------------------------------------------------------------
-#
-# ODesign natively selects fixed-vs-generated positions per output residue through a
-# per-residue design mask (the ``res`` condition-mask driven by the ``sequence`` tokens:
-# an ``N-M`` / ``N-N`` run designs a de-novo polymer interval, an ``X/A-B`` token copies a
-# source span). These two functions are the lossless bridge between that native
-# per-residue design-mask surface and the FROZEN §3.7 :data:`~ofoldx.data.placement.PlacementSpec`
-# run-length placement core, per the projection contract in ``CONTIG_GENERALITY_AUDIT.md`` §3.
-
-#: The core :data:`~ofoldx.data.molecular.PolymerType` values a generated polymer placement
-#: may take. A de-novo *ligand* run (odesign ``{"chain_type":"ligand","sequence":"N-N"}`` =
-#: ``num_atoms``) is GAP-1 in the audit: it has no ``PlacementValue`` and is rejected, not
-#: silently dropped (the atom count stays a family argument; DESIGN §3.7 "does not justify a
-#: shared ``GeneratedMolecule``").
-_CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
-
-
-@dataclass(frozen=True)
-class DesignedResidue:
-    r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
-
-    Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
-    one declaration group run-length-collapse into a single :class:`GeneratedSegment`.
-    """
-
-    polymer_type: PolymerType
-
-
-@dataclass(frozen=True)
-class FixedResidue:
-    r"""One realized output residue copied verbatim from a source residue — a ``design_mask``
-    ``False`` row.
-
-    ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
-    residues drawn contiguously (increasing ``source_index``) from one source instance
-    run-length-collapse into a single half-open :class:`ExistingSpan`.
-    """
-
-    instance_id: str
-    source_index: int
-
-
-#: One per-output-residue design-mask cell: either a de-novo designed residue
-#: (:class:`DesignedResidue`) or a fixed copy of a source residue (:class:`FixedResidue`).
-ResidueSpec = DesignedResidue | FixedResidue
-
-
-def from_design_mask(
-    residues: Sequence[ResidueSpec],
-    *,
-    group_of: Callable[[int], str],
-    placement_id_of: Callable[[int], str],
-) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a run-length :data:`PlacementSpec`.
-
-    ``residues`` is the realized output layout in order; ``group_of(i)`` labels residue ``i``'s
-    declaration group (its ODesign output chain) and ``placement_id_of(i)`` its placement.
-    Maximal consecutive runs that share one ``(group, placement_id)`` collapse into one
-    placement: a run of :class:`DesignedResidue` of one ``polymer_type`` becomes
-    ``GeneratedSegment(polymer_type, n, n)`` (exact realized length), and a run of
-    :class:`FixedResidue` drawn contiguously from one source instance becomes the half-open
-    ``ExistingSpan(instance_id, start, stop)``. A run also breaks when ``polymer_type`` changes,
-    when the source instance changes, or when ``source_index`` is not the previous ``+ 1`` — so
-    interleaving and discontiguous crops are preserved as ordered placements within the group.
-
-    Losslessness: lossless over ODesign's polymer surface — the per-residue designed flag,
-    each designed residue's ``polymer_type``, and each fixed residue's exact source residue are
-    all recoverable (see :func:`to_design_mask` for the inverse). The one named loss is GAP-1:
-    a designed non-polymer (ligand ``num_atoms``) residue has no ``PlacementValue`` and is
-    rejected here rather than silently dropped. The partition is exhaustive — every input
-    residue belongs to exactly one placement, so no realized row is unaddressable.
-    """
-
-    placement: PlacementSpec = {}
-    seen: set[str] = set()
-
-    current_group: str | None = None
-    current_placement_id: str | None = None
-    current_polymer_type: str | None = None
-    current_instance_id: str | None = None
-    run_start_source: int = 0
-    run_next_source: int = 0
-    run_length: int = 0
-
-    def flush() -> None:
-        if current_placement_id is None:
-            return
-        if current_polymer_type is not None:
-            value: GeneratedSegment | ExistingSpan = GeneratedSegment(current_polymer_type, run_length, run_length)
-        else:
-            value = ExistingSpan(current_instance_id, run_start_source, run_next_source)
-        placement.setdefault(current_group, {})[current_placement_id] = value
-
-    for index, residue in enumerate(residues):
-        group = group_of(index)
-        placement_id = placement_id_of(index)
-        if type(residue) is DesignedResidue:
-            if residue.polymer_type not in _CORE_POLYMER_TYPES:
-                raise ValueError(
-                    f"designed residue {index} has non-core polymer_type "
-                    f"{residue.polymer_type!r}; a de-novo non-polymer (ligand num_atoms) has no "
-                    f"PlacementValue (GAP-1) and cannot be projected onto the placement core"
-                )
-            extends = (
-                group == current_group
-                and placement_id == current_placement_id
-                and current_polymer_type == residue.polymer_type
-            )
-            if extends:
-                run_length += 1
-                continue
-            flush()
-            if placement_id in seen:
-                raise ValueError(
-                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
-                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
-                )
-            seen.add(placement_id)
-            current_group = group
-            current_placement_id = placement_id
-            current_polymer_type = residue.polymer_type
-            current_instance_id = None
-            run_length = 1
-        else:
-            extends = (
-                group == current_group
-                and placement_id == current_placement_id
-                and current_polymer_type is None
-                and current_instance_id == residue.instance_id
-                and run_next_source == residue.source_index
-            )
-            if extends:
-                run_next_source = residue.source_index + 1
-                continue
-            flush()
-            if placement_id in seen:
-                raise ValueError(
-                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
-                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
-                )
-            seen.add(placement_id)
-            current_group = group
-            current_placement_id = placement_id
-            current_polymer_type = None
-            current_instance_id = residue.instance_id
-            run_start_source = residue.source_index
-            run_next_source = residue.source_index + 1
-
-    flush()
-    # Frozen §3.7 construction-time check: placement_id globally unique across the PlacementSpec.
-    validate_placement(placement)
-    return placement
-
-
-def to_design_mask(
-    placement: PlacementSpec,
-    placement_map: PlacementMap,
-) -> tuple[list[bool], list[str]]:
-    r"""Project a realized :data:`PlacementSpec` back onto a per-output-residue design mask.
-
-    Returns ``(design_mask, groups)`` over the realized output rows in declared order: a
-    :class:`GeneratedSegment` occurrence (its realized length read from ``placement_map``, so
-    ranged ``min != max`` segments resolve to their sampled length) contributes ``True`` rows,
-    an :class:`ExistingSpan` contributes ``stop - start`` ``False`` rows, and each row carries
-    its declaration group (the outer key). This is the exact inverse of :func:`from_design_mask`
-    over the polymer surface. Coverage is exhaustive: exactly one mask row is emitted per
-    realized residue with no gap or overlap (frozen "every declared placement appears;
-    zero-length -> ()"), so ``design_mask`` and ``groups`` partition the whole realized layout.
-    """
-
-    design_mask: list[bool] = []
-    groups: list[str] = []
-    for group, chain in placement.items():
-        for placement_id, value in chain.items():
-            if type(value) is GeneratedSegment:
-                length = len(placement_map[group][placement_id])
-                designed = True
-            else:
-                length = value.stop - value.start
-                designed = False
-            design_mask.extend([designed] * length)
-            groups.extend([group] * length)
-    return design_mask, groups
-
-
-# --------------------------------------------------------------------------------------
-# Family-owned ODesign hotspot target record (§3.7 / §4.11.5), folded from ``.hotspot``.
-# --------------------------------------------------------------------------------------
-#
-# The released ODesign hotspot channel is a per-residue label lowered into
-# ``token_features[..., 452]`` by ``processor._hotspot_tokens``. Crucially the released
-# channel accepts **ligand** ``ComponentReference`` endpoints (the upstream ligand-design
-# example uses ``hotspot: "E/505"``, a ligand chain), so an ODesign hotspot is emphatically
-# NOT the synthetic fixed-distance protein-only ``Contact`` used by other families — it is a
-# family-owned learned signal that may point at ligand components (DESIGN §3.7:1406-1407).
-#
-# :class:`ODesignHotspot` is the owner-gated **target** record for that signal (§4.11.5,
-# §4.11.9 flag 3): a single-sided tuple of protein-or-ligand residue endpoints, with no
-# ``cutoff``/``tolerance`` (those belong to the verification-only ``Contact``, not the learned
-# hotspot). The owner's target split is:
-#
-#   * ``ODesignHotspot(residues)``            — the learned per-residue hotspot label; and
-#   * a verification-only ``Contact``          — the §B post-generation hard-distance check.
-#
-# Until that split is owner-ratified, the *running* lowering stays on the two-sided
-# :class:`Contact` soft-hotspot path (``processor.__call__`` / ``processor._hotspot_tokens``);
-# this record is defined and exported as the design target but is **not** yet swapped into the
-# running lowering. Importing it does not change behavior.
-
-
-@dataclass(frozen=True)
-class ODesignHotspot:
-    r"""A learned per-residue ODesign hotspot label over protein OR ligand components.
-
-    ``residues`` are canonical ``ComponentReference`` endpoints; unlike the synthetic
-    protein-only fixed-distance ``Contact``, ligand components are first-class endpoints
-    (§3.7 family-owned hotspot). Owner-gated target — NOT yet wired into the running
-    ``Contact`` lowering (§4.11.9 flag 3).
-    """
-
-    residues: tuple[ComponentReference, ...]
-
 
 class ODesignModel(nn.Module):
     r"""Released all-atom ODesign coordinate-design model."""
@@ -1192,3 +808,389 @@ class ODesignDesignResult:
         if directions == {"higher"}:
             return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
         return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+# ======================================================================================
+# Family-owned ODesign spatial and placement condition records (folded from the former
+# ``.conditions`` submodule) and the ODesign hotspot target record (folded from the former
+# ``.hotspot`` submodule). Folded in LAST (model-first ordering): the public model, its
+# supporting layers, and the typed contract dataclasses come first. ``processor`` imports
+# these records back from ``.model``, which is safe because that import runs only after the
+# ``.model`` module has fully loaded — internal definition order does not affect it.
+#
+# DESIGN 3.7.2 ("Spatial conditioning is family-owned") freezes only the *negative*
+# cross-family contract: there is no shared ``Condition`` base, union endpoint, or generic
+# condition bag. Each concrete family owns its exact positive records. The data-model
+# migration removed these records from the shared ``ofoldx.data.conditions`` module (which now
+# keeps only the frozen 3.7.1 identity records ``AllowedResidueIdentities`` /
+# ``TiedResidueIdentities``), so the ones ODesign consumes are re-homed here as
+# ODesign-family-owned dataclasses. This mirrors the already-wired ``rfdiffusion`` /
+# ``pxdesign`` families.
+#
+# The generation-topology placement records (:class:`~ofoldx.data.placement.GeneratedSegment`,
+# :class:`~ofoldx.data.placement.ExistingSpan`, :class:`~ofoldx.data.placement.SymbolicResidueSite`,
+# :class:`~ofoldx.data.placement.SymbolicAtomSite`) now come from the FROZEN §3.7 PlacementSpec
+# placement core in ``ofoldx.data.placement`` (owner verdicts ratified 2026-07-18). Identity is
+# placement-keyed: a placement's identity is the globally-unique ``placement_id`` inner key of
+# the core :data:`~ofoldx.data.placement.PlacementSpec` mapping, so :class:`GeneratedSegment` carries NO
+# embedded id and a pre-realization reference is exactly the two fields
+# ``SymbolicResidueSite(placement_id, offset)``. This family only wraps that core with its own
+# :class:`ODesignPlacements` condition, which re-homes the family-owned per-chain
+# ``chain_lengths`` and the hard/soft ``intent`` (DESIGN 3.7.3 rejects both as shared
+# invariants) alongside the core placement mapping.
+#
+# §3.7.4 constraint freeze: the covalent-link core (:class:`~ofoldx.data.bonds.SymbolicBond`
+# over the promoted :data:`~ofoldx.data.bonds.SymbolicBondSite` endpoint union) and the
+# target-conditioning core (the distance-free :class:`~ofoldx.data.conditions.Hotspot` label
+# and the strictly-larger geometric :class:`~ofoldx.data.conditions.Contact`) are frozen and
+# shared. This family imports them rather than re-declaring the placeholders it used to own
+# (the deleted ``DesiredCovalentLink(site_a, site_b)`` two-atom record and the two-sided
+# ``Contact`` that conflated the learned hotspot label with the §B verification cutoff).
+#
+# ``@dataclass(frozen=True)`` denotes runtime immutability, not DESIGN-frozen status.
+# ======================================================================================
+
+
+# --------------------------------------------------------------------------------------
+# Family-owned PlacementSpec condition (wraps the FROZEN §3.7 core placement mapping).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ODesignPlacements:
+    r"""One ODesign generation-topology request over the frozen §3.7 PlacementSpec core.
+
+    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
+    unique across the whole mapping and is the SOLE pre-realization reference target
+    (validated at construction). Each declaration group is one ODesign output chain and its
+    declared order is the chain layout order.
+
+    ``chain_lengths`` is a family-owned per-chain exact-length field (DESIGN 3.7.3 rejects it
+    as a shared invariant) aligned with ``placements`` group order; ``intent`` is read by the
+    family hard-condition gate in ``model._require_hard_conditions``. Both re-home here as
+    family-owned fields, never on the shared core.
+    """
+
+    placements: PlacementSpec
+    chain_lengths: tuple[int | None, ...] | None = None
+    intent: Literal["hard", "soft"] = "hard"
+
+    def __post_init__(self) -> None:
+        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
+        # the construction-time uniqueness check (raises ValueError on any duplicate).
+        validate_placement(self.placements)
+
+
+# --------------------------------------------------------------------------------------
+# Family-owned spatial conditions (DESIGN 3.7.2, family-owned & freezable target).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReferenceCoordinates:
+    r"""Fixed/constraint coordinates for a set of EXISTING input atoms (§A1).
+
+    ``intent == "hard"`` fixes the coordinates during EDM sampling; the constraint mask
+    always feeds the learned constraint distogram. ``weight`` must be ``None`` / ``1.0``
+    (the released signal is unweighted); the processor enforces that inline. Owner target
+    name: ``ODesignFixedCoordinates``.
+    """
+
+    sites: tuple[AtomSite, ...]
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft", "preference"] = "hard"
+    weight: float | None = None
+
+
+@dataclass(frozen=True)
+class Hotspot(_Hotspot):
+    r"""The §A2 learned per-residue hotspot label (family envelope over the frozen record).
+
+    Extends the frozen distance-free :class:`~ofoldx.data.conditions.Hotspot` (owner verdict
+    D3): ``residues`` names the EXISTING target residues written to
+    ``token_features[..., 452]`` by ``processor._hotspot_tokens``; the generated partner is
+    implicit (the whole design). This is the record the released two-sided ``Contact``
+    soft-hotspot lowering is split onto — it carries NO ``cutoff``/``tolerance`` (those live
+    on the geometric :class:`Contact`). The hard/soft ``intent`` rides on this family
+    envelope, never on the frozen record; the released channel is always ``"soft"`` (the
+    processor enforces it inline).
+
+    An endpoint is a ``ComponentReference`` (existing residue), a bare ``placement_id``
+    (whole generated placement), a :class:`SymbolicResidueSite` / :class:`SymbolicAtomSite`
+    (generated residue/atom), or an :class:`~ofoldx.data.molecular.AtomSite` (existing atom).
+    """
+
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class Contact(_GeometricContact):
+    r"""The §B geometric hard-distance verification record (family envelope over the frozen
+    :class:`~ofoldx.data.conditions.Contact`).
+
+    Extends the frozen two-sided geometric ``Contact`` (owner verdict D3, identity is the
+    real ``cutoff_angstrom``): ``model._require_hard_conditions`` reads ``side_a`` /
+    ``side_b`` / ``cutoff_angstrom`` / ``tolerance_angstrom`` and requires the min
+    cross-side distance to satisfy the cutoff. ``weight`` and hard/soft ``intent`` are the
+    family-owned envelope fields the frozen record deliberately omits; ``weight`` is kept
+    only so the processor can assert the released ``None`` / ``1.0`` no-weight contract.
+
+    Endpoints are the shared :data:`~ofoldx.data.conditions.Endpoint` union (existing
+    ``ComponentReference`` / :class:`~ofoldx.data.molecular.AtomSite`, a bare generated
+    ``placement_id``, a :class:`SymbolicResidueSite` / :class:`SymbolicAtomSite`). This
+    record is NO LONGER the learned hotspot signal — that is now :class:`Hotspot`.
+    """
+
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+# --------------------------------------------------------------------------------------
+# Covalent link envelope over the frozen §3.7.4 SymbolicBond core.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DesiredCovalentLink:
+    r"""A requested covalent bond (head-to-tail cyclization) as a family envelope.
+
+    The structural payload is the frozen :class:`~ofoldx.data.bonds.SymbolicBond` (owner
+    verdicts D1/D2): its endpoints reference the placement model through the promoted
+    :data:`~ofoldx.data.bonds.SymbolicBondSite` union, and its chemistry
+    (``order``/``aromatic``/``stereo``) lowers losslessly to a
+    :class:`~ofoldx.data.molecular.SystemBond`. ``intent`` (hard/soft) rides on THIS family
+    envelope, never on the frozen record. ``_materialize_cyclic_links`` resolves the bond,
+    synthesizes the ``SystemBond`` for a legal head-to-tail closure, and marks
+    ``cyclic_instances`` → ``cyclic_period`` (behavior unchanged from the deleted two-atom
+    placeholder — ODesign's previously hardcoded order ``1.0`` / aromatic ``False`` are now
+    carried explicitly by the ``SymbolicBond`` defaults).
+    """
+
+    bond: SymbolicBond
+    intent: Literal["hard", "soft"] = "hard"
+
+
+# --------------------------------------------------------------------------------------
+# design_mask <-> PlacementSpec projection (CONTIG_GENERALITY_AUDIT.md §3, family boundary).
+# --------------------------------------------------------------------------------------
+#
+# ODesign natively selects fixed-vs-generated positions per output residue through a
+# per-residue design mask (the ``res`` condition-mask driven by the ``sequence`` tokens:
+# an ``N-M`` / ``N-N`` run designs a de-novo polymer interval, an ``X/A-B`` token copies a
+# source span). These two functions are the lossless bridge between that native
+# per-residue design-mask surface and the FROZEN §3.7 :data:`~ofoldx.data.placement.PlacementSpec`
+# run-length placement core, per the projection contract in ``CONTIG_GENERALITY_AUDIT.md`` §3.
+
+#: The core :data:`~ofoldx.data.molecular.PolymerType` values a generated polymer placement
+#: may take. A de-novo *ligand* run (odesign ``{"chain_type":"ligand","sequence":"N-N"}`` =
+#: ``num_atoms``) is GAP-1 in the audit: it has no ``PlacementValue`` and is rejected, not
+#: silently dropped (the atom count stays a family argument; DESIGN §3.7 "does not justify a
+#: shared ``GeneratedMolecule``").
+_CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
+
+
+@dataclass(frozen=True)
+class DesignedResidue:
+    r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
+
+    Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
+    one declaration group run-length-collapse into a single :class:`GeneratedSegment`.
+    """
+
+    polymer_type: PolymerType
+
+
+@dataclass(frozen=True)
+class FixedResidue:
+    r"""One realized output residue copied verbatim from a source residue — a ``design_mask``
+    ``False`` row.
+
+    ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
+    residues drawn contiguously (increasing ``source_index``) from one source instance
+    run-length-collapse into a single half-open :class:`ExistingSpan`.
+    """
+
+    instance_id: str
+    source_index: int
+
+
+#: One per-output-residue design-mask cell: either a de-novo designed residue
+#: (:class:`DesignedResidue`) or a fixed copy of a source residue (:class:`FixedResidue`).
+ResidueSpec = DesignedResidue | FixedResidue
+
+
+def from_design_mask(
+    residues: Sequence[ResidueSpec],
+    *,
+    group_of: Callable[[int], str],
+    placement_id_of: Callable[[int], str],
+) -> PlacementSpec:
+    r"""Project a per-output-residue design mask onto a run-length :data:`PlacementSpec`.
+
+    ``residues`` is the realized output layout in order; ``group_of(i)`` labels residue ``i``'s
+    declaration group (its ODesign output chain) and ``placement_id_of(i)`` its placement.
+    Maximal consecutive runs that share one ``(group, placement_id)`` collapse into one
+    placement: a run of :class:`DesignedResidue` of one ``polymer_type`` becomes
+    ``GeneratedSegment(polymer_type, n, n)`` (exact realized length), and a run of
+    :class:`FixedResidue` drawn contiguously from one source instance becomes the half-open
+    ``ExistingSpan(instance_id, start, stop)``. A run also breaks when ``polymer_type`` changes,
+    when the source instance changes, or when ``source_index`` is not the previous ``+ 1`` — so
+    interleaving and discontiguous crops are preserved as ordered placements within the group.
+
+    Losslessness: lossless over ODesign's polymer surface — the per-residue designed flag,
+    each designed residue's ``polymer_type``, and each fixed residue's exact source residue are
+    all recoverable (see :func:`to_design_mask` for the inverse). The one named loss is GAP-1:
+    a designed non-polymer (ligand ``num_atoms``) residue has no ``PlacementValue`` and is
+    rejected here rather than silently dropped. The partition is exhaustive — every input
+    residue belongs to exactly one placement, so no realized row is unaddressable.
+    """
+
+    placement: PlacementSpec = {}
+    seen: set[str] = set()
+
+    current_group: str | None = None
+    current_placement_id: str | None = None
+    current_polymer_type: str | None = None
+    current_instance_id: str | None = None
+    run_start_source: int = 0
+    run_next_source: int = 0
+    run_length: int = 0
+
+    def flush() -> None:
+        if current_placement_id is None:
+            return
+        if current_polymer_type is not None:
+            value: GeneratedSegment | ExistingSpan = GeneratedSegment(current_polymer_type, run_length, run_length)
+        else:
+            value = ExistingSpan(current_instance_id, run_start_source, run_next_source)
+        placement.setdefault(current_group, {})[current_placement_id] = value
+
+    for index, residue in enumerate(residues):
+        group = group_of(index)
+        placement_id = placement_id_of(index)
+        if type(residue) is DesignedResidue:
+            if residue.polymer_type not in _CORE_POLYMER_TYPES:
+                raise ValueError(
+                    f"designed residue {index} has non-core polymer_type "
+                    f"{residue.polymer_type!r}; a de-novo non-polymer (ligand num_atoms) has no "
+                    f"PlacementValue (GAP-1) and cannot be projected onto the placement core"
+                )
+            extends = (
+                group == current_group
+                and placement_id == current_placement_id
+                and current_polymer_type == residue.polymer_type
+            )
+            if extends:
+                run_length += 1
+                continue
+            flush()
+            if placement_id in seen:
+                raise ValueError(
+                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
+                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
+                )
+            seen.add(placement_id)
+            current_group = group
+            current_placement_id = placement_id
+            current_polymer_type = residue.polymer_type
+            current_instance_id = None
+            run_length = 1
+        else:
+            extends = (
+                group == current_group
+                and placement_id == current_placement_id
+                and current_polymer_type is None
+                and current_instance_id == residue.instance_id
+                and run_next_source == residue.source_index
+            )
+            if extends:
+                run_next_source = residue.source_index + 1
+                continue
+            flush()
+            if placement_id in seen:
+                raise ValueError(
+                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
+                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
+                )
+            seen.add(placement_id)
+            current_group = group
+            current_placement_id = placement_id
+            current_polymer_type = None
+            current_instance_id = residue.instance_id
+            run_start_source = residue.source_index
+            run_next_source = residue.source_index + 1
+
+    flush()
+    # Frozen §3.7 construction-time check: placement_id globally unique across the PlacementSpec.
+    validate_placement(placement)
+    return placement
+
+
+def to_design_mask(
+    placement: PlacementSpec,
+    placement_map: PlacementMap,
+) -> tuple[list[bool], list[str]]:
+    r"""Project a realized :data:`PlacementSpec` back onto a per-output-residue design mask.
+
+    Returns ``(design_mask, groups)`` over the realized output rows in declared order: a
+    :class:`GeneratedSegment` occurrence (its realized length read from ``placement_map``, so
+    ranged ``min != max`` segments resolve to their sampled length) contributes ``True`` rows,
+    an :class:`ExistingSpan` contributes ``stop - start`` ``False`` rows, and each row carries
+    its declaration group (the outer key). This is the exact inverse of :func:`from_design_mask`
+    over the polymer surface. Coverage is exhaustive: exactly one mask row is emitted per
+    realized residue with no gap or overlap (frozen "every declared placement appears;
+    zero-length -> ()"), so ``design_mask`` and ``groups`` partition the whole realized layout.
+    """
+
+    design_mask: list[bool] = []
+    groups: list[str] = []
+    for group, chain in placement.items():
+        for placement_id, value in chain.items():
+            if type(value) is GeneratedSegment:
+                length = len(placement_map[group][placement_id])
+                designed = True
+            else:
+                length = value.stop - value.start
+                designed = False
+            design_mask.extend([designed] * length)
+            groups.extend([group] * length)
+    return design_mask, groups
+
+
+# --------------------------------------------------------------------------------------
+# Family-owned ODesign hotspot target record (§3.7 / §4.11.5), folded from ``.hotspot``.
+# --------------------------------------------------------------------------------------
+#
+# The released ODesign hotspot channel is a per-residue label lowered into
+# ``token_features[..., 452]`` by ``processor._hotspot_tokens``. Crucially the released
+# channel accepts **ligand** ``ComponentReference`` endpoints (the upstream ligand-design
+# example uses ``hotspot: "E/505"``, a ligand chain), so an ODesign hotspot is emphatically
+# NOT the synthetic fixed-distance protein-only ``Contact`` used by other families — it is a
+# family-owned learned signal that may point at ligand components (DESIGN §3.7:1406-1407).
+#
+# :class:`ODesignHotspot` is the owner-gated **target** record for that signal (§4.11.5,
+# §4.11.9 flag 3): a single-sided tuple of protein-or-ligand residue endpoints, with no
+# ``cutoff``/``tolerance`` (those belong to the verification-only ``Contact``, not the learned
+# hotspot). The owner's target split is:
+#
+#   * ``ODesignHotspot(residues)``            — the learned per-residue hotspot label; and
+#   * a verification-only ``Contact``          — the §B post-generation hard-distance check.
+#
+# Until that split is owner-ratified, the *running* lowering stays on the two-sided
+# :class:`Contact` soft-hotspot path (``processor.__call__`` / ``processor._hotspot_tokens``);
+# this record is defined and exported as the design target but is **not** yet swapped into the
+# running lowering. Importing it does not change behavior.
+
+
+@dataclass(frozen=True)
+class ODesignHotspot:
+    r"""A learned per-residue ODesign hotspot label over protein OR ligand components.
+
+    ``residues`` are canonical ``ComponentReference`` endpoints; unlike the synthetic
+    protein-only fixed-distance ``Contact``, ligand components are first-class endpoints
+    (§3.7 family-owned hotspot). Owner-gated target — NOT yet wired into the running
+    ``Contact`` lowering (§4.11.9 flag 3).
+    """
+
+    residues: tuple[ComponentReference, ...]

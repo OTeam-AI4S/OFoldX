@@ -1,6 +1,11 @@
 r"""BoltzGen raw-tensor design models.
 
-The family is deliberately unregistered until canonical Processor lowering and DesignResult decoding exist.
+Model-first order: the public ``BoltzGenModel`` (structure design) and ``BoltzGenIFoldModel``
+(inverse folding) come first, then their supporting ``nn.Module`` layers/helpers, then the typed
+contract dataclasses (Input/Output/Layout/Result) and family-local conditions last. The family is
+registered (see ``__init__``); its multi-stage ``design`` / ``inverse_fold`` flow is carried by the
+concrete ``BoltzGenPipeline``, exported for manual construction and not yet routed through the
+(unfrozen) concrete-Pipeline registry.
 """
 
 from __future__ import annotations
@@ -47,285 +52,6 @@ from ...modules.trunk.msa import MsaModule, MsaPairWeightedAveraging, OuterProdu
 from ...modules.trunk.pairformer import PairformerStack
 from ...results import Metric, PairMetric, Score
 from .config import BoltzGenConfig, BoltzGenIFoldConfig
-
-
-@dataclass(frozen=True)
-class SymbolicResidueSite:
-    r"""A pre-realization reference to one generated residue by segment and offset.
-
-    §3.7 owner-gated family-local placeholder (RFdiffusion spelling). Used only to
-    name rows of a fully-generated ``total_len`` assembly before the shared
-    placement core resolves; NOT a frozen public shape.
-    """
-
-    segment_id: str
-    offset: int
-
-
-@dataclass(frozen=True)
-class BoltzGenPlacements:
-    r"""One BoltzGen whole-assembly generation-topology request (frozen §3.7 core, X1-B).
-
-    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
-    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
-    unique across the whole mapping and is the SOLE pre-realization reference target
-    (validated at construction). Unlike ODesign — which declares one group **per output
-    chain** — a BoltzGen assembly is ONE declaration group whose inner placements are its
-    chains, so the outer group key is a pure whole-assembly grouping label that no reference
-    names (frozen §3.7 "BoltzGen whole-assembly handling (X1-B)").
-
-    Per-chain lengths are drawn at realization from the family-owned whole-assembly
-    ``total_len`` budget (the shared core carries no total-length field), so a ranged
-    :class:`~ofoldx.data.placement.GeneratedSegment` (``min_length != max_length``) is resolved
-    against ``total_len`` rather than fixed on the core. ``total_len is None`` realizes every
-    generated placement at its ``max_length``.
-    """
-
-    placements: PlacementSpec
-
-    def __post_init__(self) -> None:
-        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
-        # the construction-time uniqueness check (raises ValueError on any duplicate).
-        validate_placement(self.placements)
-
-
-@dataclass(frozen=True)
-class BoltzGenDesignMask:
-    r"""Positions to (re)design → ``design_mask`` on the model input.
-
-    ``positions`` are the designable residues (upstream ``design`` / complement of
-    ``not_design``); every named token is marked designable.
-    """
-
-    positions: tuple[ComponentReference, ...]
-
-
-@dataclass(frozen=True)
-class BoltzGenBinding:
-    r"""Binding-specification conditioning → ``binding_type`` ids.
-
-    ``binding`` is the frozen §3.7.4 shared :class:`~ofoldx.data.conditions.Hotspot` — the
-    distance-free per-residue POSITIVE binding label (owner verdict D3: BoltzGen ``binding`` is
-    the canonical hotspot analog). ``not_binding`` is the BoltzGen-owned NEGATIVE signed label
-    (embedding id 2) that has no analog in the other families, so — like ``kind`` on
-    :class:`BoltzGenContact` — it stays on this family envelope rather than on the shared
-    ``Hotspot`` core. Realized as the released binding-specification embedding ids
-    (0 = unspecified, 1 = binding, 2 = not-binding).
-    """
-
-    binding: Hotspot = Hotspot(())
-    not_binding: tuple[ComponentReference, ...] = ()
-
-
-@dataclass(frozen=True)
-class BoltzGenSecondaryStructure:
-    r"""Per-residue secondary-structure conditioning → ``ss_type`` ids.
-
-    Each assignment pairs a residue with one of the released labels ``"H"`` (helix),
-    ``"E"`` (strand), or ``"L"`` (loop); unlisted residues take the masked/unspecified
-    class.
-    """
-
-    assignments: tuple[tuple[ComponentReference, Literal["H", "E", "L"]], ...]
-
-
-@dataclass(frozen=True)
-class BoltzGenStructureGroup:
-    r"""One structure group → per-token ``structure_group`` → ``token_distance_mask``.
-
-    §3.7 family-owned (not fixed coordinates): geometry is exposed only *within* the
-    same **nonzero** group and distinct groups move independently. Realized through the
-    per-token ``structure_group`` id and its pairwise ``token_distance_mask``, never by
-    writing absolute coordinates; ``reference_space_id`` stays per-residue (the released
-    featurizer does NOT regroup it). ``group_id == 0`` is the free (ungrouped) class.
-    Ratified/frozen under the §3.7.2 family-owned spatial-conditioning contract,
-    validated exact-equal to the released featurizer (``process_token_features``,
-    2026-07-19); see the Processor lowering (``_structure_group_ids`` /
-    ``_token_distance_mask``).
-    """
-
-    members: tuple[ComponentReference, ...]
-    group_id: int
-
-
-@dataclass(frozen=True)
-class BoltzGenResidueConstraint:
-    r"""Per-residue amino-acid identity constraint → ``aa_constraint_mask`` (inverse folding).
-
-    ``allowed`` is the set of canonical three-letter residue codes permitted at
-    ``position`` (upstream ``residue_constraints``); consumed by
-    ``BoltzGenIFoldModel`` as an ``aa_constraint_mask`` gate.
-    """
-
-    position: ComponentReference
-    allowed: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class BoltzGenContact:
-    r"""A pairwise contact declaration → ``contact_conditioning`` / ``contact_threshold``.
-
-    ``contact`` is the frozen §3.7.4 shared two-sided geometric
-    :class:`~ofoldx.data.conditions.Contact`; its ``side_a`` / ``side_b`` name the two
-    contacting endpoint sets and its ``cutoff_angstrom`` is the contact distance cutoff used by
-    the released contact-conditioning encoder (BoltzGen writes it as the ``contact_threshold``
-    matrix). ``kind`` is the BoltzGen-owned released directed contact CLASS
-    (``pocket>binder`` / ``binder>pocket`` / ``contact``); directionality is a family-owned
-    extension that stays OFF the symmetric shared core and rides on this envelope.
-    """
-
-    contact: Contact
-    kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
-
-
-@dataclass(frozen=True)
-class BoltzGenCovalentBond:
-    r"""A requested covalent link → derived ``cyclic_period`` (envelope over ``SymbolicBond``).
-
-    ``bond`` is the frozen §3.7.4 shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
-    may be EXISTING input atoms (:class:`~ofoldx.data.molecular.AtomSite`) or GENERATED atoms
-    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the frozen placement
-    core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
-    :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
-    released head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
-    input system already carried (this family declares NO physical topology beyond that — a
-    non-terminal link simply surfaces as a token bond). ``intent`` is the BoltzGen-owned
-    hard/soft label kept OFF the shared bond core, per owner verdict (no ``intent`` on
-    ``SymbolicBond``).
-    """
-
-    bond: SymbolicBond
-    intent: Literal["hard", "soft"] = "hard"
-
-
-@dataclass(frozen=True)
-class BoltzGenSymmetry:
-    r"""A symmetric group of equal-length residue units → ``symmetry_index`` / ``symmetric_group``.
-
-    Each unit in ``units`` is one symmetric copy; matching offsets across units are
-    tied. Consumed by structure design as ``symmetry_index`` and by inverse folding
-    as ``symmetric_group`` (with ``tie_symmetric_sequences``).
-    """
-
-    units: tuple[tuple[ComponentReference, ...], ...]
-
-
-# The ``conditions=`` parameter type on ``BoltzGenProcessor`` (structure design). The
-# inverse-fold Processor consumes ``BoltzGenResidueConstraint`` / ``BoltzGenSymmetry``
-# through their own dedicated keyword arguments, not this union. ``BoltzGenPlacements`` carries
-# the frozen §3.7 whole-assembly generation topology (X1-B) alongside the spatial records.
-BoltzGenSchema = (
-    BoltzGenPlacements
-    | BoltzGenDesignMask
-    | BoltzGenBinding
-    | BoltzGenSecondaryStructure
-    | BoltzGenStructureGroup
-    | BoltzGenContact
-    | BoltzGenCovalentBond
-    | BoltzGenSymmetry
-)
-
-
-def symbolic_residue_aliases(
-    references: tuple[ComponentReference | SymbolicResidueSite, ...],
-) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
-    r"""Map canonical negative segment offsets to concrete positive trajectory identities.
-
-    Mirrors ``rfdiffusion.model.symbolic_residue_aliases`` so a fully-generated
-    ``total_len`` assembly can address its generated rows by segment/offset before
-    the shared placement core resolves.
-    """
-
-    segments: dict[str, list[SymbolicResidueSite]] = {}
-    for reference in references:
-        if type(reference) is SymbolicResidueSite:
-            segments.setdefault(reference.segment_id, []).append(reference)
-    return {
-        SymbolicResidueSite(segment_id, index - len(rows)): reference
-        for segment_id, rows in segments.items()
-        for index, reference in enumerate(rows)
-    }
-
-
-@dataclass(eq=False)
-class BoltzGenCandidate:
-    r"""One designed (and optionally refolded) complex and its aligned scientific values.
-
-    Each candidate owns the complete ``Structure`` of the designed assembly. The
-    assembly length varies across candidates, which is the coordinate-producing,
-    variable-length property that forbids reuse of the frozen fixed-length
-    ``DesignCandidate``.
-
-    Attributes:
-        structure: The designed complex (post inverse folding, optionally refolded by boltz2).
-        scores: Whole-candidate canonical [`Score`][ofoldx.results.Score] values keyed by name.
-        metrics: Axis-aligned [`Metric`][ofoldx.results.Metric] values (e.g. per-residue NLL / pLDDT).
-        pair_metrics: Two-axis [`PairMetric`][ofoldx.results.PairMetric] values (e.g. interaction PAE).
-    """
-
-    structure: Structure
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-    pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
-
-
-@dataclass(eq=False)
-class BoltzGenResult:
-    r"""One generation-ordered collection of coordinate-producing BoltzGen designs.
-
-    Tuple position is candidate identity for one generation context; there is no
-    auxiliary index field, and no input/context/provenance field is carried
-    (matching ``ESMFold2DesignResult``). The composite upstream ranking key is a
-    Pipeline-level argument, not part of this Result: the Result exposes the
-    primitive Scores and ``best(score)`` so a caller ranks by any single canonical
-    Score.
-    """
-
-    candidates: tuple[BoltzGenCandidate, ...]
-
-    def best(self, score: str) -> BoltzGenCandidate:
-        r"""Return the earliest best candidate under one explicit score.
-
-        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the
-        score's ``preferred`` direction must be consistently ``"higher"`` or
-        ``"lower"``; unit and scope must match across every candidate; a NaN value or
-        an undefined direction raises at ranking time; infinity is rankable; and the
-        earliest candidate wins a tie.
-        """
-
-        scores = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
-
-
-@dataclass(eq=False)
-class BoltzGenOutput:
-    r"""Tensor output of one BoltzGen structure-design forward or sampling pass."""
-
-    pred_coords: Tensor
-    distogram_logits: Tensor
-    bfactor_logits: Tensor | None = None
-    denoised_coords: Tensor | None = None
-    augmented_target: Tensor | None = None
-    noise_level: Tensor | None = None
-
-
-@dataclass(eq=False)
-class BoltzGenIFoldOutput:
-    r"""Per-token inverse-folding logits and optional sampled tokens."""
-
-    logits: Tensor
-    tokens: Tensor | None = None
 
 
 class BoltzGenModel(nn.Module):
@@ -4225,3 +3951,282 @@ class BoltzGenIFoldLayout:
     token_sites: tuple[AtomSite | tuple[str, int], ...]
     output_residues: tuple[ComponentReference, ...]
     output_instance_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SymbolicResidueSite:
+    r"""A pre-realization reference to one generated residue by segment and offset.
+
+    §3.7 owner-gated family-local placeholder (RFdiffusion spelling). Used only to
+    name rows of a fully-generated ``total_len`` assembly before the shared
+    placement core resolves; NOT a frozen public shape.
+    """
+
+    segment_id: str
+    offset: int
+
+
+@dataclass(frozen=True)
+class BoltzGenPlacements:
+    r"""One BoltzGen whole-assembly generation-topology request (frozen §3.7 core, X1-B).
+
+    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
+    unique across the whole mapping and is the SOLE pre-realization reference target
+    (validated at construction). Unlike ODesign — which declares one group **per output
+    chain** — a BoltzGen assembly is ONE declaration group whose inner placements are its
+    chains, so the outer group key is a pure whole-assembly grouping label that no reference
+    names (frozen §3.7 "BoltzGen whole-assembly handling (X1-B)").
+
+    Per-chain lengths are drawn at realization from the family-owned whole-assembly
+    ``total_len`` budget (the shared core carries no total-length field), so a ranged
+    :class:`~ofoldx.data.placement.GeneratedSegment` (``min_length != max_length``) is resolved
+    against ``total_len`` rather than fixed on the core. ``total_len is None`` realizes every
+    generated placement at its ``max_length``.
+    """
+
+    placements: PlacementSpec
+
+    def __post_init__(self) -> None:
+        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
+        # the construction-time uniqueness check (raises ValueError on any duplicate).
+        validate_placement(self.placements)
+
+
+@dataclass(frozen=True)
+class BoltzGenDesignMask:
+    r"""Positions to (re)design → ``design_mask`` on the model input.
+
+    ``positions`` are the designable residues (upstream ``design`` / complement of
+    ``not_design``); every named token is marked designable.
+    """
+
+    positions: tuple[ComponentReference, ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenBinding:
+    r"""Binding-specification conditioning → ``binding_type`` ids.
+
+    ``binding`` is the frozen §3.7.4 shared :class:`~ofoldx.data.conditions.Hotspot` — the
+    distance-free per-residue POSITIVE binding label (owner verdict D3: BoltzGen ``binding`` is
+    the canonical hotspot analog). ``not_binding`` is the BoltzGen-owned NEGATIVE signed label
+    (embedding id 2) that has no analog in the other families, so — like ``kind`` on
+    :class:`BoltzGenContact` — it stays on this family envelope rather than on the shared
+    ``Hotspot`` core. Realized as the released binding-specification embedding ids
+    (0 = unspecified, 1 = binding, 2 = not-binding).
+    """
+
+    binding: Hotspot = Hotspot(())
+    not_binding: tuple[ComponentReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class BoltzGenSecondaryStructure:
+    r"""Per-residue secondary-structure conditioning → ``ss_type`` ids.
+
+    Each assignment pairs a residue with one of the released labels ``"H"`` (helix),
+    ``"E"`` (strand), or ``"L"`` (loop); unlisted residues take the masked/unspecified
+    class.
+    """
+
+    assignments: tuple[tuple[ComponentReference, Literal["H", "E", "L"]], ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenStructureGroup:
+    r"""One structure group → per-token ``structure_group`` → ``token_distance_mask``.
+
+    §3.7 family-owned (not fixed coordinates): geometry is exposed only *within* the
+    same **nonzero** group and distinct groups move independently. Realized through the
+    per-token ``structure_group`` id and its pairwise ``token_distance_mask``, never by
+    writing absolute coordinates; ``reference_space_id`` stays per-residue (the released
+    featurizer does NOT regroup it). ``group_id == 0`` is the free (ungrouped) class.
+    Ratified/frozen under the §3.7.2 family-owned spatial-conditioning contract,
+    validated exact-equal to the released featurizer (``process_token_features``,
+    2026-07-19); see the Processor lowering (``_structure_group_ids`` /
+    ``_token_distance_mask``).
+    """
+
+    members: tuple[ComponentReference, ...]
+    group_id: int
+
+
+@dataclass(frozen=True)
+class BoltzGenResidueConstraint:
+    r"""Per-residue amino-acid identity constraint → ``aa_constraint_mask`` (inverse folding).
+
+    ``allowed`` is the set of canonical three-letter residue codes permitted at
+    ``position`` (upstream ``residue_constraints``); consumed by
+    ``BoltzGenIFoldModel`` as an ``aa_constraint_mask`` gate.
+    """
+
+    position: ComponentReference
+    allowed: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BoltzGenContact:
+    r"""A pairwise contact declaration → ``contact_conditioning`` / ``contact_threshold``.
+
+    ``contact`` is the frozen §3.7.4 shared two-sided geometric
+    :class:`~ofoldx.data.conditions.Contact`; its ``side_a`` / ``side_b`` name the two
+    contacting endpoint sets and its ``cutoff_angstrom`` is the contact distance cutoff used by
+    the released contact-conditioning encoder (BoltzGen writes it as the ``contact_threshold``
+    matrix). ``kind`` is the BoltzGen-owned released directed contact CLASS
+    (``pocket>binder`` / ``binder>pocket`` / ``contact``); directionality is a family-owned
+    extension that stays OFF the symmetric shared core and rides on this envelope.
+    """
+
+    contact: Contact
+    kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
+
+
+@dataclass(frozen=True)
+class BoltzGenCovalentBond:
+    r"""A requested covalent link → derived ``cyclic_period`` (envelope over ``SymbolicBond``).
+
+    ``bond`` is the frozen §3.7.4 shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
+    may be EXISTING input atoms (:class:`~ofoldx.data.molecular.AtomSite`) or GENERATED atoms
+    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the frozen placement
+    core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
+    :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
+    released head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
+    input system already carried (this family declares NO physical topology beyond that — a
+    non-terminal link simply surfaces as a token bond). ``intent`` is the BoltzGen-owned
+    hard/soft label kept OFF the shared bond core, per owner verdict (no ``intent`` on
+    ``SymbolicBond``).
+    """
+
+    bond: SymbolicBond
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class BoltzGenSymmetry:
+    r"""A symmetric group of equal-length residue units → ``symmetry_index`` / ``symmetric_group``.
+
+    Each unit in ``units`` is one symmetric copy; matching offsets across units are
+    tied. Consumed by structure design as ``symmetry_index`` and by inverse folding
+    as ``symmetric_group`` (with ``tie_symmetric_sequences``).
+    """
+
+    units: tuple[tuple[ComponentReference, ...], ...]
+
+
+# The ``conditions=`` parameter type on ``BoltzGenProcessor`` (structure design). The
+# inverse-fold Processor consumes ``BoltzGenResidueConstraint`` / ``BoltzGenSymmetry``
+# through their own dedicated keyword arguments, not this union. ``BoltzGenPlacements`` carries
+# the frozen §3.7 whole-assembly generation topology (X1-B) alongside the spatial records.
+BoltzGenSchema = (
+    BoltzGenPlacements
+    | BoltzGenDesignMask
+    | BoltzGenBinding
+    | BoltzGenSecondaryStructure
+    | BoltzGenStructureGroup
+    | BoltzGenContact
+    | BoltzGenCovalentBond
+    | BoltzGenSymmetry
+)
+
+
+def symbolic_residue_aliases(
+    references: tuple[ComponentReference | SymbolicResidueSite, ...],
+) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
+    r"""Map canonical negative segment offsets to concrete positive trajectory identities.
+
+    Mirrors ``rfdiffusion.model.symbolic_residue_aliases`` so a fully-generated
+    ``total_len`` assembly can address its generated rows by segment/offset before
+    the shared placement core resolves.
+    """
+
+    segments: dict[str, list[SymbolicResidueSite]] = {}
+    for reference in references:
+        if type(reference) is SymbolicResidueSite:
+            segments.setdefault(reference.segment_id, []).append(reference)
+    return {
+        SymbolicResidueSite(segment_id, index - len(rows)): reference
+        for segment_id, rows in segments.items()
+        for index, reference in enumerate(rows)
+    }
+
+
+@dataclass(eq=False)
+class BoltzGenCandidate:
+    r"""One designed (and optionally refolded) complex and its aligned scientific values.
+
+    Each candidate owns the complete ``Structure`` of the designed assembly. The
+    assembly length varies across candidates, which is the coordinate-producing,
+    variable-length property that forbids reuse of the frozen fixed-length
+    ``DesignCandidate``.
+
+    Attributes:
+        structure: The designed complex (post inverse folding, optionally refolded by boltz2).
+        scores: Whole-candidate canonical [`Score`][ofoldx.results.Score] values keyed by name.
+        metrics: Axis-aligned [`Metric`][ofoldx.results.Metric] values (e.g. per-residue NLL / pLDDT).
+        pair_metrics: Two-axis [`PairMetric`][ofoldx.results.PairMetric] values (e.g. interaction PAE).
+    """
+
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+    pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class BoltzGenResult:
+    r"""One generation-ordered collection of coordinate-producing BoltzGen designs.
+
+    Tuple position is candidate identity for one generation context; there is no
+    auxiliary index field, and no input/context/provenance field is carried
+    (matching ``ESMFold2DesignResult``). The composite upstream ranking key is a
+    Pipeline-level argument, not part of this Result: the Result exposes the
+    primitive Scores and ``best(score)`` so a caller ranks by any single canonical
+    Score.
+    """
+
+    candidates: tuple[BoltzGenCandidate, ...]
+
+    def best(self, score: str) -> BoltzGenCandidate:
+        r"""Return the earliest best candidate under one explicit score.
+
+        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the
+        score's ``preferred`` direction must be consistently ``"higher"`` or
+        ``"lower"``; unit and scope must match across every candidate; a NaN value or
+        an undefined direction raises at ranking time; infinity is rankable; and the
+        earliest candidate wins a tie.
+        """
+
+        scores = tuple(candidate.scores[score] for candidate in self.candidates)
+        directions = {value.preferred for value in scores}
+        if directions not in ({"higher"}, {"lower"}):
+            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+        if len({value.unit for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical unit")
+        if len({value.scope for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical scope")
+        if any(math.isnan(value.value) for value in scores):
+            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+        if directions == {"higher"}:
+            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+@dataclass(eq=False)
+class BoltzGenOutput:
+    r"""Tensor output of one BoltzGen structure-design forward or sampling pass."""
+
+    pred_coords: Tensor
+    distogram_logits: Tensor
+    bfactor_logits: Tensor | None = None
+    denoised_coords: Tensor | None = None
+    augmented_target: Tensor | None = None
+    noise_level: Tensor | None = None
+
+
+@dataclass(eq=False)
+class BoltzGenIFoldOutput:
+    r"""Per-token inverse-folding logits and optional sampled tokens."""
+
+    logits: Tensor
+    tokens: Tensor | None = None

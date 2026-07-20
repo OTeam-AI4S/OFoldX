@@ -60,92 +60,6 @@ from ...results import (
 )
 from .config import ProtenixConfig, ProtenixConstraintConfig
 
-# Family-owned spatial conditioning records for the Protenix v0.5.3 constraint graph.
-#
-# These records are owned by the Protenix family (DESIGN §3.7.2 negative contract: no
-# shared cross-family ``Condition`` base). Each maps onto exactly one trained constraint
-# channel of ``protenix_base_constraint_v0.5.0.pt`` (release ``a0f95f6``):
-#
-# * :class:`ProtenixAtomContact` -> the ``contact_atom`` branch. Upstream swapped the two
-#   atom-contact channels between training and inference, so only channel 0 was ever
-#   trained and it learned the *maximum* distance (see ``UPSTREAM_BUGS.md``). The record
-#   therefore carries only ``max_distance``; there is no min-distance channel to fill.
-# * :class:`ProtenixTokenContact` -> the ``contact`` branch, written as ``[0, max]``.
-# * :class:`ProtenixPocket` -> the single ``pocket`` branch, a directed binder->residue fill.
-
-
-@dataclass(frozen=True)
-class ProtenixAtomContact:
-    r"""Upper-bound distance between two exact atoms (the ``contact_atom`` channel).
-
-    Only ``max_distance`` is representable: the released checkpoint trained the atom
-    channel exclusively on the maximum distance, so no independent minimum exists.
-    """
-
-    atom_a: AtomSite
-    atom_b: AtomSite
-    max_distance: float
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.atom_a, AtomSite) or not isinstance(self.atom_b, AtomSite):
-            raise TypeError("ProtenixAtomContact endpoints must both be exact AtomSite atoms")
-        if self.atom_a == self.atom_b:
-            raise ValueError("a Protenix atom contact needs two distinct atoms")
-        if self.max_distance <= 0:
-            raise ValueError(
-                "ProtenixAtomContact max_distance must be positive; [0, 0] is indistinguishable from no contact"
-            )
-
-
-@dataclass(frozen=True)
-class ProtenixTokenContact:
-    r"""Upper-bound token-centre distance (the ``contact`` channel), written ``[0, max]``.
-
-    Each endpoint is either a residue (:data:`ComponentReference`) or a single
-    :class:`AtomSite`; a mixed atom/residue pair is allowed. Two ``AtomSite`` endpoints
-    are rejected: that pair is definitionally the atom channel
-    (use :class:`ProtenixAtomContact`).
-    """
-
-    endpoint_a: ComponentReference | AtomSite
-    endpoint_b: ComponentReference | AtomSite
-    max_distance: float
-
-    def __post_init__(self) -> None:
-        if isinstance(self.endpoint_a, AtomSite) and isinstance(self.endpoint_b, AtomSite):
-            raise ValueError(
-                "a two-atom Protenix contact is the atom channel; use ProtenixAtomContact instead of "
-                "ProtenixTokenContact"
-            )
-        if self.max_distance <= 0:
-            raise ValueError(
-                "ProtenixTokenContact max_distance must be positive; [0, 0] is indistinguishable from no contact"
-            )
-
-
-@dataclass(frozen=True)
-class ProtenixPocket:
-    r"""A single directed pocket: one binder chain contacting one or more residues.
-
-    The whole ``binder`` chain is written against each residue in ``contact_residues``
-    at one shared ``max_distance``. Zero-or-one pocket is representable per input.
-    """
-
-    binder: str
-    contact_residues: tuple[ComponentReference, ...]
-    max_distance: float
-
-    def __post_init__(self) -> None:
-        if not self.contact_residues:
-            raise ValueError("ProtenixPocket requires at least one contact residue")
-        if self.max_distance <= 0:
-            raise ValueError("ProtenixPocket max_distance must be positive")
-        for residue in self.contact_residues:
-            if isinstance(residue, AtomSite):
-                raise ValueError("ProtenixPocket contact residues must be residue references, not AtomSite atoms")
-            if residue[0] == self.binder:
-                raise ValueError("a Protenix pocket residue cannot belong to the binder chain")
-
 
 class ProtenixModel(nn.Module):
     r"""
@@ -1375,3 +1289,90 @@ class ProtenixOutput:
         r"""Expected pLDDT on the conventional 0--100 scale."""
 
         return expected_plddt(self.plddt_logits)
+
+
+# Family-owned spatial conditioning records for the Protenix v0.5.3 constraint graph.
+#
+# These records are owned by the Protenix family (DESIGN §3.7.2 negative contract: no
+# shared cross-family ``Condition`` base). Each maps onto exactly one trained constraint
+# channel of ``protenix_base_constraint_v0.5.0.pt`` (release ``a0f95f6``):
+#
+# * :class:`ProtenixAtomContact` -> the ``contact_atom`` branch. Upstream swapped the two
+#   atom-contact channels between training and inference, so only channel 0 was ever
+#   trained and it learned the *maximum* distance (see ``UPSTREAM_BUGS.md``). The record
+#   therefore carries only ``max_distance``; there is no min-distance channel to fill.
+# * :class:`ProtenixTokenContact` -> the ``contact`` branch, written as ``[0, max]``.
+# * :class:`ProtenixPocket` -> the single ``pocket`` branch, a directed binder->residue fill.
+
+
+@dataclass(frozen=True)
+class ProtenixAtomContact:
+    r"""Upper-bound distance between two exact atoms (the ``contact_atom`` channel).
+
+    Only ``max_distance`` is representable: the released checkpoint trained the atom
+    channel exclusively on the maximum distance, so no independent minimum exists.
+    """
+
+    atom_a: AtomSite
+    atom_b: AtomSite
+    max_distance: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.atom_a, AtomSite) or not isinstance(self.atom_b, AtomSite):
+            raise TypeError("ProtenixAtomContact endpoints must both be exact AtomSite atoms")
+        if self.atom_a == self.atom_b:
+            raise ValueError("a Protenix atom contact needs two distinct atoms")
+        if self.max_distance <= 0:
+            raise ValueError(
+                "ProtenixAtomContact max_distance must be positive; [0, 0] is indistinguishable from no contact"
+            )
+
+
+@dataclass(frozen=True)
+class ProtenixTokenContact:
+    r"""Upper-bound token-centre distance (the ``contact`` channel), written ``[0, max]``.
+
+    Each endpoint is either a residue (:data:`ComponentReference`) or a single
+    :class:`AtomSite`; a mixed atom/residue pair is allowed. Two ``AtomSite`` endpoints
+    are rejected: that pair is definitionally the atom channel
+    (use :class:`ProtenixAtomContact`).
+    """
+
+    endpoint_a: ComponentReference | AtomSite
+    endpoint_b: ComponentReference | AtomSite
+    max_distance: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.endpoint_a, AtomSite) and isinstance(self.endpoint_b, AtomSite):
+            raise ValueError(
+                "a two-atom Protenix contact is the atom channel; use ProtenixAtomContact instead of "
+                "ProtenixTokenContact"
+            )
+        if self.max_distance <= 0:
+            raise ValueError(
+                "ProtenixTokenContact max_distance must be positive; [0, 0] is indistinguishable from no contact"
+            )
+
+
+@dataclass(frozen=True)
+class ProtenixPocket:
+    r"""A single directed pocket: one binder chain contacting one or more residues.
+
+    The whole ``binder`` chain is written against each residue in ``contact_residues``
+    at one shared ``max_distance``. Zero-or-one pocket is representable per input.
+    """
+
+    binder: str
+    contact_residues: tuple[ComponentReference, ...]
+    max_distance: float
+
+    def __post_init__(self) -> None:
+        if not self.contact_residues:
+            raise ValueError("ProtenixPocket requires at least one contact residue")
+        if self.max_distance <= 0:
+            raise ValueError("ProtenixPocket max_distance must be positive")
+        for residue in self.contact_residues:
+            if isinstance(residue, AtomSite):
+                raise ValueError("ProtenixPocket contact residues must be residue references, not AtomSite atoms")
+            if residue[0] == self.binder:
+                raise ValueError("a Protenix pocket residue cannot belong to the binder chain")

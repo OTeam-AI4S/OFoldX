@@ -29,78 +29,6 @@ from ...results import Metric, PackPrediction, PackResult
 from .config import MpnnPackerConfig
 
 
-def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> Tensor:
-    r"""Direction features of ``points`` expressed in each residue's local backbone frame.
-
-    Builds a per-residue orthonormal frame from N/CA/C, projects the context points into it, and returns
-    scale-invariant planar/spatial direction cosines (the LigandMPNN local-angle context features).
-
-    Args:
-        n: Nitrogen coordinates `[B, L, 3]`.
-        ca: Alpha-carbon coordinates `[B, L, 3]`.
-        c: Carbon coordinates `[B, L, 3]`.
-        points: Context atom coordinates `[B, L, A, 3]`.
-
-    Returns:
-        Direction features `[B, L, A, 4]`.
-    """
-
-    first_axis = F.normalize(n - ca, dim=-1)
-    c_vector = c - ca
-    projected = torch.einsum("bli,bli->bl", first_axis, c_vector)[..., None]
-    second_axis = F.normalize(c_vector - first_axis * projected, dim=-1)
-    third_axis = torch.cross(first_axis, second_axis, dim=-1)
-    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
-    local = torch.einsum("blqp,blyq->blyp", frame, points - ca[:, :, None])
-    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
-    spatial_radius = torch.norm(local, dim=-1) + 1e-8
-    return torch.stack(
-        (
-            local[..., 0] / planar_radius,
-            local[..., 1] / planar_radius,
-            planar_radius / spatial_radius,
-            local[..., 2] / spatial_radius,
-        ),
-        dim=-1,
-    )
-
-
-def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""Find the ``k_neighbors`` nearest residues by CA distance, after every valid pair.
-
-    Args:
-        points: Reference (CA) coordinates `[B, L, 3]`.
-        mask: Valid-residue mask `[B, L]`.
-        k_neighbors: Number of neighbors to keep (capped at ``L``).
-        eps: Numerical floor under the distance square root.
-
-    Returns:
-        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
-    """
-
-    pair_mask = mask[:, None, :] & mask[:, :, None]
-    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
-    adjusted = torch.where(pair_mask, distances, torch.inf)
-    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
-
-
-def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""Compute every ordered atom-pair distance along the residue neighbor graph.
-
-    Args:
-        atoms: Per-residue atom coordinates `[B, L, A, 3]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-
-    Returns:
-        Distances `[B, L, K, A, A]`, with source atom before target atom.
-    """
-
-    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
-    neighbors = atoms[batch, neighbor_idx]
-    distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
-    return distances
-
-
 _ATOM14 = 14
 
 
@@ -873,6 +801,78 @@ class MpnnPackerFeatures(nn.Module):
         return side_chain_nodes, decode_edges
 
 
+def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> Tensor:
+    r"""Direction features of ``points`` expressed in each residue's local backbone frame.
+
+    Builds a per-residue orthonormal frame from N/CA/C, projects the context points into it, and returns
+    scale-invariant planar/spatial direction cosines (the LigandMPNN local-angle context features).
+
+    Args:
+        n: Nitrogen coordinates `[B, L, 3]`.
+        ca: Alpha-carbon coordinates `[B, L, 3]`.
+        c: Carbon coordinates `[B, L, 3]`.
+        points: Context atom coordinates `[B, L, A, 3]`.
+
+    Returns:
+        Direction features `[B, L, A, 4]`.
+    """
+
+    first_axis = F.normalize(n - ca, dim=-1)
+    c_vector = c - ca
+    projected = torch.einsum("bli,bli->bl", first_axis, c_vector)[..., None]
+    second_axis = F.normalize(c_vector - first_axis * projected, dim=-1)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
+    local = torch.einsum("blqp,blyq->blyp", frame, points - ca[:, :, None])
+    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
+    spatial_radius = torch.norm(local, dim=-1) + 1e-8
+    return torch.stack(
+        (
+            local[..., 0] / planar_radius,
+            local[..., 1] / planar_radius,
+            planar_radius / spatial_radius,
+            local[..., 2] / spatial_radius,
+        ),
+        dim=-1,
+    )
+
+
+def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
+    r"""Find the ``k_neighbors`` nearest residues by CA distance, after every valid pair.
+
+    Args:
+        points: Reference (CA) coordinates `[B, L, 3]`.
+        mask: Valid-residue mask `[B, L]`.
+        k_neighbors: Number of neighbors to keep (capped at ``L``).
+        eps: Numerical floor under the distance square root.
+
+    Returns:
+        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
+    """
+
+    pair_mask = mask[:, None, :] & mask[:, :, None]
+    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
+    adjusted = torch.where(pair_mask, distances, torch.inf)
+    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
+
+
+def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
+    r"""Compute every ordered atom-pair distance along the residue neighbor graph.
+
+    Args:
+        atoms: Per-residue atom coordinates `[B, L, A, 3]`.
+        neighbor_idx: Neighbor indices `[B, L, K]`.
+
+    Returns:
+        Distances `[B, L, K, A, A]`, with source atom before target atom.
+    """
+
+    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
+    neighbors = atoms[batch, neighbor_idx]
+    distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
+    return distances
+
+
 def _sample_von_mises_mixture(
     mean: Tensor,
     concentration: Tensor,
@@ -1018,53 +1018,6 @@ def _pack_candidate(
                 unit="nat/radian",
             )
     return PackPrediction(structure=realized, metrics=metrics)
-
-
-# ---------------------------------------------------------------------------
-# Typed tensor boundary for MpnnPacker (folded in from contract.py).
-# ---------------------------------------------------------------------------
-
-
-@dataclass(eq=False)
-class MpnnPackerInput:
-    r"""Complete tensor input and canonical decode mapping for side-chain packing."""
-
-    backbone_coordinates: Tensor
-    sequence_tokens: Tensor
-    residue_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    context_coordinates: Tensor
-    context_atomic_numbers: Tensor
-    context_mask: Tensor
-    atom37_coordinates: Tensor
-    atom37_mask: Tensor
-    pack_mask: Tensor
-    structure: Structure
-    component_references: tuple[ComponentReference, ...]
-
-
-@dataclass(eq=False)
-class MpnnPackerOutput:
-    r"""Von Mises mixture parameters predicted for four side-chain torsions."""
-
-    mean: Tensor
-    concentration: Tensor
-    mix_logits: Tensor
-
-
-@dataclass(eq=False)
-class MpnnPackerSamplingOutput:
-    r"""Final tensors from one released iterative side-chain sample."""
-
-    atom14_coordinates: Tensor
-    atom14_mask: Tensor
-    sampled_chi_angles: Tensor
-    chi_log_densities: Tensor
-    mean: Tensor
-    concentration: Tensor
-    mix_logits: Tensor
-    input_chi_sin_cos: Tensor
 
 
 class Frame:
@@ -1419,3 +1372,50 @@ def _frame_cat(frames: list[Frame]) -> Frame:
     rotation = torch.cat([frame.rotation for frame in frames], dim=-3)
     translation = torch.cat([frame.translation for frame in frames], dim=-2)
     return Frame(rotation, translation)
+
+
+# ---------------------------------------------------------------------------
+# Typed tensor boundary for MpnnPacker (folded in from contract.py).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class MpnnPackerInput:
+    r"""Complete tensor input and canonical decode mapping for side-chain packing."""
+
+    backbone_coordinates: Tensor
+    sequence_tokens: Tensor
+    residue_mask: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    context_coordinates: Tensor
+    context_atomic_numbers: Tensor
+    context_mask: Tensor
+    atom37_coordinates: Tensor
+    atom37_mask: Tensor
+    pack_mask: Tensor
+    structure: Structure
+    component_references: tuple[ComponentReference, ...]
+
+
+@dataclass(eq=False)
+class MpnnPackerOutput:
+    r"""Von Mises mixture parameters predicted for four side-chain torsions."""
+
+    mean: Tensor
+    concentration: Tensor
+    mix_logits: Tensor
+
+
+@dataclass(eq=False)
+class MpnnPackerSamplingOutput:
+    r"""Final tensors from one released iterative side-chain sample."""
+
+    atom14_coordinates: Tensor
+    atom14_mask: Tensor
+    sampled_chi_angles: Tensor
+    chi_log_densities: Tensor
+    mean: Tensor
+    concentration: Tensor
+    mix_logits: Tensor
+    input_chi_sin_cos: Tensor

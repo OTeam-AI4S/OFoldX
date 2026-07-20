@@ -9,10 +9,12 @@ coordinates the run-level random streams for its ``num_candidates`` calls withou
 reseeding (§3.7.3), threading a single caller-controlled ``seed``/``generator`` through to the
 sampler.
 
-Marker id ``"ofoldx.rfdiffusion"``. Per DESIGN.md §7.2 and Principle 13 this concrete Pipeline
-is NOT registered (no ``register_pipeline`` / ``pipeline.json``) this wave -- deferred, exactly
-as ``ESMFold2Pipeline`` defers, until real-weight sampled-output acceptance passes. This wave
-freezes its signature and family Result type at contract level only.
+Marker id ``"ofoldx.rfdiffusion"``. Per Principle 13 this concrete Pipeline IS published:
+``register_pipeline("ofoldx.rfdiffusion", ...)`` in the family ``__init__`` plus the built-in
+lazy-import index entry. The validated combined-length + hotspot ``design`` verb is a complete
+coordinate-producing capability with a working Result carrier, so a checkpoint shipping
+``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` routes ``design`` here and receives the
+family-owned ``RFdiffusionResult``.
 """
 
 from __future__ import annotations

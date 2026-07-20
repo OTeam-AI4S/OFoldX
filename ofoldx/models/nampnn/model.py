@@ -30,6 +30,7 @@ from ...modules.mpnn import (
 from ...results import DesignCandidate, DesignResult, Metric, MpnnProbabilityResult, Score, ScoreResult
 from .config import NaMpnnConfig
 
+
 MIXED_POLYMER_ATOM_NAMES = (
     "N",
     "CA",
@@ -99,120 +100,6 @@ _PROTEIN_TOKENS = tuple(range(0, 20))
 _DNA_TOKENS = tuple(range(21, 25))
 _RNA_SHARED_TOKENS = tuple(range(21, 25))
 _RNA_SEPARATE_TOKENS = tuple(range(26, 30))
-
-
-def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
-    r"""Reconstruct the idealized nucleic-acid base nitrogen coordinate."""
-
-    b = c1prime - o4prime
-    c = c2prime - c1prime
-    a = torch.cross(b, c, dim=-1)
-    return -0.56967352 * a + 0.51055973 * b - 0.53122153 * c + c1prime
-
-
-def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tensor, num_bins: int) -> Tensor:
-    r"""RBF-encode every ordered atom-pair distance for each neighbor edge."""
-
-    flat = coordinates.reshape(coordinates.shape[0], coordinates.shape[1], -1)
-    neighbor_flat = gather_nodes(flat, neighbor_indices)
-    neighbor_coordinates = neighbor_flat.reshape(
-        *neighbor_flat.shape[:-1], coordinates.shape[-2], coordinates.shape[-1]
-    )
-    differences = coordinates[:, :, None, :, None, :] - neighbor_coordinates[:, :, :, None]
-    distances = torch.sqrt(torch.sum(differences**2, -1) + 1e-6)
-    rbf = _radial_basis(distances, num_bins)
-    neighbor_mask = gather_nodes(atom_mask, neighbor_indices)
-    rbf = rbf * atom_mask[:, :, None, :, None, None] * neighbor_mask[:, :, :, None, :, None]
-    return rbf.reshape(coordinates.shape[0], coordinates.shape[1], neighbor_indices.shape[-1], -1)
-
-
-def _nearest_neighbors(coordinates: Tensor, valid_mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> Tensor:
-    r"""Return the released masked nearest-neighbor indices over the reference atom."""
-
-    pair_mask = valid_mask[:, :, None] * valid_mask[:, None, :]
-    distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
-    distances = pair_mask * distances
-    maximum = distances.max(dim=-1, keepdim=True).values
-    adjusted = distances + (1.0 - pair_mask) * maximum
-    return torch.topk(adjusted, min(num_neighbors, coordinates.shape[1]), dim=-1, largest=False).indices
-
-
-class NaMpnnFeatureEncoder(nn.Module):
-    r"""Geometric feature encoder for unified protein/nucleic-acid polymer graphs."""
-
-    def __init__(self, config: NaMpnnConfig) -> None:
-        super().__init__()
-        self.k_neighbors = config.k_neighbors
-        self.num_rbf = config.num_rbf
-        self.num_polymer_types = config.num_polymer_types
-        self.include_predicted_na_n = config.include_predicted_na_n
-        self.n_idx = MIXED_POLYMER_ATOM_TO_INDEX["N"]
-        self.ca_idx = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
-        self.c_idx = MIXED_POLYMER_ATOM_TO_INDEX["C"]
-        self.o4prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
-        self.c1prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
-        self.c2prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
-        total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
-        self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
-        self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
-        self.node_norm = nn.LayerNorm(config.feature_size)
-        self.edge_projection = nn.Linear(
-            config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
-            config.feature_size,
-            bias=False,
-        )
-        self.edge_norm = nn.LayerNorm(config.feature_size)
-
-    def forward(
-        self,
-        atom_coordinates: Tensor,
-        atom_mask: Tensor,
-        valid_mask: Tensor,
-        residue_indices: Tensor,
-        chain_indices: Tensor,
-        polymer_type_ids: Tensor,
-        protein_mask: Tensor,
-        dna_mask: Tensor,
-        rna_mask: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Build node features, edge features, and nearest-neighbor indices."""
-
-        dtype = atom_coordinates.dtype
-        atom_mask = atom_mask.to(dtype=dtype)
-        valid = valid_mask.to(dtype=dtype)
-        protein = protein_mask.to(dtype=dtype)
-        dna = dna_mask.to(dtype=dtype)
-        rna = rna_mask.to(dtype=dtype)
-
-        ca = atom_coordinates[:, :, self.ca_idx]
-        n_atom = atom_coordinates[:, :, self.n_idx]
-        c_atom = atom_coordinates[:, :, self.c_idx]
-        beta_carbon = _virtual_beta_carbon(n_atom, ca, c_atom)
-        reference = atom_coordinates[:, :, self.c1prime_idx]
-        augmented_coordinates = [atom_coordinates, beta_carbon[:, :, None, :]]
-        augmented_mask = [atom_mask, protein[:, :, None]]
-        if self.include_predicted_na_n:
-            o4prime = atom_coordinates[:, :, self.o4prime_idx]
-            c1prime = atom_coordinates[:, :, self.c1prime_idx]
-            c2prime = atom_coordinates[:, :, self.c2prime_idx]
-            na_n = _virtual_na_n(o4prime, c1prime, c2prime)
-            augmented_coordinates.append(na_n[:, :, None, :])
-            augmented_mask.append((dna + rna).clamp(max=1.0)[:, :, None])
-        all_coordinates = torch.cat(augmented_coordinates, dim=-2)
-        all_mask = torch.cat(augmented_mask, dim=-1)
-
-        neighbor_indices = _nearest_neighbors(ca + reference, valid, self.k_neighbors)
-        pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
-        residue_offset = residue_indices[:, :, None] - residue_indices[:, None, :]
-        residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]
-        same_chain = (chain_indices[:, :, None] == chain_indices[:, None, :]).long()
-        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_indices)[:, :, :, 0]
-        position_features = self.relative_position(residue_offset.long(), same_chain)
-        edge_features = self.edge_norm(self.edge_projection(torch.cat((position_features, pair_rbf), dim=-1)))
-
-        polymer_one_hot = F.one_hot(polymer_type_ids, num_classes=self.num_polymer_types).to(dtype=dtype)
-        node_features = self.node_norm(self.node_projection(polymer_one_hot))
-        return node_features, edge_features, neighbor_indices
 
 
 class NaMpnnModel(nn.Module):
@@ -938,6 +825,120 @@ class NaMpnnModel(nn.Module):
         return ScoreResult(target=input.structures[0], scores={}, metrics=metrics)
 
 
+class NaMpnnFeatureEncoder(nn.Module):
+    r"""Geometric feature encoder for unified protein/nucleic-acid polymer graphs."""
+
+    def __init__(self, config: NaMpnnConfig) -> None:
+        super().__init__()
+        self.k_neighbors = config.k_neighbors
+        self.num_rbf = config.num_rbf
+        self.num_polymer_types = config.num_polymer_types
+        self.include_predicted_na_n = config.include_predicted_na_n
+        self.n_idx = MIXED_POLYMER_ATOM_TO_INDEX["N"]
+        self.ca_idx = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
+        self.c_idx = MIXED_POLYMER_ATOM_TO_INDEX["C"]
+        self.o4prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
+        self.c1prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
+        self.c2prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
+        total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
+        self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
+        self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
+        self.node_norm = nn.LayerNorm(config.feature_size)
+        self.edge_projection = nn.Linear(
+            config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
+            config.feature_size,
+            bias=False,
+        )
+        self.edge_norm = nn.LayerNorm(config.feature_size)
+
+    def forward(
+        self,
+        atom_coordinates: Tensor,
+        atom_mask: Tensor,
+        valid_mask: Tensor,
+        residue_indices: Tensor,
+        chain_indices: Tensor,
+        polymer_type_ids: Tensor,
+        protein_mask: Tensor,
+        dna_mask: Tensor,
+        rna_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Build node features, edge features, and nearest-neighbor indices."""
+
+        dtype = atom_coordinates.dtype
+        atom_mask = atom_mask.to(dtype=dtype)
+        valid = valid_mask.to(dtype=dtype)
+        protein = protein_mask.to(dtype=dtype)
+        dna = dna_mask.to(dtype=dtype)
+        rna = rna_mask.to(dtype=dtype)
+
+        ca = atom_coordinates[:, :, self.ca_idx]
+        n_atom = atom_coordinates[:, :, self.n_idx]
+        c_atom = atom_coordinates[:, :, self.c_idx]
+        beta_carbon = _virtual_beta_carbon(n_atom, ca, c_atom)
+        reference = atom_coordinates[:, :, self.c1prime_idx]
+        augmented_coordinates = [atom_coordinates, beta_carbon[:, :, None, :]]
+        augmented_mask = [atom_mask, protein[:, :, None]]
+        if self.include_predicted_na_n:
+            o4prime = atom_coordinates[:, :, self.o4prime_idx]
+            c1prime = atom_coordinates[:, :, self.c1prime_idx]
+            c2prime = atom_coordinates[:, :, self.c2prime_idx]
+            na_n = _virtual_na_n(o4prime, c1prime, c2prime)
+            augmented_coordinates.append(na_n[:, :, None, :])
+            augmented_mask.append((dna + rna).clamp(max=1.0)[:, :, None])
+        all_coordinates = torch.cat(augmented_coordinates, dim=-2)
+        all_mask = torch.cat(augmented_mask, dim=-1)
+
+        neighbor_indices = _nearest_neighbors(ca + reference, valid, self.k_neighbors)
+        pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
+        residue_offset = residue_indices[:, :, None] - residue_indices[:, None, :]
+        residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]
+        same_chain = (chain_indices[:, :, None] == chain_indices[:, None, :]).long()
+        same_chain = gather_edges(same_chain[:, :, :, None], neighbor_indices)[:, :, :, 0]
+        position_features = self.relative_position(residue_offset.long(), same_chain)
+        edge_features = self.edge_norm(self.edge_projection(torch.cat((position_features, pair_rbf), dim=-1)))
+
+        polymer_one_hot = F.one_hot(polymer_type_ids, num_classes=self.num_polymer_types).to(dtype=dtype)
+        node_features = self.node_norm(self.node_projection(polymer_one_hot))
+        return node_features, edge_features, neighbor_indices
+
+
+def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
+    r"""Reconstruct the idealized nucleic-acid base nitrogen coordinate."""
+
+    b = c1prime - o4prime
+    c = c2prime - c1prime
+    a = torch.cross(b, c, dim=-1)
+    return -0.56967352 * a + 0.51055973 * b - 0.53122153 * c + c1prime
+
+
+def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tensor, num_bins: int) -> Tensor:
+    r"""RBF-encode every ordered atom-pair distance for each neighbor edge."""
+
+    flat = coordinates.reshape(coordinates.shape[0], coordinates.shape[1], -1)
+    neighbor_flat = gather_nodes(flat, neighbor_indices)
+    neighbor_coordinates = neighbor_flat.reshape(
+        *neighbor_flat.shape[:-1], coordinates.shape[-2], coordinates.shape[-1]
+    )
+    differences = coordinates[:, :, None, :, None, :] - neighbor_coordinates[:, :, :, None]
+    distances = torch.sqrt(torch.sum(differences**2, -1) + 1e-6)
+    rbf = _radial_basis(distances, num_bins)
+    neighbor_mask = gather_nodes(atom_mask, neighbor_indices)
+    rbf = rbf * atom_mask[:, :, None, :, None, None] * neighbor_mask[:, :, :, None, :, None]
+    return rbf.reshape(coordinates.shape[0], coordinates.shape[1], neighbor_indices.shape[-1], -1)
+
+
+def _nearest_neighbors(coordinates: Tensor, valid_mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> Tensor:
+    r"""Return the released masked nearest-neighbor indices over the reference atom."""
+
+    pair_mask = valid_mask[:, :, None] * valid_mask[:, None, :]
+    distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
+    distances = pair_mask * distances
+    maximum = distances.max(dim=-1, keepdim=True).values
+    adjusted = distances + (1.0 - pair_mask) * maximum
+    return torch.topk(adjusted, min(num_neighbors, coordinates.shape[1]), dim=-1, largest=False).indices
+
+
 def _component_from_token(token: int, polymer_type: str, shared_nucleic_tokens: bool) -> str:
     r"""Realize one sampled token as a canonical component under its polymer type."""
 
@@ -1049,46 +1050,6 @@ def _realize_system(
     return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
 
 
-# ---------------------------------------------------------------------------
-# Typed tensor and canonical-identity boundary (formerly contract.py)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(eq=False)
-class NaMpnnInput:
-    r"""Aligned tensors and canonical identities consumed by NA-MPNN operations.
-
-    One biological Processor call owns one ``Structure``; the leading tensor axis
-    is an execution-evaluation axis, not a scientific batch. ``token_group_ids``
-    is the dense causal-unit contract: exact ties, token symmetry groups,
-    same-entity shared instances, and bonded fixing all lower into it so the graph
-    hot path never reasons about nested Python groups. Aligned residue bias and
-    tied weights are ordinary zero/one tensors; the dominant ``[B, L, V, L, V]``
-    pair tensor is ``None`` when absent.
-    """
-
-    atom_coordinates: Tensor
-    atom_mask: Tensor
-    sequence_tokens: Tensor
-    valid_mask: Tensor
-    residue_indices: Tensor
-    chain_indices: Tensor
-    polymer_type_ids: Tensor
-    protein_mask: Tensor
-    dna_mask: Tensor
-    rna_mask: Tensor
-    design_mask: Tensor
-    token_group_ids: Tensor
-    structures: tuple[Structure, ...]
-    component_references: tuple[tuple[ComponentReference | None, ...], ...]
-    polymer_types: tuple[tuple[str, ...], ...]
-    conditions: tuple[tuple[AllowedResidueIdentities | TiedResidueIdentities, ...], ...]
-    tied_weights: Tensor | None = None
-    residue_logit_bias: Tensor | None = None
-    allowed_token_mask: Tensor | None = None
-    pair_logit_bias: Tensor | None = None
-
-
 def token_groups_from_ids(
     token_group_ids: Tensor,
 ) -> tuple[tuple[tuple[int, ...], ...], ...]:
@@ -1185,3 +1146,43 @@ def smoothed_loss(
     )
     target = target + eps
     return -(target * log_probabilities).sum(dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Typed tensor and canonical-identity boundary (formerly contract.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class NaMpnnInput:
+    r"""Aligned tensors and canonical identities consumed by NA-MPNN operations.
+
+    One biological Processor call owns one ``Structure``; the leading tensor axis
+    is an execution-evaluation axis, not a scientific batch. ``token_group_ids``
+    is the dense causal-unit contract: exact ties, token symmetry groups,
+    same-entity shared instances, and bonded fixing all lower into it so the graph
+    hot path never reasons about nested Python groups. Aligned residue bias and
+    tied weights are ordinary zero/one tensors; the dominant ``[B, L, V, L, V]``
+    pair tensor is ``None`` when absent.
+    """
+
+    atom_coordinates: Tensor
+    atom_mask: Tensor
+    sequence_tokens: Tensor
+    valid_mask: Tensor
+    residue_indices: Tensor
+    chain_indices: Tensor
+    polymer_type_ids: Tensor
+    protein_mask: Tensor
+    dna_mask: Tensor
+    rna_mask: Tensor
+    design_mask: Tensor
+    token_group_ids: Tensor
+    structures: tuple[Structure, ...]
+    component_references: tuple[tuple[ComponentReference | None, ...], ...]
+    polymer_types: tuple[tuple[str, ...], ...]
+    conditions: tuple[tuple[AllowedResidueIdentities | TiedResidueIdentities, ...], ...]
+    tied_weights: Tensor | None = None
+    residue_logit_bias: Tensor | None = None
+    allowed_token_mask: Tensor | None = None
+    pair_logit_bias: Tensor | None = None

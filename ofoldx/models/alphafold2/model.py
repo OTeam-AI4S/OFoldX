@@ -34,160 +34,772 @@ from ...modules.trunk.evoformer import (
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold2Config, AlphaFold2EvoformerConfig, AlphaFold2MultimerConfig
 
-# ===========================================================================
-# Tensor boundary and canonical semantic layout (monomer + multimer contracts).
-# ===========================================================================
 
+class AlphaFold2Model(nn.Module):
+    r"""
+    AlphaFold 2 structure-prediction model with AF2-shaped module boundaries.
 
-@dataclass(frozen=True)
-class AlphaFold2Layout:
-    r"""Canonical residue identities aligned to one monomer AF2 token axis."""
-
-    system: MolecularSystem
-    residue_sites: tuple[tuple[str, int], ...]
-    msa: MSA | None
-    templates: tuple[Template, ...]
-
-
-@dataclass(kw_only=True)
-class AlphaFold2Input:
-    r"""Complete compute and semantic input for released monomer AlphaFold 2.
-
-    Under the released stochastic-fold contract the Processor lowers only the
-    **raw alignment pool** and the full-MSA HHblits profile; the Model draws the
-    clustered/extra MSA feature realizations itself, once per recycle, off its
-    per-sample generator (see :meth:`AlphaFold2Model.fold`). The realized 49- and
-    25-channel tensors are therefore *not* part of the input contract.
-
-    Tensor shapes: ``aatype`` and ``residue_index`` are ``[B, N]``; target features
-    are ``[B, N, 22]``. The raw pool is ``msa_tokens [B, M, N]`` (long restype ids in
-    ``0..21`` -- ``20`` unknown, ``21`` gap; row 0 is the query), ``msa_deletions
-    [B, M, N]`` (float per-cell insertion counts), and ``msa_profile [B, N, 22]``
-    (per-column amino-acid frequency of the full pool; upstream AF2 calls this the
-    HHblits profile). Template tensors are always
-    present because their stacks are part of the released computation; zero masks
-    represent absent evidence without skipping those stacks.
-
-    ``msa_feat`` / ``msa_mask`` / ``extra_msa_feat`` / ``extra_msa_mask`` are
-    internal per-recycle realized slots the Model fills via
-    :func:`dataclasses.replace`; they are ``None`` on Processor output.
+    The trunk is organized as input embedding, recycling embedding, optional
+    template embedding, extra-MSA Evoformer stack, main Evoformer stack, and
+    native AF2 structure/head modules.
     """
 
-    aatype: Tensor
-    target_feat: Tensor
-    residue_index: Tensor
-    token_mask: Tensor
-    msa_tokens: Tensor
-    msa_deletions: Tensor
-    msa_profile: Tensor
-    template_mask: Tensor
-    template_aatype: Tensor
-    template_all_atom_positions: Tensor
-    template_all_atom_masks: Tensor
-    template_torsion_angles_sin_cos: Tensor
-    template_alt_torsion_angles_sin_cos: Tensor
-    template_torsion_angles_mask: Tensor
-    layout: AlphaFold2Layout
-    msa_feat: Tensor | None = None
-    msa_mask: Tensor | None = None
-    extra_msa_feat: Tensor | None = None
-    extra_msa_mask: Tensor | None = None
-    bert_mask: Tensor | None = None
-    true_msa: Tensor | None = None
+    config_class = AlphaFold2Config
+
+    def __init__(self, config: AlphaFold2Config | None = None) -> None:
+        config = AlphaFold2Config() if config is None else config
+        super().__init__()
+        self.config = config
+        input_config = config.input_embedding
+        recycling_config = config.recycling
+        evoformer_config = config.evoformer
+        template_config = config.template
+        iteration_config = evoformer_config.iteration
+        heads = config.heads
+
+        self._recycling_steps = config.recycling_steps
+        self.input_embedding = AlphaFold2InputEmbedding(
+            target_feature_size=input_config.target_feature_size,
+            msa_feature_size=input_config.msa_feature_size,
+            msa_channel=evoformer_config.msa_size,
+            pair_channel=evoformer_config.pair_size,
+            max_relative_feature=input_config.max_relative_feature,
+        )
+        self.recycling_embedding = AlphaFold2RecyclingEmbedding(
+            msa_channel=evoformer_config.msa_size,
+            pair_channel=evoformer_config.pair_size,
+            recycle_pos=recycling_config.recycle_pos,
+            recycle_features=recycling_config.recycle_features,
+            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
+            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
+            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
+        )
+        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
+            extra_msa_feature_size=input_config.extra_msa_feature_size,
+            extra_msa_channel=evoformer_config.extra_msa_size,
+        )
+        self.template_embedder: AlphaFold2TemplateEmbedding | None = None
+        self.template_msa_embedding: AlphaFold2TemplateMsaEmbedding | None = None
+        if template_config.enabled:
+            self.template_embedder = AlphaFold2TemplateEmbedding(
+                query_size=evoformer_config.pair_size,
+                template_size=template_config.template_pair_stack.num_channels,
+                num_blocks=template_config.template_pair_stack.num_block,
+                num_distogram_bins=template_config.num_distogram_bins,
+                min_bin=template_config.min_bin,
+                max_bin=template_config.max_bin,
+                vocab_size=template_config.vocab_size,
+                use_template_unit_vector=template_config.use_template_unit_vector,
+                triangle_multiplication_hidden_size=(
+                    template_config.template_pair_stack.triangle_multiplication_outgoing.num_intermediate_channel
+                ),
+                triangle_attention_hidden_size=(
+                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
+                ),
+                num_triangle_attention_heads=(
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
+                ),
+                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
+                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
+                num_attention_heads=template_config.attention.num_head,
+                operator_backend="auto",
+            )
+            if template_config.embed_torsion_angles:
+                self.template_msa_embedding = AlphaFold2TemplateMsaEmbedding(
+                    vocab_size=template_config.vocab_size,
+                    msa_size=evoformer_config.msa_size,
+                )
+        self.extra_msa_stack = EvoformerStack(
+            num_blocks=evoformer_config.extra_msa_num_blocks,
+            msa_size=evoformer_config.extra_msa_size,
+            pair_size=evoformer_config.pair_size,
+            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
+            outer_product_first=iteration_config.outer_product_mean.first,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            triangle_multiplication_hidden_size=(
+                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
+            ),
+            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
+            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
+            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            is_extra_msa=True,
+            operator_backend="auto",
+        )
+        self.evoformer = EvoformerStack(
+            num_blocks=evoformer_config.num_blocks,
+            msa_size=evoformer_config.msa_size,
+            pair_size=evoformer_config.pair_size,
+            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
+            outer_product_first=iteration_config.outer_product_mean.first,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            triangle_multiplication_hidden_size=(
+                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
+            ),
+            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
+            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
+            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            is_extra_msa=False,
+            operator_backend="auto",
+        )
+        self.single_activations = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
+        self.structure_module = AlphaFold2StructureModule(
+            single_size=evoformer_config.single_size,
+            pair_size=evoformer_config.pair_size,
+            num_layer=heads.structure_module.num_layer,
+            num_layer_in_transition=heads.structure_module.num_layer_in_transition,
+            num_channel=heads.structure_module.num_channel,
+            num_head=heads.structure_module.num_head,
+            num_scalar_qk=heads.structure_module.num_scalar_qk,
+            num_scalar_v=heads.structure_module.num_scalar_v,
+            num_point_qk=heads.structure_module.num_point_qk,
+            num_point_v=heads.structure_module.num_point_v,
+            dropout=heads.structure_module.dropout,
+            position_scale=heads.structure_module.position_scale,
+            sidechain_num_channel=heads.structure_module.sidechain.num_channel,
+            sidechain_num_residual_block=heads.structure_module.sidechain.num_residual_block,
+        )
+        self.distogram_head = DistogramHead(
+            pair_size=evoformer_config.pair_size,
+            num_bins=heads.distogram.num_bins,
+        )
+        nn.init.zeros_(self.distogram_head.linear.weight)
+        nn.init.zeros_(self.distogram_head.linear.bias)
+        self.predicted_lddt_head = AlphaFold2PredictedLDDTHead(
+            input_size=heads.structure_module.num_channel,
+            hidden_size=heads.predicted_lddt.num_channels,
+            num_bins=heads.predicted_lddt.num_bins,
+        )
+        self.predicted_aligned_error_head: AlphaFold2PredictedAlignedErrorHead | None = None
+        if heads.predicted_aligned_error.enabled:
+            self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
+                pair_size=evoformer_config.pair_size,
+                num_bins=heads.predicted_aligned_error.num_bins,
+            )
+        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
+            input_size=evoformer_config.single_size,
+            num_atom_types=heads.experimentally_resolved.num_atom_types,
+        )
+        self.masked_msa_head = AlphaFold2MaskedMSAHead(
+            msa_channel=evoformer_config.msa_size,
+            num_output=heads.masked_msa.num_output,
+        )
+        self.set_backend("auto")
+
+    def set_backend(self, backend: str) -> Self:
+        r"""Select the public PyTorch or OOps attention path."""
+
+        if backend not in {"auto", "torch", "oops"}:
+            raise ValueError("backend must be exactly one of: auto, torch, oops")
+        self.backend = backend
+        operator_backend = "sdpa" if backend == "torch" else backend
+        for module in self.modules():
+            if isinstance(module, GatedMultiheadAttention):
+                module.operator_backend = operator_backend
+        return self
+
+    def forward(
+        self,
+        batch: AlphaFold2Input,
+        *,
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AlphaFold2Output:
+        r"""Run recycling, structure generation, and every released output head.
+
+        Gradients flow through the final recycle. This rule is independent of
+        ``train()``/``eval()``; those modes affect only ordinary dropout.
+
+        When ``batch`` carries the raw alignment pool (``msa_feat is None``) the
+        Model realizes ``sample_msa`` / ``make_masked_msa`` / clustering /
+        ``crop_extra_msa`` itself, once per recycle when
+        ``config.msa.resample_msa_in_recycling`` is set, off ``generator``. When
+        ``batch`` already carries a realized ``msa_feat`` (the fixed-feature parity
+        injection path) the draw is skipped and the batch is consumed verbatim, so
+        that path is bit-identical to the pre-stochastic Model.
+        """
+
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if type(recycling_steps) is not int or recycling_steps < 0:
+            raise ValueError("recycling_steps must be a non-negative integer")
+
+        msa, single, pair, structure, realized = self._run_recycling(
+            batch, recycling_steps=recycling_steps, generator=generator
+        )
+        num_msa_rows = realized.msa_feat.shape[-3]
+        pae_logits = None if self.predicted_aligned_error_head is None else self.predicted_aligned_error_head(pair)
+        return AlphaFold2Output(
+            single=single,
+            pair=pair,
+            frames=structure.traj,
+            final_atom_positions=structure.final_atom_positions,
+            final_atom_mask=structure.final_atom_mask,
+            sidechain_angles=structure.sidechain_angles,
+            sidechain_unnormalized_angles=structure.sidechain_unnormalized_angles,
+            distogram_logits=self.distogram_head(pair),
+            masked_msa_logits=self.masked_msa_head(msa.narrow(-3, 0, num_msa_rows)),
+            plddt_logits=self.predicted_lddt_head(structure.structure_module),
+            pae_logits=pae_logits,
+            resolved_logits=self.experimentally_resolved_head(single),
+        )
+
+    @torch.inference_mode()
+    def fold(
+        self,
+        batch: AlphaFold2Input,
+        *,
+        num_samples: int = 1,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+    ) -> FoldResult:
+        r"""Predict monomer coordinates and return a self-contained canonical result.
+
+        Released AlphaFold 2 folds a monomer *stochastically*: it resamples,
+        BERT-masks, clusters, and crops the MSA once per recycle. ``fold`` draws
+        ``num_samples`` independent such realizations and returns one
+        [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample in draw order.
+
+        ``generator`` is the injected root RNG (the pipeline resolves any
+        ``seed``/``generator`` to it once at the boundary). Each sample draws its own
+        independent 64-bit sub-seed off that root, and per-recycle resampling advances
+        that per-sample generator (mirroring OpenFold's ensemble-of-``num_recycle + 1``
+        draw). With ``generator=None`` the fold is still stochastic, drawing from the
+        ambient default RNG.
+        """
+
+        if type(num_samples) is not int or num_samples < 1:
+            raise ValueError("num_samples must be a positive integer")
+        if batch.aatype.shape[0] != 1:
+            raise ValueError("AlphaFold 2 fold accepts one canonical system per call")
+
+        device = batch.aatype.device
+        predictions = []
+        for _ in range(num_samples):
+            sample_generator = _sample_generator(generator, device)
+            output = self(batch, recycling_steps=recycling_steps, generator=sample_generator)
+            predictions.append(self._decode_prediction(output, batch))
+        return FoldResult(predictions=tuple(predictions))
+
+    def _decode_prediction(self, output: AlphaFold2Output, batch: AlphaFold2Input) -> FoldPrediction:
+        r"""Decode one AF2 forward pass into a canonical ``FoldPrediction``."""
+
+        layout = batch.layout
+        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
+        complete_index = {site: index for index, site in enumerate(complete_sites)}
+        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
+        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
+        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
+        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
+        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
+            for atom_name, atom37_index in residue_constants.atom_order.items():
+                site = AtomSite(instance_id, monomer_index, atom_name)
+                target_index = complete_index.get(site)
+                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
+                    continue
+                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
+                coordinate_mask[target_index] = True
+        structure = Structure(
+            system=layout.system,
+            sites=complete_sites,
+            coordinates=coordinates,
+            coordinate_mask=coordinate_mask,
+        )
+        plddt_logits = output.plddt_logits[0].float()
+        plddt_bins = (
+            torch.arange(
+                plddt_logits.shape[-1],
+                device=plddt_logits.device,
+                dtype=plddt_logits.dtype,
+            )
+            + 0.5
+        ) / plddt_logits.shape[-1]
+        plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
+        pae = None if output.pae_logits is None else predicted_aligned_error(output.pae_logits[0], self.config)
+        scores = {"mean_plddt": Score(float(plddt.mean()), preferred="higher")}
+        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
+        pair_metrics: dict[str, PairMetric] = {}
+        if output.pae_logits is not None and pae is not None:
+            scores["ptm"] = Score(
+                predicted_tm_score(output.pae_logits[0], batch.token_mask[0], self.config),
+                preferred="higher",
+            )
+            pair_metrics["pae"] = PairMetric(
+                values=pae,
+                row_axis=layout.residue_sites,
+                column_axis=layout.residue_sites,
+                unit="angstrom",
+            )
+        return FoldPrediction(
+            structure=structure,
+            scores=scores,
+            metrics=metrics,
+            pair_metrics=pair_metrics,
+        )
+
+    def _run_recycling(
+        self,
+        batch: AlphaFold2Input,
+        *,
+        recycling_steps: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, AlphaFold2Input]:
+        needs_realize = batch.msa_feat is None
+        resample = needs_realize and self.config.msa.resample_msa_in_recycling
+        base_realized = None
+        if needs_realize and not resample:
+            base_realized = self._realize_msa(batch, generator=generator)
+        prev_pos, prev_msa_first_row, prev_pair = self._initial_recycling(batch)
+        cycle_batch = batch
+        for cycle in range(recycling_steps + 1):
+            if needs_realize:
+                cycle_batch = self._realize_msa(batch, generator=generator) if resample else base_realized
+            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps
+            with torch.set_grad_enabled(grad_enabled):
+                msa, single, pair, msa_first_row = self._embed_and_refine(
+                    cycle_batch,
+                    prev_pos=prev_pos,
+                    prev_msa_first_row=prev_msa_first_row,
+                    prev_pair=prev_pair,
+                )
+                structure = self.structure_module(single, pair, cycle_batch)
+            if cycle != recycling_steps:
+                prev_pos = structure.final_atom_positions.detach()
+                prev_msa_first_row = msa_first_row.detach()
+                prev_pair = pair.detach()
+        return msa, single, pair, structure, cycle_batch
+
+    def _realize_msa(self, batch: AlphaFold2Input, *, generator: torch.Generator | None) -> AlphaFold2Input:
+        r"""Realize one released MSA-feature ensemble slice from the raw pool.
+
+        Runs OpenFold's ``sample_msa`` -> ``make_masked_msa`` ->
+        ``nearest_neighbor_clusters`` / ``summarize_clusters`` -> ``crop_extra_msa``
+        -> ``make_msa_feat`` chain over the raw alignment pool carried on ``batch``
+        and returns a copy whose per-recycle realized slots are filled. Every draw
+        consumes the per-sample ``generator`` so the whole slice is reproducible
+        from the fold seed.
+        """
+
+        cfg = self.config.msa
+        device = batch.target_feat.device
+        dtype = batch.target_feat.dtype
+        (
+            msa_feat,
+            msa_mask,
+            extra_msa_feat,
+            extra_msa_mask,
+            bert_mask,
+            true_msa,
+        ) = realize_msa_features(
+            batch.msa_tokens[0],
+            batch.msa_deletions[0],
+            batch.msa_profile[0],
+            max_msa_clusters=cfg.max_msa_clusters,
+            max_extra_msa=cfg.max_extra_msa,
+            msa_cluster_features=cfg.msa_cluster_features,
+            gap_agreement_weight=cfg.gap_agreement_weight,
+            masked_msa_enabled=cfg.masked_msa_enabled,
+            uniform_prob=cfg.masked_msa_uniform_prob,
+            profile_prob=cfg.masked_msa_profile_prob,
+            same_prob=cfg.masked_msa_same_prob,
+            replace_fraction=cfg.masked_msa_replace_fraction,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        return replace(
+            batch,
+            msa_feat=msa_feat.unsqueeze(0),
+            msa_mask=msa_mask.unsqueeze(0),
+            extra_msa_feat=extra_msa_feat.unsqueeze(0),
+            extra_msa_mask=extra_msa_mask.unsqueeze(0),
+            bert_mask=bert_mask.unsqueeze(0),
+            true_msa=true_msa.unsqueeze(0),
+        )
+
+    def _embed_and_refine(
+        self,
+        batch: AlphaFold2Input,
+        *,
+        prev_pos: Tensor,
+        prev_msa_first_row: Tensor,
+        prev_pair: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        msa, pair, msa_mask, pair_mask = self.input_embedding(batch)
+        msa, pair = self.recycling_embedding(
+            msa,
+            pair,
+            batch=batch,
+            prev_pos=prev_pos,
+            prev_msa_first_row=prev_msa_first_row,
+            prev_pair=prev_pair,
+        )
+        pair = pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
+        pair = self._add_template_embedding(pair, batch, pair_mask)
+        extra_msa, extra_msa_mask = self.extra_msa_embedding(batch)
+        extra_msa, pair = self.extra_msa_stack(
+            extra_msa,
+            pair,
+            msa_mask=extra_msa_mask,
+            pair_mask=pair_mask,
+        )
+        if self.template_msa_embedding is not None:
+            template_activations, template_mask = self.template_msa_embedding(batch)
+            msa = torch.cat([msa, template_activations], dim=-3)
+            msa_mask = torch.cat([msa_mask, template_mask], dim=-2)
+        msa, pair = self.evoformer(
+            msa,
+            pair,
+            msa_mask=msa_mask,
+            pair_mask=pair_mask,
+        )
+        msa_first_row = msa.select(dim=-3, index=0)
+        single = self.single_activations(msa_first_row)
+        return msa, single, pair, msa_first_row
+
+    def _initial_recycling(self, batch: AlphaFold2Input) -> tuple[Tensor, Tensor, Tensor]:
+        token_shape = batch.token_mask.shape
+        num_tokens = token_shape[-1]
+        dtype = batch.target_feat.dtype
+        device = batch.target_feat.device
+        return (
+            torch.zeros(*token_shape, residue_constants.atom_type_num, 3, device=device, dtype=dtype),
+            torch.zeros(
+                *token_shape,
+                self.input_embedding.preprocess_msa.out_features,
+                device=device,
+                dtype=dtype,
+            ),
+            torch.zeros(
+                *token_shape[:-1],
+                num_tokens,
+                num_tokens,
+                self.input_embedding.left_single.out_features,
+                device=device,
+                dtype=dtype,
+            ),
+        )
+
+    def _add_template_embedding(self, pair: Tensor, batch: AlphaFold2Input, pair_mask: Tensor) -> Tensor:
+        if self.template_embedder is None:
+            return pair
+        return pair + self.template_embedder(pair, batch, pair_mask=pair_mask)
 
 
-@dataclass
-class AlphaFold2Output:
-    r"""Differentiable predictions and representations from one AF2 forward pass.
+class AlphaFold2MultimerModel(AlphaFold2Model):
+    r"""
+    AlphaFold-Multimer structure-prediction model sharing the AF2 trunk.
 
-    ``distogram_logits`` uses the ``num_bins - 1`` evenly spaced boundaries from
-    ``config.heads.distogram.first_break`` through ``last_break``.
+    The submodules are constructed under the exact attribute names the inherited
+    ``AlphaFold2Model`` forward/recycling methods reference, so those methods are
+    reused verbatim across the shared trunk.
     """
 
-    single: Tensor
-    pair: Tensor
-    frames: Tensor
-    final_atom_positions: Tensor
-    final_atom_mask: Tensor
-    sidechain_angles: Tensor
-    sidechain_unnormalized_angles: Tensor
-    distogram_logits: Tensor
-    masked_msa_logits: Tensor
-    plddt_logits: Tensor
-    pae_logits: Tensor | None
-    resolved_logits: Tensor
+    config_class = AlphaFold2MultimerConfig
+
+    def __init__(self, config: AlphaFold2MultimerConfig | None = None) -> None:
+        config = AlphaFold2MultimerConfig() if config is None else config
+        nn.Module.__init__(self)
+        self.config = config
+        input_config = config.input_embedding
+        recycling_config = config.recycling
+        evoformer_config: AlphaFold2EvoformerConfig = config.evoformer
+        template_config = config.template
+        iteration_config = evoformer_config.iteration
+        heads = config.heads
+
+        self._recycling_steps = config.recycling_steps
+        self.num_ensembles = config.num_ensembles
+        self.input_embedding = AlphaFold2MultimerInputEmbedding(
+            target_feature_size=input_config.target_feature_size,
+            msa_feature_size=input_config.msa_feature_size,
+            msa_channel=evoformer_config.msa_size,
+            pair_channel=evoformer_config.pair_size,
+            max_relative_idx=input_config.max_relative_idx,
+            max_relative_chain=input_config.max_relative_chain,
+            use_chain_relative=input_config.use_chain_relative,
+        )
+        self.recycling_embedding = AlphaFold2RecyclingEmbedding(
+            msa_channel=evoformer_config.msa_size,
+            pair_channel=evoformer_config.pair_size,
+            recycle_pos=recycling_config.recycle_pos,
+            recycle_features=recycling_config.recycle_features,
+            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
+            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
+            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
+        )
+        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
+            extra_msa_feature_size=input_config.extra_msa_feature_size,
+            extra_msa_channel=evoformer_config.extra_msa_size,
+        )
+        self.template_embedder: AlphaFold2MultimerTemplateEmbedding | None = None
+        self.template_msa_embedding = None
+        if template_config.enabled:
+            self.template_embedder = AlphaFold2MultimerTemplateEmbedding(
+                query_size=evoformer_config.pair_size,
+                template_size=template_config.template_pair_stack.num_channels,
+                num_blocks=template_config.template_pair_stack.num_block,
+                num_distogram_bins=template_config.num_distogram_bins,
+                min_bin=template_config.min_bin,
+                max_bin=template_config.max_bin,
+                vocab_size=template_config.vocab_size,
+                triangle_multiplication_hidden_size=(
+                    template_config.template_pair_stack.triangle_multiplication_outgoing.num_intermediate_channel
+                ),
+                triangle_attention_hidden_size=(
+                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
+                ),
+                num_triangle_attention_heads=(
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
+                ),
+                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
+                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
+                operator_backend="auto",
+            )
+            self.template_msa_embedding = AlphaFold2MultimerTemplateSingleEmbedding(
+                msa_size=evoformer_config.msa_size,
+                vocab_size=template_config.vocab_size,
+            )
+        self.extra_msa_stack = EvoformerStack(
+            num_blocks=evoformer_config.extra_msa_num_blocks,
+            msa_size=evoformer_config.extra_msa_size,
+            pair_size=evoformer_config.pair_size,
+            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
+            outer_product_first=iteration_config.outer_product_mean.first,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            triangle_multiplication_hidden_size=(
+                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
+            ),
+            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
+            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
+            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            is_extra_msa=True,
+            operator_backend="auto",
+        )
+        self.evoformer = EvoformerStack(
+            num_blocks=evoformer_config.num_blocks,
+            msa_size=evoformer_config.msa_size,
+            pair_size=evoformer_config.pair_size,
+            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
+            outer_product_first=iteration_config.outer_product_mean.first,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            triangle_multiplication_hidden_size=(
+                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
+            ),
+            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
+            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
+            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            is_extra_msa=False,
+            operator_backend="auto",
+        )
+        self.single_activations = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
+        self.structure_module = AlphaFold2MultimerStructureModule(
+            single_size=evoformer_config.single_size,
+            pair_size=evoformer_config.pair_size,
+            num_layer=heads.structure_module.num_layer,
+            num_layer_in_transition=heads.structure_module.num_layer_in_transition,
+            num_channel=heads.structure_module.num_channel,
+            num_head=heads.structure_module.num_head,
+            num_scalar_qk=heads.structure_module.num_scalar_qk,
+            num_scalar_v=heads.structure_module.num_scalar_v,
+            num_point_qk=heads.structure_module.num_point_qk,
+            num_point_v=heads.structure_module.num_point_v,
+            dropout=heads.structure_module.dropout,
+            position_scale=heads.structure_module.position_scale,
+            sidechain_num_channel=heads.structure_module.sidechain.num_channel,
+            sidechain_num_residual_block=heads.structure_module.sidechain.num_residual_block,
+        )
+        self.distogram_head = DistogramHead(
+            pair_size=evoformer_config.pair_size,
+            num_bins=heads.distogram.num_bins,
+        )
+        nn.init.zeros_(self.distogram_head.linear.weight)
+        nn.init.zeros_(self.distogram_head.linear.bias)
+        self.predicted_lddt_head = AlphaFold2PredictedLDDTHead(
+            input_size=heads.structure_module.num_channel,
+            hidden_size=heads.predicted_lddt.num_channels,
+            num_bins=heads.predicted_lddt.num_bins,
+        )
+        # The multimer TM head is always present.
+        self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
+            pair_size=evoformer_config.pair_size,
+            num_bins=heads.predicted_aligned_error.num_bins,
+        )
+        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
+            input_size=evoformer_config.single_size,
+            num_atom_types=heads.experimentally_resolved.num_atom_types,
+        )
+        self.masked_msa_head = AlphaFold2MaskedMSAHead(
+            msa_channel=evoformer_config.msa_size,
+            num_output=heads.masked_msa.num_output,
+        )
+        self.set_backend("auto")
+
+    def _realize_msa(
+        self, batch: AlphaFold2MultimerInput, *, generator: torch.Generator | None
+    ) -> AlphaFold2MultimerInput:
+        r"""Realize one released multimer MSA-feature ensemble slice from the raw pool.
+
+        Runs OpenFold's multimer ``sample_msa`` -> ``make_masked_msa`` ->
+        ``nearest_neighbor_clusters`` -> ``create_msa_feat`` chain over the raw paired
+        alignment pool carried on ``batch`` and returns a copy whose per-recycle
+        realized slots are filled. Every draw consumes the per-sample ``generator`` so
+        the whole slice is reproducible from the fold seed.
+        """
+
+        cfg = self.config.msa
+        device = batch.target_feat.device
+        dtype = batch.target_feat.dtype
+        (
+            msa_feat,
+            msa_mask,
+            extra_msa_feat,
+            extra_msa_mask,
+            bert_mask,
+            true_msa,
+        ) = realize_multimer_msa_features(
+            batch.msa_tokens[0],
+            batch.msa_deletions[0],
+            batch.msa_profile[0],
+            max_msa_clusters=cfg.max_msa_clusters,
+            max_extra_msa=cfg.max_extra_msa,
+            msa_cluster_features=cfg.msa_cluster_features,
+            gap_agreement_weight=cfg.gap_agreement_weight,
+            masked_msa_enabled=cfg.masked_msa_enabled,
+            uniform_prob=cfg.masked_msa_uniform_prob,
+            profile_prob=cfg.masked_msa_profile_prob,
+            same_prob=cfg.masked_msa_same_prob,
+            replace_fraction=cfg.masked_msa_replace_fraction,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        return replace(
+            batch,
+            msa_feat=msa_feat.unsqueeze(0),
+            msa_mask=msa_mask.unsqueeze(0),
+            extra_msa_feat=extra_msa_feat.unsqueeze(0),
+            extra_msa_mask=extra_msa_mask.unsqueeze(0),
+            bert_mask=bert_mask.unsqueeze(0),
+            true_msa=true_msa.unsqueeze(0),
+        )
+
+    @torch.inference_mode()
+    def fold(
+        self,
+        batch: AlphaFold2MultimerInput,
+        *,
+        num_samples: int = 1,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+    ) -> FoldResult:
+        r"""Predict assembly coordinates and return a self-contained canonical result.
+
+        Released AlphaFold-Multimer folds *stochastically*: it resamples (Gumbel
+        argsort, query row pinned), BERT-masks, clusters, and crops the MSA once per
+        recycle. ``fold`` draws ``num_samples`` independent such realizations and
+        returns one [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample in
+        draw order.
+
+        ``generator`` is the injected root RNG (the pipeline resolves any
+        ``seed``/``generator`` to it once at the boundary). Each sample draws its own
+        independent 64-bit sub-seed off that root, and per-recycle resampling advances
+        that per-sample generator (mirroring OpenFold's ensemble draw). With
+        ``generator=None`` the fold is still stochastic, drawing from the ambient
+        default RNG. When ``batch`` already carries a realized ``msa_feat`` (the
+        fixed-feature parity injection path) the draw is skipped and the batch is
+        consumed verbatim.
+        """
+
+        if type(num_samples) is not int or num_samples < 1:
+            raise ValueError("num_samples must be a positive integer")
+        if batch.aatype.shape[0] != 1:
+            raise ValueError("AlphaFold-Multimer fold accepts one canonical system per call")
+
+        device = batch.aatype.device
+        predictions = []
+        for _ in range(num_samples):
+            sample_generator = _sample_generator(generator, device)
+            output = self(batch, recycling_steps=recycling_steps, generator=sample_generator)
+            predictions.append(self._decode_prediction(output, batch))
+        return FoldResult(predictions=tuple(predictions))
+
+    def _decode_prediction(self, output: AlphaFold2Output, batch: AlphaFold2MultimerInput) -> FoldPrediction:
+        r"""Decode one AF-Multimer forward pass into a canonical ``FoldPrediction``."""
+
+        layout = batch.layout
+        # Chain permutation is canonical-ordering only at inference: there is no
+        # ground-truth assembly to permute predicted symmetric copies against, so
+        # residue_sites labels come straight from the Processor's concatenation.
+        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
+        complete_index = {site: index for index, site in enumerate(complete_sites)}
+        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
+        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
+        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
+        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
+        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
+            for atom_name, atom37_index in residue_constants.atom_order.items():
+                site = AtomSite(instance_id, monomer_index, atom_name)
+                target_index = complete_index.get(site)
+                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
+                    continue
+                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
+                coordinate_mask[target_index] = True
+        structure = Structure(
+            system=layout.system,
+            sites=complete_sites,
+            coordinates=coordinates,
+            coordinate_mask=coordinate_mask,
+        )
+        plddt_logits = output.plddt_logits[0].float()
+        plddt_bins = (
+            torch.arange(plddt_logits.shape[-1], device=plddt_logits.device, dtype=plddt_logits.dtype) + 0.5
+        ) / plddt_logits.shape[-1]
+        plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
+
+        pae_logits = output.pae_logits
+        assert pae_logits is not None  # the multimer TM head is always constructed
+        pae = predicted_aligned_error(pae_logits[0], self.config)
+        ptm = predicted_tm_score(pae_logits[0], batch.token_mask[0], self.config)
+        iptm = predicted_interface_tm_score(pae_logits[0], batch.chain_index[0], batch.token_mask[0], self.config)
+        weights = self.config.heads.predicted_aligned_error
+        ranking_score = weights.iptm_weight * iptm + weights.ptm_weight * ptm
+
+        scores = {
+            "mean_plddt": Score(float(plddt.mean()), preferred="higher"),
+            "ptm": Score(ptm, preferred="higher"),
+            "iptm": Score(iptm, preferred="higher"),
+            "ranking_score": Score(ranking_score, preferred="higher"),
+        }
+        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
+        pair_metrics = {
+            "pae": PairMetric(
+                values=pae,
+                row_axis=layout.residue_sites,
+                column_axis=layout.residue_sites,
+                unit="angstrom",
+            )
+        }
+        return FoldPrediction(
+            structure=structure,
+            scores=scores,
+            metrics=metrics,
+            pair_metrics=pair_metrics,
+        )
 
 
-@dataclass(frozen=True)
-class AlphaFold2MultimerLayout:
-    r"""Canonical residue identities aligned to one multi-chain AF2 token axis."""
-
-    system: MolecularSystem
-    residue_sites: tuple[tuple[str, int], ...]
-    chain_boundaries: tuple[tuple[str, int, int], ...]
-    msa: MSACollection | None
-    templates: tuple[Template, ...]
-
-
-@dataclass(kw_only=True)
-class AlphaFold2MultimerInput:
-    r"""Complete compute and semantic input for released AlphaFold-Multimer.
-
-    Tensor shapes follow the released processed-feature contract over the
-    concatenated multi-chain token axis. ``aatype`` / ``residue_index`` /
-    ``token_mask`` are ``[B, N]``; ``target_feat`` is ``[B, N, 21]``; clustered MSA
-    features are ``[B, M, N, 49]`` with paired-block semantics. ``residue_index``
-    restarts per chain, not globally.
-    ``chain_index`` / ``entity_index`` / ``symmetry_index`` are required
-    chain-identity features (AF-Haiku calls these ``asym_id`` / ``entity_id`` /
-    ``sym_id``):
-
-    - ``chain_index`` -- distinct copy identity, one per instance;
-    - ``entity_index`` -- sequence identity, one per distinct entity;
-    - ``symmetry_index`` -- copy index within an entity.
-
-    Template tensors carry atom37 positions plus the multimer pseudo-beta and
-    backbone-frame projections (no template torsion MSA row).
-
-    As with the monomer contract, under the released stochastic-fold contract the
-    Processor lowers only the **raw paired alignment pool** (``msa_tokens
-    [B, M, N]`` long restype ids in ``0..21`` -- ``20`` unknown, ``21`` gap, row 0
-    the concatenated query; ``msa_deletions [B, M, N]`` per-cell insertion counts;
-    ``msa_profile [B, N, 22]`` the full-pool per-column frequency). The Model draws
-    the clustered/extra realization itself, once per recycle, off its per-sample
-    generator (see :meth:`AlphaFold2MultimerModel.fold`). ``msa_feat`` / ``msa_mask``
-    / ``extra_msa_feat`` / ``extra_msa_mask`` / ``bert_mask`` / ``true_msa`` are
-    internal per-recycle realized slots the Model fills via
-    :func:`dataclasses.replace`; they are ``None`` on Processor output. When a
-    realized ``msa_feat`` is present (the fixed-feature parity injection path) the
-    Model consumes the batch verbatim and skips the draw.
-    """
-
-    aatype: Tensor
-    target_feat: Tensor
-    residue_index: Tensor
-    token_mask: Tensor
-    chain_index: Tensor
-    entity_index: Tensor
-    symmetry_index: Tensor
-    msa_tokens: Tensor
-    msa_deletions: Tensor
-    msa_profile: Tensor
-    template_mask: Tensor
-    template_aatype: Tensor
-    template_all_atom_positions: Tensor
-    template_all_atom_mask: Tensor
-    template_pseudo_beta: Tensor
-    template_pseudo_beta_mask: Tensor
-    template_backbone_frame: Tensor
-    template_backbone_frame_mask: Tensor
-    layout: AlphaFold2MultimerLayout
-    msa_feat: Tensor | None = None
-    msa_mask: Tensor | None = None
-    extra_msa_feat: Tensor | None = None
-    extra_msa_mask: Tensor | None = None
-    bert_mask: Tensor | None = None
-    true_msa: Tensor | None = None
+# Amber/OpenMM structure relaxation is a deferred follow-on for a future Tik; fold()
+# returns only the unrelaxed FoldPrediction (§5.2 single-structure contract).
 
 
 def _sample_generator(root: torch.Generator | None, device: torch.device) -> torch.Generator | None:
@@ -700,461 +1312,6 @@ def _multimer_make_msa_feat(
     return torch.cat(
         [msa_one_hot, has_deletion, deletion_value, cluster_profile.to(dtype), deletion_mean_value], dim=-1
     )
-
-
-class AlphaFold2Model(nn.Module):
-    r"""
-    AlphaFold 2 structure-prediction model with AF2-shaped module boundaries.
-
-    The trunk is organized as input embedding, recycling embedding, optional
-    template embedding, extra-MSA Evoformer stack, main Evoformer stack, and
-    native AF2 structure/head modules.
-    """
-
-    config_class = AlphaFold2Config
-
-    def __init__(self, config: AlphaFold2Config | None = None) -> None:
-        config = AlphaFold2Config() if config is None else config
-        super().__init__()
-        self.config = config
-        input_config = config.input_embedding
-        recycling_config = config.recycling
-        evoformer_config = config.evoformer
-        template_config = config.template
-        iteration_config = evoformer_config.iteration
-        heads = config.heads
-
-        self._recycling_steps = config.recycling_steps
-        self.input_embedding = AlphaFold2InputEmbedding(
-            target_feature_size=input_config.target_feature_size,
-            msa_feature_size=input_config.msa_feature_size,
-            msa_channel=evoformer_config.msa_size,
-            pair_channel=evoformer_config.pair_size,
-            max_relative_feature=input_config.max_relative_feature,
-        )
-        self.recycling_embedding = AlphaFold2RecyclingEmbedding(
-            msa_channel=evoformer_config.msa_size,
-            pair_channel=evoformer_config.pair_size,
-            recycle_pos=recycling_config.recycle_pos,
-            recycle_features=recycling_config.recycle_features,
-            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
-            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
-            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
-        )
-        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
-            extra_msa_feature_size=input_config.extra_msa_feature_size,
-            extra_msa_channel=evoformer_config.extra_msa_size,
-        )
-        self.template_embedder: AlphaFold2TemplateEmbedding | None = None
-        self.template_msa_embedding: AlphaFold2TemplateMsaEmbedding | None = None
-        if template_config.enabled:
-            self.template_embedder = AlphaFold2TemplateEmbedding(
-                query_size=evoformer_config.pair_size,
-                template_size=template_config.template_pair_stack.num_channels,
-                num_blocks=template_config.template_pair_stack.num_block,
-                num_distogram_bins=template_config.num_distogram_bins,
-                min_bin=template_config.min_bin,
-                max_bin=template_config.max_bin,
-                vocab_size=template_config.vocab_size,
-                use_template_unit_vector=template_config.use_template_unit_vector,
-                triangle_multiplication_hidden_size=(
-                    template_config.template_pair_stack.triangle_multiplication_outgoing.num_intermediate_channel
-                ),
-                triangle_attention_hidden_size=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
-                ),
-                num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
-                ),
-                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
-                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
-                num_attention_heads=template_config.attention.num_head,
-                operator_backend="auto",
-            )
-            if template_config.embed_torsion_angles:
-                self.template_msa_embedding = AlphaFold2TemplateMsaEmbedding(
-                    vocab_size=template_config.vocab_size,
-                    msa_size=evoformer_config.msa_size,
-                )
-        self.extra_msa_stack = EvoformerStack(
-            num_blocks=evoformer_config.extra_msa_num_blocks,
-            msa_size=evoformer_config.extra_msa_size,
-            pair_size=evoformer_config.pair_size,
-            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
-            outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
-            triangle_multiplication_hidden_size=(
-                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
-            ),
-            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
-            is_extra_msa=True,
-            operator_backend="auto",
-        )
-        self.evoformer = EvoformerStack(
-            num_blocks=evoformer_config.num_blocks,
-            msa_size=evoformer_config.msa_size,
-            pair_size=evoformer_config.pair_size,
-            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
-            outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
-            triangle_multiplication_hidden_size=(
-                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
-            ),
-            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
-            is_extra_msa=False,
-            operator_backend="auto",
-        )
-        self.single_activations = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
-        self.structure_module = AlphaFold2StructureModule(
-            single_size=evoformer_config.single_size,
-            pair_size=evoformer_config.pair_size,
-            num_layer=heads.structure_module.num_layer,
-            num_layer_in_transition=heads.structure_module.num_layer_in_transition,
-            num_channel=heads.structure_module.num_channel,
-            num_head=heads.structure_module.num_head,
-            num_scalar_qk=heads.structure_module.num_scalar_qk,
-            num_scalar_v=heads.structure_module.num_scalar_v,
-            num_point_qk=heads.structure_module.num_point_qk,
-            num_point_v=heads.structure_module.num_point_v,
-            dropout=heads.structure_module.dropout,
-            position_scale=heads.structure_module.position_scale,
-            sidechain_num_channel=heads.structure_module.sidechain.num_channel,
-            sidechain_num_residual_block=heads.structure_module.sidechain.num_residual_block,
-        )
-        self.distogram_head = DistogramHead(
-            pair_size=evoformer_config.pair_size,
-            num_bins=heads.distogram.num_bins,
-        )
-        nn.init.zeros_(self.distogram_head.linear.weight)
-        nn.init.zeros_(self.distogram_head.linear.bias)
-        self.predicted_lddt_head = AlphaFold2PredictedLDDTHead(
-            input_size=heads.structure_module.num_channel,
-            hidden_size=heads.predicted_lddt.num_channels,
-            num_bins=heads.predicted_lddt.num_bins,
-        )
-        self.predicted_aligned_error_head: AlphaFold2PredictedAlignedErrorHead | None = None
-        if heads.predicted_aligned_error.enabled:
-            self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
-                pair_size=evoformer_config.pair_size,
-                num_bins=heads.predicted_aligned_error.num_bins,
-            )
-        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
-            input_size=evoformer_config.single_size,
-            num_atom_types=heads.experimentally_resolved.num_atom_types,
-        )
-        self.masked_msa_head = AlphaFold2MaskedMSAHead(
-            msa_channel=evoformer_config.msa_size,
-            num_output=heads.masked_msa.num_output,
-        )
-        self.set_backend("auto")
-
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the public PyTorch or OOps attention path."""
-
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
-        self.backend = backend
-        operator_backend = "sdpa" if backend == "torch" else backend
-        for module in self.modules():
-            if isinstance(module, GatedMultiheadAttention):
-                module.operator_backend = operator_backend
-        return self
-
-    def forward(
-        self,
-        batch: AlphaFold2Input,
-        *,
-        recycling_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> AlphaFold2Output:
-        r"""Run recycling, structure generation, and every released output head.
-
-        Gradients flow through the final recycle. This rule is independent of
-        ``train()``/``eval()``; those modes affect only ordinary dropout.
-
-        When ``batch`` carries the raw alignment pool (``msa_feat is None``) the
-        Model realizes ``sample_msa`` / ``make_masked_msa`` / clustering /
-        ``crop_extra_msa`` itself, once per recycle when
-        ``config.msa.resample_msa_in_recycling`` is set, off ``generator``. When
-        ``batch`` already carries a realized ``msa_feat`` (the fixed-feature parity
-        injection path) the draw is skipped and the batch is consumed verbatim, so
-        that path is bit-identical to the pre-stochastic Model.
-        """
-
-        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if type(recycling_steps) is not int or recycling_steps < 0:
-            raise ValueError("recycling_steps must be a non-negative integer")
-
-        msa, single, pair, structure, realized = self._run_recycling(
-            batch, recycling_steps=recycling_steps, generator=generator
-        )
-        num_msa_rows = realized.msa_feat.shape[-3]
-        pae_logits = None if self.predicted_aligned_error_head is None else self.predicted_aligned_error_head(pair)
-        return AlphaFold2Output(
-            single=single,
-            pair=pair,
-            frames=structure.traj,
-            final_atom_positions=structure.final_atom_positions,
-            final_atom_mask=structure.final_atom_mask,
-            sidechain_angles=structure.sidechain_angles,
-            sidechain_unnormalized_angles=structure.sidechain_unnormalized_angles,
-            distogram_logits=self.distogram_head(pair),
-            masked_msa_logits=self.masked_msa_head(msa.narrow(-3, 0, num_msa_rows)),
-            plddt_logits=self.predicted_lddt_head(structure.structure_module),
-            pae_logits=pae_logits,
-            resolved_logits=self.experimentally_resolved_head(single),
-        )
-
-    @torch.inference_mode()
-    def fold(
-        self,
-        batch: AlphaFold2Input,
-        *,
-        num_samples: int = 1,
-        generator: torch.Generator | None = None,
-        recycling_steps: int | None = None,
-    ) -> FoldResult:
-        r"""Predict monomer coordinates and return a self-contained canonical result.
-
-        Released AlphaFold 2 folds a monomer *stochastically*: it resamples,
-        BERT-masks, clusters, and crops the MSA once per recycle. ``fold`` draws
-        ``num_samples`` independent such realizations and returns one
-        [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample in draw order.
-
-        ``generator`` is the injected root RNG (the pipeline resolves any
-        ``seed``/``generator`` to it once at the boundary). Each sample draws its own
-        independent 64-bit sub-seed off that root, and per-recycle resampling advances
-        that per-sample generator (mirroring OpenFold's ensemble-of-``num_recycle + 1``
-        draw). With ``generator=None`` the fold is still stochastic, drawing from the
-        ambient default RNG.
-        """
-
-        if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("num_samples must be a positive integer")
-        if batch.aatype.shape[0] != 1:
-            raise ValueError("AlphaFold 2 fold accepts one canonical system per call")
-
-        device = batch.aatype.device
-        predictions = []
-        for _ in range(num_samples):
-            sample_generator = _sample_generator(generator, device)
-            output = self(batch, recycling_steps=recycling_steps, generator=sample_generator)
-            predictions.append(self._decode_prediction(output, batch))
-        return FoldResult(predictions=tuple(predictions))
-
-    def _decode_prediction(self, output: AlphaFold2Output, batch: AlphaFold2Input) -> FoldPrediction:
-        r"""Decode one AF2 forward pass into a canonical ``FoldPrediction``."""
-
-        layout = batch.layout
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
-        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
-        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
-        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
-            for atom_name, atom37_index in residue_constants.atom_order.items():
-                site = AtomSite(instance_id, monomer_index, atom_name)
-                target_index = complete_index.get(site)
-                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
-                    continue
-                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
-                coordinate_mask[target_index] = True
-        structure = Structure(
-            system=layout.system,
-            sites=complete_sites,
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
-        )
-        plddt_logits = output.plddt_logits[0].float()
-        plddt_bins = (
-            torch.arange(
-                plddt_logits.shape[-1],
-                device=plddt_logits.device,
-                dtype=plddt_logits.dtype,
-            )
-            + 0.5
-        ) / plddt_logits.shape[-1]
-        plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
-        pae = None if output.pae_logits is None else predicted_aligned_error(output.pae_logits[0], self.config)
-        scores = {"mean_plddt": Score(float(plddt.mean()), preferred="higher")}
-        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
-        pair_metrics: dict[str, PairMetric] = {}
-        if output.pae_logits is not None and pae is not None:
-            scores["ptm"] = Score(
-                predicted_tm_score(output.pae_logits[0], batch.token_mask[0], self.config),
-                preferred="higher",
-            )
-            pair_metrics["pae"] = PairMetric(
-                values=pae,
-                row_axis=layout.residue_sites,
-                column_axis=layout.residue_sites,
-                unit="angstrom",
-            )
-        return FoldPrediction(
-            structure=structure,
-            scores=scores,
-            metrics=metrics,
-            pair_metrics=pair_metrics,
-        )
-
-    def _run_recycling(
-        self,
-        batch: AlphaFold2Input,
-        *,
-        recycling_steps: int,
-        generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, AlphaFold2Input]:
-        needs_realize = batch.msa_feat is None
-        resample = needs_realize and self.config.msa.resample_msa_in_recycling
-        base_realized = None
-        if needs_realize and not resample:
-            base_realized = self._realize_msa(batch, generator=generator)
-        prev_pos, prev_msa_first_row, prev_pair = self._initial_recycling(batch)
-        cycle_batch = batch
-        for cycle in range(recycling_steps + 1):
-            if needs_realize:
-                cycle_batch = self._realize_msa(batch, generator=generator) if resample else base_realized
-            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps
-            with torch.set_grad_enabled(grad_enabled):
-                msa, single, pair, msa_first_row = self._embed_and_refine(
-                    cycle_batch,
-                    prev_pos=prev_pos,
-                    prev_msa_first_row=prev_msa_first_row,
-                    prev_pair=prev_pair,
-                )
-                structure = self.structure_module(single, pair, cycle_batch)
-            if cycle != recycling_steps:
-                prev_pos = structure.final_atom_positions.detach()
-                prev_msa_first_row = msa_first_row.detach()
-                prev_pair = pair.detach()
-        return msa, single, pair, structure, cycle_batch
-
-    def _realize_msa(self, batch: AlphaFold2Input, *, generator: torch.Generator | None) -> AlphaFold2Input:
-        r"""Realize one released MSA-feature ensemble slice from the raw pool.
-
-        Runs OpenFold's ``sample_msa`` -> ``make_masked_msa`` ->
-        ``nearest_neighbor_clusters`` / ``summarize_clusters`` -> ``crop_extra_msa``
-        -> ``make_msa_feat`` chain over the raw alignment pool carried on ``batch``
-        and returns a copy whose per-recycle realized slots are filled. Every draw
-        consumes the per-sample ``generator`` so the whole slice is reproducible
-        from the fold seed.
-        """
-
-        cfg = self.config.msa
-        device = batch.target_feat.device
-        dtype = batch.target_feat.dtype
-        (
-            msa_feat,
-            msa_mask,
-            extra_msa_feat,
-            extra_msa_mask,
-            bert_mask,
-            true_msa,
-        ) = realize_msa_features(
-            batch.msa_tokens[0],
-            batch.msa_deletions[0],
-            batch.msa_profile[0],
-            max_msa_clusters=cfg.max_msa_clusters,
-            max_extra_msa=cfg.max_extra_msa,
-            msa_cluster_features=cfg.msa_cluster_features,
-            gap_agreement_weight=cfg.gap_agreement_weight,
-            masked_msa_enabled=cfg.masked_msa_enabled,
-            uniform_prob=cfg.masked_msa_uniform_prob,
-            profile_prob=cfg.masked_msa_profile_prob,
-            same_prob=cfg.masked_msa_same_prob,
-            replace_fraction=cfg.masked_msa_replace_fraction,
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        )
-        return replace(
-            batch,
-            msa_feat=msa_feat.unsqueeze(0),
-            msa_mask=msa_mask.unsqueeze(0),
-            extra_msa_feat=extra_msa_feat.unsqueeze(0),
-            extra_msa_mask=extra_msa_mask.unsqueeze(0),
-            bert_mask=bert_mask.unsqueeze(0),
-            true_msa=true_msa.unsqueeze(0),
-        )
-
-    def _embed_and_refine(
-        self,
-        batch: AlphaFold2Input,
-        *,
-        prev_pos: Tensor,
-        prev_msa_first_row: Tensor,
-        prev_pair: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        msa, pair, msa_mask, pair_mask = self.input_embedding(batch)
-        msa, pair = self.recycling_embedding(
-            msa,
-            pair,
-            batch=batch,
-            prev_pos=prev_pos,
-            prev_msa_first_row=prev_msa_first_row,
-            prev_pair=prev_pair,
-        )
-        pair = pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
-        pair = self._add_template_embedding(pair, batch, pair_mask)
-        extra_msa, extra_msa_mask = self.extra_msa_embedding(batch)
-        extra_msa, pair = self.extra_msa_stack(
-            extra_msa,
-            pair,
-            msa_mask=extra_msa_mask,
-            pair_mask=pair_mask,
-        )
-        if self.template_msa_embedding is not None:
-            template_activations, template_mask = self.template_msa_embedding(batch)
-            msa = torch.cat([msa, template_activations], dim=-3)
-            msa_mask = torch.cat([msa_mask, template_mask], dim=-2)
-        msa, pair = self.evoformer(
-            msa,
-            pair,
-            msa_mask=msa_mask,
-            pair_mask=pair_mask,
-        )
-        msa_first_row = msa.select(dim=-3, index=0)
-        single = self.single_activations(msa_first_row)
-        return msa, single, pair, msa_first_row
-
-    def _initial_recycling(self, batch: AlphaFold2Input) -> tuple[Tensor, Tensor, Tensor]:
-        token_shape = batch.token_mask.shape
-        num_tokens = token_shape[-1]
-        dtype = batch.target_feat.dtype
-        device = batch.target_feat.device
-        return (
-            torch.zeros(*token_shape, residue_constants.atom_type_num, 3, device=device, dtype=dtype),
-            torch.zeros(
-                *token_shape,
-                self.input_embedding.preprocess_msa.out_features,
-                device=device,
-                dtype=dtype,
-            ),
-            torch.zeros(
-                *token_shape[:-1],
-                num_tokens,
-                num_tokens,
-                self.input_embedding.left_single.out_features,
-                device=device,
-                dtype=dtype,
-            ),
-        )
-
-    def _add_template_embedding(self, pair: Tensor, batch: AlphaFold2Input, pair_mask: Tensor) -> Tensor:
-        if self.template_embedder is None:
-            return pair
-        return pair + self.template_embedder(pair, batch, pair_mask=pair_mask)
 
 
 def predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.ndarray:
@@ -3111,314 +3268,6 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         )
 
 
-class AlphaFold2MultimerModel(AlphaFold2Model):
-    r"""
-    AlphaFold-Multimer structure-prediction model sharing the AF2 trunk.
-
-    The submodules are constructed under the exact attribute names the inherited
-    ``AlphaFold2Model`` forward/recycling methods reference, so those methods are
-    reused verbatim across the shared trunk.
-    """
-
-    config_class = AlphaFold2MultimerConfig
-
-    def __init__(self, config: AlphaFold2MultimerConfig | None = None) -> None:
-        config = AlphaFold2MultimerConfig() if config is None else config
-        nn.Module.__init__(self)
-        self.config = config
-        input_config = config.input_embedding
-        recycling_config = config.recycling
-        evoformer_config: AlphaFold2EvoformerConfig = config.evoformer
-        template_config = config.template
-        iteration_config = evoformer_config.iteration
-        heads = config.heads
-
-        self._recycling_steps = config.recycling_steps
-        self.num_ensembles = config.num_ensembles
-        self.input_embedding = AlphaFold2MultimerInputEmbedding(
-            target_feature_size=input_config.target_feature_size,
-            msa_feature_size=input_config.msa_feature_size,
-            msa_channel=evoformer_config.msa_size,
-            pair_channel=evoformer_config.pair_size,
-            max_relative_idx=input_config.max_relative_idx,
-            max_relative_chain=input_config.max_relative_chain,
-            use_chain_relative=input_config.use_chain_relative,
-        )
-        self.recycling_embedding = AlphaFold2RecyclingEmbedding(
-            msa_channel=evoformer_config.msa_size,
-            pair_channel=evoformer_config.pair_size,
-            recycle_pos=recycling_config.recycle_pos,
-            recycle_features=recycling_config.recycle_features,
-            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
-            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
-            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
-        )
-        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
-            extra_msa_feature_size=input_config.extra_msa_feature_size,
-            extra_msa_channel=evoformer_config.extra_msa_size,
-        )
-        self.template_embedder: AlphaFold2MultimerTemplateEmbedding | None = None
-        self.template_msa_embedding = None
-        if template_config.enabled:
-            self.template_embedder = AlphaFold2MultimerTemplateEmbedding(
-                query_size=evoformer_config.pair_size,
-                template_size=template_config.template_pair_stack.num_channels,
-                num_blocks=template_config.template_pair_stack.num_block,
-                num_distogram_bins=template_config.num_distogram_bins,
-                min_bin=template_config.min_bin,
-                max_bin=template_config.max_bin,
-                vocab_size=template_config.vocab_size,
-                triangle_multiplication_hidden_size=(
-                    template_config.template_pair_stack.triangle_multiplication_outgoing.num_intermediate_channel
-                ),
-                triangle_attention_hidden_size=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
-                ),
-                num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
-                ),
-                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
-                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
-                operator_backend="auto",
-            )
-            self.template_msa_embedding = AlphaFold2MultimerTemplateSingleEmbedding(
-                msa_size=evoformer_config.msa_size,
-                vocab_size=template_config.vocab_size,
-            )
-        self.extra_msa_stack = EvoformerStack(
-            num_blocks=evoformer_config.extra_msa_num_blocks,
-            msa_size=evoformer_config.extra_msa_size,
-            pair_size=evoformer_config.pair_size,
-            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
-            outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
-            triangle_multiplication_hidden_size=(
-                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
-            ),
-            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
-            is_extra_msa=True,
-            operator_backend="auto",
-        )
-        self.evoformer = EvoformerStack(
-            num_blocks=evoformer_config.num_blocks,
-            msa_size=evoformer_config.msa_size,
-            pair_size=evoformer_config.pair_size,
-            outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
-            outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
-            triangle_multiplication_hidden_size=(
-                iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
-            ),
-            triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
-            is_extra_msa=False,
-            operator_backend="auto",
-        )
-        self.single_activations = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
-        self.structure_module = AlphaFold2MultimerStructureModule(
-            single_size=evoformer_config.single_size,
-            pair_size=evoformer_config.pair_size,
-            num_layer=heads.structure_module.num_layer,
-            num_layer_in_transition=heads.structure_module.num_layer_in_transition,
-            num_channel=heads.structure_module.num_channel,
-            num_head=heads.structure_module.num_head,
-            num_scalar_qk=heads.structure_module.num_scalar_qk,
-            num_scalar_v=heads.structure_module.num_scalar_v,
-            num_point_qk=heads.structure_module.num_point_qk,
-            num_point_v=heads.structure_module.num_point_v,
-            dropout=heads.structure_module.dropout,
-            position_scale=heads.structure_module.position_scale,
-            sidechain_num_channel=heads.structure_module.sidechain.num_channel,
-            sidechain_num_residual_block=heads.structure_module.sidechain.num_residual_block,
-        )
-        self.distogram_head = DistogramHead(
-            pair_size=evoformer_config.pair_size,
-            num_bins=heads.distogram.num_bins,
-        )
-        nn.init.zeros_(self.distogram_head.linear.weight)
-        nn.init.zeros_(self.distogram_head.linear.bias)
-        self.predicted_lddt_head = AlphaFold2PredictedLDDTHead(
-            input_size=heads.structure_module.num_channel,
-            hidden_size=heads.predicted_lddt.num_channels,
-            num_bins=heads.predicted_lddt.num_bins,
-        )
-        # The multimer TM head is always present.
-        self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
-            pair_size=evoformer_config.pair_size,
-            num_bins=heads.predicted_aligned_error.num_bins,
-        )
-        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
-            input_size=evoformer_config.single_size,
-            num_atom_types=heads.experimentally_resolved.num_atom_types,
-        )
-        self.masked_msa_head = AlphaFold2MaskedMSAHead(
-            msa_channel=evoformer_config.msa_size,
-            num_output=heads.masked_msa.num_output,
-        )
-        self.set_backend("auto")
-
-    def _realize_msa(
-        self, batch: AlphaFold2MultimerInput, *, generator: torch.Generator | None
-    ) -> AlphaFold2MultimerInput:
-        r"""Realize one released multimer MSA-feature ensemble slice from the raw pool.
-
-        Runs OpenFold's multimer ``sample_msa`` -> ``make_masked_msa`` ->
-        ``nearest_neighbor_clusters`` -> ``create_msa_feat`` chain over the raw paired
-        alignment pool carried on ``batch`` and returns a copy whose per-recycle
-        realized slots are filled. Every draw consumes the per-sample ``generator`` so
-        the whole slice is reproducible from the fold seed.
-        """
-
-        cfg = self.config.msa
-        device = batch.target_feat.device
-        dtype = batch.target_feat.dtype
-        (
-            msa_feat,
-            msa_mask,
-            extra_msa_feat,
-            extra_msa_mask,
-            bert_mask,
-            true_msa,
-        ) = realize_multimer_msa_features(
-            batch.msa_tokens[0],
-            batch.msa_deletions[0],
-            batch.msa_profile[0],
-            max_msa_clusters=cfg.max_msa_clusters,
-            max_extra_msa=cfg.max_extra_msa,
-            msa_cluster_features=cfg.msa_cluster_features,
-            gap_agreement_weight=cfg.gap_agreement_weight,
-            masked_msa_enabled=cfg.masked_msa_enabled,
-            uniform_prob=cfg.masked_msa_uniform_prob,
-            profile_prob=cfg.masked_msa_profile_prob,
-            same_prob=cfg.masked_msa_same_prob,
-            replace_fraction=cfg.masked_msa_replace_fraction,
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        )
-        return replace(
-            batch,
-            msa_feat=msa_feat.unsqueeze(0),
-            msa_mask=msa_mask.unsqueeze(0),
-            extra_msa_feat=extra_msa_feat.unsqueeze(0),
-            extra_msa_mask=extra_msa_mask.unsqueeze(0),
-            bert_mask=bert_mask.unsqueeze(0),
-            true_msa=true_msa.unsqueeze(0),
-        )
-
-    @torch.inference_mode()
-    def fold(
-        self,
-        batch: AlphaFold2MultimerInput,
-        *,
-        num_samples: int = 1,
-        generator: torch.Generator | None = None,
-        recycling_steps: int | None = None,
-    ) -> FoldResult:
-        r"""Predict assembly coordinates and return a self-contained canonical result.
-
-        Released AlphaFold-Multimer folds *stochastically*: it resamples (Gumbel
-        argsort, query row pinned), BERT-masks, clusters, and crops the MSA once per
-        recycle. ``fold`` draws ``num_samples`` independent such realizations and
-        returns one [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample in
-        draw order.
-
-        ``generator`` is the injected root RNG (the pipeline resolves any
-        ``seed``/``generator`` to it once at the boundary). Each sample draws its own
-        independent 64-bit sub-seed off that root, and per-recycle resampling advances
-        that per-sample generator (mirroring OpenFold's ensemble draw). With
-        ``generator=None`` the fold is still stochastic, drawing from the ambient
-        default RNG. When ``batch`` already carries a realized ``msa_feat`` (the
-        fixed-feature parity injection path) the draw is skipped and the batch is
-        consumed verbatim.
-        """
-
-        if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("num_samples must be a positive integer")
-        if batch.aatype.shape[0] != 1:
-            raise ValueError("AlphaFold-Multimer fold accepts one canonical system per call")
-
-        device = batch.aatype.device
-        predictions = []
-        for _ in range(num_samples):
-            sample_generator = _sample_generator(generator, device)
-            output = self(batch, recycling_steps=recycling_steps, generator=sample_generator)
-            predictions.append(self._decode_prediction(output, batch))
-        return FoldResult(predictions=tuple(predictions))
-
-    def _decode_prediction(self, output: AlphaFold2Output, batch: AlphaFold2MultimerInput) -> FoldPrediction:
-        r"""Decode one AF-Multimer forward pass into a canonical ``FoldPrediction``."""
-
-        layout = batch.layout
-        # Chain permutation is canonical-ordering only at inference: there is no
-        # ground-truth assembly to permute predicted symmetric copies against, so
-        # residue_sites labels come straight from the Processor's concatenation.
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
-        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
-        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
-        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
-            for atom_name, atom37_index in residue_constants.atom_order.items():
-                site = AtomSite(instance_id, monomer_index, atom_name)
-                target_index = complete_index.get(site)
-                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
-                    continue
-                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
-                coordinate_mask[target_index] = True
-        structure = Structure(
-            system=layout.system,
-            sites=complete_sites,
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
-        )
-        plddt_logits = output.plddt_logits[0].float()
-        plddt_bins = (
-            torch.arange(plddt_logits.shape[-1], device=plddt_logits.device, dtype=plddt_logits.dtype) + 0.5
-        ) / plddt_logits.shape[-1]
-        plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
-
-        pae_logits = output.pae_logits
-        assert pae_logits is not None  # the multimer TM head is always constructed
-        pae = predicted_aligned_error(pae_logits[0], self.config)
-        ptm = predicted_tm_score(pae_logits[0], batch.token_mask[0], self.config)
-        iptm = predicted_interface_tm_score(pae_logits[0], batch.chain_index[0], batch.token_mask[0], self.config)
-        weights = self.config.heads.predicted_aligned_error
-        ranking_score = weights.iptm_weight * iptm + weights.ptm_weight * ptm
-
-        scores = {
-            "mean_plddt": Score(float(plddt.mean()), preferred="higher"),
-            "ptm": Score(ptm, preferred="higher"),
-            "iptm": Score(iptm, preferred="higher"),
-            "ranking_score": Score(ranking_score, preferred="higher"),
-        }
-        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
-        pair_metrics = {
-            "pae": PairMetric(
-                values=pae,
-                row_axis=layout.residue_sites,
-                column_axis=layout.residue_sites,
-                unit="angstrom",
-            )
-        }
-        return FoldPrediction(
-            structure=structure,
-            scores=scores,
-            metrics=metrics,
-            pair_metrics=pair_metrics,
-        )
-
-
 def predicted_interface_tm_score(
     logits: Tensor,
     asym_id: Tensor,
@@ -3459,5 +3308,157 @@ def predicted_interface_tm_score(
     return float((alignment * eligible).max().item())
 
 
-# Amber/OpenMM structure relaxation is a deferred follow-on for a future Tik; fold()
-# returns only the unrelaxed FoldPrediction (§5.2 single-structure contract).
+# ===========================================================================
+# Tensor boundary and canonical semantic layout (monomer + multimer contracts).
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class AlphaFold2Layout:
+    r"""Canonical residue identities aligned to one monomer AF2 token axis."""
+
+    system: MolecularSystem
+    residue_sites: tuple[tuple[str, int], ...]
+    msa: MSA | None
+    templates: tuple[Template, ...]
+
+
+@dataclass(kw_only=True)
+class AlphaFold2Input:
+    r"""Complete compute and semantic input for released monomer AlphaFold 2.
+
+    Under the released stochastic-fold contract the Processor lowers only the
+    **raw alignment pool** and the full-MSA HHblits profile; the Model draws the
+    clustered/extra MSA feature realizations itself, once per recycle, off its
+    per-sample generator (see :meth:`AlphaFold2Model.fold`). The realized 49- and
+    25-channel tensors are therefore *not* part of the input contract.
+
+    Tensor shapes: ``aatype`` and ``residue_index`` are ``[B, N]``; target features
+    are ``[B, N, 22]``. The raw pool is ``msa_tokens [B, M, N]`` (long restype ids in
+    ``0..21`` -- ``20`` unknown, ``21`` gap; row 0 is the query), ``msa_deletions
+    [B, M, N]`` (float per-cell insertion counts), and ``msa_profile [B, N, 22]``
+    (per-column amino-acid frequency of the full pool; upstream AF2 calls this the
+    HHblits profile). Template tensors are always
+    present because their stacks are part of the released computation; zero masks
+    represent absent evidence without skipping those stacks.
+
+    ``msa_feat`` / ``msa_mask`` / ``extra_msa_feat`` / ``extra_msa_mask`` are
+    internal per-recycle realized slots the Model fills via
+    :func:`dataclasses.replace`; they are ``None`` on Processor output.
+    """
+
+    aatype: Tensor
+    target_feat: Tensor
+    residue_index: Tensor
+    token_mask: Tensor
+    msa_tokens: Tensor
+    msa_deletions: Tensor
+    msa_profile: Tensor
+    template_mask: Tensor
+    template_aatype: Tensor
+    template_all_atom_positions: Tensor
+    template_all_atom_masks: Tensor
+    template_torsion_angles_sin_cos: Tensor
+    template_alt_torsion_angles_sin_cos: Tensor
+    template_torsion_angles_mask: Tensor
+    layout: AlphaFold2Layout
+    msa_feat: Tensor | None = None
+    msa_mask: Tensor | None = None
+    extra_msa_feat: Tensor | None = None
+    extra_msa_mask: Tensor | None = None
+    bert_mask: Tensor | None = None
+    true_msa: Tensor | None = None
+
+
+@dataclass
+class AlphaFold2Output:
+    r"""Differentiable predictions and representations from one AF2 forward pass.
+
+    ``distogram_logits`` uses the ``num_bins - 1`` evenly spaced boundaries from
+    ``config.heads.distogram.first_break`` through ``last_break``.
+    """
+
+    single: Tensor
+    pair: Tensor
+    frames: Tensor
+    final_atom_positions: Tensor
+    final_atom_mask: Tensor
+    sidechain_angles: Tensor
+    sidechain_unnormalized_angles: Tensor
+    distogram_logits: Tensor
+    masked_msa_logits: Tensor
+    plddt_logits: Tensor
+    pae_logits: Tensor | None
+    resolved_logits: Tensor
+
+
+@dataclass(frozen=True)
+class AlphaFold2MultimerLayout:
+    r"""Canonical residue identities aligned to one multi-chain AF2 token axis."""
+
+    system: MolecularSystem
+    residue_sites: tuple[tuple[str, int], ...]
+    chain_boundaries: tuple[tuple[str, int, int], ...]
+    msa: MSACollection | None
+    templates: tuple[Template, ...]
+
+
+@dataclass(kw_only=True)
+class AlphaFold2MultimerInput:
+    r"""Complete compute and semantic input for released AlphaFold-Multimer.
+
+    Tensor shapes follow the released processed-feature contract over the
+    concatenated multi-chain token axis. ``aatype`` / ``residue_index`` /
+    ``token_mask`` are ``[B, N]``; ``target_feat`` is ``[B, N, 21]``; clustered MSA
+    features are ``[B, M, N, 49]`` with paired-block semantics. ``residue_index``
+    restarts per chain, not globally.
+    ``chain_index`` / ``entity_index`` / ``symmetry_index`` are required
+    chain-identity features (AF-Haiku calls these ``asym_id`` / ``entity_id`` /
+    ``sym_id``):
+
+    - ``chain_index`` -- distinct copy identity, one per instance;
+    - ``entity_index`` -- sequence identity, one per distinct entity;
+    - ``symmetry_index`` -- copy index within an entity.
+
+    Template tensors carry atom37 positions plus the multimer pseudo-beta and
+    backbone-frame projections (no template torsion MSA row).
+
+    As with the monomer contract, under the released stochastic-fold contract the
+    Processor lowers only the **raw paired alignment pool** (``msa_tokens
+    [B, M, N]`` long restype ids in ``0..21`` -- ``20`` unknown, ``21`` gap, row 0
+    the concatenated query; ``msa_deletions [B, M, N]`` per-cell insertion counts;
+    ``msa_profile [B, N, 22]`` the full-pool per-column frequency). The Model draws
+    the clustered/extra realization itself, once per recycle, off its per-sample
+    generator (see :meth:`AlphaFold2MultimerModel.fold`). ``msa_feat`` / ``msa_mask``
+    / ``extra_msa_feat`` / ``extra_msa_mask`` / ``bert_mask`` / ``true_msa`` are
+    internal per-recycle realized slots the Model fills via
+    :func:`dataclasses.replace`; they are ``None`` on Processor output. When a
+    realized ``msa_feat`` is present (the fixed-feature parity injection path) the
+    Model consumes the batch verbatim and skips the draw.
+    """
+
+    aatype: Tensor
+    target_feat: Tensor
+    residue_index: Tensor
+    token_mask: Tensor
+    chain_index: Tensor
+    entity_index: Tensor
+    symmetry_index: Tensor
+    msa_tokens: Tensor
+    msa_deletions: Tensor
+    msa_profile: Tensor
+    template_mask: Tensor
+    template_aatype: Tensor
+    template_all_atom_positions: Tensor
+    template_all_atom_mask: Tensor
+    template_pseudo_beta: Tensor
+    template_pseudo_beta_mask: Tensor
+    template_backbone_frame: Tensor
+    template_backbone_frame_mask: Tensor
+    layout: AlphaFold2MultimerLayout
+    msa_feat: Tensor | None = None
+    msa_mask: Tensor | None = None
+    extra_msa_feat: Tensor | None = None
+    extra_msa_mask: Tensor | None = None
+    bert_mask: Tensor | None = None
+    true_msa: Tensor | None = None

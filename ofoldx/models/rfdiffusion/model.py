@@ -76,206 +76,6 @@ from .config import RFdiffusionConfig
 # :data:`~ofoldx.data.conditions.ResidueEndpoint` (``ComponentReference | str | SymbolicResidueSite``).
 
 
-# --------------------------------------------------------------------------------------
-# Placement condition envelope (FROZEN §3.7 placement core carried with the family-owned
-# ``chain_lengths`` length argument).
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RFdiffusionPlacements:
-    r"""One RFdiffusion generation topology: the frozen placement core plus its lengths.
-
-    ``placements`` is the frozen §3.7 core ``PlacementSpec`` mapping
-    (``declaration_group -> placement_id -> PlacementValue``); its inner ``placement_id``
-    keys are globally unique and carry identity. ``chain_lengths`` is the RFdiffusion
-    family-owned per-group combined-length argument (aligned to the declaration-group
-    order of ``placements``); it stays on this family envelope, NEVER on the shared core
-    (which carries no length field). ``intent`` is always ``"hard"`` for RFdiffusion.
-    """
-
-    placements: PlacementMapping
-    chain_lengths: tuple[int | None, ...] | None = None
-    intent: Literal["hard", "soft"] = "hard"
-
-
-# --------------------------------------------------------------------------------------
-# Family-owned spatial / placement conditions (DESIGN 3.7.2, family-owned & investigated).
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ReferenceCoordinates:
-    r"""Fixed backbone coordinates for a set of existing atoms (consumed as ``hard``)."""
-
-    sites: tuple[AtomSite, ...]
-    tolerance_angstrom: float
-    intent: Literal["hard", "soft"] = "hard"
-
-
-@dataclass(frozen=True)
-class Coordination:
-    r"""A smooth ``1 / (1 + x**6)`` coordination-number potential between two sides."""
-
-    side_a: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
-    side_b: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
-    center_angstrom: float
-    scale_angstrom: float
-    direction: Literal["maximize", "minimize"]
-    weight: float | None = None
-    intent: Literal["hard", "soft"] = "soft"
-
-
-@dataclass(frozen=True)
-class Distance:
-    r"""A tolerance-padded ``[lower, upper]`` distance interval between two atoms."""
-
-    site_a: AtomSite | SymbolicAtomSite
-    site_b: AtomSite | SymbolicAtomSite
-    lower_angstrom: float
-    upper_angstrom: float
-    tolerance_angstrom: float = 0.0
-    weight: float | None = None
-    intent: Literal["hard", "soft"] = "soft"
-
-
-@dataclass(frozen=True)
-class RadiusOfGyration:
-    r"""A compactness potential over a set of residue centroids."""
-
-    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
-    upper_angstrom: float
-    weight: float | None = None
-    intent: Literal["hard", "soft"] = "soft"
-
-
-@dataclass(frozen=True)
-class SubstrateInteraction:
-    r"""The released nearest-substrate attraction and clearance potential.
-
-    ``repulsion_cutoff_angstrom`` is the released ``rep_r_0`` clearance radius; the
-    non-default ``rep_r_min=0`` all-pairs branch is a separate control (see the family
-    README) and is not represented by this default meaning.
-    """
-
-    residues: tuple[ComponentReference | str | SymbolicResidueSite, ...]
-    substrate_atoms: tuple[AtomSite | SymbolicAtomSite, ...]
-    center_angstrom: float
-    scale_angstrom: float
-    attraction_strength: float
-    repulsion_slope: float
-    repulsion_cutoff_angstrom: float = 5.0
-    weight: float | None = None
-    intent: Literal["hard", "soft"] = "soft"
-
-
-# RFdiffusion's requested covalent bond (e.g. terminal peptide cyclization) IS the frozen §3.7.4
-# ``SymbolicBond``; the family declares no separate record and no compatibility alias (DESIGN §10.2
-# forbids preserving prototype names through aliases). The processor still collapses a terminal
-# N->C ``SymbolicBond`` to ``cyclic_mask`` (behavior unchanged), and RFdiffusion always consumes it
-# as ``hard`` (the frozen ``SymbolicBond`` carries no ``intent`` field, matching that fixed meaning).
-
-
-@dataclass(frozen=True)
-class PointGroupSymmetry:
-    r"""A point-group symmetry over equal-length residue units (consumed as ``hard``)."""
-
-    units: tuple[tuple[ComponentReference | str | SymbolicResidueSite, ...], ...]
-    kind: str
-    order: int | None
-    tolerance_angstrom: float
-    intent: Literal["hard", "soft"] = "hard"
-
-
-@dataclass(frozen=True)
-class SecondaryStructure:
-    r"""A per-target secondary-structure label; requires a fold-conditioned checkpoint."""
-
-    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
-    kind: str
-    intent: Literal["hard", "soft"] = "soft"
-
-
-@dataclass(eq=False)
-class RFdiffusionDesignCandidate:
-    r"""One coordinate-producing RFdiffusion generation sample and its aligned values.
-
-    Each candidate owns the complete decoded backbone ``Structure`` (which owns its
-    ``MolecularSystem`` via ``Structure.system``). Generated residue identity is CCD ``UNK``;
-    the Structure contains only the backbone sites RFdiffusion produced. The variable placement
-    length across candidates is the coordinate-producing, variable-topology property that
-    forbids reuse of the shared ``DesignCandidate``. Standalone -- no base class.
-
-    ``placement_map`` is the frozen §3.7 realized output surface for this sample
-    (``declaration_group -> placement_id -> realized OUTPUT occurrences``, W6 caveat a): after
-    the variable generated lengths are sampled, RFdiffusion adopts the shared grouped
-    ``placement_map`` as its per-candidate output identity (the same surface the other three
-    families carry) rather than the FLAT pre-sample ``output_residues`` layout. It is
-    losslessly reconstructed from that flat layout at decode time and exhaustively partitions
-    every realized backbone residue; ``ComponentReference[0]`` values are this candidate's
-    ``Structure.system`` instance ids. Empty only when there is no placement (no molecular
-    input and no ``RFdiffusionPlacements``).
-    """
-
-    structure: Structure
-    placement_map: PlacementMap = field(default_factory=dict)
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-
-
-@dataclass(eq=False)
-class RFdiffusionResult:
-    r"""One generation-ordered collection of coordinate-producing RFdiffusion designs.
-
-    Tuple position is sample identity for one generation context; there is no auxiliary index
-    field, and no input/context/placement-map/provenance field is carried.
-    """
-
-    candidates: tuple[RFdiffusionDesignCandidate, ...]
-
-    def best(self, score: str) -> RFdiffusionDesignCandidate:
-        r"""Return the earliest best candidate under one explicit score.
-
-        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the score's
-        ``preferred`` direction must be consistently ``"higher"`` or ``"lower"``; unit and scope
-        must match across every candidate; a NaN value or an undefined direction raises at
-        ranking time; infinity is rankable; and the earliest candidate wins a tie.
-        """
-
-        scores = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
-
-
-@cache
-def rfdiffusion_schedule() -> dict[str, np.ndarray]:
-    r"""Load the exact released RFdiffusion IGSO(3) lookup table.
-
-    The safe NumPy archive is derived from
-    ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl``
-    at RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9``.
-    The source SHA-256 is ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``;
-    the packaged archive SHA-256 is ``89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8``.
-    The table is redistributed under RFdiffusion's BSD 3-Clause license.
-    """
-
-    with (
-        files(__package__).joinpath("rfdiffusion_schedule.npz").open("rb") as file,
-        np.load(file, allow_pickle=False) as values,
-    ):
-        return {name: values[name] for name in values.files}
-
-
 class RFdiffusionModel(nn.Module):
     r"""The released RFdiffusion RoseTTAFold denoiser and design sampler.
 
@@ -493,6 +293,25 @@ class RFdiffusionModel(nn.Module):
 
     def _resolved_backend(self, tensor: Tensor) -> str:
         return _select_backend(self.backend, tensor)
+
+
+@cache
+def rfdiffusion_schedule() -> dict[str, np.ndarray]:
+    r"""Load the exact released RFdiffusion IGSO(3) lookup table.
+
+    The safe NumPy archive is derived from
+    ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl``
+    at RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9``.
+    The source SHA-256 is ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``;
+    the packaged archive SHA-256 is ``89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8``.
+    The table is redistributed under RFdiffusion's BSD 3-Clause license.
+    """
+
+    with (
+        files(__package__).joinpath("rfdiffusion_schedule.npz").open("rb") as file,
+        np.load(file, allow_pickle=False) as values,
+    ):
+        return {name: values[name] for name in values.files}
 
 
 class RoseTTAFoldModule(nn.Module):
@@ -7349,6 +7168,22 @@ def _residue_contact_coordinate(
     return -0.58273431 * np.cross(b, c) + 0.56802827 * b - 0.54067466 * c + calpha
 
 
+def symbolic_residue_aliases(
+    references: tuple[ComponentReference | SymbolicResidueSite, ...],
+) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
+    r"""Map canonical negative segment offsets to the concrete positive trajectory identities."""
+
+    segments: dict[str, list[SymbolicResidueSite]] = {}
+    for reference in references:
+        if type(reference) is SymbolicResidueSite:
+            segments.setdefault(reference.placement_id, []).append(reference)
+    return {
+        SymbolicResidueSite(placement_id, index - len(rows)): reference
+        for placement_id, rows in segments.items()
+        for index, reference in enumerate(rows)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Folded from rfdiffusion/contract.py: RFdiffusion's exact tensor boundary and
 # semantic layout.  Records moved verbatim; the imports they need are declared
@@ -7435,17 +7270,182 @@ class RFdiffusionOutput:
     torsion_trajectory: Tensor
 
 
-def symbolic_residue_aliases(
-    references: tuple[ComponentReference | SymbolicResidueSite, ...],
-) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
-    r"""Map canonical negative segment offsets to the concrete positive trajectory identities."""
+@dataclass(eq=False)
+class RFdiffusionDesignCandidate:
+    r"""One coordinate-producing RFdiffusion generation sample and its aligned values.
 
-    segments: dict[str, list[SymbolicResidueSite]] = {}
-    for reference in references:
-        if type(reference) is SymbolicResidueSite:
-            segments.setdefault(reference.placement_id, []).append(reference)
-    return {
-        SymbolicResidueSite(placement_id, index - len(rows)): reference
-        for placement_id, rows in segments.items()
-        for index, reference in enumerate(rows)
-    }
+    Each candidate owns the complete decoded backbone ``Structure`` (which owns its
+    ``MolecularSystem`` via ``Structure.system``). Generated residue identity is CCD ``UNK``;
+    the Structure contains only the backbone sites RFdiffusion produced. The variable placement
+    length across candidates is the coordinate-producing, variable-topology property that
+    forbids reuse of the shared ``DesignCandidate``. Standalone -- no base class.
+
+    ``placement_map`` is the frozen §3.7 realized output surface for this sample
+    (``declaration_group -> placement_id -> realized OUTPUT occurrences``, W6 caveat a): after
+    the variable generated lengths are sampled, RFdiffusion adopts the shared grouped
+    ``placement_map`` as its per-candidate output identity (the same surface the other three
+    families carry) rather than the FLAT pre-sample ``output_residues`` layout. It is
+    losslessly reconstructed from that flat layout at decode time and exhaustively partitions
+    every realized backbone residue; ``ComponentReference[0]`` values are this candidate's
+    ``Structure.system`` instance ids. Empty only when there is no placement (no molecular
+    input and no ``RFdiffusionPlacements``).
+    """
+
+    structure: Structure
+    placement_map: PlacementMap = field(default_factory=dict)
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class RFdiffusionResult:
+    r"""One generation-ordered collection of coordinate-producing RFdiffusion designs.
+
+    Tuple position is sample identity for one generation context; there is no auxiliary index
+    field, and no input/context/placement-map/provenance field is carried.
+    """
+
+    candidates: tuple[RFdiffusionDesignCandidate, ...]
+
+    def best(self, score: str) -> RFdiffusionDesignCandidate:
+        r"""Return the earliest best candidate under one explicit score.
+
+        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the score's
+        ``preferred`` direction must be consistently ``"higher"`` or ``"lower"``; unit and scope
+        must match across every candidate; a NaN value or an undefined direction raises at
+        ranking time; infinity is rankable; and the earliest candidate wins a tie.
+        """
+
+        scores = tuple(candidate.scores[score] for candidate in self.candidates)
+        directions = {value.preferred for value in scores}
+        if directions not in ({"higher"}, {"lower"}):
+            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+        if len({value.unit for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical unit")
+        if len({value.scope for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical scope")
+        if any(math.isnan(value.value) for value in scores):
+            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+        if directions == {"higher"}:
+            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+# --------------------------------------------------------------------------------------
+# Placement condition envelope (FROZEN §3.7 placement core carried with the family-owned
+# ``chain_lengths`` length argument).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RFdiffusionPlacements:
+    r"""One RFdiffusion generation topology: the frozen placement core plus its lengths.
+
+    ``placements`` is the frozen §3.7 core ``PlacementSpec`` mapping
+    (``declaration_group -> placement_id -> PlacementValue``); its inner ``placement_id``
+    keys are globally unique and carry identity. ``chain_lengths`` is the RFdiffusion
+    family-owned per-group combined-length argument (aligned to the declaration-group
+    order of ``placements``); it stays on this family envelope, NEVER on the shared core
+    (which carries no length field). ``intent`` is always ``"hard"`` for RFdiffusion.
+    """
+
+    placements: PlacementMapping
+    chain_lengths: tuple[int | None, ...] | None = None
+    intent: Literal["hard", "soft"] = "hard"
+
+
+# --------------------------------------------------------------------------------------
+# Family-owned spatial / placement conditions (DESIGN 3.7.2, family-owned & investigated).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReferenceCoordinates:
+    r"""Fixed backbone coordinates for a set of existing atoms (consumed as ``hard``)."""
+
+    sites: tuple[AtomSite, ...]
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class Coordination:
+    r"""A smooth ``1 / (1 + x**6)`` coordination-number potential between two sides."""
+
+    side_a: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
+    side_b: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
+    center_angstrom: float
+    scale_angstrom: float
+    direction: Literal["maximize", "minimize"]
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class Distance:
+    r"""A tolerance-padded ``[lower, upper]`` distance interval between two atoms."""
+
+    site_a: AtomSite | SymbolicAtomSite
+    site_b: AtomSite | SymbolicAtomSite
+    lower_angstrom: float
+    upper_angstrom: float
+    tolerance_angstrom: float = 0.0
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class RadiusOfGyration:
+    r"""A compactness potential over a set of residue centroids."""
+
+    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    upper_angstrom: float
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+@dataclass(frozen=True)
+class SubstrateInteraction:
+    r"""The released nearest-substrate attraction and clearance potential.
+
+    ``repulsion_cutoff_angstrom`` is the released ``rep_r_0`` clearance radius; the
+    non-default ``rep_r_min=0`` all-pairs branch is a separate control (see the family
+    README) and is not represented by this default meaning.
+    """
+
+    residues: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    substrate_atoms: tuple[AtomSite | SymbolicAtomSite, ...]
+    center_angstrom: float
+    scale_angstrom: float
+    attraction_strength: float
+    repulsion_slope: float
+    repulsion_cutoff_angstrom: float = 5.0
+    weight: float | None = None
+    intent: Literal["hard", "soft"] = "soft"
+
+
+# RFdiffusion's requested covalent bond (e.g. terminal peptide cyclization) IS the frozen §3.7.4
+# ``SymbolicBond``; the family declares no separate record and no compatibility alias (DESIGN §10.2
+# forbids preserving prototype names through aliases). The processor still collapses a terminal
+# N->C ``SymbolicBond`` to ``cyclic_mask`` (behavior unchanged), and RFdiffusion always consumes it
+# as ``hard`` (the frozen ``SymbolicBond`` carries no ``intent`` field, matching that fixed meaning).
+
+
+@dataclass(frozen=True)
+class PointGroupSymmetry:
+    r"""A point-group symmetry over equal-length residue units (consumed as ``hard``)."""
+
+    units: tuple[tuple[ComponentReference | str | SymbolicResidueSite, ...], ...]
+    kind: str
+    order: int | None
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class SecondaryStructure:
+    r"""A per-target secondary-structure label; requires a fold-conditioned checkpoint."""
+
+    targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
+    kind: str
+    intent: Literal["hard", "soft"] = "soft"

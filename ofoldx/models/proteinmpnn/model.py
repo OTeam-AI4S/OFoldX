@@ -37,142 +37,6 @@ from ...results import (
 from .config import ProteinMpnnConfig
 
 
-def _pair_radial_basis(
-    source_coordinates: Tensor,
-    target_coordinates: Tensor,
-    neighbor_indices: Tensor,
-    num_bins: int = 16,
-) -> Tensor:
-    r"""Encode source-to-neighbor-target distances with radial bases."""
-
-    neighbor_coordinates = gather_nodes(target_coordinates, neighbor_indices)
-    neighbor_distances = torch.sqrt(
-        torch.sum((source_coordinates.unsqueeze(-2) - neighbor_coordinates) ** 2, dim=-1) + 1e-6
-    )
-    return _radial_basis(neighbor_distances, num_bins)
-
-
-class CaProteinMpnnFeatures(nn.Module):
-    r"""Released Cα-only ProteinMPNN edge feature graph."""
-
-    def __init__(self, hidden_size: int, num_neighbors: int) -> None:
-        super().__init__()
-        self.num_neighbors = num_neighbors
-        self.relative_position = MpnnRelativePositionEncoding(16)
-        self.edge_projection = nn.Linear(16 + 9 * 16 + 7, hidden_size, bias=False)
-        self.edge_norm = nn.LayerNorm(hidden_size)
-
-    @staticmethod
-    def quaternions(rotations: Tensor) -> Tensor:
-        r"""Convert rotation matrices to the released quaternion features."""
-
-        diagonal = torch.diagonal(rotations, dim1=-2, dim2=-1)
-        xx, yy, zz = diagonal.unbind(-1)
-        magnitudes = 0.5 * torch.sqrt(
-            torch.abs(
-                1
-                + torch.stack(
-                    (
-                        xx - yy - zz,
-                        -xx + yy - zz,
-                        -xx - yy + zz,
-                    ),
-                    dim=-1,
-                )
-            )
-        )
-        signs = torch.sign(
-            torch.stack(
-                (
-                    rotations[..., 2, 1] - rotations[..., 1, 2],
-                    rotations[..., 0, 2] - rotations[..., 2, 0],
-                    rotations[..., 1, 0] - rotations[..., 0, 1],
-                ),
-                dim=-1,
-            )
-        )
-        xyz = signs * magnitudes
-        w = torch.sqrt(F.relu(1 + diagonal.sum(dim=-1, keepdim=True))) / 2
-        return F.normalize(torch.cat((xyz, w), dim=-1), dim=-1)
-
-    @classmethod
-    def orientations(
-        cls,
-        alpha_carbons: Tensor,
-        neighbor_indices: Tensor,
-    ) -> Tensor:
-        r"""Return the live neighbor-orientation features."""
-
-        displacements = alpha_carbons[:, 1:] - alpha_carbons[:, :-1]
-        displacement_norms = torch.linalg.vector_norm(displacements, dim=-1)
-        consecutive = (displacement_norms > 3.6) & (displacement_norms < 4.0)
-        unit = F.normalize(displacements * consecutive.unsqueeze(-1), dim=-1)
-        u2 = unit[:, :-2]
-        u1 = unit[:, 1:-1]
-        n2 = F.normalize(torch.cross(u2, u1, dim=-1), dim=-1)
-
-        first_axis = F.normalize(u2 - u1, dim=-1)
-        frames = torch.stack((first_axis, n2, torch.cross(first_axis, n2, dim=-1)), dim=-2)
-        frames = F.pad(frames.flatten(start_dim=-2), (0, 0, 1, 2)).reshape(
-            alpha_carbons.shape[0],
-            alpha_carbons.shape[1],
-            3,
-            3,
-        )
-        neighbor_frames = gather_nodes(frames.flatten(start_dim=-2), neighbor_indices).reshape(
-            *neighbor_indices.shape,
-            3,
-            3,
-        )
-        neighbor_coordinates = gather_nodes(alpha_carbons, neighbor_indices)
-        direction = neighbor_coordinates - alpha_carbons.unsqueeze(-2)
-        direction = torch.matmul(frames.unsqueeze(-3), direction.unsqueeze(-1)).squeeze(-1)
-        direction = F.normalize(direction, dim=-1)
-        rotations = torch.matmul(frames.unsqueeze(-3).transpose(-1, -2), neighbor_frames)
-        return torch.cat((direction, cls.quaternions(rotations)), dim=-1)
-
-    def forward(
-        self,
-        backbone_coordinates: Tensor,
-        valid_mask: Tensor,
-        residue_indices: Tensor,
-        chain_indices: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        r"""Build the nine-pair Cα-only neighbor graph."""
-
-        neighbor_distances, neighbor_indices = _nearest_neighbors(
-            backbone_coordinates,
-            valid_mask,
-            self.num_neighbors,
-        )
-        previous = torch.zeros_like(backbone_coordinates)
-        previous[:, 1:] = backbone_coordinates[:, :-1]
-        following = torch.zeros_like(backbone_coordinates)
-        following[:, :-1] = backbone_coordinates[:, 1:]
-        orientation = self.orientations(backbone_coordinates, neighbor_indices)
-        distance_features = torch.cat(
-            (
-                _radial_basis(neighbor_distances),
-                _pair_radial_basis(previous, previous, neighbor_indices),
-                _pair_radial_basis(following, following, neighbor_indices),
-                _pair_radial_basis(previous, backbone_coordinates, neighbor_indices),
-                _pair_radial_basis(previous, following, neighbor_indices),
-                _pair_radial_basis(backbone_coordinates, previous, neighbor_indices),
-                _pair_radial_basis(backbone_coordinates, following, neighbor_indices),
-                _pair_radial_basis(following, previous, neighbor_indices),
-                _pair_radial_basis(following, backbone_coordinates, neighbor_indices),
-            ),
-            dim=-1,
-        )
-        residue_offsets = residue_indices[:, :, None] - residue_indices[:, None, :]
-        residue_offsets = gather_edges(residue_offsets.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        same_chain = (chain_indices[:, :, None] == chain_indices[:, None, :]).long()
-        same_chain = gather_edges(same_chain.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        position_features = self.relative_position(residue_offsets.long(), same_chain)
-        edges = torch.cat((position_features, distance_features, orientation), dim=-1)
-        return self.edge_norm(self.edge_projection(edges)), neighbor_indices
-
-
 class ProteinMpnnModel(nn.Module):
     r"""ProteinMPNN full-backbone or Cα-only sequence model."""
 
@@ -1282,6 +1146,142 @@ class ProteinMpnnModel(nn.Module):
                 )
             )
         return ProteinMpnnDesignResult(candidates=tuple(candidates), input_score=input_score)
+
+
+def _pair_radial_basis(
+    source_coordinates: Tensor,
+    target_coordinates: Tensor,
+    neighbor_indices: Tensor,
+    num_bins: int = 16,
+) -> Tensor:
+    r"""Encode source-to-neighbor-target distances with radial bases."""
+
+    neighbor_coordinates = gather_nodes(target_coordinates, neighbor_indices)
+    neighbor_distances = torch.sqrt(
+        torch.sum((source_coordinates.unsqueeze(-2) - neighbor_coordinates) ** 2, dim=-1) + 1e-6
+    )
+    return _radial_basis(neighbor_distances, num_bins)
+
+
+class CaProteinMpnnFeatures(nn.Module):
+    r"""Released Cα-only ProteinMPNN edge feature graph."""
+
+    def __init__(self, hidden_size: int, num_neighbors: int) -> None:
+        super().__init__()
+        self.num_neighbors = num_neighbors
+        self.relative_position = MpnnRelativePositionEncoding(16)
+        self.edge_projection = nn.Linear(16 + 9 * 16 + 7, hidden_size, bias=False)
+        self.edge_norm = nn.LayerNorm(hidden_size)
+
+    @staticmethod
+    def quaternions(rotations: Tensor) -> Tensor:
+        r"""Convert rotation matrices to the released quaternion features."""
+
+        diagonal = torch.diagonal(rotations, dim1=-2, dim2=-1)
+        xx, yy, zz = diagonal.unbind(-1)
+        magnitudes = 0.5 * torch.sqrt(
+            torch.abs(
+                1
+                + torch.stack(
+                    (
+                        xx - yy - zz,
+                        -xx + yy - zz,
+                        -xx - yy + zz,
+                    ),
+                    dim=-1,
+                )
+            )
+        )
+        signs = torch.sign(
+            torch.stack(
+                (
+                    rotations[..., 2, 1] - rotations[..., 1, 2],
+                    rotations[..., 0, 2] - rotations[..., 2, 0],
+                    rotations[..., 1, 0] - rotations[..., 0, 1],
+                ),
+                dim=-1,
+            )
+        )
+        xyz = signs * magnitudes
+        w = torch.sqrt(F.relu(1 + diagonal.sum(dim=-1, keepdim=True))) / 2
+        return F.normalize(torch.cat((xyz, w), dim=-1), dim=-1)
+
+    @classmethod
+    def orientations(
+        cls,
+        alpha_carbons: Tensor,
+        neighbor_indices: Tensor,
+    ) -> Tensor:
+        r"""Return the live neighbor-orientation features."""
+
+        displacements = alpha_carbons[:, 1:] - alpha_carbons[:, :-1]
+        displacement_norms = torch.linalg.vector_norm(displacements, dim=-1)
+        consecutive = (displacement_norms > 3.6) & (displacement_norms < 4.0)
+        unit = F.normalize(displacements * consecutive.unsqueeze(-1), dim=-1)
+        u2 = unit[:, :-2]
+        u1 = unit[:, 1:-1]
+        n2 = F.normalize(torch.cross(u2, u1, dim=-1), dim=-1)
+
+        first_axis = F.normalize(u2 - u1, dim=-1)
+        frames = torch.stack((first_axis, n2, torch.cross(first_axis, n2, dim=-1)), dim=-2)
+        frames = F.pad(frames.flatten(start_dim=-2), (0, 0, 1, 2)).reshape(
+            alpha_carbons.shape[0],
+            alpha_carbons.shape[1],
+            3,
+            3,
+        )
+        neighbor_frames = gather_nodes(frames.flatten(start_dim=-2), neighbor_indices).reshape(
+            *neighbor_indices.shape,
+            3,
+            3,
+        )
+        neighbor_coordinates = gather_nodes(alpha_carbons, neighbor_indices)
+        direction = neighbor_coordinates - alpha_carbons.unsqueeze(-2)
+        direction = torch.matmul(frames.unsqueeze(-3), direction.unsqueeze(-1)).squeeze(-1)
+        direction = F.normalize(direction, dim=-1)
+        rotations = torch.matmul(frames.unsqueeze(-3).transpose(-1, -2), neighbor_frames)
+        return torch.cat((direction, cls.quaternions(rotations)), dim=-1)
+
+    def forward(
+        self,
+        backbone_coordinates: Tensor,
+        valid_mask: Tensor,
+        residue_indices: Tensor,
+        chain_indices: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        r"""Build the nine-pair Cα-only neighbor graph."""
+
+        neighbor_distances, neighbor_indices = _nearest_neighbors(
+            backbone_coordinates,
+            valid_mask,
+            self.num_neighbors,
+        )
+        previous = torch.zeros_like(backbone_coordinates)
+        previous[:, 1:] = backbone_coordinates[:, :-1]
+        following = torch.zeros_like(backbone_coordinates)
+        following[:, :-1] = backbone_coordinates[:, 1:]
+        orientation = self.orientations(backbone_coordinates, neighbor_indices)
+        distance_features = torch.cat(
+            (
+                _radial_basis(neighbor_distances),
+                _pair_radial_basis(previous, previous, neighbor_indices),
+                _pair_radial_basis(following, following, neighbor_indices),
+                _pair_radial_basis(previous, backbone_coordinates, neighbor_indices),
+                _pair_radial_basis(previous, following, neighbor_indices),
+                _pair_radial_basis(backbone_coordinates, previous, neighbor_indices),
+                _pair_radial_basis(backbone_coordinates, following, neighbor_indices),
+                _pair_radial_basis(following, previous, neighbor_indices),
+                _pair_radial_basis(following, backbone_coordinates, neighbor_indices),
+            ),
+            dim=-1,
+        )
+        residue_offsets = residue_indices[:, :, None] - residue_indices[:, None, :]
+        residue_offsets = gather_edges(residue_offsets.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        same_chain = (chain_indices[:, :, None] == chain_indices[:, None, :]).long()
+        same_chain = gather_edges(same_chain.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        position_features = self.relative_position(residue_offsets.long(), same_chain)
+        edges = torch.cat((position_features, distance_features, orientation), dim=-1)
+        return self.edge_norm(self.edge_projection(edges)), neighbor_indices
 
 
 # ---------------------------------------------------------------------------

@@ -43,69 +43,6 @@ from ...modules.backend.triangle_multiplication import triangle_multiplication a
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import ESMFold2Config
 
-# ===========================================================================
-# ESMFold2's exact tensor boundary and canonical semantic layout.
-# ===========================================================================
-
-
-@dataclass(frozen=True)
-class ESMFold2Layout:
-    r"""Canonical identities aligned to one ESMFold2 token/atom tensor layout."""
-
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
-    msa: MSA | MSACollection | None = None
-
-
-@dataclass(kw_only=True)
-class ESMFold2Input:
-    r"""Tensor inputs consumed by the released ESMFold2 graph.
-
-    ESMC inputs use one batch row per protein chain. ``token_to_esmc`` stores
-    flattened row/position indices that gather those states back to structure-token
-    order.
-    """
-
-    token_index: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    symmetry_index: Tensor
-    entity_index: Tensor
-    mol_type: Tensor
-    res_type: Tensor
-    token_bonds: Tensor
-    token_attention_mask: Tensor
-    ref_pos: Tensor
-    ref_element: Tensor
-    ref_charge: Tensor
-    ref_atom_name_chars: Tensor
-    ref_space_uid: Tensor
-    atom_attention_mask: Tensor
-    atom_to_token: Tensor
-    distogram_atom_idx: Tensor
-    token_has_esmc: Tensor
-    layout: ESMFold2Layout
-    deletion_mean: Tensor | None = None
-    msa: Tensor | None = None
-    has_deletion: Tensor | None = None
-    deletion_value: Tensor | None = None
-    msa_attention_mask: Tensor | None = None
-    esmc_input_ids: Tensor | None = None
-    esmc_attention_mask: Tensor | None = None
-    token_to_esmc: Tensor | None = None
-    esmc_hidden_states: Tensor | None = None
-    noisy_atom_coordinates: Tensor | None = None
-    noise_level: Tensor | None = None
-
-
-@dataclass
-class ESMFold2Output:
-    r"""Differentiable single-step denoising output returned by ``forward``."""
-
-    denoised_coordinates: Tensor
-    distogram_logits: Tensor
-
 
 class ESMFold2Model(nn.Module):
     """ESMFold2 — all-atom structure prediction with an ESMC PLM backbone.
@@ -3574,3 +3511,67 @@ class ESMFold2DesignResult:
         if directions == {"higher"}:
             return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
         return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+
+
+# ===========================================================================
+# ESMFold2's exact tensor boundary and canonical semantic layout.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class ESMFold2Layout:
+    r"""Canonical identities aligned to one ESMFold2 token/atom tensor layout."""
+
+    system: MolecularSystem
+    atom_sites: tuple[AtomSite, ...]
+    token_sites: tuple[AtomSite | tuple[str, int], ...]
+    msa: MSA | MSACollection | None = None
+
+
+@dataclass(kw_only=True)
+class ESMFold2Input:
+    r"""Tensor inputs consumed by the released ESMFold2 graph.
+
+    ESMC inputs use one batch row per protein chain. ``token_to_esmc`` stores
+    flattened row/position indices that gather those states back to structure-token
+    order.
+    """
+
+    token_index: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    symmetry_index: Tensor
+    entity_index: Tensor
+    mol_type: Tensor
+    res_type: Tensor
+    token_bonds: Tensor
+    token_attention_mask: Tensor
+    ref_pos: Tensor
+    ref_element: Tensor
+    ref_charge: Tensor
+    ref_atom_name_chars: Tensor
+    ref_space_uid: Tensor
+    atom_attention_mask: Tensor
+    atom_to_token: Tensor
+    distogram_atom_idx: Tensor
+    token_has_esmc: Tensor
+    layout: ESMFold2Layout
+    deletion_mean: Tensor | None = None
+    msa: Tensor | None = None
+    has_deletion: Tensor | None = None
+    deletion_value: Tensor | None = None
+    msa_attention_mask: Tensor | None = None
+    esmc_input_ids: Tensor | None = None
+    esmc_attention_mask: Tensor | None = None
+    token_to_esmc: Tensor | None = None
+    esmc_hidden_states: Tensor | None = None
+    noisy_atom_coordinates: Tensor | None = None
+    noise_level: Tensor | None = None
+
+
+@dataclass
+class ESMFold2Output:
+    r"""Differentiable single-step denoising output returned by ``forward``."""
+
+    denoised_coordinates: Tensor
+    distogram_logits: Tensor

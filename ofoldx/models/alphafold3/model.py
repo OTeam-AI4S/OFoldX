@@ -1250,138 +1250,6 @@ def expected_plddt(logits: Tensor) -> Tensor:
     return (logits.softmax(dim=-1) * centers * (100.0 / logits.shape[-1])).sum(dim=-1)
 
 
-@dataclass(kw_only=True)
-class AlphaFold3Input:
-    r"""Tensors consumed by the released AlphaFold 3 graph.
-
-    ``reference_charges`` has the unique shape ``[..., N_atom, 1]``.
-
-    ``system``, ``atom_sites``, and ``token_sites`` carry the canonical identities
-    used to reconstruct the folding result. They are optional so the pure-tensor
-    model graph (``forward`` / ``_sample``) can be driven with bare tensors, but the
-    :class:`AlphaFold3Processor` always populates them so :meth:`AlphaFold3Model.fold`
-    can decode coordinates back into a :class:`~ofoldx.data.structure.Structure`.
-    """
-
-    token_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    entity_index: Tensor
-    symmetry_index: Tensor
-    token_index: Tensor
-    atom_features: Tensor
-    atom_to_token: Tensor
-    atom_mask: Tensor
-    reference_positions: Tensor
-    reference_space_id: Tensor
-    atom_token_index: Tensor
-    token_to_rep_atom: Tensor
-    token_features: Tensor
-    reference_mask: Tensor
-    reference_charges: Tensor
-    token_bonds: Tensor
-    msa_features: Tensor | None = None
-    msa_mask: Tensor | None = None
-    template_features: TemplateFeatures | None = None
-    system: MolecularSystem | None = None
-    atom_sites: tuple[AtomSite, ...] = ()
-    token_sites: tuple[AtomSite | ComponentReference, ...] = ()
-
-
-@dataclass
-class AlphaFold3Output:
-    r"""Predictions computed by one AlphaFold 3 denoising call."""
-
-    coordinates: Tensor
-    distogram_logits: Tensor
-    plddt_logits: Tensor
-    pae_logits: Tensor
-    pde_logits: Tensor
-    resolved_logits: Tensor
-
-    @property
-    def plddt(self) -> Tensor:
-        r"""Expected pLDDT on the conventional 0--100 scale."""
-
-        return expected_plddt(self.plddt_logits)
-
-
-# ---------------------------------------------------------------------------------
-# Family-owned seed-group-preserving folding result (folded from ``result.py``).
-#
-# The released AlphaFold 3 inference pipeline runs ``S`` seeds; each seed shares one
-# trunk pass and draws ``num_diffusion_samples`` diffusion rollouts, and the
-# ``S x num_samples`` samples are pooled and ranked (upstream ``model.py:487-528``).
-# Per frozen DESIGN 5.2, a family that returns several seed groups owns a concrete
-# result that *preserves* those groups rather than flattening them into the shared
-# ``ofoldx.results.FoldResult``. The shared ``FoldPrediction`` value is reused
-# unchanged; only the outer grouping is family-specific.
-# ---------------------------------------------------------------------------------
-
-
-@dataclass(eq=False)
-class AlphaFold3SeedGroup:
-    r"""One diffusion seed and its generation-ordered samples.
-
-    Attributes:
-        seed: The integer diffusion seed shared by every sample in this group.
-        predictions: Generation-ordered samples drawn for this seed; tuple
-            position is the sample identity within the group.
-    """
-
-    seed: int
-    predictions: tuple[FoldPrediction, ...]
-
-
-@dataclass(eq=False)
-class AlphaFold3FoldResult:
-    r"""One AlphaFold 3 folding result preserving its per-seed sample groups.
-
-    Attributes:
-        seed_groups: One :class:`AlphaFold3SeedGroup` per seed, in the order the
-            seeds were run.
-    """
-
-    seed_groups: tuple[AlphaFold3SeedGroup, ...]
-
-    def best(self, score: str) -> FoldPrediction:
-        r"""Return the earliest best prediction under one explicit score.
-
-        Pools every sample across every seed group and ranks the pool by the named
-        :class:`~ofoldx.results.Score`, matching the upstream pooled ranking across
-        all ``S x num_samples`` samples. This reuses the exact
-        explicit-direction, identical-unit, identical-scope, NaN-rejecting,
-        infinity-rankable, earliest-tie semantics of
-        :meth:`~ofoldx.results.FoldResult.best` (frozen DESIGN 5.2 forbids routing
-        this through a shared rank helper, so the checks are written directly).
-
-        Args:
-            score: The name of the per-sample score to rank on.
-
-        Returns:
-            The earliest pooled sample that is best under ``score``.
-
-        Raises:
-            ValueError: If the score does not consistently prefer higher or lower
-                values, mixes units or scopes, or contains a NaN value.
-        """
-
-        predictions = tuple(prediction for group in self.seed_groups for prediction in group.predictions)
-        scores = tuple(prediction.scores[score] for prediction in predictions)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(predictions, key=lambda prediction: prediction.scores[score].value)
-        return min(predictions, key=lambda prediction: prediction.scores[score].value)
-
-
 # ---------------------------------------------------------------------------------
 # Family-owned DSSP / geometry post-processing for the ranking score (folded from
 # ``confidence.py``).
@@ -1728,3 +1596,135 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
 
     tree = spatial.cKDTree(coordinates)
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
+
+
+@dataclass(kw_only=True)
+class AlphaFold3Input:
+    r"""Tensors consumed by the released AlphaFold 3 graph.
+
+    ``reference_charges`` has the unique shape ``[..., N_atom, 1]``.
+
+    ``system``, ``atom_sites``, and ``token_sites`` carry the canonical identities
+    used to reconstruct the folding result. They are optional so the pure-tensor
+    model graph (``forward`` / ``_sample``) can be driven with bare tensors, but the
+    :class:`AlphaFold3Processor` always populates them so :meth:`AlphaFold3Model.fold`
+    can decode coordinates back into a :class:`~ofoldx.data.structure.Structure`.
+    """
+
+    token_mask: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    entity_index: Tensor
+    symmetry_index: Tensor
+    token_index: Tensor
+    atom_features: Tensor
+    atom_to_token: Tensor
+    atom_mask: Tensor
+    reference_positions: Tensor
+    reference_space_id: Tensor
+    atom_token_index: Tensor
+    token_to_rep_atom: Tensor
+    token_features: Tensor
+    reference_mask: Tensor
+    reference_charges: Tensor
+    token_bonds: Tensor
+    msa_features: Tensor | None = None
+    msa_mask: Tensor | None = None
+    template_features: TemplateFeatures | None = None
+    system: MolecularSystem | None = None
+    atom_sites: tuple[AtomSite, ...] = ()
+    token_sites: tuple[AtomSite | ComponentReference, ...] = ()
+
+
+@dataclass
+class AlphaFold3Output:
+    r"""Predictions computed by one AlphaFold 3 denoising call."""
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    plddt_logits: Tensor
+    pae_logits: Tensor
+    pde_logits: Tensor
+    resolved_logits: Tensor
+
+    @property
+    def plddt(self) -> Tensor:
+        r"""Expected pLDDT on the conventional 0--100 scale."""
+
+        return expected_plddt(self.plddt_logits)
+
+
+# ---------------------------------------------------------------------------------
+# Family-owned seed-group-preserving folding result (folded from ``result.py``).
+#
+# The released AlphaFold 3 inference pipeline runs ``S`` seeds; each seed shares one
+# trunk pass and draws ``num_diffusion_samples`` diffusion rollouts, and the
+# ``S x num_samples`` samples are pooled and ranked (upstream ``model.py:487-528``).
+# Per frozen DESIGN 5.2, a family that returns several seed groups owns a concrete
+# result that *preserves* those groups rather than flattening them into the shared
+# ``ofoldx.results.FoldResult``. The shared ``FoldPrediction`` value is reused
+# unchanged; only the outer grouping is family-specific.
+# ---------------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class AlphaFold3SeedGroup:
+    r"""One diffusion seed and its generation-ordered samples.
+
+    Attributes:
+        seed: The integer diffusion seed shared by every sample in this group.
+        predictions: Generation-ordered samples drawn for this seed; tuple
+            position is the sample identity within the group.
+    """
+
+    seed: int
+    predictions: tuple[FoldPrediction, ...]
+
+
+@dataclass(eq=False)
+class AlphaFold3FoldResult:
+    r"""One AlphaFold 3 folding result preserving its per-seed sample groups.
+
+    Attributes:
+        seed_groups: One :class:`AlphaFold3SeedGroup` per seed, in the order the
+            seeds were run.
+    """
+
+    seed_groups: tuple[AlphaFold3SeedGroup, ...]
+
+    def best(self, score: str) -> FoldPrediction:
+        r"""Return the earliest best prediction under one explicit score.
+
+        Pools every sample across every seed group and ranks the pool by the named
+        :class:`~ofoldx.results.Score`, matching the upstream pooled ranking across
+        all ``S x num_samples`` samples. This reuses the exact
+        explicit-direction, identical-unit, identical-scope, NaN-rejecting,
+        infinity-rankable, earliest-tie semantics of
+        :meth:`~ofoldx.results.FoldResult.best` (frozen DESIGN 5.2 forbids routing
+        this through a shared rank helper, so the checks are written directly).
+
+        Args:
+            score: The name of the per-sample score to rank on.
+
+        Returns:
+            The earliest pooled sample that is best under ``score``.
+
+        Raises:
+            ValueError: If the score does not consistently prefer higher or lower
+                values, mixes units or scopes, or contains a NaN value.
+        """
+
+        predictions = tuple(prediction for group in self.seed_groups for prediction in group.predictions)
+        scores = tuple(prediction.scores[score] for prediction in predictions)
+        directions = {value.preferred for value in scores}
+        if directions not in ({"higher"}, {"lower"}):
+            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+        if len({value.unit for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical unit")
+        if len({value.scope for value in scores}) != 1:
+            raise ValueError(f"score {score!r} must use one identical scope")
+        if any(math.isnan(value.value) for value in scores):
+            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+        if directions == {"higher"}:
+            return max(predictions, key=lambda prediction: prediction.scores[score].value)
+        return min(predictions, key=lambda prediction: prediction.scores[score].value)

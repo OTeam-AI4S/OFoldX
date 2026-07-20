@@ -52,370 +52,6 @@ _VOCABULARY = len(AMINO_ACID_COMPONENT_IDS) + 1
 _GENERATABLE = len(AMINO_ACID_COMPONENT_IDS)
 
 
-def side_chain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
-    r"""Build LigandMPNN's 32-slot side-chain element lookup for atom37 slots ``5:37``."""
-
-    return torch.tensor(
-        [6, 6, 6, 8, 8, 16, 6, 6, 6, 7, 7, 8, 8, 16, 6, 6, 6, 6, 7, 7, 7, 8, 8, 6, 7, 7, 8, 6, 6, 6, 7, 8],
-        dtype=torch.long,
-        device=device,
-    )
-
-
-def _backbone_atoms(coordinates: Tensor) -> dict[str, Tensor]:
-    r"""Split N/CA/C/O coordinates and add the idealized virtual Cβ atom."""
-
-    nitrogen = coordinates[:, :, 0]
-    alpha_carbon = coordinates[:, :, 1]
-    carbon = coordinates[:, :, 2]
-    oxygen = coordinates[:, :, 3]
-    beta_carbon = _virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
-    return {"N": nitrogen, "CA": alpha_carbon, "C": carbon, "O": oxygen, "CB": beta_carbon}
-
-
-def _local_angle_features(
-    nitrogen: Tensor,
-    alpha_carbon: Tensor,
-    carbon: Tensor,
-    points: Tensor,
-) -> Tensor:
-    r"""Direction features of ``points`` expressed in each residue's local backbone frame."""
-
-    first_axis = F.normalize(nitrogen - alpha_carbon, dim=-1)
-    carbon_vector = carbon - alpha_carbon
-    projected = torch.einsum("bli,bli->bl", first_axis, carbon_vector)[..., None]
-    second_axis = F.normalize(carbon_vector - first_axis * projected, dim=-1)
-    third_axis = torch.cross(first_axis, second_axis, dim=-1)
-    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
-    local = torch.einsum("blqp,blyq->blyp", frame, points - alpha_carbon[:, :, None])
-    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
-    spatial_radius = torch.norm(local, dim=-1) + 1e-8
-    return torch.stack(
-        (
-            local[..., 0] / planar_radius,
-            local[..., 1] / planar_radius,
-            planar_radius / spatial_radius,
-            local[..., 2] / spatial_radius,
-        ),
-        dim=-1,
-    )
-
-
-def _decode_groups(decode_order: Tensor, tied_groups: list[list[int]]) -> list[list[int]]:
-    r"""Order tied groups by the first time any member appears in the decode order."""
-
-    ordered: list[list[int]] = []
-    seen: set[int] = set()
-    for residue in decode_order.detach().cpu().tolist():
-        residue = int(residue)
-        if residue in seen:
-            continue
-        group = next((candidate for candidate in tied_groups if residue in candidate), None)
-        selected = list(group) if group is not None else [residue]
-        ordered.append(selected)
-        seen.update(selected)
-    return ordered
-
-
-def _collapse_tied_order(
-    decode_order_row: Tensor,
-    tied_groups: tuple[tuple[int, ...], ...],
-) -> Tensor:
-    r"""Collapse a drawn order so every tied group decodes consecutively from its first member."""
-
-    ordered = _decode_groups(decode_order_row, [list(group) for group in tied_groups])
-    return torch.tensor(
-        list(itertools.chain.from_iterable(ordered)),
-        device=decode_order_row.device,
-        dtype=torch.long,
-    )
-
-
-def _realize_designed_system(
-    system: MolecularSystem,
-    component_references: tuple[ComponentReference | None, ...],
-    sampled_tokens: list[int],
-    design_mask: list[bool],
-) -> MolecularSystem:
-    r"""Realize one candidate while preserving entity, instance, and bond identity.
-
-    Designed protein occurrences take their sampled generatable identity; every untouched entity,
-    instance, and resolvable stored bond is preserved. Changed copies of a shared entity partition by
-    their complete output component-ID sequence exactly as frozen for ProteinMpnn, and entities from
-    different originals never merge.
-    """
-
-    replacements = {
-        reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
-        for reference, token, selected in zip(component_references, sampled_tokens, design_mask)
-        if reference is not None and selected
-    }
-    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            realized_by_instance[instance_id] = PolymerSequence(
-                entity.polymer_type,
-                tuple(
-                    replacements.get((instance_id, index), component)
-                    for index, component in enumerate(entity.components)
-                ),
-            )
-        else:
-            realized_by_instance[instance_id] = entity
-
-    # TODO(§3.4.1 reopened): family-owned canonical entity splitting is still reopened for LigandMpnn.
-    # Until it freezes we partition changed copies within each original entity by complete output
-    # component-ID sequence, exactly as frozen for ProteinMpnn (§4.7); this is the minimal current
-    # behavior and never merges entities from different originals.
-    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
-        entity_id: [] for entity_id in system.entities
-    }
-    for instance_id, entity_id in system.instances.items():
-        entity = realized_by_instance[instance_id]
-        signature = tuple(component.component_id for component in entity.components)
-        partition = next(
-            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
-            None,
-        )
-        if partition is None:
-            partitions[entity_id].append((signature, entity, [instance_id]))
-        else:
-            partition[2].append(instance_id)
-
-    used_ids = set(system.entities)
-    new_entities: dict[str, PolymerSequence | Molecule] = {}
-    instance_entities: dict[str, str] = {}
-    for entity_id, original in system.entities.items():
-        values = partitions[entity_id]
-        original_signature = tuple(component.component_id for component in original.components)
-        primary_index = next(
-            (index for index, value in enumerate(values) if value[0] == original_signature),
-            0,
-        )
-        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
-            signature, entity, instance_ids = values[partition_index]
-            if partition_index == primary_index:
-                output_id = entity_id
-            else:
-                suffix = 2
-                output_id = f"{entity_id}_{suffix}"
-                while output_id in used_ids:
-                    suffix += 1
-                    output_id = f"{entity_id}_{suffix}"
-                used_ids.add(output_id)
-            new_entities[output_id] = original if signature == original_signature else entity
-            for instance_id in instance_ids:
-                instance_entities[instance_id] = output_id
-    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-    candidate = MolecularSystem(new_entities, new_instances)
-    retained_bonds = []
-    for bond in system.bonds:
-        try:
-            candidate.atom(bond.site_a)
-            candidate.atom(bond.site_b)
-            if bond.stereo_sites is not None:
-                candidate.atom(bond.stereo_sites[0])
-                candidate.atom(bond.stereo_sites[1])
-        except KeyError:
-            continue
-        retained_bonds.append(bond)
-    return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
-
-
-class LigandMpnnFeatures(MpnnProteinFeatures):
-    r"""
-    Input featurizer for the LigandMPNN backbone graph and ligand/side-chain context.
-
-    Derives the virtual Cβ atom, builds the k-nearest-neighbor residue graph and pairwise edge features
-    (through the shared full-protein edge graph), and in parallel featurizes the nonprotein context atoms
-    (per-atom RBF distances to backbone atoms, periodic-table element one-hots, and local-frame angle
-    features). When ``use_side_chain_context`` is set at call time, the observed side-chain atoms of the
-    nearest fixed residues are folded into that context and the nearest atoms are reselected.
-
-    Args:
-        hidden_size: Width of the per-residue edge features and per-atom context node features.
-        num_neighbors: Number of nearest-neighbor residues in the graph.
-        num_positional_embeddings: Width of the relative-position embedding.
-        num_rbf: Number of radial basis functions per distance feature.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_neighbors: int,
-        *,
-        num_positional_embeddings: int = 16,
-        num_rbf: int = 16,
-    ) -> None:
-        super().__init__(
-            hidden_size,
-            num_neighbors,
-            num_positional_embeddings=num_positional_embeddings,
-            num_rbf=num_rbf,
-        )
-        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
-        self.atom_norm = nn.LayerNorm(hidden_size)
-        self.element_projection = nn.Linear(147, 64)
-        self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
-        self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
-        self.context_edge_norm = nn.LayerNorm(hidden_size)
-        self.context_node_norm = nn.LayerNorm(hidden_size)
-        buffer_device = self.element_projection.weight.device
-        if buffer_device.type == "meta":
-            buffer_device = torch.device("cpu")
-        group, period = periodic_group_period(device=buffer_device)
-        self.register_buffer("periodic_group", group, persistent=False)
-        self.register_buffer("periodic_period", period, persistent=False)
-        self.register_buffer(
-            "side_chain_atom_types",
-            side_chain_atom_types(device=buffer_device),
-            persistent=False,
-        )
-
-    def forward(
-        self,
-        backbone_coordinates: Tensor,
-        valid_mask: Tensor,
-        residue_indices: Tensor,
-        chain_indices: Tensor,
-        context_coordinates: Tensor,
-        context_atomic_numbers: Tensor,
-        context_mask: Tensor,
-        residue_context_coordinates: Tensor,
-        residue_context_mask: Tensor,
-        design_mask: Tensor,
-        *,
-        use_side_chain_context: bool,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""Featurize backbone geometry and context atoms into graph inputs.
-
-        Coordinate noise, when requested, is already applied by the caller to ``backbone_coordinates`` and
-        ``context_coordinates``; the fixed side-chain coordinates are never perturbed.
-
-        Returns:
-            Tuple ``(atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask)``:
-            per-residue context node features, residue-graph edges and neighbor indices, and the
-            context-atom node/edge features and validity mask.
-        """
-
-        num_context_atoms = context_coordinates.shape[2]
-        atoms = _backbone_atoms(backbone_coordinates)
-        edges, neighbor_indices = super().forward(
-            backbone_coordinates,
-            valid_mask,
-            residue_indices,
-            chain_indices,
-        )
-        if use_side_chain_context:
-            context_coordinates, context_atomic_numbers, context_mask = self._append_side_chain_context(
-                atoms["CB"],
-                context_coordinates,
-                context_atomic_numbers,
-                context_mask,
-                residue_context_coordinates,
-                residue_context_mask,
-                design_mask,
-                valid_mask,
-                neighbor_indices,
-                num_context_atoms,
-            )
-
-        context_atomic_numbers = context_atomic_numbers.long()
-        element_features = self._element_features(context_atomic_numbers)
-        element_projection = self.element_projection(element_features.to(dtype=backbone_coordinates.dtype))
-
-        backbone_atoms = torch.stack(
-            (atoms["N"], atoms["CA"], atoms["C"], atoms["O"], atoms["CB"]),
-            dim=2,
-        )
-        atom_context_distances = torch.sqrt(
-            torch.sum((backbone_atoms[:, :, :, None] - context_coordinates[:, :, None]) ** 2, dim=-1) + 1e-6
-        )
-        atom_context_features = _radial_basis(atom_context_distances.movedim(2, 3), self.num_rbf).flatten(start_dim=-2)
-        atom_features = torch.cat(
-            (
-                atom_context_features,
-                element_projection,
-                _local_angle_features(atoms["N"], atoms["CA"], atoms["C"], context_coordinates),
-            ),
-            dim=-1,
-        )
-        atom_features = self.atom_norm(self.atom_projection(atom_features))
-        context_distances = torch.sqrt(
-            torch.sum((context_coordinates[:, :, :, None] - context_coordinates[:, :, None, :]) ** 2, dim=-1) + 1e-6
-        )
-        context_edges = self.context_edge_norm(
-            self.context_edge_projection(_radial_basis(context_distances, self.num_rbf))
-        )
-        context_nodes = self.context_node_norm(
-            self.context_node_projection(element_features.to(dtype=backbone_coordinates.dtype))
-        )
-        return atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask
-
-    def _append_side_chain_context(
-        self,
-        beta_carbon: Tensor,
-        context_coordinates: Tensor,
-        context_atomic_numbers: Tensor,
-        context_mask: Tensor,
-        residue_context_coordinates: Tensor,
-        residue_context_mask: Tensor,
-        design_mask: Tensor,
-        valid_mask: Tensor,
-        neighbor_indices: Tensor,
-        num_context_atoms: int,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Append the observed side-chain atoms of the nearest fixed residues, then reselect atoms.
-
-        Only source-fixed rows contribute side-chain atoms; the first sixteen residue KNN neighbors
-        supply their observed 32-slot side chains, which are concatenated with the nonprotein context
-        before the nearest ``num_context_atoms`` atoms are reselected around the virtual Cβ.
-        """
-
-        batch, length = context_mask.shape[:2]
-        fixed_mask = residue_context_mask * (1 - design_mask[:, :, None])
-        neighbor_subset = neighbor_indices[:, :, :16]
-        side_chain_mask = gather_nodes(fixed_mask, neighbor_subset).reshape(batch, length, -1)
-        side_chain_coordinates = gather_nodes(
-            residue_context_coordinates.reshape(batch, length, -1),
-            neighbor_subset,
-        ).reshape(batch, length, -1, 3)
-        side_chain_types = self.side_chain_atom_types[None, None, None, :].expand(
-            batch,
-            length,
-            neighbor_subset.shape[2],
-            -1,
-        )
-        side_chain_types = side_chain_types.reshape(batch, length, -1)
-        context_coordinates = torch.cat((side_chain_coordinates, context_coordinates), dim=2)
-        context_mask = torch.cat((side_chain_mask, context_mask), dim=2)
-        context_atomic_numbers = torch.cat((side_chain_types, context_atomic_numbers), dim=2)
-        distances = torch.sum((beta_carbon[:, :, None] - context_coordinates) ** 2, dim=-1)
-        valid = valid_mask[:, :, None] * context_mask
-        adjusted = distances * valid + (1.0 - valid) * 10000.0
-        atom_count = min(num_context_atoms, adjusted.shape[-1])
-        atom_indices = torch.topk(adjusted, atom_count, dim=-1, largest=False).indices
-        context_coordinates = torch.gather(context_coordinates, 2, atom_indices[:, :, :, None].expand(-1, -1, -1, 3))
-        context_atomic_numbers = torch.gather(context_atomic_numbers, 2, atom_indices)
-        context_mask = torch.gather(context_mask, 2, atom_indices)
-        return context_coordinates, context_atomic_numbers, context_mask
-
-    def _element_features(self, atomic_numbers: Tensor) -> Tensor:
-        r"""One-hot-encode each context atom by element, periodic group, and period."""
-
-        group = self.periodic_group[atomic_numbers]
-        period = self.periodic_period[atomic_numbers]
-        return torch.cat(
-            (
-                F.one_hot(atomic_numbers, 120),
-                F.one_hot(group, 19),
-                F.one_hot(period, 8),
-            ),
-            dim=-1,
-        )
-
-
 class LigandMpnnModel(nn.Module):
     r"""
     Message-passing model that designs protein sequences for a protein-ligand complex.
@@ -1296,6 +932,370 @@ class LigandMpnnModel(nn.Module):
             for index in range(num_candidates)
         )
         return DesignResult(candidates=candidates)
+
+
+def side_chain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
+    r"""Build LigandMPNN's 32-slot side-chain element lookup for atom37 slots ``5:37``."""
+
+    return torch.tensor(
+        [6, 6, 6, 8, 8, 16, 6, 6, 6, 7, 7, 8, 8, 16, 6, 6, 6, 6, 7, 7, 7, 8, 8, 6, 7, 7, 8, 6, 6, 6, 7, 8],
+        dtype=torch.long,
+        device=device,
+    )
+
+
+def _backbone_atoms(coordinates: Tensor) -> dict[str, Tensor]:
+    r"""Split N/CA/C/O coordinates and add the idealized virtual Cβ atom."""
+
+    nitrogen = coordinates[:, :, 0]
+    alpha_carbon = coordinates[:, :, 1]
+    carbon = coordinates[:, :, 2]
+    oxygen = coordinates[:, :, 3]
+    beta_carbon = _virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
+    return {"N": nitrogen, "CA": alpha_carbon, "C": carbon, "O": oxygen, "CB": beta_carbon}
+
+
+def _local_angle_features(
+    nitrogen: Tensor,
+    alpha_carbon: Tensor,
+    carbon: Tensor,
+    points: Tensor,
+) -> Tensor:
+    r"""Direction features of ``points`` expressed in each residue's local backbone frame."""
+
+    first_axis = F.normalize(nitrogen - alpha_carbon, dim=-1)
+    carbon_vector = carbon - alpha_carbon
+    projected = torch.einsum("bli,bli->bl", first_axis, carbon_vector)[..., None]
+    second_axis = F.normalize(carbon_vector - first_axis * projected, dim=-1)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
+    local = torch.einsum("blqp,blyq->blyp", frame, points - alpha_carbon[:, :, None])
+    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
+    spatial_radius = torch.norm(local, dim=-1) + 1e-8
+    return torch.stack(
+        (
+            local[..., 0] / planar_radius,
+            local[..., 1] / planar_radius,
+            planar_radius / spatial_radius,
+            local[..., 2] / spatial_radius,
+        ),
+        dim=-1,
+    )
+
+
+def _decode_groups(decode_order: Tensor, tied_groups: list[list[int]]) -> list[list[int]]:
+    r"""Order tied groups by the first time any member appears in the decode order."""
+
+    ordered: list[list[int]] = []
+    seen: set[int] = set()
+    for residue in decode_order.detach().cpu().tolist():
+        residue = int(residue)
+        if residue in seen:
+            continue
+        group = next((candidate for candidate in tied_groups if residue in candidate), None)
+        selected = list(group) if group is not None else [residue]
+        ordered.append(selected)
+        seen.update(selected)
+    return ordered
+
+
+def _collapse_tied_order(
+    decode_order_row: Tensor,
+    tied_groups: tuple[tuple[int, ...], ...],
+) -> Tensor:
+    r"""Collapse a drawn order so every tied group decodes consecutively from its first member."""
+
+    ordered = _decode_groups(decode_order_row, [list(group) for group in tied_groups])
+    return torch.tensor(
+        list(itertools.chain.from_iterable(ordered)),
+        device=decode_order_row.device,
+        dtype=torch.long,
+    )
+
+
+def _realize_designed_system(
+    system: MolecularSystem,
+    component_references: tuple[ComponentReference | None, ...],
+    sampled_tokens: list[int],
+    design_mask: list[bool],
+) -> MolecularSystem:
+    r"""Realize one candidate while preserving entity, instance, and bond identity.
+
+    Designed protein occurrences take their sampled generatable identity; every untouched entity,
+    instance, and resolvable stored bond is preserved. Changed copies of a shared entity partition by
+    their complete output component-ID sequence exactly as frozen for ProteinMpnn, and entities from
+    different originals never merge.
+    """
+
+    replacements = {
+        reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
+        for reference, token, selected in zip(component_references, sampled_tokens, design_mask)
+        if reference is not None and selected
+    }
+    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            realized_by_instance[instance_id] = PolymerSequence(
+                entity.polymer_type,
+                tuple(
+                    replacements.get((instance_id, index), component)
+                    for index, component in enumerate(entity.components)
+                ),
+            )
+        else:
+            realized_by_instance[instance_id] = entity
+
+    # TODO(§3.4.1 reopened): family-owned canonical entity splitting is still reopened for LigandMpnn.
+    # Until it freezes we partition changed copies within each original entity by complete output
+    # component-ID sequence, exactly as frozen for ProteinMpnn (§4.7); this is the minimal current
+    # behavior and never merges entities from different originals.
+    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
+        entity_id: [] for entity_id in system.entities
+    }
+    for instance_id, entity_id in system.instances.items():
+        entity = realized_by_instance[instance_id]
+        signature = tuple(component.component_id for component in entity.components)
+        partition = next(
+            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
+            None,
+        )
+        if partition is None:
+            partitions[entity_id].append((signature, entity, [instance_id]))
+        else:
+            partition[2].append(instance_id)
+
+    used_ids = set(system.entities)
+    new_entities: dict[str, PolymerSequence | Molecule] = {}
+    instance_entities: dict[str, str] = {}
+    for entity_id, original in system.entities.items():
+        values = partitions[entity_id]
+        original_signature = tuple(component.component_id for component in original.components)
+        primary_index = next(
+            (index for index, value in enumerate(values) if value[0] == original_signature),
+            0,
+        )
+        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
+            signature, entity, instance_ids = values[partition_index]
+            if partition_index == primary_index:
+                output_id = entity_id
+            else:
+                suffix = 2
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+            new_entities[output_id] = original if signature == original_signature else entity
+            for instance_id in instance_ids:
+                instance_entities[instance_id] = output_id
+    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
+    candidate = MolecularSystem(new_entities, new_instances)
+    retained_bonds = []
+    for bond in system.bonds:
+        try:
+            candidate.atom(bond.site_a)
+            candidate.atom(bond.site_b)
+            if bond.stereo_sites is not None:
+                candidate.atom(bond.stereo_sites[0])
+                candidate.atom(bond.stereo_sites[1])
+        except KeyError:
+            continue
+        retained_bonds.append(bond)
+    return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
+
+
+class LigandMpnnFeatures(MpnnProteinFeatures):
+    r"""
+    Input featurizer for the LigandMPNN backbone graph and ligand/side-chain context.
+
+    Derives the virtual Cβ atom, builds the k-nearest-neighbor residue graph and pairwise edge features
+    (through the shared full-protein edge graph), and in parallel featurizes the nonprotein context atoms
+    (per-atom RBF distances to backbone atoms, periodic-table element one-hots, and local-frame angle
+    features). When ``use_side_chain_context`` is set at call time, the observed side-chain atoms of the
+    nearest fixed residues are folded into that context and the nearest atoms are reselected.
+
+    Args:
+        hidden_size: Width of the per-residue edge features and per-atom context node features.
+        num_neighbors: Number of nearest-neighbor residues in the graph.
+        num_positional_embeddings: Width of the relative-position embedding.
+        num_rbf: Number of radial basis functions per distance feature.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_neighbors: int,
+        *,
+        num_positional_embeddings: int = 16,
+        num_rbf: int = 16,
+    ) -> None:
+        super().__init__(
+            hidden_size,
+            num_neighbors,
+            num_positional_embeddings=num_positional_embeddings,
+            num_rbf=num_rbf,
+        )
+        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
+        self.atom_norm = nn.LayerNorm(hidden_size)
+        self.element_projection = nn.Linear(147, 64)
+        self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
+        self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
+        self.context_edge_norm = nn.LayerNorm(hidden_size)
+        self.context_node_norm = nn.LayerNorm(hidden_size)
+        buffer_device = self.element_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        group, period = periodic_group_period(device=buffer_device)
+        self.register_buffer("periodic_group", group, persistent=False)
+        self.register_buffer("periodic_period", period, persistent=False)
+        self.register_buffer(
+            "side_chain_atom_types",
+            side_chain_atom_types(device=buffer_device),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        backbone_coordinates: Tensor,
+        valid_mask: Tensor,
+        residue_indices: Tensor,
+        chain_indices: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+        residue_context_coordinates: Tensor,
+        residue_context_mask: Tensor,
+        design_mask: Tensor,
+        *,
+        use_side_chain_context: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        r"""Featurize backbone geometry and context atoms into graph inputs.
+
+        Coordinate noise, when requested, is already applied by the caller to ``backbone_coordinates`` and
+        ``context_coordinates``; the fixed side-chain coordinates are never perturbed.
+
+        Returns:
+            Tuple ``(atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask)``:
+            per-residue context node features, residue-graph edges and neighbor indices, and the
+            context-atom node/edge features and validity mask.
+        """
+
+        num_context_atoms = context_coordinates.shape[2]
+        atoms = _backbone_atoms(backbone_coordinates)
+        edges, neighbor_indices = super().forward(
+            backbone_coordinates,
+            valid_mask,
+            residue_indices,
+            chain_indices,
+        )
+        if use_side_chain_context:
+            context_coordinates, context_atomic_numbers, context_mask = self._append_side_chain_context(
+                atoms["CB"],
+                context_coordinates,
+                context_atomic_numbers,
+                context_mask,
+                residue_context_coordinates,
+                residue_context_mask,
+                design_mask,
+                valid_mask,
+                neighbor_indices,
+                num_context_atoms,
+            )
+
+        context_atomic_numbers = context_atomic_numbers.long()
+        element_features = self._element_features(context_atomic_numbers)
+        element_projection = self.element_projection(element_features.to(dtype=backbone_coordinates.dtype))
+
+        backbone_atoms = torch.stack(
+            (atoms["N"], atoms["CA"], atoms["C"], atoms["O"], atoms["CB"]),
+            dim=2,
+        )
+        atom_context_distances = torch.sqrt(
+            torch.sum((backbone_atoms[:, :, :, None] - context_coordinates[:, :, None]) ** 2, dim=-1) + 1e-6
+        )
+        atom_context_features = _radial_basis(atom_context_distances.movedim(2, 3), self.num_rbf).flatten(start_dim=-2)
+        atom_features = torch.cat(
+            (
+                atom_context_features,
+                element_projection,
+                _local_angle_features(atoms["N"], atoms["CA"], atoms["C"], context_coordinates),
+            ),
+            dim=-1,
+        )
+        atom_features = self.atom_norm(self.atom_projection(atom_features))
+        context_distances = torch.sqrt(
+            torch.sum((context_coordinates[:, :, :, None] - context_coordinates[:, :, None, :]) ** 2, dim=-1) + 1e-6
+        )
+        context_edges = self.context_edge_norm(
+            self.context_edge_projection(_radial_basis(context_distances, self.num_rbf))
+        )
+        context_nodes = self.context_node_norm(
+            self.context_node_projection(element_features.to(dtype=backbone_coordinates.dtype))
+        )
+        return atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask
+
+    def _append_side_chain_context(
+        self,
+        beta_carbon: Tensor,
+        context_coordinates: Tensor,
+        context_atomic_numbers: Tensor,
+        context_mask: Tensor,
+        residue_context_coordinates: Tensor,
+        residue_context_mask: Tensor,
+        design_mask: Tensor,
+        valid_mask: Tensor,
+        neighbor_indices: Tensor,
+        num_context_atoms: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        r"""Append the observed side-chain atoms of the nearest fixed residues, then reselect atoms.
+
+        Only source-fixed rows contribute side-chain atoms; the first sixteen residue KNN neighbors
+        supply their observed 32-slot side chains, which are concatenated with the nonprotein context
+        before the nearest ``num_context_atoms`` atoms are reselected around the virtual Cβ.
+        """
+
+        batch, length = context_mask.shape[:2]
+        fixed_mask = residue_context_mask * (1 - design_mask[:, :, None])
+        neighbor_subset = neighbor_indices[:, :, :16]
+        side_chain_mask = gather_nodes(fixed_mask, neighbor_subset).reshape(batch, length, -1)
+        side_chain_coordinates = gather_nodes(
+            residue_context_coordinates.reshape(batch, length, -1),
+            neighbor_subset,
+        ).reshape(batch, length, -1, 3)
+        side_chain_types = self.side_chain_atom_types[None, None, None, :].expand(
+            batch,
+            length,
+            neighbor_subset.shape[2],
+            -1,
+        )
+        side_chain_types = side_chain_types.reshape(batch, length, -1)
+        context_coordinates = torch.cat((side_chain_coordinates, context_coordinates), dim=2)
+        context_mask = torch.cat((side_chain_mask, context_mask), dim=2)
+        context_atomic_numbers = torch.cat((side_chain_types, context_atomic_numbers), dim=2)
+        distances = torch.sum((beta_carbon[:, :, None] - context_coordinates) ** 2, dim=-1)
+        valid = valid_mask[:, :, None] * context_mask
+        adjusted = distances * valid + (1.0 - valid) * 10000.0
+        atom_count = min(num_context_atoms, adjusted.shape[-1])
+        atom_indices = torch.topk(adjusted, atom_count, dim=-1, largest=False).indices
+        context_coordinates = torch.gather(context_coordinates, 2, atom_indices[:, :, :, None].expand(-1, -1, -1, 3))
+        context_atomic_numbers = torch.gather(context_atomic_numbers, 2, atom_indices)
+        context_mask = torch.gather(context_mask, 2, atom_indices)
+        return context_coordinates, context_atomic_numbers, context_mask
+
+    def _element_features(self, atomic_numbers: Tensor) -> Tensor:
+        r"""One-hot-encode each context atom by element, periodic group, and period."""
+
+        group = self.periodic_group[atomic_numbers]
+        period = self.periodic_period[atomic_numbers]
+        return torch.cat(
+            (
+                F.one_hot(atomic_numbers, 120),
+                F.one_hot(group, 19),
+                F.one_hot(period, 8),
+            ),
+            dim=-1,
+        )
 
 
 # ---------------------------------------------------------------------------

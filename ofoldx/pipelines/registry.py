@@ -12,6 +12,7 @@ _BUILTIN_PIPELINE_MODULES = {
     "ofoldx.mpnn_packer": "ofoldx.models.mpnn_packer",
     "ofoldx.nampnn": "ofoldx.models.nampnn",
     "ofoldx.proteinmpnn": "ofoldx.models.proteinmpnn",
+    "ofoldx.rfdiffusion": "ofoldx.models.rfdiffusion",
 }
 
 # Deferred-but-reserved built-in ids: their pipeline registration is not wired up yet, so they are
