@@ -46,10 +46,12 @@ The goal is a common model ecosystem for biomolecular structure: predictable at 
 
 The four shared task words are fold, design, score, and pack. They are routing vocabulary, not a taxonomy of architectures and not the completeness boundary of a model. A published family implements every scientific function of the released model, including relevant heads, conditioning modes, sampling modes, scoring paths, and checkpoint variants. OFoldX publishes no partial family under a weaker label.
 
-Training orchestration is not part of this Model Hub work. Differentiable Models
-remain trainable as normal PyTorch modules. Runner design resumes from
-MultiMolecule and Danling only after its structure-side consumers and exact config
-contract are audited; this document does not freeze a Runner API.
+Training orchestration is in scope. Differentiable Models remain ordinary
+trainable PyTorch modules; the Runner (§10.3) is the config-only Danling consumer
+that trains, evaluates, and infers with them. It never leaks training state into a
+frozen Model, Processor, or config: a Model exposes forward-time predictions and
+unreduced loss primitives, and the Runner-side objective owns the reduction,
+dataset, optimizer, schedule, and metrics.
 
 ### 1.2 First principles
 
@@ -6695,13 +6697,37 @@ but that fact does not justify changing unrelated dataclass semantics. This
 document intentionally does not prescribe exact helper names, nominal subclass
 checks, validation order, or error text.
 
-### 10.3 Runner is outside this contract
+### 10.3 The Runner training contract
 
-This Model Hub document freezes no Runner class, constructor, config, or method
-surface. Future Runner work begins from MultiMolecule's config-only Danling design
-and the concrete structure-model training, evaluation, and inference consumers.
-Existing Runner prototypes are not an accepted public contract merely because they
-remain in the worktree.
+The Runner is the config-only Danling consumer that trains, evaluates, and infers
+with any registered family. Construction takes one `RunnerConfig` — a
+`danling.RunnerConfig` extended with a `model` section (a registered architecture
+id plus typed-config overrides, or a repository to fine-tune) and a `data` section
+(each split's raw-structure source plus Processor arguments). The Runner builds the
+Model from the model registry and the Processor as the featurizer; danling owns the
+optimizer, scheduler, dataloader, checkpoint, EMA, and metric machinery from the
+inherited config sections. No training state — dataset, objective, optimizer, or
+schedule — is ever written into a Model, Processor, or Model config.
+
+A `StructureDataset` lowers each raw structure through the family Processor on
+demand, passing the same reference inference passes so training and inference share
+one featurization. A generic dataclass collate concatenates per-structure Inputs
+along the batch axis, right-padding ragged sequence and atom axes to the batch
+maximum; a family whose Input needs bespoke padding registers an override.
+
+The training loss lives only in an objective, never in a Model: a Model's forward
+returns predictions or unreduced loss primitives, and the objective reduces one
+batch to a scalar. Objectives are grounded, not speculative — the MPNN families
+masked-mean their in-repo label-smoothed per-token loss over the scored positions,
+and the diffusion families apply the EDM-weighted denoising error over valid atoms.
+An architecture with no faithful in-repo objective is absent from the objective
+table and raises rather than fabricating a loss (Principle 13). `Runner.infer`
+drives the Model forward graph in batches; the Result-producing task surface
+remains the Pipelines'.
+
+The exact class, method, and helper names remain ordinary implementation detail:
+this section fixes the contract — config-only construction, the Model/objective
+split, and no training state in frozen surfaces — not a signature.
 
 ### 10.4 Review questions
 
