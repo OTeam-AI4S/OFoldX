@@ -20,13 +20,24 @@ _BUILTIN_PIPELINE_MODULES = {
 # _pipeline_class). They must nonetheless stay RESERVED for their owner package so a third party
 # cannot squat the id before the official owner is ready to register it.
 #
-# TODO(DESIGN.md §6.2 / §5948): promote "ofoldx.boltz2_affinity" into _BUILTIN_PIPELINE_MODULES once
-# Boltz2AffinityPipeline gains a multi-pair (two-checkpoint) loader/factory and a .save(); its
-# register_pipeline is deferred in ofoldx/models/boltz2/__init__.py until then. The class stays
-# importable for manual construction, but the routed factory (api/tasks.py) must not resolve a
-# 4-arg ctor with no save() through the (model, processor) path.
+# All three are multi-child / multi-pair composition Pipelines whose live constructors do NOT match
+# the frozen §7.4 one-pair `(*, model, processor)` route the factory (api/tasks.py) drives with
+# `pipeline_class(model=model, processor=processor)`. §7.4 keeps such compositions live-only ("A
+# composition with no single root owner remains live-only ... and cannot acquire a marker"), so each
+# publishes by EXPORT (importable + reexported concrete Pipeline), not by a routed pipeline.json.
+# Routing any of them would drive the (model, processor) factory path into a non-matching ctor and
+# raise at construction with no standard-root fallback -- the exact landmine §7.4 forbids:
+#   * ofoldx.boltz2_affinity -> Boltz2AffinityPipeline (two-checkpoint; promote into
+#     _BUILTIN_PIPELINE_MODULES once §7.4 freezes a multi-pair loader/factory + .save(); its
+#     register_pipeline is deferred in ofoldx/models/boltz2/__init__.py until then).
+#   * ofoldx.odesign -> ODesignPipeline (4-arg ctor: model, processor, protein_designer,
+#     ligand_designer -- composes the read-only proteinmpnn/ligandmpnn Pipelines).
+#   * ofoldx.boltzgen -> BoltzGenPipeline (two required pairs: design + inverse-fold, plus optional
+#     injected boltz2 fold/affinity stages).
 _RESERVED_PIPELINE_IDS = {
     "ofoldx.boltz2_affinity": "ofoldx.models.boltz2",
+    "ofoldx.odesign": "ofoldx.models.odesign",
+    "ofoldx.boltzgen": "ofoldx.models.boltzgen",
 }
 
 
