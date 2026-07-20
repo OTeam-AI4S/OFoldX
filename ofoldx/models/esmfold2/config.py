@@ -156,3 +156,54 @@ class ESMFold2ProcessorConfig(Config):
     r"""Input contract paired with one released ESMFold2 checkpoint."""
 
     msa_conditioning: bool = True
+
+
+class ESMFold2ExperimentalConfidenceHeadConfig(Config):
+    r"""Confidence head of the experimental recurrent ESMFold2 graph.
+
+    A narrower confidence contract than the released head: pLDDT and PAE only
+    (no PDE head, no resolved head) and a 128-bin coarse-distogram pair embedding
+    over a 2.0-52.0 angstrom range. Provenance: Biohub transformers
+    ``modeling_esmfold2_experimental.ConfidenceHead``.
+    """
+
+    num_plddt_bins: int = 50
+    num_pae_bins: int = 64
+    min_dist: float = 2.0
+    max_dist: float = 52.0
+    distogram_bins: int = 128
+    folding_trunk: ESMFold2FoldingTrunkConfig = ESMFold2FoldingTrunkConfig({"num_blocks": 4})
+
+
+class ESMFold2ExperimentalConfig(Config):
+    r"""Graph construction for the experimental recurrent ESMFold2 binder-design head.
+
+    A different architecture from [`ESMFold2Config`][ofoldx.models.esmfold2.ESMFold2Config]:
+    the older recurrent trunk re-injects the previous pair representation through a
+    zero-initialised ``pair_loop_proj`` each loop (no ``parcae`` linear-recurrent coda,
+    no per-loop ``lm_encoder`` trunk, no ``msa_encoder_overwrite``), integrates the ESMC
+    projection into ``z_init`` once, and carries the narrower experimental confidence
+    contract with a 128-bin distogram head. ``disable_msa_features`` mirrors the released
+    ``ESMFold2-Experimental-Fast`` single-sequence inversion checkpoint.
+
+    Defaults reflect ``biohub/ESMFold2-Experimental-Fast`` (the primary design inversion
+    model: 24 trunk blocks, MSA disabled). The MSA-conditioned ``biohub/ESMFold2-Experimental``
+    critic checkpoint sets ``folding_trunk.num_blocks = 48``, ``disable_msa_features = False``
+    and ``msa_encoder.enabled = True``; construct those from the checkpoint ``config.json``.
+    """
+
+    single_size: int = 384
+    pair_size: int = 256
+    num_relative_residue_bins: int = 32
+    num_relative_chain_bins: int = 2
+    num_loops: int = 3
+    disable_msa_features: bool = True
+    language_model_dropout: float = 0.0
+    force_language_model_dropout: bool = False
+
+    esmc: ESMFold2ESMCConfig = ESMFold2ESMCConfig()
+    inputs: ESMFold2InputsEmbedderConfig = ESMFold2InputsEmbedderConfig()
+    folding_trunk: ESMFold2FoldingTrunkConfig = ESMFold2FoldingTrunkConfig({"num_blocks": 24})
+    structure_head: ESMFold2StructureHeadConfig = ESMFold2StructureHeadConfig({"distogram_bins": 128})
+    confidence_head: ESMFold2ExperimentalConfidenceHeadConfig = ESMFold2ExperimentalConfidenceHeadConfig()
+    msa_encoder: ESMFold2MSAEncoderConfig = ESMFold2MSAEncoderConfig({"enabled": False, "msa_head_dim": 32})

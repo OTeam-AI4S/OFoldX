@@ -16,8 +16,8 @@ from torch import Tensor
 
 from ...artifacts import save_model
 from ...references import classify_reference
-from .config import ESMFold2Config, ESMFold2ESMCConfig, ESMFold2ProcessorConfig
-from .model import ESMFold2Model
+from .config import ESMFold2Config, ESMFold2ESMCConfig, ESMFold2ExperimentalConfig, ESMFold2ProcessorConfig
+from .model import ESMFold2ExperimentalModel, ESMFold2Model
 from .processor import ESMFold2Processor
 
 _DEFAULT_ESMC_REPOSITORY = "multimolecule/esmc-6b"
@@ -258,6 +258,122 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             "per_loop_dropout": lm_encoder["per_loop_lm_dropout"],
         },
     }
+
+
+def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2ExperimentalConfig:
+    r"""Build an [`ESMFold2ExperimentalConfig`][ofoldx.models.esmfold2.ESMFold2ExperimentalConfig]
+    from a ``type="experimental"`` recurrent-graph checkpoint ``config.json``.
+
+    Every graph dimension is read from the checkpoint (the Fast inversion model ships 24
+    trunk blocks with the MSA encoder disabled; the MSA-conditioned critic ships 48 blocks);
+    nothing is guessed.
+    """
+
+    if raw_config.get("model_type") != "esmfold2" or raw_config.get("type") != "experimental":
+        raise ValueError("checkpoint config is not the experimental Biohub ESMFold2 architecture")
+
+    config = ESMFold2ExperimentalConfig()
+    config.single_size = raw_config["d_single"]
+    config.pair_size = raw_config["d_pair"]
+    config.num_relative_residue_bins = raw_config["n_relative_residx_bins"]
+    config.num_relative_chain_bins = raw_config["n_relative_chain_bins"]
+    config.num_loops = raw_config["num_loops"]
+    config.disable_msa_features = raw_config["disable_msa_features"]
+    config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
+    config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
+
+    inputs = raw_config["inputs"]
+    atom_encoder = inputs["atom_encoder"]
+    config.inputs.input_size = inputs["d_inputs"]
+    ae = config.inputs.atom_encoder
+    ae.atom_size = atom_encoder["d_atom"]
+    ae.token_size = atom_encoder["d_token"]
+    ae.num_blocks = atom_encoder["n_blocks"]
+    ae.num_attention_heads = atom_encoder["n_heads"]
+    ae.sliding_window_size = atom_encoder["swa_window_size"]
+    ae.expansion_ratio = atom_encoder["expansion_ratio"]
+    ae.spatial_rope_base_frequency = atom_encoder["spatial_rope_base_frequency"]
+    ae.num_spatial_rope_pairs_per_axis = atom_encoder["n_spatial_rope_pairs_per_axis"]
+    ae.num_uid_rope_pairs = atom_encoder["n_uid_rope_pairs"]
+    ae.uid_rope_base_frequency = atom_encoder["uid_rope_base_frequency"]
+
+    config.folding_trunk.num_blocks = raw_config["folding_trunk"]["n_layers"]
+
+    structure = raw_config["structure_head"]
+    diffusion = structure["diffusion_module"]
+    sh = config.structure_head
+    sh.distogram_bins = structure["distogram_bins"]
+    sh.gamma_0 = structure["gamma_0"]
+    sh.gamma_min = structure["gamma_min"]
+    sh.noise_scale = structure["noise_scale"]
+    sh.step_scale = structure["step_scale"]
+    sh.inference_s_max = structure["inference_s_max"]
+    sh.inference_s_min = structure["inference_s_min"]
+    sh.inference_p = structure["inference_p"]
+    sh.num_sampling_steps = structure["inference_num_steps"]
+    dm = sh.diffusion_module
+    dm.sigma_data = diffusion["sigma_data"]
+    dm.atom_size = diffusion["c_atom"]
+    dm.token_size = diffusion["c_token"]
+    dm.pair_size = diffusion["c_z"]
+    dm.input_size = diffusion["c_s_inputs"]
+    dm.fourier_dim = diffusion["fourier_dim"]
+    dm.num_atom_blocks = diffusion["atom_num_blocks"]
+    dm.num_atom_attention_heads = diffusion["atom_num_heads"]
+    dm.num_token_blocks = diffusion["token_num_blocks"]
+    dm.num_token_attention_heads = diffusion["token_num_heads"]
+    dm.transition_multiplier = diffusion["transition_multiplier"]
+
+    confidence = raw_config["confidence_head"]
+    ch = config.confidence_head
+    ch.distogram_bins = confidence["distogram_bins"]
+    ch.min_dist = confidence["min_dist"]
+    ch.max_dist = confidence["max_dist"]
+    ch.num_plddt_bins = confidence["num_plddt_bins"]
+    ch.num_pae_bins = confidence["num_pae_bins"]
+    ch.folding_trunk.num_blocks = confidence["folding_trunk"]["n_layers"]
+
+    msa = raw_config["msa_encoder"]
+    mc = config.msa_encoder
+    mc.enabled = msa["enabled"]
+    mc.msa_size = msa["d_msa"]
+    mc.hidden_size = msa["d_hidden"]
+    mc.num_blocks = msa["n_layers"]
+    mc.num_msa_attention_heads = msa["n_heads_msa"]
+    mc.msa_head_dim = msa["msa_head_width"]
+
+    return config
+
+
+def load_experimental_esmfold2(
+    checkpoint_or_repo: str | PathLike[str],
+    *,
+    esmc: EsmCModel | None = None,
+    config_path: str | PathLike[str] | None = None,
+    cache_dir: str | PathLike[str] | None = None,
+    local_files_only: bool = False,
+) -> ESMFold2ExperimentalModel:
+    r"""Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
+
+    The MultiMolecule ESMC child is loaded separately (the head safetensors does not carry
+    it): the head strict-loads first with ``esmc=None`` and the optional ``esmc`` is attached
+    afterwards via [`load_esmc`][ofoldx.models.esmfold2.ESMFold2ExperimentalModel.load_esmc].
+    """
+
+    checkpoint_path, resolved_config_path = resolve_esmfold2_source(
+        checkpoint_or_repo,
+        config_path=config_path,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
+    raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
+    config = experimental_config_from_biohub(raw_config)
+    model = ESMFold2ExperimentalModel(config, esmc=None)
+    head_state = load_esmfold2_state_dict(checkpoint_path)
+    model.load_state_dict(head_state, strict=True)
+    if esmc is not None:
+        model.load_esmc(esmc)
+    return model
 
 
 def main(argv: list[str] | None = None) -> None:

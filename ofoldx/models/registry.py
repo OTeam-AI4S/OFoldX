@@ -35,6 +35,7 @@ _BUILTIN_MODEL_MODULES = {
     "ofoldx.boltzgen": "ofoldx.models.boltzgen",
     "ofoldx.boltzgen_ifold": "ofoldx.models.boltzgen",
     "ofoldx.esmfold2": "ofoldx.models.esmfold2",
+    "ofoldx.esmfold2_experimental": "ofoldx.models.esmfold2",
     "ofoldx.ligandmpnn": "ofoldx.models.ligandmpnn",
     "ofoldx.mpnn_packer": "ofoldx.models.mpnn_packer",
     "ofoldx.nampnn": "ofoldx.models.nampnn",

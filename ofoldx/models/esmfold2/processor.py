@@ -25,7 +25,7 @@ from ...data.molecular import (
 )
 from ...data.structure import Structure
 from ...references import classify_reference
-from .config import ESMFold2ProcessorConfig
+from .config import ESMFold2ExperimentalConfig, ESMFold2ProcessorConfig
 from .model import ESMFold2Input, ESMFold2Layout
 
 _PROTEIN_RESIDUE_TYPES = {
@@ -122,6 +122,62 @@ class ESMFold2Processor:
             device=self.device,
             dtype=self.dtype,
         )
+
+
+class ESMFold2ExperimentalProcessor:
+    r"""Lower target|binder complexes for the experimental recurrent ESMFold2 design graph.
+
+    Paired with [`ESMFold2ExperimentalModel`][ofoldx.models.esmfold2.ESMFold2ExperimentalModel].
+    The experimental design/inversion checkpoints are single-sequence
+    (``disable_msa_features``), so this Processor reuses the released ESMFold2 token/atom
+    lowering with MSA conditioning off and rejects MSA evidence. The soft one-hot
+    ``res_type_soft`` design tensor consumed by the differentiable trunk is assembled by
+    the binder-design Pipeline, not here (it depends on the per-step optimisation logits).
+    """
+
+    config_class = ESMFold2ExperimentalConfig
+
+    def __init__(
+        self,
+        config: ESMFold2ExperimentalConfig | None = None,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.config = ESMFold2ExperimentalConfig() if config is None else config
+        self._base = ESMFold2Processor(
+            ESMFold2ProcessorConfig({"msa_conditioning": not self.config.disable_msa_features}),
+            device=device,
+            dtype=dtype,
+        )
+
+    @property
+    def device(self) -> torch.device:
+        return self._base.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._base.dtype
+
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Update output placement in place and return this Processor."""
+
+        self._base.to(device, dtype)
+        return self
+
+    def __call__(
+        self,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem,
+        *,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+    ) -> ESMFold2Input:
+        r"""Lower one target|binder complex to experimental ESMFold2 tensors (no MSA)."""
+
+        return self._base(input, msa=msa)
 
 
 def molecular_system(
