@@ -175,7 +175,7 @@ class ODesignModel(nn.Module):
 
     def forward(
         self,
-        batch: ODesignInput,
+        input: ODesignInput,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
@@ -186,8 +186,8 @@ class ODesignModel(nn.Module):
         steps = self.recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
             raise ValueError("recycling_steps must be positive")
-        token_embedding, single, pair, relative_features = self._run_trunk(batch, recycling_steps=steps)
-        context = self._denoise_context(batch, token_embedding, single, pair, relative_features)
+        token_embedding, single, pair, relative_features = self._run_trunk(input, recycling_steps=steps)
+        context = self._denoise_context(input, token_embedding, single, pair, relative_features)
 
         def denoise(noisy_chunk: Tensor, noise_chunk: Tensor) -> Tensor:
             return self.coordinate_denoiser(
@@ -223,7 +223,7 @@ class ODesignModel(nn.Module):
     @torch.inference_mode()
     def design(
         self,
-        batch: ODesignInput,
+        input: ODesignInput,
         *,
         num_candidates: int = 1,
         generator: torch.Generator | None = None,
@@ -243,9 +243,9 @@ class ODesignModel(nn.Module):
         # not import ``.processor`` at module scope; ``_realize_ranges`` is only needed at call time.
         from .processor import _realize_ranges
 
-        batch = _realize_ranges(batch, generator)
+        input = _realize_ranges(input, generator)
         output = self.sample(
-            batch,
+            input,
             num_samples=num_candidates,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
@@ -254,11 +254,11 @@ class ODesignModel(nn.Module):
             generator=generator,
         )
         structures = tuple(
-            _structure_from_coordinates(output.coordinates[0, 0, index], batch.layout)
+            _structure_from_coordinates(output.coordinates[0, 0, index], input.layout)
             for index in range(num_candidates)
         )
         for structure in structures:
-            _require_hard_conditions(structure, batch)
+            _require_hard_conditions(structure, input)
         # §5.3.1/§5.3.3: the frozen shared DesignCandidate is coordinate-free (system,
         # scores) and must NOT be widened. ODesign is coordinate-generating, so each sample
         # is carried by the family-local ODesignDesignCandidate subtype, which adds the
@@ -291,7 +291,7 @@ class ODesignModel(nn.Module):
     @torch.inference_mode()
     def sample(
         self,
-        batch: ODesignInput,
+        input: ODesignInput,
         *,
         num_samples: int = 1,
         recycling_steps: int | None = None,
@@ -306,26 +306,26 @@ class ODesignModel(nn.Module):
         if steps < 1:
             raise ValueError("recycling_steps must be positive")
         partial_diffusion = partial_diffusion_snr is not None
-        if partial_diffusion and not bool(batch.observed_mask.all()):
+        if partial_diffusion and not bool(input.observed_mask.all()):
             raise ValueError("partial diffusion requires observed coordinates for every model atom")
         max_noise_level = 1 / math.sqrt(partial_diffusion_snr + 1e-6) if partial_diffusion_snr is not None else None
         coordinates = []
         distograms = []
         bond_logits = []
         for _ in range(num_model_seeds):
-            token_embedding, single, pair, relative_features = self._run_trunk(batch, recycling_steps=steps)
+            token_embedding, single, pair, relative_features = self._run_trunk(input, recycling_steps=steps)
             distograms.append(self.distogram_head(pair))
             bond_logits.append(self.token_bond_type_head(pair))
             coordinates.append(
                 self.coordinate_sampler(
                     self.coordinate_denoiser,
-                    context=self._denoise_context(batch, token_embedding, single, pair, relative_features),
+                    context=self._denoise_context(input, token_embedding, single, pair, relative_features),
                     num_samples=num_samples,
                     num_sampling_steps=num_sampling_steps,
                     sample_chunk_size=1,
-                    initial_coords=batch.observed_positions if partial_diffusion else None,
-                    condition_coords=batch.observed_positions,
-                    condition_mask=batch.fixed_coordinate_mask,
+                    initial_coords=input.observed_positions if partial_diffusion else None,
+                    condition_coords=input.observed_positions,
+                    condition_mask=input.fixed_coordinate_mask,
                     max_noise_level=max_noise_level,
                     generator=generator,
                 )
@@ -338,38 +338,38 @@ class ODesignModel(nn.Module):
 
     def _run_trunk(
         self,
-        batch: ODesignInput,
+        input: ODesignInput,
         *,
         recycling_steps: int,
     ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
         local_geometry = self.input_embedder.build_local_geometry(
-            batch.reference_positions,
-            batch.reference_space_id,
+            input.reference_positions,
+            input.reference_space_id,
         )
         token_embedding = self.input_embedder(
-            batch.atom_features,
-            reference_positions=batch.reference_positions,
-            reference_charges=batch.reference_charges,
-            reference_mask=batch.reference_mask,
-            token_features=batch.token_features,
-            atom_to_token=batch.atom_to_token,
-            num_tokens=batch.token_features.shape[-2],
-            atom_mask=batch.atom_mask,
-            token_mask=batch.token_mask,
+            input.atom_features,
+            reference_positions=input.reference_positions,
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            token_features=input.token_features,
+            atom_to_token=input.atom_to_token,
+            num_tokens=input.token_features.shape[-2],
+            atom_mask=input.atom_mask,
+            token_mask=input.token_mask,
             local_geometry=local_geometry,
         )
         single_init = self.single_init_projection(token_embedding)
         relative_features = generate_relative_position_features(
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            cyclic_period=batch.cyclic_period,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
+            cyclic_period=input.cyclic_period,
             dtype=single_init.dtype,
         )
-        pair_mask = pair_mask_from_token_mask(batch.token_mask)
-        pair_init = self._initial_pair(single_init, batch, relative_features)
+        pair_mask = pair_mask_from_token_mask(input.token_mask)
+        pair_init = self._initial_pair(single_init, input, relative_features)
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
         grad_enabled = torch.is_grad_enabled()
@@ -378,14 +378,14 @@ class ODesignModel(nn.Module):
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
                 pair = pair + self.constraint_distogram_embedder(
                     pair,
-                    batch.constraint_distogram,
+                    input.constraint_distogram,
                     pair_mask=pair_mask,
                 )
                 _, pair = self.msa_trunk(
-                    batch.msa_features,
+                    input.msa_features,
                     pair,
                     token_embedding,
-                    msa_mask=batch.msa_mask,
+                    msa_mask=input.msa_mask,
                     pair_mask=pair_mask,
                 )
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
@@ -395,37 +395,37 @@ class ODesignModel(nn.Module):
     def _initial_pair(
         self,
         single: Tensor,
-        batch: ODesignInput,
+        input: ODesignInput,
         relative_features: RelativePositionBuckets,
     ) -> Tensor:
         pair = self.pair_left_projection(single).unsqueeze(-2)
         pair = pair + self.pair_right_projection(single).unsqueeze(-3)
         pair = pair + self.relative_position_embedder(relative_features)
-        pair = pair + self.token_bond_projection(batch.token_bonds.unsqueeze(-1))
-        return pair * pair_mask_from_token_mask(batch.token_mask).unsqueeze(-1).to(pair.dtype)
+        pair = pair + self.token_bond_projection(input.token_bonds.unsqueeze(-1))
+        return pair * pair_mask_from_token_mask(input.token_mask).unsqueeze(-1).to(pair.dtype)
 
     def _denoise_context(
         self,
-        batch: ODesignInput,
+        input: ODesignInput,
         token_embedding: Tensor,
         single: Tensor,
         pair: Tensor,
         relative_features: RelativePositionBuckets,
     ) -> CoordinateDenoiseContext:
         return CoordinateDenoiseContext(
-            atom_features=batch.atom_features,
-            atom_to_token=batch.atom_to_token,
-            reference_positions=batch.reference_positions,
-            reference_charges=batch.reference_charges,
-            reference_mask=batch.reference_mask,
-            atom_mask=batch.atom_mask,
+            atom_features=input.atom_features,
+            atom_to_token=input.atom_to_token,
+            reference_positions=input.reference_positions,
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            atom_mask=input.atom_mask,
             token_embedding=token_embedding,
             single=single,
             pair=pair,
             relative_features=relative_features,
             local_geometry=self.coordinate_denoiser.build_local_geometry(
-                batch.reference_positions,
-                batch.reference_space_id,
+                input.reference_positions,
+                input.reference_space_id,
             ),
         )
 
@@ -557,19 +557,19 @@ def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> S
     )
 
 
-def _require_hard_conditions(structure: Structure, batch: ODesignInput) -> None:
+def _require_hard_conditions(structure: Structure, input: ODesignInput) -> None:
     r"""Raise when a coordinate-generated candidate violates a hard condition."""
 
-    source_residues = batch.layout.source_residue_map
-    placement_map = batch.layout.placement_map
-    instance_of = batch.layout.instance_of
-    source_atoms = batch.layout.source_atom_map
+    source_residues = input.layout.source_residue_map
+    placement_map = input.layout.placement_map
+    instance_of = input.layout.instance_of
+    source_atoms = input.layout.source_atom_map
     coordinates = {site: structure.coordinates[index] for index, site in enumerate(structure.sites)}
     reference = {
-        site: batch.observed_positions[0, index].detach().to(device="cpu", dtype=torch.float32).numpy()
-        for index, site in enumerate(batch.layout.sites)
+        site: input.observed_positions[0, index].detach().to(device="cpu", dtype=torch.float32).numpy()
+        for index, site in enumerate(input.layout.sites)
     }
-    for index, condition in enumerate(batch.layout.conditions):
+    for index, condition in enumerate(input.layout.conditions):
         satisfied: bool | None
         # TODO(§3.7↔§5 reopened): `value` is a real per-condition constraint measurement
         # (angstrom RMSD / min-distance) with no frozen per-condition home; only the
@@ -594,7 +594,7 @@ def _require_hard_conditions(structure: Structure, batch: ODesignInput) -> None:
         elif type(condition) is Contact:
             left = _contact_sites(
                 condition.side_a,
-                batch.layout,
+                input.layout,
                 source_residues,
                 placement_map,
                 instance_of,
@@ -602,7 +602,7 @@ def _require_hard_conditions(structure: Structure, batch: ODesignInput) -> None:
             )
             right = _contact_sites(
                 condition.side_b,
-                batch.layout,
+                input.layout,
                 source_residues,
                 placement_map,
                 instance_of,

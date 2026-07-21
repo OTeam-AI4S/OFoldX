@@ -153,16 +153,16 @@ class RFdiffusionModel(nn.Module):
                 module.backend = backend
         return self
 
-    def forward(self, batch: RFdiffusionInput) -> RFdiffusionOutput:
+    def forward(self, input: RFdiffusionInput) -> RFdiffusionOutput:
         r"""Run one ordinary differentiable denoising pass."""
 
-        msa_masked, msa_full, template_1d, template_2d, template_coords, alpha_t = self._features(batch)
+        msa_masked, msa_full, template_1d, template_2d, template_coords, alpha_t = self._features(input)
         output = self.network(
             msa_masked,
             msa_full,
-            batch.sequence,
-            batch.noisy_coords,
-            batch.residue_index,
+            input.sequence,
+            input.noisy_coords,
+            input.residue_index,
             template_1d=template_1d,
             template_2d=template_2d,
             template_coords=template_coords,
@@ -170,18 +170,18 @@ class RFdiffusionModel(nn.Module):
             msa_prev=None,
             pair_prev=None,
             state_prev=None,
-            motif_mask=batch.fixed_structure_mask,
-            cyclic_reses=batch.cyclic_mask,
+            motif_mask=input.fixed_structure_mask,
+            cyclic_reses=input.cyclic_mask,
         )
         return RFdiffusionOutput(*output)
 
     def _features(
         self,
-        batch: RFdiffusionInput,
+        input: RFdiffusionInput,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""Build the exact released MSA/template feature channels."""
 
-        sequence = batch.sequence
+        sequence = input.sequence
         batch_size, length = sequence.shape[:2]
         msa_masked = sequence.new_zeros((batch_size, 1, length, 48))
         msa_masked[..., :22] = sequence[:, None]
@@ -198,12 +198,12 @@ class RFdiffusionModel(nn.Module):
         masked = sequence[..., MASK_TOKEN] > 0.5
         visible_sequence[..., 20] = visible_sequence[..., 20].masked_fill(masked, 1)
         template_1d[..., :21] = visible_sequence[:, None]
-        time = 1 - batch.timestep.to(sequence.dtype) / float(self.num_timesteps)
+        time = 1 - input.timestep.to(sequence.dtype) / float(self.num_timesteps)
         time = (
             time[:, None]
-            .expand_as(batch.fixed_structure_mask)
+            .expand_as(input.fixed_structure_mask)
             .masked_fill(
-                batch.fixed_structure_mask,
+                input.fixed_structure_mask,
                 1,
             )
         )
@@ -213,19 +213,19 @@ class RFdiffusionModel(nn.Module):
                 (
                     template_1d,
                     template_1d.new_zeros((batch_size, 1, length, 1)),
-                    batch.hotspot_mask[:, None, :, None].to(sequence.dtype),
+                    input.hotspot_mask[:, None, :, None].to(sequence.dtype),
                 ),
                 dim=-1,
             )
         if self.template_1d_size == 28:
-            template_1d = torch.cat((template_1d, batch.secondary_structure[:, None]), dim=-1)
+            template_1d = torch.cat((template_1d, input.secondary_structure[:, None]), dim=-1)
 
-        coords = batch.noisy_coords.clone()
+        coords = input.noisy_coords.clone()
         if self.sidechain_input:
             coords[:, :, 3:] = coords[:, :, 3:].masked_fill(masked[:, :, None, None], float("nan"))
         else:
             coords[:, :, 3:] = coords[:, :, 3:].masked_fill(
-                (~batch.fixed_structure_mask)[:, :, None, None],
+                (~input.fixed_structure_mask)[:, :, None, None],
                 float("nan"),
             )
         template_coords = torch.cat(
@@ -241,13 +241,13 @@ class RFdiffusionModel(nn.Module):
             template_2d[..., :44] = 0
             template_coords = torch.zeros_like(template_coords)
         if self.template_2d_size == 47:
-            template_2d = torch.cat((template_2d, batch.block_adjacency[:, None]), dim=-1)
+            template_2d = torch.cat((template_2d, input.block_adjacency[:, None]), dim=-1)
         return msa_masked, msa_full, template_1d, template_2d, template_coords, alpha_t
 
     @torch.inference_mode()
     def design(
         self,
-        batch: RFdiffusionInput,
+        input: RFdiffusionInput,
         *,
         num_candidates: int = 1,
         num_sampling_steps: int | None = None,
@@ -279,9 +279,9 @@ class RFdiffusionModel(nn.Module):
 
         if num_candidates <= 0:
             raise ValueError("num_candidates must be a positive integer")
-        if batch.sequence.shape[0] != 1:
+        if input.sequence.shape[0] != 1:
             raise ValueError("RFdiffusion design accepts one canonical system at a time")
-        prepared = [_sample_variable_lengths(batch, generator) for _ in range(num_candidates)]
+        prepared = [_sample_variable_lengths(input, generator) for _ in range(num_candidates)]
         sampler = RFdiffusionSampler(
             self.config,
             network=self.network,
@@ -3991,7 +3991,7 @@ class RFdiffusionSampler:
 
     def sample(
         self,
-        batch: RFdiffusionInput,
+        input: RFdiffusionInput,
         *,
         num_sampling_steps: int | None = None,
         final_step: int | None = None,
@@ -4005,7 +4005,7 @@ class RFdiffusionSampler:
         the network and denoiser each step and accumulating the coord trajectory.
 
         Args:
-            batch: One canonical RFdiffusion tensor input.
+            input: One canonical RFdiffusion tensor input.
             num_sampling_steps: Number of timesteps in the active translation, rotation, and time-feature schedules.
             final_step: Last (smallest) timestep to denoise to; defaults to the constructor value.
             generator: Optional RNG for reproducible sampling.
@@ -4017,7 +4017,7 @@ class RFdiffusionSampler:
             length-one timestep axis unless full CPU trajectories were requested.
 
         Examples:
-            >>> result = sampler.sample(batch)  # doctest: +SKIP
+            >>> result = sampler.sample(input)  # doctest: +SKIP
         """
 
         active_steps = (
@@ -4026,38 +4026,38 @@ class RFdiffusionSampler:
         if active_steps <= 0:
             raise ValueError("num_sampling_steps must be positive")
         stop_t = self.final_step if final_step is None else integer_index(final_step)
-        if batch.layout.templates and (
+        if input.layout.templates and (
             self.config.preprocess.template_1d_size != 28 or self.config.preprocess.template_2d_size != 47
         ):
             raise ValueError("Template evidence requires an RFdiffusion fold-conditioned checkpoint")
-        if any(type(condition) is SecondaryStructure for condition in batch.layout.conditions) and (
+        if any(type(condition) is SecondaryStructure for condition in input.layout.conditions) and (
             self.config.preprocess.template_1d_size != 28
         ):
             raise ValueError("SecondaryStructure requires an RFdiffusion fold-conditioned checkpoint")
-        mask_sequence = batch.fixed_sequence_mask
-        mask_structure = batch.fixed_structure_mask
+        mask_sequence = input.fixed_sequence_mask
+        mask_structure = input.fixed_structure_mask
         diffusion_mask = mask_structure.squeeze(0)
         diffuser = self._make_diffuser(active_steps)
-        length = batch.noisy_coords.shape[1]
-        coords27 = batch.noisy_coords.new_full((length, 27, 3), float("nan"))
-        coords27[:, :14] = batch.noisy_coords[0]
+        length = input.noisy_coords.shape[1]
+        coords27 = input.noisy_coords.new_full((length, 27, 3), float("nan"))
+        coords27[:, :14] = input.noisy_coords[0]
         atom_mask = torch.isfinite(coords27).all(dim=-1)
-        original_sequence = batch.sequence[0].argmax(dim=-1)
+        original_sequence = input.sequence[0].argmax(dim=-1)
         if bool(diffusion_mask.any()):
             center = coords27[diffusion_mask, 1].mean(dim=0)
         else:
             observed_calpha = torch.isfinite(coords27[:, 1]).all(dim=-1)
             center = coords27[observed_calpha, 1].mean(dim=0) if bool(observed_calpha.any()) else coords27.new_zeros(3)
         if self.partial_steps is not None:
-            if batch.layout.structure is None:
+            if input.layout.structure is None:
                 raise ValueError("partial diffusion requires coordinates for every output residue")
-            source_index = {site: index for index, site in enumerate(batch.layout.structure.sites)}
-            for reference in batch.layout.output_residues:
+            source_index = {site: index for index, site in enumerate(input.layout.structure.sites)}
+            for reference in input.layout.output_residues:
                 if type(reference) is SymbolicResidueSite:
                     raise ValueError("partial diffusion requires coordinates for every output residue")
                 for atom_name in ("N", "CA", "C"):
                     source = source_index.get(AtomSite(reference[0], reference[1], atom_name))
-                    if source is None or not bool(batch.layout.structure.coordinate_mask[source]):
+                    if source is None or not bool(input.layout.structure.coordinate_mask[source]):
                         raise ValueError(
                             "partial diffusion requires observed N/CA/C coordinates for every output residue"
                         )
@@ -4086,9 +4086,9 @@ class RFdiffusionSampler:
         )
         noisy_coords = diffused[-1, :, :14]
         symmetry_conditions = tuple(
-            condition for condition in batch.layout.conditions if type(condition) is PointGroupSymmetry
+            condition for condition in input.layout.conditions if type(condition) is PointGroupSymmetry
         )
-        symmetry = None if not symmetry_conditions else RFdiffusionSymmetry(symmetry_conditions[0], batch.layout)
+        symmetry = None if not symmetry_conditions else RFdiffusionSymmetry(symmetry_conditions[0], input.layout)
         if symmetry is not None:
             noisy_coords, sequence = symmetry.apply(
                 noisy_coords,
@@ -4096,7 +4096,7 @@ class RFdiffusionSampler:
                 recenter=self.symmetry_recenter,
                 radius_angstrom=self.symmetry_radius_angstrom,
             )
-        guidance = RFdiffusionGuidance(batch.layout)
+        guidance = RFdiffusionGuidance(input.layout)
         denoiser = self._make_denoiser(
             length,
             diffuser=diffuser,
@@ -4109,13 +4109,13 @@ class RFdiffusionSampler:
             px0_trajectory: list[Tensor] = []
             xt_minus_1_trajectory: list[Tensor] = []
         previous_prediction: Tensor | None = None
-        residue_index = batch.residue_index
+        residue_index = input.residue_index
         if symmetry is not None:
             residue_index = symmetry.chain_broken_residue_index(residue_index)
-        secondary_structure = batch.secondary_structure[0]
-        block_adjacency = batch.block_adjacency[0]
-        hotspot_mask = batch.hotspot_mask[0]
-        cyclic_mask = batch.cyclic_mask[0]
+        secondary_structure = input.secondary_structure[0]
+        block_adjacency = input.block_adjacency[0]
+        hotspot_mask = input.hotspot_mask[0]
+        cyclic_mask = input.cyclic_mask[0]
         for t in range(start_t, stop_t - 1, -1):
             (
                 msa_masked,
@@ -6261,15 +6261,15 @@ class ComputeAllAtomCoords(nn.Module):
 
 
 def _sample_variable_lengths(
-    batch: RFdiffusionInput,
+    input: RFdiffusionInput,
     generator: torch.Generator | None,
 ) -> RFdiffusionInput:
     # Deferred to break the model<->processor import cycle after contract.py was folded in.
     from .processor import terminal_cyclization_instance
 
-    placements = [condition for condition in batch.layout.conditions if type(condition) is RFdiffusionPlacements]
+    placements = [condition for condition in input.layout.conditions if type(condition) is RFdiffusionPlacements]
     if not placements:
-        return batch
+        return input
     placement = placements[0]
     rng_device = torch.device("cpu") if generator is None else generator.device
 
@@ -6286,7 +6286,7 @@ def _sample_variable_lengths(
             ).item()
         )
 
-    # RFdiffusion ContigMap.length (batch.layout.combined_length): the combined generated length
+    # RFdiffusion ContigMap.length (input.layout.combined_length): the combined generated length
     # across the placement's GeneratedSegment rows -- the family-owned §3.7 topology constraint
     # threaded from the Processor. Upstream RFdiffusion re-samples the per-subcon generated lengths
     # until their inpaint total lands in the requested [min, max] window and errors if it never can
@@ -6294,7 +6294,7 @@ def _sample_variable_lengths(
     # same way: reject-and-resample the per-GeneratedSegment draws until their combined length
     # satisfies the window, with an upstream-style attempt cap that raises rather than silently
     # dropping the request. When it is None the single draw below is unconstrained.
-    combined_length = batch.layout.combined_length
+    combined_length = input.layout.combined_length
     # placement_id -> GeneratedSegment, so a whole-placement reference (spelled as the bare
     # placement_id string, e.g. in PointGroupSymmetry units) recovers its length bounds
     # without the value carrying its own id.
@@ -6328,7 +6328,7 @@ def _sample_variable_lengths(
                 remaining -= length
 
         symmetry = next(
-            (condition for condition in batch.layout.conditions if type(condition) is PointGroupSymmetry),
+            (condition for condition in input.layout.conditions if type(condition) is PointGroupSymmetry),
             None,
         )
         if symmetry is not None:
@@ -6427,17 +6427,17 @@ def _sample_variable_lengths(
 
     references = tuple(output_residues)
     instances = tuple(output_instances)
-    if references == batch.layout.output_residues and instances == batch.layout.output_instance_ids:
-        return batch
-    if batch.layout.templates:
+    if references == input.layout.output_residues and instances == input.layout.output_instance_ids:
+        return input
+    if input.layout.templates:
         raise ValueError("variable generated lengths cannot be combined with aligned Template evidence")
 
-    old_index = {reference: index for index, reference in enumerate(batch.layout.output_residues)}
+    old_index = {reference: index for index, reference in enumerate(input.layout.output_residues)}
     length = len(references)
-    coords = batch.noisy_coords.new_empty((1, length, 14, 3))
-    sequence = batch.sequence.new_zeros((1, length, 22))
+    coords = input.noisy_coords.new_empty((1, length, 14, 3))
+    sequence = input.sequence.new_zeros((1, length, 22))
     sequence[..., MASK_TOKEN] = 1
-    fixed_structure = torch.zeros((1, length), dtype=torch.bool, device=batch.noisy_coords.device)
+    fixed_structure = torch.zeros((1, length), dtype=torch.bool, device=input.noisy_coords.device)
     fixed_sequence = torch.zeros_like(fixed_structure)
     hotspots = torch.zeros_like(fixed_structure)
     for row, reference in enumerate(references):
@@ -6445,11 +6445,11 @@ def _sample_variable_lengths(
         if previous is None:
             coords[0, row] = float("nan")
             continue
-        coords[0, row] = batch.noisy_coords[0, previous]
-        sequence[0, row] = batch.sequence[0, previous]
-        fixed_structure[0, row] = batch.fixed_structure_mask[0, previous]
-        fixed_sequence[0, row] = batch.fixed_sequence_mask[0, previous]
-        hotspots[0, row] = batch.hotspot_mask[0, previous]
+        coords[0, row] = input.noisy_coords[0, previous]
+        sequence[0, row] = input.sequence[0, previous]
+        fixed_structure[0, row] = input.fixed_structure_mask[0, previous]
+        fixed_sequence[0, row] = input.fixed_sequence_mask[0, previous]
+        hotspots[0, row] = input.hotspot_mask[0, previous]
     for row, reference in enumerate(references):
         if type(reference) is SymbolicResidueSite:
             sequence[0, row].zero_()
@@ -6469,7 +6469,7 @@ def _sample_variable_lengths(
     row_by_reference.update(
         {alias: row_by_reference[reference] for alias, reference in symbolic_residue_aliases(references).items()}
     )
-    for condition in batch.layout.conditions:
+    for condition in input.layout.conditions:
         if type(condition) is not AllowedResidueIdentities:
             continue
         token = residue_token(next(iter(condition.component_ids)))
@@ -6489,7 +6489,7 @@ def _sample_variable_lengths(
             fixed_sequence[0, row] = True
     secondary_labels = torch.full((1, length), 3, dtype=torch.int64, device=coords.device)
     label_by_kind = {"helix": 0, "strand": 1, "loop": 2}
-    for condition in batch.layout.conditions:
+    for condition in input.layout.conditions:
         if type(condition) is not SecondaryStructure:
             continue
         rows: list[int] = []
@@ -6505,7 +6505,7 @@ def _sample_variable_lengths(
         secondary_labels[0, torch.tensor(rows, device=coords.device)] = label_by_kind[condition.kind]
     cyclic_mask = torch.zeros((1, length), dtype=torch.bool, device=coords.device)
     row_by_reference_for_cyclization = dict(row_by_reference)
-    for condition in batch.layout.conditions:
+    for condition in input.layout.conditions:
         if type(condition) is not SymbolicBond:
             continue
         instance_id = terminal_cyclization_instance(
@@ -6533,15 +6533,15 @@ def _sample_variable_lengths(
             torch.full((1, length, length), 2, dtype=torch.int64, device=coords.device),
             num_classes=3,
         ).to(coords.dtype),
-        timestep=batch.timestep,
+        timestep=input.timestep,
         layout=RFdiffusionLayout(
-            system=batch.layout.system,
-            structure=batch.layout.structure,
-            templates=batch.layout.templates,
-            conditions=batch.layout.conditions,
+            system=input.layout.system,
+            structure=input.layout.structure,
+            templates=input.layout.templates,
+            conditions=input.layout.conditions,
             output_residues=references,
             output_instance_ids=instances,
-            combined_length=batch.layout.combined_length,
+            combined_length=input.layout.combined_length,
         ),
     )
 
@@ -6583,20 +6583,20 @@ def _decode_design(
     # frozen coordinate-free shared DesignResult, which §5.3.1/§5.3.3 forbids. Diffusion
     # internals (timesteps / px0 / x_t_minus_1) are dropped as §5.1 trajectory diagnostics.
     candidates: list[RFdiffusionDesignCandidate] = []
-    for sample, batch in zip(samples, inputs, strict=True):
+    for sample, input in zip(samples, inputs, strict=True):
         raw_coordinates, sequence, _timesteps, self_consistency_plddt, _px0, _xt_minus_1 = sample
         coordinates = raw_coordinates.clone()
-        fixed = batch.fixed_structure_mask[0].to(device=coordinates.device, dtype=torch.bool)
+        fixed = input.fixed_structure_mask[0].to(device=coordinates.device, dtype=torch.bool)
         if bool(fixed.any()):
-            reference = batch.noisy_coords[0].to(device=coordinates.device, dtype=coordinates.dtype)
+            reference = input.noisy_coords[0].to(device=coordinates.device, dtype=coordinates.dtype)
             if align_motif:
                 coordinates = Denoiser.align_to_xt_motif(coordinates, reference, fixed)
             coordinates[fixed] = reference[fixed]
-        layout = batch.layout
+        layout = input.layout
         candidate, _identity_map, residue_map = _decode_structure(
             coordinates,
             sequence,
-            batch.fixed_sequence_mask[0],
+            input.fixed_sequence_mask[0],
             layout,
         )
         candidate_outcomes = _condition_outcomes(candidate, layout, residue_map)

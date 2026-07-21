@@ -154,7 +154,7 @@ class Boltz2Model(nn.Module):
             operator_backend="auto",
         )
         self.distogram_head = DistogramHead(
-            pair_size=pair_size, num_bins=config.num_bins, symmetrize_before_projection=True
+            pair_size=pair_size, num_bins=config.num_distogram_bins, symmetrize_before_projection=True
         )
 
         diffusion = config.diffusion
@@ -222,7 +222,7 @@ class Boltz2Model(nn.Module):
         )
         self.bfactor_head: BFactorHead | None = None
         if config.predict_bfactor:
-            self.bfactor_head = BFactorHead(single_size=single_size, num_bins=config.num_bins)
+            self.bfactor_head = BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
         self.set_backend("auto")
 
     def set_backend(self, backend: str) -> Self:
@@ -254,7 +254,7 @@ class Boltz2Model(nn.Module):
 
     def forward(
         self,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         recycling_steps: int | None = None,
         num_samples: int = 1,
@@ -270,7 +270,7 @@ class Boltz2Model(nn.Module):
         is a distinct private inference path until canonical Processor lowering and FoldResult decoding exist.
 
         Args:
-            batch: Typed model input; training requires ``batch.target_positions``.
+            input: Typed model input; training requires ``input.target_positions``.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             num_samples: Number of noised copies drawn per batch element.
             generator: Optional PyTorch random generator for the diffusion noise.
@@ -281,19 +281,19 @@ class Boltz2Model(nn.Module):
 
         """
 
-        representations = self._trunk(batch, recycling_steps=recycling_steps)
-        target_positions = cast(Tensor, batch.target_positions)
-        conditioning = self._build_diffusion_conditioning(representations, batch)
+        representations = self._trunk(input, recycling_steps=recycling_steps)
+        target_positions = cast(Tensor, input.target_positions)
+        conditioning = self._build_diffusion_conditioning(representations, input)
         denoised, sigmas, augmented_target = self.structure_module.denoise(
             target_positions,
-            batch.atom_mask,
+            input.atom_mask,
             multiplicity=num_samples,
             generator=generator,
             single_inputs=representations.single_inputs,
             single_trunk=representations.single,
             conditioning=conditioning,
-            atom_to_token=batch.atom_to_token,
-            token_mask=batch.token_mask,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
         )
         batch_size = representations.single.shape[0]
         return Boltz2Output(
@@ -307,7 +307,7 @@ class Boltz2Model(nn.Module):
     @torch.inference_mode()
     def fold(
         self,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         num_samples: int = 1,
         generator: torch.Generator | None = None,
@@ -327,7 +327,7 @@ class Boltz2Model(nn.Module):
         [`Boltz1Model.fold`][ofoldx.models.boltz1.model.Boltz1Model.fold].
 
         Args:
-            batch: One lowered Boltz-2 input carrying the canonical
+            input: One lowered Boltz-2 input carrying the canonical
                 [`Boltz2Layout`][ofoldx.models.boltz2.model.Boltz2Layout] produced by ``Boltz2Processor``.
             num_samples: Number of reverse-diffusion samples to draw.
             generator: Optional RNG for reproducible sampling noise; resolved once at the Pipeline boundary.
@@ -341,23 +341,23 @@ class Boltz2Model(nn.Module):
 
         if type(num_samples) is not int or num_samples < 1:
             raise ValueError("num_samples must be a positive integer")
-        if batch.token_mask.shape[0] != 1:
+        if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz2Model.fold accepts one molecular system per call")
-        if batch.layout is None:
+        if input.layout is None:
             raise ValueError("Boltz2Model.fold requires the canonical layout produced by its Processor")
 
         output = self._fold(
-            batch,
+            input,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
             num_samples=num_samples,
             generator=generator,
         )
-        return _decode_boltz2_fold_result(output, batch)
+        return _decode_boltz2_fold_result(output, input)
 
     def _fold(
         self,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
@@ -374,7 +374,7 @@ class Boltz2Model(nn.Module):
         canonical FoldResult decoding are complete.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             num_samples: Number of reverse-diffusion samples to draw.
@@ -385,12 +385,12 @@ class Boltz2Model(nn.Module):
 
         """
 
-        representations = self._trunk(batch, recycling_steps=recycling_steps)
+        representations = self._trunk(input, recycling_steps=recycling_steps)
         single = representations.single
         pair = representations.pair
         sample_coords_flat = self._sample_coords(
             representations,
-            batch,
+            input,
             num_sampling_steps=num_sampling_steps,
             num_samples=num_samples,
             generator=generator,
@@ -400,18 +400,18 @@ class Boltz2Model(nn.Module):
             single,
             pair,
             sample_coords_flat,
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            token_bonds=batch.token_bonds,
-            type_bonds=batch.type_bonds,
-            contact_conditioning=batch.contact_conditioning,
-            contact_threshold=batch.contact_threshold,
-            token_to_rep_atom=batch.token_to_rep_atom,
-            token_mask=batch.token_mask,
-            cyclic_period=batch.cyclic_period,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
+            token_bonds=input.token_bonds,
+            type_bonds=input.type_bonds,
+            contact_conditioning=input.contact_conditioning,
+            contact_threshold=input.contact_threshold,
+            token_to_rep_atom=input.token_to_rep_atom,
+            token_mask=input.token_mask,
+            cyclic_period=input.cyclic_period,
             multiplicity=num_samples,
         )
         bfactor = self.bfactor_head(single) if self.bfactor_head is not None else None
@@ -430,12 +430,12 @@ class Boltz2Model(nn.Module):
             ),
         )
 
-    def _trunk(self, batch: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2Representations:
+    def _trunk(self, input: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2Representations:
         r"""
         Run the recycled folding trunk (template + MSA + Pairformer) and emit the trunk representations.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             recycling_steps: Total number of trunk passes; defaults to the configured value. The trunk runs
                 ``recycling_steps`` times.
 
@@ -445,8 +445,8 @@ class Boltz2Model(nn.Module):
         """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        single_inputs, single_init, pair_init, relative_position_encoding = self._initial_representations(batch)
-        token_mask = batch.token_mask
+        single_inputs, single_init, pair_init, relative_position_encoding = self._initial_representations(input)
+        token_mask = input.token_mask
         pair_mask = pair_mask_from_token_mask(token_mask)
 
         single = torch.zeros_like(single_init)
@@ -457,30 +457,30 @@ class Boltz2Model(nn.Module):
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
-                if batch.template_restype is not None:
+                if input.template_restype is not None:
                     pair = pair + cast(TemplateV2Embedder, self.template_embedder)(
                         pair,
-                        residue_type=batch.template_restype,
-                        frame_rotation=cast(Tensor, batch.template_frame_rot),
-                        frame_translation=cast(Tensor, batch.template_frame_t),
-                        frame_mask=cast(Tensor, batch.template_mask_frame),
-                        cb_coords=cast(Tensor, batch.template_cb),
-                        ca_coords=cast(Tensor, batch.template_ca),
-                        cb_mask=cast(Tensor, batch.template_mask_cb),
-                        visibility_ids=cast(Tensor, batch.visibility_ids),
-                        template_mask=cast(Tensor, batch.template_mask),
+                        residue_type=input.template_restype,
+                        frame_rotation=cast(Tensor, input.template_frame_rot),
+                        frame_translation=cast(Tensor, input.template_frame_t),
+                        frame_mask=cast(Tensor, input.template_mask_frame),
+                        cb_coords=cast(Tensor, input.template_cb),
+                        ca_coords=cast(Tensor, input.template_ca),
+                        cb_mask=cast(Tensor, input.template_mask_cb),
+                        visibility_ids=cast(Tensor, input.visibility_ids),
+                        template_mask=cast(Tensor, input.template_mask),
                         pair_mask=pair_mask,
                     )
-                if batch.msa is not None:
+                if input.msa is not None:
                     # Boltz adds the MSA module's (input-inclusive) refined pair as a residual.
                     pair = pair + self.msa_module(
                         pair,
                         single_inputs,
-                        msa=batch.msa,
-                        has_deletion=cast(Tensor, batch.has_deletion),
-                        deletion_value=cast(Tensor, batch.deletion_value),
-                        is_paired=cast(Tensor, batch.msa_paired),
-                        msa_mask=cast(Tensor, batch.msa_mask),
+                        msa=input.msa,
+                        has_deletion=cast(Tensor, input.has_deletion),
+                        deletion_value=cast(Tensor, input.deletion_value),
+                        is_paired=cast(Tensor, input.msa_paired),
+                        msa_mask=cast(Tensor, input.msa_mask),
                         token_mask=token_mask,
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
@@ -493,12 +493,12 @@ class Boltz2Model(nn.Module):
             relative_position_encoding=relative_position_encoding,
         )
 
-    def _initial_representations(self, batch: Boltz2Input) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _initial_representations(self, input: Boltz2Input) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Build the recycling-invariant input representations from the batch.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
 
         Returns:
             Tuple ``(single_inputs, single_init, pair_init, relative_position_encoding)`` where ``single_inputs``
@@ -507,18 +507,18 @@ class Boltz2Model(nn.Module):
         """
 
         single_inputs = self.input_embedder(
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
-            residue_type=batch.residue_type,
-            msa_profile=batch.msa_profile,
-            deletion_mean=batch.deletion_mean,
-            method_feature=batch.method_feature,
-            modified=batch.modified,
-            cyclic_period=batch.cyclic_period,
-            chain_type=batch.chain_type,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+            residue_type=input.residue_type,
+            msa_profile=input.msa_profile,
+            deletion_mean=input.deletion_mean,
+            method_feature=input.method_feature,
+            modified=input.modified,
+            cyclic_period=input.cyclic_period,
+            chain_type=input.chain_type,
         )
 
         single_init = self.single_init_projection(single_inputs)
@@ -526,27 +526,27 @@ class Boltz2Model(nn.Module):
         pair_init = pair_init + self.pair_right_projection(single_inputs).unsqueeze(-3)
 
         relative_features = generate_relative_position_features(
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            cyclic_period=batch.cyclic_period,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
+            cyclic_period=input.cyclic_period,
             dtype=single_init.dtype,
         )
         relative_position_encoding = self.relative_position_embedder(relative_features)
         pair_init = pair_init + relative_position_encoding
-        pair_init = pair_init + self.token_bond_projection(batch.token_bonds.unsqueeze(-1).to(pair_init.dtype))
-        pair_init = pair_init + self.token_bond_type_embedding(batch.type_bonds.long())
+        pair_init = pair_init + self.token_bond_projection(input.token_bonds.unsqueeze(-1).to(pair_init.dtype))
+        pair_init = pair_init + self.token_bond_type_embedding(input.type_bonds.long())
         pair_init = pair_init + self.contact_conditioning(
-            batch.contact_conditioning.to(pair_init.dtype), batch.contact_threshold.to(pair_init.dtype)
+            input.contact_conditioning.to(pair_init.dtype), input.contact_threshold.to(pair_init.dtype)
         )
         return single_inputs, single_init, pair_init, relative_position_encoding
 
     def _sample_coords(
         self,
         representations: _Boltz2Representations,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         num_sampling_steps: int | None,
         num_samples: int,
@@ -558,7 +558,7 @@ class Boltz2Model(nn.Module):
         Args:
             representations: Trunk representations from
                 [`_trunk`][ofoldx.models.boltz2.model.Boltz2Model._trunk].
-            batch: Typed model input.
+            input: Typed model input.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             num_samples: Number of independent samples to draw per batch element.
             generator: Optional PyTorch random generator for diffusion noise.
@@ -567,21 +567,21 @@ class Boltz2Model(nn.Module):
             Flattened sampled atom coords ``(B*num_samples, M, 3)``.
         """
 
-        conditioning = self._build_diffusion_conditioning(representations, batch)
+        conditioning = self._build_diffusion_conditioning(representations, input)
         return self.structure_module._sample(
-            batch.atom_mask,
+            input.atom_mask,
             num_sampling_steps=num_sampling_steps,
             multiplicity=num_samples,
             generator=generator,
             single_inputs=representations.single_inputs,
             single_trunk=representations.single,
             conditioning=conditioning,
-            atom_to_token=batch.atom_to_token,
-            token_mask=batch.token_mask,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
         )
 
     def _build_diffusion_conditioning(
-        self, representations: _Boltz2Representations, batch: Boltz2Input
+        self, representations: _Boltz2Representations, input: Boltz2Input
     ) -> dict[str, Tensor]:
         r"""
         Precompute the per-call-invariant diffusion conditioning from the trunk representations.
@@ -592,7 +592,7 @@ class Boltz2Model(nn.Module):
         Args:
             representations: Trunk representations from
                 [`_trunk`][ofoldx.models.boltz2.model.Boltz2Model._trunk].
-            batch: Typed model input.
+            input: Typed model input.
 
         Returns:
             The [`DiffusionConditioning`][ofoldx.models.boltz2.model.DiffusionConditioning] output dict.
@@ -602,11 +602,11 @@ class Boltz2Model(nn.Module):
             representations.single,
             representations.pair,
             representations.relative_position_encoding,
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
         )
 
 
@@ -661,7 +661,7 @@ class Boltz2AffinityModel(Boltz2Model):
     @torch.inference_mode()
     def score(
         self,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         num_samples: int = 5,
         generator: torch.Generator | None = None,
@@ -686,15 +686,15 @@ class Boltz2AffinityModel(Boltz2Model):
             raise ValueError("recycling_steps must be a positive integer or None")
         if num_sampling_steps is not None and (type(num_sampling_steps) is not int or num_sampling_steps <= 0):
             raise ValueError("num_sampling_steps must be a positive integer or None")
-        if batch.token_mask.shape[0] != 1:
+        if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz2AffinityModel.score accepts one molecular system per call")
-        if batch.layout is None:
+        if input.layout is None:
             raise ValueError("Boltz2AffinityModel.score requires the canonical layout produced by its Processor")
-        if batch.layout.affinity_instance_id is None:
+        if input.layout.affinity_instance_id is None:
             raise ValueError("Boltz2AffinityModel.score requires one canonical affinity ligand instance")
 
         structure_output, raw_scores = self._score(
-            batch,
+            input,
             recycling_steps=recycling_steps,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
@@ -703,7 +703,7 @@ class Boltz2AffinityModel(Boltz2Model):
         )
         selected_index = int(raw_scores["selected_sample_index"][0].item())
         selected_coords = structure_output.pred_coords[0, selected_index]
-        layout = batch.layout
+        layout = input.layout
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
@@ -730,7 +730,7 @@ class Boltz2AffinityModel(Boltz2Model):
         # atom mask (reconstructable from the affinity ligand scope), and the run provenance / RNG echo. The
         # first-stage per-sample confidence and its ranked selection live on the Pipeline's
         # ``structure_predictions``; this root pass returns only the second-pass ``target`` and the six Scores.
-        ligand_id = cast(Boltz2Layout, batch.layout).affinity_instance_id
+        ligand_id = cast(Boltz2Layout, input.layout).affinity_instance_id
         scope = frozenset({cast(str, ligand_id)})
         return ScoreResult(
             target=structure,
@@ -774,7 +774,7 @@ class Boltz2AffinityModel(Boltz2Model):
     @torch.inference_mode()
     def _score(
         self,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         *,
         pred_coords: Tensor | None = None,
         recycling_steps: int | None = None,
@@ -787,7 +787,7 @@ class Boltz2AffinityModel(Boltz2Model):
         Raw released affinity protocol, optionally using caller-supplied candidate coords.
 
         Args:
-            batch: Typed Boltz-2 input. ``affinity_token_mask`` may select the ligand; otherwise ligand tokens are
+            input: Typed Boltz-2 input. ``affinity_token_mask`` may select the ligand; otherwise ligand tokens are
                 inferred from ``molecule_type == 3``.
             pred_coords: Optional atom coords to score with shape ``(B, S, M, 3)``.
             recycling_steps: Optional trunk recycling passes. Defaults to the config value.
@@ -801,12 +801,12 @@ class Boltz2AffinityModel(Boltz2Model):
 
         """
 
-        representations = self._trunk(batch, recycling_steps=recycling_steps)
+        representations = self._trunk(input, recycling_steps=recycling_steps)
         batch_size = representations.single.shape[0]
         if pred_coords is None:
             sample_coords_flat = self._sample_coords(
                 representations,
-                batch,
+                input,
                 num_sampling_steps=num_sampling_steps,
                 num_samples=num_samples,
                 generator=generator,
@@ -821,31 +821,31 @@ class Boltz2AffinityModel(Boltz2Model):
             representations.single,
             representations.pair,
             sample_coords_flat,
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            token_bonds=batch.token_bonds,
-            type_bonds=batch.type_bonds,
-            contact_conditioning=batch.contact_conditioning,
-            contact_threshold=batch.contact_threshold,
-            token_to_rep_atom=batch.token_to_rep_atom,
-            token_mask=batch.token_mask,
-            cyclic_period=batch.cyclic_period,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
+            token_bonds=input.token_bonds,
+            type_bonds=input.type_bonds,
+            contact_conditioning=input.contact_conditioning,
+            contact_threshold=input.contact_threshold,
+            token_to_rep_atom=input.token_to_rep_atom,
+            token_mask=input.token_mask,
+            cyclic_period=input.cyclic_period,
             multiplicity=num_samples,
         )
         iptm = _boltz2_ptm_scores(
             confidence["pae_logits"],
             pred_coords=sample_coords_flat,
-            batch=batch,
+            input=input,
             multiplicity=num_samples,
         )["iptm"].reshape(batch_size, num_samples)
         selected_sample_index = iptm.argmax(dim=1)
         selected_coords = pred_coords[torch.arange(batch_size, device=pred_coords.device), selected_sample_index]
         scores = self._score_affinity(
             representations,
-            batch,
+            input,
             selected_coords.unsqueeze(1),
             molecular_weight_correction=molecular_weight_correction,
         )
@@ -864,7 +864,7 @@ class Boltz2AffinityModel(Boltz2Model):
     def _score_affinity(
         self,
         representations: _Boltz2Representations,
-        batch: Boltz2Input,
+        input: Boltz2Input,
         pred_coords: Tensor,
         *,
         affinity_token_mask: Tensor | None = None,
@@ -881,7 +881,7 @@ class Boltz2AffinityModel(Boltz2Model):
         Args:
             representations: Trunk representations from
                 [`_trunk`][ofoldx.models.boltz2.model.Boltz2Model._trunk].
-            batch: Typed Boltz-2 input.
+            input: Typed Boltz-2 input.
             pred_coords: Atom coords to score with shape ``(B, S, M, 3)``.
             affinity_token_mask: Optional explicit ligand token mask ``(B, N)``.
             affinity_mw: Optional per-batch molecular weight used by the molecular-weight correction.
@@ -894,18 +894,18 @@ class Boltz2AffinityModel(Boltz2Model):
         batch_size, multiplicity = pred_coords.shape[:2]
         coords = pred_coords.flatten(0, 1)
         if affinity_token_mask is None:
-            affinity_token_mask = batch.affinity_token_mask
+            affinity_token_mask = input.affinity_token_mask
         if affinity_token_mask is None:
             raise ValueError("Boltz-2 affinity scoring requires one explicit ligand token mask")
-        if batch.affinity_msa_profile is None or batch.affinity_deletion_mean is None:
+        if input.affinity_msa_profile is None or input.affinity_deletion_mean is None:
             raise ValueError("Boltz-2 affinity scoring requires its single-sequence affinity profile")
-        ligand_mask = affinity_token_mask.bool() & batch.token_mask.bool()
-        molecule_type = batch.molecule_type
+        ligand_mask = affinity_token_mask.bool() & input.token_mask.bool()
+        molecule_type = input.molecule_type
         if molecule_type is None:
-            receptor_mask = batch.chain_type == 0
+            receptor_mask = input.chain_type == 0
         else:
             receptor_mask = molecule_type == 0
-        receptor_mask = receptor_mask & batch.token_mask.bool()
+        receptor_mask = receptor_mask & input.token_mask.bool()
         affinity_pair_mask = (
             ligand_mask.unsqueeze(-1) & receptor_mask.unsqueeze(-2)
             | receptor_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
@@ -913,25 +913,25 @@ class Boltz2AffinityModel(Boltz2Model):
         )
         pair = representations.pair * affinity_pair_mask.unsqueeze(-1).to(representations.pair)
         affinity_single_inputs = self.input_embedder(
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
-            residue_type=batch.residue_type,
-            msa_profile=batch.affinity_msa_profile,
-            deletion_mean=batch.affinity_deletion_mean,
-            method_feature=batch.method_feature,
-            modified=batch.modified,
-            cyclic_period=batch.cyclic_period,
-            chain_type=batch.chain_type,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+            residue_type=input.residue_type,
+            msa_profile=input.affinity_msa_profile,
+            deletion_mean=input.affinity_deletion_mean,
+            method_feature=input.method_feature,
+            modified=input.modified,
+            cyclic_period=input.cyclic_period,
+            chain_type=input.chain_type,
         )
         head_kwargs = {
             "single_inputs": affinity_single_inputs,
             "pair": pair,
             "pred_coords": coords,
-            "token_to_rep_atom": batch.token_to_rep_atom,
-            "token_mask": batch.token_mask,
+            "token_to_rep_atom": input.token_to_rep_atom,
+            "token_mask": input.token_mask,
             "ligand_mask": ligand_mask,
             "receptor_mask": receptor_mask,
             "multiplicity": multiplicity,
@@ -957,7 +957,7 @@ class Boltz2AffinityModel(Boltz2Model):
             "affinity_probability_binary2": probability2,
         }
         if molecular_weight_correction:
-            affinity_mw = batch.affinity_mw if affinity_mw is None else affinity_mw
+            affinity_mw = input.affinity_mw if affinity_mw is None else affinity_mw
             if affinity_mw is None:
                 raise ValueError("molecular-weight correction requires the selected ligand molecular weight")
             affinity_pred_value = scores["affinity_pred_value"]
@@ -2619,7 +2619,7 @@ class BFactorHead(nn.Module):
         return self.projection(single)
 
 
-def _decode_boltz2_fold_result(output: Boltz2Output, batch: Boltz2Input) -> FoldResult:
+def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> FoldResult:
     r"""Decode one raw [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output] into a ``FoldResult``.
 
     Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
@@ -2627,7 +2627,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, batch: Boltz2Input) -> Fold
     per-sample pTM/ipTM ranking scores onto the canonical value carriers aligned to the layout's token axis.
     """
 
-    layout = cast(Boltz2Layout, batch.layout)
+    layout = cast(Boltz2Layout, input.layout)
     token_count = len(layout.token_sites)
     atom_count = len(layout.atom_sites)
 
@@ -2657,7 +2657,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, batch: Boltz2Input) -> Fold
     ptm_scores = _boltz2_ptm_scores(
         cast(Tensor, output.pae_logits).flatten(0, 1),
         pred_coords=output.pred_coords.flatten(0, 1),
-        batch=batch,
+        input=input,
         multiplicity=num_samples,
     )
     ptm = ptm_scores["ptm"].reshape(num_samples).float().cpu()
@@ -2668,7 +2668,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, batch: Boltz2Input) -> Fold
     # Whole-call all-zero-iPTM decision (upstream boltz2.py:1084 / DESIGN 5.4.3): interface is ipTM unless the
     # entire call's ipTM tensor is all-zero, then pTM; confidence_score = (4 * complex_plddt + interface) / 5 on
     # the released 0-1 pLDDT fraction.
-    token_mask = batch.token_mask[0, :token_count].to(device="cpu", dtype=torch.float32)
+    token_mask = input.token_mask[0, :token_count].to(device="cpu", dtype=torch.float32)
     complex_plddt = (plddt_fraction * token_mask).sum(dim=-1) / token_mask.sum().clamp_min(1.0)
     interface = ptm if torch.allclose(iptm, torch.zeros_like(iptm)) else iptm
     confidence_score = (4.0 * complex_plddt + interface) / 5.0
@@ -2732,18 +2732,18 @@ def _boltz2_ptm_scores(
     pae_logits: Tensor,
     *,
     pred_coords: Tensor,
-    batch: Boltz2Input,
+    input: Boltz2Input,
     multiplicity: int,
 ) -> dict[str, Tensor]:
     r"""Derive the released pTM and interface-pTM scores from PAE logits."""
 
-    token_mask = batch.token_mask.repeat_interleave(multiplicity, 0).float()
+    token_mask = input.token_mask.repeat_interleave(multiplicity, 0).float()
     frame_mask = _boltz2_predicted_frame_mask(
         pred_coords,
-        batch=batch,
+        input=input,
         multiplicity=multiplicity,
     ).float()
-    chain_index = batch.chain_index.repeat_interleave(multiplicity, 0)
+    chain_index = input.chain_index.repeat_interleave(multiplicity, 0)
     pair_mask_ptm = frame_mask[:, :, None] * token_mask[:, None, :] * token_mask[:, :, None]
     pair_mask_iptm = pair_mask_ptm * (chain_index[:, None, :] != chain_index[:, :, None]).to(pae_logits)
 
@@ -2764,7 +2764,7 @@ def _boltz2_ptm_scores(
             dim=1,
         ).values
 
-    molecule_type = batch.molecule_type if batch.molecule_type is not None else batch.chain_type
+    molecule_type = input.molecule_type if input.molecule_type is not None else input.chain_type
     molecule_type = molecule_type.repeat_interleave(multiplicity, 0)
     is_ligand = (molecule_type == 3).float()
     is_protein = (molecule_type == 0).float()
@@ -2783,26 +2783,26 @@ def _boltz2_ptm_scores(
 def _boltz2_predicted_frame_mask(
     pred_coords: Tensor,
     *,
-    batch: Boltz2Input,
+    input: Boltz2Input,
     multiplicity: int,
 ) -> Tensor:
     r"""Return the exact predicted-frame validity mask used by Boltz-2 pTM."""
 
-    if batch.frame_atom_index is None:
+    if input.frame_atom_index is None:
         raise ValueError("Boltz-2 confidence requires token frame atom indices")
-    frame_index = batch.frame_atom_index.repeat_interleave(multiplicity, 0).to(
+    frame_index = input.frame_atom_index.repeat_interleave(multiplicity, 0).to(
         device=pred_coords.device,
         dtype=torch.long,
     )
-    molecule_type = batch.molecule_type if batch.molecule_type is not None else batch.chain_type
+    molecule_type = input.molecule_type if input.molecule_type is not None else input.chain_type
     molecule_type = molecule_type.to(device=pred_coords.device)
-    chain_index = batch.chain_index.to(device=pred_coords.device)
-    token_mask = batch.token_mask.to(device=pred_coords.device, dtype=torch.bool)
-    atom_mask = batch.atom_mask.to(device=pred_coords.device, dtype=torch.bool)
-    atom_to_token = batch.atom_to_token.to(device=pred_coords.device, dtype=torch.long)
+    chain_index = input.chain_index.to(device=pred_coords.device)
+    token_mask = input.token_mask.to(device=pred_coords.device, dtype=torch.bool)
+    atom_mask = input.atom_mask.to(device=pred_coords.device, dtype=torch.bool)
+    atom_to_token = input.atom_to_token.to(device=pred_coords.device, dtype=torch.long)
     atom_chain = chain_index.gather(1, atom_to_token)
 
-    for batch_index in range(batch.token_mask.shape[0]):
+    for batch_index in range(input.token_mask.shape[0]):
         ligand_chains = torch.unique(
             chain_index[batch_index][token_mask[batch_index] & (molecule_type[batch_index] == 3)]
         )

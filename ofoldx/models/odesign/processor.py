@@ -839,10 +839,10 @@ def _materialize_cyclic_links(
     )
 
 
-def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> ODesignInput:
-    placement = next((condition for condition in batch.layout.conditions if type(condition) is ODesignPlacements), None)
+def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> ODesignInput:
+    placement = next((condition for condition in input.layout.conditions if type(condition) is ODesignPlacements), None)
     if placement is None:
-        return batch
+        return input
     ranged = {
         placement_id: part
         for chain in placement.placements.values()
@@ -850,7 +850,7 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
         if type(part) is GeneratedSegment and part.min_length != part.max_length
     }
     if not ranged:
-        return batch
+        return input
     lengths = {}
     chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
     for chain, chain_length in zip(placement.placements.values(), chain_lengths):
@@ -866,7 +866,7 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
                         segment.min_length,
                         segment.max_length + 1,
                         (),
-                        device=batch.reference_positions.device,
+                        device=input.reference_positions.device,
                         generator=generator,
                     )
                 )
@@ -887,25 +887,25 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
                 torch.randint(
                     len(available),
                     (),
-                    device=batch.reference_positions.device,
+                    device=input.reference_positions.device,
                     generator=generator,
                 )
             )
             lengths[available[selected][0]] += 1
     if all(length == ranged[placement_id].max_length for placement_id, length in lengths.items()):
-        return batch
+        return input
 
     polymer_instances = [
         instance_id
-        for instance_id, entity_id in batch.layout.system.instances.items()
-        if type(batch.layout.system.entities[entity_id]) is PolymerSequence
+        for instance_id, entity_id in input.layout.system.instances.items()
+        if type(input.layout.system.entities[entity_id]) is PolymerSequence
     ]
     residue_map = {}
     placement_map: PlacementMap = {}
     realized_sequences = []
     sequence_by_signature = {}
     used_entity_ids = {
-        entity_id for entity_id, entity in batch.layout.system.entities.items() if type(entity) is Molecule
+        entity_id for entity_id, entity in input.layout.system.entities.items() if type(entity) is Molecule
     }
     # Walk declaration groups in order, indexing the realized polymer instances by declaration
     # position among NON-EMPTY groups only: a zero-length declaration group mints no realized
@@ -922,8 +922,8 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
             continue
         instance_id = polymer_instances[chain_position]
         chain_position += 1
-        old_entity_id = batch.layout.system.instances[instance_id]
-        old_entity = cast(PolymerSequence, batch.layout.system.entities[old_entity_id])
+        old_entity_id = input.layout.system.instances[instance_id]
+        old_entity = cast(PolymerSequence, input.layout.system.entities[old_entity_id])
         old_index = 0
         new_index = 0
         components = []
@@ -955,12 +955,12 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
         realized_sequences.append((instance_id, entity_id, sequence))
 
     molecule_entities = {
-        entity_id: entity for entity_id, entity in batch.layout.system.entities.items() if type(entity) is Molecule
+        entity_id: entity for entity_id, entity in input.layout.system.entities.items() if type(entity) is Molecule
     }
     molecule_instances = {
         instance_id: entity_id
-        for instance_id, entity_id in batch.layout.system.instances.items()
-        if type(batch.layout.system.entities[entity_id]) is Molecule
+        for instance_id, entity_id in input.layout.system.instances.items()
+        if type(input.layout.system.entities[entity_id]) is Molecule
     }
     instances = {
         **{instance_id: entity_id for instance_id, entity_id, _ in realized_sequences},
@@ -972,13 +972,13 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
     }
 
     def map_site(site: AtomSite) -> AtomSite | None:
-        if type(batch.layout.system.entities[batch.layout.system.instances[site.instance_id]]) is Molecule:
+        if type(input.layout.system.entities[input.layout.system.instances[site.instance_id]]) is Molecule:
             return site
         residue = residue_map.get((site.instance_id, site.component_index))
         return None if residue is None else AtomSite(residue[0], residue[1], site.atom_id)
 
     bonds = []
-    for bond in batch.layout.system.bonds:
+    for bond in input.layout.system.bonds:
         site_a = map_site(bond.site_a)
         site_b = map_site(bond.site_b)
         if site_a is None or site_b is None:
@@ -1004,48 +1004,48 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
     system = MolecularSystem(entities, instances, frozenset(bonds))
     source_residue_map = {
         source: residue_map[output]
-        for source, output in batch.layout.source_residue_map.items()
+        for source, output in input.layout.source_residue_map.items()
         if output in residue_map
     }
     source_atom_map = {
         source: mapped
-        for source, output in batch.layout.source_atom_map.items()
+        for source, output in input.layout.source_atom_map.items()
         if (mapped := map_site(output)) is not None
     }
     system, cyclic_instances, cyclic_links = _materialize_cyclic_links(
         system,
-        batch.layout.conditions,
+        input.layout.conditions,
         placement_map,
-        batch.layout.instance_of,
+        input.layout.instance_of,
         source_atom_map,
     )
 
-    old_to_new_site = {site: mapped for site in batch.layout.sites if (mapped := map_site(site)) is not None}
+    old_to_new_site = {site: mapped for site in input.layout.sites if (mapped := map_site(site)) is not None}
     sites = tuple(old_to_new_site.values())
     new_to_old_site = {new: old for old, new in old_to_new_site.items()}
-    old_atom_index = {site: index for index, site in enumerate(batch.layout.sites)}
+    old_atom_index = {site: index for index, site in enumerate(input.layout.sites)}
     atom_indices = torch.tensor(
         [old_atom_index[new_to_old_site[site]] for site in sites],
         dtype=torch.int64,
-        device=batch.atom_mask.device,
+        device=input.atom_mask.device,
     )
     token_sites, token_residues, token_entities = _tokens(system, sites)
     old_token_indices = torch.tensor(
-        [int(batch.atom_to_token[0, old_atom_index[new_to_old_site[group[0]]]]) for group in token_sites],
+        [int(input.atom_to_token[0, old_atom_index[new_to_old_site[group[0]]]]) for group in token_sites],
         dtype=torch.int64,
-        device=batch.token_mask.device,
+        device=input.token_mask.device,
     )
     atom_to_token = torch.tensor(
         [token_index for token_index, group in enumerate(token_sites) for _ in group],
         dtype=torch.int64,
-        device=batch.atom_to_token.device,
+        device=input.atom_to_token.device,
     ).unsqueeze(0)
     site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
     chain_index, entity_index, symmetry_index, residue_index = (
-        value.unsqueeze(0).to(batch.residue_index.device)
+        value.unsqueeze(0).to(input.residue_index.device)
         for value in _token_indices(system, token_sites, token_residues, token_entities)
     )
-    selected_reference_spaces = batch.reference_space_id.index_select(1, atom_indices)
+    selected_reference_spaces = input.reference_space_id.index_select(1, atom_indices)
     reference_space_map = {}
     reference_space_id = []
     for value in selected_reference_spaces[0].tolist():
@@ -1055,18 +1055,18 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
     reference_space_id = torch.tensor(
         reference_space_id,
         dtype=torch.int64,
-        device=batch.reference_space_id.device,
+        device=input.reference_space_id.device,
     ).unsqueeze(0)
-    observed_positions = batch.observed_positions.index_select(1, atom_indices)
-    observed_mask = batch.observed_mask.index_select(1, atom_indices)
-    fixed_coordinate_mask = batch.fixed_coordinate_mask.index_select(1, atom_indices)
-    token_bonds = _token_bonds(system, token_sites, site_to_token, excluded=cyclic_links).to(batch.token_bonds)
-    constraint_distogram = batch.constraint_distogram.index_select(1, old_token_indices).index_select(
+    observed_positions = input.observed_positions.index_select(1, atom_indices)
+    observed_mask = input.observed_mask.index_select(1, atom_indices)
+    fixed_coordinate_mask = input.fixed_coordinate_mask.index_select(1, atom_indices)
+    token_bonds = _token_bonds(system, token_sites, site_to_token, excluded=cyclic_links).to(input.token_bonds)
+    constraint_distogram = input.constraint_distogram.index_select(1, old_token_indices).index_select(
         2,
         old_token_indices,
     )
     layout = replace(
-        batch.layout,
+        input.layout,
         system=system,
         sites=sites,
         placement_map=placement_map,
@@ -1074,29 +1074,29 @@ def _realize_ranges(batch: ODesignInput, generator: torch.Generator | None) -> O
         source_atom_map=source_atom_map,
     )
     return replace(
-        batch,
-        token_mask=batch.token_mask.index_select(1, old_token_indices),
+        input,
+        token_mask=input.token_mask.index_select(1, old_token_indices),
         residue_index=residue_index,
         chain_index=chain_index,
         entity_index=entity_index,
         symmetry_index=symmetry_index,
-        token_index=torch.arange(len(token_sites), device=batch.token_index.device).unsqueeze(0),
-        cyclic_period=_cyclic_period(token_sites, cyclic_instances).unsqueeze(0).to(batch.cyclic_period.device),
-        token_features=batch.token_features.index_select(1, old_token_indices),
+        token_index=torch.arange(len(token_sites), device=input.token_index.device).unsqueeze(0),
+        cyclic_period=_cyclic_period(token_sites, cyclic_instances).unsqueeze(0).to(input.cyclic_period.device),
+        token_features=input.token_features.index_select(1, old_token_indices),
         token_bonds=token_bonds.unsqueeze(0),
-        atom_features=batch.atom_features.index_select(1, atom_indices),
+        atom_features=input.atom_features.index_select(1, atom_indices),
         atom_to_token=atom_to_token,
-        atom_mask=batch.atom_mask.index_select(1, atom_indices),
-        reference_positions=batch.reference_positions.index_select(1, atom_indices),
+        atom_mask=input.atom_mask.index_select(1, atom_indices),
+        reference_positions=input.reference_positions.index_select(1, atom_indices),
         reference_space_id=reference_space_id,
-        reference_mask=batch.reference_mask.index_select(1, atom_indices),
-        reference_charges=batch.reference_charges.index_select(1, atom_indices),
+        reference_mask=input.reference_mask.index_select(1, atom_indices),
+        reference_charges=input.reference_charges.index_select(1, atom_indices),
         observed_positions=observed_positions,
         observed_mask=observed_mask,
         fixed_coordinate_mask=fixed_coordinate_mask,
         constraint_distogram=constraint_distogram,
-        msa_features=batch.msa_features.index_select(2, old_token_indices),
-        msa_mask=batch.msa_mask.index_select(2, old_token_indices),
+        msa_features=input.msa_features.index_select(2, old_token_indices),
+        msa_mask=input.msa_mask.index_select(2, old_token_indices),
         layout=layout,
     )
 

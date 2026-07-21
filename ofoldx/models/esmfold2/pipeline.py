@@ -51,8 +51,26 @@ from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor, antibod
 # offset the experimental trunk one-hot uses; ``F.pad(design, (2, 11))`` lifts it to the
 # 33-class ``res_type`` space (2 leading pad/gap slots, 11 trailing nucleic slots).
 _AA3_ORDER = (
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
 )
 _AA1_TO_IDX = {restype_3to1[three]: index for index, three in enumerate(_AA3_ORDER)}
 _IDX_TO_AA1 = {index: restype_3to1[three] for index, three in enumerate(_AA3_ORDER)}
@@ -269,12 +287,22 @@ def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dic
     is_binder[:-binder_length] *= 0.0
 
     intra = _contact_loss(
-        distogram_logits, bin_distance, num_contacts=2, min_sep=9, cutoff=14.0,
-        chain_mask=is_binder, binder_mask=is_binder,
+        distogram_logits,
+        bin_distance,
+        num_contacts=2,
+        min_sep=9,
+        cutoff=14.0,
+        chain_mask=is_binder,
+        binder_mask=is_binder,
     )
     inter = _contact_loss(
-        distogram_logits, bin_distance, num_contacts=1, min_sep=0, cutoff=22.0,
-        chain_mask=1 - is_binder, binder_mask=is_binder,
+        distogram_logits,
+        bin_distance,
+        num_contacts=1,
+        min_sep=0,
+        cutoff=22.0,
+        chain_mask=1 - is_binder,
+        binder_mask=is_binder,
     )
 
     binder_disto = distogram_logits[:, -binder_length:, -binder_length:, :]
@@ -288,9 +316,7 @@ def _structure_losses(distogram_logits: torch.Tensor, binder_length: int) -> dic
     glob = F.elu(rg_term - rg_th)
 
     total = (
-        _LOSS_WEIGHTS["intra_contact"] * intra
-        + _LOSS_WEIGHTS["inter_contact"] * inter
-        + _LOSS_WEIGHTS["glob"] * glob
+        _LOSS_WEIGHTS["intra_contact"] * intra + _LOSS_WEIGHTS["inter_contact"] * inter + _LOSS_WEIGHTS["glob"] * glob
     )
     return {"intra_contact": intra, "inter_contact": inter, "glob": glob, "total": total}
 
@@ -318,9 +344,7 @@ def _distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, bi
     return float(max(0.0, min(1.0, 1.0 - mean_entropy / math.log(51))))
 
 
-def cdr_distogram_iptm_proxy(
-    distogram_logits: torch.Tensor, target_length: int, binder_sequence: str
-) -> float:
+def cdr_distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, binder_sequence: str) -> float:
     r"""Algorithm 15 CDR restriction — entropy-of-binding ipTM proxy over the CDR rows only.
 
     A structure-derived antibody score: it restricts the binder→target binding-confidence
@@ -447,11 +471,15 @@ class ESMFold2Pipeline:
         if not isinstance(self.model, ESMFold2Model):
             raise TypeError("fold requires the released ESMFold2Model; this Pipeline is bound for design")
 
+        if seed is not None and generator is not None:
+            raise ValueError("seed and generator are mutually exclusive")
+        if generator is None and seed is not None:
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+
         batch = self.processor(input, msa=msa)
         return self.model.fold(
             batch,
             num_samples=num_samples,
-            seed=seed,
             generator=generator,
             num_loops=num_loops,
             num_sampling_steps=num_sampling_steps,
@@ -557,15 +585,21 @@ class ESMFold2Pipeline:
                 optimizer.zero_grad()
                 design = F.softmax(logits / temperature, dim=-1)
                 binder_sequence = "".join(_IDX_TO_AA1[int(i)] for i in design.argmax(dim=-1)[0])
-                batch = processor([
-                    PolymerSequence.from_one_letter(target_sequence),
-                    PolymerSequence.from_one_letter(binder_sequence),
-                ])
+                batch = processor(
+                    [
+                        PolymerSequence.from_one_letter(target_sequence),
+                        PolymerSequence.from_one_letter(binder_sequence),
+                    ]
+                )
                 res_type_soft = torch.cat([target_soft, F.pad(design, (2, 11))], dim=1)
 
                 output = model.forward(
-                    batch, res_type_soft=res_type_soft, num_loops=1, num_sampling_steps=1,
-                    calculate_confidence=False, return_structure=False,
+                    batch,
+                    res_type_soft=res_type_soft,
+                    num_loops=1,
+                    num_sampling_steps=1,
+                    calculate_confidence=False,
+                    return_structure=False,
                 )
                 distogram = output["distogram_logits"].float()
                 losses = _structure_losses(distogram, binder_length)
@@ -595,9 +629,7 @@ class ESMFold2Pipeline:
                     best_proxy = proxy
                     best_sequence = binder_sequence
 
-            candidates.append(
-                self._refold(processor, model, target_sequence, best_sequence, target_length, seed)
-            )
+            candidates.append(self._refold(processor, model, target_sequence, best_sequence, target_length, seed))
 
         return ESMFold2DesignResult(candidates=tuple(candidates))
 
@@ -639,13 +671,19 @@ class ESMFold2Pipeline:
     ) -> ESMFold2DesignCandidate:
         r"""Discretely refold one designed target|binder complex into a scored candidate."""
 
-        batch = processor([
-            PolymerSequence.from_one_letter(target_sequence),
-            PolymerSequence.from_one_letter(binder_sequence),
-        ])
+        batch = processor(
+            [
+                PolymerSequence.from_one_letter(target_sequence),
+                PolymerSequence.from_one_letter(binder_sequence),
+            ]
+        )
         with torch.no_grad():
             output = model.forward(
-                batch, num_loops=None, num_diffusion_samples=1, calculate_confidence=True, seed=seed,
+                batch,
+                num_loops=None,
+                num_diffusion_samples=1,
+                calculate_confidence=True,
+                seed=seed,
             )
         structure = self._structure(batch, output)
         binder_length = len(binder_sequence)
@@ -673,15 +711,13 @@ class ESMFold2Pipeline:
                 unit="angstrom",
             ),
         }
-        return ESMFold2DesignCandidate(
-            structure=structure, scores=scores, metrics=metrics, pair_metrics=pair_metrics
-        )
+        return ESMFold2DesignCandidate(structure=structure, scores=scores, metrics=metrics, pair_metrics=pair_metrics)
 
     @staticmethod
-    def _structure(batch: ESMFold2Input, output: dict[str, torch.Tensor]) -> Structure:
+    def _structure(input: ESMFold2Input, output: dict[str, torch.Tensor]) -> Structure:
         r"""Scatter model atoms onto the complete non-hydrogen sites of the target|binder system."""
 
-        layout = batch.layout
+        layout = input.layout
         atom_count = len(layout.atom_sites)
         raw_coordinates = output["sample_atom_coords"][0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]

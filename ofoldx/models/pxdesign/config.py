@@ -44,7 +44,7 @@ class PxDesignSamplerConfig(Config):
     max_noise_level: float = 160.0
     min_noise_level: float = 4e-4
     rho: float = 7.0
-    gamma0: float = 1.0
+    gamma_0: float = 1.0
     gamma_min: float = 0.01
     noise_scale: float = 1.003
     step_scale_min: float = 1.0

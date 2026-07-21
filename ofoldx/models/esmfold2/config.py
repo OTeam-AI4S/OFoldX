@@ -63,12 +63,12 @@ class ESMFold2LMEncoderConfig(Config):
 class ESMFold2AtomAttentionConfig(Config):
     r"""Sliding-window atom attention with three-dimensional rotary features."""
 
-    atom_size: int = 128
-    token_size: int = 768
+    atom_hidden_size: int = 128
+    token_hidden_size: int = 768
     num_blocks: int = 3
     num_attention_heads: int = 4
     sliding_window_size: int = 128
-    expansion_ratio: int = 2
+    expansion: int = 2
     spatial_rope_base_frequency: float = 20.0
     num_spatial_rope_pairs_per_axis: int = 2
     num_uid_rope_pairs: int = 10
@@ -92,30 +92,30 @@ class ESMFold2DiffusionModuleConfig(Config):
     r"""Diffusion score network."""
 
     sigma_data: float = 16.0
-    atom_size: int = 128
-    token_size: int = 768
+    atom_hidden_size: int = 128
+    token_hidden_size: int = 768
     pair_size: int = 256
     input_size: int = 451
-    fourier_dim: int = 256
+    fourier_embedding_size: int = 256
     num_atom_blocks: int = 3
     num_atom_attention_heads: int = 4
     num_token_blocks: int = 12
     num_token_attention_heads: int = 16
-    transition_multiplier: int = 2
+    expansion: int = 2
 
 
 class ESMFold2StructureHeadConfig(Config):
     r"""Diffusion structure head and sampler defaults."""
 
     diffusion_module: ESMFold2DiffusionModuleConfig = ESMFold2DiffusionModuleConfig()
-    distogram_bins: int = 64
-    gamma_0: float = 0.8
+    num_distogram_bins: int = 64
+    churn_rate: float = 0.8
     gamma_min: float = 1.0
     noise_scale: float = 1.003
     step_scale: float = 1.5
-    inference_s_max: float = 160.0
-    inference_s_min: float = 4e-4
-    inference_p: float = 7.0
+    max_noise_level: float = 160.0
+    min_noise_level: float = 4e-4
+    rho: float = 7.0
     num_sampling_steps: int = 14
 
 
@@ -125,9 +125,9 @@ class ESMFold2ConfidenceHeadConfig(Config):
     num_plddt_bins: int = 50
     num_pde_bins: int = 64
     num_pae_bins: int = 64
-    min_dist: float = 3.25
-    max_dist: float = 50.75
-    distogram_bins: int = 39
+    min_distance: float = 3.25
+    max_distance: float = 50.75
+    num_distogram_bins: int = 39
     folding_trunk: ESMFold2FoldingTrunkConfig = ESMFold2FoldingTrunkConfig({"num_blocks": 4})
 
 
@@ -175,9 +175,9 @@ class ESMFold2ExperimentalConfidenceHeadConfig(Config):
     enabled: bool = True
     num_plddt_bins: int = 50
     num_pae_bins: int = 64
-    min_dist: float = 2.0
-    max_dist: float = 52.0
-    distogram_bins: int = 128
+    min_distance: float = 2.0
+    max_distance: float = 52.0
+    num_distogram_bins: int = 128
     folding_trunk: ESMFold2FoldingTrunkConfig = ESMFold2FoldingTrunkConfig({"num_blocks": 4})
 
 
@@ -218,6 +218,6 @@ class ESMFold2ExperimentalConfig(Config):
     esmc: ESMFold2ESMCConfig = ESMFold2ESMCConfig()
     inputs: ESMFold2InputsEmbedderConfig = ESMFold2InputsEmbedderConfig()
     folding_trunk: ESMFold2FoldingTrunkConfig = ESMFold2FoldingTrunkConfig({"num_blocks": 24})
-    structure_head: ESMFold2StructureHeadConfig = ESMFold2StructureHeadConfig({"distogram_bins": 128})
+    structure_head: ESMFold2StructureHeadConfig = ESMFold2StructureHeadConfig({"num_distogram_bins": 128})
     confidence_head: ESMFold2ExperimentalConfidenceHeadConfig = ESMFold2ExperimentalConfidenceHeadConfig()
     msa_encoder: ESMFold2MSAEncoderConfig = ESMFold2MSAEncoderConfig({"enabled": False, "msa_head_dim": 32})

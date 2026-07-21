@@ -193,12 +193,12 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "inputs": {
             "input_size": inputs["d_inputs"],
             "atom_encoder": {
-                "atom_size": atom_encoder["d_atom"],
-                "token_size": atom_encoder["d_token"],
+                "atom_hidden_size": atom_encoder["d_atom"],
+                "token_hidden_size": atom_encoder["d_token"],
                 "num_blocks": atom_encoder["n_blocks"],
                 "num_attention_heads": atom_encoder["n_heads"],
                 "sliding_window_size": atom_encoder["swa_window_size"],
-                "expansion_ratio": atom_encoder["expansion_ratio"],
+                "expansion": atom_encoder["expansion_ratio"],
                 "spatial_rope_base_frequency": atom_encoder["spatial_rope_base_frequency"],
                 "num_spatial_rope_pairs_per_axis": atom_encoder["n_spatial_rope_pairs_per_axis"],
                 "num_uid_rope_pairs": atom_encoder["n_uid_rope_pairs"],
@@ -211,34 +211,34 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "structure_head": {
             "diffusion_module": {
                 "sigma_data": diffusion["sigma_data"],
-                "atom_size": diffusion["c_atom"],
-                "token_size": diffusion["c_token"],
+                "atom_hidden_size": diffusion["c_atom"],
+                "token_hidden_size": diffusion["c_token"],
                 "pair_size": diffusion["c_z"],
                 "input_size": diffusion["c_s_inputs"],
-                "fourier_dim": diffusion["fourier_dim"],
+                "fourier_embedding_size": diffusion["fourier_dim"],
                 "num_atom_blocks": diffusion["atom_num_blocks"],
                 "num_atom_attention_heads": diffusion["atom_num_heads"],
                 "num_token_blocks": diffusion["token_num_blocks"],
                 "num_token_attention_heads": diffusion["token_num_heads"],
-                "transition_multiplier": diffusion["transition_multiplier"],
+                "expansion": diffusion["transition_multiplier"],
             },
-            "distogram_bins": structure["distogram_bins"],
-            "gamma_0": structure["gamma_0"],
+            "num_distogram_bins": structure["distogram_bins"],
+            "churn_rate": structure["gamma_0"],
             "gamma_min": structure["gamma_min"],
             "noise_scale": structure["noise_scale"],
             "step_scale": structure["step_scale"],
-            "inference_s_max": structure["inference_s_max"],
-            "inference_s_min": structure["inference_s_min"],
-            "inference_p": structure["inference_p"],
+            "max_noise_level": structure["inference_s_max"],
+            "min_noise_level": structure["inference_s_min"],
+            "rho": structure["inference_p"],
             "num_sampling_steps": structure["inference_num_steps"],
         },
         "confidence_head": {
             "num_plddt_bins": confidence["num_plddt_bins"],
             "num_pde_bins": confidence["num_pde_bins"],
             "num_pae_bins": confidence["num_pae_bins"],
-            "min_dist": confidence["min_dist"],
-            "max_dist": confidence["max_dist"],
-            "distogram_bins": confidence["distogram_bins"],
+            "min_distance": confidence["min_dist"],
+            "max_distance": confidence["max_dist"],
+            "num_distogram_bins": confidence["distogram_bins"],
             "folding_trunk": {"num_blocks": confidence_trunk["n_layers"]},
         },
         "msa_encoder": {
@@ -294,12 +294,12 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     atom_encoder = inputs["atom_encoder"]
     config.inputs.input_size = inputs["d_inputs"]
     ae = config.inputs.atom_encoder
-    ae.atom_size = atom_encoder["d_atom"]
-    ae.token_size = atom_encoder["d_token"]
+    ae.atom_hidden_size = atom_encoder["d_atom"]
+    ae.token_hidden_size = atom_encoder["d_token"]
     ae.num_blocks = atom_encoder["n_blocks"]
     ae.num_attention_heads = atom_encoder["n_heads"]
     ae.sliding_window_size = atom_encoder["swa_window_size"]
-    ae.expansion_ratio = atom_encoder["expansion_ratio"]
+    ae.expansion = atom_encoder["expansion_ratio"]
     ae.spatial_rope_base_frequency = atom_encoder["spatial_rope_base_frequency"]
     ae.num_spatial_rope_pairs_per_axis = atom_encoder["n_spatial_rope_pairs_per_axis"]
     ae.num_uid_rope_pairs = atom_encoder["n_uid_rope_pairs"]
@@ -310,34 +310,34 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     structure = raw_config["structure_head"]
     diffusion = structure["diffusion_module"]
     sh = config.structure_head
-    sh.distogram_bins = structure["distogram_bins"]
-    sh.gamma_0 = structure["gamma_0"]
+    sh.num_distogram_bins = structure["distogram_bins"]
+    sh.churn_rate = structure["gamma_0"]
     sh.gamma_min = structure["gamma_min"]
     sh.noise_scale = structure["noise_scale"]
     sh.step_scale = structure["step_scale"]
-    sh.inference_s_max = structure["inference_s_max"]
-    sh.inference_s_min = structure["inference_s_min"]
-    sh.inference_p = structure["inference_p"]
+    sh.max_noise_level = structure["inference_s_max"]
+    sh.min_noise_level = structure["inference_s_min"]
+    sh.rho = structure["inference_p"]
     sh.num_sampling_steps = structure["inference_num_steps"]
     dm = sh.diffusion_module
     dm.sigma_data = diffusion["sigma_data"]
-    dm.atom_size = diffusion["c_atom"]
-    dm.token_size = diffusion["c_token"]
+    dm.atom_hidden_size = diffusion["c_atom"]
+    dm.token_hidden_size = diffusion["c_token"]
     dm.pair_size = diffusion["c_z"]
     dm.input_size = diffusion["c_s_inputs"]
-    dm.fourier_dim = diffusion["fourier_dim"]
+    dm.fourier_embedding_size = diffusion["fourier_dim"]
     dm.num_atom_blocks = diffusion["atom_num_blocks"]
     dm.num_atom_attention_heads = diffusion["atom_num_heads"]
     dm.num_token_blocks = diffusion["token_num_blocks"]
     dm.num_token_attention_heads = diffusion["token_num_heads"]
-    dm.transition_multiplier = diffusion["transition_multiplier"]
+    dm.expansion = diffusion["transition_multiplier"]
 
     confidence = raw_config["confidence_head"]
     ch = config.confidence_head
     ch.enabled = confidence.get("enabled", True)
-    ch.distogram_bins = confidence["distogram_bins"]
-    ch.min_dist = confidence["min_dist"]
-    ch.max_dist = confidence["max_dist"]
+    ch.num_distogram_bins = confidence["distogram_bins"]
+    ch.min_distance = confidence["min_dist"]
+    ch.max_distance = confidence["max_dist"]
     ch.num_plddt_bins = confidence["num_plddt_bins"]
     ch.num_pae_bins = confidence["num_pae_bins"]
     ch.folding_trunk.num_blocks = confidence["folding_trunk"]["n_layers"]

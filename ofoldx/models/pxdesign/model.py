@@ -91,15 +91,15 @@ class PxDesignModel(nn.Module):
 
     def forward(
         self,
-        batch: PxDesignInput,
+        input: PxDesignInput,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
     ) -> PxDesignOutput:
         r"""Denoise caller-supplied coordinates at a caller-supplied EDM noise level."""
 
-        token_embedding, single, pair, relative_features = self.encode_condition(batch)
-        context = self._denoise_context(batch, token_embedding, single, pair, relative_features)
+        token_embedding, single, pair, relative_features = self.encode_condition(input)
+        context = self._denoise_context(input, token_embedding, single, pair, relative_features)
         coordinates = self.coordinate_denoiser(
             context.to_denoising_input(
                 noisy_coords=noisy_coordinates,
@@ -111,7 +111,7 @@ class PxDesignModel(nn.Module):
     @torch.inference_mode()
     def sample(
         self,
-        batch: PxDesignInput,
+        input: PxDesignInput,
         *,
         num_samples: int = 100,
         num_sampling_steps: int = 400,
@@ -120,9 +120,9 @@ class PxDesignModel(nn.Module):
     ) -> PxDesignOutput:
         r"""Run the released PxDesign EDM sampler and return raw model coordinates."""
 
-        batch = _augment_reference_conformers(batch, generator)
-        token_embedding, single, pair, relative_features = self.encode_condition(batch)
-        context = self._denoise_context(batch, token_embedding, single, pair, relative_features)
+        input = _augment_reference_conformers(input, generator)
+        token_embedding, single, pair, relative_features = self.encode_condition(input)
+        context = self._denoise_context(input, token_embedding, single, pair, relative_features)
         coordinates = self.coordinate_sampler(
             self.coordinate_denoiser,
             context=context,
@@ -136,7 +136,7 @@ class PxDesignModel(nn.Module):
     @torch.inference_mode()
     def design(
         self,
-        batch: PxDesignInput,
+        input: PxDesignInput,
         *,
         num_candidates: int = 1,
         generator: torch.Generator | None = None,
@@ -149,10 +149,10 @@ class PxDesignModel(nn.Module):
         sole random stream; per-sample EDM sampling remains model-intrinsic.
         """
 
-        if batch.reference_positions.shape[:-2] != (1,):
+        if input.reference_positions.shape[:-2] != (1,):
             raise ValueError("PxDesignModel.design requires exactly one biological input")
         output = self.sample(
-            batch,
+            input,
             num_samples=num_candidates,
             num_sampling_steps=num_sampling_steps,
             sample_chunk_size=sample_chunk_size,
@@ -161,10 +161,10 @@ class PxDesignModel(nn.Module):
         candidates = tuple(
             PxDesignCandidate(
                 structure=Structure(
-                    system=batch.layout.system,
-                    sites=batch.layout.sites,
+                    system=input.layout.system,
+                    sites=input.layout.sites,
                     coordinates=output.coordinates[0, index].detach().to(device="cpu", dtype=torch.float32).numpy(),
-                    coordinate_mask=np.ones(len(batch.layout.sites), dtype=np.bool_),
+                    coordinate_mask=np.ones(len(input.layout.sites), dtype=np.bool_),
                 ),
             )
             for index in range(num_candidates)
@@ -182,25 +182,25 @@ class PxDesignModel(nn.Module):
 
     def encode_condition(
         self,
-        batch: PxDesignInput,
+        input: PxDesignInput,
     ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
         r"""Compute the released token, zero-single, pair, and relative conditioning."""
 
-        token_embedding, pair = self.condition_embedder(batch)
+        token_embedding, pair = self.condition_embedder(input)
         single = token_embedding.new_zeros(*token_embedding.shape[:-1], self.config.single_size)
         relative_features = generate_relative_position_features(
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
             dtype=token_embedding.dtype,
         )
         return token_embedding, single, pair, relative_features
 
     def _denoise_context(
         self,
-        batch: PxDesignInput,
+        input: PxDesignInput,
         token_embedding: Tensor,
         single: Tensor,
         pair: Tensor,
@@ -209,16 +209,16 @@ class PxDesignModel(nn.Module):
         r"""Assemble the conditioning shared by ``forward`` and ``sample``."""
 
         local_geometry = self.coordinate_denoiser.build_local_geometry(
-            batch.reference_positions,
-            batch.reference_space_id,
+            input.reference_positions,
+            input.reference_space_id,
         )
         return CoordinateDenoiseContext(
-            atom_features=batch.atom_features,
-            atom_to_token=batch.atom_to_token,
-            reference_positions=batch.reference_positions,
-            reference_charges=batch.reference_charges,
-            reference_mask=batch.reference_mask,
-            atom_mask=batch.atom_mask,
+            atom_features=input.atom_features,
+            atom_to_token=input.atom_to_token,
+            reference_positions=input.reference_positions,
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            atom_mask=input.atom_mask,
             token_embedding=token_embedding,
             single=single,
             pair=pair,
@@ -257,41 +257,41 @@ class PxDesignConditionEmbedder(nn.Module):
         )
         self.add_feature_size = embedder.add_feature_size
 
-    def forward(self, batch: PxDesignInput) -> tuple[Tensor, Tensor]:
+    def forward(self, input: PxDesignInput) -> tuple[Tensor, Tensor]:
         r"""Return the released token and conditional-template pair embeddings."""
 
         local_geometry = self.atom_encoder.build_local_geometry(
-            batch.reference_positions,
-            batch.reference_space_id,
+            input.reference_positions,
+            input.reference_space_id,
         )
         atom_output = self.atom_encoder(
-            batch.atom_features,
-            reference_positions=batch.reference_positions,
-            reference_charges=torch.arcsinh(batch.reference_charges),
-            reference_mask=batch.reference_mask,
-            atom_mask=batch.atom_mask,
-            atom_to_token=batch.atom_to_token,
-            num_tokens=batch.restype.shape[-2],
+            input.atom_features,
+            reference_positions=input.reference_positions,
+            reference_charges=torch.arcsinh(input.reference_charges),
+            reference_mask=input.reference_mask,
+            atom_mask=input.atom_mask,
+            atom_to_token=input.atom_to_token,
+            num_tokens=input.restype.shape[-2],
             local_geometry=local_geometry,
         )
         add_feature = F.one_hot(
-            torch.zeros(batch.restype.shape[:-1], device=batch.restype.device, dtype=torch.long),
+            torch.zeros(input.restype.shape[:-1], device=input.restype.device, dtype=torch.long),
             num_classes=self.add_feature_size,
         ).to(dtype=atom_output.token_hidden.dtype)
         token_embedding = self.input_map(
             torch.cat(
                 (
                     atom_output.token_hidden,
-                    batch.restype.to(atom_output.token_hidden),
-                    batch.plddt.to(atom_output.token_hidden),
-                    batch.hotspot.to(atom_output.token_hidden),
+                    input.restype.to(atom_output.token_hidden),
+                    input.plddt.to(atom_output.token_hidden),
+                    input.hotspot.to(atom_output.token_hidden),
                     add_feature,
                     add_feature,
                 ),
                 dim=-1,
             )
         )
-        pair = self.template_embedder(batch.conditional_templ, batch.conditional_templ_mask)
+        pair = self.template_embedder(input.conditional_templ, input.conditional_templ_mask)
         return token_embedding, pair.to(token_embedding)
 
 
@@ -321,7 +321,7 @@ class PxDesignSampler(nn.Module):
             rho=sampler.rho,
             sigma_data=config.denoiser.sigma_data,
         )
-        self.gamma0 = sampler.gamma0
+        self.gamma_0 = sampler.gamma_0
         self.gamma_min = sampler.gamma_min
         self.noise_scale = sampler.noise_scale
         self.step_scale_min = sampler.step_scale_min
@@ -387,7 +387,7 @@ class PxDesignSampler(nn.Module):
 
                 gamma = torch.where(
                     sigma_next > self.gamma_min,
-                    sigma_next.new_tensor(self.gamma0),
+                    sigma_next.new_tensor(self.gamma_0),
                     sigma_next.new_zeros(()),
                 )
                 sigma_hat = sigma_prev * (gamma + 1)
@@ -439,14 +439,14 @@ class PxDesignSampler(nn.Module):
 
 
 def _augment_reference_conformers(
-    batch: PxDesignInput,
+    input: PxDesignInput,
     generator: torch.Generator | None,
 ) -> PxDesignInput:
     r"""Apply the released independent per-residue reference augmentation."""
 
-    positions = batch.reference_positions.clone()
+    positions = input.reference_positions.clone()
     flat_positions = positions.reshape(-1, positions.shape[-2], 3)
-    flat_spaces = batch.reference_space_id.reshape(-1, batch.reference_space_id.shape[-1])
+    flat_spaces = input.reference_space_id.reshape(-1, input.reference_space_id.shape[-1])
     for sample_positions, sample_spaces in zip(flat_positions, flat_spaces):
         for space_id in torch.unique(sample_spaces):
             selected = sample_spaces == space_id
@@ -472,7 +472,7 @@ def _augment_reference_conformers(
             )[0]
             augmented = (values + translation) @ rotation.transpose(-1, -2)
             sample_positions[selected] = augmented.to(sample_positions.dtype)
-    return replace(batch, reference_positions=positions)
+    return replace(input, reference_positions=positions)
 
 
 # ============================================================================

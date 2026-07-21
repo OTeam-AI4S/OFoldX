@@ -225,7 +225,7 @@ class BoltzGenModel(nn.Module):
             num_atom_decoder_attention_heads=diffusion.num_atom_attention_heads,
             num_token_transformer_blocks=diffusion.num_token_transformer_blocks,
             num_token_transformer_heads=diffusion.num_token_transformer_heads,
-            conditioning_transition_layers=diffusion.conditioning_transition_layers,
+            num_conditioning_transitions=diffusion.num_conditioning_transitions,
         )
         score_model = DiffusionScoreModel(
             single_size=single_size,
@@ -239,7 +239,7 @@ class BoltzGenModel(nn.Module):
             num_token_transformer_heads=diffusion.num_token_transformer_heads,
             num_atom_decoder_blocks=diffusion.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=diffusion.num_atom_attention_heads,
-            conditioning_transition_layers=diffusion.conditioning_transition_layers,
+            num_conditioning_transitions=diffusion.num_conditioning_transitions,
             operator_backend="auto",
         )
         self.structure_module = AtomDiffusion(
@@ -291,7 +291,7 @@ class BoltzGenModel(nn.Module):
 
     def forward(
         self,
-        batch: BoltzGenInput,
+        input: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
@@ -308,7 +308,7 @@ class BoltzGenModel(nn.Module):
         denoising loss is computed. This is the compile-friendly gradient path.
 
         Args:
-            batch: Typed model input. ``target_positions`` supplies the training target; ``coords`` is the
+            input: Typed model input. ``target_positions`` supplies the training target; ``coords`` is the
                 fallback when it is absent.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             generator: Optional PyTorch random generator for the augmentation, noise level, and Gaussian noise.
@@ -319,21 +319,21 @@ class BoltzGenModel(nn.Module):
         """
 
         single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
-            batch,
+            input,
             recycling_steps=recycling_steps,
         )
         conditioning = self.diffusion_conditioning(
             single,
             pair,
             relative_position_encoding,
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
         )
-        target = batch.coords if batch.target_positions is None else batch.target_positions
-        atom_mask = batch.atom_mask
+        target = input.coords if input.target_positions is None else input.target_positions
+        atom_mask = input.atom_mask
         augmented_target = _center_random_augmentation(target, atom_mask, generator=generator)
         sigmas = self.structure_module.noise_distribution(
             atom_mask.shape[0], device=augmented_target.device, dtype=augmented_target.dtype, generator=generator
@@ -350,8 +350,8 @@ class BoltzGenModel(nn.Module):
             single_inputs=single_inputs,
             single_trunk=single,
             conditioning=conditioning,
-            atom_to_token=batch.atom_to_token,
-            token_mask=batch.token_mask,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
         )
         return BoltzGenOutput(
             pred_coords=denoised_coords,
@@ -364,7 +364,7 @@ class BoltzGenModel(nn.Module):
 
     def design(
         self,
-        batch: BoltzGenInput,
+        input: BoltzGenInput,
         *,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
@@ -381,7 +381,7 @@ class BoltzGenModel(nn.Module):
         canonical ``BoltzGenDesignResult`` decoding are owned by ``BoltzGenPipeline``.
 
         Args:
-            batch: Typed structure-design input from ``BoltzGenProcessor``.
+            input: Typed structure-design input from ``BoltzGenProcessor``.
             num_samples: Number of reverse-diffusion samples to draw.
             num_sampling_steps: Optional EDM sampling steps. Defaults to the sampler config value.
             recycling_steps: Optional recycling passes. Defaults to the config value.
@@ -394,7 +394,7 @@ class BoltzGenModel(nn.Module):
         """
 
         return self._design(
-            batch,
+            input,
             recycling_steps=recycling_steps,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
@@ -406,7 +406,7 @@ class BoltzGenModel(nn.Module):
     @torch.no_grad()
     def _design(
         self,
-        batch: BoltzGenInput,
+        input: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
         num_samples: int = 1,
@@ -416,10 +416,10 @@ class BoltzGenModel(nn.Module):
         noise_scale: float | None = None,
     ) -> BoltzGenOutput:
         r"""
-        Draw reverse-diffusion structure samples from a preprocessed batch.
+        Draw reverse-diffusion structure samples from a preprocessed input.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             num_samples: Number of reverse-diffusion samples to draw.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
@@ -432,21 +432,21 @@ class BoltzGenModel(nn.Module):
         """
 
         single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
-            batch,
+            input,
             recycling_steps=recycling_steps,
         )
         conditioning = self.diffusion_conditioning(
             single,
             pair,
             relative_position_encoding,
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
         )
         pred_coords = self.structure_module.sample(
-            batch.atom_mask,
+            input.atom_mask,
             num_sampling_steps=num_sampling_steps,
             multiplicity=num_samples,
             generator=generator,
@@ -455,10 +455,10 @@ class BoltzGenModel(nn.Module):
             single_inputs=single_inputs,
             single_trunk=single,
             conditioning=conditioning,
-            atom_to_token=batch.atom_to_token,
-            token_mask=batch.token_mask,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
         )
-        batch_size = batch.token_mask.shape[0]
+        batch_size = input.token_mask.shape[0]
         return BoltzGenOutput(
             pred_coords=pred_coords.reshape(batch_size, num_samples, *pred_coords.shape[1:]),
             distogram_logits=distogram_logits,
@@ -467,7 +467,7 @@ class BoltzGenModel(nn.Module):
 
     def _run_trunk(
         self,
-        batch: BoltzGenInput,
+        input: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -475,7 +475,7 @@ class BoltzGenModel(nn.Module):
         Run the structure trunk.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
 
         Returns:
@@ -485,44 +485,44 @@ class BoltzGenModel(nn.Module):
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
         single_inputs = self.input_embedder(
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
-            residue_type=batch.residue_type,
-            msa_profile=batch.msa_profile,
-            deletion_mean=batch.deletion_mean,
-            method_feature=batch.method_feature,
-            modified=batch.modified,
-            cyclic_period=batch.cyclic_period,
-            chain_type=batch.chain_type,
-            binding_type=batch.binding_type,
-            design_mask=batch.design_mask,
-            ss_type=batch.ss_type,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+            residue_type=input.residue_type,
+            msa_profile=input.msa_profile,
+            deletion_mean=input.deletion_mean,
+            method_feature=input.method_feature,
+            modified=input.modified,
+            cyclic_period=input.cyclic_period,
+            chain_type=input.chain_type,
+            binding_type=input.binding_type,
+            design_mask=input.design_mask,
+            ss_type=input.ss_type,
         )
 
         single_init = self.single_init_projection(single_inputs)
         pair_init = self.pair_left_projection(single_inputs).unsqueeze(-2)
         pair_init = pair_init + self.pair_right_projection(single_inputs).unsqueeze(-3)
         relative_features = generate_relative_position_features(
-            residue_index=batch.residue_index,
-            chain_index=batch.chain_index,
-            entity_index=batch.entity_index,
-            symmetry_index=batch.symmetry_index,
-            token_index=batch.token_index,
-            cyclic_period=batch.cyclic_period,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
+            cyclic_period=input.cyclic_period,
             dtype=single_init.dtype,
         )
         relative_position_encoding = self.relative_position_embedder(relative_features)
         pair_init = pair_init + relative_position_encoding
-        pair_init = pair_init + self.token_bond_projection(batch.token_bonds.to(pair_init.dtype))
-        pair_init = pair_init + self.token_bond_type_embedding(batch.type_bonds.long())
+        pair_init = pair_init + self.token_bond_projection(input.token_bonds.to(pair_init.dtype))
+        pair_init = pair_init + self.token_bond_type_embedding(input.type_bonds.long())
         pair_init = pair_init + self.contact_conditioning(
-            batch.contact_conditioning.to(pair_init.dtype), batch.contact_threshold.to(pair_init.dtype)
+            input.contact_conditioning.to(pair_init.dtype), input.contact_threshold.to(pair_init.dtype)
         )
 
-        token_mask = batch.token_mask
+        token_mask = input.token_mask
         pair_mask = pair_mask_from_token_mask(token_mask)
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
@@ -532,18 +532,18 @@ class BoltzGenModel(nn.Module):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
                 if self.token_distance is not None:
-                    pair = pair + self.token_distance(pair, batch, relative_position_encoding, pair_mask=pair_mask)
-                if batch.template_restype is not None:
-                    pair = pair + self.template_module(pair, batch, pair_mask=pair_mask)
-                if batch.msa is not None:
+                    pair = pair + self.token_distance(pair, input, relative_position_encoding, pair_mask=pair_mask)
+                if input.template_restype is not None:
+                    pair = pair + self.template_module(pair, input, pair_mask=pair_mask)
+                if input.msa is not None:
                     pair = pair + self.msa_module(
                         pair,
                         single_inputs,
-                        msa=batch.msa,
-                        has_deletion=batch.has_deletion,
-                        deletion_value=batch.deletion_value,
-                        is_paired=batch.msa_paired,
-                        msa_mask=batch.msa_mask,
+                        msa=input.msa,
+                        has_deletion=input.has_deletion,
+                        deletion_value=input.deletion_value,
+                        is_paired=input.msa_paired,
+                        msa_mask=input.msa_mask,
                         token_mask=token_mask,
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
@@ -642,39 +642,39 @@ class BoltzGenIFoldModel(nn.Module):
                 module.operator_backend = operator_backend
         return self
 
-    def forward(self, batch: BoltzGenIFoldInput) -> BoltzGenIFoldOutput:
+    def forward(self, input: BoltzGenIFoldInput) -> BoltzGenIFoldOutput:
         r"""
         Return per-token residue-type logits for structure-conditioned sequence design.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
 
         Returns:
             Design-generator output carrying sequence logits.
         """
 
         single_inputs = self.input_embedder(
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
-            residue_type=batch.residue_type,
-            msa_profile=batch.msa_profile,
-            deletion_mean=batch.deletion_mean,
-            method_feature=batch.method_feature,
-            modified=batch.modified,
-            cyclic_period=batch.cyclic_period,
-            chain_type=batch.chain_type,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+            residue_type=input.residue_type,
+            msa_profile=input.msa_profile,
+            deletion_mean=input.deletion_mean,
+            method_feature=input.method_feature,
+            modified=input.modified,
+            cyclic_period=input.cyclic_period,
+            chain_type=input.chain_type,
         )
-        edge_index, valid_mask, node, edge = self.encoder(batch, single_inputs=single_inputs)
+        edge_index, valid_mask, node, edge = self.encoder(input, single_inputs=single_inputs)
         return BoltzGenIFoldOutput(
-            logits=self.decoder(node, edge, edge_index, valid_mask, batch),
+            logits=self.decoder(node, edge, edge_index, valid_mask, input),
         )
 
     def design(
         self,
-        batch: BoltzGenIFoldInput,
+        input: BoltzGenIFoldInput,
         *,
         temperature: float | None = None,
         inverse_fold_restriction: tuple[str, ...] = (),
@@ -687,7 +687,7 @@ class BoltzGenIFoldModel(nn.Module):
         the numerics are unchanged. Returns per-token ``logits`` and sampled ``tokens``.
 
         Args:
-            batch: Typed inverse-fold input from ``BoltzGenIFoldProcessor``.
+            input: Typed inverse-fold input from ``BoltzGenIFoldProcessor``.
             temperature: Optional categorical sampling temperature. ``None`` selects argmax.
             inverse_fold_restriction: Canonical amino acids to exclude from this call.
             tie_symmetric_sequences: Whether symmetric copies share one sample.
@@ -698,7 +698,7 @@ class BoltzGenIFoldModel(nn.Module):
         """
 
         return self._design(
-            batch,
+            input,
             temperature=temperature,
             inverse_fold_restriction=inverse_fold_restriction,
             tie_symmetric_sequences=tie_symmetric_sequences,
@@ -708,7 +708,7 @@ class BoltzGenIFoldModel(nn.Module):
     @torch.no_grad()
     def _design(
         self,
-        batch: BoltzGenIFoldInput,
+        input: BoltzGenIFoldInput,
         *,
         temperature: float | None = None,
         inverse_fold_restriction: tuple[str, ...] = (),
@@ -719,7 +719,7 @@ class BoltzGenIFoldModel(nn.Module):
         Autoregressively design residue tokens from the conditioned structure.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             temperature: Optional categorical sampling temperature. ``None`` selects argmax decoding.
             inverse_fold_restriction: Canonical amino acids to exclude from this design call.
             tie_symmetric_sequences: Whether matching positions across symmetric copies share one sample.
@@ -730,26 +730,26 @@ class BoltzGenIFoldModel(nn.Module):
         """
 
         single_inputs = self.input_embedder(
-            atom_features=batch.atom_features,
-            reference_positions=batch.reference_positions,
-            atom_mask=batch.atom_mask,
-            reference_space_id=batch.reference_space_id,
-            atom_to_token=batch.atom_to_token,
-            residue_type=batch.residue_type,
-            msa_profile=batch.msa_profile,
-            deletion_mean=batch.deletion_mean,
-            method_feature=batch.method_feature,
-            modified=batch.modified,
-            cyclic_period=batch.cyclic_period,
-            chain_type=batch.chain_type,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+            residue_type=input.residue_type,
+            msa_profile=input.msa_profile,
+            deletion_mean=input.deletion_mean,
+            method_feature=input.method_feature,
+            modified=input.modified,
+            cyclic_period=input.cyclic_period,
+            chain_type=input.chain_type,
         )
-        edge_index, valid_mask, node, edge = self.encoder(batch, single_inputs=single_inputs)
+        edge_index, valid_mask, node, edge = self.encoder(input, single_inputs=single_inputs)
         logits, residue_type = self.decoder.sample(
             node,
             edge,
             edge_index,
             valid_mask,
-            batch,
+            input,
             temperature=temperature,
             inverse_fold_restriction=inverse_fold_restriction,
             tie_symmetric_sequences=tie_symmetric_sequences,
@@ -1775,7 +1775,7 @@ class DiffusionConditioning(nn.Module):
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_token_transformer_blocks: Number of token-transformer blocks (one bias projection each).
         num_token_transformer_heads: Number of attention heads per token-transformer block.
-        conditioning_transition_layers: Number of transition layers in the pairwise conditioner.
+        num_conditioning_transitions: Number of transition layers in the pairwise conditioner.
     """
 
     def __init__(
@@ -1793,11 +1793,11 @@ class DiffusionConditioning(nn.Module):
         num_atom_decoder_attention_heads: int = 4,
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
-        conditioning_transition_layers: int = 2,
+        num_conditioning_transitions: int = 2,
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
-            pair_size=pair_size, relative_position_size=pair_size, num_transitions=conditioning_transition_layers
+            pair_size=pair_size, relative_position_size=pair_size, num_transitions=num_conditioning_transitions
         )
         self.atom_encoder = AtomEncoder(
             atom_feature_size=atom_feature_size,
@@ -1956,7 +1956,7 @@ class DiffusionScoreModel(nn.Module):
         num_token_transformer_heads: Number of attention heads per token-transformer block.
         num_atom_decoder_blocks: Number of atom-decoder blocks.
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
-        conditioning_transition_layers: Number of transition layers in the single conditioner.
+        num_conditioning_transitions: Number of transition layers in the single conditioner.
         operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
@@ -1973,7 +1973,7 @@ class DiffusionScoreModel(nn.Module):
         num_token_transformer_heads: int = 16,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
-        conditioning_transition_layers: int = 2,
+        num_conditioning_transitions: int = 2,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -1981,7 +1981,7 @@ class DiffusionScoreModel(nn.Module):
         self.single_conditioner = SingleConditioning(
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
-            num_transitions=conditioning_transition_layers,
+            num_transitions=num_conditioning_transitions,
         )
         self.atom_attention_encoder = AtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -2706,33 +2706,33 @@ class InverseFoldingEncoder(nn.Module):
         self.distance_smearing = GaussianSmearing(start=0.0, stop=20.0, num_gaussians=16)
 
     @torch.no_grad()
-    def build_knn_graph(self, batch: BoltzGenIFoldInput) -> tuple[Tensor, Tensor, Tensor]:
+    def build_knn_graph(self, input: BoltzGenIFoldInput) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Build the kNN token graph from representative-atom distances.
 
         Args:
-            batch: Typed model input (supplies ``token_mask``, ``center_coords``, and token bonds).
+            input: Typed model input (supplies ``token_mask``, ``center_coords``, and token bonds).
 
         Returns:
             Tuple of ``edge_index`` ``(2, E)`` into packed valid tokens, ``valid_mask`` ``(B, N_token)``, and
             per-edge bond features ``(E, 1 + NUM_BOND_TYPES + 1)``.
         """
 
-        valid_mask = batch.token_mask.bool()
+        valid_mask = input.token_mask.bool()
         batch_size, num_tokens = valid_mask.shape
         valid_pair = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
         packed_index = (valid_mask.flatten().cumsum(dim=0) - 1).view(batch_size, num_tokens)
         num_neighbors = min(self.num_neighbors, num_tokens)
 
-        distances = torch.cdist(batch.center_coords, batch.center_coords)
+        distances = torch.cdist(input.center_coords, input.center_coords)
         distances = distances.masked_fill(~valid_pair, float("inf"))
         src = torch.topk(distances, num_neighbors, largest=False).indices  # (B, N, num_neighbors)
         dst = torch.arange(num_tokens, device=src.device)[None, :, None].expand(batch_size, -1, num_neighbors)
 
         # token_bonds carries a trailing singleton (B, N, N, 1); drop it so the gather index (B, N, num_neighbors)
         # matches its rank (the BoltzGen reference does the same, asserting shape[-1] == 1). type_bonds is (B, N, N).
-        token_bonds = torch.gather(batch.token_bonds[..., 0], 2, src)
-        type_bonds = torch.gather(batch.type_bonds, 2, src)
+        token_bonds = torch.gather(input.token_bonds[..., 0], 2, src)
+        type_bonds = torch.gather(input.type_bonds, 2, src)
 
         src, dst = src.flatten(start_dim=1), dst.flatten(start_dim=1)
         token_bonds, type_bonds = token_bonds.flatten(), type_bonds.flatten()
@@ -2748,12 +2748,12 @@ class InverseFoldingEncoder(nn.Module):
         return edge_index, valid_mask, bond
 
     @torch.no_grad()
-    def edge_geometry(self, batch: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
+    def edge_geometry(self, input: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
         r"""
         Compute the per-edge backbone-atom (4x4) pairwise-distance RBF feature.
 
         Args:
-            batch: Typed model input (supplies backbone-atom coordinates).
+            input: Typed model input (supplies backbone-atom coordinates).
             edge_index: Edge endpoints ``(2, E)`` into packed valid tokens.
             valid_mask: Boolean token validity mask ``(B, N_token)``.
 
@@ -2763,11 +2763,11 @@ class InverseFoldingEncoder(nn.Module):
 
         src, dst = edge_index[0], edge_index[1]
         batch_size, num_tokens = valid_mask.shape
-        coords = batch.coords
+        coords = input.coords
         if self.training and self.inverse_fold_noise > 0:
             coords = coords + torch.randn_like(coords) * self.inverse_fold_noise
         backbone = _gather_backbone4(
-            batch.token_to_bb4_atoms,
+            input.token_to_bb4_atoms,
             coords,
             batch_size,
             num_tokens,
@@ -2776,12 +2776,12 @@ class InverseFoldingEncoder(nn.Module):
         return self.distance_smearing(distance)
 
     @torch.no_grad()
-    def edge_attributes(self, batch: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
+    def edge_attributes(self, input: BoltzGenIFoldInput, edge_index: Tensor, valid_mask: Tensor) -> Tensor:
         r"""
         Compute the per-edge relative-position / same-chain / same-residue attributes.
 
         Args:
-            batch: Typed model input (supplies ``chain_index`` and ``residue_index``).
+            input: Typed model input (supplies ``chain_index`` and ``residue_index``).
             edge_index: Edge endpoints ``(2, E)`` into packed valid tokens.
             valid_mask: Boolean token validity mask ``(B, N_token)``.
 
@@ -2791,9 +2791,9 @@ class InverseFoldingEncoder(nn.Module):
         """
 
         src, dst = edge_index[0], edge_index[1]
-        asym = batch.chain_index[valid_mask]
+        asym = input.chain_index[valid_mask]
         same_chain = asym[src] == asym[dst]
-        residue = batch.residue_index[valid_mask]
+        residue = input.residue_index[valid_mask]
         same_residue = residue[src] == residue[dst]
         delta = torch.clip(residue[dst] - residue[src] + self.max_relative_position, 0, 2 * self.max_relative_position)
         delta = torch.where(same_chain, delta, torch.zeros_like(delta) + 2 * self.max_relative_position + 1)
@@ -2802,7 +2802,7 @@ class InverseFoldingEncoder(nn.Module):
 
     def forward(
         self,
-        batch: BoltzGenIFoldInput,
+        input: BoltzGenIFoldInput,
         *,
         single_inputs: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -2814,7 +2814,7 @@ class InverseFoldingEncoder(nn.Module):
         and runs the graph-attention layers.
 
         Args:
-            batch: Typed model input.
+            input: Typed model input.
             single_inputs: Token single embedding ``(B, N_token, single_size)``.
 
         Returns:
@@ -2823,9 +2823,9 @@ class InverseFoldingEncoder(nn.Module):
 
         """
 
-        edge_index, valid_mask, bond = self.build_knn_graph(batch)
-        geometry = self.edge_geometry(batch, edge_index, valid_mask)
-        edge_attr = self.edge_attributes(batch, edge_index, valid_mask)
+        edge_index, valid_mask, bond = self.build_knn_graph(input)
+        geometry = self.edge_geometry(input, edge_index, valid_mask)
+        edge_attr = self.edge_attributes(input, edge_index, valid_mask)
 
         node = self.node_input_projection(single_inputs[valid_mask])
         edge = self.edge_input_projection(torch.cat([geometry, edge_attr, bond], dim=-1))
@@ -2883,7 +2883,7 @@ class InverseFoldingDecoder(nn.Module):
         self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
 
     def forward(
-        self, node: Tensor, edge: Tensor, edge_index: Tensor, valid_mask: Tensor, batch: BoltzGenIFoldInput
+        self, node: Tensor, edge: Tensor, edge_index: Tensor, valid_mask: Tensor, input: BoltzGenIFoldInput
     ) -> Tensor:
         r"""
         Predict per-token residue-type logits with teacher forcing and random per-edge neighbour visibility.
@@ -2897,7 +2897,7 @@ class InverseFoldingDecoder(nn.Module):
             edge: Packed encoder edge states ``(E, edge_size)``.
             edge_index: Edge endpoints ``(2, E)`` into packed valid tokens.
             valid_mask: Boolean token validity mask ``(B, N_token)``.
-            batch: Typed model input (supplies ground-truth ``residue_type``).
+            input: Typed model input (supplies ground-truth ``residue_type``).
 
         Returns:
             Dense per-token residue-type logits ``(B, N_token, vocab_size)`` (zero at invalid tokens).
@@ -2909,7 +2909,7 @@ class InverseFoldingDecoder(nn.Module):
             # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
             rand = torch.rand(node.shape[0], device=node.device)
             visibility = rand[src] < rand[dst]
-            known = batch.residue_type.bool()[valid_mask][src] * visibility[:, None]
+            known = input.residue_type.bool()[valid_mask][src] * visibility[:, None]
             known = known.to(edge.dtype)
         residue_rep = self.residue_type_projection(known)
         neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
@@ -2930,7 +2930,7 @@ class InverseFoldingDecoder(nn.Module):
         edge: Tensor,
         edge_index: Tensor,
         valid_mask: Tensor,
-        batch: BoltzGenIFoldInput,
+        input: BoltzGenIFoldInput,
         *,
         temperature: float | None = None,
         inverse_fold_restriction: tuple[str, ...] = (),
@@ -2946,7 +2946,7 @@ class InverseFoldingDecoder(nn.Module):
         positions are fixed to ``res_type_clone``.
 
         Faithful to the upstream boltzgen ``InverseFoldingDecoder.sample``, including per-residue amino-acid
-        constraints (``batch.aa_constraint_mask`` + call-time ``inverse_fold_restriction``, combined into an additive
+        constraints (``input.aa_constraint_mask`` + call-time ``inverse_fold_restriction``, combined into an additive
         canonical-logit mask via ``_build_constraint_logit_mask``) and, when ``tie_symmetric_sequences`` is set,
         homomer-symmetry tying (logits are averaged across a symmetric group, sampled once, and applied to every
         copy). Input-side masks (``aa_constraint_mask``, ``symmetric_group``) must be supplied by the caller until
@@ -2957,7 +2957,7 @@ class InverseFoldingDecoder(nn.Module):
             edge: Packed encoder edge states of shape `[E, edge_size]`.
             edge_index: Edge endpoints of shape `[2, E]` indexing into the packed valid tokens.
             valid_mask: Boolean token validity mask of shape `[B, num_tokens]`.
-            batch: The typed model input, supplying ``design_mask``, ground-truth ``residue_type``, and the
+            input: The typed model input, supplying ``design_mask``, ground-truth ``residue_type``, and the
                 per-residue / symmetry constraint masks.
             temperature: Optional softmax temperature for stochastic sampling; ``None`` (or 0) argmaxes instead.
             inverse_fold_restriction: Canonical amino acids to block in this sampling call.
@@ -2970,11 +2970,11 @@ class InverseFoldingDecoder(nn.Module):
 
         src, dst = edge_index[0], edge_index[1]
         num_nodes = node.shape[0]
-        design_mask = cast(Tensor, batch.design_mask).bool()[valid_mask]
+        design_mask = cast(Tensor, input.design_mask).bool()[valid_mask]
         decoded = node.new_zeros(num_nodes, self.vocab_size)
         logits = node.new_zeros(num_nodes, self.vocab_size)
 
-        constraint_mask = None if batch.aa_constraint_mask is None else batch.aa_constraint_mask[valid_mask]
+        constraint_mask = None if input.aa_constraint_mask is None else input.aa_constraint_mask[valid_mask]
         per_residue_mask = _build_constraint_logit_mask(
             num_nodes=num_nodes,
             aa_constraint_mask=constraint_mask,
@@ -2985,15 +2985,15 @@ class InverseFoldingDecoder(nn.Module):
 
         order = torch.randperm(num_nodes, device=node.device, generator=generator).tolist()
         if (~design_mask).any():
-            known = batch.residue_type[valid_mask][~design_mask].to(decoded.dtype)
+            known = input.residue_type[valid_mask][~design_mask].to(decoded.dtype)
             decoded[~design_mask] = known
             logits[~design_mask] = known
             fixed = set(torch.where(~design_mask)[0].tolist())
             order = [position for position in order if position not in fixed]
 
         symmetry_groups, position_to_group = (
-            self._build_symmetric_groups(batch, valid_mask, design_mask)
-            if tie_symmetric_sequences and batch.symmetric_group is not None
+            self._build_symmetric_groups(input, valid_mask, design_mask)
+            if tie_symmetric_sequences and input.symmetric_group is not None
             else ({}, {})
         )
         sampled: set[int] = set()
@@ -3049,7 +3049,7 @@ class InverseFoldingDecoder(nn.Module):
         return dense_logits, dense_res_type
 
     def _build_symmetric_groups(
-        self, batch: BoltzGenIFoldInput, valid_mask: Tensor, design_mask: Tensor
+        self, input: BoltzGenIFoldInput, valid_mask: Tensor, design_mask: Tensor
     ) -> tuple[dict[int, list[int]], dict[int, int]]:
         r"""
         Group designable packed-token positions that must share a residue type under homomer symmetry.
@@ -3060,7 +3060,7 @@ class InverseFoldingDecoder(nn.Module):
         """
 
         metadata = torch.stack(
-            [design_mask, cast(Tensor, batch.symmetric_group)[valid_mask], batch.residue_index[valid_mask]], dim=-1
+            [design_mask, cast(Tensor, input.symmetric_group)[valid_mask], input.residue_index[valid_mask]], dim=-1
         ).tolist()
         key_to_positions: dict[tuple[int, int], list[int]] = {}
         for position, (designable, group, residue_index) in enumerate(metadata):
@@ -3140,7 +3140,7 @@ class TokenDistanceModule(nn.Module):
     def forward(
         self,
         pair: Tensor,
-        batch: BoltzGenInput,
+        input: BoltzGenInput,
         relative_position_encoding: Tensor,
         pair_mask: Tensor | None = None,
     ) -> Tensor:
@@ -3153,7 +3153,7 @@ class TokenDistanceModule(nn.Module):
 
         Args:
             pair: Trunk pair representation ``(B, N_token, N_token, pair_size)``.
-            batch: Typed model input (supplies ``center_coords`` and ``token_distance_mask``).
+            input: Typed model input (supplies ``center_coords`` and ``token_distance_mask``).
             relative_position_encoding: Relative-position pair features ``(B, N_token, N_token, pair_size)``.
             pair_mask: Optional boolean pair mask ``(B, N_token, N_token)``.
 
@@ -3161,13 +3161,13 @@ class TokenDistanceModule(nn.Module):
             Additive pair update ``(B, N_token, N_token, pair_size)``.
         """
 
-        coords = batch.center_coords
+        coords = input.center_coords
         distances = torch.cdist(coords, coords)
         boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1, device=distances.device)
         distogram = F.one_hot((distances[..., None] > boundaries).sum(dim=-1).long(), num_classes=self.num_bins)
 
-        distance_features = torch.cat([distogram, self.distance_encoder(relative_position_encoding, batch)], dim=-1)
-        distance_features = distance_features * batch.token_distance_mask.unsqueeze(-1)
+        distance_features = torch.cat([distogram, self.distance_encoder(relative_position_encoding, input)], dim=-1)
+        distance_features = distance_features * input.token_distance_mask.unsqueeze(-1)
         value = self.pair_projection(self.norm_pair(pair)) + self.distance_feature_projection(
             distance_features.to(pair.dtype)
         )
@@ -3242,7 +3242,7 @@ class TemplateModule(nn.Module):
                 for _ in range(num_blocks)
             )
 
-    def forward(self, pair: Tensor, batch: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
+    def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
         r"""
         Featurize template geometry into an additive pair update, aggregated over the template axis.
 
@@ -3253,7 +3253,7 @@ class TemplateModule(nn.Module):
 
         Args:
             pair: Trunk pair representation ``(B, N_token, N_token, pair_size)``.
-            batch: Typed model input supplying the template features.
+            input: Typed model input supplying the template features.
             pair_mask: Optional boolean pair mask ``(B, N_token, N_token)``.
 
         Returns:
@@ -3261,15 +3261,15 @@ class TemplateModule(nn.Module):
 
         """
 
-        res_type = cast(Tensor, batch.template_restype)
-        frame_mask = cast(Tensor, batch.template_mask_frame)
-        frame_rotation = cast(Tensor, batch.template_frame_rot)
-        frame_translation = cast(Tensor, batch.template_frame_t)
-        cb_coords = cast(Tensor, batch.template_cb)
-        ca_coords = cast(Tensor, batch.template_ca)
-        cb_mask = cast(Tensor, batch.template_mask_cb)
-        template_mask = cast(Tensor, batch.template_mask)
-        visibility = cast(Tensor, batch.visibility_ids)
+        res_type = cast(Tensor, input.template_restype)
+        frame_mask = cast(Tensor, input.template_mask_frame)
+        frame_rotation = cast(Tensor, input.template_frame_rot)
+        frame_translation = cast(Tensor, input.template_frame_t)
+        cb_coords = cast(Tensor, input.template_cb)
+        ca_coords = cast(Tensor, input.template_ca)
+        cb_mask = cast(Tensor, input.template_mask_cb)
+        template_mask = cast(Tensor, input.template_mask)
+        visibility = cast(Tensor, input.visibility_ids)
         present = template_mask.any(dim=2).float()
         count = present.sum(dim=1).clamp(min=1)
         batch_size, num_templates, num_tokens = res_type.shape[:3]
@@ -3334,7 +3334,7 @@ class DistanceTokenEncoder(nn.Module):
         self.distance_smearing = BroadcastGaussianSmearing(start=0.0, stop=2.0, num_gaussians=distance_gaussian_dim)
         self.distance_token_bias_trans = ProjectionTransition(distance_gaussian_dim + 1 + pair_size, pair_size, out_dim)
 
-    def forward(self, relative_position_encoding: Tensor, batch: BoltzGenInput) -> Tensor:
+    def forward(self, relative_position_encoding: Tensor, input: BoltzGenInput) -> Tensor:
         r"""
         Compute per-backbone-atom pairwise distance features conditioned on the relative-position encoding.
 
@@ -3344,7 +3344,7 @@ class DistanceTokenEncoder(nn.Module):
 
         Args:
             relative_position_encoding: Relative-position pair features ``(B, N_token, N_token, pair_size)``.
-            batch: Typed model input (supplies ``token_to_bb4_atoms`` and ``coords``).
+            input: Typed model input (supplies ``token_to_bb4_atoms`` and ``coords``).
 
         Returns:
             Distance-conditioned pair features ``(B, N_token, N_token, 4 * out_dim)``.
@@ -3352,8 +3352,8 @@ class DistanceTokenEncoder(nn.Module):
 
         batch_size, num_tokens = relative_position_encoding.shape[:2]
         backbone = _gather_backbone4(
-            batch.token_to_bb4_atoms,
-            batch.coords,
+            input.token_to_bb4_atoms,
+            input.coords,
             batch_size,
             num_tokens,
         ).permute(0, 2, 1, 3)

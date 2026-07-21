@@ -53,13 +53,13 @@ from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import FoldResult, Metric, Score, ScoreResult
 from .model import (
     BoltzGenDesignCandidate,
+    BoltzGenDesignResult,
     BoltzGenIFoldInput,
     BoltzGenIFoldModel,
     BoltzGenIFoldOutput,
     BoltzGenInput,
     BoltzGenModel,
     BoltzGenResidueConstraint,
-    BoltzGenDesignResult,
     BoltzGenSchema,
 )
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
@@ -74,9 +74,7 @@ class _FoldModel(Protocol):
 
     def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
 
-    def fold(
-        self, batch: object, *, num_samples: int = ..., generator: torch.Generator | None = ...
-    ) -> FoldResult: ...
+    def fold(self, batch: object, *, num_samples: int = ..., generator: torch.Generator | None = ...) -> FoldResult: ...
 
 
 class _ScoreModel(Protocol):
@@ -306,7 +304,7 @@ class BoltzGenPipeline(CompositePipeline):
         return BoltzGenDesignCandidate(structure=structure, scores=scores, metrics=metrics)
 
 
-def _decode_structure(batch: BoltzGenInput, coords: torch.Tensor) -> Structure:
+def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
     r"""Map one sample's model atom coords back onto canonical sites → ``Structure``.
 
     Mirrors ``Boltz2AffinityModel.score``'s decode: place the model atom order onto the
@@ -314,7 +312,7 @@ def _decode_structure(batch: BoltzGenInput, coords: torch.Tensor) -> Structure:
     no released end-to-end decode reference exists for bit-level parity.
     """
 
-    layout = batch.layout
+    layout = input.layout
     if layout is None or layout.system is None:
         raise ValueError("BoltzGenPipeline requires a Processor-populated layout with a system to decode")
     system = layout.system
@@ -379,9 +377,7 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
         return ()
     flags = mask[0].bool().tolist()
     return tuple(
-        reference
-        for reference, flag in zip(layout.output_residues, flags)
-        if flag and isinstance(reference, tuple)
+        reference for reference, flag in zip(layout.output_residues, flags) if flag and isinstance(reference, tuple)
     )
 
 

@@ -61,7 +61,7 @@ class BoltzGenDiffusionConfig(Config):
     atom_pair_hidden_size: int = 16
     num_query_atoms: int = 32
     num_key_atoms: int = 128
-    conditioning_transition_layers: int = 2
+    num_conditioning_transitions: int = 2
     sigma_data: float = 16.0
     alignment_reverse_diff: bool = True
 
@@ -138,7 +138,7 @@ class BoltzGenConfig(Config):
     design: BoltzGenStructureDesignConfig = BoltzGenStructureDesignConfig()
 
     @classmethod
-    def structuretrained_small(cls) -> "BoltzGenConfig":
+    def structuretrained_small(cls) -> BoltzGenConfig:
         r"""Config for the reduced ``boltzgen1_structuretrained_small`` structure-design checkpoint.
 
         The released small artifact is the same dim-for-dim BoltzGen structure-design contract as

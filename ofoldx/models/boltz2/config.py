@@ -284,7 +284,7 @@ class Boltz2Config(Config):
         atom_hidden_size: Width of the atom single channel in the input embedder.
         atom_pair_hidden_size: Width of the atom pair channel in the input embedder.
         atom_feature_size: Width of the per-atom reference feature vector.
-        num_bins: Number of distogram / B-factor output bins.
+        num_distogram_bins: Number of distogram / B-factor output bins.
         fourier_embedding_size: Width of the Fourier noise-level embedding.
         relative_position_size: Width of the relative-position feature vector.
         num_bond_types: Bond-type vocabulary size (``token_bonds_type``: ``Embedding(7, pair_size)``).
@@ -315,7 +315,7 @@ class Boltz2Config(Config):
     atom_hidden_size: int = 128
     atom_pair_hidden_size: int = 16
     atom_feature_size: int = 388
-    num_bins: int = 64
+    num_distogram_bins: int = 64
     fourier_embedding_size: int = 256
     relative_position_size: int = 139
     num_bond_types: int = 7  # token_bonds_type: Embedding(len(bond_types) + 1 = 7, pair_size)
