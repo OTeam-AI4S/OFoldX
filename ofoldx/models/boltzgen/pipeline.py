@@ -3,7 +3,7 @@ r"""OFoldX's biological operation boundary for the released BoltzGen design pipe
 ``BoltzGenPipeline`` binds the two family Model/Processor pairs and the optionally composed
 fold / affinity stages into the released multi-stage flow
 (``design -> inverse_folding -> folding -> affinity -> analysis/filter``, upstream
-``cli/boltzgen.py`` ``step_names``) and returns the family-owned ``BoltzGenResult``. It is
+``cli/boltzgen.py`` ``step_names``) and returns the family-owned ``BoltzGenDesignResult``. It is
 not a base class and shares no runtime request object with any other family (mirroring
 ``Boltz1Pipeline``).
 
@@ -52,14 +52,14 @@ from ...data.structure import Structure
 from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import FoldResult, Metric, Score, ScoreResult
 from .model import (
-    BoltzGenCandidate,
+    BoltzGenDesignCandidate,
     BoltzGenIFoldInput,
     BoltzGenIFoldModel,
     BoltzGenIFoldOutput,
     BoltzGenInput,
     BoltzGenModel,
     BoltzGenResidueConstraint,
-    BoltzGenResult,
+    BoltzGenDesignResult,
     BoltzGenSchema,
 )
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
@@ -164,12 +164,12 @@ class BoltzGenPipeline(CompositePipeline):
         ranking: str | Sequence[tuple[str, float]] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> BoltzGenResult:
-        r"""Run the released multi-stage design flow and return a ``BoltzGenResult``.
+    ) -> BoltzGenDesignResult:
+        r"""Run the released multi-stage design flow and return a ``BoltzGenDesignResult``.
 
         Stage order (upstream ``step_names``): (1) design lowering + structure sampling,
         (2) inverse folding on the sampled backbone, (3) refold, (4) affinity, (5) analysis
-        decode into ``BoltzGenCandidate`` s. The refold and affinity stages are run when a
+        decode into ``BoltzGenDesignCandidate`` s. The refold and affinity stages are run when a
         fold / affinity model is composed in (``self.fold`` / ``self.affinity`` is not ``None``) —
         composition is the switch; there are no mode flags.
 
@@ -186,7 +186,7 @@ class BoltzGenPipeline(CompositePipeline):
             generator: Optional RNG for reproducible sampling.
 
         Returns:
-            One ``BoltzGenResult`` with one candidate per drawn design.
+            One ``BoltzGenDesignResult`` with one candidate per drawn design.
         """
 
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
@@ -204,7 +204,7 @@ class BoltzGenPipeline(CompositePipeline):
         # metadata) and, through it, the predicted-sequence remap in ``_analyze``.
         design_references = _design_references(design_batch)
 
-        candidates: list[BoltzGenCandidate] = []
+        candidates: list[BoltzGenDesignCandidate] = []
         for sample_index in range(num_candidates):
             backbone = _decode_structure(design_batch, design_output.pred_coords[0, sample_index])
             ifold_batch = self.ifold_processor(backbone, design=design_references)
@@ -216,7 +216,7 @@ class BoltzGenPipeline(CompositePipeline):
                 generator=generator,
             )
             candidates.append(candidate)
-        return BoltzGenResult(candidates=tuple(candidates))
+        return BoltzGenDesignResult(candidates=tuple(candidates))
 
     def inverse_fold(
         self,
@@ -228,12 +228,12 @@ class BoltzGenPipeline(CompositePipeline):
         temperature: float | None = None,
         num_sequences: int = 1,
         generator: torch.Generator | None = None,
-    ) -> BoltzGenResult:
+    ) -> BoltzGenDesignResult:
         r"""Run inverse folding (stage 2) standalone on a fixed backbone."""
 
         ifold_batch = self.ifold_processor(input, design=design, aa_constraints=aa_constraints, symmetry=symmetry)
         backbone = _fixed_backbone_structure(input)
-        candidates: list[BoltzGenCandidate] = []
+        candidates: list[BoltzGenDesignCandidate] = []
         for _ in range(num_sequences):
             ifold_output = self.ifold_model.design(ifold_batch, temperature=temperature, generator=generator)
             candidates.append(
@@ -244,7 +244,7 @@ class BoltzGenPipeline(CompositePipeline):
                     generator=generator,
                 )
             )
-        return BoltzGenResult(candidates=tuple(candidates))
+        return BoltzGenDesignResult(candidates=tuple(candidates))
 
     def _analyze(
         self,
@@ -253,7 +253,7 @@ class BoltzGenPipeline(CompositePipeline):
         ifold_batch: BoltzGenIFoldInput,
         ifold_output: BoltzGenIFoldOutput,
         generator: torch.Generator | None,
-    ) -> BoltzGenCandidate:
+    ) -> BoltzGenDesignCandidate:
         r"""Assemble one candidate: remap the designed sequence, attach the NLL metric and scores.
 
         Faithful to released BoltzGen (``DesignWriter.write_on_batch_end`` with ``inverse_fold``):
@@ -303,7 +303,7 @@ class BoltzGenPipeline(CompositePipeline):
             if "affinity_probability_binary" in affinity_result.scores:
                 scores["binding_probability"] = affinity_result.scores["affinity_probability_binary"]
 
-        return BoltzGenCandidate(structure=structure, scores=scores, metrics=metrics)
+        return BoltzGenDesignCandidate(structure=structure, scores=scores, metrics=metrics)
 
 
 def _decode_structure(batch: BoltzGenInput, coords: torch.Tensor) -> Structure:

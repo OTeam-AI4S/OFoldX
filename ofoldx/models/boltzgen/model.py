@@ -378,7 +378,7 @@ class BoltzGenModel(nn.Module):
         Thin public wrapper over the parity-passing ``_design`` reverse-diffusion body;
         the numerics are unchanged. Produces ``pred_coords [B, num_samples, A, 3]`` plus
         the trunk ``distogram_logits`` and ``bfactor_logits``. Sequence assignment and the
-        canonical ``BoltzGenResult`` decoding are owned by ``BoltzGenPipeline``.
+        canonical ``BoltzGenDesignResult`` decoding are owned by ``BoltzGenPipeline``.
 
         Args:
             batch: Typed structure-design input from ``BoltzGenProcessor``.
@@ -598,7 +598,7 @@ class BoltzGenIFoldModel(nn.Module):
             hidden_size=ifold.hidden_size,
             num_layers=ifold.num_encoder_layers,
             num_attention_heads=ifold.num_attention_heads,
-            k_neighbors=ifold.k_neighbors,
+            num_neighbors=ifold.num_neighbors,
             dropout=ifold.dropout,
             softmax_dropout=ifold.softmax_dropout,
             inverse_fold_noise=ifold.inverse_fold_noise,
@@ -2660,7 +2660,7 @@ class InverseFoldingEncoder(nn.Module):
         hidden_size: Width of the graph-attention hidden channel.
         num_layers: Number of graph-attention layers.
         num_attention_heads: Number of attention heads per layer.
-        k_neighbors: Number of nearest neighbours per token.
+        num_neighbors: Number of nearest neighbours per token.
         max_relative_position: Clamp range for the relative-position edge feature.
         dropout: Dropout probability inside the graph-attention layers.
         softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
@@ -2675,14 +2675,14 @@ class InverseFoldingEncoder(nn.Module):
         hidden_size: int = 128,
         num_layers: int = 3,
         num_attention_heads: int = 4,
-        k_neighbors: int = 30,
+        num_neighbors: int = 30,
         max_relative_position: int = 32,
         dropout: float = 0.1,
         softmax_dropout: float = 0.2,
         inverse_fold_noise: float = 0.2,
     ) -> None:
         super().__init__()
-        self.k_neighbors = k_neighbors
+        self.num_neighbors = num_neighbors
         self.max_relative_position = max_relative_position
         self.inverse_fold_noise = inverse_fold_noise
         # geo (4x4 backbone-atom distances x 16 RBF = 256)
@@ -2722,14 +2722,14 @@ class InverseFoldingEncoder(nn.Module):
         batch_size, num_tokens = valid_mask.shape
         valid_pair = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
         packed_index = (valid_mask.flatten().cumsum(dim=0) - 1).view(batch_size, num_tokens)
-        k_neighbors = min(self.k_neighbors, num_tokens)
+        num_neighbors = min(self.num_neighbors, num_tokens)
 
         distances = torch.cdist(batch.center_coords, batch.center_coords)
         distances = distances.masked_fill(~valid_pair, float("inf"))
-        src = torch.topk(distances, k_neighbors, largest=False).indices  # (B, N, k_neighbors)
-        dst = torch.arange(num_tokens, device=src.device)[None, :, None].expand(batch_size, -1, k_neighbors)
+        src = torch.topk(distances, num_neighbors, largest=False).indices  # (B, N, num_neighbors)
+        dst = torch.arange(num_tokens, device=src.device)[None, :, None].expand(batch_size, -1, num_neighbors)
 
-        # token_bonds carries a trailing singleton (B, N, N, 1); drop it so the gather index (B, N, k_neighbors)
+        # token_bonds carries a trailing singleton (B, N, N, 1); drop it so the gather index (B, N, num_neighbors)
         # matches its rank (the BoltzGen reference does the same, asserting shape[-1] == 1). type_bonds is (B, N, N).
         token_bonds = torch.gather(batch.token_bonds[..., 0], 2, src)
         type_bonds = torch.gather(batch.type_bonds, 2, src)
@@ -4161,7 +4161,7 @@ def symbolic_residue_aliases(
 
 
 @dataclass(eq=False)
-class BoltzGenCandidate:
+class BoltzGenDesignCandidate:
     r"""One designed (and optionally refolded) complex and its aligned scientific values.
 
     Each candidate owns the complete ``Structure`` of the designed assembly. The
@@ -4183,7 +4183,7 @@ class BoltzGenCandidate:
 
 
 @dataclass(eq=False)
-class BoltzGenResult:
+class BoltzGenDesignResult:
     r"""One generation-ordered collection of coordinate-producing BoltzGen designs.
 
     Tuple position is candidate identity for one generation context; there is no
@@ -4194,9 +4194,9 @@ class BoltzGenResult:
     Score.
     """
 
-    candidates: tuple[BoltzGenCandidate, ...]
+    candidates: tuple[BoltzGenDesignCandidate, ...]
 
-    def best(self, score: str) -> BoltzGenCandidate:
+    def best(self, score: str) -> BoltzGenDesignCandidate:
         r"""Return the earliest best candidate under one explicit score.
 
         Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the

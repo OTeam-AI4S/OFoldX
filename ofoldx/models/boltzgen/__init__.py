@@ -17,7 +17,7 @@ from .config import (
 )
 from .model import (
     BoltzGenBinding,
-    BoltzGenCandidate,
+    BoltzGenDesignCandidate,
     BoltzGenContact,
     BoltzGenDesignMask,
     BoltzGenIFoldInput,
@@ -28,7 +28,7 @@ from .model import (
     BoltzGenOutput,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
-    BoltzGenResult,
+    BoltzGenDesignResult,
     BoltzGenSchema,
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
@@ -57,8 +57,8 @@ __all__ = [
     "BoltzGenIFoldInput",
     "BoltzGenOutput",
     "BoltzGenIFoldOutput",
-    "BoltzGenResult",
-    "BoltzGenCandidate",
+    "BoltzGenDesignResult",
+    "BoltzGenDesignCandidate",
     "BoltzGenSchema",
     "BoltzGenBinding",
     "BoltzGenContact",

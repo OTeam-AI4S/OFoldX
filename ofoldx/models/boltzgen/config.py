@@ -102,7 +102,7 @@ class BoltzGenIFoldModuleConfig(Config):
     num_encoder_layers: int = 6
     num_decoder_layers: int = 3
     num_attention_heads: int = 4
-    k_neighbors: int = 30
+    num_neighbors: int = 30
     num_atom_encoder_blocks: int = 1
     num_atom_encoder_attention_heads: int = 4
     num_query_atoms: int = 32
