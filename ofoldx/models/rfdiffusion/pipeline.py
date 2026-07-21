@@ -3,7 +3,7 @@ r"""OFoldX's biological operation boundary for released RFdiffusion generation &
 Owns the one Processor call and the family's released coordinate-producing ``design`` verb.
 ``design`` lowers one generation input through :class:`RFdiffusionProcessor` and runs the
 released reverse-diffusion sampler via :meth:`RFdiffusionModel.design`, returning the
-family-owned, coordinate-producing :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionResult`
+family-owned, coordinate-producing :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignResult`
 (NOT the frozen coordinate-free shared ``DesignResult``; §5.3.1/§5.3.3, §6.1). The Pipeline
 coordinates the run-level random streams for its ``num_candidates`` calls without unintended
 reseeding (§3.7.3), threading a single caller-controlled ``seed``/``generator`` through to the
@@ -14,7 +14,7 @@ Marker id ``"ofoldx.rfdiffusion"``. Per Principle 13 this concrete Pipeline IS p
 lazy-import index entry. The validated combined-length + hotspot ``design`` verb is a complete
 coordinate-producing capability with a working Result carrier, so a checkpoint shipping
 ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` routes ``design`` here and receives the
-family-owned ``RFdiffusionResult``.
+family-owned ``RFdiffusionDesignResult``.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from .model import (
     ReferenceCoordinates,
     RFdiffusionModel,
     RFdiffusionPlacements,
-    RFdiffusionResult,
+    RFdiffusionDesignResult,
     SecondaryStructure,
     SubstrateInteraction,
 )
@@ -56,7 +56,7 @@ class RFdiffusionPipeline:
 
     Marker id ``"ofoldx.rfdiffusion"``. The Pipeline is not a base class and shares no runtime
     request object with any other family. ``design`` returns the family-owned
-    :class:`RFdiffusionResult`.
+    :class:`RFdiffusionDesignResult`.
     """
 
     model: RFdiffusionModel
@@ -121,8 +121,8 @@ class RFdiffusionPipeline:
         guidance_decay: str = "constant",
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> RFdiffusionResult:
-        r"""Lower one generation input and run released RFdiffusion design into an ``RFdiffusionResult``.
+    ) -> RFdiffusionDesignResult:
+        r"""Lower one generation input and run released RFdiffusion design into an ``RFdiffusionDesignResult``.
 
         Lowers base/complex/inpaint/active-site/fold conditioning through the Processor -- honoring
         the frozen §3.7.3 ``inpaint_sequence`` and the family-owned §3.7 ``length``

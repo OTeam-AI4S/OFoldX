@@ -266,7 +266,7 @@ class RFdiffusionModel(nn.Module):
         guidance_scale: float = 10.0,
         guidance_decay: str = "constant",
         generator: torch.Generator | None = None,
-    ) -> RFdiffusionResult:
+    ) -> RFdiffusionDesignResult:
         r"""Generate canonical backbone Structures, sampling variable placement lengths per candidate.
 
         The sampler follows the released raw final-``pX0`` contract. Canonical motif
@@ -6576,9 +6576,9 @@ def _decode_design(
     inputs: list[RFdiffusionInput],
     *,
     align_motif: bool,
-) -> RFdiffusionResult:
+) -> RFdiffusionDesignResult:
     # RFdiffusion is coordinate-producing and variable-topology, so each sample is wired into
-    # the family-owned standalone RFdiffusionDesignCandidate/RFdiffusionResult (results.py),
+    # the family-owned standalone RFdiffusionDesignCandidate/RFdiffusionDesignResult (results.py),
     # carrying the decoded Structure and per-sample values, rather than reusing or widening the
     # frozen coordinate-free shared DesignResult, which §5.3.1/§5.3.3 forbids. Diffusion
     # internals (timesteps / px0 / x_t_minus_1) are dropped as §5.1 trajectory diagnostics.
@@ -6636,7 +6636,7 @@ def _decode_design(
                 metrics={"plddt": Metric(values=plddt, axis=plddt_axis, unit="0-100")},
             )
         )
-    return RFdiffusionResult(candidates=tuple(candidates))
+    return RFdiffusionDesignResult(candidates=tuple(candidates))
 
 
 def _decode_structure(
@@ -7345,7 +7345,7 @@ class RFdiffusionDesignCandidate:
 
 
 @dataclass(eq=False)
-class RFdiffusionResult:
+class RFdiffusionDesignResult:
     r"""One generation-ordered collection of coordinate-producing RFdiffusion designs.
 
     Tuple position is sample identity for one generation context; there is no auxiliary index

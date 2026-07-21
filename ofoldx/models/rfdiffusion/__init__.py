@@ -11,7 +11,7 @@ from .model import (
     RFdiffusionInput,
     RFdiffusionModel,
     RFdiffusionOutput,
-    RFdiffusionResult,
+    RFdiffusionDesignResult,
 )
 from .pipeline import RFdiffusionPipeline
 from .processor import RFdiffusionProcessor
@@ -24,7 +24,7 @@ __all__ = [
     "RFdiffusionPipeline",
     "RFdiffusionInput",
     "RFdiffusionOutput",
-    "RFdiffusionResult",
+    "RFdiffusionDesignResult",
     "RFdiffusionDesignCandidate",
     "ComputeAllAtomCoords",
 ]
@@ -37,7 +37,7 @@ MODELS.register(
 )
 
 # `standard_tasks` stays empty (§6.1): the root pair must NOT be wrapped by the generic standard
-# "design" Pipeline, because `design` returns the family-owned `RFdiffusionResult`, which is not
+# "design" Pipeline, because `design` returns the family-owned `RFdiffusionDesignResult`, which is not
 # losslessly the shared `DesignResult` (§7). Instead the concrete coordinate-producing
 # `RFdiffusionPipeline` is published under the family id, exactly as `ProteinMpnnPipeline` is: a
 # checkpoint shipping `pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}` routes `design` to it and
