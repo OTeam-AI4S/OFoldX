@@ -486,3 +486,7 @@ def main(argv: list[str] | None = None) -> None:
         token=args.token,
         private=args.private,
     )
+
+
+if __name__ == "__main__":
+    main()

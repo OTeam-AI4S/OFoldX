@@ -323,17 +323,25 @@ def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str,
     r"""Load the exact released RFdiffusion IGSO(3) lookup table from a convert-time source.
 
     This is a convert-stage loader only: the released table is baked into ``model.safetensors`` as
-    the model's persistent ``igso3_*`` buffers, so nothing reads it at inference time. ``source``
-    defaults to the untracked ``rfdiffusion_schedule.npz`` beside this module; a ``.pkl`` source is
-    read as an original RFdiffusion IGSO(3) cache pickle and any other suffix as the safe NumPy
-    archive. The reference archive is derived from
+    the model's persistent ``igso3_*`` buffers, so nothing reads it at inference time. ``source`` is
+    required (the table is NOT shipped inside the installed package -- it is a Hub release artifact):
+    pass the original RFdiffusion IGSO(3) ``.pkl`` cache, or a ``.npz`` archive of the same table; a
+    ``.pkl`` source is read as an original RFdiffusion IGSO(3) cache pickle and any other suffix as
+    the safe NumPy archive. The reference archive is derived from
     ``schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl`` at
     RosettaCommons/RFdiffusion revision ``2d0c003df46b9db41d119321f15403dec3716cd9`` (source
     SHA-256 ``cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23``) and is
     redistributed under RFdiffusion's BSD 3-Clause license.
     """
 
-    path = Path(__file__).with_name("rfdiffusion_schedule.npz") if source is None else Path(source)
+    if source is None:
+        raise ValueError(
+            "the IGSO(3) schedule source is required: it is baked into converted checkpoints as the "
+            "model's igso3_* buffers and is not shipped in the installed package. Pass the original "
+            "RFdiffusion IGSO(3) .pkl cache (or an .npz archive of the same table) via schedule_source "
+            "(the convert CLI's --schedule-source)."
+        )
+    path = Path(source)
     if path.suffix == ".pkl":
         with path.open("rb") as handle:
             values = pickle.load(handle)

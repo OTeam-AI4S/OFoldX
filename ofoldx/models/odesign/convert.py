@@ -826,3 +826,7 @@ def _replace_many(key: str, replacements: Mapping[str, str]) -> str:
     for source, target in replacements.items():
         key = key.replace(source, target)
     return key
+
+
+if __name__ == "__main__":
+    main()

@@ -25,4 +25,18 @@ from .results import (
     Score,
     ScoreResult,
 )
-from .runners import Runner
+
+
+def __getattr__(name: str):
+    r"""Lazily expose the training ``Runner``.
+
+    ``Runner`` pulls the training stack (danling -> torchmetrics, several seconds), which the
+    ``fold``/``design``/``score``/``pack`` inference surface never needs; importing it lazily keeps
+    ``import ofoldx`` cheap for inference users. ``ofoldx.Runner`` still resolves on first access.
+    """
+
+    if name == "Runner":
+        from .runners import Runner
+
+        return Runner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

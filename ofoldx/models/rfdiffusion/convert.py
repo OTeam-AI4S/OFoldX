@@ -200,9 +200,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--schedule-source",
         type=Path,
-        default=None,
-        help="IGSO(3) schedule source (.npz or original RFdiffusion .pkl); "
-        "defaults to rfdiffusion_schedule.npz beside the module",
+        required=True,
+        help="IGSO(3) schedule source (the original RFdiffusion .pkl cache, or an .npz archive of "
+        "the same table); required, as the table is not shipped in the package -- it is baked into "
+        "the converted checkpoint's igso3_* buffers",
     )
     parser.add_argument(
         "--repo-id",
