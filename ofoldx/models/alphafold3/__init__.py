@@ -12,12 +12,19 @@ from .model import (
     AlphaFold3Model,
     AlphaFold3Output,
     AlphaFold3SeedGroup,
-    confidence_summary,
-    fraction_disordered,
-    has_clash,
-    ranking_score,
 )
 from .processor import AlphaFold3Processor
+
+__all__ = [
+    "AlphaFold3Config",
+    "AlphaFold3ProcessorConfig",
+    "AlphaFold3Model",
+    "AlphaFold3Processor",
+    "AlphaFold3Input",
+    "AlphaFold3Output",
+    "AlphaFold3FoldResult",
+    "AlphaFold3SeedGroup",
+]
 
 # ``fold`` returns the family-owned ``AlphaFold3FoldResult`` (seed groups preserved), which is
 # not losslessly wrappable by the generic standard fold Pipeline, so no standard task is

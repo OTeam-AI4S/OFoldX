@@ -59,8 +59,8 @@ class MpnnPackerModel(nn.Module):
             edge_size=config.edge_size,
             num_positional_embeddings=config.num_positional_embeddings,
             num_rbf=config.num_rbf,
-            k_neighbors=config.k_neighbors,
-            atom_context_num=config.atom_context_num,
+            num_neighbors=config.num_neighbors,
+            num_context_atoms=config.num_context_atoms,
             coordinate_noise=config.coordinate_noise,
             lower_bound=config.lower_bound,
             upper_bound=config.upper_bound,
@@ -557,8 +557,8 @@ class MpnnPackerFeatures(nn.Module):
         edge_size: Width of the per-edge features.
         num_positional_embeddings: Width of the relative-position embedding.
         num_rbf: Number of radial basis functions per distance feature.
-        k_neighbors: Number of nearest-neighbor residues in the graph.
-        atom_context_num: Number of ligand context atoms per residue used by the decoder.
+        num_neighbors: Number of nearest-neighbor residues in the graph.
+        num_context_atoms: Number of ligand context atoms per residue used by the decoder.
         coordinate_noise: Training-time Gaussian coordinate-noise standard deviation.
         lower_bound: Lower distance bound for the context RBF expansion.
         upper_bound: Upper distance bound for the context RBF expansion.
@@ -571,16 +571,16 @@ class MpnnPackerFeatures(nn.Module):
         edge_size: int,
         num_positional_embeddings: int,
         num_rbf: int,
-        k_neighbors: int,
-        atom_context_num: int,
+        num_neighbors: int,
+        num_context_atoms: int,
         coordinate_noise: float,
         lower_bound: float,
         upper_bound: float,
     ) -> None:
         super().__init__()
         self.num_rbf = num_rbf
-        self.k_neighbors = k_neighbors
-        self.atom_context_num = atom_context_num
+        self.num_neighbors = num_neighbors
+        self.num_context_atoms = num_context_atoms
         self.coordinate_noise = coordinate_noise
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
@@ -598,7 +598,7 @@ class MpnnPackerFeatures(nn.Module):
             bias=False,
         )
         self.decode_edge_norm = nn.LayerNorm(edge_size)
-        self.decode_node_projection = nn.Linear(_ATOM14 * atom_context_num * num_rbf, node_size, bias=False)
+        self.decode_node_projection = nn.Linear(_ATOM14 * num_context_atoms * num_rbf, node_size, bias=False)
         self.decode_node_norm = nn.LayerNorm(node_size)
 
         self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
@@ -672,7 +672,7 @@ class MpnnPackerFeatures(nn.Module):
             coordinates[:, :, 3],
         )
         cb = _virtual_beta_carbon(n, ca, c)
-        _, neighbor_indices = _knn(ca, residue_mask, self.k_neighbors)
+        _, neighbor_indices = _knn(ca, residue_mask, self.num_neighbors)
 
         backbone_atoms = torch.stack((n, ca, c, o, cb), dim=2)
         pair_distances = _neighbor_atom_distances(backbone_atoms, neighbor_indices)
@@ -753,9 +753,9 @@ class MpnnPackerFeatures(nn.Module):
 
         coordinates = atom14_coordinates
         atom_mask = atom14_mask & residue_mask[:, :, None]
-        context_coordinates = context_coordinates[:, :, : self.atom_context_num]
-        context_mask = context_mask[:, :, : self.atom_context_num]
-        context_atomic_numbers = context_atomic_numbers[:, :, : self.atom_context_num].long()
+        context_coordinates = context_coordinates[:, :, : self.num_context_atoms]
+        context_mask = context_mask[:, :, : self.num_context_atoms]
+        context_atomic_numbers = context_atomic_numbers[:, :, : self.num_context_atoms].long()
         batch, length = coordinates.shape[:2]
 
         gathered_mask = gather_nodes(atom_mask, neighbor_indices)
@@ -837,13 +837,13 @@ def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> T
     )
 
 
-def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""Find the ``k_neighbors`` nearest residues by CA distance, after every valid pair.
+def _knn(points: Tensor, mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
+    r"""Find the ``num_neighbors`` nearest residues by CA distance, after every valid pair.
 
     Args:
         points: Reference (CA) coordinates `[B, L, 3]`.
         mask: Valid-residue mask `[B, L]`.
-        k_neighbors: Number of neighbors to keep (capped at ``L``).
+        num_neighbors: Number of neighbors to keep (capped at ``L``).
         eps: Numerical floor under the distance square root.
 
     Returns:
@@ -853,7 +853,7 @@ def _knn(points: Tensor, mask: Tensor, k_neighbors: int, eps: float = 1e-6) -> t
     pair_mask = mask[:, None, :] & mask[:, :, None]
     distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
     adjusted = torch.where(pair_mask, distances, torch.inf)
-    return torch.topk(adjusted, min(k_neighbors, points.shape[1]), dim=-1, largest=False)
+    return torch.topk(adjusted, min(num_neighbors, points.shape[1]), dim=-1, largest=False)
 
 
 def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:

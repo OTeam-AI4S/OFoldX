@@ -25,6 +25,30 @@ from .model import (
 from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
+# The PxDesign family deliberately publishes a tensor-level API (§docstring): its Sampler,
+# condition embedders, and Layout are part of the intended public surface and are kept here.
+__all__ = [
+    "PxDesignConfig",
+    "PxDesignConditionEmbedderConfig",
+    "PxDesignDenoiserConfig",
+    "PxDesignProcessorConfig",
+    "PxDesignSamplerConfig",
+    "PxDesignModel",
+    "PxDesignProcessor",
+    "PxDesignPipeline",
+    "PxDesignInput",
+    "PxDesignOutput",
+    "PxDesignResult",
+    "PxDesignCandidate",
+    "PxDesignLayout",
+    "PxDesignSampler",
+    "PxDesignConditionEmbedder",
+    "PxDesignConditionalTemplateEmbedder",
+    "TargetChain",
+    "from_binder",
+    "to_binder",
+]
+
 # `standard_tasks` stays () (§6.1, mirroring rfdiffusion): the root pair must NOT be wrapped by
 # the generic standard `DesignPipeline`, which returns the shared coordinate-free `DesignResult`
 # and lowers `AllowedResidueIdentities`/`TiedResidueIdentities`. PxDesign is coordinate-producing:

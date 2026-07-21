@@ -24,7 +24,7 @@ class NaMpnnConfig(Config):
         feature_size: Shared width of the polymer node and geometric edge features.
         num_encoder_layers: Number of graph encoder layers.
         num_decoder_layers: Number of autoregressive decoder layers.
-        k_neighbors: Number of nearest neighbors in the residue graph.
+        num_neighbors: Number of nearest neighbors in the residue graph.
         dropout: Dropout probability in encoder and decoder layers.
         num_positional_embeddings: Width of the relative-position embedding.
         num_rbf: Number of radial-basis bins for atom-pair distances.
@@ -43,7 +43,7 @@ class NaMpnnConfig(Config):
     feature_size: int = 128
     num_encoder_layers: int = 3
     num_decoder_layers: int = 3
-    k_neighbors: int = 32
+    num_neighbors: int = 32
     dropout: float = 0.1
     num_positional_embeddings: int = 16
     num_rbf: int = 16

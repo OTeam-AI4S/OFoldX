@@ -830,7 +830,7 @@ class NaMpnnFeatureEncoder(nn.Module):
 
     def __init__(self, config: NaMpnnConfig) -> None:
         super().__init__()
-        self.k_neighbors = config.k_neighbors
+        self.num_neighbors = config.num_neighbors
         self.num_rbf = config.num_rbf
         self.num_polymer_types = config.num_polymer_types
         self.include_predicted_na_n = config.include_predicted_na_n
@@ -889,7 +889,7 @@ class NaMpnnFeatureEncoder(nn.Module):
         all_coordinates = torch.cat(augmented_coordinates, dim=-2)
         all_mask = torch.cat(augmented_mask, dim=-1)
 
-        neighbor_indices = _nearest_neighbors(ca + reference, valid, self.k_neighbors)
+        neighbor_indices = _nearest_neighbors(ca + reference, valid, self.num_neighbors)
         pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
         residue_offset = residue_indices[:, :, None] - residue_indices[:, None, :]
         residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]

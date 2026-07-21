@@ -10,6 +10,17 @@ from .model import CaProteinMpnnFeatures, ProteinMpnnDesignResult, ProteinMpnnIn
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
+__all__ = [
+    "ProteinMpnnConfig",
+    "ProteinMpnnProcessorConfig",
+    "ProteinMpnnModel",
+    "ProteinMpnnProcessor",
+    "ProteinMpnnInput",
+    "ProteinMpnnDesignResult",
+    "ProteinMpnnPipeline",
+    "ProteinMpnnDesignAndPackPipeline",
+]
+
 MODELS.register(
     "ofoldx.proteinmpnn",
     model=ProteinMpnnModel,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
-from .chemistry import standardize_boltz2_affinity_smiles
 from .config import (
     Boltz2AffinityConfig,
     Boltz2AffinityHeadConfig,
@@ -16,9 +15,28 @@ from .config import (
     Boltz2TemplateConfig,
     Boltz2TrunkConfig,
 )
-from .model import Boltz2AffinityModel, Boltz2Input, Boltz2Layout, Boltz2Model, Boltz2Output
+from .model import Boltz2AffinityModel, Boltz2Input, Boltz2Model, Boltz2Output
 from .pipeline import Boltz2AffinityPipeline
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
+
+__all__ = [
+    "Boltz2Config",
+    "Boltz2AffinityConfig",
+    "Boltz2AffinityHeadConfig",
+    "Boltz2ConfidenceConfig",
+    "Boltz2DiffusionConfig",
+    "Boltz2InputEmbedderConfig",
+    "Boltz2SamplerConfig",
+    "Boltz2TemplateConfig",
+    "Boltz2TrunkConfig",
+    "Boltz2Model",
+    "Boltz2AffinityModel",
+    "Boltz2Processor",
+    "Boltz2AffinityProcessor",
+    "Boltz2AffinityPipeline",
+    "Boltz2Input",
+    "Boltz2Output",
+]
 
 # Two registered Model/Processor pairs over two distinct checkpoints. The standard ``ofoldx.boltz2`` fold pair
 # resolves through the generic standard fold Pipeline (standard_tasks=("fold",)) and is fully published.

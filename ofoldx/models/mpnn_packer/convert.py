@@ -159,13 +159,13 @@ def convert_mpnn_packer_checkpoint(
         mmap=True,
     )
     config = MpnnPackerConfig(
-        k_neighbors=checkpoint["num_edges"],
-        atom_context_num=checkpoint["atom_context_num"],
+        num_neighbors=checkpoint["num_edges"],
+        num_context_atoms=checkpoint["atom_context_num"],
     )
     model = MpnnPackerModel(config)
     state_dict = convert_mpnn_packer_state_dict(checkpoint["model_state_dict"])
     model.load_state_dict(state_dict, strict=True)
-    processor = MpnnPackerProcessor(MpnnPackerProcessorConfig(atom_context_num=config.atom_context_num))
+    processor = MpnnPackerProcessor(MpnnPackerProcessorConfig(num_context_atoms=config.num_context_atoms))
     MpnnPackerPipeline(model=model, processor=processor).save(
         output_dir,
         repo_id=repo_id,

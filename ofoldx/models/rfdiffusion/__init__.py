@@ -16,6 +16,19 @@ from .model import (
 from .pipeline import RFdiffusionPipeline
 from .processor import RFdiffusionProcessor
 
+__all__ = [
+    "RFdiffusionConfig",
+    "RFdiffusionProcessorConfig",
+    "RFdiffusionModel",
+    "RFdiffusionProcessor",
+    "RFdiffusionPipeline",
+    "RFdiffusionInput",
+    "RFdiffusionOutput",
+    "RFdiffusionResult",
+    "RFdiffusionDesignCandidate",
+    "ComputeAllAtomCoords",
+]
+
 MODELS.register(
     "ofoldx.rfdiffusion",
     model=RFdiffusionModel,

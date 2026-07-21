@@ -50,16 +50,46 @@ from .config import (
 )
 from .model import (
     AlphaFold2Input,
-    AlphaFold2Layout,
     AlphaFold2Model,
     AlphaFold2MultimerInput,
-    AlphaFold2MultimerLayout,
     AlphaFold2MultimerModel,
     AlphaFold2Output,
     AlphaFold2StructureModuleOutput,
     predicted_interface_tm_score,
 )
 from .processor import AlphaFold2MultimerProcessor, AlphaFold2Processor
+
+__all__ = [
+    # Configs
+    "AlphaFold2Config",
+    "AlphaFold2EvoformerConfig",
+    "AlphaFold2EvoformerIterationConfig",
+    "AlphaFold2HeadsConfig",
+    "AlphaFold2InputEmbeddingConfig",
+    "AlphaFold2MSAConfig",
+    "AlphaFold2ProcessorConfig",
+    "AlphaFold2RecyclingConfig",
+    "AlphaFold2StructureModuleHeadConfig",
+    "AlphaFold2TemplateConfig",
+    "AlphaFold2MultimerConfig",
+    "AlphaFold2MultimerHeadsConfig",
+    "AlphaFold2MultimerInputEmbeddingConfig",
+    "AlphaFold2MultimerProcessorConfig",
+    "AlphaFold2MultimerTemplateConfig",
+    # Models
+    "AlphaFold2Model",
+    "AlphaFold2MultimerModel",
+    # Processors
+    "AlphaFold2Processor",
+    "AlphaFold2MultimerProcessor",
+    # Input / output types
+    "AlphaFold2Input",
+    "AlphaFold2Output",
+    "AlphaFold2MultimerInput",
+    "AlphaFold2StructureModuleOutput",
+    # Public helpers
+    "predicted_interface_tm_score",
+]
 
 MODELS.register(
     "ofoldx.alphafold2",

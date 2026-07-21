@@ -8,7 +8,7 @@ from chanfig import Config
 class MpnnPackerProcessorConfig(Config):
     r"""Tensor-shape choices for canonical Structure lowering."""
 
-    atom_context_num: int = 16
+    num_context_atoms: int = 16
 
 
 class MpnnPackerConfig(Config):
@@ -19,8 +19,8 @@ class MpnnPackerConfig(Config):
     num_encoder_layers: int = 3
     num_decoder_layers: int = 3
     num_rbf: int = 16
-    k_neighbors: int = 32
-    atom_context_num: int = 16
+    num_neighbors: int = 32
+    num_context_atoms: int = 16
     num_mix: int = 3
     num_positional_embeddings: int = 16
     dropout: float = 0.0

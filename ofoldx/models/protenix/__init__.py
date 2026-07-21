@@ -11,15 +11,8 @@ from .config import (
     ProtenixProcessorConfig,
 )
 from .model import (
-    AtomConfidenceProjector,
-    ConfidenceHead,
-    ConfidencePairEmbedder,
-    InputEmbedder,
-    PairConfidenceProjector,
     ProtenixAtomContact,
-    ProtenixConstraintEmbedder,
     ProtenixConstraintModel,
-    ProtenixConstraintSubstructureEmbedder,
     ProtenixInput,
     ProtenixModel,
     ProtenixOutput,
@@ -28,6 +21,23 @@ from .model import (
 )
 from .pipeline import ProtenixConstraintPipeline
 from .processor import ProtenixConstraintProcessor, ProtenixProcessor
+
+__all__ = [
+    "ProtenixConfig",
+    "ProtenixConstraintConfig",
+    "ProtenixProcessorConfig",
+    "ProtenixConstraintProcessorConfig",
+    "ProtenixModel",
+    "ProtenixConstraintModel",
+    "ProtenixProcessor",
+    "ProtenixConstraintProcessor",
+    "ProtenixConstraintPipeline",
+    "ProtenixInput",
+    "ProtenixOutput",
+    "ProtenixPocket",
+    "ProtenixAtomContact",
+    "ProtenixTokenContact",
+]
 
 MODELS.register(
     "ofoldx.protenix",

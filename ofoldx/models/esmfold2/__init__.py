@@ -19,23 +19,12 @@ from .config import (
     ESMFold2StructureHeadConfig,
 )
 from .model import (
-    ConfidenceHead,
-    DiffusionModule,
-    DiffusionStructureHead,
-    ESMFold2AtomDecoder,
-    ESMFold2AtomEncoder,
     ESMFold2DesignCandidate,
     ESMFold2DesignResult,
-    ESMFold2ExperimentalConfidenceHead,
     ESMFold2ExperimentalModel,
     ESMFold2Input,
-    ESMFold2Layout,
     ESMFold2Model,
     ESMFold2Output,
-    FoldingTrunk,
-    InputsEmbedder,
-    LanguageModelPairEncoder,
-    MSAEncoder,
 )
 from .pipeline import ESMFold2Pipeline, cdr_distogram_iptm_proxy
 from .processor import (
@@ -45,6 +34,36 @@ from .processor import (
     antibody_cdr_prompt,
     is_antibody_sequence,
 )
+
+__all__ = [
+    "ESMFold2AtomAttentionConfig",
+    "ESMFold2ConfidenceHeadConfig",
+    "ESMFold2Config",
+    "ESMFold2DiffusionModuleConfig",
+    "ESMFold2ESMCConfig",
+    "ESMFold2ExperimentalConfidenceHeadConfig",
+    "ESMFold2ExperimentalConfig",
+    "ESMFold2FoldingTrunkConfig",
+    "ESMFold2InputsEmbedderConfig",
+    "ESMFold2LMEncoderConfig",
+    "ESMFold2MSAEncoderConfig",
+    "ESMFold2ParcaeConfig",
+    "ESMFold2ProcessorConfig",
+    "ESMFold2StructureHeadConfig",
+    "ESMFold2Model",
+    "ESMFold2ExperimentalModel",
+    "ESMFold2Processor",
+    "ESMFold2ExperimentalProcessor",
+    "ESMFold2Pipeline",
+    "ESMFold2Input",
+    "ESMFold2Output",
+    "ESMFold2DesignCandidate",
+    "ESMFold2DesignResult",
+    "cdr_distogram_iptm_proxy",
+    "antibody_cdr_indices",
+    "antibody_cdr_prompt",
+    "is_antibody_sequence",
+]
 
 MODELS.register(
     "ofoldx.esmfold2",

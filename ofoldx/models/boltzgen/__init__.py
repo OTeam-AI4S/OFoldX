@@ -15,18 +15,15 @@ from .config import (
     BoltzGenTemplateConfig,
     BoltzGenTrunkConfig,
 )
-from .convert import convert_boltzgen_checkpoint, convert_boltzgen_ifold_checkpoint
 from .model import (
     BoltzGenBinding,
     BoltzGenCandidate,
     BoltzGenContact,
     BoltzGenDesignMask,
     BoltzGenIFoldInput,
-    BoltzGenIFoldLayout,
     BoltzGenIFoldModel,
     BoltzGenIFoldOutput,
     BoltzGenInput,
-    BoltzGenLayout,
     BoltzGenModel,
     BoltzGenOutput,
     BoltzGenPlacements,
@@ -36,12 +33,45 @@ from .model import (
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
     BoltzGenSymmetry,
-    SymbolicResidueSite,
-    symbolic_residue_aliases,
 )
 from .pipeline import BoltzGenPipeline
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
 from .projection import DesignMaskResidue, from_design_mask, to_design_mask
+
+__all__ = [
+    "BoltzGenConfig",
+    "BoltzGenDiffusionConfig",
+    "BoltzGenIFoldConfig",
+    "BoltzGenIFoldModuleConfig",
+    "BoltzGenInputEmbedderConfig",
+    "BoltzGenSamplerConfig",
+    "BoltzGenStructureDesignConfig",
+    "BoltzGenTemplateConfig",
+    "BoltzGenTrunkConfig",
+    "BoltzGenModel",
+    "BoltzGenIFoldModel",
+    "BoltzGenProcessor",
+    "BoltzGenIFoldProcessor",
+    "BoltzGenPipeline",
+    "BoltzGenInput",
+    "BoltzGenIFoldInput",
+    "BoltzGenOutput",
+    "BoltzGenIFoldOutput",
+    "BoltzGenResult",
+    "BoltzGenCandidate",
+    "BoltzGenSchema",
+    "BoltzGenBinding",
+    "BoltzGenContact",
+    "BoltzGenSymmetry",
+    "BoltzGenSecondaryStructure",
+    "BoltzGenResidueConstraint",
+    "BoltzGenStructureGroup",
+    "BoltzGenPlacements",
+    "BoltzGenDesignMask",
+    "DesignMaskResidue",
+    "from_design_mask",
+    "to_design_mask",
+]
 
 # Two registered pairs, one per architecture (their Processor call signature and input type
 # differ, satisfying the §7 "separate arch only on signature/type difference" test). The three

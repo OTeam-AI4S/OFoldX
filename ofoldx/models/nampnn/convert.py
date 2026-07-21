@@ -55,7 +55,7 @@ def convert_nampnn_checkpoint(
         feature_size=state_dict["W_v.weight"].shape[1],
         num_encoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
         num_decoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
-        k_neighbors=_K_NEIGHBORS,
+        num_neighbors=_K_NEIGHBORS,
     )
     model = NaMpnnModel(config)
     model.load_state_dict(convert_nampnn_state_dict(state_dict), strict=True, assign=True)

@@ -379,10 +379,10 @@ class MpnnPackerProcessor:
 
         backbone_tensor = torch.as_tensor(np.stack(backbone), device=self.device, dtype=self.dtype).unsqueeze(0)
         valid_tensor = torch.tensor(valid, dtype=torch.bool, device=self.device).unsqueeze(0)
-        atom_context_num = self.config.atom_context_num
-        selected_coords = torch.zeros(len(rows), atom_context_num, 3, device=self.device, dtype=self.dtype)
-        selected_types = torch.zeros(len(rows), atom_context_num, device=self.device, dtype=torch.int64)
-        selected_mask = torch.zeros(len(rows), atom_context_num, device=self.device, dtype=torch.bool)
+        num_context_atoms = self.config.num_context_atoms
+        selected_coords = torch.zeros(len(rows), num_context_atoms, 3, device=self.device, dtype=self.dtype)
+        selected_types = torch.zeros(len(rows), num_context_atoms, device=self.device, dtype=torch.int64)
+        selected_mask = torch.zeros(len(rows), num_context_atoms, device=self.device, dtype=torch.bool)
         if use_atom_context:
             context_coords: list[np.ndarray] = []
             context_types: list[int] = []
@@ -416,7 +416,7 @@ class MpnnPackerProcessor:
                 squared_distance = ((cb[:, None] - context[None]) ** 2).sum(dim=-1)
                 pair_mask = valid_tensor[0, :, None] * context_mask[None]
                 adjusted_distance = squared_distance * pair_mask + (~pair_mask) * 1000.0
-                atom_count = min(atom_context_num, context.shape[0])
+                atom_count = min(num_context_atoms, context.shape[0])
                 nearest = torch.topk(
                     adjusted_distance,
                     atom_count,

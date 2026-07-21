@@ -70,24 +70,24 @@ class AlphaFold2Model(nn.Module):
             pair_channel=evoformer_config.pair_size,
             recycle_pos=recycling_config.recycle_pos,
             recycle_features=recycling_config.recycle_features,
-            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
-            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
-            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
+            prev_pos_min_distance=recycling_config.prev_pos.min_distance,
+            prev_pos_max_distance=recycling_config.prev_pos.max_distance,
+            prev_pos_num_distogram_bins=recycling_config.prev_pos.num_distogram_bins,
         )
-        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
+        self.extra_msa_embedding = AlphaFold2ExtraMSAEmbedding(
             extra_msa_feature_size=input_config.extra_msa_feature_size,
             extra_msa_channel=evoformer_config.extra_msa_size,
         )
         self.template_embedder: AlphaFold2TemplateEmbedding | None = None
-        self.template_msa_embedding: AlphaFold2TemplateMsaEmbedding | None = None
+        self.template_msa_embedding: AlphaFold2TemplateMSAEmbedding | None = None
         if template_config.enabled:
             self.template_embedder = AlphaFold2TemplateEmbedding(
                 query_size=evoformer_config.pair_size,
                 template_size=template_config.template_pair_stack.num_channels,
                 num_blocks=template_config.template_pair_stack.num_block,
                 num_distogram_bins=template_config.num_distogram_bins,
-                min_bin=template_config.min_bin,
-                max_bin=template_config.max_bin,
+                min_distance=template_config.min_distance,
+                max_distance=template_config.max_distance,
                 vocab_size=template_config.vocab_size,
                 use_template_unit_vector=template_config.use_template_unit_vector,
                 triangle_multiplication_hidden_size=(
@@ -97,15 +97,15 @@ class AlphaFold2Model(nn.Module):
                     template_config.template_pair_stack.triangle_attention_starting_node.value_dim
                 ),
                 num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_heads
                 ),
-                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
-                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
-                num_attention_heads=template_config.attention.num_head,
+                transition_expansion=template_config.template_pair_stack.pair_transition.expansion,
+                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
+                num_attention_heads=template_config.attention.num_heads,
                 operator_backend="auto",
             )
             if template_config.embed_torsion_angles:
-                self.template_msa_embedding = AlphaFold2TemplateMsaEmbedding(
+                self.template_msa_embedding = AlphaFold2TemplateMSAEmbedding(
                     vocab_size=template_config.vocab_size,
                     msa_size=evoformer_config.msa_size,
                 )
@@ -115,16 +115,16 @@ class AlphaFold2Model(nn.Module):
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
             outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=(
                 iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
             ),
             triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_heads,
+            msa_transition_expansion=iteration_config.msa_transition.expansion,
+            pair_transition_expansion=iteration_config.pair_transition.expansion,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout,
             is_extra_msa=True,
             operator_backend="auto",
         )
@@ -134,16 +134,16 @@ class AlphaFold2Model(nn.Module):
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
             outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=(
                 iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
             ),
             triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_heads,
+            msa_transition_expansion=iteration_config.msa_transition.expansion,
+            pair_transition_expansion=iteration_config.pair_transition.expansion,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout,
             is_extra_msa=False,
             operator_backend="auto",
         )
@@ -154,7 +154,7 @@ class AlphaFold2Model(nn.Module):
             num_layer=heads.structure_module.num_layer,
             num_layer_in_transition=heads.structure_module.num_layer_in_transition,
             num_channel=heads.structure_module.num_channel,
-            num_head=heads.structure_module.num_head,
+            num_heads=heads.structure_module.num_heads,
             num_scalar_qk=heads.structure_module.num_scalar_qk,
             num_scalar_v=heads.structure_module.num_scalar_v,
             num_point_qk=heads.structure_module.num_point_qk,
@@ -528,11 +528,11 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_channel=evoformer_config.pair_size,
             recycle_pos=recycling_config.recycle_pos,
             recycle_features=recycling_config.recycle_features,
-            prev_pos_min_bin=recycling_config.prev_pos.min_bin,
-            prev_pos_max_bin=recycling_config.prev_pos.max_bin,
-            prev_pos_num_bins=recycling_config.prev_pos.num_bins,
+            prev_pos_min_distance=recycling_config.prev_pos.min_distance,
+            prev_pos_max_distance=recycling_config.prev_pos.max_distance,
+            prev_pos_num_distogram_bins=recycling_config.prev_pos.num_distogram_bins,
         )
-        self.extra_msa_embedding = AlphaFold2ExtraMsaEmbedding(
+        self.extra_msa_embedding = AlphaFold2ExtraMSAEmbedding(
             extra_msa_feature_size=input_config.extra_msa_feature_size,
             extra_msa_channel=evoformer_config.extra_msa_size,
         )
@@ -544,8 +544,8 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                 template_size=template_config.template_pair_stack.num_channels,
                 num_blocks=template_config.template_pair_stack.num_block,
                 num_distogram_bins=template_config.num_distogram_bins,
-                min_bin=template_config.min_bin,
-                max_bin=template_config.max_bin,
+                min_distance=template_config.min_distance,
+                max_distance=template_config.max_distance,
                 vocab_size=template_config.vocab_size,
                 triangle_multiplication_hidden_size=(
                     template_config.template_pair_stack.triangle_multiplication_outgoing.num_intermediate_channel
@@ -554,10 +554,10 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                     template_config.template_pair_stack.triangle_attention_starting_node.value_dim
                 ),
                 num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_head
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_heads
                 ),
-                transition_expansion=template_config.template_pair_stack.pair_transition.num_intermediate_factor,
-                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout_rate,
+                transition_expansion=template_config.template_pair_stack.pair_transition.expansion,
+                dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
                 operator_backend="auto",
             )
             self.template_msa_embedding = AlphaFold2MultimerTemplateSingleEmbedding(
@@ -570,16 +570,16 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
             outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=(
                 iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
             ),
             triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_heads,
+            msa_transition_expansion=iteration_config.msa_transition.expansion,
+            pair_transition_expansion=iteration_config.pair_transition.expansion,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout,
             is_extra_msa=True,
             operator_backend="auto",
         )
@@ -589,16 +589,16 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=iteration_config.outer_product_mean.num_outer_channel,
             outer_product_first=iteration_config.outer_product_mean.first,
-            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_head,
+            num_msa_attention_heads=iteration_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=(
                 iteration_config.triangle_multiplication_outgoing.num_intermediate_channel
             ),
             triangle_attention_hidden_size=iteration_config.triangle_attention_starting_node.value_dim,
-            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_head,
-            msa_transition_expansion=iteration_config.msa_transition.num_intermediate_factor,
-            pair_transition_expansion=iteration_config.pair_transition.num_intermediate_factor,
-            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout_rate,
-            pair_dropout=iteration_config.triangle_attention_starting_node.dropout_rate,
+            num_triangle_attention_heads=iteration_config.triangle_attention_starting_node.num_heads,
+            msa_transition_expansion=iteration_config.msa_transition.expansion,
+            pair_transition_expansion=iteration_config.pair_transition.expansion,
+            msa_dropout=iteration_config.msa_row_attention_with_pair_bias.dropout,
+            pair_dropout=iteration_config.triangle_attention_starting_node.dropout,
             is_extra_msa=False,
             operator_backend="auto",
         )
@@ -609,7 +609,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             num_layer=heads.structure_module.num_layer,
             num_layer_in_transition=heads.structure_module.num_layer_in_transition,
             num_channel=heads.structure_module.num_channel,
-            num_head=heads.structure_module.num_head,
+            num_heads=heads.structure_module.num_heads,
             num_scalar_qk=heads.structure_module.num_scalar_qk,
             num_scalar_v=heads.structure_module.num_scalar_v,
             num_point_qk=heads.structure_module.num_point_qk,
@@ -1512,7 +1512,7 @@ class AlphaFold2StructureModule(nn.Module):
         num_layer: int,
         num_layer_in_transition: int,
         num_channel: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1532,7 +1532,7 @@ class AlphaFold2StructureModule(nn.Module):
             num_channel=num_channel,
             pair_size=pair_size,
             num_layer_in_transition=num_layer_in_transition,
-            num_head=num_head,
+            num_heads=num_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -1595,7 +1595,7 @@ class FoldIteration(nn.Module):
         num_channel: int,
         pair_size: int,
         num_layer_in_transition: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1610,7 +1610,7 @@ class FoldIteration(nn.Module):
         self.invariant_point_attention = InvariantPointAttention(
             num_channel=num_channel,
             pair_size=pair_size,
-            num_head=num_head,
+            num_heads=num_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -1664,7 +1664,7 @@ class InvariantPointAttention(nn.Module):
         *,
         num_channel: int,
         pair_size: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1672,35 +1672,35 @@ class InvariantPointAttention(nn.Module):
         dist_epsilon: float = 1e-8,
     ) -> None:
         super().__init__()
-        self.num_head = num_head
+        self.num_heads = num_heads
         self.num_scalar_qk = num_scalar_qk
         self.num_scalar_v = num_scalar_v
         self.num_point_qk = num_point_qk
         self.num_point_v = num_point_v
         self.dist_epsilon = dist_epsilon
-        self.q_scalar = nn.Linear(num_channel, num_head * num_scalar_qk)
-        self.kv_scalar = nn.Linear(num_channel, num_head * (num_scalar_v + num_scalar_qk))
-        self.q_point_local = nn.Linear(num_channel, num_head * 3 * num_point_qk)
-        self.kv_point_local = nn.Linear(num_channel, num_head * 3 * (num_point_qk + num_point_v))
-        self.attention_2d = nn.Linear(pair_size, num_head)
-        output_size = num_head * num_scalar_v + 4 * num_head * num_point_v + num_head * pair_size
+        self.q_scalar = nn.Linear(num_channel, num_heads * num_scalar_qk)
+        self.kv_scalar = nn.Linear(num_channel, num_heads * (num_scalar_v + num_scalar_qk))
+        self.q_point_local = nn.Linear(num_channel, num_heads * 3 * num_point_qk)
+        self.kv_point_local = nn.Linear(num_channel, num_heads * 3 * (num_point_qk + num_point_v))
+        self.attention_2d = nn.Linear(pair_size, num_heads)
+        output_size = num_heads * num_scalar_v + 4 * num_heads * num_point_v + num_heads * pair_size
         self.output_projection = nn.Linear(output_size, num_channel)
-        self.trainable_point_weights = nn.Parameter(torch.empty(num_head))
+        self.trainable_point_weights = nn.Parameter(torch.empty(num_heads))
         nn.init.constant_(self.trainable_point_weights, math.log(math.exp(1.0) - 1.0))
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, *, inputs_1d: Tensor, inputs_2d: Tensor, mask: Tensor, affine: QuatAffine) -> Tensor:
-        num_head = self.num_head
-        q_scalar = self.q_scalar(inputs_1d).unflatten(-1, (num_head, self.num_scalar_qk))
-        kv_scalar = self.kv_scalar(inputs_1d).unflatten(-1, (num_head, self.num_scalar_v + self.num_scalar_qk))
+        num_heads = self.num_heads
+        q_scalar = self.q_scalar(inputs_1d).unflatten(-1, (num_heads, self.num_scalar_qk))
+        kv_scalar = self.kv_scalar(inputs_1d).unflatten(-1, (num_heads, self.num_scalar_v + self.num_scalar_qk))
         k_scalar, v_scalar = kv_scalar.split((self.num_scalar_qk, self.num_scalar_v), dim=-1)
 
-        q_point_local = self.q_point_local(inputs_1d).unflatten(-1, (3, num_head, self.num_point_qk)).movedim(-3, -1)
+        q_point_local = self.q_point_local(inputs_1d).unflatten(-1, (3, num_heads, self.num_point_qk)).movedim(-3, -1)
         q_point = affine.apply_to_point(q_point_local, extra_dims=2)
         kv_point_local = (
             self.kv_point_local(inputs_1d)
-            .unflatten(-1, (3, num_head, self.num_point_qk + self.num_point_v))
+            .unflatten(-1, (3, num_heads, self.num_point_qk + self.num_point_v))
             .movedim(-3, -1)
         )
         kv_point = affine.apply_to_point(kv_point_local, extra_dims=2)
@@ -1978,8 +1978,8 @@ class AlphaFold2TemplateEmbedding(nn.Module):
         template_size: int,
         num_blocks: int,
         num_distogram_bins: int,
-        min_bin: float,
-        max_bin: float,
+        min_distance: float,
+        max_distance: float,
         vocab_size: int,
         use_template_unit_vector: bool,
         triangle_multiplication_hidden_size: int,
@@ -1995,8 +1995,8 @@ class AlphaFold2TemplateEmbedding(nn.Module):
             template_size=template_size,
             num_blocks=num_blocks,
             num_distogram_bins=num_distogram_bins,
-            min_bin=min_bin,
-            max_bin=max_bin,
+            min_distance=min_distance,
+            max_distance=max_distance,
             vocab_size=vocab_size,
             use_template_unit_vector=use_template_unit_vector,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -2058,8 +2058,8 @@ class AlphaFold2SingleTemplateEmbedding(nn.Module):
         template_size: int,
         num_blocks: int,
         num_distogram_bins: int,
-        min_bin: float,
-        max_bin: float,
+        min_distance: float,
+        max_distance: float,
         vocab_size: int,
         use_template_unit_vector: bool,
         triangle_multiplication_hidden_size: int,
@@ -2071,8 +2071,8 @@ class AlphaFold2SingleTemplateEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.num_distogram_bins = num_distogram_bins
-        self.min_bin = min_bin
-        self.max_bin = max_bin
+        self.min_distance = min_distance
+        self.max_distance = max_distance
         self.vocab_size = vocab_size
         self.use_template_unit_vector = use_template_unit_vector
         template_feature_size = num_distogram_bins + 1 + 2 * vocab_size + 3 + 1
@@ -2108,9 +2108,9 @@ class AlphaFold2SingleTemplateEmbedding(nn.Module):
         template_pair_mask = pseudo_beta_mask.unsqueeze(-1) * pseudo_beta_mask.unsqueeze(-2)
         distogram = _distogram(
             pseudo_beta,
-            min_bin=self.min_bin,
-            max_bin=self.max_bin,
-            num_bins=self.num_distogram_bins,
+            min_distance=self.min_distance,
+            max_distance=self.max_distance,
+            num_distogram_bins=self.num_distogram_bins,
         ).to(dtype=template_batch.dtype)
 
         residue_j = aatype_one_hot.unsqueeze(-3).expand(*template_pair_mask.shape, self.vocab_size)
@@ -2279,7 +2279,7 @@ class AlphaFold2TemplatePairStackLayer(nn.Module):
         return self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
 
 
-class AlphaFold2TemplateMsaEmbedding(nn.Module):
+class AlphaFold2TemplateMSAEmbedding(nn.Module):
     r"""
     Embed template torsion features as extra MSA rows.
     """
@@ -2385,12 +2385,12 @@ def _template_batch(batch: AlphaFold2Input) -> AlphaFold2TemplateBatch:
     )
 
 
-def _distogram(positions: Tensor, *, min_bin: float, max_bin: float, num_bins: int) -> Tensor:
+def _distogram(positions: Tensor, *, min_distance: float, max_distance: float, num_distogram_bins: int) -> Tensor:
     squared_distances = (positions.unsqueeze(-2) - positions.unsqueeze(-3)).square().sum(dim=-1, keepdim=True)
     lower = torch.linspace(
-        min_bin,
-        max_bin,
-        steps=num_bins,
+        min_distance,
+        max_distance,
+        steps=num_distogram_bins,
         device=positions.device,
         dtype=positions.dtype,
     ).square()
@@ -2450,17 +2450,17 @@ class AlphaFold2RecyclingEmbedding(nn.Module):
         pair_channel: int,
         recycle_pos: bool,
         recycle_features: bool,
-        prev_pos_min_bin: float,
-        prev_pos_max_bin: float,
-        prev_pos_num_bins: int,
+        prev_pos_min_distance: float,
+        prev_pos_max_distance: float,
+        prev_pos_num_distogram_bins: int,
     ) -> None:
         super().__init__()
         self.recycle_pos = recycle_pos
         self.recycle_features = recycle_features
-        self.prev_pos_min_bin = prev_pos_min_bin
-        self.prev_pos_max_bin = prev_pos_max_bin
-        self.prev_pos_num_bins = prev_pos_num_bins
-        self.prev_pos_linear = nn.Linear(prev_pos_num_bins, pair_channel)
+        self.prev_pos_min_distance = prev_pos_min_distance
+        self.prev_pos_max_distance = prev_pos_max_distance
+        self.prev_pos_num_distogram_bins = prev_pos_num_distogram_bins
+        self.prev_pos_linear = nn.Linear(prev_pos_num_distogram_bins, pair_channel)
         self.prev_msa_first_row_norm = LayerNorm(msa_channel)
         self.prev_pair_norm = LayerNorm(pair_channel)
 
@@ -2498,9 +2498,9 @@ class AlphaFold2RecyclingEmbedding(nn.Module):
             (rep_pos.unsqueeze(-2).float() - rep_pos.unsqueeze(-3).float()).square().sum(dim=-1).to(dtype=dtype)
         )
         lower_breaks = torch.linspace(
-            self.prev_pos_min_bin,
-            self.prev_pos_max_bin,
-            steps=self.prev_pos_num_bins,
+            self.prev_pos_min_distance,
+            self.prev_pos_max_distance,
+            steps=self.prev_pos_num_distogram_bins,
             device=squared_distances.device,
             dtype=squared_distances.dtype,
         )
@@ -2511,7 +2511,7 @@ class AlphaFold2RecyclingEmbedding(nn.Module):
         )
 
 
-class AlphaFold2ExtraMsaEmbedding(nn.Module):
+class AlphaFold2ExtraMSAEmbedding(nn.Module):
     r"""
     Embed extra-MSA features before the extra-MSA Evoformer stack.
     """
@@ -2740,8 +2740,8 @@ class AlphaFold2MultimerSingleTemplateEmbedding(nn.Module):
         template_size: int,
         num_blocks: int,
         num_distogram_bins: int,
-        min_bin: float,
-        max_bin: float,
+        min_distance: float,
+        max_distance: float,
         vocab_size: int,
         triangle_multiplication_hidden_size: int,
         triangle_attention_hidden_size: int,
@@ -2752,8 +2752,8 @@ class AlphaFold2MultimerSingleTemplateEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.num_distogram_bins = num_distogram_bins
-        self.min_bin = min_bin
-        self.max_bin = max_bin
+        self.min_distance = min_distance
+        self.max_distance = max_distance
         self.vocab_size = vocab_size
         # Official order (DeepMind ``single_template_embedding`` concat list):
         # 0 dgram, 1 pseudo-beta mask, 2 aatype(col), 3 aatype(row), 4/5/6 unit vec x/y/z,
@@ -2800,7 +2800,10 @@ class AlphaFold2MultimerSingleTemplateEmbedding(nn.Module):
         pseudo_beta_mask_2d = pseudo_beta_mask.unsqueeze(-1) * pseudo_beta_mask.unsqueeze(-2)
         pseudo_beta_mask_2d = pseudo_beta_mask_2d * multichain_mask_2d
         distogram = _distogram(
-            pseudo_beta, min_bin=self.min_bin, max_bin=self.max_bin, num_bins=self.num_distogram_bins
+            pseudo_beta,
+            min_distance=self.min_distance,
+            max_distance=self.max_distance,
+            num_distogram_bins=self.num_distogram_bins,
         ).to(dtype=dtype)
         distogram = distogram * pseudo_beta_mask_2d.unsqueeze(-1)
         act = self.template_pair_embedding_0(distogram)
@@ -2842,8 +2845,8 @@ class AlphaFold2MultimerTemplateEmbedding(nn.Module):
         template_size: int,
         num_blocks: int,
         num_distogram_bins: int,
-        min_bin: float,
-        max_bin: float,
+        min_distance: float,
+        max_distance: float,
         vocab_size: int,
         triangle_multiplication_hidden_size: int,
         triangle_attention_hidden_size: int,
@@ -2858,8 +2861,8 @@ class AlphaFold2MultimerTemplateEmbedding(nn.Module):
             template_size=template_size,
             num_blocks=num_blocks,
             num_distogram_bins=num_distogram_bins,
-            min_bin=min_bin,
-            max_bin=max_bin,
+            min_distance=min_distance,
+            max_distance=max_distance,
             vocab_size=vocab_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
             triangle_attention_hidden_size=triangle_attention_hidden_size,
@@ -3036,21 +3039,21 @@ def _apply_inverse_rigid_to_points(rigid: Rigid, points: Tensor) -> Tensor:
 class PointProjectionMultimer(nn.Module):
     r"""AF-Multimer per-head point projection (``PointProjection``).
 
-    Projects the single representation to ``num_head * 3 * num_points`` local coordinates
+    Projects the single representation to ``num_heads * 3 * num_points`` local coordinates
     and lifts them into each residue's global backbone frame. Mirrors OpenFold
     ``structure_module.py:PointProjection`` (``is_multimer=True``): the flat output is read
     as ``[H, 3, P]`` and reordered to ``[H, P, 3]`` before the rigid is applied.
     """
 
-    def __init__(self, c_s: int, num_points: int, num_head: int) -> None:
+    def __init__(self, c_s: int, num_points: int, num_heads: int) -> None:
         super().__init__()
-        self.num_head = num_head
+        self.num_heads = num_heads
         self.num_points = num_points
-        self.point_projection = nn.Linear(c_s, num_head * 3 * num_points)
+        self.point_projection = nn.Linear(c_s, num_heads * 3 * num_points)
 
     def forward(self, single: Tensor, rigid: Rigid) -> Tensor:
         points_local = self.point_projection(single)
-        points_local = points_local.view(*points_local.shape[:-1], self.num_head, 3, self.num_points)
+        points_local = points_local.view(*points_local.shape[:-1], self.num_heads, 3, self.num_points)
         points_local = points_local.movedim(-2, -1)
         return _apply_rigid_to_points(rigid, points_local)
 
@@ -3095,7 +3098,7 @@ class InvariantPointAttentionMultimer(nn.Module):
         *,
         c_s: int,
         c_z: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -3103,25 +3106,25 @@ class InvariantPointAttentionMultimer(nn.Module):
         inf: float = 1e5,
     ) -> None:
         super().__init__()
-        self.num_head = num_head
+        self.num_heads = num_heads
         self.num_scalar_qk = num_scalar_qk
         self.num_scalar_v = num_scalar_v
         self.num_point_qk = num_point_qk
         self.num_point_v = num_point_v
         self.inf = inf
-        self.q_scalar_projection = nn.Linear(c_s, num_head * num_scalar_qk, bias=False)
-        self.k_scalar_projection = nn.Linear(c_s, num_head * num_scalar_qk, bias=False)
-        self.v_scalar_projection = nn.Linear(c_s, num_head * num_scalar_v, bias=False)
-        self.q_point_projection = PointProjectionMultimer(c_s, num_point_qk, num_head)
-        self.k_point_projection = PointProjectionMultimer(c_s, num_point_qk, num_head)
-        self.v_point_projection = PointProjectionMultimer(c_s, num_point_v, num_head)
-        self.attention_2d = nn.Linear(c_z, num_head)
-        self.trainable_point_weights = nn.Parameter(torch.zeros(num_head))
-        output_size = num_head * (c_z + num_scalar_v + num_point_v * 4)
+        self.q_scalar_projection = nn.Linear(c_s, num_heads * num_scalar_qk, bias=False)
+        self.k_scalar_projection = nn.Linear(c_s, num_heads * num_scalar_qk, bias=False)
+        self.v_scalar_projection = nn.Linear(c_s, num_heads * num_scalar_v, bias=False)
+        self.q_point_projection = PointProjectionMultimer(c_s, num_point_qk, num_heads)
+        self.k_point_projection = PointProjectionMultimer(c_s, num_point_qk, num_heads)
+        self.v_point_projection = PointProjectionMultimer(c_s, num_point_v, num_heads)
+        self.attention_2d = nn.Linear(c_z, num_heads)
+        self.trainable_point_weights = nn.Parameter(torch.zeros(num_heads))
+        output_size = num_heads * (c_z + num_scalar_v + num_point_v * 4)
         self.output_projection = nn.Linear(output_size, c_s)
 
     def forward(self, *, single: Tensor, pair: Tensor, mask: Tensor, rigid: Rigid) -> Tensor:
-        num_head = self.num_head
+        num_heads = self.num_heads
 
         point_variance = max(self.num_point_qk, 1) * 9.0 / 2.0
         point_weights = math.sqrt(1.0 / point_variance)
@@ -3135,8 +3138,8 @@ class InvariantPointAttentionMultimer(nn.Module):
         attn_qk_point = -0.5 * (dist2 * point_weights[..., None, :, None]).sum(dim=-1)
 
         scalar_weights = math.sqrt(1.0 / max(self.num_scalar_qk, 1))
-        q_scalar = self.q_scalar_projection(single).view(*single.shape[:-1], num_head, self.num_scalar_qk)
-        k_scalar = self.k_scalar_projection(single).view(*single.shape[:-1], num_head, self.num_scalar_qk)
+        q_scalar = self.q_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_qk)
+        k_scalar = self.k_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_qk)
         q_scalar = q_scalar * scalar_weights
         attn_qk_scalar = torch.einsum("...qhc,...khc->...qkh", q_scalar, k_scalar)
 
@@ -3149,19 +3152,19 @@ class InvariantPointAttentionMultimer(nn.Module):
         # softmax over the key axis (Nj), which is dim -2 in the [*, Ni, Nj, H] layout.
         attn = torch.softmax(attn_logits, dim=-2)
 
-        v_scalar = self.v_scalar_projection(single).view(*single.shape[:-1], num_head, self.num_scalar_v)
+        v_scalar = self.v_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_v)
         result_scalar = torch.einsum("...qkh,...khc->...qhc", attn, v_scalar)
-        result_scalar = result_scalar.reshape(*result_scalar.shape[:-2], num_head * self.num_scalar_v)
+        result_scalar = result_scalar.reshape(*result_scalar.shape[:-2], num_heads * self.num_scalar_v)
 
         v_point = self.v_point_projection(single, rigid)
         # [*, Ni, H, P_v, 3]
         result_point = (attn[..., None, None] * v_point.unsqueeze(-5)).sum(dim=-4)
-        result_point = result_point.reshape(*result_point.shape[:-3], num_head * self.num_point_v, 3)
+        result_point = result_point.reshape(*result_point.shape[:-3], num_heads * self.num_point_v, 3)
         result_point = _apply_inverse_rigid_to_points(rigid, result_point)
         result_point_norm = torch.sqrt(1e-8 + result_point.square().sum(dim=-1))
 
         result_pair = torch.einsum("...qkh,...qkc->...qhc", attn, pair)
-        result_pair = result_pair.reshape(*result_pair.shape[:-2], num_head * pair.shape[-1])
+        result_pair = result_pair.reshape(*result_pair.shape[:-2], num_heads * pair.shape[-1])
 
         output_features = torch.cat(
             [
@@ -3191,7 +3194,7 @@ class FoldIterationMultimer(nn.Module):
         num_channel: int,
         pair_size: int,
         num_layer_in_transition: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -3206,7 +3209,7 @@ class FoldIterationMultimer(nn.Module):
         self.invariant_point_attention = InvariantPointAttentionMultimer(
             c_s=num_channel,
             c_z=pair_size,
-            num_head=num_head,
+            num_heads=num_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -3266,7 +3269,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         num_layer: int,
         num_layer_in_transition: int,
         num_channel: int,
-        num_head: int,
+        num_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -3286,7 +3289,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             num_channel=num_channel,
             pair_size=pair_size,
             num_layer_in_transition=num_layer_in_transition,
-            num_head=num_head,
+            num_heads=num_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,

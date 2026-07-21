@@ -16,20 +16,20 @@ class AlphaFold2PrevPosConfig(Config):
     Previous-position distogram recycling bins.
     """
 
-    min_bin: float = 3.25
-    max_bin: float = 20.75
-    num_bins: int = 15
+    min_distance: float = 3.25
+    max_distance: float = 20.75
+    num_distogram_bins: int = 15
 
 
-class AlphaFold2MsaRowAttentionWithPairBiasConfig(Config):
-    num_head: int = 8
-    dropout_rate: float = 0.15
+class AlphaFold2MSARowAttentionWithPairBiasConfig(Config):
+    num_heads: int = 8
+    dropout: float = 0.15
 
 
 class AlphaFold2TriangleAttentionConfig(Config):
-    num_head: int = 4
+    num_heads: int = 4
     value_dim: int = 32
-    dropout_rate: float = 0.25
+    dropout: float = 0.25
 
 
 class AlphaFold2TransitionConfig(Config):
@@ -37,7 +37,7 @@ class AlphaFold2TransitionConfig(Config):
     Transition feed-forward expansion.
     """
 
-    num_intermediate_factor: int = 4
+    expansion: int = 4
 
 
 class AlphaFold2OuterProductMeanConfig(Config):
@@ -66,8 +66,8 @@ class AlphaFold2EvoformerIterationConfig(Config):
     two triangle orientations and one MSA head count for row and column attention.
     """
 
-    msa_row_attention_with_pair_bias: AlphaFold2MsaRowAttentionWithPairBiasConfig = (
-        AlphaFold2MsaRowAttentionWithPairBiasConfig()
+    msa_row_attention_with_pair_bias: AlphaFold2MSARowAttentionWithPairBiasConfig = (
+        AlphaFold2MSARowAttentionWithPairBiasConfig()
     )
     msa_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig()
     outer_product_mean: AlphaFold2OuterProductMeanConfig = AlphaFold2OuterProductMeanConfig()
@@ -89,7 +89,7 @@ class AlphaFold2TemplatePairStackConfig(Config):
     triangle_multiplication_outgoing: AlphaFold2TriangleMultiplicationConfig = AlphaFold2TriangleMultiplicationConfig(
         {"num_intermediate_channel": 64}
     )
-    pair_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig({"num_intermediate_factor": 2})
+    pair_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig({"expansion": 2})
 
 
 class AlphaFold2TemplatePointwiseAttentionConfig(Config):
@@ -97,7 +97,7 @@ class AlphaFold2TemplatePointwiseAttentionConfig(Config):
     Template pointwise attention config.
     """
 
-    num_head: int = 4
+    num_heads: int = 4
 
 
 class AlphaFold2TemplateConfig(Config):
@@ -107,8 +107,8 @@ class AlphaFold2TemplateConfig(Config):
 
     enabled: bool = True
     embed_torsion_angles: bool = True
-    min_bin: float = 3.25
-    max_bin: float = 50.75
+    min_distance: float = 3.25
+    max_distance: float = 50.75
     num_distogram_bins: int = 39
     vocab_size: int = 22
     use_template_unit_vector: bool = False
@@ -215,7 +215,7 @@ class AlphaFold2StructureModuleHeadConfig(Config):
 
     dropout: float = 0.1
     num_channel: int = 384
-    num_head: int = 12
+    num_heads: int = 12
     num_layer: int = 8
     num_layer_in_transition: int = 3
     num_point_qk: int = 4
@@ -348,8 +348,8 @@ class AlphaFold2MultimerTemplateConfig(Config):
 
     enabled: bool = True
     embed_torsion_angles: bool = False
-    min_bin: float = 3.25
-    max_bin: float = 50.75
+    min_distance: float = 3.25
+    max_distance: float = 50.75
     num_distogram_bins: int = 39
     vocab_size: int = 22
     use_template_unit_vector: bool = True

@@ -145,9 +145,9 @@ def _convert_multimer_tensor(source_key: str, tensor: Tensor) -> Tensor:
     r"""Convert one official multimer tensor, handling the multimer IPA projections.
 
     The AF-Multimer invariant-point-attention scalar/point projections store weights as
-    ``(c_s, num_head, out)`` Haiku tensors that flatten to ``(num_head * out, c_s)`` in the
-    native ``Linear`` layout, and their biases as ``(num_head, out)`` flattening to
-    ``(num_head * out,)``. Every other tensor uses the shared monomer conversion.
+    ``(c_s, num_heads, out)`` Haiku tensors that flatten to ``(num_heads * out, c_s)`` in the
+    native ``Linear`` layout, and their biases as ``(num_heads, out)`` flattening to
+    ``(num_heads * out,)``. Every other tensor uses the shared monomer conversion.
     """
 
     _, name = deepmind._split_official_param_key(source_key)
