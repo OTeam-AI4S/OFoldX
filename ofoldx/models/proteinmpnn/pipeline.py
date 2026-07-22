@@ -13,7 +13,6 @@ from typing_extensions import Self
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io import read_pdb
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
@@ -21,6 +20,7 @@ from ...modules.mpnn import (
 )
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import MpnnProbabilityResult, PackResult, ScoreResult
+from ..mpnn_pdb import read_mpnn_pdb
 from .model import ProteinMpnnDesignResult, ProteinMpnnModel
 from .processor import ProteinMpnnProcessor
 
@@ -75,19 +75,8 @@ def _candidate_protein_sequences(
     return sequences
 
 
-class ProteinMpnnPipeline(PairedPipeline):
+class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]):
     r"""Bind one ProteinMpnn Model–Processor pair for biological operations."""
-
-    model: ProteinMpnnModel
-    processor: ProteinMpnnProcessor
-
-    def __init__(
-        self,
-        *,
-        model: ProteinMpnnModel,
-        processor: ProteinMpnnProcessor,
-    ) -> None:
-        super().__init__(model=model, processor=processor)
 
     def design(
         self,
@@ -113,7 +102,7 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> ProteinMpnnDesignResult:
         r"""Design sequences for selected positions on a fixed backbone."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
@@ -123,15 +112,15 @@ class ProteinMpnnPipeline(PairedPipeline):
             pssm_probabilities=pssm_probabilities,
             pssm_log_odds=pssm_log_odds,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.design(
-            batch,
+            features,
             num_candidates=num_candidates,
             num_decoding_orders=num_decoding_orders,
             temperature=temperature,
             backbone_noise=backbone_noise,
             global_logit_bias=global_logit_bias,
-            global_omit_token_mask=_global_omit_token_mask(global_omit_tokens, device=batch.valid_mask.device),
+            global_omit_token_mask=_global_omit_token_mask(global_omit_tokens, device=features.valid_mask.device),
             pssm_mixture=pssm_mixture,
             pssm_log_odds_threshold=pssm_log_odds_threshold,
             generator=generator,
@@ -150,10 +139,10 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> ScoreResult:
         r"""Score one sequence over independently drawn decoding orders."""
 
-        batch = self.processor(input, sequence=sequence, positions=positions)
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        features = self.processor(input, sequence=sequence, positions=positions)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.score(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=generator,
@@ -172,10 +161,10 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return sequence-conditioned autoregressive probabilities over orders."""
 
-        batch = self.processor(input, positions=positions, conditions=conditions)
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        features = self.processor(input, positions=positions, conditions=conditions)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.autoregressive_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=generator,
@@ -194,10 +183,10 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return order-dependent sequence-free autoregressive probabilities."""
 
-        batch = self.processor(input, positions=positions, conditions=conditions)
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        features = self.processor(input, positions=positions, conditions=conditions)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.sequence_free_autoregressive_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=generator,
@@ -215,10 +204,10 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return target-last conditional probabilities for every row."""
 
-        batch = self.processor(input, positions=positions)
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        features = self.processor(input, positions=positions)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.conditional_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=generator,
@@ -236,10 +225,10 @@ class ProteinMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return target-first sequence-free probabilities for every row."""
 
-        batch = self.processor(input, positions=positions)
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        features = self.processor(input, positions=positions)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.unconditional_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=generator,
@@ -305,8 +294,8 @@ class ProteinMpnnDesignAndPackPipeline:
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]:
         r"""Design sequences on one canonical Structure and pack each candidate."""
 
-        structure = read_pdb(input) if isinstance(input, (str, PathLike)) else input
-        design_input = self.designer.processor.process_structure(
+        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
+        features = self.designer.processor.process_structure(
             structure,
             positions=positions,
             conditions=conditions,
@@ -317,10 +306,10 @@ class ProteinMpnnDesignAndPackPipeline:
             pssm_log_odds=pssm_log_odds,
             filter_by_occupancy=filter_by_occupancy,
         )
-        device = design_input.valid_mask.device
+        device = features.valid_mask.device
         generator = resolve_generator(seed, generator, device=device)
         design_result = self.designer.model.design(
-            design_input,
+            features,
             num_candidates=num_candidates,
             num_decoding_orders=num_decoding_orders,
             temperature=temperature,
@@ -334,8 +323,8 @@ class ProteinMpnnDesignAndPackPipeline:
         if repack_everything:
             packing_positions: Sequence[ComponentReference] | None = None
         else:
-            references = design_input.component_references[0]
-            selected = (design_input.valid_mask[0] & design_input.design_mask[0]).tolist()
+            references = features.component_references[0]
+            selected = (features.valid_mask[0] & features.design_mask[0]).tolist()
             packing_positions = [
                 reference for reference, keep in zip(references, selected) if keep and reference is not None
             ]

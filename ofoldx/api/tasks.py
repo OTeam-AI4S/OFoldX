@@ -2,38 +2,42 @@ r"""The four standard one-shot tasks and their repository-backed factory."""
 
 from __future__ import annotations
 
-import inspect
-import os
 from collections.abc import Mapping, Sequence
 from os import PathLike
-from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, TypeAlias
 
-import chanfig
 import torch
 
-from ..data.conditions import AllowedResidueIdentities, TiedResidueIdentities
+from .._repository import (
+    PROCESSOR_METADATA,
+    hydrate_weights,
+    load_json_object,
+    load_registered_model,
+    load_registered_processor,
+    model_values,
+    resolve_hub_repository,
+    resolve_repository,
+)
 from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ..data.structure import Structure
-from ..hub import (
-    _PROCESSOR_METADATA,
-    _hydrate_weights,
-    _load_registered_model,
-    _load_registered_processor,
-    _model_config,
-    _resolve_hub_repository,
-    _resolve_repository,
-)
 from ..pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
-from ..pipelines.registry import PIPELINES
+from ..pipelines.registry import PIPELINES, PipelineRegistration, PipelineTask
 
-FoldInput: TypeAlias = str | PathLike[str] | PolymerSequence | MolecularSystem | Structure
-DesignInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str]
+FoldInput: TypeAlias = (
+    str
+    | PathLike[str]
+    | PolymerSequence
+    | Sequence[PolymerSequence]
+    | Mapping[str, PolymerSequence]
+    | MolecularSystem
+    | Structure
+)
+DesignInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str] | None
 ScoreInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str]
 PackInput: TypeAlias = Structure | str | PathLike[str]
-MSAInput: TypeAlias = MSA | MSACollection
-TemplateInput: TypeAlias = Template
+MSAInput: TypeAlias = MSA | MSACollection | str | PathLike[str]
+TemplateInput: TypeAlias = Template | str | PathLike[str]
 
 _STANDARD_PIPELINE_CLASSES = {
     "fold": FoldPipeline,
@@ -43,64 +47,12 @@ _STANDARD_PIPELINE_CLASSES = {
 }
 
 
-def _validate_input(input: object) -> None:
-    r"""Reject a malformed one-shot input at the API boundary with a clear error.
-
-    The one-shot task functions accept an in-memory carrier (:class:`Structure`,
-    :class:`MolecularSystem`, :class:`PolymerSequence`) or a path to an existing structure file.
-    Anything else — ``None``, an empty string, a directory, an arbitrary object — is caught here
-    so the caller gets a clear ``TypeError`` / ``ValueError`` instead of an opaque failure deep
-    inside a Processor. A path that simply does not exist is left to the Processor's own
-    ``FileNotFoundError``.
-    """
-
-    if isinstance(input, (Structure, MolecularSystem, PolymerSequence)):
-        return
-    if isinstance(input, (str, PathLike)):
-        text = os.fspath(input)
-        if not text:
-            raise ValueError("input path is empty; pass a path to a structure file")
-        if Path(text).expanduser().is_dir():
-            raise ValueError(f"input path {text!r} is a directory, not a structure file")
-        return
-    raise TypeError(
-        "input must be a Structure, MolecularSystem, PolymerSequence, or a path to a structure "
-        f"file, not {type(input).__name__}"
-    )
-
-
-def _accepts_keyword(method: object, name: str) -> bool:
-    r"""Report whether ``method`` accepts the keyword ``name`` (directly or via ``**kwargs``)."""
-
-    parameters = inspect.signature(method).parameters.values()
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-        return True
-    return any(parameter.name == name for parameter in parameters)
-
-
-def _guard_evidence(method: object, model: object, *, msa: object, templates: Sequence[object]) -> None:
-    r"""Fail clearly when evidence is supplied to a model whose task cannot consume it.
-
-    ``fold`` / ``design`` advertise ``msa=`` / ``templates=``, but a structure-only concrete
-    pipeline (ProteinMPNN, ...) does not accept them. Rather than forwarding into a raw
-    ``TypeError: ... unexpected keyword argument 'msa'`` deep in the call, name the model and the
-    evidence its task ignores.
-    """
-
-    unsupported: list[str] = []
-    if msa is not None and not _accepts_keyword(method, "msa"):
-        unsupported.append("MSA")
-    if templates and not _accepts_keyword(method, "templates"):
-        unsupported.append("templates")
-    if unsupported:
-        raise TypeError(f"model {model!r} does not consume {'/'.join(unsupported)}")
-
-
 def pipeline(
-    task: Literal["fold", "design", "score", "pack"],
+    task: PipelineTask,
     *,
     model: str | PathLike[str],
     revision: str | None = None,
+    token: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Any:
@@ -111,55 +63,63 @@ def pipeline(
     except KeyError:
         valid = ", ".join(repr(name) for name in _STANDARD_PIPELINE_CLASSES)
         raise ValueError(f"unknown task {task!r}; valid tasks are {valid}") from None
-    metadata_repository = _resolve_repository(
+    metadata_repository = resolve_repository(
         model,
         revision=revision,
-        allow_patterns=(*_PROCESSOR_METADATA, "pipeline.json"),
+        token=token,
+        allow_patterns=(*PROCESSOR_METADATA, "pipeline.json"),
     )
     marker = metadata_repository.path / "pipeline.json"
-    has_marker = marker.exists()
-    if has_marker:
-        marker_values = chanfig.NestedDict.load(marker)
-        if not isinstance(marker_values, dict):
-            raise TypeError("pipeline.json must contain a JSON object")
-        if set(marker_values) != {"pipeline"}:
-            raise ValueError("pipeline.json must contain exactly one pipeline field")
-        pipeline_id = marker_values["pipeline"]
+    publication: PipelineRegistration | None = None
+    if marker.exists():
+        marker_values = load_json_object(marker)
+        pipeline_id = marker_values.get("pipeline")
         if not isinstance(pipeline_id, str):
             raise TypeError("pipeline.json pipeline must be a string")
-        selected_pipeline_class = PIPELINES.lookup(pipeline_id)
-        if not callable(getattr(selected_pipeline_class, task, None)):
-            raise ValueError(f"pipeline {pipeline_id!r} does not support {task}")
-        if getattr(selected_pipeline_class, "_PAIR_LAYOUT", None) is not None:
-            # DESIGN §7.4 multi-pair: the concrete class owns several class-owned pairs and must load
-            # every one of them from the same immutable snapshot, so the factory dispatches to the
-            # class's own multi-pair loader instead of the one-pair (model, processor) call. Pin the
-            # full snapshot at the commit the marker was read from; for a local directory that same
-            # directory already holds every pair.
-            if metadata_repository.repository is None:
-                snapshot = metadata_repository.path
-            else:
-                snapshot = _resolve_hub_repository(
-                    metadata_repository.repository,
-                    revision=metadata_repository.commit,
-                    allow_patterns=None,
-                ).path
-            return selected_pipeline_class.from_repository(snapshot, device=device, dtype=dtype)
-    else:
-        selected_pipeline_class = standard_pipeline_class
+        publication = PIPELINES.lookup_registration(pipeline_id)
 
-    registration, model_config = _model_config(metadata_repository.path)
-    if not has_marker and task not in registration.standard_tasks:
-        raise ValueError(f"model architecture {registration.id!r} does not support standard {task}")
+    registration, raw_model_values = model_values(metadata_repository.path)
+    if publication is None:
+        publication = PIPELINES.for_architecture(registration.id)
+    if publication is None:
+        if task not in registration.standard_tasks:
+            raise ValueError(f"model architecture {registration.id!r} does not support {task}")
+        selected_pipeline_class = standard_pipeline_class
+        repository_loader = None
+    else:
+        if task not in publication.tasks:
+            raise ValueError(f"pipeline {publication.id!r} does not support {task}")
+        if publication.repository_loader is None and registration.id not in publication.architectures:
+            raise ValueError(
+                f"pipeline {publication.id!r} is not registered for model architecture {registration.id!r}"
+            )
+        selected_pipeline_class = publication.pipeline
+        repository_loader = publication.repository_loader
+
+    if repository_loader is not None:
+        # Composite and externally persisted Pipelines own their complete repository
+        # layout. Resolve one immutable snapshot and let the concrete class load it.
+        if metadata_repository.repository is None:
+            snapshot = metadata_repository.path
+        else:
+            snapshot = resolve_hub_repository(
+                metadata_repository.repository,
+                revision=metadata_repository.commit,
+                allow_patterns=None,
+                token=token,
+            ).path
+        return repository_loader(snapshot, device=device, dtype=dtype)
+
     # Construct the Processor before requesting weights.
-    loaded_processor = _load_registered_processor(
+    loaded_processor = load_registered_processor(
         metadata_repository,
         registration,
         device=device,
         dtype=dtype,
     )
-    repository = _hydrate_weights(metadata_repository)
-    loaded_model = _load_registered_model(
+    repository = hydrate_weights(metadata_repository, token=token)
+    model_config = registration.model_config(raw_model_values)
+    loaded_model = load_registered_model(
         repository,
         registration,
         model_config,
@@ -175,20 +135,29 @@ def fold(
     *,
     model: str | PathLike[str],
     revision: str | None = None,
+    token: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     msa: MSAInput | None = None,
     templates: Sequence[TemplateInput] = (),
-    num_samples: int = 1,
+    num_samples: int | None = None,
     seed: int | None = None,
     generator: torch.Generator | None = None,
+    **task_kwargs: Any,
 ) -> Any:
-    r"""Fold a biological input with one repository-backed Model/Processor pair."""
+    r"""Fold a biological input, forwarding task controls to its concrete Pipeline."""
 
-    _validate_input(input)
-    fold_pipeline = pipeline("fold", model=model, revision=revision, device=device, dtype=dtype)
-    _guard_evidence(fold_pipeline.fold, model, msa=msa, templates=templates)
-    arguments: dict[str, object] = {"num_samples": num_samples}
+    fold_pipeline = pipeline(
+        "fold",
+        model=model,
+        revision=revision,
+        token=token,
+        device=device,
+        dtype=dtype,
+    )
+    arguments: dict[str, object] = dict(task_kwargs)
+    if num_samples is not None:
+        arguments["num_samples"] = num_samples
     if msa is not None:
         arguments["msa"] = msa
     if templates:
@@ -205,21 +174,30 @@ def design(
     *,
     model: str | PathLike[str],
     revision: str | None = None,
+    token: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     msa: MSAInput | None = None,
     templates: Sequence[TemplateInput] = (),
-    conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-    num_candidates: int = 1,
+    conditions: Sequence[object] = (),
+    num_candidates: int | None = None,
     seed: int | None = None,
     generator: torch.Generator | None = None,
+    **task_kwargs: Any,
 ) -> Any:
-    r"""Design candidates with one repository-backed Model/Processor pair."""
+    r"""Design candidates, forwarding task controls to its concrete Pipeline."""
 
-    _validate_input(input)
-    design_pipeline = pipeline("design", model=model, revision=revision, device=device, dtype=dtype)
-    _guard_evidence(design_pipeline.design, model, msa=msa, templates=templates)
-    arguments: dict[str, object] = {"num_candidates": num_candidates}
+    design_pipeline = pipeline(
+        "design",
+        model=model,
+        revision=revision,
+        token=token,
+        device=device,
+        dtype=dtype,
+    )
+    arguments: dict[str, object] = dict(task_kwargs)
+    if num_candidates is not None:
+        arguments["num_candidates"] = num_candidates
     if msa is not None:
         arguments["msa"] = msa
     if templates:
@@ -238,15 +216,16 @@ def score(
     *,
     model: str | PathLike[str],
     revision: str | None = None,
+    token: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     seed: int | None = None,
     generator: torch.Generator | None = None,
+    **task_kwargs: Any,
 ) -> Any:
-    r"""Score a molecular input with one repository-backed Model/Processor pair."""
+    r"""Score a molecular input, forwarding task controls to its concrete Pipeline."""
 
-    _validate_input(input)
-    arguments: dict[str, object] = {}
+    arguments: dict[str, object] = dict(task_kwargs)
     if seed is not None:
         arguments["seed"] = seed
     if generator is not None:
@@ -257,6 +236,7 @@ def score(
         revision=revision,
         device=device,
         dtype=dtype,
+        token=token,
     ).score(input, **arguments)
 
 
@@ -265,6 +245,7 @@ def pack(
     *,
     model: str | PathLike[str],
     revision: str | None = None,
+    token: str | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     sequence: str | Mapping[str, str | Sequence[str]] | None = None,
@@ -272,15 +253,18 @@ def pack(
     num_samples: int = 1,
     seed: int | None = None,
     generator: torch.Generator | None = None,
+    **task_kwargs: Any,
 ) -> Any:
-    r"""Pack side chains with one repository-backed Model/Processor pair."""
+    r"""Pack side chains, forwarding task controls to its concrete Pipeline."""
 
-    _validate_input(input)
-    arguments: dict[str, object] = {
-        "sequence": sequence,
-        "positions": positions,
-        "num_samples": num_samples,
-    }
+    arguments: dict[str, object] = dict(task_kwargs)
+    arguments.update(
+        {
+            "sequence": sequence,
+            "positions": positions,
+            "num_samples": num_samples,
+        }
+    )
     if seed is not None:
         arguments["seed"] = seed
     if generator is not None:
@@ -291,4 +275,5 @@ def pack(
         revision=revision,
         device=device,
         dtype=dtype,
+        token=token,
     ).pack(input, **arguments)

@@ -4,7 +4,7 @@ Backend dispatch for the adaptive (conditioned) layer-norm operator.
 The dispatcher owns backend selection and calling-convention adaptation. Modules pass the ordinary
 tensor arguments -- the fused ``conditioning_projection`` weight ``[2 * hidden_size, conditioning_size]``
 and the ``[hidden_size]`` ``conditioning_scale_bias`` -- without a second validation layer. The
-``"oops"`` backend delegates to the fused ``adaptive_layer_norm`` kernel; ``"eager"`` runs the
+``"oops"`` backend delegates to the OOps-owned implementation; ``"eager"`` runs the
 equivalent pure-PyTorch composition.
 """
 
@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_adaptive_layer_norm = oops_kernel("adaptive_layer_norm")
@@ -38,7 +38,7 @@ def adaptive_layer_norm(
     ``hidden`` is layer-normed affine-free; ``conditioning`` is layer-normed with
     ``conditioning_norm_weight`` (no bias). The normed conditioning is projected once through the fused
     ``projection_weight`` and split into the raw ``scale`` and ``shift`` halves; ``scale_bias`` is added
-    to the scale half before the sigmoid gate. The ``"oops"`` backend delegates to the fused kernel;
+    to the scale half before the sigmoid gate. The ``"oops"`` backend delegates to OOps dispatch;
     ``"eager"`` runs the equivalent pure-PyTorch composition.
 
     Args:
@@ -53,9 +53,6 @@ def adaptive_layer_norm(
 
     Returns:
         ``[..., hidden_size]`` conditioned activations.
-
-    Raises:
-        OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA tensors.
 
     Examples:
         >>> import torch
@@ -83,15 +80,14 @@ def adaptive_layer_norm(
         public_default="eager",
     )
     if backend == "oops":
-        if not hidden.is_cuda:
-            raise OOpsUnsupportedError("operator_backend 'oops' for adaptive_layer_norm requires CUDA tensors")
         return _oops_adaptive_layer_norm(
             hidden,
             conditioning,
+            projection_weight,
+            scale_bias,
             conditioning_norm_weight=conditioning_norm_weight,
-            projection_weight=projection_weight,
-            scale_bias=scale_bias,
             eps=eps,
+            conditioning_eps=eps,
         )
     hidden_normed = F.layer_norm(hidden, (hidden.shape[-1],), None, None, eps)
     conditioning_normed = F.layer_norm(conditioning, (conditioning.shape[-1],), conditioning_norm_weight, None, eps)

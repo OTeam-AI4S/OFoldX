@@ -3,17 +3,42 @@ r"""The explicit molecular scoring Pipeline."""
 from __future__ import annotations
 
 from os import PathLike
+from typing import Generic, Protocol, TypeVar
 
 import torch
 
+from ..artifacts import SaveableModel
 from ..data.molecular import MolecularSystem
 from ..data.structure import Structure
 from ..results import ScoreResult
 from ._paired import PairedPipeline
-from .generator import inputs_device, resolve_generator
+from .generator import PipelineProcessor, processor_device, resolve_generator
+
+_FeaturesT = TypeVar("_FeaturesT")
+_ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
+_ModelInputT_contra = TypeVar("_ModelInputT_contra", contravariant=True)
 
 
-class ScorePipeline(PairedPipeline):
+class _ScoreProcessor(PipelineProcessor, Protocol[_ProcessorOutputT_co]):
+    def __call__(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str],
+    ) -> _ProcessorOutputT_co: ...
+
+
+class _ScoreModel(SaveableModel, Protocol[_ModelInputT_contra]):
+    def score(
+        self,
+        input: _ModelInputT_contra,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> ScoreResult: ...
+
+
+class ScorePipeline(
+    PairedPipeline[_ScoreModel[_FeaturesT], _ScoreProcessor[_FeaturesT]],
+    Generic[_FeaturesT],
+):
     r"""Bind one scoring Model to its paired Processor."""
 
     def score(
@@ -23,9 +48,9 @@ class ScorePipeline(PairedPipeline):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        inputs = self.processor(input)  # type: ignore[operator]
-        generator = resolve_generator(seed, generator, device=inputs_device(inputs))
-        return self.model.score(  # type: ignore[attr-defined]
-            inputs,
+        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        features = self.processor(input)
+        return self.model.score(
+            features,
             generator=generator,
         )

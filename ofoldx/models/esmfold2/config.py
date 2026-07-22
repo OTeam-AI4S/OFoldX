@@ -138,7 +138,7 @@ class ESMFold2Config(Config):
     pair_size: int = 256
     num_relative_residue_bins: int = 32
     num_relative_chain_bins: int = 2
-    num_loops: int = 3
+    recycling_steps: int = 4
     language_model_mask_probability: float = 0.0
     msa_encoder_overwrite: bool = True
 
@@ -202,7 +202,7 @@ class ESMFold2ExperimentalConfig(Config):
     pair_size: int = 256
     num_relative_residue_bins: int = 32
     num_relative_chain_bins: int = 2
-    num_loops: int = 3
+    recycling_steps: int = 4
     disable_msa_features: bool = True
     language_model_dropout: float = 0.0
     force_language_model_dropout: bool = False
@@ -212,7 +212,7 @@ class ESMFold2ExperimentalConfig(Config):
     # sequence prior into the structure objective during binder design. The released default
     # 0.15 is the general de-novo-binder weight; construct an antibody-framework design (fixed
     # framework, mutable CDR loops) with 0.05 so the structure objective dominates the short
-    # CDR loops. ``ESMFold2Pipeline.design`` reads this value and never selects it at runtime.
+    # CDR loops. ``ESMFold2DesignPipeline.design`` reads this value and never selects it at runtime.
     language_model_weight: float = 0.15
 
     esmc: ESMFold2ESMCConfig = ESMFold2ESMCConfig()

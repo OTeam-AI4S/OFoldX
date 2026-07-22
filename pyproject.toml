@@ -9,8 +9,6 @@ requires = [
 name = "ofoldx"
 description = "Open biomolecular structure models for prediction, scoring, and design"
 readme = "README.md"
-license = "AGPL-3.0-or-later"
-license-files = [ "LICENSE.md" ]
 keywords = [
   "biomolecular-design",
   "deep-learning",
@@ -19,6 +17,8 @@ keywords = [
   "protein",
   "rna",
 ]
+license = "AGPL-3.0-or-later"
+license-files = [ "LICENSE.md" ]
 maintainers = [
   { name = "Zhiyuan Chen", email = "this@zyc.ai" },
 ]
@@ -44,38 +44,37 @@ dynamic = [
   "version",
 ]
 dependencies = [
+  "abnumber>=0.4.4",
+  "anarci>=2026.2.13.2",
   "biotite>=1.7",
   "chanfig",
-  "chembl_structure_pipeline",
+  "chembl-structure-pipeline",
   "danling>=0.4.2",
-  "huggingface-hub>=0.24.0",
-  # esmfold2 needs EsmC (EsmCConfig/EsmCModel/EsmCForMaskedLM), which no PUBLISHED
-  # multimolecule release ships yet (PyPI tops out at 0.2.0, no esmc model). The owner
-  # (multimolecule author) must publish a release containing the esmc model, then bump this
-  # floor; until then esmfold2 is import-gated on the unpublished dev source. Do NOT pin a
-  # git-URL dependency here (unreviewed supply-chain code on every install).
-  "multimolecule>=0.2.0",
+  "huggingface-hub>=0.24",
+  "multimolecule>=0.2",
   "numpy",
+  # pyarrow is a direct import in ofoldx/data/ccd/resolver.py (AF3 CCD resolution path); it is
+  # currently present only transitively via multimolecule->datasets, so declare it directly.
+  "pyarrow",
   "rdkit",
   "safetensors>=0.2.8",
   "scipy",
   "torch",
-  "typing-extensions>=4.0",
+  # transformers is a direct import in ofoldx/models/esmfold2/convert.py; present today only
+  # transitively via multimolecule (a hard transformers dep), so declare it directly.
+  "transformers",
+  "typing-extensions>=4",
   "zstandard",
+]
+optional-dependencies.oops = [
+  "ooperators",
 ]
 urls.homepage = "https://github.com/OTeam-AI4S/OFoldX"
 urls.issues = "https://github.com/OTeam-AI4S/OFoldX/issues"
 urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
-[project.optional-dependencies]
-oops = [
-  "ooperators",
-]
 
 [tool.setuptools]
 packages.find.include = [ "ofoldx*" ]
-
-[tool.setuptools.package-data]
-"ofoldx.models.rfdiffusion" = [ "rfdiffusion_schedule.npz" ]
 
 [tool.setuptools_scm]
 write_to = "ofoldx/_version.py"
@@ -91,9 +90,9 @@ profile = "black"
 [tool.mypy]
 ignore_missing_imports = true
 python_version = "3.10"
-# The parity probes under scripts/parity/<family>/ reuse basenames (confidence_parity,
-# forward_parity, ...) across families. Each family dir is a package (its __init__.py),
-# so the modules are family-qualified (boltz1.confidence_parity vs boltz2.confidence_parity).
+# The parity probes under scripts/parity/<model>/ reuse basenames (confidence_parity,
+# forward_parity, ...) across models. Each model directory is a package (its __init__.py),
+# so the modules are model-qualified (boltz1.confidence_parity vs boltz2.confidence_parity).
 # Disable namespace-package discovery so mypy does not ALSO map scripts/parity/*.py under a
 # second "scripts.parity.*" root ("source file found twice").
 namespace_packages = false

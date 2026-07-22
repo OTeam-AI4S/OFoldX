@@ -15,13 +15,17 @@ from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
 from ...modules.adaptive_norm import AdaptiveLayerNorm
-from ...modules.atom import AtomToTokenEncoder, TokenPairToLocalAtomPairBroadcast, TokenToAtomBroadcast
+from ...modules.atom import (
+    AtomToTokenEncoder,
+    AtomToTokenEncoderBase,
+    TokenPairToLocalAtomPairBroadcast,
+    TokenToAtomBroadcast,
+)
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.geometry import uniform_random_rotation
-from ...modules.transformer import ConditionedTransformerLayer, ProtenixConditionedTransformerLayer
 from ...modules.transition import Transition
 from ...results import Metric, Score
 from .config import PxDesignConfig
@@ -56,16 +60,9 @@ class PxDesignModel(nn.Module):
             num_atom_decoder_attention_heads=denoiser.num_atom_decoder_attention_heads,
             num_query_atoms=denoiser.num_query_atoms,
             num_key_atoms=denoiser.num_key_atoms,
+            cross_attention_key_source="normalized",
         )
         self.coordinate_sampler = PxDesignSampler(config)
-        # PXDesign drives Protenix's own ``DiffusionModule``/``AtomAttentionEncoder`` upstream
-        # (PXDesign/pxdesign/model/pxdesign.py:20,45; embedders.py:21), so it follows Protenix's
-        # double-adaLN cross-attention: the key/value adaptive norm consumes the already query-normed
-        # activation. The shared atom encoder/decoder build the AF3-canonical base layer, so re-cast
-        # every cross-attention atom transformer onto the Protenix-lineage subclass.
-        for module in self.modules():
-            if isinstance(module, ConditionedTransformerLayer) and module.cross_attention_mode:
-                module.__class__ = ProtenixConditionedTransformerLayer
         self.set_backend("auto")
 
     def set_backend(self, backend: str) -> Self:
@@ -80,6 +77,7 @@ class PxDesignModel(nn.Module):
                 module,
                 (
                     AdaptiveLayerNorm,
+                    AtomToTokenEncoderBase,
                     GatedMultiheadAttention,
                     TokenPairToLocalAtomPairBroadcast,
                     TokenToAtomBroadcast,
@@ -169,15 +167,11 @@ class PxDesignModel(nn.Module):
             )
             for index in range(num_candidates)
         )
-        # §5.3 reopened + LOCKED: PxDesign is coordinate-producing, so each backbone sample
-        # is wired into a standalone family-local PxDesignCandidate (carrying the decoded
-        # Structure, which owns its MolecularSystem) collected into the family-owned
-        # PxDesignResult, NOT the frozen coordinate-free shared DesignResult (whose §5.3.1
-        # fixed-length slice excludes PXDesign) and NOT by widening the shared record (§5.3.3).
+        # PxDesign is coordinate-producing, so each backbone sample is carried by a
+        # PxDesignCandidate containing the decoded Structure and collected in a
+        # PxDesignResult. The coordinate-free shared DesignResult cannot represent this output.
         # The released sampler decodes no per-sample score or metric (its plddt input is
-        # zeros and it has no confidence head), so scores/metrics stay empty. Per-condition
-        # PlacementSpec satisfaction flags carried no measured value and drove no hard-constraint
-        # raise here, so they are dropped with the removed ConditionOutcome carrier.
+        # zeros and it has no confidence head), so scores/metrics stay empty.
         return PxDesignResult(candidates=candidates)
 
     def encode_condition(
@@ -242,6 +236,7 @@ class PxDesignConditionEmbedder(nn.Module):
             num_query_atoms=embedder.num_query_atoms,
             num_key_atoms=embedder.num_key_atoms,
             atom_feature_size=config.atom_feature_size,
+            cross_attention_key_source="normalized",
         )
         input_size = (
             embedder.token_hidden_size
@@ -476,18 +471,14 @@ def _augment_reference_conformers(
 
 
 # ============================================================================
-# PxDesign released tensor boundary (folded in from contract.py)
+# PxDesign tensor inputs and outputs
 # ============================================================================
-# ``Score`` / ``Metric`` are the shared scientific value types. PXDesign is
-# coordinate-producing, so per the LOCKED §5.3 decision (§5.3.1 freezes the shared
-# fixed-length carrier and explicitly excludes PXDesign and every coordinate-generating
-# design operation; §5.3.3 forbids widening that shared record for such families) it defines
-# its OWN standalone family ``PxDesignCandidate`` / ``PxDesignResult`` below and reuses
-# neither the shared ``DesignCandidate`` nor the coordinate-free ``DesignResult``.
+# ``Score`` and ``Metric`` are shared scientific value types. PxDesign defines standalone
+# ``PxDesignCandidate`` and ``PxDesignResult`` records because its candidates carry coordinates;
+# it does not reuse the coordinate-free shared candidate and result records.
 #
-# The placement core is frozen (DESIGN §3.7 "placement core", ratified
-# 2026-07-18): ``PlacementSpec`` and ``PlacementMap`` are the shared records in ``ofoldx.data``;
-# ``Hotspot`` is the frozen §3.7.4 distance-free per-residue label PXDesign consumes.
+# ``PlacementSpec`` and ``PlacementMap`` are shared records in ``ofoldx.data``. ``Hotspot`` is
+# the shared distance-free per-residue label consumed by PxDesign.
 
 
 @dataclass(frozen=True)
@@ -496,7 +487,8 @@ class PxDesignLayout:
 
     system: MolecularSystem
     sites: tuple[AtomSite, ...]
-    conditions: tuple[PlacementSpec | Hotspot, ...]
+    placement: PlacementSpec
+    conditions: tuple[Hotspot, ...]
     placement_map: PlacementMap
 
 
@@ -540,25 +532,20 @@ class PxDesignOutput:
 class PxDesignCandidate:
     r"""One ranked, evaluated PXDesign target--binder backbone design sample.
 
-    PXDesign is a coordinate-*producing* family, so per the LOCKED §5.3 decision this
-    candidate is a STANDALONE family-local record — NOT a subclass of the shared §5.3.1
-    :class:`~ofoldx.results.DesignCandidate`, whose frozen fixed-length slice explicitly
-    excludes PXDesign and every coordinate-generating design operation, and NOT a widening of
-    that shared record, which §5.3.3 forbids for coordinate-producing and variable-topology
-    families. It mirrors the sibling coordinate-producing
+    PXDesign is coordinate-producing, so this candidate is a standalone record,
+    not a subclass of the coordinate-free :class:`~ofoldx.results.DesignCandidate`. It mirrors the
+    sibling coordinate-producing
     :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignCandidate`: each candidate owns
     the decoded backbone :class:`~ofoldx.data.structure.Structure` (which owns its
     ``MolecularSystem`` via ``Structure.system``), so no separate ``system`` field is carried.
-    The family carrier for these coordinate-bearing candidates is the sibling
-    :class:`PxDesignResult` (NOT the shared coordinate-free ``DesignResult``). This is a
-    family-local carrier pending the §5.3 coordinate-bearing design sub-freeze — NOT a frozen
-    public shape.
+    These coordinate-bearing candidates are collected by :class:`PxDesignResult`, not
+    the shared coordinate-free ``DesignResult``.
 
     Fields:
 
     - ``structure`` — the decoded backbone Structure (truthful ``UNK`` binder identity,
       GLY/xpb backbone atom contract). Present for every generator sample.
-    - ``scores`` — the evaluation Scores (§3): AF2-IG / Protenix confidence, RMSD, geometry,
+    - ``scores`` — evaluation Scores: AF2-IG / Protenix confidence, RMSD, geometry,
       success flags, and the ranking ``rank`` / ``bucket`` / ``pass_*`` Scores stamped by the
       suite. Empty for raw generator output.
     - ``metrics`` — per-residue evaluation metrics (e.g. AF2 pLDDT). Currently empty for raw
@@ -583,13 +570,10 @@ class PxDesignCandidate:
 class PxDesignResult:
     r"""One generation-ordered collection of ranked, evaluated PXDesign candidates.
 
-    This is PXDesign's OWN family Result. PXDesign is coordinate-producing, so per the
-    LOCKED §5.3 decision it defines this carrier in its own dir rather than reusing the
-    frozen, coordinate-free shared :class:`~ofoldx.results.DesignResult` (§5.3.1). It is a
-    family-local carrier — NOT itself DESIGN-frozen — pending the §5.3 coordinate-bearing
-    design sub-freeze, and is explicitly not the shared ``DesignResult``.
+    This result carries coordinate-bearing PXDesign candidates and therefore
+    does not reuse the coordinate-free shared :class:`~ofoldx.results.DesignResult`.
 
-    ``.best`` / ``.ranked`` replicate the frozen single-Score validation at
+    ``.best`` and ``.ranked`` apply the single-Score validation from
     results/values.py:95-110 (single unit, single scope, consistent ``preferred``,
     NaN-reject). ``ranked("af2_ipae")`` (preview) / ``ranked("ptx_iptm")`` (extended)
     reproduce the released within-bucket tie ordering; the full released two-tier
@@ -600,7 +584,7 @@ class PxDesignResult:
     candidates: tuple[PxDesignCandidate, ...]
 
     def _validated_scores(self, score: str) -> tuple[Score, ...]:
-        r"""Return the per-candidate Scores after the frozen single-Score checks."""
+        r"""Return the per-candidate Scores after the shared single-Score checks."""
 
         scores = tuple(candidate.scores[score] for candidate in self.candidates)
         directions = {value.preferred for value in scores}

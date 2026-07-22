@@ -1,4 +1,4 @@
-r"""Canonical molecular-system lowering for the released Boltz-2 affinity checkpoint."""
+r"""Input processing for Boltz-2 folding and affinity scoring."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from multimolecule.io import read_fasta_records
 from torch import Tensor
 from typing_extensions import Self
 
-from ...data.evidence import MSA, MSACollection
+from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import AtomSite, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
 from ...io.structure import read_structure
@@ -61,10 +61,9 @@ _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
 _UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
 _MSA_GAP = 1
 # MSA cells are UPPERCASE one-letter MSA symbols (or the ``-`` gap), not ChemicalComponent IDs. The
-# Processor owns the symbol->token mapping keyed by the entity's resolved polymer_type: it reproduces
-# the pre-migration ``_residue_type(component_id, polymer_type)`` path, which mapped the standard
-# residues to their model token and every other component (ambiguity codes, unknowns) to the family
-# UNKNOWN token. ``_PROTEIN_MSA_RESTYPE``/``_DNA_MSA_RESTYPE`` project one-letter symbols onto the
+# Processor owns the symbol->token mapping keyed by the entity's resolved polymer type. Standard
+# residues map to their model token and every other component (ambiguity codes and unknowns) maps to
+# the model's UNKNOWN token. ``_PROTEIN_MSA_RESTYPE``/``_DNA_MSA_RESTYPE`` project one-letter symbols onto the
 # three-letter tokens Boltz-2 already uses; RNA one-letter symbols equal their component IDs directly.
 _PROTEIN_MSA_RESTYPE = {
     symbol: _PROTEIN_RESIDUE_TYPES[component_id]
@@ -153,11 +152,11 @@ class Boltz2AffinityProcessor:
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
-        r"""Lower one released affinity-pass input and its selected ligand.
+        r"""Lower one affinity-pass input and its selected ligand.
 
-        Molecular weight is computed from the selected canonical graph without
-        consulting provenance. Raw SMILES affinity ligands must therefore be
-        standardized before constructing the input system.
+        Molecular weight is computed from the selected canonical graph. Raw SMILES
+        affinity ligands must therefore be standardized before constructing the input
+        system.
         """
 
         if isinstance(input, str | PathLike):
@@ -165,8 +164,12 @@ class Boltz2AffinityProcessor:
         if not isinstance(input, MolecularSystem | Structure):
             raise TypeError("Boltz2AffinityProcessor input must be a MolecularSystem, Structure, or structure path")
 
-        structure = input if isinstance(input, Structure) else None
-        system = input.system if structure is not None else input
+        if isinstance(input, Structure):
+            structure = input
+            system = input.system
+        else:
+            structure = None
+            system = input
         protein_instances = [
             instance_id
             for instance_id, entity_id in system.instances.items()
@@ -209,13 +212,9 @@ class Boltz2AffinityProcessor:
 class Boltz2Processor:
     r"""Lower one canonical molecular system to a whole-system folding ``Boltz2Input``.
 
-    Mirrors [`Boltz1Processor`][ofoldx.models.boltz1.processor.Boltz1Processor]: it lowers the *whole* system
-    (no ligand-centered affinity crop, no affinity tensors) with the same token/atom/bond/MSA construction the
-    affinity Processor uses, and records ``layout.affinity_instance_id = None``. It is config-less (carrying
-    only ``device``/``dtype``), so it writes no ``processor.json``.
-
-    Only inputs the released folding path actually consumes appear in the signature. Template and Condition
-    routing is documented investigation (DESIGN 6.2) and is not exposed here yet.
+    Uses the same token, atom, bond, and MSA construction as the affinity Processor
+    without ligand-centered cropping or affinity tensors. The layout records
+    ``affinity_instance_id = None``.
     """
 
     def __init__(
@@ -254,8 +253,12 @@ class Boltz2Processor:
         if not isinstance(input, MolecularSystem | Structure):
             raise TypeError("Boltz2Processor input must be a MolecularSystem, Structure, or structure path")
 
-        structure = input if isinstance(input, Structure) else None
-        system = input.system if structure is not None else input
+        if isinstance(input, Structure):
+            structure = input
+            system = input.system
+        else:
+            structure = None
+            system = input
         if not system.instances:
             raise ValueError("Boltz-2 requires at least one molecular instance")
 
@@ -281,7 +284,7 @@ def _prepare_boltz2_affinity_features(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz2Input:
-    r"""Build the released affinity token, atom, MSA, and identity layout."""
+    r"""Build the affinity token, atom, MSA, and identity layout."""
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
@@ -503,7 +506,6 @@ def _prepare_boltz2_affinity_features(
             5,
         ),
         "contact_threshold": torch.zeros(token_count, token_count),
-        "chain_type": molecule_types,
         "molecule_type": molecule_types,
         "frame_atom_index": frame_atom_index,
         "frame_mask": frame_mask,
@@ -768,15 +770,11 @@ def _prepare_boltz2_structure_features(
             5,
         ),
         "contact_threshold": torch.zeros(token_count, token_count),
-        "chain_type": molecule_types,
         "molecule_type": molecule_types,
         "frame_atom_index": frame_atom_index,
         "frame_mask": frame_mask,
-        # Whole-system folding uses upstream's default experimental method: the boltz2 predict path passes
-        # ``override_method=None`` and inference records carry ``StructureInfo.method=None``, so featurizerv2
-        # falls back to ``method_types_ids["x-ray diffraction"] == 1`` (reference/boltz src main.py:1071,1280
-        # and data/feature/featurizerv2.py:661-678). This differs from the affinity scoring pass, which is the
-        # only path that overrides to ``method="other" == 4`` (main.py:1367).
+        # Whole-system folding uses the x-ray-diffraction method id; the affinity
+        # pass uses the ``other`` method id.
         "method_feature": torch.full((token_count,), 1, dtype=torch.long),
         "modified": torch.tensor(
             [cast(bool, token["modified"]) for token in tokens],
@@ -896,20 +894,20 @@ def _token_bond_features(
         if not isinstance(entity, Molecule):
             continue
         for component_index, component in enumerate(entity.components):
-            for bond in component.bonds or ():
+            for component_bond in component.bonds or ():
                 add(
-                    AtomSite(instance_id, component_index, bond.atom_a),
-                    AtomSite(instance_id, component_index, bond.atom_b),
-                    bond_type_of(bond.order, bond.aromatic),
+                    AtomSite(instance_id, component_index, component_bond.atom_a),
+                    AtomSite(instance_id, component_index, component_bond.atom_b),
+                    bond_type_of(component_bond.order, component_bond.aromatic),
                 )
-        for bond in entity.bonds:
+        for molecule_bond in entity.bonds:
             add(
-                AtomSite(instance_id, bond.component_a, bond.atom_a),
-                AtomSite(instance_id, bond.component_b, bond.atom_b),
-                bond_type_of(bond.order, bond.aromatic),
+                AtomSite(instance_id, molecule_bond.component_a, molecule_bond.atom_a),
+                AtomSite(instance_id, molecule_bond.component_b, molecule_bond.atom_b),
+                bond_type_of(molecule_bond.order, molecule_bond.aromatic),
             )
-    for bond in system.bonds:
-        add(bond.site_a, bond.site_b, 6)
+    for system_bond in system.bonds:
+        add(system_bond.site_a, system_bond.site_b, 6)
     return token_bonds, type_bonds
 
 
@@ -928,10 +926,10 @@ def _msa_features(
         # entity, ``query_to_entity`` is now the identity map (column i binds ``entity.components[i]``,
         # so a token's monomer index is directly the aligned-row column), and cells are UPPERCASE
         # one-letter symbols (or ``-``) rather than ChemicalComponent IDs. A bare MSA is a single-chain
-        # plan over its unpaired pool; a collection replays its dense row_pairing/row_is_paired plan
-        # across the paired and unpaired pools -- the same partition the pre-migration nested-tuple
-        # plan drew, now read off the dense arrays.
-        columns = (msa,) if isinstance(msa, MSA) else msa.msas
+        # plan over its unpaired pool; a collection follows its dense ``row_pairing`` and
+        # ``row_is_paired`` plan across the paired and unpaired pools.
+        bindings = msa_bindings(msa)
+        columns = tuple(value for value, _target_instance_id in bindings)
         if isinstance(msa, MSA):
             plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
                 ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
@@ -945,9 +943,7 @@ def _msa_features(
                 )
                 for plan_index in range(msa.row_pairing.shape[0])
             ]
-        polymer_types = {
-            value.entity_id: cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in columns
-        }
+        polymer_types = tuple(cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in columns)
         row_values: list[Tensor] = []
         deletion_values: list[Tensor] = []
         paired_values: list[Tensor] = []
@@ -956,21 +952,25 @@ def _msa_features(
             deletion_row = torch.zeros(len(tokens))
             paired_row = torch.zeros(len(tokens))
             present = len(selections)
-            # A taxonomy-paired plan row draws every populated cell from the paired pool; the dense
-            # ``row_is_paired`` flag records exactly that, replacing the removed ``taxonomy_ids`` field,
-            # so ``present > 1`` paired-pool rows reproduce the pre-migration taxonomic-pair semantics.
+            # A taxonomy-paired plan row has more than one populated column and draws every
+            # populated cell from the paired pool.
             taxonomic_pair = (
                 isinstance(msa, MSACollection) and present > 1 and all(is_paired for _, _, is_paired in selections)
             )
             for column_index, source_row, is_paired in selections:
                 value = columns[column_index]
-                polymer_type = polymer_types[value.entity_id]
+                target_instance_id = bindings[column_index][1]
+                polymer_type = polymer_types[column_index]
                 aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
                 deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
                     source_row
                 ]
                 for token_index, token in enumerate(tokens):
-                    if token["entity_id"] != value.entity_id or token["monomer_index"] is None:
+                    if (
+                        token["entity_id"] != value.entity_id
+                        or (target_instance_id is not None and token["instance_id"] != target_instance_id)
+                        or token["monomer_index"] is None
+                    ):
                         continue
                     monomer_index = cast(int, token["monomer_index"])
                     row[token_index] = _msa_symbol_restype(aligned[monomer_index], polymer_type)
@@ -1016,7 +1016,9 @@ def _reference_coordinates(system: MolecularSystem, sites: tuple[AtomSite, ...])
     return coordinates
 
 
-def _molecule_reference_coordinates(molecule: Molecule) -> dict[str, tuple[float, float, float]]:
+def _molecule_reference_coordinates(
+    molecule: Molecule,
+) -> dict[tuple[int, str], tuple[float, float, float]]:
     from rdkit import Chem
     from rdkit.Chem import AllChem
 
@@ -1047,11 +1049,10 @@ def _augment_reference_positions(
     *,
     generator: torch.Generator | None = None,
 ) -> None:
-    r"""Apply the released conformer augmentation with a caller-injected RNG.
+    r"""Randomly rotate and translate each resolved reference conformer.
 
-    Per OWNER principle P1 the seed→generator resolution lives at the Pipeline boundary; this
-    reference-conformer roto-translation draws from the injected ``generator`` (``None`` means the
-    ambient RNG, matching the upstream Boltz featurizer). No hardcoded seed is created here.
+    Random values are drawn from ``generator``; ``None`` uses the ambient PyTorch
+    RNG.
     """
 
     if not len(space_ids):
@@ -1121,7 +1122,7 @@ def _affinity_ligand_properties(molecule: Molecule) -> tuple[int, float]:
 
 
 def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
-    r"""Materialize canonical molecule data as RDKit chemistry without consulting provenance."""
+    r"""Materialize canonical molecule data as RDKit chemistry."""
 
     from rdkit import Chem
 
@@ -1147,20 +1148,20 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
         4.0: Chem.BondType.QUADRUPLE,
     }
     for component_index, component in enumerate(molecule.components):
-        for bond in component.bonds or ():
+        for component_bond in component.bonds or ():
             editable.AddBond(
-                atom_index[(component_index, bond.atom_a)],
-                atom_index[(component_index, bond.atom_b)],
-                bond_types[bond.order],
+                atom_index[(component_index, component_bond.atom_a)],
+                atom_index[(component_index, component_bond.atom_b)],
+                bond_types[component_bond.order],
             )
-            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(bond.aromatic)
-    for bond in molecule.bonds:
+            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(component_bond.aromatic)
+    for molecule_bond in molecule.bonds:
         editable.AddBond(
-            atom_index[(bond.component_a, bond.atom_a)],
-            atom_index[(bond.component_b, bond.atom_b)],
-            bond_types[bond.order],
+            atom_index[(molecule_bond.component_a, molecule_bond.atom_a)],
+            atom_index[(molecule_bond.component_b, molecule_bond.atom_b)],
+            bond_types[molecule_bond.order],
         )
-        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(bond.aromatic)
+        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(molecule_bond.aromatic)
 
     value = editable.GetMol()
     Chem.SanitizeMol(value)
@@ -1194,20 +1195,7 @@ def _normalize_msa(
     if msa is None:
         return None
     if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        for value in values:
-            # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over
-            # the primary system supplied here, so the Processor resolves the entity and checks its
-            # query width -- the frozen MSA validates neither against an entity.
-            entity = system.entities.get(value.entity_id)
-            if not isinstance(entity, PolymerSequence):
-                raise ValueError(f"MSA entity {value.entity_id!r} disagrees with the input system")
-            width = len(value.unpaired_sequences[0])
-            if width != len(entity.components):
-                raise ValueError(
-                    f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
-                    f"{len(entity.components)} components"
-                )
+        resolve_msa_bindings(msa, system)
         return msa
     path = Path(msa).expanduser()
     proteins = [
@@ -1220,10 +1208,8 @@ def _normalize_msa(
     records = read_fasta_records(path)
     if not records:
         raise ValueError("MSA FASTA contains no rows")
-    # The pre-migration path lowered the aligned FASTA at full width and read only query-non-gap
-    # columns with all-zero insertion counts. Projecting each row to the query axis (dropping
-    # query-gap columns and folding ``.`` into ``-``) with all-zero deletion counts reproduces those
-    # exact symbols and deletion features on the new query-width MSA; row 0 is the ungapped query.
+    # Project each row onto non-gap query columns, normalize ``.`` to ``-``, and use zero deletion
+    # counts. Row 0 is the ungapped query.
     query = records[0].sequence.upper()
     keep = [index for index, symbol in enumerate(query) if symbol not in "-."]
     width = len(keep)

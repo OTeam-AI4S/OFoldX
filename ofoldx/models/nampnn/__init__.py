@@ -1,41 +1,24 @@
-r"""OFoldX-native NA-MPNN mixed-polymer inverse-folding architecture."""
+r"""NA-MPNN mixed-polymer inverse-folding implementation."""
 
 from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import NaMpnnConfig, NaMpnnProcessorConfig
-from .model import (
-    MIXED_POLYMER_ATOM_NAMES,
-    MIXED_POLYMER_COMPONENT_IDS,
-    NaMpnnFeatureEncoder,
-    NaMpnnInput,
-    NaMpnnModel,
-    nll_loss,
-    smoothed_loss,
-    token_groups_from_ids,
-)
+from .model import NaMpnnInput, NaMpnnModel
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
-__all__ = [
-    "NaMpnnConfig",
-    "NaMpnnProcessorConfig",
-    "NaMpnnModel",
-    "NaMpnnProcessor",
-    "NaMpnnInput",
-    "NaMpnnPipeline",
-    "nll_loss",
-    "smoothed_loss",
-]
-
-MODELS.register(
+MODELS.register_model(
     "ofoldx.nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
+    processor_config=NaMpnnProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.nampnn",
     pipeline=NaMpnnPipeline,
+    tasks=("design", "score"),
+    architectures=("ofoldx.nampnn",),
 )

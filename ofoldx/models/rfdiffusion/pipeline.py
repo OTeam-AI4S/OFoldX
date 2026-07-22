@@ -1,20 +1,13 @@
-r"""OFoldX's biological operation boundary for released RFdiffusion generation & design.
+r"""RFdiffusion generation and design pipeline.
 
-Owns the one Processor call and the family's released coordinate-producing ``design`` verb.
-``design`` lowers one generation input through :class:`RFdiffusionProcessor` and runs the
-released reverse-diffusion sampler via :meth:`RFdiffusionModel.design`, returning the
-family-owned, coordinate-producing :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignResult`
-(NOT the frozen coordinate-free shared ``DesignResult``; §5.3.1/§5.3.3, §6.1). The Pipeline
-coordinates the run-level random streams for its ``num_candidates`` calls without unintended
-reseeding (§3.7.3), threading a single caller-controlled ``seed``/``generator`` through to the
-sampler.
+``design`` lowers one generation input through :class:`RFdiffusionProcessor`, runs the released
+reverse-diffusion sampler via :meth:`RFdiffusionModel.design`, and returns the coordinate-producing
+:class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignResult`. A single caller-controlled
+``seed`` or ``generator`` supplies the random stream for every requested candidate without
+unintended reseeding.
 
-Marker id ``"ofoldx.rfdiffusion"``. Per Principle 13 this concrete Pipeline IS published:
-``register_pipeline("ofoldx.rfdiffusion", ...)`` in the family ``__init__`` plus the built-in
-lazy-import index entry. The validated combined-length + hotspot ``design`` verb is a complete
-coordinate-producing capability with a working Result carrier, so a checkpoint shipping
-``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` routes ``design`` here and receives the
-family-owned ``RFdiffusionDesignResult``.
+The marker ID is ``"ofoldx.rfdiffusion"``. A checkpoint containing
+``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` routes ``design`` to this pipeline.
 """
 
 from __future__ import annotations
@@ -24,73 +17,48 @@ from os import PathLike
 from typing import Literal
 
 import torch
-from typing_extensions import Self
 
-# The requested covalent link IS the frozen §3.7.4 SymbolicBond (no family alias; DESIGN §10.2).
+# RFdiffusion represents requested covalent links directly as SymbolicBond values.
 from ...data.bonds import SymbolicBond
 
-# AllowedResidueIdentities stays shared: it is the frozen §3.7.1 identity record.
+# AllowedResidueIdentities is shared by sequence-design pipelines.
 from ...data.conditions import AllowedResidueIdentities
 from ...data.evidence import Template
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
-from ...pipelines import resolve_generator
+from ...pipelines import PairedPipeline, resolve_generator
 from .model import (
-    Contact,
     Coordination,
     Distance,
+    Hotspot,
     PointGroupSymmetry,
     RadiusOfGyration,
     ReferenceCoordinates,
+    RFdiffusionDesignResult,
     RFdiffusionModel,
     RFdiffusionPlacements,
-    RFdiffusionDesignResult,
     SecondaryStructure,
     SubstrateInteraction,
 )
 from .processor import RFdiffusionProcessor
 
 
-class RFdiffusionPipeline:
-    r"""Bind one RFdiffusion Model-Processor pair for the released coordinate-producing design verb.
+class RFdiffusionPipeline(PairedPipeline[RFdiffusionModel, RFdiffusionProcessor]):
+    r"""Bind one RFdiffusion Model-Processor pair for coordinate-producing design.
 
-    Marker id ``"ofoldx.rfdiffusion"``. The Pipeline is not a base class and shares no runtime
-    request object with any other family. ``design`` returns the family-owned
+    Marker id ``"ofoldx.rfdiffusion"``. :meth:`design` returns an
     :class:`RFdiffusionDesignResult`.
     """
-
-    model: RFdiffusionModel
-    processor: RFdiffusionProcessor
-
-    def __init__(
-        self,
-        *,
-        model: RFdiffusionModel,
-        processor: RFdiffusionProcessor,
-    ) -> None:
-        self.model = model
-        self.processor = processor
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Place the Model and Processor on one device and dtype in place."""
-
-        self.model.to(device=device, dtype=dtype)
-        self.processor.to(device=device, dtype=dtype)
-        return self
 
     def design(
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None = None,
         *,
-        templates: Sequence[Template | str | PathLike[str]] = (),
+        placement: RFdiffusionPlacements | None = None,
+        templates: Sequence[Template] = (),
         conditions: Sequence[
             AllowedResidueIdentities
-            | Contact
-            | RFdiffusionPlacements
+            | Hotspot
             | Coordination
             | SymbolicBond
             | Distance
@@ -124,17 +92,18 @@ class RFdiffusionPipeline:
     ) -> RFdiffusionDesignResult:
         r"""Lower one generation input and run released RFdiffusion design into an ``RFdiffusionDesignResult``.
 
-        Lowers base/complex/inpaint/active-site/fold conditioning through the Processor -- honoring
-        the frozen §3.7.3 ``inpaint_sequence`` and the family-owned §3.7 ``length``
+        Lowers base, complex, inpaint, active-site, or fold conditioning through the Processor,
+        honoring ``inpaint_sequence`` and the RFdiffusion ``length``
         (``ContigMap.length``, combined generated length across inpaint chains, excluding receptor)
         -- then forwards every effective released sampling control to
         :meth:`RFdiffusionModel.design`. ``seed`` and ``generator`` are mutually exclusive and are
         the single caller-controlled run-level random stream for the ``num_candidates`` samples.
-        Each candidate owns the complete decoded backbone ``Structure`` of one generated design.
+        Each candidate contains the complete decoded backbone ``Structure`` of one generated design.
         """
 
         batch = self.processor(
             input,
+            placement=placement,
             templates=templates,
             conditions=conditions,
             inpaint_sequence=inpaint_sequence,

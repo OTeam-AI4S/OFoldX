@@ -1,15 +1,11 @@
-r"""
-Operator-backend resolution shared by the per-operator dispatchers.
+r"""Operator backend selection.
 
 ``operator_backend`` chooses which implementation an operator uses:
 
-- ``"oops"``      — the OOps fused CUDA kernels (fastest; requires CUDA).
+- ``"oops"``      — optional OOps implementation.
 - ``"sdpa"``      — ``torch.nn.functional.scaled_dot_product_attention`` (attention only).
-- ``"eager"``     — pure-PyTorch reference (always available).
-- ``"auto"``      — resolve at runtime to ``"oops"`` when available, else the best public backend.
-
-``"auto"`` is the default so an install without the (currently private) OOps package still runs on
-the public path, while an internal install with OOps + CUDA transparently gets the fast kernels.
+- ``"eager"``     — PyTorch implementation.
+- ``"auto"``      — OOps when available and suitable, otherwise the public default.
 """
 
 from __future__ import annotations
@@ -23,13 +19,9 @@ from ._oops import OOPS_AVAILABLE
 
 def oops_available() -> bool:
     r"""
-    Report whether the optional OOps adapter imported successfully.
+    Return whether OOps imported successfully.
 
-    Device eligibility belongs to each actual tensor call. This predicate reports only adapter
-    availability; runtime dispatch separately requires the participating tensors to be on CUDA.
-
-    Returns:
-        ``True`` when the OOps adapter imported successfully, else ``False``.
+    Runtime ``"auto"`` dispatch also considers the participating tensors.
 
     Examples:
         >>> from ofoldx.modules.backend.resolve import oops_available
@@ -42,11 +34,10 @@ def oops_available() -> bool:
 
 def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
     r"""
-    Resolve an ``operator_backend`` request to a concrete backend this operator supports.
+    Resolve a backend request without tensor-specific constraints.
 
     ``"auto"`` becomes ``"oops"`` when OOps is available and supported, otherwise ``public_default``.
-    An explicit value is validated against ``supported`` and returned unchanged. Explicit requests never
-    silently degrade to a different implementation.
+    Explicit values are validated and returned unchanged.
 
     Args:
         requested: The requested backend, ``"auto"`` or one of the known backend names.
@@ -79,11 +70,9 @@ def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], publ
 
 def resolve_config_operator_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
     r"""
-    Validate an operator-backend setting while preserving ``"auto"`` for runtime dispatch.
+    Validate a stored backend setting while preserving ``"auto"``.
 
-    Module constructors use this when they need to store the user's backend preference. Resolving
-    ``"auto"`` at construction time can be wrong because the module might later be called with CPU tensors
-    even on a CUDA-visible host. Runtime dispatchers should use [`resolve_tensor_operator_backend`][].
+    Runtime dispatchers resolve ``"auto"`` after tensors are available.
 
     Args:
         requested: The requested backend, ``"auto"`` or one of the known backend names.
@@ -112,17 +101,16 @@ def resolve_tensor_operator_backend(
     public_default: str,
 ) -> str:
     r"""
-    Resolve an operator backend for a specific call site with concrete tensors.
+    Resolve a backend for concrete tensors.
 
-    This is the runtime companion to [`resolve_operator_backend`][]. ``"auto"`` only selects the OOps
-    backend when OOps is available *and* every provided tensor is already on CUDA. Explicit requests keep
-    the stricter behavior: ``operator_backend="oops"`` still resolves to ``"oops"`` even for CPU tensors,
-    so the dispatcher can raise the usual device error.
+    ``"auto"`` selects OOps only when it is available, supported, and every provided
+    tensor is on CUDA. ``None`` values are ignored and at least one tensor is required.
+    Explicit requests are validated without device-based fallback.
 
     Args:
         requested: The requested backend, ``"auto"`` or one of the known backend names.
-        tensors: Tensors that must be CUDA-resident for the OOps implementation to run. ``None`` values
-            are ignored so optional masks can be passed directly.
+        tensors: Tensors considered by ``"auto"`` backend selection. ``None`` values are ignored so
+            optional masks can be passed directly.
         supported: The backends this particular operator implements, in preference order.
         public_default: The public backend to use when OOps is unavailable or unsuitable for the tensors.
 

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from importlib import import_module
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, Protocol, cast
 
+import chanfig
 from torch import nn
 
-_STANDARD_TASKS = frozenset({"fold", "design", "score", "pack"})
+StandardTask = Literal["fold", "design", "score", "pack"]
+_STANDARD_TASKS: frozenset[StandardTask] = frozenset({"fold", "design", "score", "pack"})
+
+
+class _ConfiguredModel(Protocol):
+    config_class: type[chanfig.Config]
 
 
 class ModelRegistration(NamedTuple):
@@ -17,8 +23,9 @@ class ModelRegistration(NamedTuple):
     id: str
     model: type[nn.Module]
     processor: type[Any]
-    model_config: type[Any]
-    standard_tasks: frozenset[Literal["fold", "design", "score", "pack"]]
+    processor_config: type[chanfig.Config] | None
+    model_config: type[chanfig.Config]
+    standard_tasks: frozenset[StandardTask]
 
 
 _BUILTIN_MODEL_MODULES = {
@@ -44,65 +51,47 @@ _BUILTIN_MODEL_MODULES = {
 }
 
 
-class ModelRegistry(dict):
+class ModelRegistry(chanfig.Registry):
     r"""Registry of Model/Processor architecture identities, keyed by architecture id.
 
-    ``MODELS.register(id, model=..., processor=..., standard_tasks=...)`` registers
-    one identity. Lookups resolve by id (:meth:`lookup`, lazy-importing the owner of
-    a built-in id), by exact Model config class (:meth:`for_config`), or by exact
-    ``(Model, Processor)`` class pair (:meth:`for_pair`); the config and pair indexes
-    keep those lookups exact rather than a linear scan.
+    ``MODELS.register_model(id, model=..., processor=..., processor_config=...,
+    standard_tasks=...)`` registers one identity. Lookups resolve by id
+    (:meth:`lookup_model`, lazy-importing the owner of a built-in id), by exact Model
+    config class (:meth:`for_config`), or by exact ``(Model, Processor)`` class pair
+    (:meth:`for_pair`); the config and pair indexes keep those lookups exact rather than
+    a linear scan.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.by_config: dict[type[Any], ModelRegistration] = {}
-        self.by_pair: dict[tuple[type[nn.Module], type[Any]], ModelRegistration] = {}
+    by_config: dict[type[chanfig.Config], ModelRegistration]
+    by_pair: dict[tuple[type[nn.Module], type[Any]], ModelRegistration]
 
-    def register(
+    def __init__(self) -> None:
+        super().__init__(case_sensitive=True)
+        self.setattr("separator", "\0")
+        self.setattr("by_config", {})
+        self.setattr("by_pair", {})
+
+    def register_model(
         self,
         id: str,
         *,
         model: type[nn.Module],
         processor: type[Any],
-        standard_tasks: Collection[Literal["fold", "design", "score", "pack"]] = (),
+        processor_config: type[chanfig.Config] | None,
+        standard_tasks: Collection[str] = (),
     ) -> None:
         r"""Register one Model/Processor pair."""
 
-        if not isinstance(id, str):
-            raise TypeError("model architecture id must be a string")
-        if not id:
-            raise ValueError("model architecture id must not be empty")
-        if not isinstance(model, type) or not issubclass(model, nn.Module):
-            raise TypeError("model must be a torch.nn.Module class")
-        if not isinstance(processor, type):
-            raise TypeError("processor must be a class")
+        self._import_builtin(id)
 
-        model_config = getattr(model, "config_class", None)
-        if not isinstance(model_config, type):
-            raise TypeError("model.config_class must be a class")
+        model_config = cast(_ConfiguredModel, model).config_class
 
         standard_task_values = frozenset(standard_tasks)
         unknown = standard_task_values - _STANDARD_TASKS
         if unknown:
             raise ValueError(f"unknown standard tasks: {unknown!r}")
+        validated_tasks = cast(frozenset[StandardTask], standard_task_values)
 
-        # Reserve every built-in architecture id for its owner module. Without this a pre-import
-        # MODELS.register("ofoldx.<builtin>", Fake) would win first-writer-wins and lookup would
-        # return the squatter before ever importing the official owner. A registration is the owner's
-        # only when the model class is defined inside the owner package (its __module__ is the owner
-        # module or a submodule of it); any other caller is rejected. New third-party ids are unaffected.
-        owner_module = _BUILTIN_MODEL_MODULES.get(id)
-        if owner_module is not None:
-            origin = getattr(model, "__module__", "") or ""
-            if origin != owner_module and not origin.startswith(f"{owner_module}."):
-                raise ValueError(
-                    f"model architecture {id!r} is a reserved built-in id owned by {owner_module!r}; "
-                    "third-party models must register under a new id"
-                )
-
-        if id in self:
-            raise ValueError(f"model architecture {id!r} is already registered")
         pair = (model, processor)
         if pair in self.by_pair:
             raise ValueError("Model/Processor pair is already registered")
@@ -114,38 +103,34 @@ class ModelRegistry(dict):
             id=id,
             model=model,
             processor=processor,
+            processor_config=processor_config,
             model_config=model_config,
-            standard_tasks=standard_task_values,
+            standard_tasks=validated_tasks,
         )
-        self[id] = registration
+        super().register(registration, id)
         self.by_pair[pair] = registration
         self.by_config.setdefault(model_config, registration)
 
-    def lookup(self, id: str) -> ModelRegistration:
+    def _import_builtin(self, id: str) -> None:
+        module = _BUILTIN_MODEL_MODULES.get(id)
+        if module is not None and id not in self:
+            import_module(module)
+
+    def lookup_model(self, id: str) -> ModelRegistration:
         r"""Resolve one registered model identity, importing a built-in owner on demand."""
 
-        if id not in self and id in _BUILTIN_MODEL_MODULES:
-            import_module(_BUILTIN_MODEL_MODULES[id])
-        try:
-            return self[id]
-        except KeyError:
-            raise ValueError(f"unknown model architecture: {id!r}") from None
+        self._import_builtin(id)
+        return cast(ModelRegistration, super().lookup(id))
 
     def for_config(self, config: object) -> ModelRegistration:
         r"""Return the registration selected by an exact Model config class."""
 
-        try:
-            return self.by_config[type(config)]
-        except KeyError:
-            raise ValueError(f"unregistered Model config class: {type(config).__name__}") from None
+        return self.by_config[type(config)]
 
     def for_pair(self, model: object, processor: object) -> ModelRegistration:
         r"""Return the registration for an exact Model/Processor class pair."""
 
-        try:
-            return self.by_pair[type(model), type(processor)]
-        except KeyError:
-            raise ValueError("model and processor are not one registered architecture pair") from None
+        return self.by_pair[type(model), type(processor)]
 
 
 MODELS = ModelRegistry()

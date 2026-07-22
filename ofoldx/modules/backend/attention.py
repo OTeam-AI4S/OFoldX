@@ -1,8 +1,8 @@
 r"""
 Backend dispatch for gated multi-head (pair-bias) attention.
 
-The dispatch owns both implementations' calling conventions in one place: OOps fused pair-bias
-kernels (with an optional gated fast path) and the public PyTorch references.
+The dispatch owns both implementations' calling conventions in one place: OOps-owned pair-bias
+implementations (including its gated callable) and the public PyTorch references.
 [`GatedMultiheadAttention`][] stays backend-agnostic — it owns the q/k/v projection and passes it in.
 """
 
@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_gated_pair_bias_attention = oops_kernel("gated_pair_bias_attention")
@@ -40,9 +40,9 @@ def gated_multihead_attention(
     r"""
     Project q/k/v via ``projection``, run attention on ``operator_backend``, and merge heads.
 
-    Dispatches the attention math to the OOps fused pair-bias kernels (with a gated fast path when
-    ``projection.gating``) or a pure-PyTorch reference. ``biases`` are summed into a single additive pair bias and
-    ``attention_mask`` becomes a large-negative additive mask; both are broadcast to the attention shape.
+    Dispatches the attention math to OOps-owned pair-bias dispatch (using its gated callable when the
+    projection contract permits) or a pure-PyTorch reference. ``biases`` are summed into a single additive pair
+    bias and ``attention_mask`` becomes a large-negative additive mask; both are broadcast to the attention shape.
 
     Args:
         query: ``(..., q_tokens, query_size)`` query input.
@@ -58,8 +58,6 @@ def gated_multihead_attention(
     Returns:
         ``(..., q_tokens, hidden_size)`` attention output with heads merged.
 
-    Raises:
-        OOpsUnsupportedError: If ``operator_backend`` is ``"oops"`` on non-CUDA tensors.
     Examples:
         >>> import torch  # doctest: +SKIP
         >>> from ofoldx.modules.attention.multihead import MultiheadAttentionProjection
@@ -98,10 +96,6 @@ def gated_multihead_attention(
             attention_mask=attention_mask,
         )
     elif operator_backend == "oops":
-        if not query_projection.is_cuda:
-            raise OOpsUnsupportedError(
-                "GatedMultiheadAttention backend 'oops' requires CUDA tensors; use operator_backend='sdpa'"
-            )
         can_use_fused_gated_output = (
             projection.gating and projection.output_projection.bias is None and projection.gate_projection.bias is None
         )
@@ -143,6 +137,60 @@ def gated_multihead_attention(
     return projection.merge(output, query)
 
 
+def projected_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    attention_mask: Tensor | None,
+    operator_backend: str,
+    torch_backend: Literal["sdpa", "eager"],
+    scale: float | None = None,
+) -> Tensor:
+    r"""Run attention over already-projected head-major q/k/v tensors.
+
+    This is the projection-free companion to :func:`gated_multihead_attention` for
+    architectures that own nonstandard q/k/v preparation such as QK normalization or
+    rotary embeddings. The backend contract and ``auto`` semantics remain centralized
+    here instead of being reimplemented by each Model.
+    """
+
+    if torch_backend not in {"sdpa", "eager"}:
+        raise ValueError(f"unsupported torch_backend {torch_backend!r}; expected 'eager' or 'sdpa'")
+    resolved = resolve_tensor_operator_backend(
+        operator_backend,
+        tensors=(query, key, value, attention_mask),
+        supported=("oops", "sdpa", "eager"),
+        public_default=torch_backend,
+    )
+    if resolved == "eager":
+        return _eager_attention(
+            query,
+            key,
+            value,
+            biases=None,
+            attention_mask=attention_mask,
+            scale=scale,
+        )
+    if resolved == "oops":
+        return _oops_attention(
+            query,
+            key,
+            value,
+            biases=None,
+            attention_mask=attention_mask,
+            scale=scale,
+        )
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        scale=scale,
+    )
+
+
 def triangle_attention(
     pair: Tensor,
     triangle_bias: Tensor,
@@ -158,7 +206,7 @@ def triangle_attention(
     Projects the (already layer-normed) ``pair`` into per-row attention heads and attends along the
     key/column axis with the pre-computed per-head ``triangle_bias``. When the resolved backend is
     ``oops`` and the projection is bias-free (the AlphaFold 3 / Boltz / Protenix / ODesign lineage),
-    the dedicated flash ``triangle_attention`` kernel is used, which consumes the ``(..., rows, cols,
+    the dedicated OOps-owned ``triangle_attention`` implementation is used, which consumes the ``(..., rows, cols,
     heads, head_dim)`` q/k/v layout and the row-broadcast ``(..., rows|1, heads, cols, cols)`` bias
     directly instead of flattening the row axis into a generic pair-bias attention. Every other backend
     (``sdpa``/``eager``, or ``oops`` with a biased AlphaFold 2 projection) folds the key mask into an
@@ -185,7 +233,6 @@ def triangle_attention(
     )
     can_flash = (
         resolved == "oops"
-        and pair.is_cuda
         and projection.gating
         and projection.output_projection.bias is None
         and projection.gate_projection.bias is None
@@ -218,13 +265,13 @@ def _oops_triangle_flash(
     projection: MultiheadAttentionProjection,
 ) -> Tensor:
     r"""
-    Run the fused OOps flash ``triangle_attention`` kernel and apply the sigmoid output gate.
+    Run the OOps-owned ``triangle_attention`` implementation and apply the sigmoid output gate.
 
-    The flash kernel keeps the row axis batched: q/k/v stay in ``(..., rows, cols, heads, head_dim)``
-    layout (the natural projection output, no head-front transpose), the mask is the boolean
+    The OOps callable accepts q/k/v in ``(..., rows, cols, heads, head_dim)`` layout (the natural
+    projection output, no head-front transpose), the mask is the boolean
     ``(..., rows, cols)`` keep-mask, and the bias is the row-broadcast ``(..., rows|1, heads, cols,
-    cols)`` tensor. The ``1/sqrt(head_dim)`` scaling is folded into the kernel, so the projections are
-    left unscaled; the gate and output projection are then applied by ``projection.merge``.
+    cols)`` tensor. The ``1/sqrt(head_dim)`` scaling is passed directly to OOps dispatch, so the
+    projections are left unscaled; the gate and output projection are then applied by ``projection.merge``.
     """
 
     heads = projection.num_attention_heads
@@ -252,6 +299,7 @@ def _eager_attention(
     biases: Sequence[Tensor] | None,
     attention_mask: Tensor | None,
     inf: float = 1e6,
+    scale: float | None = None,
 ) -> Tensor:
     r"""
     Pure PyTorch attention path matching Boltz's reference ``AttentionPairBias`` numerics.
@@ -262,8 +310,9 @@ def _eager_attention(
     """
 
     head_dim = query_projection.shape[-1]
+    scale = head_dim**-0.5 if scale is None else scale
     logits = torch.einsum("...hid,...hjd->...hij", query_projection.float(), key_projection.float())
-    logits = logits / (head_dim**0.5)
+    logits = logits * scale
     if biases is not None:
         for bias in biases:
             if bias.dim() == logits.dim() - 1:
@@ -289,13 +338,13 @@ def _oops_attention_pair_bias(
     projection: MultiheadAttentionProjection,
 ) -> Tensor | None:
     r"""
-    Run the fused OOps gated pair-bias attention fast path.
+    Run the OOps-owned gated pair-bias attention implementation.
 
-    Flattens the leading batch dims, builds the summed pair bias and mask, and delegates to the fused
-    gated kernel that fuses the sigmoid output gate and output projection.
+    Flattens the leading batch dims, builds the summed pair bias and mask, and delegates gate and output
+    composition to OOps dispatch.
 
     Args:
-        query: ``(..., q_tokens, query_size)`` gating input passed to the fused kernel.
+        query: ``(..., q_tokens, query_size)`` gating input passed to the OOps callable.
         query_projection, key_projection, value_projection: Head-split q/k/v of shape
             ``(..., heads, tokens, head_dim)``.
         biases: Optional additive pair biases.
@@ -304,7 +353,7 @@ def _oops_attention_pair_bias(
 
     Returns:
         ``(..., q_tokens, hidden_size)`` output, or ``None`` when there is no pair bias to feed the
-        fused kernel (the caller then falls back to the ungated OOps path).
+        gated OOps callable (the caller then falls back to the ungated OOps path).
     """
     prefix_shape = query_projection.shape[:-3]
     num_heads, query_length, head_dim = query_projection.shape[-3:]
@@ -353,12 +402,13 @@ def _oops_attention(
     *,
     biases: Sequence[Tensor] | None,
     attention_mask: Tensor | None,
+    scale: float | None = 1.0,
 ) -> Tensor:
     r"""
     Run the ungated OOps pair-bias attention path.
 
-    Flattens the leading batch dims, builds the summed pair bias and mask, calls the fused pair-bias
-    kernel, and restores the original prefix shape.
+    Flattens the leading batch dims, builds the summed pair bias and mask, calls the OOps-owned pair-bias
+    implementation, and restores the original prefix shape.
 
     Args:
         query_projection, key_projection, value_projection: Head-split q/k/v of shape
@@ -392,7 +442,7 @@ def _oops_attention(
         query_length=query_length,
         key_length=key_length,
     )
-    output = _oops_pair_bias_attention(query_flat, key_flat, value_flat, mask=mask, pair_bias=pair_bias, scale=1.0)
+    output = _oops_pair_bias_attention(query_flat, key_flat, value_flat, mask=mask, pair_bias=pair_bias, scale=scale)
     return cast(Tensor, output).reshape(*prefix_shape, num_heads, query_length, head_dim)
 
 
@@ -407,7 +457,7 @@ def _oops_pair_bias(
     dtype: torch.dtype,
 ) -> Tensor | None:
     r"""
-    Broadcast and sum the pair biases into the flat ``(flat_prefix, heads, q, k)`` bias the kernel wants.
+    Broadcast and sum the pair biases into the flat ``(flat_prefix, heads, q, k)`` bias consumed by OOps.
 
     Args:
         biases: Optional additive pair biases; ``None``/empty yields ``None``.
@@ -440,10 +490,10 @@ def _oops_attention_mask(
     key_length: int,
 ) -> Tensor | None:
     r"""
-    Broadcast the attention mask to the flat boolean mask the OOps kernel expects.
+    Broadcast the attention mask to the flat boolean mask consumed by the OOps callable.
 
-    Accepts a per-query-key mask ``(..., q, k)`` or a key-only mask ``(..., k)`` and flattens the leading
-    batch dims accordingly.
+    Accepts a per-query-key mask ``(..., q, k)``, its SDPA-style singleton-head form
+    ``(..., 1, q, k)``, or a key-only mask ``(..., k)`` and flattens the leading batch dims accordingly.
 
     Args:
         attention_mask: Optional boolean mask; ``None`` yields ``None``.
@@ -460,6 +510,10 @@ def _oops_attention_mask(
     if attention_mask is None:
         return None
     attention_mask = attention_mask.bool()
+    if attention_mask.dim() == len(prefix_shape) + 3 and attention_mask.shape[-3] == 1:
+        attention_mask = attention_mask.squeeze(-3)
+    if attention_mask.shape[-2:] == (1, key_length):
+        attention_mask = attention_mask.squeeze(-2)
     if attention_mask.shape[-2:] == (query_length, key_length):
         target_shape = (*prefix_shape, query_length, key_length)
         return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=2).reshape(

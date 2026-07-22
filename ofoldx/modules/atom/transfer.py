@@ -205,7 +205,8 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
     [`TokenPairToAtomPairBroadcast`][ofoldx.modules.atom.transfer.TokenPairToAtomPairBroadcast]:
     instead of the dense ``N_atom x N_atom`` grid it emits, per query window, only the token pairs
     the local attention actually reads, keeping memory linear in the atom count. When every batch
-    element shares one ``atom_to_token`` map it dispatches a fused gather kernel.
+    element shares one ``atom_to_token`` map, OOps dispatch may select its Triton gather when supported;
+    distinct per-example maps are handled by the same backend API.
 
     Args:
         num_query_atoms: Number of query atoms per local window.
@@ -237,7 +238,7 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
             token_pair: ``[..., N_token, N_token, C]`` token-pair features.
             atom_to_token: ``[..., N_atom]`` token index for each atom.
             num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window so the
-                pair-bias windows line up with the attention key gather. Unset keeps the legacy padded window.
+                pair-bias windows line up with the attention key gather. Unset keeps the fixed padded window.
 
         Returns:
             ``[..., N_window, num_query_atoms, num_key_atoms, C]`` local atom-pair features.
@@ -253,42 +254,14 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
         """
 
         atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_pair.shape[:-3]))
-        shared_atom_to_token = _shared_atom_to_token(atom_to_token)
-        if shared_atom_to_token is not None:
-            return dispatch_token_pair_to_atom_window_gather(
-                token_pair,
-                shared_atom_to_token,
-                n_queries=self.windowing.num_query_atoms,
-                n_keys=self.windowing.num_key_atoms,
-                operator_backend=self.operator_backend,
-                num_valid_atoms=num_valid_atoms,
-            )
-
-        token_windows = self.windowing(atom_to_token.unsqueeze(-1), num_valid_atoms)
-        query_token_index = token_windows.query.squeeze(-1)
-        key_token_index = token_windows.key.squeeze(-1)
-
-        channels = token_pair.shape[-1]
-        prefix = tuple(token_pair.shape[:-3])
-        num_tokens = token_pair.shape[-3]
-        flat_token_pair = token_pair.reshape(-1, num_tokens, num_tokens, channels)
-        flat_query_token_index = query_token_index.reshape(flat_token_pair.shape[0], *query_token_index.shape[-2:])
-        flat_key_token_index = key_token_index.reshape(flat_token_pair.shape[0], *key_token_index.shape[-2:])
-        batch_index = torch.arange(flat_token_pair.shape[0], device=token_pair.device).view(-1, 1, 1, 1)
-        row_index = flat_query_token_index.unsqueeze(-1).expand(
-            -1,
-            -1,
-            -1,
-            flat_key_token_index.shape[-1],
+        return dispatch_token_pair_to_atom_window_gather(
+            token_pair,
+            atom_to_token,
+            n_queries=self.windowing.num_query_atoms,
+            n_keys=self.windowing.num_key_atoms,
+            operator_backend=self.operator_backend,
+            num_valid_atoms=num_valid_atoms,
         )
-        col_index = flat_key_token_index.unsqueeze(-2).expand(
-            -1,
-            -1,
-            flat_query_token_index.shape[-1],
-            -1,
-        )
-        atom_pair = flat_token_pair[batch_index, row_index, col_index]
-        return atom_pair.reshape(*prefix, *query_token_index.shape[-2:], key_token_index.shape[-1], channels)
 
 
 def _expand_atom_axis(tensor: Tensor, target_prefix: tuple[int, ...]) -> Tensor:
@@ -312,28 +285,3 @@ def _expand_atom_axis(tensor: Tensor, target_prefix: tuple[int, ...]) -> Tensor:
         view_shape = (*source_prefix, *((1,) * (len(target_prefix) - len(source_prefix))), num_atoms)
         tensor = tensor.reshape(view_shape)
     return torch.broadcast_to(tensor, target_shape)
-
-
-def _shared_atom_to_token(atom_to_token: Tensor) -> Tensor | None:
-    r"""
-    Return the single shared atom->token map when every batch element uses the same one.
-
-    A shared map lets the caller take the fused single-map gather path instead of per-element
-    indexing. On CUDA the equality check is skipped (only the trivial batch-of-one case qualifies)
-    to avoid a device sync.
-
-    Args:
-        atom_to_token: ``[..., N_atom]`` token index for each atom.
-
-    Returns:
-        The shared ``[N_atom]`` map, or ``None`` when the batch elements differ.
-    """
-    if atom_to_token.dim() == 1:
-        return atom_to_token
-    flat_atom_to_token = atom_to_token.reshape(-1, atom_to_token.shape[-1])
-    first = flat_atom_to_token[0]
-    if flat_atom_to_token.shape[0] == 1:
-        return first
-    if not atom_to_token.is_cuda and torch.equal(flat_atom_to_token, first.expand_as(flat_atom_to_token)):
-        return first
-    return None

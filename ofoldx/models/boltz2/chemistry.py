@@ -7,8 +7,6 @@ from ...data.molecular import Molecule
 
 def standardize_boltz2_affinity_smiles(
     smiles: str,
-    *,
-    entity_id: str,
 ) -> Molecule:
     r"""Return the ChEMBL-standardized Boltz-2 affinity ligand graph.
 

@@ -14,6 +14,7 @@ from .attention.multihead import GatedMultiheadAttention
 from .transition import ConditionedTransition
 
 TransitionKind = Literal["double", "triple"]
+CrossAttentionKeySource = Literal["raw", "normalized"]
 
 
 class ConditionedTransformer(nn.Module):
@@ -56,6 +57,7 @@ class ConditionedTransformer(nn.Module):
         conditioning_size: int | None = None,
         operator_backend: str = "auto",
         cross_attention_mode: bool = False,
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
         transition: TransitionKind = "triple",
     ) -> None:
         super().__init__()
@@ -67,6 +69,7 @@ class ConditionedTransformer(nn.Module):
                 num_attention_heads,
                 operator_backend,
                 cross_attention_mode=cross_attention_mode,
+                cross_attention_key_source=cross_attention_key_source,
                 transition=transition,
             )
             for _ in range(num_blocks)
@@ -126,11 +129,9 @@ class ConditionedTransformerLayer(nn.Module):
     The pair bias is supplied precomputed, already projected to per-head logits. ``to_keys``
     selects the windowed key set for local atom attention; when ``None`` the layer self-attends
     over the full token/atom axis. ``cross_attention_mode`` adds a second adaptive norm on the
-    key/value path; that norm consumes the *raw* hidden (DeepMind AF3 ``cross_attention``, which
-    adaLN-norms queries and keys independently from the raw activation) -- the canonical behavior.
-    Families whose upstream stacks a second adaLN on the already query-normed activation override
-    [`_cross_attention_key_source`][ofoldx.modules.transformer.ConditionedTransformerLayer._cross_attention_key_source]
-    in a subclass rather than flipping a flag here. ``transition`` selects either the triple-product
+    key/value path. ``cross_attention_key_source`` selects whether that norm consumes the raw hidden
+    (DeepMind AF3) or the already query-normalized activation (Protenix and descendants). ``transition``
+    selects either the triple-product
     [ConditionedTransitionBlock][ofoldx.modules.transformer.ConditionedTransitionBlock] or the
     double-product [ConditionedTransition][ofoldx.modules.transition.ConditionedTransition].
 
@@ -163,13 +164,15 @@ class ConditionedTransformerLayer(nn.Module):
         num_attention_heads: int,
         operator_backend: str = "auto",
         cross_attention_mode: bool = False,
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
         transition: TransitionKind = "triple",
     ) -> None:
         super().__init__()
         self.cross_attention_mode = cross_attention_mode
+        self.cross_attention_key_source = cross_attention_key_source
         self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         if cross_attention_mode:
-            # A second adaptive norm on the key/value path (see ``_cross_attention_key_source``).
+            # A second adaptive norm on the key/value path.
             self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
         self.attention = GatedMultiheadAttention(
             hidden_size,
@@ -186,23 +189,6 @@ class ConditionedTransformerLayer(nn.Module):
         else:
             raise ValueError(f"unknown transition: {transition!r} (expected 'triple' or 'double')")
         self.sigmoid = nn.Sigmoid()
-
-    def _cross_attention_key_source(self, hidden: Tensor, normalized: Tensor) -> Tensor:
-        r"""
-        Select what the key/value adaptive norm consumes in ``cross_attention_mode``.
-
-        The canonical (DeepMind AF3 ``cross_attention``) convention norms the *raw* hidden, so queries
-        and keys each adaLN the raw activation independently. Subclasses whose upstream stacks a second
-        adaLN on the already query-normed activation override this to return ``normalized`` instead.
-
-        Args:
-            hidden: `[..., q, hidden_size]` raw query-side activations (pre-norm).
-            normalized: `[..., q, hidden_size]` the query-side conditioned-normed activation.
-
-        Returns:
-            The activation the key/value adaptive norm should consume; the raw ``hidden`` by default.
-        """
-        return hidden
 
     def forward(
         self,
@@ -246,10 +232,9 @@ class ConditionedTransformerLayer(nn.Module):
         # Cross-attention adaptive-norms the key/value path independently. The canonical convention
         # (DeepMind AF3 ``cross_attention``) norms the *raw* hidden -- ``x_q = adaLN(act, cond_q)``,
         # ``x_k = adaLN(gather(act), cond_k)`` -- so the key path is a norm of the raw hidden, chosen by
-        # ``_cross_attention_key_source``. Applying the norm per-atom before ``to_keys`` gathers each key
-        # its own conditioning.
+        # Applying the norm per atom before ``to_keys`` gathers each key with its own conditioning.
         if self.cross_attention_mode:
-            key_source = self._cross_attention_key_source(hidden, normalized)
+            key_source = normalized if self.cross_attention_key_source == "normalized" else hidden
             key_base = self.key_value_norm(key_source, conditioning)
         else:
             key_base = normalized
@@ -276,24 +261,6 @@ class ConditionedTransformerLayer(nn.Module):
         gate = self.sigmoid(self.output_gate_projection(conditioning))
         hidden = hidden + gate * attention
         return hidden + self.transition(hidden, conditioning)
-
-
-class ProtenixConditionedTransformerLayer(ConditionedTransformerLayer):
-    r"""
-    Protenix-lineage cross-attention layer: the key/value adaptive norm double-norms.
-
-    Protenix ``AttentionPairBias`` (``cross_attention_mode`` + ``has_s``) stacks a *second* adaptive
-    LN on the *already query-normed* activation for the key/value path, rather than the AF3 canonical
-    norm-on-raw-hidden. This overrides only that key-source selection; everything else -- the query
-    norm, gated attention, transition, and the key/value ``AdaptiveLayerNorm`` module itself --
-    inherits unchanged from [`ConditionedTransformerLayer`][ofoldx.modules.transformer.ConditionedTransformerLayer].
-    The whole Protenix lineage (protenix/odesign/pxdesign) shares this convention, so odesign and
-    pxdesign import and reuse this class for their atom cross-attention instead of duplicating it.
-    """
-
-    def _cross_attention_key_source(self, hidden: Tensor, normalized: Tensor) -> Tensor:
-        r"""Norm the already query-normed activation (Protenix double-adaLN), not the raw hidden."""
-        return normalized
 
 
 class ConditionedTransitionBlock(nn.Module):

@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_outer_product_mean = oops_kernel("outer_product_mean")
@@ -48,8 +48,7 @@ def outer_product_mean(
         proj_out_weight, proj_out_bias: Output projection (affine).
         proj_left_bias, proj_right_bias: Optional left/right projection biases; ``None`` keeps the
             projections bias-free (the AF3-lineage path). The AlphaFold 2 outer-product mean supplies
-            both. The fused ``oops`` kernel has no bias support, so a non-``None`` bias forces the
-            ``eager`` path.
+            both.
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
@@ -57,9 +56,6 @@ def outer_product_mean(
 
     Returns:
         ``(B, N, N, pair_size)`` pair update, where ``pair_size`` is the row count of ``proj_out_weight``.
-
-    Raises:
-        OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA tensors.
 
     Examples:
         >>> import torch
@@ -90,16 +86,7 @@ def outer_product_mean(
         supported=_SUPPORTED,
         public_default="eager",
     )
-    has_projection_bias = proj_left_bias is not None or proj_right_bias is not None
-    if backend == "oops" and not has_projection_bias:
-        if not msa.is_cuda:
-            raise OOpsUnsupportedError(
-                "OuterProductMean backend 'oops' requires CUDA tensors; use operator_backend='eager'"
-            )
-        if msa_mask is not None and not msa_mask.is_cuda:
-            raise OOpsUnsupportedError(
-                "OuterProductMean backend 'oops' requires a CUDA msa_mask; use operator_backend='eager'"
-            )
+    if backend == "oops":
         return _oops_outer_product_mean(
             msa,
             msa_mask,
@@ -108,6 +95,8 @@ def outer_product_mean(
             proj_left_weight=proj_left_weight,
             proj_right_weight=proj_right_weight,
             proj_out_weight=proj_out_weight,
+            proj_left_bias=proj_left_bias,
+            proj_right_bias=proj_right_bias,
             proj_out_bias=proj_out_bias,
             eps=norm_eps,
             denom_eps=denom_eps,

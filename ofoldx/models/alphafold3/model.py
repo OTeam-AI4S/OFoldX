@@ -19,25 +19,31 @@ from torch import Tensor, nn
 from typing_extensions import Self
 
 from ...data.molecular import (
-    HYDROGEN_ELEMENTS,
     AtomSite,
     ComponentReference,
     MolecularSystem,
-    Molecule,
     PolymerSequence,
+    restype_3to1,
 )
 from ...data.structure import Structure
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
+    AtomToTokenEncoderBase,
     LocalAtomGeometry,
+    LocalAtomWindowing,
     TokenPairToLocalAtomPairBroadcast,
     TokenToAtomBroadcast,
 )
 from ...modules.attention import GatedMultiheadAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
-from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler, EdmScheduler
+from ...modules.diffusion import (
+    CoordinateDenoiseContext,
+    CoordinateDenoisingInput,
+    CoordinateEdmSampler,
+    EdmScheduler,
+)
 from ...modules.embedding import (
     RelativePositionBuckets,
     RelativePositionEmbedder,
@@ -46,7 +52,7 @@ from ...modules.embedding import (
     generate_relative_position_features,
 )
 from ...modules.functional import pair_mask_from_token_mask
-from ...modules.head import ConfidenceHead, DistogramHead, tm_bin_weights
+from ...modules.head import ConfidenceHead, DistogramHead, expected_plddt, tm_bin_weights
 from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
@@ -92,6 +98,7 @@ class AlphaFold3Model(nn.Module):
             single_size=config.single_size,
             pair_size=config.pair_size,
             dropout=config.trunk.pairformer_dropout,
+            ending_node_transpose_bias=True,
         )
         self.coordinate_denoiser = CoordinateDenoiser(
             num_encoder_blocks=config.denoiser.num_token_encoder_blocks,
@@ -147,6 +154,7 @@ class AlphaFold3Model(nn.Module):
             num_triangle_attention_heads=config.confidence.num_triangle_attention_heads,
             expansion=config.confidence.expansion,
             dropout=config.confidence.pairformer_dropout,
+            ending_node_transpose_bias=True,
             single_max_abs=config.confidence.single_max_abs,
             # AlphaFold 3 confidence flags: no extra single LayerNorm, no raw-distance projection channel,
             # and PDE symmetrizes the projected LOGITS (DeepMind ``left + swapaxes(left, -2, -3)``). The
@@ -161,6 +169,7 @@ class AlphaFold3Model(nn.Module):
             token_feature_size=config.token_feature_size,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
+            ending_node_transpose_bias=True,
         )
         self.template_embedder = TemplateEmbedder(
             pair_size=config.pair_size,
@@ -172,28 +181,18 @@ class AlphaFold3Model(nn.Module):
             num_triangle_attention_heads=config.template.num_triangle_attention_heads,
             expansion=config.template.expansion,
             dropout=config.template.dropout,
+            ending_node_transpose_bias=True,
         )
         self.reset_parameters()
-        # DeepMind AlphaFold 3's ending-node triangle self-attention (``GridSelfAttention`` with
-        # ``transpose=True``) computes its pair bias from the pre-transpose pair. The shared ending-node
-        # module derives it from the transposed pair by default (OpenFold convention); flip every AF3
-        # ending node onto the AlphaFold 3 convention so the bias orientation matches the checkpoint.
-        for module in self.modules():
-            ending_node = getattr(module, "triangle_attention_ending_node", None)
-            if ending_node is not None:
-                ending_node.transpose_bias = True
-        # AF3 uses the canonical base ``ConditionedTransformerLayer`` for atom cross-attention: its
-        # key/value adaptive norm consumes the raw hidden (DeepMind AF3 ``cross_attention`` adaptive-norms
-        # queries and keys independently from the raw activation), so no per-family re-casting is needed.
+        # Atom cross-attention adaptively normalizes queries and keys from the raw hidden state.
         self.set_backend("auto")
 
     def reset_parameters(self) -> None:
         r"""
         Zero-initialize the recycling and PAE/PDE projection weights after construction.
 
-        The recycling projections and the PAE/PDE output projections start at zero so the first
-        recycling pass and the untrained confidence head contribute nothing, matching the upstream
-        AlphaFold 3 initialization.
+        The recycling and PAE/PDE output projections start at zero, so the first
+        recycling pass and an untrained confidence head contribute nothing.
 
         Examples:
             >>> from ofoldx.models.alphafold3 import AlphaFold3Config, AlphaFold3Model  # doctest: +SKIP
@@ -218,6 +217,7 @@ class AlphaFold3Model(nn.Module):
                 module,
                 (
                     AdaptiveLayerNorm,
+                    AtomToTokenEncoderBase,
                     GatedMultiheadAttention,
                     MsaPairWeightedAveraging,
                     OuterProductMean,
@@ -232,7 +232,7 @@ class AlphaFold3Model(nn.Module):
 
     def forward(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
@@ -243,69 +243,60 @@ class AlphaFold3Model(nn.Module):
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
-        representations = self._run_trunk(input, recycling_steps=recycling_steps)
-        coordinates = self.coordinate_denoiser(
-            self._denoise_context(input, representations).to_denoising_input(
+        representations = self._run_trunk(features, recycling_steps=recycling_steps)
+        coordinates = self._denoise(
+            self._denoise_context(features, representations).to_denoising_input(
                 noisy_coords=noisy_coordinates,
                 noise_level=noise_level,
             )
         )
-        return self._assemble_output(input, representations, coordinates)
+        return self._assemble_output(features, representations, coordinates)
 
     @torch.inference_mode()
     def _sample(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         recycling_steps: int | None = None,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> AlphaFold3Output:
-        r"""Run the released sampler for a future canonical fold implementation."""
+        r"""Run coordinate sampling and confidence heads."""
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
-        representations = self._run_trunk(input, recycling_steps=recycling_steps)
+        representations = self._run_trunk(features, recycling_steps=recycling_steps)
         pred_coords = self.coordinate_sampler(
-            self.coordinate_denoiser,
-            context=self._denoise_context(input, representations),
+            self._denoise,
+            context=self._denoise_context(features, representations),
             num_samples=num_samples,
             num_sampling_steps=self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps,
             generator=generator,
         )
-        return self._assemble_output(input, representations, pred_coords)
+        return self._assemble_output(features, representations, pred_coords)
 
     @torch.inference_mode()
     def fold(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> AlphaFold3FoldResult:
-        r"""Run released AlphaFold 3 folding and decode a seed-group-preserving result.
+        r"""Run AlphaFold 3 folding and preserve the diffusion seed group.
 
-        The released pipeline runs ``S`` seeds; each seed shares one trunk pass and draws
-        ``num_samples`` diffusion rollouts, and the ``S x num_samples`` samples are pooled and
-        ranked by ``ranking_score`` (upstream ``model.py:487-528``). This reproduces one seed
-        group: a shared trunk pass with ``num_samples`` diffusion rollouts driven off the injected
-        ``generator``, preserved intact in the family-owned
-        :class:`~ofoldx.models.alphafold3.model.AlphaFold3FoldResult` (frozen DESIGN 5.2 forbids
-        flattening the seed groups into the shared ``FoldResult``); ranking across the pool is the
-        result's ``best()``.
+        One trunk pass is shared by ``num_samples`` diffusion rollouts. The returned
+        :class:`AlphaFold3FoldResult` preserves that group, while :meth:`best`
+        ranks predictions across all groups.
 
-        Per OWNER principle P1 the model graph is a pure function of ``(tensors, generator)``: this
-        method accepts an already-resolved :class:`torch.Generator` (or ``None`` for the ambient
-        RNG) and never resolves an integer seed or creates a generator. The ``seed``/``generator``
-        resolution lives once at the pipeline boundary in
-        :func:`~ofoldx.pipelines.resolve_generator`.
+        ``generator`` drives the rollouts; ``None`` uses the ambient PyTorch RNG.
 
         Args:
-            input: A Processor-built input carrying ``system``, ``atom_sites``, and ``token_sites``.
+            features: A Processor-built input carrying ``system``, ``atom_sites``, and ``token_sites``.
             num_samples: Diffusion rollouts drawn for the seed group (default 5).
             generator: The already-resolved RNG driving the diffusion rollouts; ``None`` uses the
                 ambient RNG.
@@ -313,7 +304,7 @@ class AlphaFold3Model(nn.Module):
             num_sampling_steps: Diffusion sampling steps; defaults to the config value.
 
         Returns:
-            The family-owned result with a single seed group.
+            A result containing one seed group.
         """
 
         num_samples = 5 if num_samples is None else num_samples
@@ -325,56 +316,53 @@ class AlphaFold3Model(nn.Module):
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
-        if input.system is None or not input.atom_sites or not input.token_sites:
+        if features.system is None or not features.atom_sites or not features.token_sites:
             raise ValueError(
                 "fold requires a Processor-built input carrying system, atom_sites, and token_sites; "
                 "bare-tensor inputs can only drive forward/_sample"
             )
 
         group = self._decode_seed_group(
-            input,
+            features,
             num_samples=num_samples,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
-            seed=0,
+            seed=None,
         )
         return AlphaFold3FoldResult(seed_groups=(group,))
 
     def _decode_seed_group(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         num_samples: int,
         recycling_steps: int,
         num_sampling_steps: int,
         generator: torch.Generator | None,
-        seed: int,
+        seed: int | None,
     ) -> AlphaFold3SeedGroup:
         r"""Sample one seed's diffusion rollouts and decode them into one seed group.
 
-        Shares one trunk pass across ``num_samples`` rollouts (upstream ``model.py:320-366``),
-        decodes each sample's :class:`~ofoldx.data.structure.Structure`, and finalizes the full
-        released confidence surface: the pTM / ipTM / ptm_iptm_average tensor summary plus the
-        chain-pair / per-chain PAE and PDE aggregates (family-owned NumPy mirroring upstream
-        ``confidences.py``) and the disorder / clash ranking terms
-        (:mod:`~ofoldx.models.alphafold3.model`).
+        Shares one trunk pass across ``num_samples`` rollouts, decodes each sample's
+        :class:`~ofoldx.data.structure.Structure`, and computes pTM, ipTM, PAE/PDE
+        aggregates, disorder, clashes, and ranking scores.
         """
 
         output = self._sample(
-            input,
+            features,
             recycling_steps=recycling_steps,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
         )
 
-        assert input.system is not None
-        atom_count = len(input.atom_sites)
-        token_count = len(input.token_sites)
-        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element != "H"]
+        assert features.system is not None
+        atom_count = len(features.atom_sites)
+        token_count = len(features.token_sites)
+        complete_sites = [site for site, atom in features.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray([complete_index[site] for site in input.atom_sites], dtype=np.intp)
+        model_to_complete = np.asarray([complete_index[site] for site in features.atom_sites], dtype=np.intp)
 
         coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
         atom_plddt = output.plddt[0, :, :atom_count].to(device="cpu", dtype=torch.float32)
@@ -387,15 +375,14 @@ class AlphaFold3Model(nn.Module):
         pde = _expected_bin_value(pde_logits, _uniform_bin_centers(pde_logits.shape[-1], 0.0, 32.0))
         resolved_probability = resolved_logits.softmax(dim=-1)[..., 1]
         contact_probability = _contact_probability(distogram_logits).numpy()
-        ptm, iptm, ptm_iptm_average = (value[0].cpu() for value in self.confidence_summary(output, input))
+        ptm, iptm, ptm_iptm_average = (value[0].cpu() for value in self.confidence_summary(output, features))
 
-        # Family-owned NumPy over the already-decoded per-sample tensors, mirroring upstream
-        # ``confidences.py`` (chain_pair_pae / chain_pair_pde / pde_single / pae_metrics).
+        # Chain-level confidence summaries operate on decoded per-sample arrays.
         full_pae = pae.numpy()
         full_pde = pde.numpy()
-        asym_ids = input.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
-        frame_mask = input.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
-        instance_ids = tuple(input.system.instances.keys())
+        asym_ids = features.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
+        frame_mask = features.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
+        instance_ids = tuple(features.system.instances.keys())
         unique_chain = np.unique(asym_ids)
         chain_axis = tuple(instance_ids[int(index)] for index in unique_chain)
         multi_chain = unique_chain.shape[0] > 1
@@ -416,7 +403,7 @@ class AlphaFold3Model(nn.Module):
         ranking_confidence_pae = _rank_metric(
             full_pae,
             contact_probability * frame_mask[:, None].astype(float),
-            rank_metric_eps=self.config.confidence.rank_metric_eps,
+            rank_metric_eps=self.config.rank_metric_eps,
         )
 
         predictions: list[FoldPrediction] = []
@@ -426,7 +413,7 @@ class AlphaFold3Model(nn.Module):
             complete_coordinates[model_to_complete] = coordinates[sample_index]
             coordinate_mask[model_to_complete] = True
             structure = Structure(
-                system=input.system,
+                system=features.system,
                 sites=tuple(complete_sites),
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
@@ -452,13 +439,13 @@ class AlphaFold3Model(nn.Module):
                         "has_clash": Score(float(clash), preferred="lower"),
                     },
                     metrics={
-                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=input.atom_sites),
+                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=features.atom_sites),
                         "resolved_probability": Metric(
-                            values=resolved_probability[sample_index].numpy(), axis=input.atom_sites
+                            values=resolved_probability[sample_index].numpy(), axis=features.atom_sites
                         ),
                         "predicted_distance_error": Metric(
                             values=pde_full_chain[sample_index],
-                            axis=input.token_sites,
+                            axis=features.token_sites,
                             unit="angstrom",
                         ),
                         "chain_ptm": Metric(values=chain_metrics["iptm_ichain"][sample_index], axis=chain_axis),
@@ -479,20 +466,20 @@ class AlphaFold3Model(nn.Module):
                     pair_metrics={
                         "pae": PairMetric(
                             values=pae[sample_index].numpy(),
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=features.token_sites,
+                            column_axis=features.token_sites,
                             unit="angstrom",
                         ),
                         "pde": PairMetric(
                             values=pde[sample_index].numpy(),
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=features.token_sites,
+                            column_axis=features.token_sites,
                             unit="angstrom",
                         ),
                         "contact_probs": PairMetric(
                             values=contact_probability,
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=features.token_sites,
+                            column_axis=features.token_sites,
                         ),
                         "chain_pair_iptm": PairMetric(
                             values=chain_metrics["chain_pair_iptm"][sample_index],
@@ -524,25 +511,28 @@ class AlphaFold3Model(nn.Module):
 
     def _assemble_output(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
         coordinates: Tensor,
     ) -> AlphaFold3Output:
-        r"""Compute the released distogram and confidence predictions."""
+        r"""Compute distogram and confidence predictions."""
 
         token_embedding, single, pair, _ = representations
+        confidence_dtype = self.confidence_head.pair_embedder.left_token_projection.weight.dtype
         plddt_logits, pae_logits, pde_logits, resolved_logits = self.confidence_head(
-            single,
-            pair=pair,
-            token_embedding=token_embedding,
+            single.to(dtype=confidence_dtype),
+            pair=pair.to(dtype=confidence_dtype),
+            token_embedding=token_embedding.to(dtype=confidence_dtype),
             pred_coords=coordinates,
-            token_to_rep_atom=input.token_to_rep_atom,
-            atom_to_token=input.atom_to_token,
-            atom_token_index=input.atom_token_index,
+            token_to_rep_atom=features.token_to_rep_atom,
+            atom_to_token=features.atom_to_token,
+            atom_token_index=features.atom_token_index,
         )
+        with torch.autocast(device_type=pair.device.type, enabled=False):
+            distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.linear.weight.dtype))
         return AlphaFold3Output(
             coordinates=coordinates,
-            distogram_logits=self.distogram_head(pair),
+            distogram_logits=distogram_logits,
             plddt_logits=plddt_logits,
             pae_logits=pae_logits,
             pde_logits=pde_logits,
@@ -551,37 +541,43 @@ class AlphaFold3Model(nn.Module):
 
     def _denoise_context(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
     ) -> CoordinateDenoiseContext:
         r"""Assemble conditioning shared by ``forward`` and the sampler."""
 
         token_embedding, single, pair, relative_features = representations
         return CoordinateDenoiseContext(
-            atom_features=input.atom_features,
-            atom_to_token=input.atom_to_token,
-            reference_positions=input.reference_positions,
-            reference_charges=input.reference_charges,
-            reference_mask=input.reference_mask,
-            atom_mask=input.atom_mask,
+            atom_features=features.atom_features,
+            atom_to_token=features.atom_to_token,
+            reference_positions=features.reference_positions,
+            reference_charges=features.reference_charges,
+            reference_mask=features.reference_mask,
+            atom_mask=features.atom_mask,
             token_embedding=token_embedding,
             single=single,
             pair=pair,
             relative_features=relative_features,
-            local_geometry=self.coordinate_denoiser.build_local_geometry(
-                input.reference_positions,
-                input.reference_space_id,
-                # Real atoms are packed contiguously at the front of the flat layout; the count selects the
-                # DeepMind AF3 clamped/shifted key window (upstream ``AtomCrossAtt.compute_features``), so the
-                # diffusion atom transformer attends over the same 128 real keys per window as the reference.
-                num_valid_atoms=int(input.atom_mask.to(torch.bool).sum(-1).amax().item()),
+            local_geometry=_build_alphafold3_local_geometry(
+                self.coordinate_denoiser.atom_encoder.atom_pair_encoder.local_geometry_builder.windowing,
+                reference_positions=features.reference_positions,
+                reference_space_id=features.reference_space_id,
+                atom_to_token=features.atom_to_token,
+                atom_mask=features.atom_mask,
+                num_tokens=features.token_features.shape[-2],
             ),
         )
+
+    def _denoise(self, inputs: CoordinateDenoisingInput) -> Tensor:
+        r"""Run the FP32 diffusion head independently of trunk autocast."""
+
+        with torch.autocast(device_type=inputs.noisy_coords.device.type, enabled=False):
+            return self.coordinate_denoiser(inputs)
 
     def confidence_summary(
         self,
         output: AlphaFold3Output,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         max_error_bin: float = 31.0,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -589,18 +585,17 @@ class AlphaFold3Model(nn.Module):
         Compute the pTM / ipTM / ptm_iptm_average summary from a model output.
 
         This is an opt-in, parameter-free post-processing step over the PAE logits already produced by
-        the confidence head: callers run `forward` and then pass the output plus the input here to
-        get the scalar tensor summaries. Chains are read from ``input.chain_index`` and the valid frame
-        mask from ``input.token_mask``.
+        the confidence head: callers run `forward` and then pass the output plus the features here to
+        get the scalar tensor summaries. Chains are read from ``features.chain_index`` and the valid frame
+        mask from ``features.token_mask``.
 
-        The third element is ``ptm_iptm_average`` -- the pure tensor ``0.8 * ipTM + 0.2 * pTM``
-        (upstream ``model.py:404``). It is **not** the released ``ranking_score``: the released one
-        additionally folds in DSSP disorder and clash terms (upstream ``confidences.py:194-206``),
-        which require a decoded Structure and are finalized in :meth:`fold`.
+        The third element is ``0.8 * ipTM + 0.2 * pTM``. ``ranking_score`` also
+        includes DSSP disorder and clash terms, which require a decoded Structure
+        and are finalized in :meth:`fold`.
 
         Args:
             output: Structure-prediction output carrying ``pae_logits``.
-            input: The model input the output was produced from.
+            features: The model input the output was produced from.
             max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
 
         Returns:
@@ -608,17 +603,17 @@ class AlphaFold3Model(nn.Module):
 
         Examples:
             >>> model = AlphaFold3Model(AlphaFold3Config()).eval()  # doctest: +SKIP
-            >>> input = processor("complex.cif")  # doctest: +SKIP
-            >>> ptm, iptm, ptm_iptm_average = model.confidence_summary(model(input), input)  # doctest: +SKIP
+            >>> features = processor("complex.cif")  # doctest: +SKIP
+            >>> ptm, iptm, ptm_iptm_average = model.confidence_summary(model(features), features)  # doctest: +SKIP
             >>> ptm_iptm_average.shape  # doctest: +SKIP
             torch.Size([1, 1])
         """
 
         num_tokens = output.pae_logits.shape[-2]
-        frame_mask = input.token_mask.to(torch.bool)
+        frame_mask = features.token_mask.to(torch.bool)
         # Broadcast token-axis fields across the per-sample logit axis so the summary is per-sample.
         sample_axes = output.pae_logits.dim() - 3
-        asym_id = input.chain_index
+        asym_id = features.chain_index
         for _ in range(sample_axes - asym_id.dim() + 1):
             asym_id = asym_id.unsqueeze(1)
             frame_mask = frame_mask.unsqueeze(1)
@@ -631,7 +626,7 @@ class AlphaFold3Model(nn.Module):
 
     def _run_trunk(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         *,
         recycling_steps: int,
     ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
@@ -639,43 +634,50 @@ class AlphaFold3Model(nn.Module):
         Build the token embedding and run the recycled trunk to final single/pair representations.
 
         Args:
-            input: Typed model input.
+            features: Typed model input.
             recycling_steps: Number of recycling passes to run.
 
         Returns:
             Trunk representations (token embedding, single, pair, relative features, pair mask).
         """
 
+        atom_dtype = self.input_embedder.atom_encoder.atom_conditioner.atom_feature_projection.weight.dtype
+        reference_positions = features.reference_positions.to(dtype=atom_dtype)
         token_embedding = self.input_embedder(
-            input.atom_features,
-            token_features=input.token_features,
-            reference_positions=input.reference_positions,
-            reference_charges=input.reference_charges,
-            reference_mask=input.reference_mask,
-            atom_to_token=input.atom_to_token,
-            num_tokens=input.token_features.shape[-2],
-            atom_mask=input.atom_mask,
-            token_mask=input.token_mask,
+            features.atom_features.to(dtype=atom_dtype),
+            token_features=features.token_features,
+            reference_positions=reference_positions,
+            reference_charges=features.reference_charges.to(dtype=atom_dtype),
+            reference_mask=features.reference_mask,
+            atom_to_token=features.atom_to_token,
+            num_tokens=features.token_features.shape[-2],
+            atom_mask=features.atom_mask,
+            token_mask=features.token_mask,
             local_geometry=self.input_embedder.build_local_geometry(
-                input.reference_positions,
-                input.reference_space_id,
+                reference_positions,
+                features.reference_space_id,
+                atom_to_token=features.atom_to_token,
+                atom_mask=features.atom_mask,
+                num_tokens=features.token_features.shape[-2],
             ),
         )
+        # Per-atom conditioning remains float32 until entering the Evoformer projection dtype.
+        token_embedding = token_embedding.to(dtype=self.single_init_projection.weight.dtype)
 
         single_init = self.single_init_projection(token_embedding)
         relative_features = generate_relative_position_features(
-            residue_index=input.residue_index,
-            chain_index=input.chain_index,
-            entity_index=input.entity_index,
-            symmetry_index=input.symmetry_index,
-            token_index=input.token_index,
+            residue_index=features.residue_index,
+            chain_index=features.chain_index,
+            entity_index=features.entity_index,
+            symmetry_index=features.symmetry_index,
+            token_index=features.token_index,
             dtype=single_init.dtype,
         )
-        pair_init = self._initial_pair(token_embedding, input, relative_features)
+        pair_init = self._initial_pair(token_embedding, features, relative_features)
 
-        pair_mask = pair_mask_from_token_mask(input.token_mask)
+        pair_mask = pair_mask_from_token_mask(features.token_mask)
         single, pair = self._run_recycling(
-            input,
+            features,
             token_embedding,
             single_init,
             pair_init,
@@ -687,34 +689,54 @@ class AlphaFold3Model(nn.Module):
 
     def _run_recycling(
         self,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         token_embedding: Tensor,
         single_init: Tensor,
         pair_init: Tensor,
         pair_mask: Tensor,
         recycling_steps: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""Run the released recycling loop as an ordinary differentiable graph."""
+        r"""Run the differentiable recycling loop."""
 
-        single = torch.zeros_like(single_init)
-        pair = torch.zeros_like(pair_init)
+        template_features = features.template_features
+        if template_features is not None:
+            template_features = TemplateFeatures(
+                distogram=template_features.distogram.to(dtype=pair_init.dtype),
+                pseudo_beta_mask=template_features.pseudo_beta_mask.to(dtype=pair_init.dtype),
+                residue_type=template_features.residue_type,
+                unit_vector=template_features.unit_vector.to(dtype=pair_init.dtype),
+                backbone_frame_mask=template_features.backbone_frame_mask.to(dtype=pair_init.dtype),
+                template_mask=template_features.template_mask,
+            )
+        msa_features = None
+        if features.msa_features is not None:
+            msa_features = features.msa_features.to(dtype=pair_init.dtype)
+
+        # Recycled representations are stored in float32 and cast to the activation
+        # dtype at the start of each pass.
+        single = torch.zeros_like(single_init, dtype=torch.float32)
+        pair = torch.zeros_like(pair_init, dtype=torch.float32)
         for _ in range(recycling_steps):
-            pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
-            if input.template_features is not None:
-                pair = pair + self.template_embedder(pair, input.template_features, pair_mask=pair_mask)
-            if input.msa_features is not None:
+            pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair.to(dtype=pair_init.dtype)))
+            if template_features is not None:
+                pair = pair + self.template_embedder(pair, template_features, pair_mask=pair_mask)
+            if msa_features is not None:
                 _, pair = self.msa_trunk(
-                    input.msa_features, pair, token_embedding, msa_mask=input.msa_mask, pair_mask=pair_mask
+                    msa_features, pair, token_embedding, msa_mask=features.msa_mask, pair_mask=pair_mask
                 )
-            single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
+            single = single_init + self.single_recycle_projection(
+                self.single_recycle_norm(single.to(dtype=single_init.dtype))
+            )
             single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+            single = single.float()
+            pair = pair.float()
 
         return single, pair
 
     def _initial_pair(
         self,
         token_embedding: torch.Tensor,
-        input: AlphaFold3Input,
+        features: AlphaFold3Input,
         relative_features: RelativePositionBuckets,
     ) -> torch.Tensor:
         r"""
@@ -722,7 +744,7 @@ class AlphaFold3Model(nn.Module):
 
         Args:
             token_embedding: Initial target-feature representation ``(..., N_token, token_feature_size)``.
-            input: Typed model input (provides token bonds and the token mask).
+            features: Typed model input (provides token bonds and the token mask).
             relative_features: Relative-position bucket features for the pair embedder.
 
         Returns:
@@ -731,14 +753,14 @@ class AlphaFold3Model(nn.Module):
 
         left = self.pair_left_projection(token_embedding).unsqueeze(-2)
         right = self.pair_right_projection(token_embedding).unsqueeze(-3)
-        token_bonds = input.token_bonds.to(device=token_embedding.device, dtype=token_embedding.dtype)
+        token_bonds = features.token_bonds.to(device=token_embedding.device, dtype=token_embedding.dtype)
         token_bonds = torch.broadcast_to(token_bonds, (*token_embedding.shape[:-1], token_embedding.shape[-2]))
         token_bonds = token_bonds.unsqueeze(-1)
         pair = left + right
         pair = pair + self.relative_position_embedder(relative_features)
         pair = pair + self.token_bond_projection(token_bonds)
 
-        pair_mask = pair_mask_from_token_mask(input.token_mask)
+        pair_mask = pair_mask_from_token_mask(features.token_mask)
         return pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
 
 
@@ -800,17 +822,19 @@ class InputEmbedder(nn.Module):
             Token embedding ``(..., N_token, single_size + token_tail)``.
         """
 
-        encoder_reference_charges = torch.arcsinh(reference_charges)
-        atom_encoder_output = self.atom_encoder(
-            atom_features,
-            reference_positions=reference_positions,
-            reference_charges=encoder_reference_charges,
-            reference_mask=reference_mask,
-            atom_mask=atom_mask,
-            atom_to_token=atom_to_token,
-            num_tokens=num_tokens,
-            local_geometry=local_geometry,
-        )
+        atom_dtype = self.atom_encoder.atom_conditioner.atom_feature_projection.weight.dtype
+        # Reference features remain FP32 even when the Evoformer uses a lower precision.
+        with torch.autocast(device_type=reference_positions.device.type, enabled=False):
+            atom_encoder_output = self.atom_encoder(
+                atom_features.to(dtype=atom_dtype),
+                reference_positions=reference_positions.to(dtype=atom_dtype),
+                reference_charges=torch.arcsinh(reference_charges.to(dtype=atom_dtype)),
+                reference_mask=reference_mask,
+                atom_mask=atom_mask,
+                atom_to_token=atom_to_token,
+                num_tokens=num_tokens,
+                local_geometry=local_geometry,
+            )
         token_single = atom_encoder_output.token_hidden
 
         token_tail = token_features[..., self.single_size :].to(token_single)
@@ -820,22 +844,80 @@ class InputEmbedder(nn.Module):
             token_embedding = token_embedding * token_mask.unsqueeze(-1).to(dtype=token_embedding.dtype)
         return token_embedding
 
-    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+    def build_local_geometry(
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        *,
+        atom_to_token: Tensor,
+        atom_mask: Tensor,
+        num_tokens: int,
+    ) -> LocalAtomGeometry:
         r"""
         Build local atom geometry using the input atom-encoder layout.
 
         Args:
             reference_positions: Centered reference-conformer atom coords ``(..., N_atom, 3)``.
             reference_space_id: Reference-conformer group id for each atom ``(..., N_atom)``.
+            atom_to_token: Token index for each packed atom ``(..., N_atom)``.
+            atom_mask: Valid packed-atom mask ``(..., N_atom)``.
+            num_tokens: Number of tokens in the dense reference layout.
 
         Returns:
             Local atom geometry for the input atom encoder.
         """
 
-        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id)
+        return _build_alphafold3_local_geometry(
+            self.atom_encoder.atom_pair_encoder.local_geometry_builder.windowing,
+            reference_positions=reference_positions,
+            reference_space_id=reference_space_id,
+            atom_to_token=atom_to_token,
+            atom_mask=atom_mask,
+            num_tokens=num_tokens,
+        )
 
 
-# ipTM contributes 0.8 and pTM 0.2 to the combined ranking score (upstream ``_IPTM_WEIGHT``).
+def _build_alphafold3_local_geometry(
+    windowing: LocalAtomWindowing,
+    *,
+    reference_positions: Tensor,
+    reference_space_id: Tensor,
+    atom_to_token: Tensor,
+    atom_mask: Tensor,
+    num_tokens: int,
+) -> LocalAtomGeometry:
+    r"""Build AF3 local atom geometry and key-space ids."""
+
+    atom_mask = atom_mask.to(torch.bool)
+    num_valid_atoms = int(atom_mask.sum(-1).amax().item())
+    position_windows = windowing(reference_positions, num_valid_atoms)
+
+    query_space_id = torch.where(atom_mask, reference_space_id, 0)
+    query_space_windows = windowing(query_space_id.unsqueeze(-1), num_valid_atoms)
+
+    # Key-space ids use a dense [token, 24] layout while positions use packed queries.
+    token_space_sum = reference_space_id.new_zeros(*reference_space_id.shape[:-1], num_tokens)
+    token_atom_count = reference_space_id.new_zeros(*reference_space_id.shape[:-1], num_tokens)
+    token_space_sum.scatter_add_(-1, atom_to_token, torch.where(atom_mask, reference_space_id, 0))
+    token_atom_count.scatter_add_(-1, atom_to_token, atom_mask.to(reference_space_id.dtype))
+    token_space_id = torch.div(token_space_sum, token_atom_count.clamp_min(1), rounding_mode="floor")
+    dense_space_id = token_space_id.unsqueeze(-1).expand(*token_space_id.shape, 24).flatten(-2)
+    atom_count = atom_to_token.shape[-1]
+    key_space_id = dense_space_id[..., :atom_count]
+    key_space_windows = windowing(key_space_id.unsqueeze(-1), num_valid_atoms)
+
+    distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
+    distance_mask = (query_space_windows.query.unsqueeze(-2) == key_space_windows.key.unsqueeze(-3)).to(
+        reference_positions.dtype
+    )
+    return LocalAtomGeometry(
+        distance_vectors=distance_vectors,
+        distance_mask=distance_mask,
+        window_info=position_windows.info,
+    )
+
+
+# ipTM contributes 0.8 and pTM contributes 0.2 to the combined score.
 _IPTM_WEIGHT = 0.8
 
 
@@ -863,8 +945,8 @@ def pae_bin_centers(num_bins: int, max_error_bin: float = 31.0, *, device: torch
     r"""
     Return the PAE-bin center distances used to take the expected aligned error.
 
-    The first ``num_bins - 1`` centers evenly tile ``[0, max_error_bin]`` at half-step offsets and a
-    final catch-all bin is appended one step beyond, matching the upstream ``pae_breaks`` construction.
+    The first ``num_bins - 1`` centers evenly tile ``[0, max_error_bin]`` at
+    half-step offsets; a final catch-all bin is appended one step beyond.
 
     Args:
         num_bins: Number of PAE logit bins.
@@ -911,9 +993,8 @@ def tm_adjusted_pae(
 
     Softmaxes the logits into a distance-error distribution, weights each bin by its TM-score term
     ``1 / (1 + (d / d0)^2)``, and sums over bins. The TM-score length scale ``d0`` uses the interface
-    token count (both chains of the pair) when ``interface`` is set, else the global token count, so
-    ipTM and pTM use the same tensor construction with different normalization counts (upstream
-    ``tmscore_adjusted_pae_interface`` vs ``tmscore_adjusted_pae_global``).
+    token count (both chains of the pair) when ``interface`` is set, else the global
+    token count. ipTM and pTM therefore differ only in normalization counts.
 
     Args:
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
@@ -945,7 +1026,7 @@ def tm_adjusted_pae(
     if interface:
         num_chain_tokens = (same_chain.to(pae_logits.dtype) * pair_mask).sum(dim=-1)
         num_tokens = num_chain_tokens.unsqueeze(-1) + num_chain_tokens.unsqueeze(-2)
-        # Don't double-count within a single chain (upstream ``num_interface_tokens`` correction).
+        # Tokens from one chain contribute once to the interface length.
         num_tokens = num_tokens - same_chain.to(pae_logits.dtype) * torch.floor(num_tokens / 2)
         num_tokens = num_tokens * pair_mask
     else:
@@ -961,7 +1042,7 @@ def predicted_tm_score(adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tens
 
     Restricts to cross-chain pairs when ``interface`` is set, row-normalizes the mask, takes the masked
     per-row average of the adjusted PAE, and returns the best row. Returns ``NaN`` when the (interface)
-    mask is empty, matching upstream ``predicted_tm_score`` (single-chain systems have no ipTM).
+    mask is empty; single-chain systems therefore have no ipTM.
 
     Args:
         adjusted_pae: ``[..., N_token, N_token]`` TM-adjusted PAE.
@@ -1003,11 +1084,9 @@ def confidence_summary(
     r"""
     Compute pTM, ipTM, and the ptm_iptm_average from PAE logits.
 
-    The third element is ``ptm_iptm_average`` = ``0.8 * ipTM + 0.2 * pTM`` (pTM substituted for a
-    NaN ipTM on single-chain systems), the pure tensor quantity of upstream ``model.py:404``. It is
-    **not** the released ``ranking_score``, which additionally folds in DSSP disorder and clash terms
-    (upstream ``confidences.py:194-206``); those require a decoded Structure and are added in
-    :meth:`AlphaFold3Model.fold`.
+    The third element is ``0.8 * ipTM + 0.2 * pTM``, with pTM substituted for
+    NaN ipTM on single-chain systems. The final ranking score additionally includes
+    DSSP disorder and clash terms in :meth:`AlphaFold3Model.fold`.
 
     Args:
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
@@ -1045,22 +1124,17 @@ def confidence_summary(
     return ptm, iptm, ptm_iptm_average
 
 
-# --- Family-owned NumPy confidence aggregates ---------------------------------------
-# Faithful re-expressions of the released per-sample chain-pair / per-chain PAE and PDE
-# summaries (upstream ``confidences.py`` ``chain_pair_pae`` / ``chain_pair_pde`` /
-# ``pde_single`` / ``pae_metrics`` / ``rank_metric``), operating on the already-decoded
-# ``[num_samples, num_tokens, num_tokens]`` NumPy tensors. ``asym_ids`` is the per-token
-# chain index; chains are the sorted unique chain indices.
+# Per-sample chain-pair and per-chain PAE/PDE summaries over decoded NumPy arrays.
 
 
 def _weighted_mean(mask: np.ndarray, value: np.ndarray, axis: object) -> np.ndarray:
-    r"""Contact/frame-weighted mean, upstream ``confidences.weighted_mean``."""
+    r"""Compute a contact/frame-weighted mean."""
 
     return np.mean(mask * value, axis=axis) / (np.finfo(value.dtype).tiny + np.mean(mask, axis=axis))
 
 
 def _weighted_nanmean(value: np.ndarray, mask: np.ndarray, axis: int) -> np.ndarray:
-    r"""NaN-aware weighted mean; empty slices return NaN (upstream ``weighted_nanmean``)."""
+    r"""Compute a NaN-aware weighted mean; empty slices return NaN."""
 
     mask = mask.astype(float)
     nan_idxs = np.where(np.isnan(value))
@@ -1071,7 +1145,7 @@ def _weighted_nanmean(value: np.ndarray, mask: np.ndarray, axis: int) -> np.ndar
 
 
 def _chain_pair_pde(full_pde: np.ndarray, asym_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    r"""Per chain-pair mean and min predicted distance error (upstream ``chain_pair_pde``)."""
+    r"""Compute per-chain-pair mean and minimum predicted distance error."""
 
     unique = np.unique(asym_ids)
     num_chains = len(unique)
@@ -1090,7 +1164,7 @@ def _chain_pair_pde(full_pde: np.ndarray, asym_ids: np.ndarray) -> tuple[np.ndar
 def _pde_single(
     asym_ids: np.ndarray, full_pde: np.ndarray, contact_probs: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Contact-weighted intra/cross-chain and per-token PDE summaries (upstream ``pde_single``)."""
+    r"""Compute contact-weighted intra-chain, cross-chain, and per-token PDE."""
 
     unique = np.unique(asym_ids)
     num_chains = len(unique)
@@ -1116,7 +1190,7 @@ def _chain_pair_pae(
     mask: np.ndarray,
     contact_probs: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Per chain-pair mean/min predicted aligned error (upstream ``chain_pair_pae``)."""
+    r"""Compute per-chain-pair mean and minimum predicted aligned error."""
 
     if contact_probs is None:
         contact_probs = np.ones(full_pae.shape[1:], dtype=float)
@@ -1148,7 +1222,7 @@ def _chain_pair_pae(
 def _predicted_tm_score_np(
     tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, asym_id: np.ndarray, interface: bool
 ) -> float:
-    r"""Scalar pTM / ipTM over one sample (upstream ``confidences.predicted_tm_score``)."""
+    r"""Compute scalar pTM or ipTM for one sample."""
 
     if interface:
         pair_mask = pair_mask * (asym_id[:, None] != asym_id[None, :])
@@ -1160,7 +1234,7 @@ def _predicted_tm_score_np(
 
 
 def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, asym_id: np.ndarray) -> np.ndarray:
-    r"""Per chain-pair ipTM matrix for one sample (upstream ``chain_pairwise_predicted_tm_scores``)."""
+    r"""Compute the per-chain-pair ipTM matrix for one sample."""
 
     unique = list(np.unique(asym_id))
     num_chains = len(unique)
@@ -1179,12 +1253,10 @@ def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, asy
     return pairwise
 
 
-def _reduce_chain_pair(
-    chain_pair: np.ndarray, num_chain_tokens: np.ndarray, *, agg_over_col: bool
-) -> tuple[np.ndarray, np.ndarray]:
-    r"""Per-chain intra (diagonal) and cross-chain mean reductions (upstream ``reduce_chain_pair``).
+def _reduce_chain_pair(chain_pair: np.ndarray, *, agg_over_col: bool) -> tuple[np.ndarray, np.ndarray]:
+    r"""Reduce chain pairs to intra-chain and cross-chain means.
 
-    Uses the released ``per_chain`` weighting (unit chain weights) and mean aggregation.
+    Chain weights are uniform.
     """
 
     num_samples, num_chains, _ = chain_pair.shape
@@ -1203,9 +1275,9 @@ def _pae_metrics(
     contact_probs: np.ndarray,
     tm_adjusted_pae_interface: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    r"""Per-chain ipTM / PAE aggregates and the chain-pair ipTM matrix (upstream ``pae_metrics``)."""
+    r"""Compute per-chain ipTM/PAE aggregates and the chain-pair ipTM matrix."""
 
-    chain_pair_contact_weighted, _, unique = _chain_pair_pae(full_pae, asym_ids, mask=mask, contact_probs=contact_probs)
+    chain_pair_contact_weighted, _, _ = _chain_pair_pae(full_pae, asym_ids, mask=mask, contact_probs=contact_probs)
     chain_pair_iptm = np.stack(
         [
             _chain_pairwise_iptm(tm_adjusted_pae=sample_tm, asym_id=asym_ids, pair_mask=mask)
@@ -1213,11 +1285,10 @@ def _pae_metrics(
         ],
         axis=0,
     )
-    num_chain_tokens = np.array([np.sum(asym_ids == asym_id) for asym_id in unique])
 
     def reduce(chain_pair: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        ichain, xchain_row = _reduce_chain_pair(chain_pair, num_chain_tokens, agg_over_col=False)
-        _, xchain_col = _reduce_chain_pair(chain_pair, num_chain_tokens, agg_over_col=True)
+        ichain, xchain_row = _reduce_chain_pair(chain_pair, agg_over_col=False)
+        _, xchain_col = _reduce_chain_pair(chain_pair, agg_over_col=True)
         with np.errstate(invalid="ignore"):
             xchain = np.nanmean(np.stack([xchain_row, xchain_col], axis=0), axis=0)
         return ichain, xchain
@@ -1234,53 +1305,17 @@ def _pae_metrics(
 
 
 def _rank_metric(full_pae: np.ndarray, contact_probs: np.ndarray, *, rank_metric_eps: float) -> np.ndarray:
-    r"""Contact-weighted PAE ranking metric, higher is better (upstream ``rank_metric``)."""
+    r"""Compute a contact-weighted PAE ranking metric; higher is better."""
 
     return -np.sum(full_pae * contact_probs[None, :, :], axis=(-2, -1)) / (np.sum(contact_probs) + rank_metric_eps)
 
 
-# ---------------------------------------------------------------------------
-# Model contract (folded in from the former ``contract.py``): the tensor
-# boundary of the released AlphaFold 3 model graph.
-# ---------------------------------------------------------------------------
-
-
-def expected_plddt(logits: Tensor) -> Tensor:
-    r"""Expected pLDDT on the conventional 0--100 scale from per-bin logits."""
-
-    centers = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype) + 0.5
-    return (logits.softmax(dim=-1) * centers * (100.0 / logits.shape[-1])).sum(dim=-1)
-
-
-# ---------------------------------------------------------------------------------
-# Family-owned DSSP / geometry post-processing for the ranking score (folded from
-# ``confidence.py``).
-#
-# Faithful re-expressions of the upstream confidence utilities
-# (``/data/users/z/reference/alphafold3/src/alphafold3/model/confidences.py:56-206``)
-# that the tensor-only ``confidence_summary`` cannot compute because they require a
-# *decoded* ``ofoldx.data.structure.Structure``:
-#
-# - ``fraction_disordered`` -- windowed AlphaFold-RSA disorder fraction over protein
-#   chains (upstream ``confidences.py:62-137``).
-# - ``has_clash`` -- polymer-atom clash detection over protein / RNA / DNA chains
-#   (upstream ``confidences.py:140-191``).
-# - ``ranking_score`` -- the released ranking score combining the tensor
-#   ``ptm_iptm_average`` with the disorder and clash terms (upstream
-#   ``confidences.py:194-206``).
-#
-# These consume the per-sample decoded Structure, so the AlphaFold 3 ``fold`` decode
-# runs them once per sample to finalize the ``ranking_score`` Score.
-# ---------------------------------------------------------------------------------
-
-# --- Ranking weights (upstream ``confidences.py:56-58``) -------------------------
-_IPTM_WEIGHT = 0.8
+# DSSP and geometry terms evaluated after coordinates are decoded.
 _FRACTION_DISORDERED_WEIGHT = 0.5
 _CLASH_PENALIZATION_WEIGHT = 100.0
 
 # Maximum accessible surface areas from Sander & Rost 1994
-# (https://doi.org/10.1002/prot.340200303); upstream ``confidences.py:32-52``. AF3
-# owns this table because it drives the AlphaFold-RSA disorder fraction.
+# (https://doi.org/10.1002/prot.340200303), used by AlphaFold-RSA.
 MAX_ACCESSIBLE_SURFACE_AREA = {
     "ALA": 106.0,
     "ARG": 248.0,
@@ -1304,8 +1339,7 @@ MAX_ACCESSIBLE_SURFACE_AREA = {
     "VAL": 142.0,
 }
 
-# rASA disorder threshold, AlphaFold-RSA
-# (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9601767); upstream default.
+# AlphaFold-RSA rASA disorder threshold.
 _RASA_DISORDER_CUTOFF = 0.581
 _RASA_WINDOW = 25
 
@@ -1313,12 +1347,10 @@ _POLYMER_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
 def ranking_score(ptm: float, iptm: float, fraction_disordered_: float, has_clash_: bool) -> float:
-    r"""Return the released AlphaFold 3 ranking score for one sample.
+    r"""Return the AlphaFold 3 ranking score for one sample.
 
     ``ptm_iptm_average + 0.5 * fraction_disordered - 100 * has_clash``, with pTM
-    substituted for the ipTM term when ipTM is ``NaN`` (single-chain systems),
-    exactly matching upstream ``confidences.get_ranking_score``
-    (``confidences.py:194-206``).
+    substituted for the ipTM term when ipTM is ``NaN``.
 
     Args:
         ptm: The predicted global TM score.
@@ -1345,12 +1377,11 @@ def fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RAS
     r"""Fraction of protein residues predicted disordered by windowed AlphaFold-RSA.
 
     Restricts to protein chains, computes a windowed (window 25) relative solvent
-    accessible surface area per residue via a DSSP backend, and returns the mean
-    fraction of residues whose rASA exceeds ``rasa_disorder_cutoff`` (upstream
-    ``confidences.py:99-137``). Identical chain sequences reuse a cached rASA
-    profile. When no DSSP backend is available (or the DSSP call fails), the rASA
-    list stays empty and the function returns ``0.0``, exactly matching the
-    upstream on-failure behavior (``confidences.py:132-137``).
+    accessible surface area per residue with DSSP 4.4.7 semantics, and returns the mean
+    fraction of residues whose rASA exceeds ``rasa_disorder_cutoff``. Identical
+    chain sequences reuse a cached rASA
+    profile. Calculation errors propagate rather than being reinterpreted as an
+    absent chain.
 
     Args:
         structure: The decoded per-sample structure to score.
@@ -1362,17 +1393,14 @@ def fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RAS
     """
 
     rasa: list[float] = []
-    sequence_rasa: dict[tuple[str, ...], np.ndarray] = {}
+    sequence_rasa: dict[str, np.ndarray] = {}
     for instance_id in _protein_chain_ids(structure):
         chain_sequence = _chain_sequence(structure, instance_id)
         cached = sequence_rasa.get(chain_sequence)
         if cached is not None:
             rasa.extend(cached.tolist())
             continue
-        try:
-            per_residue = _windowed_solvent_accessible_area(structure, instance_id)
-        except (ValueError, RuntimeError, ImportError):
-            continue
+        per_residue = _windowed_solvent_accessible_area(structure, instance_id)
         sequence_rasa[chain_sequence] = per_residue
         rasa.extend(per_residue.tolist())
 
@@ -1393,7 +1421,7 @@ def has_clash(
     overlapping when more than ``min_clashes_for_overlap`` of its atoms lie within
     ``cutoff_radius`` Angstrom of a polymer atom in another chain (or a residue more
     than one apart in the same chain), or when more than ``min_fraction_for_overlap``
-    of the chain's atoms clash (upstream ``confidences.py:140-191``).
+    of the chain's atoms clash.
 
     Args:
         structure: The decoded per-sample structure to score.
@@ -1434,11 +1462,10 @@ def has_clash(
 def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) -> np.ndarray:
     r"""Windowed per-residue rASA for one protein chain (AlphaFold-RSA).
 
-    Runs the solvent-accessibility backend over the chain, normalizes each residue's
+    Runs the DSSP 4.4.7 solvent-accessibility algorithm over the chain, normalizes each residue's
     accessible surface area by :data:`MAX_ACCESSIBLE_SURFACE_AREA`, clips to ``1.0``, and
-    averages over a ``window``-wide reflect-padded window (upstream ``confidences.py:62-96``).
-    Raises ``ImportError`` / ``RuntimeError`` when the backend is unavailable, which the
-    caller treats as an unavailable backend and degrades to ``0.0``.
+    averages over a reflect-padded window.
+    Raises ``RuntimeError`` when the chain has no complete DSSP residues.
     """
 
     accessible = _dssp_accessible_area(structure, instance_id)
@@ -1455,84 +1482,129 @@ def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) ->
     return np.convolve(padded, np.ones(_RASA_WINDOW), "valid") / _RASA_WINDOW
 
 
-# Shrake-Rupley solvent-accessibility parameters. Released AF3 obtains per-residue
-# accessible surface area from ``mkdssp`` (DSSP's numerical Lee-Richards integration).
-# OFoldX has no DSSP binary, so it substitutes biotite's Shrake-Rupley SASA with the
-# standard 1.4 Angstrom water probe and ProtOr heavy-atom radii (Tsai 1999), which is
-# the accessibility model the Sander & Rost max-ASA normalization was calibrated
-# against. ``fraction_disordered`` averages this over a 25-residue window and thresholds
-# it, so per-residue SASA differences below the DSSP/Shrake-Rupley level wash out.
-_SASA_PROBE_RADIUS = 1.4
-_SASA_POINT_NUMBER = 1000
+# DSSP 4.4.7 accessibility parameters.
+_DSSP_ATOM_RADII = {"N": 1.65, "CA": 1.87, "C": 1.76, "O": 1.4}
+_DSSP_SIDE_CHAIN_RADIUS = 1.8
+_DSSP_WATER_RADIUS = 1.4
+_DSSP_SURFACE_POINT_COUNT = 401
+
+
+def _dssp_surface_dots() -> np.ndarray:
+    r"""Return the 401-point Fibonacci sphere used by DSSP 4.4.7."""
+
+    n = (_DSSP_SURFACE_POINT_COUNT - 1) // 2
+    indices = np.arange(-n, n + 1, dtype=np.int32)
+    golden_ratio = np.float32((1.0 + np.sqrt(np.float32(5.0))) / 2.0)
+    latitude = np.arcsin(np.float32(2.0) * indices.astype(np.float32) / np.float32(_DSSP_SURFACE_POINT_COUNT))
+    longitude = np.asarray(
+        np.fmod(indices.astype(np.float64), np.float64(golden_ratio)) * 2.0 * np.pi / np.float64(golden_ratio),
+        dtype=np.float32,
+    )
+    return np.stack(
+        (
+            np.sin(longitude) * np.cos(latitude),
+            np.cos(longitude) * np.cos(latitude),
+            np.sin(latitude),
+        ),
+        axis=-1,
+    ).astype(np.float32)
+
+
+_DSSP_SURFACE_DOTS = _dssp_surface_dots()
+_DSSP_SURFACE_POINT_WEIGHT = np.float32(4.0 * np.pi / _DSSP_SURFACE_POINT_COUNT)
 
 
 def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[str, float]]:
     r"""Return per-residue ``(residue_name, accessible_area)`` for one protein chain.
 
-    This is the solvent-accessibility backend that released AF3 delegates to ``mkdssp``.
-    OFoldX bundles no DSSP binary, so accessibility comes from biotite's Shrake-Rupley
-    :func:`biotite.structure.sasa` over the chain's observed heavy atoms in isolation
-    (matching AF3, which runs DSSP on each chain filtered out on its own), summed per
-    residue. Rows are returned in chain sequence order for residues that have at least
-    one observed heavy atom; unresolved residues are skipped, mirroring DSSP's chain
-    breaks. Raises ``ImportError`` when biotite is unavailable and ``RuntimeError`` when
-    the chain has no observed heavy atoms, both of which :func:`fraction_disordered`
-    treats as an unavailable backend and degrades to ``0.0`` (upstream on-failure path).
+    This implements the DSSP 4.4.7 accessibility calculation with its atom radii,
+    401-point Fibonacci sphere, water radius, overlap test, and integer output
+    rounding. DSSP drops residues that
+    do not contain all four backbone atoms (N, CA, C, O), then scores each retained
+    residue against the complete retained chain in isolation.
     """
 
-    import biotite.structure as biotite_structure
-
+    residues: dict[int, tuple[str, dict[str, np.ndarray], list[np.ndarray]]] = {}
     system = structure.system
-    coordinates: list[np.ndarray] = []
-    elements: list[str] = []
-    residue_indices: list[int] = []
-    residue_names: list[str] = []
-    atom_names: list[str] = []
-    order: list[int] = []
-    names_by_residue: dict[int, str] = {}
     for index, site in enumerate(structure.sites):
         if site.instance_id != instance_id:
             continue
         if not bool(structure.coordinate_mask[index]):
             continue
         atom = system.atom(site)
-        if atom.element in HYDROGEN_ELEMENTS:
+        if atom.element.upper() == "H":
             continue
         component = system.component((instance_id, site.component_index))
-        coordinates.append(np.asarray(structure.coordinates[index], dtype=np.float32))
-        elements.append(atom.element.upper())
-        residue_indices.append(site.component_index)
-        residue_names.append(component.component_id)
-        atom_names.append(site.atom_id)
-        if site.component_index not in names_by_residue:
-            names_by_residue[site.component_index] = component.component_id
-            order.append(site.component_index)
+        coordinate = np.asarray(structure.coordinates[index], dtype=np.float32)
+        residue_name, backbone, side_chain = residues.setdefault(
+            site.component_index,
+            (component.component_id, {}, []),
+        )
+        if site.atom_id in _DSSP_ATOM_RADII:
+            backbone[site.atom_id] = coordinate
+        else:
+            side_chain.append(coordinate)
 
-    if not coordinates:
-        raise RuntimeError("protein chain has no observed heavy atoms")
+    complete_residues = [
+        (component_index, residue_name, backbone, side_chain)
+        for component_index, (residue_name, backbone, side_chain) in sorted(residues.items())
+        if backbone.keys() >= _DSSP_ATOM_RADII.keys()
+    ]
+    if not complete_residues:
+        raise RuntimeError("protein chain has no complete residues")
 
-    array = biotite_structure.AtomArray(len(coordinates))
-    array.coord = np.stack(coordinates, axis=0)
-    array.element = np.asarray(elements, dtype="U2")
-    array.res_id = np.asarray(residue_indices, dtype=np.int64)
-    array.res_name = np.asarray(residue_names, dtype="U5")
-    array.atom_name = np.asarray(atom_names, dtype="U6")
-    array.chain_id = np.full(len(coordinates), "A", dtype="U1")
-    array.hetero = np.zeros(len(coordinates), dtype=bool)
+    atom_coordinates: list[np.ndarray] = []
+    atom_radii: list[float] = []
+    atom_residue_indices: list[int] = []
+    residue_names: list[str] = []
+    for residue_index, (_, residue_name, backbone, side_chain) in enumerate(complete_residues):
+        residue_names.append(residue_name)
+        for atom_name in ("N", "CA", "C", "O"):
+            atom_coordinates.append(backbone[atom_name])
+            atom_radii.append(_DSSP_ATOM_RADII[atom_name])
+            atom_residue_indices.append(residue_index)
+        atom_coordinates.extend(side_chain)
+        atom_radii.extend([_DSSP_SIDE_CHAIN_RADIUS] * len(side_chain))
+        atom_residue_indices.extend([residue_index] * len(side_chain))
 
-    per_atom = biotite_structure.sasa(
-        array,
-        probe_radius=_SASA_PROBE_RADIUS,
-        point_number=_SASA_POINT_NUMBER,
-        vdw_radii="ProtOr",
-    )
-    residue_indices_array = np.asarray(residue_indices)
-    per_atom = np.where(np.isfinite(per_atom), per_atom, 0.0)
+    coordinates = np.asarray(atom_coordinates, dtype=np.float32)
+    radii = np.asarray(atom_radii, dtype=np.float32)
+    residue_indices = np.asarray(atom_residue_indices, dtype=np.int64)
+    atom_areas = np.empty(coordinates.shape[0], dtype=np.float32)
+    surface_radii = radii + np.float32(_DSSP_WATER_RADIUS)
+    occlusion_radii = radii.astype(np.float64) + np.float64(np.float32(_DSSP_WATER_RADIUS))
 
-    rows: list[tuple[str, float]] = []
-    for component_index in order:
-        area = float(np.sum(per_atom[residue_indices_array == component_index]))
-        rows.append((names_by_residue[component_index], area))
+    for atom_index, (coordinate, surface_radius, occlusion_radius) in enumerate(
+        zip(coordinates, surface_radii, occlusion_radii)
+    ):
+        relative = coordinates - coordinate
+        center_distances_sq = np.sum(relative * relative, axis=-1, dtype=np.float32)
+        candidate_mask = (center_distances_sq.astype(np.float64) > 0.0001) & (
+            center_distances_sq.astype(np.float64) < np.square(occlusion_radius + occlusion_radii)
+        )
+        candidates = relative[candidate_mask]
+        candidate_radii_sq = np.square(occlusion_radii[candidate_mask])
+        surface_points = _DSSP_SURFACE_DOTS * surface_radius
+        if candidates.shape[0] == 0:
+            free_count = _DSSP_SURFACE_POINT_COUNT
+        else:
+            point_distances_sq = np.sum(
+                np.square(surface_points[:, None, :] - candidates[None, :, :]),
+                axis=-1,
+                dtype=np.float32,
+            )
+            free_count = int(np.sum(np.all(candidate_radii_sq < point_distances_sq.astype(np.float64), axis=-1)))
+        surface = np.float32(0.0)
+        for _ in range(free_count):
+            surface = np.float32(surface + _DSSP_SURFACE_POINT_WEIGHT)
+        atom_areas[atom_index] = np.float32(np.float32(surface * surface_radius) * surface_radius)
+
+    rows = []
+    for residue_index, residue_name in enumerate(residue_names):
+        area = np.float32(0.0)
+        for atom_area in atom_areas[residue_indices == residue_index]:
+            area = np.float32(area + atom_area)
+        rows.append((residue_name, float(np.floor(area + np.float32(0.5)))))
     return rows
 
 
@@ -1548,11 +1620,11 @@ def _protein_chain_ids(structure: Structure) -> list[str]:
     return chain_ids
 
 
-def _chain_sequence(structure: Structure, instance_id: str) -> tuple[str, ...]:
-    r"""Ordered component ids of one chain (a cache key standing in for its sequence)."""
+def _chain_sequence(structure: Structure, instance_id: str) -> str:
+    r"""Return the protein sequence used by the cross-chain rASA cache."""
 
     entity = structure.system.entities[structure.system.instances[instance_id]]
-    return tuple(component.component_id for component in entity.components)
+    return "".join(restype_3to1.get(component.component_id, "X") for component in entity.components)
 
 
 def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1566,7 +1638,7 @@ def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.nda
         if not bool(structure.coordinate_mask[index]):
             continue
         entity = system.entities[system.instances[site.instance_id]]
-        if isinstance(entity, Molecule) or getattr(entity, "polymer_type", None) not in _POLYMER_TYPES:
+        if not isinstance(entity, PolymerSequence) or entity.polymer_type not in _POLYMER_TYPES:
             continue
         coordinates.append(np.asarray(structure.coordinates[index], dtype=np.float64))
         residue_ids.append(site.component_index)
@@ -1581,20 +1653,9 @@ def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.nda
 
 
 def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]]:
-    r"""Neighbor indices within ``cutoff_radius`` per atom.
+    r"""Find atom neighbors within ``cutoff_radius`` using a cKDTree."""
 
-    Uses ``scipy.spatial.cKDTree`` when available (matching upstream
-    ``confidences.py:167-170``); falls back to a dense NumPy pairwise search so the
-    clash test still runs without SciPy.
-    """
-
-    try:
-        from scipy import spatial
-    except ImportError:
-        differences = coordinates[:, None, :] - coordinates[None, :, :]
-        distances = np.sqrt(np.sum(differences * differences, axis=-1))
-        within = distances <= cutoff_radius
-        return [np.nonzero(row)[0].tolist() for row in within]
+    from scipy import spatial
 
     tree = spatial.cKDTree(coordinates)
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
@@ -1602,7 +1663,7 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
 
 @dataclass(kw_only=True)
 class AlphaFold3Input:
-    r"""Tensors consumed by the released AlphaFold 3 graph.
+    r"""Tensors consumed by the AlphaFold 3 graph.
 
     ``reference_charges`` has the unique shape ``[..., N_atom, 1]``.
 
@@ -1656,17 +1717,7 @@ class AlphaFold3Output:
         return expected_plddt(self.plddt_logits)
 
 
-# ---------------------------------------------------------------------------------
-# Family-owned seed-group-preserving folding result (folded from ``result.py``).
-#
-# The released AlphaFold 3 inference pipeline runs ``S`` seeds; each seed shares one
-# trunk pass and draws ``num_diffusion_samples`` diffusion rollouts, and the
-# ``S x num_samples`` samples are pooled and ranked (upstream ``model.py:487-528``).
-# Per frozen DESIGN 5.2, a family that returns several seed groups owns a concrete
-# result that *preserves* those groups rather than flattening them into the shared
-# ``ofoldx.results.FoldResult``. The shared ``FoldPrediction`` value is reused
-# unchanged; only the outer grouping is family-specific.
-# ---------------------------------------------------------------------------------
+# AlphaFold 3 results preserve the sample grouping for each diffusion seed.
 
 
 @dataclass(eq=False)
@@ -1674,12 +1725,12 @@ class AlphaFold3SeedGroup:
     r"""One diffusion seed and its generation-ordered samples.
 
     Attributes:
-        seed: The integer diffusion seed shared by every sample in this group.
+        seed: The integer diffusion seed shared by every sample, when one was supplied.
         predictions: Generation-ordered samples drawn for this seed; tuple
             position is the sample identity within the group.
     """
 
-    seed: int
+    seed: int | None
     predictions: tuple[FoldPrediction, ...]
 
 
@@ -1698,12 +1749,9 @@ class AlphaFold3FoldResult:
         r"""Return the earliest best prediction under one explicit score.
 
         Pools every sample across every seed group and ranks the pool by the named
-        :class:`~ofoldx.results.Score`, matching the upstream pooled ranking across
-        all ``S x num_samples`` samples. This reuses the exact
+        :class:`~ofoldx.results.Score`, using the
         explicit-direction, identical-unit, identical-scope, NaN-rejecting,
-        infinity-rankable, earliest-tie semantics of
-        :meth:`~ofoldx.results.FoldResult.best` (frozen DESIGN 5.2 forbids routing
-        this through a shared rank helper, so the checks are written directly).
+        infinity-rankable, earliest-tie semantics of :meth:`~ofoldx.results.FoldResult.best`.
 
         Args:
             score: The name of the per-sample score to rank on.

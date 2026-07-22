@@ -8,7 +8,10 @@ StructureModule geometry, and structure-prediction contract.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+import operator
+from copy import copy
+from dataclasses import dataclass
+from typing import Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -16,10 +19,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from typing_extensions import Self
 
-from ...data import residue_constants
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
+from ...modules import residue_constants
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm
 from ...modules.functional import pair_mask_from_token_mask
@@ -27,6 +30,7 @@ from ...modules.head import DistogramHead, tm_bin_weights
 from ...modules.transition import RowwiseDropout
 from ...modules.trunk import EvoformerStack
 from ...modules.trunk.evoformer import (
+    AlphaFold2OuterProductMean,
     AlphaFold2TriangleAttention,
     AlphaFold2TriangleMultiplication,
     EvoformerTransition,
@@ -57,7 +61,14 @@ class AlphaFold2Model(nn.Module):
         iteration_config = evoformer_config.iteration
         heads = config.heads
 
-        self._recycling_steps = config.recycling_steps
+        self._recycling_steps = operator.index(config.recycling_steps)
+        if self._recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
+        self.num_ensembles = operator.index(config.num_ensembles)
+        if self.num_ensembles < 1:
+            raise ValueError("num_ensembles must be positive")
+        self._resample_msa_in_recycling = config.msa.resample_msa_in_recycling
+        self._ensemble_msa_from_last = False
         self.input_embedding = AlphaFold2InputEmbedding(
             target_feature_size=input_config.target_feature_size,
             msa_feature_size=input_config.msa_feature_size,
@@ -197,15 +208,18 @@ class AlphaFold2Model(nn.Module):
         if backend not in {"auto", "torch", "oops"}:
             raise ValueError("backend must be exactly one of: auto, torch, oops")
         self.backend = backend
-        operator_backend = "sdpa" if backend == "torch" else backend
+        attention_backend = "sdpa" if backend == "torch" else backend
+        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(module, GatedMultiheadAttention):
+                module.operator_backend = attention_backend
+            elif isinstance(module, (AlphaFold2OuterProductMean, AlphaFold2TriangleMultiplication)):
                 module.operator_backend = operator_backend
         return self
 
     def forward(
         self,
-        input: AlphaFold2Input,
+        input: AlphaFold2Input | AlphaFold2MultimerInput,
         *,
         recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
@@ -217,20 +231,23 @@ class AlphaFold2Model(nn.Module):
 
         When ``input`` carries the raw alignment pool (``msa_feat is None``) the
         Model realizes ``sample_msa`` / ``make_masked_msa`` / clustering /
-        ``crop_extra_msa`` itself, once per recycle when
-        ``config.msa.resample_msa_in_recycling`` is set, off ``generator``. When
-        ``input`` already carries a realized ``msa_feat`` (the fixed-feature parity
-        injection path) the draw is skipped and the input is consumed verbatim, so
+        ``crop_extra_msa`` itself for every representation-ensemble member and
+        recycle, off ``generator``. It averages ``single``, ``pair``, and
+        ``msa_first_row`` before StructureModule; the monomer graph keeps the first
+        member's full MSA representation, matching DeepMind ``AlphaFoldIteration``.
+        When ``input`` already carries a realized ``msa_feat`` (the precomputed-feature
+        input path) the draw is skipped and the input is consumed verbatim, so
         that path is bit-identical to the pre-stochastic Model.
         """
 
-        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if type(recycling_steps) is not int or recycling_steps < 1:
-            raise ValueError("recycling_steps must be a positive integer")
+        recycling_steps = operator.index(self._recycling_steps if recycling_steps is None else recycling_steps)
+        if recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
 
         msa, single, pair, structure, realized = self._run_recycling(
             input, recycling_steps=recycling_steps, generator=generator
         )
+        assert realized.msa_feat is not None
         num_msa_rows = realized.msa_feat.shape[-3]
         pae_logits = None if self.predicted_aligned_error_head is None else self.predicted_aligned_error_head(pair)
         return AlphaFold2Output(
@@ -266,14 +283,15 @@ class AlphaFold2Model(nn.Module):
 
         ``generator`` is the injected root RNG (the pipeline resolves any
         ``seed``/``generator`` to it once at the boundary). Each sample draws its own
-        independent 64-bit sub-seed off that root, and per-recycle resampling advances
-        that per-sample generator (mirroring OpenFold's ensemble-of-``num_recycle + 1``
-        draw). With ``generator=None`` the fold is still stochastic, drawing from the
-        ambient default RNG.
+        independent 64-bit sub-seed off that root. Per-recycle resampling and each
+        configured representation-ensemble member advance that per-sample generator.
+        With ``generator=None`` the fold is still stochastic, drawing from the ambient
+        default RNG.
         """
 
-        if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("num_samples must be a positive integer")
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         if input.aatype.shape[0] != 1:
             raise ValueError("AlphaFold 2 fold accepts one canonical system per call")
 
@@ -305,7 +323,7 @@ class AlphaFold2Model(nn.Module):
                 coordinate_mask[target_index] = True
         structure = Structure(
             system=layout.system,
-            sites=complete_sites,
+            sites=tuple(complete_sites),
             coordinates=coordinates,
             coordinate_mask=coordinate_mask,
         )
@@ -343,25 +361,32 @@ class AlphaFold2Model(nn.Module):
 
     def _run_recycling(
         self,
-        input: AlphaFold2Input,
+        input: _AlphaFold2InputT,
         *,
         recycling_steps: int,
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, AlphaFold2Input]:
+    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, _AlphaFold2InputT]:
         needs_realize = input.msa_feat is None
-        resample = needs_realize and self.config.msa.resample_msa_in_recycling
-        base_realized = None
+        resample = needs_realize and self._resample_msa_in_recycling
+        fixed_ensemble: tuple[_AlphaFold2InputT, ...] | None = None
         if needs_realize and not resample:
-            base_realized = self._realize_msa(input, generator=generator)
+            fixed_ensemble = tuple(self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles))
         prev_pos, prev_msa_first_row, prev_pair = self._initial_recycling(input)
-        cycle_input = input
         for cycle in range(recycling_steps):
             if needs_realize:
-                cycle_input = self._realize_msa(input, generator=generator) if resample else base_realized
+                if resample:
+                    cycle_inputs = tuple(
+                        self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles)
+                    )
+                else:
+                    assert fixed_ensemble is not None
+                    cycle_inputs = fixed_ensemble
+            else:
+                cycle_inputs = (input,) * self.num_ensembles
             grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
-                msa, single, pair, msa_first_row = self._embed_and_refine(
-                    cycle_input,
+                msa, single, pair, msa_first_row, cycle_input = self._run_ensemble(
+                    cycle_inputs,
                     prev_pos=prev_pos,
                     prev_msa_first_row=prev_msa_first_row,
                     prev_pair=prev_pair,
@@ -373,18 +398,60 @@ class AlphaFold2Model(nn.Module):
                 prev_pair = pair.detach()
         return msa, single, pair, structure, cycle_input
 
-    def _realize_msa(self, input: AlphaFold2Input, *, generator: torch.Generator | None) -> AlphaFold2Input:
+    def _run_ensemble(
+        self,
+        inputs: tuple[_AlphaFold2InputT, ...],
+        *,
+        prev_pos: Tensor,
+        prev_msa_first_row: Tensor,
+        prev_pair: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, _AlphaFold2InputT]:
+        # DeepMind monomer keeps the first MSA representation; multimer's scan
+        # overwrites MSA-only outputs and therefore keeps the last.
+        selected_msa = None
+        selected_input = inputs[0]
+        single_sum = None
+        pair_sum = None
+        msa_first_row_sum = None
+        for index, ensemble_input in enumerate(inputs):
+            msa, single, pair, msa_first_row = self._embed_and_refine(
+                ensemble_input,
+                prev_pos=prev_pos,
+                prev_msa_first_row=prev_msa_first_row,
+                prev_pair=prev_pair,
+            )
+            if index == 0 or self._ensemble_msa_from_last:
+                selected_msa = msa
+                selected_input = ensemble_input
+            single_sum = single if single_sum is None else single_sum + single
+            pair_sum = pair if pair_sum is None else pair_sum + pair
+            msa_first_row_sum = msa_first_row if msa_first_row_sum is None else msa_first_row_sum + msa_first_row
+
+        assert selected_msa is not None
+        assert single_sum is not None
+        assert pair_sum is not None
+        assert msa_first_row_sum is not None
+        if len(inputs) == 1:
+            return selected_msa, single_sum, pair_sum, msa_first_row_sum, selected_input
+        scale = 1.0 / len(inputs)
+        return (
+            selected_msa,
+            single_sum * scale,
+            pair_sum * scale,
+            msa_first_row_sum * scale,
+            selected_input,
+        )
+
+    def _realize_msa(self, input: _AlphaFold2InputT, *, generator: torch.Generator | None) -> _AlphaFold2InputT:
         r"""Realize one released MSA-feature ensemble slice from the raw pool.
 
         Runs OpenFold's ``sample_msa`` -> ``make_masked_msa`` ->
         ``nearest_neighbor_clusters`` / ``summarize_clusters`` -> ``crop_extra_msa``
-        -> ``make_msa_feat`` chain over the raw alignment pool carried on ``input``
-        and returns a copy whose per-recycle realized slots are filled. Every draw
-        consumes the per-sample ``generator`` so the whole slice is reproducible
-        from the fold seed.
+        -> ``make_msa_feat`` chain over the raw alignment tensors supplied by the
+        shared realization boundary. Every draw consumes the per-sample ``generator``
+        so the whole slice is reproducible from the fold seed.
         """
 
-        cfg = self.config.msa
         device = input.target_feat.device
         dtype = input.target_feat.dtype
         (
@@ -394,10 +461,38 @@ class AlphaFold2Model(nn.Module):
             extra_msa_mask,
             bert_mask,
             true_msa,
-        ) = realize_msa_features(
+        ) = self._realize_msa_features(
             input.msa_tokens[0],
             input.msa_deletions[0],
             input.msa_profile[0],
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        realized = copy(input)
+        realized.msa_feat = msa_feat.unsqueeze(0)
+        realized.msa_mask = msa_mask.unsqueeze(0)
+        realized.extra_msa_feat = extra_msa_feat.unsqueeze(0)
+        realized.extra_msa_mask = extra_msa_mask.unsqueeze(0)
+        realized.bert_mask = bert_mask.unsqueeze(0)
+        realized.true_msa = true_msa.unsqueeze(0)
+        return realized
+
+    def _realize_msa_features(
+        self,
+        msa_tokens: Tensor,
+        msa_deletions: Tensor,
+        msa_profile: Tensor,
+        *,
+        generator: torch.Generator | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _MSARealization:
+        cfg = self.config.msa
+        return realize_msa_features(
+            msa_tokens,
+            msa_deletions,
+            msa_profile,
             max_msa_clusters=cfg.max_msa_clusters,
             max_extra_msa=cfg.max_extra_msa,
             msa_cluster_features=cfg.msa_cluster_features,
@@ -411,19 +506,10 @@ class AlphaFold2Model(nn.Module):
             device=device,
             dtype=dtype,
         )
-        return replace(
-            input,
-            msa_feat=msa_feat.unsqueeze(0),
-            msa_mask=msa_mask.unsqueeze(0),
-            extra_msa_feat=extra_msa_feat.unsqueeze(0),
-            extra_msa_mask=extra_msa_mask.unsqueeze(0),
-            bert_mask=bert_mask.unsqueeze(0),
-            true_msa=true_msa.unsqueeze(0),
-        )
 
     def _embed_and_refine(
         self,
-        input: AlphaFold2Input,
+        input: _AlphaFold2RecyclingInput,
         *,
         prev_pos: Tensor,
         prev_msa_first_row: Tensor,
@@ -461,7 +547,7 @@ class AlphaFold2Model(nn.Module):
         single = self.single_activations(msa_first_row)
         return msa, single, pair, msa_first_row
 
-    def _initial_recycling(self, input: AlphaFold2Input) -> tuple[Tensor, Tensor, Tensor]:
+    def _initial_recycling(self, input: _AlphaFold2RecyclingInput) -> tuple[Tensor, Tensor, Tensor]:
         token_shape = input.token_mask.shape
         num_tokens = token_shape[-1]
         dtype = input.target_feat.dtype
@@ -484,7 +570,7 @@ class AlphaFold2Model(nn.Module):
             ),
         )
 
-    def _add_template_embedding(self, pair: Tensor, input: AlphaFold2Input, pair_mask: Tensor) -> Tensor:
+    def _add_template_embedding(self, pair: Tensor, input: _AlphaFold2RecyclingInput, pair_mask: Tensor) -> Tensor:
         if self.template_embedder is None:
             return pair
         return pair + self.template_embedder(pair, input, pair_mask=pair_mask)
@@ -512,8 +598,14 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         iteration_config = evoformer_config.iteration
         heads = config.heads
 
-        self._recycling_steps = config.recycling_steps
-        self.num_ensembles = config.num_ensembles
+        self._recycling_steps = operator.index(config.recycling_steps)
+        if self._recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
+        self.num_ensembles = operator.index(config.num_ensembles)
+        if self.num_ensembles < 1:
+            raise ValueError("num_ensembles must be positive")
+        self._resample_msa_in_recycling = config.msa.resample_msa_in_recycling
+        self._ensemble_msa_from_last = True
         self.input_embedding = AlphaFold2MultimerInputEmbedding(
             target_feature_size=input_config.target_feature_size,
             msa_feature_size=input_config.msa_feature_size,
@@ -645,32 +737,30 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         )
         self.set_backend("auto")
 
-    def _realize_msa(
-        self, input: AlphaFold2MultimerInput, *, generator: torch.Generator | None
-    ) -> AlphaFold2MultimerInput:
+    def _realize_msa_features(
+        self,
+        msa_tokens: Tensor,
+        msa_deletions: Tensor,
+        msa_profile: Tensor,
+        *,
+        generator: torch.Generator | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _MSARealization:
         r"""Realize one released multimer MSA-feature ensemble slice from the raw pool.
 
         Runs OpenFold's multimer ``sample_msa`` -> ``make_masked_msa`` ->
         ``nearest_neighbor_clusters`` -> ``create_msa_feat`` chain over the raw paired
-        alignment pool carried on ``input`` and returns a copy whose per-recycle
-        realized slots are filled. Every draw consumes the per-sample ``generator`` so
-        the whole slice is reproducible from the fold seed.
+        alignment tensors supplied by the shared realization boundary. Every draw
+        consumes the per-sample ``generator`` so the whole slice is reproducible from
+        the fold seed.
         """
 
         cfg = self.config.msa
-        device = input.target_feat.device
-        dtype = input.target_feat.dtype
-        (
-            msa_feat,
-            msa_mask,
-            extra_msa_feat,
-            extra_msa_mask,
-            bert_mask,
-            true_msa,
-        ) = realize_multimer_msa_features(
-            input.msa_tokens[0],
-            input.msa_deletions[0],
-            input.msa_profile[0],
+        return realize_multimer_msa_features(
+            msa_tokens,
+            msa_deletions,
+            msa_profile,
             max_msa_clusters=cfg.max_msa_clusters,
             max_extra_msa=cfg.max_extra_msa,
             msa_cluster_features=cfg.msa_cluster_features,
@@ -683,15 +773,6 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             generator=generator,
             device=device,
             dtype=dtype,
-        )
-        return replace(
-            input,
-            msa_feat=msa_feat.unsqueeze(0),
-            msa_mask=msa_mask.unsqueeze(0),
-            extra_msa_feat=extra_msa_feat.unsqueeze(0),
-            extra_msa_mask=extra_msa_mask.unsqueeze(0),
-            bert_mask=bert_mask.unsqueeze(0),
-            true_msa=true_msa.unsqueeze(0),
         )
 
     @torch.inference_mode()
@@ -713,16 +794,17 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
 
         ``generator`` is the injected root RNG (the pipeline resolves any
         ``seed``/``generator`` to it once at the boundary). Each sample draws its own
-        independent 64-bit sub-seed off that root, and per-recycle resampling advances
-        that per-sample generator (mirroring OpenFold's ensemble draw). With
-        ``generator=None`` the fold is still stochastic, drawing from the ambient
+        independent 64-bit sub-seed off that root. Per-recycle resampling and each
+        configured representation-ensemble member advance that per-sample generator.
+        With ``generator=None`` the fold is still stochastic, drawing from the ambient
         default RNG. When ``input`` already carries a realized ``msa_feat`` (the
-        fixed-feature parity injection path) the draw is skipped and the input is
+        precomputed-feature input path) the draw is skipped and the input is
         consumed verbatim.
         """
 
-        if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("num_samples must be a positive integer")
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         if input.aatype.shape[0] != 1:
             raise ValueError("AlphaFold-Multimer fold accepts one canonical system per call")
 
@@ -731,10 +813,10 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         for _ in range(num_samples):
             sample_generator = _sample_generator(generator, device)
             output = self(input, recycling_steps=recycling_steps, generator=sample_generator)
-            predictions.append(self._decode_prediction(output, input))
+            predictions.append(self._decode_multimer_prediction(output, input))
         return FoldResult(predictions=tuple(predictions))
 
-    def _decode_prediction(self, output: AlphaFold2Output, input: AlphaFold2MultimerInput) -> FoldPrediction:
+    def _decode_multimer_prediction(self, output: AlphaFold2Output, input: AlphaFold2MultimerInput) -> FoldPrediction:
         r"""Decode one AF-Multimer forward pass into a canonical ``FoldPrediction``."""
 
         layout = input.layout
@@ -757,7 +839,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                 coordinate_mask[target_index] = True
         structure = Structure(
             system=layout.system,
-            sites=complete_sites,
+            sites=tuple(complete_sites),
             coordinates=coordinates,
             coordinate_mask=coordinate_mask,
         )
@@ -798,8 +880,29 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         )
 
 
-# Amber/OpenMM structure relaxation is a deferred follow-on for a future Tik; fold()
-# returns only the unrelaxed FoldPrediction (§5.2 single-structure contract).
+# ``fold()`` returns an unrelaxed ``FoldPrediction``; callers may apply
+# Amber/OpenMM structure relaxation downstream.
+
+
+class _AlphaFold2RecyclingInput(Protocol):
+    r"""Tensor fields shared by monomer and multimer recycling."""
+
+    aatype: Tensor
+    target_feat: Tensor
+    token_mask: Tensor
+    msa_tokens: Tensor
+    msa_deletions: Tensor
+    msa_profile: Tensor
+    msa_feat: Tensor | None
+    msa_mask: Tensor | None
+    extra_msa_feat: Tensor | None
+    extra_msa_mask: Tensor | None
+    bert_mask: Tensor | None
+    true_msa: Tensor | None
+
+
+_AlphaFold2InputT = TypeVar("_AlphaFold2InputT", bound=_AlphaFold2RecyclingInput)
+_MSARealization = tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
 
 def _sample_generator(root: torch.Generator | None, device: torch.device) -> torch.Generator | None:
@@ -1084,8 +1187,8 @@ def _make_extra_msa_feat(extra_tokens: Tensor, extra_deletions: Tensor, dtype: t
 # ``make_masked_msa`` corrupts over a 22-class alphabet with a Gumbel-max draw;
 # ``nearest_neighbor_clusters`` uses a softmax *soft* assignment (not a hard
 # argmax) and folds ``summarize_clusters`` into the same pass. These are genuine
-# per-family differences, so they live in dedicated multimer helpers rather than
-# flagging the monomer path (memory: shared-module-vs-subclass).
+# monomer/multimer algorithm differences, so dedicated multimer helpers keep the
+# monomer path free of mode-dependent branches.
 # ===========================================================================
 
 
@@ -1132,10 +1235,15 @@ def realize_multimer_msa_features(
     deletions = msa_deletions.to(device=device, dtype=dtype)
     profile = msa_profile.to(device=device, dtype=dtype)
     num_seq, num_res = tokens.shape
-    # Every materialized pool row is valid (the Processor emits a dense pool); the
-    # released pool ``msa_mask`` is therefore all-ones. Carried explicitly so the
-    # Gumbel logits / cluster einsums match the released masked form exactly.
+    # The released multimer pipeline pads every raw pool to at least 512 rows
+    # before sampling. Padded rows carry token/deletion zeroes and a zero mask.
+    min_num_seq = 512
     pool_mask = torch.ones((num_seq, num_res), device=device, dtype=dtype)
+    if num_seq < min_num_seq:
+        pad_rows = min_num_seq - num_seq
+        tokens = F.pad(tokens, (0, 0, 0, pad_rows))
+        deletions = F.pad(deletions, (0, 0, 0, pad_rows))
+        pool_mask = F.pad(pool_mask, (0, 0, 0, pad_rows))
 
     (
         sel_tokens,
@@ -2245,11 +2353,13 @@ class AlphaFold2TemplatePairStackLayer(nn.Module):
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
+            operator_backend=operator_backend,
         )
         self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
+            operator_backend=operator_backend,
         )
         self.feed_forward = EvoformerTransition(pair_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
@@ -2272,9 +2382,8 @@ class AlphaFold2TemplatePairStackLayer(nn.Module):
         return pair + self.feed_forward(pair, pair_mask)
 
     def _ending_node(self, pair: Tensor, pair_mask: Tensor) -> Tensor:
-        # The unified TriangleAttention never transposes internally (TRUNK_EINSUM_LOCK.md §3): the
-        # ending node attends over the transposed residue axes, so the caller flips ``(-3, -2)`` (and
-        # the mask's last two) around the call and flips the output back.
+        # TriangleAttention preserves the input residue-axis orientation. Ending-node attention
+        # therefore transposes the pair and mask residue axes around the call, then restores them.
         end_pair_mask = pair_mask.transpose(-2, -1)
         return self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
 
@@ -2833,9 +2942,9 @@ class AlphaFold2MultimerTemplateEmbedding(nn.Module):
 
     Runs :class:`AlphaFold2MultimerSingleTemplateEmbedding` over every template, averages
     the per-template pair activations, applies ReLU, and projects to the pair channel.
-    Backbone unit vectors come from the processor's precomputed ``template_backbone_frame``
-    rigid; the cross-chain ``multichain_mask`` restricts template features to same-asym
-    residue pairs, matching OpenFold's ``multichain_mask_2d``.
+    Backbone unit vectors are built from atom37 coordinates in the model graph; the
+    cross-chain ``multichain_mask`` restricts template features to same-asym residue
+    pairs, matching the released DeepMind multimer implementation.
     """
 
     def __init__(
@@ -2899,26 +3008,80 @@ class AlphaFold2MultimerTemplateEmbedding(nn.Module):
 def _template_backbone_unit_vector(input: AlphaFold2MultimerInput) -> tuple[Tensor, Tensor]:
     r"""Return the pairwise backbone unit vector and per-residue backbone mask per template.
 
-    Mirrors OpenFold ``TemplateEmbedderMultimer``: with the per-residue backbone rigid ``Tᵢ``
+    Mirrors DeepMind ``SingleTemplateEmbedding``: with the per-residue backbone rigid ``Tᵢ``
     (rotation ``Rᵢ``, CA translation ``tᵢ``), the pairwise unit vector is
     ``normalize(Rᵢᵀ (tⱼ − tᵢ))`` -- the direction from residue ``i`` to residue ``j`` expressed
     in ``i``'s local frame. Shapes: unit vector ``[B, S_t, N, N, 3]``, mask ``[B, S_t, N]``.
-
-    Faithfulness note: this requires ``template_backbone_frame`` to carry the real Gram-Schmidt
-    N/CA/C frame. The current processor writes an identity-rotation placeholder, so the vector
-    reduces to ``normalize(tⱼ − tᵢ)``; a numerically faithful template golden needs the
-    processor to emit the true backbone rotation.
     """
 
-    frame = input.template_backbone_frame
-    rotation = frame[..., :3, :3]  # [B, S_t, N, 3, 3]
-    translation = frame[..., :3, 3]  # [B, S_t, N, 3]
-    difference = translation.unsqueeze(-3) - translation.unsqueeze(-2)  # t_j - t_i : [B, S_t, Ni, Nj, 3]
-    # local[i, j, m] = sum_c R_i[c, m] * (t_j - t_i)[c]  ==  (R_iᵀ (t_j - t_i))[m]
-    local = torch.einsum("...icm,...ijc->...ijm", rotation, difference)
-    norm = torch.sqrt(local.square().sum(dim=-1, keepdim=True).clamp_min(1e-12))
-    unit_vector = local / norm
-    return unit_vector, input.template_backbone_frame_mask
+    positions = input.template_all_atom_positions
+    output_dtype = positions.dtype
+    compute_dtype = torch.float32 if output_dtype in (torch.float16, torch.bfloat16) else output_dtype
+    positions = positions.to(dtype=compute_dtype)
+
+    n = residue_constants.atom_order["N"]
+    ca = residue_constants.atom_order["CA"]
+    c = residue_constants.atom_order["C"]
+    translation = positions[..., ca, :]
+    x_axis = _multimer_normalize_vector(positions[..., c, :] - translation)
+    n_axis = positions[..., n, :] - translation
+
+    # Preserve the released JAX CUDA graph's component order and single-rounding geometry.
+    projection = n_axis[..., 1] * x_axis[..., 1]
+    projection = torch.addcmul(projection, n_axis[..., 0], x_axis[..., 0])
+    projection = torch.addcmul(projection, n_axis[..., 2], x_axis[..., 2])
+    y_axis = (n_axis.to(torch.float64) - projection.to(torch.float64).unsqueeze(-1) * x_axis.to(torch.float64)).to(
+        dtype=compute_dtype
+    )
+    y_axis = _multimer_normalize_vector(y_axis)
+
+    x_axis_double = x_axis.to(torch.float64)
+    y_axis_double = y_axis.to(torch.float64)
+    z_axis = torch.stack(
+        [
+            x_axis_double[..., 1] * y_axis_double[..., 2] - (x_axis[..., 2] * y_axis[..., 1]).to(torch.float64),
+            x_axis_double[..., 2] * y_axis_double[..., 0] - (x_axis[..., 0] * y_axis[..., 2]).to(torch.float64),
+            x_axis_double[..., 0] * y_axis_double[..., 1] - (x_axis[..., 1] * y_axis[..., 0]).to(torch.float64),
+        ],
+        dim=-1,
+    ).to(dtype=compute_dtype)
+    inverse_rotation = torch.stack([x_axis, y_axis, z_axis], dim=-1).transpose(-1, -2)
+
+    inverse_translation = inverse_rotation[..., 0] * translation[..., 0].unsqueeze(-1)
+    inverse_translation = torch.addcmul(
+        inverse_translation,
+        inverse_rotation[..., 1],
+        translation[..., 1].unsqueeze(-1),
+    )
+    inverse_translation = torch.addcmul(
+        inverse_translation,
+        inverse_rotation[..., 2],
+        translation[..., 2].unsqueeze(-1),
+    )
+    inverse_translation = -inverse_translation
+
+    transformed_points = inverse_rotation[..., 1].unsqueeze(-2) * translation[..., 1].unsqueeze(-2).unsqueeze(-1)
+    transformed_points = torch.addcmul(
+        transformed_points,
+        inverse_rotation[..., 0].unsqueeze(-2),
+        translation[..., 0].unsqueeze(-2).unsqueeze(-1),
+    )
+    transformed_points = torch.addcmul(
+        transformed_points,
+        inverse_rotation[..., 2].unsqueeze(-2),
+        translation[..., 2].unsqueeze(-2).unsqueeze(-1),
+    )
+    unit_vector = _multimer_normalize_vector(transformed_points + inverse_translation.unsqueeze(-2))
+    atom_mask = input.template_all_atom_mask
+    backbone_mask = atom_mask[..., n] * atom_mask[..., ca] * atom_mask[..., c]
+    return unit_vector.to(dtype=output_dtype), backbone_mask.to(dtype=output_dtype)
+
+
+def _multimer_normalize_vector(value: Tensor) -> Tensor:
+    squared_norm = value[..., 1].square()
+    squared_norm = torch.addcmul(squared_norm, value[..., 0], value[..., 0])
+    squared_norm = torch.addcmul(squared_norm, value[..., 2], value[..., 2])
+    return value / torch.sqrt(squared_norm.clamp_min(1e-12)).unsqueeze(-1)
 
 
 class AlphaFold2MultimerTemplateSingleEmbedding(nn.Module):
@@ -3401,8 +3564,9 @@ class AlphaFold2Input:
 
     Under the released stochastic-fold contract the Processor lowers only the
     **raw alignment pool** and the full-MSA HHblits profile; the Model draws the
-    clustered/extra MSA feature realizations itself, once per recycle, off its
-    per-sample generator (see :meth:`AlphaFold2Model.fold`). The realized 49- and
+    clustered/extra MSA feature realizations itself, once per configured ensemble
+    member and recycle, off its per-sample generator (see
+    :meth:`AlphaFold2Model.fold`). The realized 49- and
     25-channel tensors are therefore *not* part of the input contract.
 
     Tensor shapes: ``aatype`` and ``residue_index`` are ``[B, N]``; target features
@@ -3415,8 +3579,8 @@ class AlphaFold2Input:
     represent absent evidence without skipping those stacks.
 
     ``msa_feat`` / ``msa_mask`` / ``extra_msa_feat`` / ``extra_msa_mask`` are
-    internal per-recycle realized slots the Model fills via
-    :func:`dataclasses.replace`; they are ``None`` on Processor output.
+    internal per-recycle realized slots the Model fills on a shallow per-realization
+    input copy; they are ``None`` on Processor output.
     """
 
     aatype: Tensor
@@ -3500,12 +3664,13 @@ class AlphaFold2MultimerInput:
     [B, M, N]`` long restype ids in ``0..21`` -- ``20`` unknown, ``21`` gap, row 0
     the concatenated query; ``msa_deletions [B, M, N]`` per-cell insertion counts;
     ``msa_profile [B, N, 22]`` the full-pool per-column frequency). The Model draws
-    the clustered/extra realization itself, once per recycle, off its per-sample
-    generator (see :meth:`AlphaFold2MultimerModel.fold`). ``msa_feat`` / ``msa_mask``
+    the clustered/extra realization itself, once per configured ensemble member and
+    recycle, off its per-sample generator (see
+    :meth:`AlphaFold2MultimerModel.fold`). ``msa_feat`` / ``msa_mask``
     / ``extra_msa_feat`` / ``extra_msa_mask`` / ``bert_mask`` / ``true_msa`` are
-    internal per-recycle realized slots the Model fills via
-    :func:`dataclasses.replace`; they are ``None`` on Processor output. When a
-    realized ``msa_feat`` is present (the fixed-feature parity injection path) the
+    internal per-recycle realized slots the Model fills on a shallow per-realization
+    input copy; they are ``None`` on Processor output. When a
+    realized ``msa_feat`` is present (the precomputed-feature input path) the
     Model consumes the input verbatim and skips the draw.
     """
 

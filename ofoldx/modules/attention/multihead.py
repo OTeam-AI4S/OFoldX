@@ -20,7 +20,7 @@ class GatedMultiheadAttention(nn.Module):
 
     Wraps a [`MultiheadAttentionProjection`][ofoldx.modules.attention.multihead.MultiheadAttentionProjection]
     and dispatches the scaled-dot-product core to the resolved operator backend
-    (``oops`` fused kernels or a pure-PyTorch reference). This is the shared attention block used by the trunk,
+    (OOps-owned dispatch or a pure-PyTorch reference). This is the shared attention block used by the trunk,
     atom, and diffusion stacks; higher-level modules supply the pair-derived ``biases``.
 
     Args:

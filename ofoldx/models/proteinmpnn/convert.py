@@ -21,7 +21,7 @@ from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
 CA_EDGE_INPUT_WIDTH = 167
 
 
-def convert_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
+def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
     r"""Translate every live released ProteinMPNN tensor to its native name.
 
     The released Cα checkpoints contain five parameters whose outputs are never
@@ -107,7 +107,7 @@ def convert_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
     return converted
 
 
-def convert_checkpoint(
+def convert_proteinmpnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -141,7 +141,7 @@ def convert_checkpoint(
         ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
     )
     model = ProteinMpnnModel(config)
-    model.load_state_dict(convert_state_dict(state_dict), strict=True, assign=True)
+    model.load_state_dict(convert_proteinmpnn_state_dict(state_dict), strict=True, assign=True)
     processor = ProteinMpnnProcessor(ProteinMpnnProcessorConfig(ca_only=config.ca_only))
     ProteinMpnnPipeline(model=model, processor=processor).save(
         output_dir,
@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    convert_checkpoint(
+    convert_proteinmpnn_checkpoint(
         args.checkpoint,
         args.output_dir,
         repo_id=args.repo_id,

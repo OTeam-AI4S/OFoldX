@@ -10,12 +10,12 @@ from ofoldx.data import (
     PolymerSequence,
     get_component,
 )
-from ofoldx.data.components import _AUDITED_COMPONENTS
+from ofoldx.data.components import _BUILTIN_COMPONENTS
 
 # DESIGN.md 3.2.1: the package-audited set is exactly 31 IDs -- the 21 protein components
 # (the 20 standard residues plus the wwPDB CCD ``UNK`` placeholder) and 10 nucleic
 # components (8 standard CCD graphs plus the ``N`` / ``DN`` generated placeholders).
-_AUDITED_PROTEIN_IDS = frozenset(
+_BUILTIN_PROTEIN_IDS = frozenset(
     {
         "ALA",
         "ARG",
@@ -40,8 +40,8 @@ _AUDITED_PROTEIN_IDS = frozenset(
         "UNK",
     }
 )
-_AUDITED_NUCLEIC_IDS = frozenset({"A", "C", "G", "U", "DA", "DC", "DG", "DT", "N", "DN"})
-_AUDITED_IDS = _AUDITED_PROTEIN_IDS | _AUDITED_NUCLEIC_IDS
+_BUILTIN_NUCLEIC_IDS = frozenset({"A", "C", "G", "U", "DA", "DC", "DG", "DT", "N", "DN"})
+_BUILTIN_IDS = _BUILTIN_PROTEIN_IDS | _BUILTIN_NUCLEIC_IDS
 
 
 def _undirected_bonds(bonds: frozenset[ChemicalBond]) -> set[tuple[frozenset[str], float, bool]]:
@@ -185,17 +185,17 @@ def test_partial_observation_needs_no_ccd_graph_and_filters_by_element() -> None
 
 
 def test_audited_component_set_is_exactly_thirty_one_ids() -> None:
-    assert len(_AUDITED_PROTEIN_IDS) == 21
-    assert len(_AUDITED_NUCLEIC_IDS) == 10
-    assert len(_AUDITED_IDS) == 31
-    assert set(_AUDITED_COMPONENTS) == _AUDITED_IDS
+    assert len(_BUILTIN_PROTEIN_IDS) == 21
+    assert len(_BUILTIN_NUCLEIC_IDS) == 10
+    assert len(_BUILTIN_IDS) == 31
+    assert set(_BUILTIN_COMPONENTS) == _BUILTIN_IDS
 
-    for component_id in _AUDITED_IDS:
+    for component_id in _BUILTIN_IDS:
         assert get_component(component_id).component_id == component_id
 
 
 def test_audited_components_are_self_contained_complete_graphs() -> None:
-    for component_id in _AUDITED_IDS:
+    for component_id in _BUILTIN_IDS:
         component = get_component(component_id)
         atom_ids = {atom.atom_id for atom in component.atoms}
 

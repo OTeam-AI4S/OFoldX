@@ -10,15 +10,17 @@ Processor config. This module owns only the ``ligand_mpnn`` context architecture
 ``ligandmpnn_v_32_{005,010,020,030}_25.pt`` checkpoints, which share one graph and differ only in their
 training coordinate-noise label. The released side-chain checkpoint belongs to
 `ofoldx.models.mpnn_packer`, and the label-conditioned ``global_label_membrane_mpnn`` /
-``per_residue_label_membrane_mpnn`` checkpoints are a distinct architecture (a live node embedding, no
-context layers) owned by the frozen §4.9 membrane vertical; their unique tensors are unrecognized here and
-raise rather than mis-map onto the ligand context keys.
+``per_residue_label_membrane_mpnn`` checkpoints form a distinct architecture with a live node embedding and
+no context layers; their unique tensors are unrecognized here and raise rather than map onto ligand-context
+keys.
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping
 from os import PathLike
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -285,3 +287,30 @@ def convert_ligandmpnn_checkpoint(
         token=token,
         private=private,
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    r"""Convert one released LigandMPNN checkpoint from the command line."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    convert_ligandmpnn_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
+if __name__ == "__main__":
+    main()

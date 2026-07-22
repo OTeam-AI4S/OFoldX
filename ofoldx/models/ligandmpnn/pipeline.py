@@ -13,9 +13,9 @@ from typing_extensions import Self
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io import read_pdb
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, PackResult
+from ..mpnn_pdb import read_mpnn_pdb
 from .model import LigandMpnnModel
 from .processor import LigandMpnnProcessor
 
@@ -32,8 +32,7 @@ def _candidate_protein_sequences(
     Packer; it never forwards logits, ranks, interface masks, or feature tensors.
     Candidate systems partition changed copies within each original entity exactly as
     the designer realizes them, so reading instances here follows that realization
-    without a second split. TODO(§3.4.1 reopened): revisit if entity splitting gains
-    a distinct instance-identity contract.
+    without a second split.
     """
 
     sequences: dict[str, tuple[str, ...]] = {}
@@ -44,19 +43,8 @@ def _candidate_protein_sequences(
     return sequences
 
 
-class LigandMpnnPipeline(PairedPipeline):
+class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
     r"""Bind one LigandMpnn Model-Processor pair for biological operations."""
-
-    model: LigandMpnnModel
-    processor: LigandMpnnProcessor
-
-    def __init__(
-        self,
-        *,
-        model: LigandMpnnModel,
-        processor: LigandMpnnProcessor,
-    ) -> None:
-        super().__init__(model=model, processor=processor)
 
     def design(
         self,
@@ -79,7 +67,7 @@ class LigandMpnnPipeline(PairedPipeline):
     ) -> DesignResult:
         r"""Design sequences over selected positions with ligand and residue context."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
@@ -90,9 +78,9 @@ class LigandMpnnPipeline(PairedPipeline):
             ligand_interface_cutoff=ligand_interface_cutoff,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.design(
-            batch,
+            features,
             num_candidates=num_candidates,
             temperature=temperature,
             coordinate_noise=coordinate_noise,
@@ -116,16 +104,16 @@ class LigandMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return sequence-conditioned autoregressive probabilities over orders."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.autoregressive_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             coordinate_noise=coordinate_noise,
             use_side_chain_context=use_side_chain_context,
@@ -148,16 +136,16 @@ class LigandMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return order-dependent sequence-free autoregressive probabilities."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.sequence_free_autoregressive_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             coordinate_noise=coordinate_noise,
             use_side_chain_context=use_side_chain_context,
@@ -179,15 +167,15 @@ class LigandMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return target-last conditional probabilities for every row."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.conditional_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             coordinate_noise=coordinate_noise,
             use_side_chain_context=use_side_chain_context,
@@ -209,15 +197,15 @@ class LigandMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return target-first sequence-free probabilities for every row."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=batch.backbone_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.backbone_coordinates.device)
         return self.model.unconditional_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             coordinate_noise=coordinate_noise,
             use_side_chain_context=use_side_chain_context,
@@ -280,8 +268,8 @@ class LigandMpnnDesignAndPackPipeline:
     ) -> tuple[DesignResult, tuple[PackResult, ...]]:
         r"""Design sequences on one canonical Structure and pack each candidate."""
 
-        structure = read_pdb(input) if isinstance(input, (str, PathLike)) else input
-        design_input = self.designer.processor.process_structure(
+        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
+        features = self.designer.processor.process_structure(
             structure,
             positions=positions,
             conditions=conditions,
@@ -292,10 +280,10 @@ class LigandMpnnDesignAndPackPipeline:
             ligand_interface_cutoff=ligand_interface_cutoff,
             filter_by_occupancy=filter_by_occupancy,
         )
-        device = design_input.valid_mask.device
+        device = features.valid_mask.device
         generator = resolve_generator(seed, generator, device=device)
         design_result = self.designer.model.design(
-            design_input,
+            features,
             num_candidates=num_candidates,
             temperature=temperature,
             coordinate_noise=coordinate_noise,
@@ -305,8 +293,8 @@ class LigandMpnnDesignAndPackPipeline:
         if repack_everything:
             packing_positions: Sequence[ComponentReference] | None = None
         else:
-            references = design_input.component_references
-            selected = (design_input.valid_mask[0] & design_input.design_mask[0]).tolist()
+            references = features.component_references
+            selected = (features.valid_mask[0] & features.design_mask[0]).tolist()
             packing_positions = [
                 reference for reference, keep in zip(references, selected) if keep and reference is not None
             ]

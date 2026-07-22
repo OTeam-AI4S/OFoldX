@@ -1,10 +1,4 @@
-r"""
-AlphaFold 2 configuration.
-
-The public surface contains only values that construct the released computation.
-Runtime placement, operator dispatch, checkpointing, loss weights, and source
-checkpoint metadata are deliberately absent.
-"""
+r"""Configuration objects for AlphaFold 2 monomer and multimer models."""
 
 from __future__ import annotations
 
@@ -59,10 +53,9 @@ class AlphaFold2TriangleMultiplicationConfig(Config):
 
 class AlphaFold2EvoformerIterationConfig(Config):
     r"""
-    One official Evoformer iteration's module-level knobs.
+    Module-level settings for one Evoformer iteration.
 
-    These fields all alter a constructed module or its released dropout behavior.
-    The released graph uses one shared width/head/dropout specification for the
+    The graph uses one shared width/head/dropout specification for the
     two triangle orientations and one MSA head count for row and column attention.
     """
 
@@ -240,15 +233,13 @@ class AlphaFold2HeadsConfig(Config):
 
 
 class AlphaFold2MSAConfig(Config):
-    r"""Released predict-mode stochastic MSA realization constants.
+    r"""Stochastic MSA realization settings.
 
-    Under the frozen stochastic-fold contract the *Model* (not the Processor)
-    realizes MSA features once per recycle from the raw alignment pool carried on
-    :class:`AlphaFold2Input`: ``sample_msa`` -> ``make_masked_msa`` ->
+    The Model realizes MSA features once per representation-ensemble member and
+    recycle from the raw alignment pool carried by :class:`AlphaFold2Input`:
+    ``sample_msa`` -> ``make_masked_msa`` ->
     ``nearest_neighbor_clusters`` / ``summarize_clusters`` -> ``crop_extra_msa`` ->
-    ``make_msa_feat``. These fields therefore live on the model config beside the
-    computation that consumes them; every value is a DeepMind/OpenFold ``predict``
-    constant (OpenFold ``config.py`` predict preset + ``input_pipeline.py``).
+    ``make_msa_feat``.
     """
 
     max_msa_clusters: int = 512
@@ -261,7 +252,6 @@ class AlphaFold2MSAConfig(Config):
     masked_msa_uniform_prob: float = 0.10
     masked_msa_profile_prob: float = 0.10
     masked_msa_same_prob: float = 0.10
-    num_ensemble: int = 1
 
 
 class AlphaFold2Config(Config):
@@ -269,6 +259,8 @@ class AlphaFold2Config(Config):
     Configuration for [`AlphaFold2Model`][ofoldx.models.alphafold2.AlphaFold2Model].
 
     The nested fields expose AF2's executable architectural boundaries.
+    ``num_ensembles`` is model-level because every member repeats the complete
+    embedding and Evoformer trunk before representation averaging.
     """
 
     input_embedding: AlphaFold2InputEmbeddingConfig = AlphaFold2InputEmbeddingConfig()
@@ -279,6 +271,7 @@ class AlphaFold2Config(Config):
     msa: AlphaFold2MSAConfig = AlphaFold2MSAConfig()
 
     recycling_steps: int = 4
+    num_ensembles: int = 1
 
 
 class AlphaFold2ProcessorConfig(Config):
@@ -292,27 +285,14 @@ class AlphaFold2ProcessorConfig(Config):
     max_templates: int = 4
 
 
-# ===========================================================================
 # AlphaFold-Multimer configuration.
-#
-# Sibling config classes to the monomer surface above. The registry forbids two
-# Model classes sharing one Model config class (``registry.py:76-78``), so the
-# multimer Model needs its own ``config_class``; it reuses the shared recycling and
-# Evoformer groups defined above and locks the multimer-specific values drawn from
-# OpenFold's ``multimer_config_update`` (``openfold/config.py:800``).
-#
-# The public surface follows the same exclusions as the monomer config: no runtime
-# placement, operator dispatch, checkpointing, loss weights, or source-checkpoint
-# metadata.
-# ===========================================================================
 
 
 class AlphaFold2MultimerStructureModuleHeadConfig(AlphaFold2StructureModuleHeadConfig):
     r"""AF-Multimer structure module surface.
 
-    Identical to the monomer surface except the backbone translation scale, which the
-    released multimer graph sets to ``20`` (``openfold/config.py`` multimer
-    ``trans_scale_factor``) versus the monomer ``10``.
+    Identical to the monomer surface except for a backbone translation scale of
+    ``20`` rather than ``10``.
     """
 
     position_scale: float = 20.0
@@ -325,7 +305,7 @@ class AlphaFold2MultimerInputEmbeddingConfig(Config):
     ``max_relative_idx`` bounds the within-chain relative position one-hot and
     ``max_relative_chain`` bounds the cross-chain (asym) relative index. When
     ``use_chain_relative`` is set the positional encoding also carries a
-    same-entity flag, matching OpenFold ``InputEmbedderMultimer``.
+    same-entity flag.
     """
 
     target_feature_size: int = 21
@@ -361,8 +341,8 @@ class AlphaFold2MultimerMaskedMSAHeadConfig(Config):
     r"""
     Masked-MSA reconstruction head config.
 
-    The multimer masked-MSA head emits ``22`` classes, not the monomer ``23``
-    (``openfold/config.py:963``).
+    The multimer masked-MSA head emits ``22`` classes rather than the monomer's
+    ``23``.
     """
 
     num_output: int = 22
@@ -373,8 +353,8 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
     Predicted-aligned-error / weighted-pTM head config.
 
     The multimer TM head is always enabled and additionally produces an interface
-    ipTM branch. ``ranking_score`` is the released ``weighted_ptm_score``
-    ``iptm_weight * iptm + ptm_weight * ptm`` (``openfold/model/heads.py:82-88``).
+    ipTM branch. ``ranking_score`` is
+    ``iptm_weight * iptm + ptm_weight * ptm``.
     """
 
     enabled: bool = True
@@ -389,8 +369,7 @@ class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
     r"""
     Chain center-of-mass head config.
 
-    Part of the released module set (``openfold/config.py:974``); inference-inert
-    but present so a strict checkpoint load sees its parameters.
+    This head is inference-inert but remains part of the parameterized module set.
     """
 
     enabled: bool = True
@@ -415,20 +394,15 @@ class AlphaFold2MultimerHeadsConfig(Config):
 
 
 class AlphaFold2MultimerMSAConfig(Config):
-    r"""Released AlphaFold-Multimer stochastic MSA realization constants.
+    r"""AlphaFold-Multimer stochastic MSA realization settings.
 
-    Under the frozen stochastic-fold contract the *Model* (not the Processor)
-    realizes MSA features once per recycle from the raw alignment pool carried on
-    :class:`AlphaFold2MultimerInput`, mirroring OpenFold's multimer
-    ``ensembled_transform_fns``: ``sample_msa`` (Gumbel argsort, row-0 preserved via
+    The Model realizes MSA features once per representation-ensemble member and
+    recycle from the raw alignment pool carried by
+    :class:`AlphaFold2MultimerInput`: ``sample_msa`` (Gumbel argsort, row 0
+    preserved via
     ``cluster_bias_mask``) -> ``make_masked_msa`` (22-class Gumbel-max BERT, *before*
     clustering) -> ``nearest_neighbor_clusters`` (softmax soft assignment) ->
-    ``create_msa_feat``. Every value is a DeepMind/OpenFold multimer ``predict``
-    constant (``multimer_config_update`` + base ``masked_msa`` block). The extra-MSA
-    axis is cropped inside ``sample_msa`` itself, so there is no separate crop step.
-
-    ``max_msa_clusters`` / ``max_extra_msa`` are the ``model_[1-3]_multimer_v3``
-    predict values (508 / 2048); the earlier ``_v2`` presets used 252 / 1152.
+    ``create_msa_feat``. The extra-MSA axis is cropped inside ``sample_msa``.
     """
 
     max_msa_clusters: int = 508
@@ -441,7 +415,6 @@ class AlphaFold2MultimerMSAConfig(Config):
     masked_msa_uniform_prob: float = 0.10
     masked_msa_profile_prob: float = 0.10
     masked_msa_same_prob: float = 0.10
-    num_ensemble: int = 1
 
 
 class AlphaFold2MultimerConfig(Config):
@@ -451,12 +424,14 @@ class AlphaFold2MultimerConfig(Config):
 
     The nested groups reuse the shared recycling and Evoformer trunk unchanged and
     lock the multimer-specific input-embedding, template, and head values.
+    ``num_ensembles`` is model-level because every member repeats the complete
+    embedding and Evoformer trunk before representation averaging.
     """
 
     input_embedding: AlphaFold2MultimerInputEmbeddingConfig = AlphaFold2MultimerInputEmbeddingConfig()
     recycling: AlphaFold2RecyclingConfig = AlphaFold2RecyclingConfig()
-    # AF-Multimer applies the outer-product-mean at the START of every Evoformer /
-    # extra-MSA iteration (OpenFold ``opm_first=True``); the monomer default is opm-last.
+    # AF-Multimer applies outer-product mean before the other Evoformer updates;
+    # the monomer configuration applies it last.
     evoformer: AlphaFold2EvoformerConfig = AlphaFold2EvoformerConfig(
         {"iteration": {"outer_product_mean": {"first": True}}}
     )
@@ -464,7 +439,7 @@ class AlphaFold2MultimerConfig(Config):
     heads: AlphaFold2MultimerHeadsConfig = AlphaFold2MultimerHeadsConfig()
     msa: AlphaFold2MultimerMSAConfig = AlphaFold2MultimerMSAConfig()
 
-    recycling_steps: int = 4
+    recycling_steps: int = 21
     num_ensembles: int = 1
 
 

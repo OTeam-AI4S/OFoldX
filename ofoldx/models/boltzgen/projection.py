@@ -1,11 +1,11 @@
-r"""Design-mask <-> placement-core projection for BoltzGen structure design.
+r"""Project BoltzGen residue design masks to and from placement records.
 
-The lossless projection between a per-output-residue design-mask surface and the frozen
-shared placement core (:data:`~ofoldx.data.placement.PlacementSpec`). ``from_design_mask``
-folds a per-residue mask into maximal designed / fixed runs; ``to_design_mask`` unfolds a
-realized placement core back onto per-realized-row designed-ness. Named losses: a designed
-non-polymer (de-novo ligand) has no core spelling (GAP-1) and per-residue pinned identity is
-carried by a separate conditioning record, not by this projection.
+``from_design_mask`` collapses a per-residue mask into maximal generated-polymer segments
+and contiguous spans of existing components in a
+:data:`~ofoldx.data.placement.PlacementSpec`. ``to_design_mask`` expands those placements
+through a :data:`~ofoldx.data.placement.PlacementMap` to recover designedness for each
+realized row. The representation cannot encode generated non-polymers such as de-novo
+ligands, and per-residue pinned identity remains in a separate conditioning record.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from ...data.placement import (
     PlacementMap,
     PlacementSpec,
     PlacementValue,
-    validate_placement,
 )
 
 
@@ -33,8 +32,8 @@ class DesignMaskResidue:
     * a DESIGNED (generated) residue — ``designed=True``, ``polymer_type`` set, ``source=None``;
     * a FIXED (source/context) residue — ``designed=False``, ``source=(instance_id, index)`` set.
 
-    ``designed=True`` with ``polymer_type=None`` is the GAP-1 designed-non-polymer case and is
-    rejected by :func:`from_design_mask` (a de-novo ligand is not spellable in the core).
+    ``designed=True`` with ``polymer_type=None`` represents a generated non-polymer and is
+    rejected by :func:`from_design_mask` because :class:`PlacementValue` cannot encode it.
     """
 
     designed: bool
@@ -73,9 +72,11 @@ def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> 
             raise ValueError(f"designed placement {placement_id!r} carries a source reference")
         return GeneratedSegment(polymer_type, len(run), len(run))
 
-    sources = [residue.source for residue in run]
-    if any(source is None for source in sources):
-        raise ValueError(f"fixed placement {placement_id!r} has a residue with no source reference")
+    sources: list[ComponentReference] = []
+    for residue in run:
+        if residue.source is None:
+            raise ValueError(f"fixed placement {placement_id!r} has a residue with no source reference")
+        sources.append(residue.source)
     instance_id = sources[0][0]
     start = sources[0][1]
     for offset, source in enumerate(sources):
@@ -93,7 +94,7 @@ def from_design_mask(
     group_of: Callable[[int], str],
     placement_id_of: Callable[[int], str],
 ) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto the shared placement core.
+    r"""Project a per-output-residue design mask onto a :class:`PlacementSpec`.
 
     Args:
         residues: The per-output-residue mask cells, in output order (see :class:`DesignMaskResidue`).
@@ -106,8 +107,9 @@ def from_design_mask(
     Returns:
         The realized :data:`~ofoldx.data.placement.PlacementSpec`: maximal designed runs →
         :class:`GeneratedSegment` (exact length), maximal fixed runs → :class:`ExistingSpan`.
-        Interleaving is preserved as ordered placements within each group. Lossless for the
-        polymer surface; see module docstring for the named losses.
+        Interleaving is preserved as ordered placements within each group. The projection
+        preserves the information expressible by :class:`GeneratedSegment` and
+        :class:`ExistingSpan`; see the module docstring for its representational limits.
     """
 
     placement: PlacementSpec = {}
@@ -140,7 +142,6 @@ def from_design_mask(
         run.append(residue)
     _flush()
 
-    validate_placement(placement)  # frozen §3.7 global-uniqueness gate (redundant but explicit)
     return placement
 
 
@@ -148,26 +149,26 @@ def to_design_mask(
     placement: PlacementSpec,
     placement_map: PlacementMap,
 ) -> tuple[list[bool], list[str]]:
-    r"""Project a realized placement core back onto a per-realized-row design mask.
+    r"""Project realized placements back onto a per-realized-row design mask.
 
-    Walks ``placement`` in frozen declared order (outer group, then inner placement) and, for
+    Walks ``placement`` in declaration order (outer group, then inner placement) and, for
     each placement, emits one row per realized occurrence in ``placement_map``: ``True`` for a
     :class:`GeneratedSegment` occurrence, ``False`` for an :class:`ExistingSpan` occurrence, with
     the declaration-group label carried per row. Symmetry/copy expansion (a placement whose
     occurrences span more than one realized instance id) yields one row per occurrence, so the
-    result is over the REALIZED rows, matching the frozen ``placement_map`` order.
+    result covers the realized rows in ``placement_map`` occurrence order.
 
     Returns:
         ``(res_design_mask, per_row_group)`` — a per-realized-row designed-ness flag and the
-        owning declaration-group label. Lossless given ``placement_map``; per-residue pinned
-        identity is NOT carried (a separate conditioning record — see module docstring).
+        owning declaration-group label. ``placement_map`` supplies the realized expansion;
+        per-residue pinned identity is carried separately, as described in the module docstring.
     """
 
     res_design_mask: list[bool] = []
     per_row_group: list[str] = []
     for group, placements in placement.items():
         for placement_id, value in placements.items():
-            designed = type(value) is GeneratedSegment
+            designed = isinstance(value, GeneratedSegment)
             occurrences = placement_map[group][placement_id]
             for _ in occurrences:
                 res_design_mask.append(designed)

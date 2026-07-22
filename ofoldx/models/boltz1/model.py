@@ -2,10 +2,10 @@ r"""
 Boltz-1 model.
 
 This module implements the native Boltz-1 structure-prediction path: token/atom input embedding, recycling
-trunk, optional MSA update, distogram head, EDM coordinate sampling, and the released Boltz-1 confidence/ranking
-head family.
+trunk, optional MSA update, distogram head, EDM coordinate sampling, and the released Boltz-1 confidence and
+ranking heads.
 
-The family is registered as ``ofoldx.boltz1``: alongside the differentiable ``forward`` training graph it
+The implementation is registered as ``ofoldx.boltz1``: alongside the differentiable ``forward`` training graph it
 exposes the public ``fold`` task, which runs the released reverse-diffusion path and decodes a self-contained
 canonical ``FoldResult`` from the raw ``Boltz1Output`` produced by its ``Boltz1Processor`` lowering.
 """
@@ -13,6 +13,7 @@ canonical ``FoldResult`` from the raw ``Boltz1Output`` produced by its ``Boltz1P
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -32,7 +33,7 @@ from ...modules.atom.transfer import TokenPairToLocalAtomPairBroadcast, TokenToA
 from ...modules.atom.window import gather_key_windows
 from ...modules.attention import GatedMultiheadAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
-from ...modules.diffusion.conditioning import condition_pair, condition_single
+from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.embedding.fourier import FrozenFourierEmbedding
 from ...modules.embedding.position import RelativePositionEmbedder, generate_relative_position_features
@@ -355,8 +356,9 @@ class Boltz1Model(nn.Module):
 
         """
 
-        if type(num_samples) is not int or num_samples < 1:
-            raise ValueError("num_samples must be a positive integer")
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz1Model.fold accepts one molecular system per call")
         if input.layout is None:
@@ -494,11 +496,11 @@ class Boltz1Model(nn.Module):
     def _trunk(self, input: Boltz1Input, *, recycling_steps: int | None = None) -> _Boltz1Representations:
         r"""
         Iterate the recycling loop: recycle-project the running single/pair, fold in the MSA module (when
-        present), and run the Pairformer, for ``recycling_steps + 1`` cycles.
+        present), and run the Pairformer for ``recycling_steps`` total passes.
 
         Args:
             input: The Boltz-1 input batch.
-            recycling_steps: Number of extra recycles beyond the first pass; defaults to the configured value.
+            recycling_steps: Total number of trunk passes; defaults to the configured value.
 
         Returns:
             The final trunk [`_Boltz1Representations`][ofoldx.models.boltz1.model._Boltz1Representations].
@@ -506,8 +508,9 @@ class Boltz1Model(nn.Module):
         """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if type(recycling_steps) is not int or recycling_steps < 1:
-            raise ValueError("recycling_steps must be a positive integer")
+        recycling_steps = operator.index(recycling_steps)
+        if recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
         single_inputs, single_init, pair_init, relative_position_encoding = self._initial_representations(input)
         token_mask = input.token_mask
         pair_mask = pair_mask_from_token_mask(token_mask)
@@ -941,7 +944,7 @@ class AtomEncoder(nn.Module):
         mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
         space_id = pad_atoms(reference_space_id)
         uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
-        uid_keys = to_keys(space_id.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).long()
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
         pair_bias = None
@@ -1201,7 +1204,7 @@ class DiffusionConditioning(nn.Module):
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
-            num_conditioning_transitions=num_conditioning_transitions,
+            num_transitions=num_conditioning_transitions,
         )
         self.atom_encoder = AtomEncoder(
             atom_feature_size=atom_feature_size,
@@ -1291,56 +1294,6 @@ class DiffusionConditioning(nn.Module):
             "atom_dec_bias": atom_dec_bias,
             "token_trans_bias": token_trans_bias,
         }
-
-
-class PairwiseConditioning(nn.Module):
-    r"""
-    Condition the trunk pair representation with the relative-position encoding (Algorithm 21).
-
-    Args:
-        pair_size: Width of the trunk pair representation.
-        relative_position_size: Width of the relative-position encoding concatenated onto the pair.
-        num_conditioning_transitions: Number of transition blocks refining the conditioned pair.
-        transition_expansion: Inner-width expansion factor of each transition block.
-    """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        relative_position_size: int = 128,
-        num_conditioning_transitions: int = 2,
-        transition_expansion: int = 2,
-    ) -> None:
-        super().__init__()
-        self.init_projection = nn.Sequential(
-            LayerNorm(pair_size + relative_position_size),
-            nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
-        )
-        self.transitions = nn.ModuleList(
-            Transition(pair_size, expansion=transition_expansion) for _ in range(num_conditioning_transitions)
-        )
-
-    def forward(self, pair_trunk: Tensor, relative_position_encoding: Tensor) -> Tensor:
-        r"""
-        Concatenate ``pair_trunk`` and the relative-position encoding, project back to ``pair_size``, then refine
-        with the transition stack. Both inputs and the output are ``(B, N, N, pair_size)``.
-
-        Args:
-            pair_trunk: `[B, N, N, pair_size]` trunk pair representation to condition.
-            relative_position_encoding: `[B, N, N, relative_position_size]` relative-position encoding concatenated
-                onto the pair before projection.
-
-        Returns:
-            The `[B, N, N, pair_size]` conditioned pair representation.
-        """
-
-        return condition_pair(
-            pair_trunk,
-            relative_position_encoding,
-            norm=self.init_projection[0],
-            projection=self.init_projection[1],
-            transitions=self.transitions,
-        )
 
 
 class AtomDiffusion(nn.Module):
@@ -2691,9 +2644,7 @@ def _boltz1_steering_features(input: Boltz1Input, *, atom_features: Tensor) -> d
 
     device = atom_features.device
     return {
-        "atom_to_token": torch.nn.functional.one_hot(
-            input.atom_to_token.to(torch.long), num_classes=input.token_mask.shape[-1]
-        ).to(device=device, dtype=torch.float32),
+        "atom_to_token": input.atom_to_token.to(device=device),
         "asym_id": input.chain_index.to(device=device, dtype=torch.long),
         "atom_pad_mask": input.atom_mask.to(device=device),
         "ref_element": atom_features[..., 5:133].to(device=device),
@@ -3319,9 +3270,7 @@ class VDWOverlapPotential(DistancePotential, FlatBottomPotential):
             Tuple ``(pair_index, (k, lower_bounds, None), None)``; ``pair_index`` is empty when no atoms remain.
         """
 
-        atom_chain_id = (
-            torch.bmm(feats["atom_to_token"].float(), feats["asym_id"].unsqueeze(-1).float()).squeeze(-1).long()
-        )[0]
+        atom_chain_id = feats["asym_id"].gather(1, feats["atom_to_token"])[0]
         atom_pad_mask = feats["atom_pad_mask"][0].bool()
         if not torch.any(atom_pad_mask):
             pair_index = torch.empty(2, 0, dtype=torch.long, device=atom_chain_id.device)
@@ -3372,9 +3321,7 @@ class SymmetricChainCOMPotential(DistancePotential, FlatBottomPotential):
             over chain centers of mass.
         """
 
-        atom_chain_id = (
-            torch.bmm(feats["atom_to_token"].float(), feats["asym_id"].unsqueeze(-1).float()).squeeze(-1).long()
-        )[0]
+        atom_chain_id = feats["asym_id"].gather(1, feats["atom_to_token"])[0]
         atom_pad_mask = feats["atom_pad_mask"][0].bool()
         pair_index = feats["symmetric_chain_index"][0]
         if pair_index.shape[1] == 0 or not torch.any(atom_pad_mask):
@@ -3741,8 +3688,8 @@ def _boltz1_confidence_scores(
     token_mask = input.token_mask.repeat_interleave(multiplicity, 0).to(plddt)
     complex_plddt = (plddt * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp_min(1)
 
-    chain_type = _chain_type_for_confidence(input, multiplicity, plddt.device)
-    is_ligand_token = (chain_type == 3).to(plddt)
+    molecule_type = _molecule_type_for_confidence(input, multiplicity, plddt.device)
+    is_ligand_token = (molecule_type == 3).to(plddt)
     is_contact = (distances < 8).to(plddt)
     chain_index = input.chain_index.repeat_interleave(multiplicity, 0)
     is_different_chain = (chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2)).to(plddt)
@@ -3873,9 +3820,9 @@ def _compute_boltz1_ptm_scores(
         dim=1,
     ).values
 
-    chain_type = _chain_type_for_confidence(input, multiplicity, pae_logits.device)
-    is_ligand = (chain_type == 3).to(pae_logits)
-    is_protein = (chain_type == 0).to(pae_logits)
+    molecule_type = _molecule_type_for_confidence(input, multiplicity, pae_logits.device)
+    is_ligand = (molecule_type == 3).to(pae_logits)
+    is_protein = (molecule_type == 0).to(pae_logits)
     ligand_mask = pair_mask_iptm * (
         is_ligand[:, :, None] * is_protein[:, None, :] + is_protein[:, :, None] * is_ligand[:, None, :]
     )
@@ -3926,11 +3873,14 @@ def _predicted_frame_mask(pred_coords: Tensor, *, input: Boltz1Input, multiplici
         multiplicity: Number of samples per input.
 
     Returns:
-        A `[B*mult, N]` mask of tokens with a usable frame (falls back to the token mask when frames are absent).
+        A `[B*mult, N]` mask of tokens with a usable frame.
+
+    Raises:
+        ValueError: If either required frame field is absent.
     """
 
     if input.frame_atom_index is None or input.frame_mask is None:
-        return input.token_mask.repeat_interleave(multiplicity, 0)
+        raise ValueError("Boltz-1 confidence scoring requires both frame_atom_index and frame_mask")
     frame_index = input.frame_atom_index.repeat_interleave(multiplicity, 0).to(
         device=pred_coords.device, dtype=torch.long
     )
@@ -3947,23 +3897,20 @@ def _predicted_frame_mask(pred_coords: Tensor, *, input: Boltz1Input, multiplici
     return frame_mask & non_collinear & input.token_mask.repeat_interleave(multiplicity, 0).to(frame_mask.device)
 
 
-def _chain_type_for_confidence(input: Boltz1Input, multiplicity: int, device: torch.device) -> Tensor:
+def _molecule_type_for_confidence(input: Boltz1Input, multiplicity: int, device: torch.device) -> Tensor:
     r"""
-    Resolve the per-token chain/molecule type used to classify ligand/protein tokens for confidence.
+    Repeat the per-token molecule type used to classify ligand/protein tokens for confidence.
 
     Args:
-        input: The Boltz-1 input batch (prefers ``chain_type``, falls back to ``molecule_type``).
+        input: The Boltz-1 input batch.
         multiplicity: Number of samples per input.
         device: Target device.
 
     Returns:
-        A `[B*mult, N]` long tensor of chain types (all zeros when neither field is present).
+        A `[B*mult, N]` long tensor of molecule types.
     """
 
-    chain_type = input.chain_type if input.chain_type is not None else input.molecule_type
-    if chain_type is None:
-        return torch.zeros_like(input.token_mask, dtype=torch.long).repeat_interleave(multiplicity, 0).to(device)
-    return chain_type.repeat_interleave(multiplicity, 0).to(device=device, dtype=torch.long)
+    return input.molecule_type.repeat_interleave(multiplicity, 0).to(device=device, dtype=torch.long)
 
 
 def _decode_boltz1_fold_result(output: Boltz1Output, input: Boltz1Input) -> FoldResult:
@@ -4027,14 +3974,14 @@ def _decode_boltz1_fold_result(output: Boltz1Output, input: Boltz1Input) -> Fold
         coordinate_mask[model_to_complete] = True
         structure = Structure(
             system=layout.system,
-            sites=complete_sites,
+            sites=tuple(complete_sites),
             coordinates=complete_coordinates,
             coordinate_mask=coordinate_mask,
         )
 
         sample_scores: dict[str, Score] = {}
         if complex_plddt is not None:
-            # Published pLDDT is on the cross-family 0-100 scale; the released expected pLDDT is 0-1.
+            # Published pLDDT uses the shared 0-100 scale; the released expected pLDDT is 0-1.
             sample_scores["plddt"] = Score(float(complex_plddt[sample_index]) * 100.0, preferred="higher")
         if complex_iplddt is not None:
             sample_scores["iplddt"] = Score(float(complex_iplddt[sample_index]) * 100.0, preferred="higher")
@@ -4138,21 +4085,9 @@ class _Boltz1Representations:
 
 
 # ---------------------------------------------------------------------------
-# Tensor boundary of the released Boltz-1 model graph.
-#
-# Formerly ``ofoldx/models/boltz1/contract.py``; folded in verbatim. Anchors the
-# Boltz-1 tensor boundary in one place, matching the AlphaFold 2 and AlphaFold 3
-# ``contract.py`` verticals: the pure-tensor input, the raw output, the canonical
-# identity layout, the trunk-embedding value, and the family-owned pocket record.
+# Tensor boundary of the released Boltz-1 model graph: the pure-tensor input,
+# raw output, canonical identity layout, trunk-embedding value, and pocket record.
 # ---------------------------------------------------------------------------
-
-# Boltz-1 pocket one-hot classes (config ``pocket_feature_size == 4``); mirrors upstream
-# ``const.py`` ``pocket_contact_info`` labels: UNSPECIFIED, UNSELECTED, POCKET, BINDER.
-_POCKET_UNSPECIFIED = 0
-_POCKET_UNSELECTED = 1
-_POCKET_POCKET = 2
-_POCKET_BINDER = 3
-_POCKET_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -4219,8 +4154,7 @@ class Boltz1Input:
         msa_profile: `[B, N, vocab_size]` MSA profile feature.
         deletion_mean: `[B, N]` mean-deletion feature.
         token_bonds: `[B, N, N]` inter-token bond indicator.
-        molecule_type: Optional `[B, N]` per-token molecule type.
-        chain_type: Optional `[B, N]` per-token chain type (preferred over ``molecule_type`` for confidence).
+        molecule_type: `[B, N]` per-token molecule type.
         target_positions: Optional `[B, M, 3]` ground-truth atom positions.
         target_mask: Optional `[B, M]` ground-truth validity mask.
         frame_atom_index: Optional `[B, N, 3]` three-atom frame indices per token.
@@ -4273,8 +4207,7 @@ class Boltz1Input:
     msa_profile: Tensor
     deletion_mean: Tensor
     token_bonds: Tensor
-    molecule_type: Tensor | None = None
-    chain_type: Tensor | None = None
+    molecule_type: Tensor
     target_positions: Tensor | None = None
     target_mask: Tensor | None = None
     frame_atom_index: Tensor | None = None

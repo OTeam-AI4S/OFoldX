@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .molecular import PolymerSequence
+from .molecular import MolecularSystem, PolymerSequence
 from .structure import Structure
 
 
@@ -128,6 +128,67 @@ class MSACollection:
                 raise ValueError("target_instance_ids must have one entry per MSA")
             if len(set(self.target_instance_ids)) != len(self.target_instance_ids):
                 raise ValueError("target_instance_ids must be pairwise unique")
+
+
+def msa_bindings(msa: MSA | MSACollection) -> tuple[tuple[MSA, str | None], ...]:
+    r"""Return each MSA column with its exact instance target, or ``None`` for broadcast."""
+
+    columns = (msa,) if isinstance(msa, MSA) else msa.msas
+    targets = (
+        (None,) * len(columns) if isinstance(msa, MSA) or msa.target_instance_ids is None else msa.target_instance_ids
+    )
+    return tuple(zip(columns, targets))
+
+
+def resolve_msa_bindings(
+    msa: MSA | MSACollection,
+    system: MolecularSystem,
+) -> tuple[tuple[MSA, str | None, PolymerSequence], ...]:
+    r"""Close MSA entity/instance references over one molecular system."""
+
+    resolved: list[tuple[MSA, str | None, PolymerSequence]] = []
+    for column, target_instance_id in msa_bindings(msa):
+        entity = system.entities.get(column.entity_id)
+        if not isinstance(entity, PolymerSequence):
+            raise ValueError(f"MSA entity {column.entity_id!r} is not a polymer entity in the input system")
+        if target_instance_id is not None:
+            target_entity_id = system.instances.get(target_instance_id)
+            if target_entity_id is None:
+                raise ValueError(f"MSA targets unknown input instance {target_instance_id!r}")
+            if target_entity_id != column.entity_id:
+                raise ValueError(
+                    f"MSA target instance {target_instance_id!r} belongs to entity "
+                    f"{target_entity_id!r}, not {column.entity_id!r}"
+                )
+        width = len(column.unpaired_sequences[0])
+        if width != len(entity):
+            raise ValueError(
+                f"MSA for entity {column.entity_id!r} spans {width} columns but the entity has {len(entity)} components"
+            )
+        resolved.append((column, target_instance_id, entity))
+    return tuple(resolved)
+
+
+def msa_binding_map(msa: MSA | MSACollection) -> dict[tuple[str, str | None], MSA]:
+    r"""Index MSA columns by ``(entity_id, exact_instance_or_none)``."""
+
+    return {(column.entity_id, target_instance_id): column for column, target_instance_id in msa_bindings(msa)}
+
+
+def select_msa_binding(
+    bindings: dict[tuple[str, str | None], MSA],
+    entity_id: str,
+    instance_id: str,
+) -> tuple[tuple[str, str | None], MSA] | None:
+    r"""Select an exact-instance MSA column, falling back to entity broadcast."""
+
+    exact = (entity_id, instance_id)
+    if exact in bindings:
+        return exact, bindings[exact]
+    broadcast = (entity_id, None)
+    if broadcast in bindings:
+        return broadcast, bindings[broadcast]
+    return None
 
 
 @dataclass(eq=False)

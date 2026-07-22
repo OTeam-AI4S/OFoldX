@@ -1,3 +1,0 @@
-r"""
-RFdiffusion model tests.
-"""

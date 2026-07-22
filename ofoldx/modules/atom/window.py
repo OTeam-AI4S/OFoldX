@@ -45,7 +45,7 @@ def gather_key_windows(
     r"""
     Gather each query window's overlapping key-atom neighbourhood from a flat ``(B, N, D)`` atom tensor.
 
-    With ``num_valid_atoms`` unset (or below ``num_key_atoms``) the legacy zero-padded fixed window is used:
+    With ``num_valid_atoms`` unset (or below ``num_key_atoms``) the fixed zero-padded window is used:
     a strided ``unfold`` view (O(N), no matmul) equivalent to a one-hot indexing-matrix einsum, with slots
     past the atom range read as zero. With ``num_valid_atoms`` given (and ``>= num_key_atoms``) the DeepMind
     AF3 **clamped/shifted** window is used instead: boundary windows are slid inwards so every key is a real
@@ -210,7 +210,7 @@ class LocalAtomGeometryBuilder(nn.Module):
         position_windows = self.windowing(reference_positions, num_valid_atoms)
         space_windows = self.windowing(reference_space_id.unsqueeze(-1), num_valid_atoms)
         distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
-        distance_mask = (space_windows.query.unsqueeze(-2).int() == space_windows.key.unsqueeze(-3).int()).to(
+        distance_mask = (space_windows.query.unsqueeze(-2) == space_windows.key.unsqueeze(-3)).to(
             dtype=reference_positions.dtype
         )
         return LocalAtomGeometry(
@@ -264,7 +264,7 @@ class LocalAtomWindowing(nn.Module):
             tensor: ``[..., N_atom, C]`` atom-axis tensor.
             num_valid_atoms: Number of real atoms (contiguous at the front). When given (and
                 ``>= num_key_atoms``) the DeepMind AF3 clamped/shifted key window is used, so boundary
-                windows carry a full ``num_key_atoms`` of real keys; otherwise the legacy zero-padded window
+                windows carry a full ``num_key_atoms`` of real keys; otherwise the fixed zero-padded window
                 is used. See [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows].
 
         Returns:

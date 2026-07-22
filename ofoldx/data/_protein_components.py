@@ -1,12 +1,7 @@
-r"""Raw package-owned graph rows for audited protein components.
+r"""Built-in protein component graphs and reference coordinates.
 
-The table explicitly declares zero radical electrons, zero implicit hydrogens, and
-explicit hydrogen atom nodes so each graph is self-contained. Those are package data,
-not a claim that this module independently proves ordinary valence, closed-shell
-plausibility, or toolkit sanitization. It contains the twenty standard residues and
-the wwPDB CCD ``UNK`` unknown-amino-acid placeholder. Construction and public access
-live in ``ofoldx.data.components``; this module is only the audited literal data
-asset.
+The data covers the twenty standard amino acids and the wwPDB CCD ``UNK``
+placeholder. Construction and public access live in :mod:`ofoldx.data.components`.
 """
 
 from __future__ import annotations
@@ -15,11 +10,11 @@ from collections.abc import Mapping
 
 _RawAtom = tuple[str, str, int, bool, str | None]
 _RawBond = tuple[str, str, float, bool]
-_RawComponent = tuple[tuple[_RawAtom, ...], tuple[_RawBond, ...]]
+ComponentRows = tuple[tuple[_RawAtom, ...], tuple[_RawBond, ...]]
 _RawCoordinate = tuple[float, float, float]
 _RawReferenceCoordinates = tuple[tuple[str, _RawCoordinate], ...]
 
-_AUDITED_PROTEIN_COMPONENT_DATA: Mapping[str, _RawComponent] = {
+COMPONENT_ROWS: Mapping[str, ComponentRows] = {
     "ALA": (
         (
             ("N", "N", 0, False, None),
@@ -946,7 +941,7 @@ _AUDITED_PROTEIN_COMPONENT_DATA: Mapping[str, _RawComponent] = {
 # These rows intentionally contain only coordinates published by Biohub. Component
 # construction aligns them to the complete atom tuple; every unlisted site becomes
 # None.
-_AUDITED_PROTEIN_REFERENCE_COORDINATES: Mapping[str, _RawReferenceCoordinates] = {
+REFERENCE_COORDINATE_ROWS: Mapping[str, _RawReferenceCoordinates] = {
     "ALA": (
         ("N", (-0.01003183238208294, -1.2073018550872803, -1.0555061101913452)),
         ("CA", (-0.04190138354897499, 0.17447763681411743, -0.5729365348815918)),

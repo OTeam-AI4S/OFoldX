@@ -86,12 +86,7 @@ class EdmScheduler(nn.Module):
         step_size = 1 / num_sampling_steps
         step_indices = torch.arange(num_sampling_steps + 1, device=device, dtype=dtype)
         maximum = self.max_noise_level if max_noise_level is None else max_noise_level
-        if (
-            isinstance(maximum, bool)
-            or not isinstance(maximum, int | float)
-            or not math.isfinite(maximum)
-            or maximum <= 0
-        ):
+        if not math.isfinite(maximum) or maximum <= 0:
             raise ValueError("max_noise_level must be a finite positive number")
         max_root = maximum ** (1 / self.rho)
         min_root = self.min_noise_level ** (1 / self.rho)

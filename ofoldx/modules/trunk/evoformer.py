@@ -114,6 +114,7 @@ class EvoformerBlock(nn.Module):
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
+            operator_backend=operator_backend,
         )
         self.msa_stack = MsaStack(
             msa_size=msa_size,
@@ -185,7 +186,7 @@ class MsaStack(nn.Module):
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
         msa = msa + self.rowwise_dropout(
-            self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask),
+            self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask),
         )
         if self.msa_column_attention is not None:
             msa = msa + self.msa_column_attention(msa, msa_mask=msa_mask)
@@ -215,11 +216,13 @@ class PairStack(nn.Module):
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
+            operator_backend=operator_backend,
         )
         self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
+            operator_backend=operator_backend,
         )
         self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
@@ -240,9 +243,8 @@ class PairStack(nn.Module):
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
-        # The unified TriangleAttention never transposes internally (TRUNK_EINSUM_LOCK.md §3): the
-        # ending node attends over the transposed residue axes, so the caller flips ``(-3, -2)`` (and
-        # the mask's last two) around the call and flips the output back.
+        # TriangleAttention preserves the input residue-axis orientation. Ending-node attention
+        # therefore transposes the pair and mask residue axes around the call, then restores them.
         end_pair_mask = pair_mask.transpose(-2, -1)
         pair = pair + self.rowwise_dropout(
             self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2),
@@ -277,8 +279,7 @@ class MsaRowAttentionWithPairBias(nn.Module):
             operator_backend=operator_backend,
         )
 
-    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
-        del pair_mask
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor) -> Tensor:
         msa = self.query_norm(msa)
         pair = self.feat_2d_norm(pair)
         pair_bias = self.feat_2d_weights(pair).movedim(-1, -3).unsqueeze(-4)
@@ -408,21 +409,27 @@ class AlphaFold2OuterProductMean(OuterProductMean):
 
     AlphaFold 2 variant of the shared bias-free
     [`OuterProductMean`][ofoldx.modules.trunk.msa.OuterProductMean]: the left/right MSA
-    projections carry a learned bias (all AF3-lineage checkpoints leave them bias-free). The
-    biased projections force the ``eager`` backend, since the fused ``oops`` kernel takes no bias
-    tensors. Everything else — pre-LayerNorm, divide-after-projection (``count + eps``) normalisation
-    and the affine output projection — is inherited unchanged from the shared module, whose ``forward``
-    already forwards ``left_projection.bias`` / ``right_projection.bias`` to the eager backend path.
+    projections carry a learned bias (all AF3-lineage checkpoints leave them bias-free). Everything
+    else — pre-LayerNorm, divide-after-projection (``count + eps``) normalisation and the affine output
+    projection — is inherited unchanged from the shared module. OOps owns the biased implementation.
     """
 
-    def __init__(self, *, msa_size: int, pair_size: int, hidden_size: int, eps: float = 1e-3) -> None:
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        hidden_size: int,
+        eps: float = 1e-3,
+        operator_backend: str = "auto",
+    ) -> None:
         super().__init__(
             msa_size=msa_size,
             hidden_size=hidden_size,
             pair_size=pair_size,
             eps=eps,
             divide_before_projection=False,
-            operator_backend="eager",
+            operator_backend=operator_backend,
         )
         self.left_projection = nn.Linear(msa_size, hidden_size)
         self.right_projection = nn.Linear(msa_size, hidden_size)
@@ -435,12 +442,11 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
     AlphaFold 2 variant of the shared bias-free
     [`TriangleMultiplication`][ofoldx.modules.attention.triangle.TriangleMultiplication]: all six
     projections (left/right value, left/right gate, output, and the input gate) carry a learned bias,
-    where every AF3-lineage checkpoint leaves them bias-free. The biased projections force the
-    ``eager`` backend, since the fused ``oops`` kernel takes no bias tensors. Everything else — the
+    where every AF3-lineage checkpoint leaves them bias-free. Everything else — the
     canonical incoming/outgoing contraction ``"...kih,...kjh->...ijh"`` / ``"...ikh,...jkh->...ijh"``
     (left owns row ``i``, right owns column ``j``), the input/output LayerNorms and the gated output
     projection — is inherited unchanged from the shared module, whose ``forward`` already forwards
-    each projection's ``.bias`` to the eager backend path.
+    each projection's ``.bias`` to the selected backend. OOps owns the biased implementation.
 
     Because the shared module fixes the operand order (left→``i``, right→``j``) for both directions,
     the AlphaFold 2 *incoming* converter must load DeepMind/OpenFold ``left_projection``/``left_gate``
@@ -449,12 +455,19 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
     ``ofoldx/models/alphafold2/converters``.
     """
 
-    def __init__(self, *, pair_size: int, hidden_size: int, outgoing: bool) -> None:
+    def __init__(
+        self,
+        *,
+        pair_size: int,
+        hidden_size: int,
+        outgoing: bool,
+        operator_backend: str = "auto",
+    ) -> None:
         super().__init__(
             pair_size=pair_size,
             hidden_size=hidden_size,
             outgoing=outgoing,
-            operator_backend="eager",
+            operator_backend=operator_backend,
         )
         self.left_projection = nn.Linear(pair_size, hidden_size)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size)
@@ -472,11 +485,11 @@ class AlphaFold2TriangleAttention(TriangleAttention):
     [`TriangleAttention`][ofoldx.modules.attention.triangle.TriangleAttention]: the attention output
     projection and the output gate carry a learned bias (``gate_bias_init=1.0`` opens the gate near
     init), where every AF3-lineage checkpoint leaves them bias-free. The biased gate/output keep the
-    module off the flash ``triangle_attention`` kernel, which requires bias-free projections; the
+    module on the generic backend route rather than the OOps-owned bias-free ``triangle_attention`` callable; the
     attention core still dispatches to whatever ``operator_backend`` resolves to, applying the gate and
     output bias in the (backend-agnostic) head merge. ``transpose_bias`` stays ``False`` — the OpenFold
     convention, matching DeepMind's own AlphaFold 2 ending node — and the row/column direction is set by
-    the caller orienting ``pair`` (never inside this module). See TRUNK_EINSUM_LOCK.md §3.
+    the caller orienting ``pair``; this module always preserves the orientation it receives.
     """
 
     def __init__(self, *, pair_size: int, head_dim: int, num_attention_heads: int, operator_backend: str) -> None:

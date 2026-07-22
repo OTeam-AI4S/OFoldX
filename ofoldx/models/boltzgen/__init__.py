@@ -1,4 +1,4 @@
-r"""BoltzGen structure-design and inverse-folding family, its Processors, Pipeline, and registration."""
+r"""BoltzGen structure-design and inverse-folding implementations."""
 
 from __future__ import annotations
 
@@ -17,9 +17,10 @@ from .config import (
 )
 from .model import (
     BoltzGenBinding,
-    BoltzGenDesignCandidate,
     BoltzGenContact,
+    BoltzGenDesignCandidate,
     BoltzGenDesignMask,
+    BoltzGenDesignResult,
     BoltzGenIFoldInput,
     BoltzGenIFoldModel,
     BoltzGenIFoldOutput,
@@ -28,76 +29,33 @@ from .model import (
     BoltzGenOutput,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
-    BoltzGenDesignResult,
     BoltzGenSchema,
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
     BoltzGenSymmetry,
 )
-from .pipeline import BoltzGenPipeline
+from .pipeline import BoltzGenFoldModel, BoltzGenPipeline, BoltzGenScoreModel, BoltzGenStageProcessor
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
 from .projection import DesignMaskResidue, from_design_mask, to_design_mask
 
-__all__ = [
-    "BoltzGenConfig",
-    "BoltzGenDiffusionConfig",
-    "BoltzGenIFoldConfig",
-    "BoltzGenIFoldModuleConfig",
-    "BoltzGenInputEmbedderConfig",
-    "BoltzGenSamplerConfig",
-    "BoltzGenStructureDesignConfig",
-    "BoltzGenTemplateConfig",
-    "BoltzGenTrunkConfig",
-    "BoltzGenModel",
-    "BoltzGenIFoldModel",
-    "BoltzGenProcessor",
-    "BoltzGenIFoldProcessor",
-    "BoltzGenPipeline",
-    "BoltzGenInput",
-    "BoltzGenIFoldInput",
-    "BoltzGenOutput",
-    "BoltzGenIFoldOutput",
-    "BoltzGenDesignResult",
-    "BoltzGenDesignCandidate",
-    "BoltzGenSchema",
-    "BoltzGenBinding",
-    "BoltzGenContact",
-    "BoltzGenSymmetry",
-    "BoltzGenSecondaryStructure",
-    "BoltzGenResidueConstraint",
-    "BoltzGenStructureGroup",
-    "BoltzGenPlacements",
-    "BoltzGenDesignMask",
-    "DesignMaskResidue",
-    "from_design_mask",
-    "to_design_mask",
-]
-
-# Two registered pairs, one per architecture (their Processor call signature and input type
-# differ, satisfying the §7 "separate arch only on signature/type difference" test). The three
-# structure checkpoints (diverse / adherence / structuretrained-small) are weight variants of
-# the one ``BoltzGenModel`` architecture — one arch, multiple checkpoints, not separate pairs.
-#
-# ``standard_tasks=()`` for both: BoltzGen design is a multi-stage family operation, not a
-# single-Model standard verb. The ``design`` verb resolves through the concrete family
-# ``BoltzGenPipeline``, a DESIGN §7.4 multi-pair Pipeline: the structure-design pair owns the
-# runnable root, the inverse-fold pair lives at ``ifold/``, and the optional read-only boltz2
-# ``fold/`` / ``affinity/`` stages are optional sub-pairs (declared in its ``_PAIR_LAYOUT``). It is
-# registered below, so a marked repository's ``design`` routes through the factory's multi-pair
-# loader (``from_repository``) instead of the one-pair ``(model, processor)`` call.
-MODELS.register(
+# Design loads the structure and inverse-folding pairs through the concrete multi-pair pipeline.
+MODELS.register_model(
     "ofoldx.boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
+    processor_config=None,
     standard_tasks=(),
 )
-MODELS.register(
+MODELS.register_model(
     "ofoldx.boltzgen_ifold",
     model=BoltzGenIFoldModel,
     processor=BoltzGenIFoldProcessor,
+    processor_config=None,
     standard_tasks=(),
 )
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.boltzgen",
     pipeline=BoltzGenPipeline,
+    tasks=("design",),
+    repository_loader=BoltzGenPipeline.from_repository,
 )

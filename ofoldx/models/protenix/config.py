@@ -43,7 +43,7 @@ class ProtenixConstraintConfig(ProtenixConfig):
 
     Flips ``constraints`` to ``True`` so the four-branch constraint pair-bias
     embedder is built. Every other field is inherited unchanged from the
-    parity-frozen base shape; the constraint checkpoint always carries all four
+    base graph; the constraint checkpoint always carries all four
     embedders (they were trained jointly), so this is one checkpoint-variant
     selector, not four independently toggleable features.
     """
@@ -57,13 +57,14 @@ class ProtenixProcessorConfig(Config):
     ``constraints`` is a record-only marker of which checkpoint contract this
     config pairs with; it does NOT gate keyword acceptance. The accept/reject
     split between the default and constraint Processors is carried entirely by the
-    two distinct ``__call__`` signatures (DESIGN §3.7.2): the default
+    two distinct ``__call__`` signatures: the default
     :class:`~ofoldx.models.protenix.processor.ProtenixProcessor` signature omits the
     constraint keywords, so passing them raises ``TypeError`` at the call boundary.
     """
 
     constraints: bool = False
     max_msa_rows: int = 16384
+    augment_reference_positions: bool = True
 
 
 class ProtenixConstraintProcessorConfig(ProtenixProcessorConfig):

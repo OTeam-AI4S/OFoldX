@@ -8,7 +8,6 @@ Euler and Heun solvers, stochastic churn, per-step center-random augmentation, a
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,11 +16,9 @@ from torch import Tensor, nn
 
 from ..atom import LocalAtomGeometry
 from ..embedding import RelativePositionBuckets
-from ..geometry import uniform_random_rotation, weighted_rigid_align
+from ..geometry import uniform_random_rotation
 from .schedule import EdmScheduler
-from .types import CoordinateDenoisingInput
-
-_CoordinateDenoiseFn = Callable[[CoordinateDenoisingInput], Tensor]
+from .types import CoordinateDenoiseFn, CoordinateDenoisingInput
 
 
 @dataclass
@@ -261,17 +258,9 @@ class CoordinateEdmSampler(nn.Module):
         min_churn_noise_level: Churn is only applied while the next noise level exceeds this threshold.
         noise_scale: Multiplier on the injected churn noise standard deviation.
         step_scale: Multiplier on each solver step (the "gradient scaling" trick that over-steps the ODE).
-        low_noise_step_scale: Alternate ``step_scale`` used below ``low_noise_step_scale_threshold``; ``None``
-            disables the low-noise override and reuses ``step_scale`` everywhere.
-        low_noise_step_scale_threshold: Noise level below which ``low_noise_step_scale`` replaces ``step_scale``.
         center_random_augmentation: If ``True``, apply a random rigid augmentation (plus centering) each step;
             otherwise only center.
         reverse_augmentation: If ``True``, reverse each per-step random rigid augmentation after the solver update.
-        sample_noise_before_augmentation: If ``True``, draw the churn noise before augmenting the coords rather
-            than after.
-        alignment_reverse_diff: If ``True``, weighted-rigid-align the churned (noisy) coords onto the denoised
-            coords mid-step (before the ODE derivative), as the Boltz-family reverse-diffusion loops do. Defaults
-            to ``False`` so existing callers (ODesign / AlphaFold3 / Protenix) keep their exact behavior.
 
     Raises:
         ValueError: If ``solver`` is not ``"euler"`` or ``"heun"``.
@@ -295,12 +284,8 @@ class CoordinateEdmSampler(nn.Module):
         min_churn_noise_level: float = 1.0,
         noise_scale: float = 1.003,
         step_scale: float = 1.5,
-        low_noise_step_scale: float | None = None,
-        low_noise_step_scale_threshold: float = 0.65,
         center_random_augmentation: bool = True,
         reverse_augmentation: bool = False,
-        sample_noise_before_augmentation: bool = False,
-        alignment_reverse_diff: bool = False,
     ) -> None:
         super().__init__()
         if solver not in {"euler", "heun"}:
@@ -311,13 +296,8 @@ class CoordinateEdmSampler(nn.Module):
         self.min_churn_noise_level = min_churn_noise_level
         self.noise_scale = noise_scale
         self.step_scale = step_scale
-        self.low_noise_step_scale = step_scale if low_noise_step_scale is None else low_noise_step_scale
-        self.use_low_noise_step_scale = low_noise_step_scale is not None
-        self.low_noise_step_scale_threshold = low_noise_step_scale_threshold
         self.center_random_augmentation = center_random_augmentation
         self.reverse_augmentation = reverse_augmentation
-        self.sample_noise_before_augmentation = sample_noise_before_augmentation
-        self.alignment_reverse_diff = alignment_reverse_diff
 
     def augment_target(
         self,
@@ -364,7 +344,7 @@ class CoordinateEdmSampler(nn.Module):
 
     def forward(
         self,
-        denoise: _CoordinateDenoiseFn,
+        denoise: CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         num_samples: int = 1,
@@ -423,7 +403,7 @@ class CoordinateEdmSampler(nn.Module):
 
     def _sample(
         self,
-        denoise: _CoordinateDenoiseFn,
+        denoise: CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         num_samples: int,
@@ -460,6 +440,8 @@ class CoordinateEdmSampler(nn.Module):
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         if sample_chunk_size is not None and sample_chunk_size < 1:
             raise ValueError(f"sample_chunk_size must be positive, got {sample_chunk_size}")
+        if (condition_coords is None) != (condition_mask is None):
+            raise ValueError("condition_coords and condition_mask must be provided together")
         noise_schedule = self.scheduler(
             num_sampling_steps=num_sampling_steps,
             device=context.device,
@@ -509,10 +491,7 @@ class CoordinateEdmSampler(nn.Module):
                 coords = self._apply_condition(coords, chunk_condition_coords, condition_mask)
             num_transitions = noise_schedule.size(0) - 1
             for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
-                noise = None
                 augmentation_transform = None
-                if self.sample_noise_before_augmentation:
-                    noise = torch.empty_like(coords).normal_(generator=generator)
                 if self.center_random_augmentation:
                     coords, augmentation_transform = self._center_random_augmentation(
                         coords,
@@ -529,8 +508,7 @@ class CoordinateEdmSampler(nn.Module):
                             target=coords,
                         )
                     coords = self._apply_condition(coords, step_condition_coords, condition_mask)
-                if noise is None:
-                    noise = torch.empty_like(coords).normal_(generator=generator)
+                noise = torch.empty_like(coords).normal_(generator=generator)
                 coords = self._step(
                     denoise,
                     coords,
@@ -659,13 +637,13 @@ class CoordinateEdmSampler(nn.Module):
 
     def _step(
         self,
-        denoise: _CoordinateDenoiseFn,
+        denoise: CoordinateDenoiseFn,
         coords: Tensor,
         sigma_prev: Tensor,
         sigma_next: Tensor,
         *,
         context: CoordinateDenoiseContext,
-        noise: Tensor | None = None,
+        noise: Tensor,
         condition_coords: Tensor | None = None,
         condition_mask: Tensor | None = None,
         is_terminal: bool = False,
@@ -682,7 +660,7 @@ class CoordinateEdmSampler(nn.Module):
             sigma_prev: Noise level at the start of the step.
             sigma_next: Noise level at the end of the step.
             context: Static conditioning tensors.
-            noise: Optional pre-drawn churn noise; drawn internally when ``None``.
+            noise: Pre-drawn churn noise sampled after coordinate augmentation.
             condition_coords: Optional coords to keep fixed during denoising, already in the current frame.
             condition_mask: Optional atom mask selecting the fixed coords.
             is_terminal: If ``True``, skip the Heun correction even for the Heun solver.
@@ -699,15 +677,13 @@ class CoordinateEdmSampler(nn.Module):
         sigma_hat = sigma_prev * (churn + 1)
         delta_noise = torch.sqrt(sigma_hat**2 - sigma_prev**2)
 
-        if noise is None:
-            noise = torch.randn_like(coords)
         if condition_mask is not None:
             noise = torch.where(
                 _atom_mask_for_coords(condition_mask, noise).bool(),
                 torch.zeros_like(noise),
                 noise,
             )
-        noisy_coords = coords + self._churn_increment(delta_noise, noise)
+        noisy_coords = coords + self.noise_scale * delta_noise * noise
         if condition_mask is not None and condition_coords is not None:
             noisy_coords = self._apply_condition(noisy_coords, condition_coords, condition_mask)
 
@@ -723,13 +699,9 @@ class CoordinateEdmSampler(nn.Module):
             noise_level=noise_level,
         )
 
-        if self.alignment_reverse_diff:
-            noisy_coords = self._align_reverse_diff(noisy_coords, denoised_coords, context)
-
         delta = self._derivative(noisy_coords, denoised_coords, noise_level)
         dt = sigma_next - sigma_hat
-        step_scale = self._step_scale(sigma_next)
-        coords_next = noisy_coords + step_scale * dt[..., None, None] * delta
+        coords_next = noisy_coords + self.step_scale * dt[..., None, None] * delta
         if condition_mask is not None and condition_coords is not None:
             coords_next = self._apply_condition(coords_next, condition_coords, condition_mask)
         if self.solver == "euler" or is_terminal:
@@ -745,71 +717,19 @@ class CoordinateEdmSampler(nn.Module):
             noise_level=next_noise_level,
         )
         next_delta = self._derivative(coords_next, next_denoised_coords, next_noise_level)
-        coords_next = noisy_coords + step_scale * dt[..., None, None] * 0.5 * (delta + next_delta)
+        coords_next = noisy_coords + self.step_scale * dt[..., None, None] * 0.5 * (delta + next_delta)
         if condition_mask is not None and condition_coords is not None:
             coords_next = self._apply_condition(coords_next, condition_coords, condition_mask)
         return coords_next
-
-    def _churn_increment(self, delta_noise: Tensor, noise: Tensor) -> Tensor:
-        r"""
-        Return the stochastic-churn coordinate increment added before denoising.
-
-        The base EDM rule injects ``noise_scale * sqrt(sigma_hat^2 - sigma_prev^2) * epsilon``. Subclasses that
-        follow a different churn convention (for example BoltzGen's faithful ``noise_scale^2`` factor) override
-        this single hook so the rest of the step loop stays shared.
-
-        Args:
-            delta_noise: The churn standard deviation ``sqrt(sigma_hat^2 - sigma_prev^2)`` for this step.
-            noise: Pre-drawn standard-normal churn noise, shape `[..., N_sample, N_atom, 3]`.
-
-        Returns:
-            The coordinate increment to add to the current coords.
-        """
-        return self.noise_scale * delta_noise * noise
-
-    def _align_reverse_diff(
-        self, noisy_coords: Tensor, denoised_coords: Tensor, context: CoordinateDenoiseContext
-    ) -> Tensor:
-        r"""
-        Weighted-rigid-align the churned coords onto the denoised coords (Boltz-family reverse-diffusion step).
-
-        Mirrors the Boltz loops' ``weighted_rigid_align(source=noisy, target=denoised, weight=atom_mask)`` run in
-        fp32 and cast back, so the ODE derivative is taken against the aligned frame. Only reached when
-        ``alignment_reverse_diff`` is ``True``.
-
-        Args:
-            noisy_coords: Churned coords, shape `[..., N_sample, N_atom, 3]`.
-            denoised_coords: Denoised coords, same shape.
-            context: Static conditioning tensors (source of ``atom_mask``).
-
-        Returns:
-            The aligned ``noisy_coords``.
-        """
-        num_samples = noisy_coords.shape[-3]
-        weight = _expand_at_dim(context.atom_mask, dim=-2, size=num_samples)
-        aligned = weighted_rigid_align(
-            source=noisy_coords.float(),
-            target=denoised_coords.float(),
-            weight=weight.float(),
-        )
-        return aligned.to(noisy_coords)
 
     @staticmethod
     def _derivative(noisy_coords: Tensor, denoised_coords: Tensor, noise_level: Tensor) -> Tensor:
         r"""Return the EDM ODE derivative ``(noisy - denoised) / sigma`` used by the solver step."""
         return (noisy_coords - denoised_coords) / noise_level[..., None, None]
 
-    def _step_scale(self, sigma_next: Tensor) -> Tensor:
-        r"""Return the per-step scaling, using ``low_noise_step_scale`` below the low-noise threshold."""
-        step_scale = sigma_next.new_tensor(self.step_scale)
-        if not self.use_low_noise_step_scale:
-            return step_scale
-        low_noise_step_scale = sigma_next.new_tensor(self.low_noise_step_scale)
-        return torch.where(sigma_next < self.low_noise_step_scale_threshold, low_noise_step_scale, step_scale)
-
     def _denoise(
         self,
-        denoise: _CoordinateDenoiseFn,
+        denoise: CoordinateDenoiseFn,
         *,
         context: CoordinateDenoiseContext,
         noisy_coords: Tensor,
@@ -914,35 +834,6 @@ class CoordinateEdmSampler(nn.Module):
             condition_coords.to(dtype=coords.dtype),
             coords,
         )
-
-
-class BoltzGenCoordinateEdmSampler(CoordinateEdmSampler):
-    r"""
-    [`CoordinateEdmSampler`][ofoldx.modules.diffusion.sampling.CoordinateEdmSampler] with BoltzGen's churn factor.
-
-    BoltzGen's released reverse-diffusion loop injects the churn noise with an extra ``noise_scale`` factor: it
-    computes ``noise_var = noise_scale^2 * (sigma_hat^2 - sigma_prev^2)`` and then adds
-    ``noise_scale * sqrt(noise_var) * epsilon``, i.e. ``noise_scale^2 * sqrt(sigma_hat^2 - sigma_prev^2) *
-    epsilon`` -- one more ``noise_scale`` than the standard EDM rule. That factor is faithful to upstream (it must
-    stay to keep BoltzGen structure-diffusion parity), so it lives here as a single-hook override rather than a
-    branch in the shared step. Everything else -- schedule walking, augmentation, alignment, the Euler/Heun update
-    -- is inherited unchanged. Pair this subclass with a dilated
-    [`EdmScheduler`][ofoldx.modules.diffusion.schedule.EdmScheduler] variant to reproduce the released design
-    inference schedule.
-
-    Examples:
-        >>> import torch
-        >>> sampler = BoltzGenCoordinateEdmSampler(noise_scale=0.95, step_scale=1.8)
-        >>> delta_noise = torch.tensor(2.0)
-        >>> noise = torch.ones(1, 1, 1, 3)
-        >>> increment = sampler._churn_increment(delta_noise, noise)  # noise_scale**2 * delta_noise
-        >>> bool(torch.allclose(increment, torch.full((1, 1, 1, 3), 0.95**2 * 2.0)))
-        True
-    """
-
-    def _churn_increment(self, delta_noise: Tensor, noise: Tensor) -> Tensor:
-        r"""Inject churn with BoltzGen's faithful ``noise_scale^2 * sqrt(sigma_hat^2 - sigma_prev^2)`` factor."""
-        return (self.noise_scale**2) * delta_noise * noise
 
 
 def _rot_vec_mul(rotation: Tensor, vectors: Tensor) -> Tensor:

@@ -1,9 +1,9 @@
 r"""
-Shared diffusion conditioning helpers.
+Shared diffusion conditioning components.
 
-Functional building blocks that fold trunk single/pair representations together with noise-level and
-relative-position features into the conditioned inputs a coordinate denoiser consumes. The modules doing the actual
-norm/projection/transition work are passed in by the caller so these helpers stay stateless.
+Provides the reusable [`PairwiseConditioning`][ofoldx.modules.diffusion.conditioning.PairwiseConditioning] module
+and lower-level functional helpers for combining trunk representations with noise-level and relative-position
+features.
 """
 
 from __future__ import annotations
@@ -12,6 +12,55 @@ from collections.abc import Iterable
 
 import torch
 from torch import Tensor, nn
+
+from ..backend import LayerNorm
+from ..transition import Transition
+
+
+class PairwiseConditioning(nn.Module):
+    r"""
+    Condition a pair representation with relative-position features.
+
+    Args:
+        pair_size: Width of the pair representation.
+        relative_position_size: Width of the relative-position features concatenated with the pair.
+        num_transitions: Number of transition blocks refining the conditioned pair.
+        expansion: Inner-width expansion factor of each transition block.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        relative_position_size: int = 128,
+        num_transitions: int = 2,
+        expansion: int = 2,
+    ) -> None:
+        super().__init__()
+        self.init_projection = nn.Sequential(
+            LayerNorm(pair_size + relative_position_size),
+            nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
+        )
+        self.transitions = nn.ModuleList(Transition(pair_size, expansion=expansion) for _ in range(num_transitions))
+
+    def forward(self, pair_trunk: Tensor, relative_position_encoding: Tensor) -> Tensor:
+        r"""
+        Project concatenated pair features and refine them with residual transitions.
+
+        Args:
+            pair_trunk: Trunk pair representation ``[..., N_token, N_token, pair_size]``.
+            relative_position_encoding: Relative-position features
+                ``[..., N_token, N_token, relative_position_size]``.
+
+        Returns:
+            Conditioned pair representation ``[..., N_token, N_token, pair_size]``.
+        """
+        return condition_pair(
+            pair_trunk,
+            relative_position_encoding,
+            norm=self.init_projection[0],
+            projection=self.init_projection[1],
+            transitions=self.transitions,
+        )
 
 
 def condition_single(

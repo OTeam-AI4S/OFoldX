@@ -1,49 +1,17 @@
 r"""
-Concrete graph primitives shared by the released MPNN families.
+Concrete graph primitives shared by the released MPNN implementations.
 
-This module owns the exact message-passing blocks, feature graphs, aligned tensor
-carriers, and helper functions reused by more than one released MPNN family.
-Concrete Models, Inputs, Configs, samplers, Pipelines, and family-specific feature
-graphs remain with their families.
+This module owns the exact message-passing blocks, feature graphs, and helper
+functions reused by more than one released MPNN implementation.
+Concrete Models, Inputs, Configs, samplers, Pipelines, and model-specific feature
+graphs remain with their implementations.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-
-@dataclass(eq=False)
-class MpnnOutput:
-    r"""Raw logits and exact causal ranks from an MPNN sequence graph."""
-
-    logits: Tensor
-    decoding_ranks: Tensor
-
-    @property
-    def log_probabilities(self) -> Tensor:
-        r"""Return vocabulary log probabilities without storing a duplicate tensor."""
-
-        return self.logits.log_softmax(dim=-1)
-
-    @property
-    def probabilities(self) -> Tensor:
-        r"""Return vocabulary probabilities without storing a duplicate tensor."""
-
-        return self.logits.softmax(dim=-1)
-
-
-@dataclass(eq=False)
-class MpnnSamplingOutput:
-    r"""Complete aligned tensor output from an MPNN sequence sampler."""
-
-    sequences: Tensor
-    log_probabilities: Tensor
-    sampling_probabilities: Tensor
-    decoding_ranks: Tensor
 
 
 def gather_edges(edges: Tensor, neighbor_indices: Tensor) -> Tensor:
@@ -70,7 +38,7 @@ def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_i
     return torch.cat((neighbor_states, gather_nodes(node_states, neighbor_indices)), dim=-1)
 
 
-def _nearest_neighbors(
+def nearest_neighbors(
     coordinates: Tensor,
     valid_mask: Tensor,
     num_neighbors: int,
@@ -91,7 +59,7 @@ def _nearest_neighbors(
     )
 
 
-def _radial_basis(
+def radial_basis(
     distances: Tensor,
     num_bins: int = 16,
     lower_bound: float = 2.0,
@@ -111,7 +79,7 @@ def _radial_basis(
     return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
 
 
-def _virtual_beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
+def virtual_beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
     r"""Reconstruct the idealized protein Cβ coordinate from N, Cα, and C."""
 
     b = alpha_carbon - nitrogen
@@ -119,7 +87,7 @@ def _virtual_beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor)
     return -0.58273431 * torch.cross(b, c, dim=-1) + 0.56802827 * b - 0.54067466 * c + alpha_carbon
 
 
-def _decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
+def decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
     r"""Convert a residue permutation to aligned lower-is-earlier causal ranks."""
 
     ranks = torch.empty_like(decoding_order)
@@ -131,7 +99,7 @@ def _decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
     return ranks
 
 
-def _autoregressive_masks(
+def autoregressive_masks(
     decoding_ranks: Tensor,
     neighbor_indices: Tensor,
     valid_mask: Tensor,
@@ -301,9 +269,9 @@ class MpnnProteinFeatures(nn.Module):
         alpha_carbon = backbone_coordinates[:, :, 1]
         carbon = backbone_coordinates[:, :, 2]
         oxygen = backbone_coordinates[:, :, 3]
-        beta_carbon = _virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
+        beta_carbon = virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
         atoms = torch.stack((alpha_carbon, nitrogen, carbon, oxygen, beta_carbon), dim=2)
-        neighbor_distances, neighbor_indices = _nearest_neighbors(
+        neighbor_distances, neighbor_indices = nearest_neighbors(
             alpha_carbon,
             valid_mask,
             self.num_neighbors,
@@ -327,7 +295,7 @@ class MpnnProteinFeatures(nn.Module):
             (0, 1, 2, 3, 4, 1, 2, 3, 4, 2, 3, 4, 2, 3, 2, 0, 0, 0, 0, 1, 1, 1, 4, 4, 3),
         ]
         pair_distances = torch.cat((neighbor_distances.unsqueeze(-1), pair_distances[..., 1:]), dim=-1)
-        distance_features = _radial_basis(pair_distances, self.num_rbf).flatten(start_dim=-2)
+        distance_features = radial_basis(pair_distances, self.num_rbf).flatten(start_dim=-2)
 
         neighbor_residue_indices = gather_nodes(residue_indices.unsqueeze(-1), neighbor_indices).squeeze(-1)
         residue_offsets = residue_indices.unsqueeze(-1) - neighbor_residue_indices

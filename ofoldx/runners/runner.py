@@ -36,7 +36,7 @@ class Runner(dl.Runner):
         super().__init__(config)
         # Config-only construction can skip chanfig's ``boot`` (which runs ``post``), so run the
         # curated ``RunnerConfig.post`` validation here before ``build_model`` -- otherwise a missing
-        # ``model.name`` surfaces as ``MODELS.lookup(None)``'s opaque "unknown model architecture".
+        # ``model.name`` surfaces as ``MODELS.lookup_model(None)``'s opaque "unknown model architecture".
         self.config.post()
         self._architecture = ""
         self.model = self.build_model()
@@ -66,7 +66,7 @@ class Runner(dl.Runner):
         from ..models.registry import MODELS
 
         model_config = self.config.model
-        registration = MODELS.lookup(model_config.name)
+        registration = MODELS.lookup_model(model_config.name)
         self._architecture = registration.id
         if model_config.pretrained:
             from ..auto import AutoModel
@@ -88,7 +88,7 @@ class Runner(dl.Runner):
 
             processor = AutoProcessor(model_config.pretrained)
         else:
-            processor = MODELS.lookup(model_config.name).processor()
+            processor = MODELS.lookup_model(model_config.name).processor()
         datasets: dict[str, Any] = {}
         for split, spec in self.config.data.items():
             processor_kwargs = {key: value for key, value in spec.items() if key != "source"}

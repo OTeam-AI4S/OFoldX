@@ -1,8 +1,28 @@
 # Upstream bugs
 
-This document records confirmed bugs in upstream reference implementations that
-OFoldX intentionally does not preserve as scientific behavior. It is an evidence
-log, not a compatibility matrix or a list of unsupported features.
+This document records confirmed bugs in upstream reference implementations,
+including both corrected OFoldX divergences and defects intentionally preserved
+for strict numerical parity. Each entry states which policy applies. It is an
+evidence log, not a compatibility matrix or a list of unsupported features.
+
+## Boltz reference augmentation skips the highest space ID
+
+**Upstream:** `jwohlwend/boltz` and `HannesStark/boltzgen`
+
+**Affected families:** Boltz-1, Boltz-2, and BoltzGen.
+
+**Classification:** confirmed inference-preprocessing defect, intentionally
+preserved by OFoldX for strict upstream parity.
+
+The released reference augmentation loops over `range(space_ids.max())`. Because
+the upper bound is exclusive, the highest reference-space ID is never augmented;
+when zero is the only ID, no reference space is augmented. OFoldX preserves this
+exact loop in all three affected Processors so identical inputs retain identical
+reference features and downstream numerical outputs.
+
+This behavior may be corrected only after the project deliberately selects a
+corrected upstream target and re-establishes end-to-end numerical parity against
+that target. It must not be changed as an isolated cleanup.
 
 ## Boltz-2 affinity molecular weight drops implicit hydrogens
 

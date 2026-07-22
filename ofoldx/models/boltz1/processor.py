@@ -1,4 +1,4 @@
-r"""Canonical molecular-system lowering for the released Boltz-1 structure checkpoint."""
+r"""Input processing for Boltz-1 structure prediction."""
 
 from __future__ import annotations
 
@@ -13,27 +13,25 @@ from multimolecule.io import read_fasta_records
 from torch import Tensor
 from typing_extensions import Self
 
-from ...data.evidence import MSA, MSACollection
+from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
 from ...io.structure import read_structure
-from .model import (
-    _POCKET_BINDER,
-    _POCKET_POCKET,
-    _POCKET_SIZE,
-    _POCKET_UNSELECTED,
-    _POCKET_UNSPECIFIED,
-    Boltz1Input,
-    Boltz1Layout,
-    Boltz1Pocket,
-)
+from .model import Boltz1Input, Boltz1Layout, Boltz1Pocket
 
 if TYPE_CHECKING:
     from rdkit.Chem.rdchem import Mol
 
-# Boltz-1 shares the 33-token residue vocabulary with Boltz-2 (``vocab_size=33`` in both configs): protein
-# residues occupy tokens 2..21, the family UNKNOWN tokens are 22/27/32, RNA 23..27, DNA 28..32, and token 1
-# is the MSA gap. The Processor owns this symbol->token mapping exactly as ``boltz2/processor.py`` does.
+# Boltz-1 pocket one-hot classes (config ``pocket_feature_size == 4``); mirrors upstream
+# ``const.py`` ``pocket_contact_info`` labels: UNSPECIFIED, UNSELECTED, POCKET, BINDER.
+_POCKET_UNSPECIFIED = 0
+_POCKET_UNSELECTED = 1
+_POCKET_POCKET = 2
+_POCKET_BINDER = 3
+_POCKET_SIZE = 4
+
+# The 33-token residue vocabulary places proteins at 2..21, UNKNOWN tokens at
+# 22/27/32, RNA at 23..27, DNA at 28..32, and the MSA gap at 1.
 _PROTEIN_RESIDUE_TYPES = {
     component_id: index
     for index, component_id in enumerate(
@@ -74,8 +72,8 @@ _UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
 _MSA_GAP = 1
 # MSA cells are UPPERCASE one-letter MSA symbols (or the ``-`` gap), not ChemicalComponent IDs. The
 # Processor owns the symbol->token mapping keyed by the entity's resolved polymer_type, reproducing the
-# family ``_residue_type`` path: standard residues map to their model token and everything else to the
-# family UNKNOWN token. RNA one-letter symbols equal their component IDs directly.
+# Boltz-1 ``_residue_type`` path: standard residues map to their model token and everything else to the
+# model's UNKNOWN token. RNA one-letter symbols equal their component IDs directly.
 _PROTEIN_MSA_RESTYPE = {
     symbol: _PROTEIN_RESIDUE_TYPES[component_id]
     for symbol, component_id in {
@@ -122,13 +120,13 @@ def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
 class Boltz1Processor:
     r"""Lower one canonical molecular system to ``Boltz1Input``.
 
-    Mirrors the released Boltz-1 featurizer: residue-token geometry, the 33-token
+    Produces residue-token geometry, the 33-token
     residue/MSA vocabulary, the shared EDM reference-atom feature vector (with the
     Boltz-1 atom-pad-mask channel), the four-class pocket one-hot (all-``UNSPECIFIED``
     unless a ``Boltz1Pocket`` is supplied), and the per-token molecule/frame fields
-    the confidence-ranking head consumes. The
-    optional Boltz-1x physical-potential constraint surface is left empty (the
-    model materializes empty steering features from the absent fields).
+    consumed by the confidence-ranking head. The optional Boltz-1x
+    physical-potential constraint surface is left empty; the model materializes
+    empty steering features from the absent fields.
     """
 
     def __init__(
@@ -163,8 +161,8 @@ class Boltz1Processor:
     ) -> Boltz1Input:
         r"""Lower one folding input, its optional MSA evidence, and an optional pocket to ``Boltz1Input``.
 
-        ``generator`` (``None`` means the ambient RNG) drives the reference-conformer augmentation;
-        the seed→generator resolution itself lives once at the Pipeline boundary (principle P1).
+        ``generator`` drives reference-conformer augmentation; ``None`` uses the
+        ambient PyTorch RNG.
         """
 
         if isinstance(input, str | PathLike):
@@ -172,8 +170,12 @@ class Boltz1Processor:
         if not isinstance(input, MolecularSystem | Structure):
             raise TypeError("Boltz1Processor input must be a MolecularSystem, Structure, or structure path")
 
-        structure = input if isinstance(input, Structure) else None
-        system = input.system if structure is not None else input
+        if isinstance(input, Structure):
+            structure = input
+            system = input.system
+        else:
+            structure = None
+            system = input
         if not system.instances:
             raise ValueError("Boltz-1 requires at least one molecular instance")
 
@@ -199,7 +201,7 @@ def _prepare_boltz1_features(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz1Input:
-    r"""Build the released Boltz-1 token, atom, MSA, and identity layout."""
+    r"""Build the Boltz-1 token, atom, MSA, and identity layout."""
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
@@ -412,7 +414,6 @@ def _prepare_boltz1_features(
         "deletion_mean": msa_values.pop("deletion_mean"),
         "token_bonds": token_bonds,
         "molecule_type": molecule_types,
-        "chain_type": molecule_types,
         "frame_atom_index": frame_atom_index,
         "frame_mask": frame_mask,
         "cyclic_period": cyclic_period,
@@ -444,13 +445,11 @@ def _pocket_feature(
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> Tensor:
-    r"""Lower one optional ``Boltz1Pocket`` to the released four-class pocket one-hot ``[N, 4]``.
+    r"""Lower one optional ``Boltz1Pocket`` to a four-class pocket one-hot ``[N, 4]``.
 
-    Mirrors the released inference path (upstream ``featurizer.process_token_features``): every token of the
-    ``binder`` instance becomes ``BINDER``; every token whose ``ComponentReference`` is named in ``pocket``
-    becomes ``POCKET``; every remaining token becomes ``UNSELECTED``. ``pocket=None`` keeps the released
-    all-``UNSPECIFIED`` default. A ``binder`` instance or a ``pocket`` reference that does not resolve in the
-    input system fails here rather than silently degrading.
+    Every token of the ``binder`` instance becomes ``BINDER``; named pocket
+    residues become ``POCKET``; all remaining tokens become ``UNSELECTED``.
+    ``pocket=None`` yields all ``UNSPECIFIED`` tokens.
     """
 
     token_count = len(tokens)
@@ -506,13 +505,13 @@ def _token_bond_indicator(
         entity = system.entities[entity_id]
         if not isinstance(entity, Molecule):
             continue
-        for bond in entity.bonds:
+        for molecule_bond in entity.bonds:
             add(
-                AtomSite(instance_id, bond.component_a, bond.atom_a),
-                AtomSite(instance_id, bond.component_b, bond.atom_b),
+                AtomSite(instance_id, molecule_bond.component_a, molecule_bond.atom_a),
+                AtomSite(instance_id, molecule_bond.component_b, molecule_bond.atom_b),
             )
-    for bond in system.bonds:
-        add(bond.site_a, bond.site_b)
+    for system_bond in system.bonds:
+        add(system_bond.site_a, system_bond.site_b)
     return token_bonds
 
 
@@ -530,9 +529,9 @@ def _msa_features(
         # The MSA holds no PolymerSequence: column ``c`` binds ``columns[c].entity_id`` to a system entity,
         # a token's monomer index is directly the aligned-row column, and cells are UPPERCASE one-letter
         # symbols (or ``-``). A bare MSA is a single-chain plan over its unpaired pool; a collection replays
-        # its dense row_pairing/row_is_paired plan across the paired and unpaired pools -- the same partition
-        # the pre-migration nested-tuple plan drew, now read off the dense arrays (frozen §3.6 evidence API).
-        columns = (msa,) if isinstance(msa, MSA) else msa.msas
+        # its dense ``row_pairing`` and ``row_is_paired`` plan across the paired and unpaired pools.
+        bindings = msa_bindings(msa)
+        columns = tuple(value for value, _target_instance_id in bindings)
         if isinstance(msa, MSA):
             plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
                 ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
@@ -546,9 +545,7 @@ def _msa_features(
                 )
                 for plan_index in range(msa.row_pairing.shape[0])
             ]
-        polymer_types = {
-            value.entity_id: cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in columns
-        }
+        polymer_types = tuple(cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in columns)
         row_values: list[Tensor] = []
         deletion_values: list[Tensor] = []
         paired_values: list[Tensor] = []
@@ -558,20 +555,25 @@ def _msa_features(
             paired_row = torch.zeros(len(tokens))
             present = len(selections)
             # A taxonomy-paired plan row draws every populated cell from the paired pool; the dense
-            # ``row_is_paired`` flag records exactly that, so ``present > 1`` paired-pool rows reproduce the
-            # pre-migration taxonomic-pair semantics.
+            # ``row_is_paired`` flag records exactly that; more than one populated paired column denotes
+            # a taxonomy-paired row.
             taxonomic_pair = (
                 isinstance(msa, MSACollection) and present > 1 and all(is_paired for _, _, is_paired in selections)
             )
             for column_index, source_row, is_paired in selections:
                 value = columns[column_index]
-                polymer_type = polymer_types[value.entity_id]
+                target_instance_id = bindings[column_index][1]
+                polymer_type = polymer_types[column_index]
                 aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
                 deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
                     source_row
                 ]
                 for token_index, token in enumerate(tokens):
-                    if token["entity_id"] != value.entity_id or token["monomer_index"] is None:
+                    if (
+                        token["entity_id"] != value.entity_id
+                        or (target_instance_id is not None and token["instance_id"] != target_instance_id)
+                        or token["monomer_index"] is None
+                    ):
                         continue
                     monomer_index = cast(int, token["monomer_index"])
                     row[token_index] = _msa_symbol_restype(aligned[monomer_index], polymer_type)
@@ -648,11 +650,10 @@ def _augment_reference_positions(
     *,
     generator: torch.Generator | None = None,
 ) -> None:
-    r"""Apply the released conformer augmentation with a caller-injected RNG.
+    r"""Randomly rotate and translate each resolved reference conformer.
 
-    Per OWNER principle P1 the seed→generator resolution lives at the Pipeline boundary; this
-    reference-conformer roto-translation draws from the injected ``generator`` (``None`` means the
-    ambient RNG, matching the upstream Boltz featurizer). No hardcoded seed is created here.
+    Random values are drawn from ``generator``; ``None`` uses the ambient PyTorch
+    RNG.
     """
 
     if not len(space_ids):
@@ -713,7 +714,7 @@ def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> l
 
 
 def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
-    r"""Materialize canonical molecule data as RDKit chemistry without consulting provenance."""
+    r"""Materialize canonical molecule data as RDKit chemistry."""
 
     from rdkit import Chem
 
@@ -739,20 +740,20 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
         4.0: Chem.BondType.QUADRUPLE,
     }
     for component_index, component in enumerate(molecule.components):
-        for bond in component.bonds or ():
+        for component_bond in component.bonds or ():
             editable.AddBond(
-                atom_index[(component_index, bond.atom_a)],
-                atom_index[(component_index, bond.atom_b)],
-                bond_types[bond.order],
+                atom_index[(component_index, component_bond.atom_a)],
+                atom_index[(component_index, component_bond.atom_b)],
+                bond_types[component_bond.order],
             )
-            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(bond.aromatic)
-    for bond in molecule.bonds:
+            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(component_bond.aromatic)
+    for molecule_bond in molecule.bonds:
         editable.AddBond(
-            atom_index[(bond.component_a, bond.atom_a)],
-            atom_index[(bond.component_b, bond.atom_b)],
-            bond_types[bond.order],
+            atom_index[(molecule_bond.component_a, molecule_bond.atom_a)],
+            atom_index[(molecule_bond.component_b, molecule_bond.atom_b)],
+            bond_types[molecule_bond.order],
         )
-        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(bond.aromatic)
+        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(molecule_bond.aromatic)
 
     value = editable.GetMol()
     Chem.SanitizeMol(value)
@@ -786,19 +787,7 @@ def _normalize_msa(
     if msa is None:
         return None
     if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        for value in values:
-            # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over the
-            # primary system supplied here, so the Processor resolves the entity and checks its query width.
-            entity = system.entities.get(value.entity_id)
-            if not isinstance(entity, PolymerSequence):
-                raise ValueError(f"MSA entity {value.entity_id!r} disagrees with the input system")
-            width = len(value.unpaired_sequences[0])
-            if width != len(entity.components):
-                raise ValueError(
-                    f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
-                    f"{len(entity.components)} components"
-                )
+        resolve_msa_bindings(msa, system)
         return msa
     path = Path(msa).expanduser()
     proteins = [

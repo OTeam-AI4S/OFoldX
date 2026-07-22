@@ -1,39 +1,38 @@
-r"""OFoldX's biological operation boundary for released ESMFold2 folding and binder design.
+r"""Task-specific ESMFold2 folding and binder-design Pipelines.
 
-Owns the one Processor call and the family's released biological verbs. ``fold`` is the
-convenience wrapper over ``ESMFold2Processor`` + ``ESMFold2Model.fold``, returning the
-shared ``FoldResult`` unchanged. ``design`` runs the released binder-design procedure
-(gradient descent on per-position soft-sequence logits through the experimental recurrent
-graph, then a discrete refold) and returns the family-owned, coordinate-producing
-``ESMFold2DesignResult``. Upstream provenance:
+``ESMFold2Pipeline`` binds the released Model/Processor pair and exposes only ``fold``.
+``ESMFold2DesignPipeline`` binds the experimental recurrent graph and exposes only
+``design``; its repository also owns the ESMC masked-LM child used by the objective.
+The design implementation performs gradient descent on per-position soft-sequence logits,
+then discretely refolds each candidate into an ``ESMFold2DesignResult``. Upstream provenance:
 ``biohub_esm/cookbook/tutorials/binder_design.py`` (Algorithm 11 gradient-guided sequence
 optimisation L828, Algorithm 12 contact losses L260, Algorithm 13 globularity L323,
 Algorithm 14 ESMC pseudo-perplexity sequence regulariser L715, Algorithm 15 distogram ipTM
 proxy L423, binder prompt ``'#'`` mutable positions L110).
-
-One Pipeline binds one Model/Processor pair. ``fold`` requires the released
-``ESMFold2Model``; ``design`` requires the experimental inversion model
-``ESMFold2ExperimentalModel`` — the graph whose distogram is differentiable w.r.t. the
-soft sequence. Per DESIGN.md 7.2 the concrete ``register_pipeline`` marker is still owned
-by the family package, but both verbs are now implemented.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from functools import cache
 from os import PathLike
 from pathlib import Path
+from typing import cast
 
+import chanfig
 import numpy as np
 import torch
 import torch.nn.functional as F
 from typing_extensions import Self
 
+from ..._repository import load_json_object, resolve_repository, upload_repository
+from ...artifacts import save_model
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem, PolymerSequence, restype_3to1
 from ...data.structure import Structure
+from ...pipelines import PIPELINES, PairedPipeline, resolve_generator
 from ...references import classify_reference
 from ...results import FoldResult, Metric, PairMetric, Score
 from .model import (
@@ -42,7 +41,6 @@ from .model import (
     ESMFold2ExperimentalModel,
     ESMFold2Input,
     ESMFold2Model,
-    _experimental_seed_context,
     compute_esmc_masked_lm_logits,
 )
 from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor, antibody_cdr_indices
@@ -91,6 +89,22 @@ _TEMPERATURE_MIN = 1e-2
 _ESMC_MASK_FRACTION = 0.15
 _LM_MASK_PASSES = 4
 _LM_LOSS_CHUNK = 128
+
+
+@contextmanager
+def _frozen_eval(model: torch.nn.Module) -> Iterator[None]:
+    r"""Run one design call in frozen eval mode, then restore the exact module state."""
+
+    training = tuple((module, module.training) for module in model.modules())
+    requires_grad = tuple((parameter, parameter.requires_grad) for parameter in model.parameters())
+    model.eval().requires_grad_(False)
+    try:
+        yield
+    finally:
+        for parameter, enabled in requires_grad:
+            parameter.requires_grad_(enabled)
+        for module, enabled in training:
+            module.training = enabled
 
 
 @cache
@@ -144,7 +158,7 @@ def _esmc_pseudo_perplexity_nll(
     design: torch.Tensor,
     score_mask: torch.Tensor,
     *,
-    seed: int | None,
+    generator: torch.Generator | None,
     n_passes: int = _LM_MASK_PASSES,
     mask_fraction: float = _ESMC_MASK_FRACTION,
     chunk_size: int = _LM_LOSS_CHUNK,
@@ -189,22 +203,25 @@ def _esmc_pseudo_perplexity_nll(
 
     all_masked_rows: list[torch.Tensor] = []
     all_pass_masks: list[torch.Tensor] = []
-    with _experimental_seed_context(seed):
-        for sample in range(batch_size):
-            position_indices = score_mask[sample].nonzero(as_tuple=False).flatten()
-            num_positions = int(position_indices.numel())
-            if num_positions == 0:
-                raise ValueError("ESMC pseudo-perplexity score mask selected zero positions")
-            num_masked = max(1, math.ceil(mask_fraction * num_positions))
-            random_scores = torch.rand((n_passes, num_positions), device=device)
-            masked_offsets = random_scores.topk(num_masked, dim=-1, largest=False).indices
-            pass_masks = torch.zeros((n_passes, binder_length), dtype=torch.bool, device=device)
-            pass_masks[torch.arange(n_passes, device=device)[:, None], position_indices[masked_offsets]] = True
-            masked = input_onehot[sample : sample + 1].repeat(n_passes, 1, 1)
-            mask_rows, mask_cols = pass_masks.nonzero(as_tuple=True)
-            masked[mask_rows, mask_cols + 1] = mask_token
-            all_masked_rows.append(masked)
-            all_pass_masks.append(pass_masks)
+    for sample in range(batch_size):
+        position_indices = score_mask[sample].nonzero(as_tuple=False).flatten()
+        num_positions = int(position_indices.numel())
+        if num_positions == 0:
+            raise ValueError("ESMC pseudo-perplexity score mask selected zero positions")
+        num_masked = max(1, math.ceil(mask_fraction * num_positions))
+        random_scores = torch.rand(
+            (n_passes, num_positions),
+            device=device,
+            generator=generator,
+        )
+        masked_offsets = random_scores.topk(num_masked, dim=-1, largest=False).indices
+        pass_masks = torch.zeros((n_passes, binder_length), dtype=torch.bool, device=device)
+        pass_masks[torch.arange(n_passes, device=device)[:, None], position_indices[masked_offsets]] = True
+        masked = input_onehot[sample : sample + 1].repeat(n_passes, 1, 1)
+        mask_rows, mask_cols = pass_masks.nonzero(as_tuple=True)
+        masked[mask_rows, mask_cols + 1] = mask_token
+        all_masked_rows.append(masked)
+        all_pass_masks.append(pass_masks)
 
     masked_sequences = torch.cat(all_masked_rows, dim=0)
     attention_mask = torch.ones(masked_sequences.shape[0], masked_sequences.shape[1], device=device)
@@ -394,62 +411,33 @@ def _target_one_letter(target: str | PathLike[str] | Structure | MolecularSystem
             raise NotImplementedError("ESMFold2 design targets one single-chain protein target")
         return "".join(restype_3to1[component.component_id] for component in proteins[0].components)
 
-    classified = classify_reference(target)
+    classified = classify_reference(cast(str | PathLike[str], target))
     if isinstance(classified, Path):
         from multimolecule.io import read_fasta_records
 
-        records = read_fasta_records(classified)
+        records = tuple(read_fasta_records(classified))
+        if len(records) != 1:
+            raise ValueError("ESMFold2 design requires exactly one target FASTA record")
         return records[0].sequence.strip().upper()
     return str(classified).strip().upper()
 
 
-class ESMFold2Pipeline:
-    r"""Bind one ESMFold2 Model-Processor pair for the released folding and design verbs.
+class ESMFold2Pipeline(PairedPipeline[ESMFold2Model, ESMFold2Processor]):
+    r"""Run released ESMFold2 structure prediction.
 
-    Marker id ``"ofoldx.esmfold2"``. The Pipeline is not a base class and shares no runtime
-    request object with any other family. ``fold`` (released ``ESMFold2Model``) returns the
-    shared ``FoldResult``; ``design`` (experimental ``ESMFold2ExperimentalModel``) returns
-    the family-owned ``ESMFold2DesignResult``. A given Pipeline is bound with the model the
-    verb it will run requires.
+    Marker id ``"ofoldx.esmfold2"`` and task ``"fold"``. Repository persistence,
+    placement, and the exact Model-Processor pairing come from ``PairedPipeline``.
     """
-
-    model: ESMFold2Model | ESMFold2ExperimentalModel
-    processor: ESMFold2Processor | ESMFold2ExperimentalProcessor
-
-    def __init__(
-        self,
-        *,
-        model: ESMFold2Model | ESMFold2ExperimentalModel,
-        processor: ESMFold2Processor | ESMFold2ExperimentalProcessor,
-    ) -> None:
-        self.model = model
-        self.processor = processor
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Place the Model and Processor on one device and dtype in place.
-
-        No whole-Model ``dtype`` is forced: per DESIGN.md 4.1.1 the audited release stores
-        its head in FP32 and the ESMC child in BF16, and an explicit ``dtype`` here would
-        intentionally collapse that mixture. Ordinary device movement preserves it.
-        """
-
-        self.model.to(device=device, dtype=dtype)
-        self.processor.to(device=device, dtype=dtype)
-        return self
 
     def fold(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         num_samples: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        num_loops: int | None = None,
+        recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
         language_model_mask_probability: float | None = None,
         language_model_dropout: float | None = 0.3,
@@ -465,23 +453,16 @@ class ESMFold2Pipeline:
 
         Forwards every effective released inference control to ``ESMFold2Model.fold``; the
         Fast variant rejects ``msa`` at the paired Processor boundary. ``Structure`` inputs
-        are rejected there too (topology-only fold).
+        contribute their canonical molecular system; observed coordinates are not features.
         """
-
-        if not isinstance(self.model, ESMFold2Model):
-            raise TypeError("fold requires the released ESMFold2Model; this Pipeline is bound for design")
-
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
-        if generator is None and seed is not None:
-            generator = torch.Generator(device="cpu").manual_seed(int(seed))
 
         batch = self.processor(input, msa=msa)
         return self.model.fold(
             batch,
             num_samples=num_samples,
+            seed=seed,
             generator=generator,
-            num_loops=num_loops,
+            recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
             language_model_mask_probability=language_model_mask_probability,
             language_model_dropout=language_model_dropout,
@@ -493,6 +474,112 @@ class ESMFold2Pipeline:
             step_scale=step_scale,
             denoising_early_exit_rmsd=denoising_early_exit_rmsd,
         )
+
+
+class ESMFold2DesignPipeline(PairedPipeline[ESMFold2ExperimentalModel, ESMFold2ExperimentalProcessor]):
+    r"""Run experimental ESMFold2 binder design with its persisted ESMC child.
+
+    Marker id ``"ofoldx.esmfold2_design"`` and task ``"design"``. The root pair is
+    architecture ``"ofoldx.esmfold2_experimental"``; ``esmc/`` stores the exact
+    MultiMolecule masked-LM model and tokenizer used by the design objective.
+    """
+
+    @classmethod
+    def from_repository(
+        cls,
+        repository: str | PathLike[str],
+        *,
+        revision: str | None = None,
+        token: str | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Restore the experimental head and its ESMC masked-LM child."""
+
+        from multimolecule import AutoTokenizer, ProteinTokenizer
+        from transformers import AutoModelForMaskedLM
+
+        from ...auto import AutoModel, AutoProcessor
+
+        root = resolve_repository(repository, revision=revision, token=token).path
+        architecture = load_json_object(root / "model.json").get("architecture")
+        if architecture != "ofoldx.esmfold2_experimental":
+            raise ValueError(
+                "ESMFold2DesignPipeline requires root architecture "
+                f"'ofoldx.esmfold2_experimental', got {architecture!r}"
+            )
+        model = cast(ESMFold2ExperimentalModel, AutoModel(root, device=device, dtype=dtype))
+        processor = cast(ESMFold2ExperimentalProcessor, AutoProcessor(root, device=device, dtype=dtype))
+        esmc_repository = root / "esmc"
+        processor._base.tokenizer = cast(
+            ProteinTokenizer,
+            AutoTokenizer.from_pretrained(esmc_repository, local_files_only=True),
+        )
+        esmc = AutoModelForMaskedLM.from_pretrained(esmc_repository, local_files_only=True, dtype=dtype)
+        if device is not None:
+            esmc.to(device=device)
+        model.load_esmc(esmc)
+        return cls(model=model, processor=processor)
+
+    def save(
+        self,
+        directory: str | PathLike[str],
+        *,
+        max_shard_size: int | str = "5GB",
+        repo_id: str | None = None,
+        token: str | None = None,
+        private: bool = False,
+        commit_message: str | None = None,
+    ) -> None:
+        r"""Persist the experimental root pair, ESMC child, tokenizer, and marker."""
+
+        from huggingface_hub import save_torch_state_dict
+
+        esmc = self.model.esmc
+        lm_head = self.model.esmc_lm_head
+        if esmc is None or lm_head is None:
+            raise RuntimeError("saving ESMFold2 design requires an attached EsmCForMaskedLM")
+        pipeline_id = PIPELINES.id_for(type(self))
+        if pipeline_id is None:
+            raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline")
+
+        destination = Path(directory).expanduser()
+        self.model.esmc = None
+        self.model.esmc_lm_head = None
+        try:
+            save_model(
+                destination,
+                model=self.model,
+                processor=self.processor,
+                max_shard_size=max_shard_size,
+            )
+        finally:
+            self.model.esmc = esmc
+            self.model.esmc_lm_head = lm_head
+
+        esmc_destination = destination / "esmc"
+        esmc_destination.mkdir(parents=True, exist_ok=True)
+        esmc.config.save_pretrained(esmc_destination)
+        esmc_state = {f"model.{name}": value for name, value in esmc.state_dict().items()}
+        esmc_state.update({f"lm_head.{name}": value for name, value in lm_head.state_dict().items()})
+        save_torch_state_dict(
+            esmc_state,
+            esmc_destination,
+            filename_pattern="model{suffix}.safetensors",
+            max_shard_size=max_shard_size,
+            safe_serialization=True,
+        )
+        self.processor._base.tokenizer.save_pretrained(esmc_destination)
+        chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
+
+        if repo_id is not None:
+            upload_repository(
+                destination,
+                repo_id,
+                token=token,
+                private=private,
+                commit_message=commit_message,
+            )
 
     def design(
         self,
@@ -523,8 +610,8 @@ class ESMFold2Pipeline:
         ``EsmCForMaskedLM``), the released ESMC pseudo-perplexity sequence regulariser
         (Algorithm 14) is added to the structure objective at the fixed released gradient
         weight ``ESMFold2ExperimentalConfig.language_model_weight`` (a construction-time
-        hyperparameter, read here, never selected at runtime). With only a bare ESMC trunk
-        attached the design falls back to the structure-only objective.
+        hyperparameter, read here, never selected at runtime). A nonzero weight therefore
+        requires an attached masked-LM head; the algorithm never silently drops that term.
 
         The design is mode-agnostic: it optimises exactly the mutable ``'#'`` positions of
         ``binder_prompt`` (the design mask) and never inspects what kind of binder it is. A
@@ -537,18 +624,12 @@ class ESMFold2Pipeline:
         it as ``binder_prompt``.
         """
 
-        if not isinstance(self.model, ESMFold2ExperimentalModel):
-            raise TypeError(
-                "design requires the experimental ESMFold2ExperimentalModel inversion graph; "
-                "this Pipeline is bound with the released ESMFold2Model"
-            )
         if binder_length <= 0:
             raise ValueError("binder_length must be positive")
         if num_candidates <= 0:
             raise ValueError("num_candidates must be positive")
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
-
+        if num_optimization_steps <= 0:
+            raise ValueError("num_optimization_steps must be positive")
         prompt = _MUTABLE_TOKEN * binder_length if binder_prompt is None else binder_prompt
         if len(prompt) != binder_length:
             raise ValueError("binder_prompt length must equal binder_length")
@@ -558,24 +639,50 @@ class ESMFold2Pipeline:
         # the construction-time config (0.15 general binder / 0.05 antibody framework); design
         # reads it and never selects it from the input's nature.
         language_model_weight = model.config.language_model_weight
-        model.eval().requires_grad_(False)
-        device = model.z_init_1.weight.device
+        if language_model_weight != 0 and model.esmc_lm_head is None:
+            raise RuntimeError("binder design with a nonzero language_model_weight requires an EsmCForMaskedLM")
         processor = self.processor
+        base_generator = resolve_generator(seed, generator, device=model.z_init_1.weight.device)
+        with _frozen_eval(model):
+            return self._run_design(
+                model=model,
+                processor=processor,
+                target=target,
+                prompt=prompt,
+                binder_length=binder_length,
+                num_candidates=num_candidates,
+                num_optimization_steps=num_optimization_steps,
+                remove_cysteines=remove_cysteines,
+                language_model_weight=language_model_weight,
+                generator=base_generator,
+            )
+
+    def _run_design(
+        self,
+        *,
+        model: ESMFold2ExperimentalModel,
+        processor: ESMFold2ExperimentalProcessor,
+        target: str | PathLike[str] | Structure | MolecularSystem,
+        prompt: str,
+        binder_length: int,
+        num_candidates: int,
+        num_optimization_steps: int,
+        remove_cysteines: bool,
+        language_model_weight: float,
+        generator: torch.Generator | None,
+    ) -> ESMFold2DesignResult:
+        device = model.z_init_1.weight.device
 
         target_sequence = _target_one_letter(target)
         target_length = len(target_sequence)
         target_batch = processor(PolymerSequence.from_one_letter(target_sequence))
         target_soft = F.one_hot(target_batch.res_type.long(), num_classes=33).float().to(device)
 
-        base_generator = generator
-        if base_generator is None and seed is not None:
-            base_generator = torch.Generator(device="cpu").manual_seed(int(seed))
-
         candidates: list[ESMFold2DesignCandidate] = []
         for _ in range(num_candidates):
-            logits, gradient_mask = self._initial_logits(prompt, remove_cysteines, base_generator, device)
+            logits, gradient_mask = self._initial_logits(prompt, remove_cysteines, generator, device)
             best_sequence = ""
-            best_proxy = -1.0
+            best_proxy = -math.inf
 
             optimizer = torch.optim.SGD([logits], lr=_LEARNING_RATE)
             for step in range(num_optimization_steps):
@@ -596,10 +703,11 @@ class ESMFold2Pipeline:
                 output = model.forward(
                     batch,
                     res_type_soft=res_type_soft,
-                    num_loops=1,
+                    recycling_steps=2,
                     num_sampling_steps=1,
                     calculate_confidence=False,
                     return_structure=False,
+                    generator=generator,
                 )
                 distogram = output["distogram_logits"].float()
                 losses = _structure_losses(distogram, binder_length)
@@ -613,8 +721,12 @@ class ESMFold2Pipeline:
                 if model.esmc_lm_head is not None:
                     design_lm = F.softmax(logits / temperature, dim=-1)
                     score_mask = gradient_mask.sum(dim=-1) > 0
-                    step_seed = None if seed is None else int(seed) + step
-                    plm_loss = _esmc_pseudo_perplexity_nll(model, design_lm, score_mask, seed=step_seed)
+                    plm_loss = _esmc_pseudo_perplexity_nll(
+                        model,
+                        design_lm,
+                        score_mask,
+                        generator=generator,
+                    )
                     plm_grad = torch.autograd.grad(plm_loss.mean(), logits)[0]
                     plm_term = _normalized_gradient(plm_grad, gradient_mask)
                     combined_grad = combined_grad + language_model_weight * plm_term
@@ -625,11 +737,20 @@ class ESMFold2Pipeline:
                 optimizer.step()
 
                 proxy = _distogram_iptm_proxy(distogram.detach(), target_length, binder_length)
-                if proxy > best_proxy:
+                if step == 0 or proxy > best_proxy:
                     best_proxy = proxy
                     best_sequence = binder_sequence
 
-            candidates.append(self._refold(processor, model, target_sequence, best_sequence, target_length, seed))
+            candidates.append(
+                self._refold(
+                    processor,
+                    model,
+                    target_sequence,
+                    best_sequence,
+                    target_length,
+                    generator,
+                )
+            )
 
         return ESMFold2DesignResult(candidates=tuple(candidates))
 
@@ -643,22 +764,27 @@ class ESMFold2Pipeline:
         r"""Seed soft-sequence logits and the mutable-position gradient mask from the prompt."""
 
         length = len(prompt)
-        noise = 0.01 * torch.randn(1, length, _AA_DIMS, generator=generator)
-        logits = torch.zeros(1, length, _AA_DIMS)
-        mask = torch.ones(1, length, _AA_DIMS)
+        noise = 0.01 * torch.randn(
+            1,
+            length,
+            _AA_DIMS,
+            generator=generator,
+            device=device,
+        )
+        logits = torch.zeros(1, length, _AA_DIMS, device=device)
+        mask = torch.ones(1, length, _AA_DIMS, device=device)
         for i, symbol in enumerate(prompt):
             if symbol == _MUTABLE_TOKEN:
                 logits[:, i, :] = noise[:, i, :]
+                if remove_cysteines:
+                    logits[:, i, _CYS_IDX] = -1e6
+                    mask[:, i, _CYS_IDX] = 0.0
             else:
                 if symbol not in _AA1_TO_IDX:
                     raise ValueError(f"binder_prompt symbol {symbol!r} is not a standard amino acid or '#'")
                 logits[:, i, _AA1_TO_IDX[symbol]] = 10.0
                 mask[:, i, :] = 0.0
-        if remove_cysteines:
-            logits[:, :, _CYS_IDX] = -1e6
-            mask[:, :, _CYS_IDX] = 0.0
-        logits = logits.to(device).requires_grad_(True)
-        return logits, mask.to(device)
+        return logits.requires_grad_(True), mask
 
     def _refold(
         self,
@@ -667,7 +793,7 @@ class ESMFold2Pipeline:
         target_sequence: str,
         binder_sequence: str,
         target_length: int,
-        seed: int | None,
+        generator: torch.Generator | None,
     ) -> ESMFold2DesignCandidate:
         r"""Discretely refold one designed target|binder complex into a scored candidate."""
 
@@ -680,10 +806,10 @@ class ESMFold2Pipeline:
         with torch.no_grad():
             output = model.forward(
                 batch,
-                num_loops=None,
+                recycling_steps=None,
                 num_diffusion_samples=1,
                 calculate_confidence=True,
-                seed=seed,
+                generator=generator,
             )
         structure = self._structure(batch, output)
         binder_length = len(binder_sequence)
@@ -729,7 +855,7 @@ class ESMFold2Pipeline:
         coordinate_mask[model_to_complete] = True
         return Structure(
             system=layout.system,
-            sites=complete_sites,
+            sites=tuple(complete_sites),
             coordinates=coordinates,
             coordinate_mask=coordinate_mask,
         )

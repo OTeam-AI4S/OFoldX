@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import ComponentReference, MolecularSystem
+from ...data.molecular import ComponentReference
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, ScoreResult
@@ -17,18 +17,12 @@ from .model import NaMpnnModel
 from .processor import NaMpnnProcessor
 
 
-class NaMpnnPipeline(PairedPipeline):
+class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
     r"""Bind one NaMpnn Model-Processor pair for released biological operations."""
-
-    model: NaMpnnModel
-    processor: NaMpnnProcessor
-
-    def __init__(self, *, model: NaMpnnModel, processor: NaMpnnProcessor) -> None:
-        super().__init__(model=model, processor=processor)
 
     def design(
         self,
-        input: Structure | MolecularSystem | str | PathLike[str],
+        input: Structure | str | PathLike[str],
         *,
         positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
@@ -45,7 +39,7 @@ class NaMpnnPipeline(PairedPipeline):
     ) -> DesignResult:
         r"""Design mixed-polymer sequences on one fixed backbone."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
@@ -55,9 +49,9 @@ class NaMpnnPipeline(PairedPipeline):
             pair_bias=pair_bias,
             global_omit_tokens=global_omit_tokens,
         )
-        generator = resolve_generator(seed, generator, device=batch.atom_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.atom_coordinates.device)
         return self.model.design(
-            batch,
+            features,
             num_candidates=num_candidates,
             temperature=temperature,
             global_logit_bias=global_logit_bias,
@@ -66,7 +60,7 @@ class NaMpnnPipeline(PairedPipeline):
 
     def score(
         self,
-        input: Structure | MolecularSystem | str | PathLike[str],
+        input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         positions: Sequence[ComponentReference] | None = None,
@@ -76,36 +70,32 @@ class NaMpnnPipeline(PairedPipeline):
     ) -> MpnnProbabilityResult:
         r"""Return sequence-conditioned autoregressive probabilities over orders."""
 
-        batch = self.processor(input, sequence=sequence, positions=positions)
-        generator = resolve_generator(seed, generator, device=batch.atom_coordinates.device)
+        features = self.processor(input, sequence=sequence, positions=positions)
+        generator = resolve_generator(seed, generator, device=features.atom_coordinates.device)
         return self.model.score(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
             generator=generator,
         )
 
     def unconditional_probabilities(
         self,
-        input: Structure | MolecularSystem | str | PathLike[str],
+        input: Structure | str | PathLike[str],
         *,
         positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
-        seed: int | None = None,
-        generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""Return sequence-free all-equal-rank probabilities for every row."""
 
-        batch = self.processor(input, positions=positions)
-        generator = resolve_generator(seed, generator, device=batch.atom_coordinates.device)
+        features = self.processor(input, positions=positions)
         return self.model.unconditional_probabilities(
-            batch,
+            features,
             num_decoding_orders=num_decoding_orders,
-            generator=generator,
         )
 
     def specificity_profile(
         self,
-        input: Structure | MolecularSystem | str | PathLike[str],
+        input: Structure | str | PathLike[str],
         *,
         positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
@@ -119,16 +109,16 @@ class NaMpnnPipeline(PairedPipeline):
     ) -> ScoreResult:
         r"""Average released nucleic-acid base probabilities with protein context fixed."""
 
-        batch = self.processor(
+        features = self.processor(
             input,
             positions=positions,
             conditions=conditions,
             symmetry_groups=symmetry_groups,
             global_omit_tokens=global_omit_tokens,
         )
-        generator = resolve_generator(seed, generator, device=batch.atom_coordinates.device)
+        generator = resolve_generator(seed, generator, device=features.atom_coordinates.device)
         return self.model.specificity_profile(
-            batch,
+            features,
             num_samples=num_samples,
             temperature=temperature,
             global_logit_bias=global_logit_bias,

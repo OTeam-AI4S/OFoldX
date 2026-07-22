@@ -3,6 +3,7 @@ r"""ProteinMPNN fixed-backbone sequence model."""
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import dataclass
 
 import torch
@@ -10,22 +11,25 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.components import get_component
-from ...data.molecular import ComponentReference, MolecularSystem, Molecule, PolymerSequence
+from ...data.molecular import (
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+)
 from ...data.structure import Structure
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     MpnnDecoderLayer,
     MpnnEncoderLayer,
-    MpnnOutput,
     MpnnProteinFeatures,
     MpnnRelativePositionEncoding,
-    MpnnSamplingOutput,
-    _autoregressive_masks,
-    _nearest_neighbors,
-    _radial_basis,
+    autoregressive_masks,
     cat_neighbors_nodes,
     gather_edges,
     gather_nodes,
+    nearest_neighbors,
+    radial_basis,
 )
 from ...results import (
     DesignCandidate,
@@ -88,56 +92,54 @@ class ProteinMpnnModel(nn.Module):
     def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
         r"""Validate the independent decoding-order evaluation count."""
 
-        if type(num_decoding_orders) is not int or num_decoding_orders <= 0:
-            raise ValueError("num_decoding_orders must be a positive integer")
-        return num_decoding_orders
+        return _positive_integer(num_decoding_orders, "num_decoding_orders")
 
     @staticmethod
-    def _require_single_target(input: ProteinMpnnInput) -> None:
+    def _require_single_target(features: ProteinMpnnInput) -> None:
         r"""Reject an execution-batch axis on one-target biological operations."""
 
-        if input.backbone_coordinates.shape[0] != 1 or len(input.structures) != 1:
+        if features.backbone_coordinates.shape[0] != 1 or len(features.structures) != 1:
             raise ValueError("this ProteinMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
-    def _repeat_input(input: ProteinMpnnInput, count: int) -> ProteinMpnnInput:
+    def _repeat_input(features: ProteinMpnnInput, count: int) -> ProteinMpnnInput:
         r"""Repeat one biological input into ``count`` aligned evaluation rows."""
 
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
 
         return ProteinMpnnInput(
-            backbone_coordinates=repeat(input.backbone_coordinates),
-            sequence_tokens=repeat(input.sequence_tokens),
-            valid_mask=repeat(input.valid_mask),
-            residue_indices=repeat(input.residue_indices),
-            chain_indices=repeat(input.chain_indices),
-            design_mask=repeat(input.design_mask),
-            structures=input.structures * count,
-            component_references=input.component_references * count,
-            tied_group_ids=repeat(input.tied_group_ids),
-            tied_weights=repeat(input.tied_weights),
-            allowed_token_mask=repeat(input.allowed_token_mask),
-            residue_logit_bias=repeat(input.residue_logit_bias),
-            pssm_coefficients=repeat(input.pssm_coefficients),
-            pssm_probabilities=repeat(input.pssm_probabilities),
-            pssm_log_odds=repeat(input.pssm_log_odds),
+            backbone_coordinates=repeat(features.backbone_coordinates),
+            sequence_tokens=repeat(features.sequence_tokens),
+            valid_mask=repeat(features.valid_mask),
+            residue_indices=repeat(features.residue_indices),
+            chain_indices=repeat(features.chain_indices),
+            design_mask=repeat(features.design_mask),
+            structures=features.structures * count,
+            component_references=features.component_references * count,
+            tied_group_ids=repeat(features.tied_group_ids),
+            tied_weights=repeat(features.tied_weights),
+            allowed_token_mask=repeat(features.allowed_token_mask),
+            residue_logit_bias=repeat(features.residue_logit_bias),
+            pssm_coefficients=repeat(features.pssm_coefficients),
+            pssm_probabilities=repeat(features.pssm_probabilities),
+            pssm_log_odds=repeat(features.pssm_log_odds),
         )
 
     def _probability_result(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         logits: Tensor,
         decoding_ranks: Tensor,
     ) -> MpnnProbabilityResult:
         r"""Wrap aligned per-evaluation logits with the one target's identity."""
 
         return MpnnProbabilityResult(
-            target=input.structures[0],
-            component_references=input.component_references[0],
-            sequence_tokens=input.sequence_tokens[0],
-            valid_mask=input.valid_mask[0],
-            design_mask=input.design_mask[0],
+            target=features.structures[0],
+            component_references=features.component_references[0],
+            sequence_tokens=features.sequence_tokens[0],
+            valid_mask=features.valid_mask[0],
+            design_mask=features.design_mask[0],
             logits=logits,
             decoding_ranks=decoding_ranks,
         )
@@ -280,7 +282,7 @@ class ProteinMpnnModel(nn.Module):
         sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        backward_mask, forward_mask = _autoregressive_masks(
+        backward_mask, forward_mask = autoregressive_masks(
             decoding_ranks,
             neighbor_indices,
             valid_mask.to(dtype=node_states.dtype),
@@ -314,7 +316,7 @@ class ProteinMpnnModel(nn.Module):
         token_states = torch.zeros_like(node_states)
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        _, forward_mask = _autoregressive_masks(decoding_ranks, neighbor_indices, mask)
+        _, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
         forward_context = forward_mask * encoder_context
         states = node_states
         for layer in self.decoder_layers:
@@ -323,7 +325,7 @@ class ProteinMpnnModel(nn.Module):
 
     def encode(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
@@ -332,55 +334,55 @@ class ProteinMpnnModel(nn.Module):
 
         backbone_noise = self._validate_backbone_noise(backbone_noise)
         return self._encode(
-            input.backbone_coordinates,
-            input.valid_mask,
-            input.residue_indices,
-            input.chain_indices,
+            features.backbone_coordinates,
+            features.valid_mask,
+            features.residue_indices,
+            features.chain_indices,
             backbone_noise=backbone_noise,
             generator=generator,
         )
 
     def forward(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         decoding_ranks: Tensor | None = None,
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
-    ) -> MpnnOutput:
+    ) -> ProteinMpnnOutput:
         r"""Return the single teacher-forced differentiable sequence-conditioned pass."""
 
         backbone_noise = self._validate_backbone_noise(backbone_noise)
         if decoding_ranks is not None:
-            self._assert_decoding_ranks(decoding_ranks, input.tied_group_ids)
+            self._assert_decoding_ranks(decoding_ranks, features.tied_group_ids)
         node_states, edge_states, neighbor_indices = self._encode(
-            input.backbone_coordinates,
-            input.valid_mask,
-            input.residue_indices,
-            input.chain_indices,
+            features.backbone_coordinates,
+            features.valid_mask,
+            features.residue_indices,
+            features.chain_indices,
             backbone_noise=backbone_noise,
             generator=generator,
         )
         if decoding_ranks is None:
             decoding_ranks = self._generate_ranks(
-                input.valid_mask,
-                input.design_mask,
-                input.tied_group_ids,
+                features.valid_mask,
+                features.design_mask,
+                features.tied_group_ids,
                 generator,
             )
         logits = self._decode_logits(
             node_states,
             edge_states,
             neighbor_indices,
-            input.sequence_tokens,
-            input.valid_mask,
+            features.sequence_tokens,
+            features.valid_mask,
             decoding_ranks,
         )
-        return MpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
+        return ProteinMpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
 
     def autoregressive_probabilities(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
@@ -389,21 +391,21 @@ class ProteinMpnnModel(nn.Module):
     ) -> MpnnProbabilityResult:
         r"""Return sequence-conditioned autoregressive probabilities over orders."""
 
-        self._require_single_target(input)
+        self._require_single_target(features)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         backbone_noise = self._validate_backbone_noise(backbone_noise)
-        repeated = self._repeat_input(input, num_decoding_orders)
+        repeated = self._repeat_input(features, num_decoding_orders)
         output = self.forward(
             repeated,
             decoding_ranks=decoding_ranks,
             backbone_noise=backbone_noise,
             generator=generator,
         )
-        return self._probability_result(input, output.logits, output.decoding_ranks)
+        return self._probability_result(features, output.logits, output.decoding_ranks)
 
     def sequence_free_autoregressive_probabilities(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
@@ -412,10 +414,10 @@ class ProteinMpnnModel(nn.Module):
     ) -> MpnnProbabilityResult:
         r"""Return order-dependent sequence-free autoregressive probabilities."""
 
-        self._require_single_target(input)
+        self._require_single_target(features)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         backbone_noise = self._validate_backbone_noise(backbone_noise)
-        repeated = self._repeat_input(input, num_decoding_orders)
+        repeated = self._repeat_input(features, num_decoding_orders)
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
         node_states, edge_states, neighbor_indices = self._encode(
@@ -440,11 +442,11 @@ class ProteinMpnnModel(nn.Module):
             repeated.valid_mask,
             decoding_ranks,
         )
-        return self._probability_result(input, logits, decoding_ranks)
+        return self._probability_result(features, logits, decoding_ranks)
 
     def _single_residue_probabilities(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int,
         base_decoding_ranks: Tensor | None,
@@ -454,10 +456,10 @@ class ProteinMpnnModel(nn.Module):
     ) -> MpnnProbabilityResult:
         r"""Evaluate every target moved exactly last or first under one base order."""
 
-        self._require_single_target(input)
+        self._require_single_target(features)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         backbone_noise = self._validate_backbone_noise(backbone_noise)
-        repeated = self._repeat_input(input, num_decoding_orders)
+        repeated = self._repeat_input(features, num_decoding_orders)
         device = repeated.backbone_coordinates.device
         node_states, edge_states, neighbor_indices = self._encode(
             repeated.backbone_coordinates,
@@ -523,11 +525,11 @@ class ProteinMpnnModel(nn.Module):
                 ranks,
             )[:, target]
             effective_ranks[:, target] = ranks
-        return self._probability_result(input, logits, effective_ranks)
+        return self._probability_result(features, logits, effective_ranks)
 
     def conditional_probabilities(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int = 1,
         base_decoding_ranks: Tensor | None = None,
@@ -537,7 +539,7 @@ class ProteinMpnnModel(nn.Module):
         r"""Return target-last conditional probabilities for every row."""
 
         return self._single_residue_probabilities(
-            input,
+            features,
             num_decoding_orders=num_decoding_orders,
             base_decoding_ranks=base_decoding_ranks,
             backbone_noise=backbone_noise,
@@ -547,7 +549,7 @@ class ProteinMpnnModel(nn.Module):
 
     def unconditional_probabilities(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int = 1,
         base_decoding_ranks: Tensor | None = None,
@@ -557,7 +559,7 @@ class ProteinMpnnModel(nn.Module):
         r"""Return target-first sequence-free probabilities for every row."""
 
         return self._single_residue_probabilities(
-            input,
+            features,
             num_decoding_orders=num_decoding_orders,
             base_decoding_ranks=base_decoding_ranks,
             backbone_noise=backbone_noise,
@@ -568,7 +570,7 @@ class ProteinMpnnModel(nn.Module):
     @torch.inference_mode()
     def score(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
@@ -577,10 +579,10 @@ class ProteinMpnnModel(nn.Module):
     ) -> ScoreResult:
         r"""Score the input sequence over independently drawn decoding orders."""
 
-        self._require_single_target(input)
+        self._require_single_target(features)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         backbone_noise = self._validate_backbone_noise(backbone_noise)
-        repeated = self._repeat_input(input, num_decoding_orders)
+        repeated = self._repeat_input(features, num_decoding_orders)
         log_probabilities = self.forward(
             repeated,
             decoding_ranks=decoding_ranks,
@@ -601,8 +603,8 @@ class ProteinMpnnModel(nn.Module):
                 (
                     designed_values,
                     global_values,
-                    input.design_mask[0],
-                    input.valid_mask[0],
+                    features.design_mask[0],
+                    features.valid_mask[0],
                 )
             )
             .detach()
@@ -610,10 +612,10 @@ class ProteinMpnnModel(nn.Module):
         )
         designed_evaluations = host_result[:num_decoding_orders].numpy()
         global_evaluations = host_result[num_decoding_orders : 2 * num_decoding_orders].numpy()
-        length = input.sequence_tokens.shape[1]
+        length = features.sequence_tokens.shape[1]
         host_design_mask = host_result[2 * num_decoding_orders : 2 * num_decoding_orders + length].bool()
         host_valid_mask = host_result[2 * num_decoding_orders + length :].bool()
-        references = input.component_references[0]
+        references = features.component_references[0]
         designed_scope = frozenset(
             reference
             for reference, selected, present in zip(
@@ -629,7 +631,7 @@ class ProteinMpnnModel(nn.Module):
             if reference is not None and present
         )
         return ScoreResult(
-            target=input.structures[0],
+            target=features.structures[0],
             scores={
                 "designed_sequence_nll": Score(
                     value=float(designed_evaluations.mean()),
@@ -654,19 +656,25 @@ class ProteinMpnnModel(nn.Module):
         *,
         temperature: float,
         global_logit_bias: Tensor | None,
+        global_omit_token_mask: Tensor | None,
         residue_logit_bias: Tensor | None,
         pssm_coefficient: Tensor | None,
         pssm_probabilities: Tensor | None,
         pssm_mixture: float,
-        hard_support: Tensor,
+        pssm_log_odds: Tensor | None,
+        pssm_log_odds_threshold: float | None,
+        allowed_token_mask: Tensor | None,
     ) -> Tensor:
-        r"""Apply each soft control once, then intersect final hard support."""
+        r"""Apply released sampling controls in their original order."""
 
+        scaled_logits = logits / temperature
         if global_logit_bias is not None:
-            logits = logits + global_logit_bias
+            scaled_logits = scaled_logits + global_logit_bias / temperature
         if residue_logit_bias is not None:
-            logits = logits + residue_logit_bias
-        probabilities = F.softmax(logits / temperature, dim=-1)
+            scaled_logits = scaled_logits + residue_logit_bias / temperature
+        if global_omit_token_mask is not None:
+            scaled_logits = scaled_logits - global_omit_token_mask.to(scaled_logits.dtype) * 1e8
+        probabilities = F.softmax(scaled_logits, dim=-1)
         if pssm_probabilities is not None and pssm_mixture:
             coefficient = (
                 torch.ones(logits.shape[0], device=logits.device, dtype=logits.dtype)
@@ -676,45 +684,19 @@ class ProteinMpnnModel(nn.Module):
             mixture = pssm_mixture * coefficient
             probabilities = (1 - mixture.unsqueeze(-1)) * probabilities + mixture.unsqueeze(-1) * pssm_probabilities
 
-        probabilities = probabilities * hard_support
-        return probabilities / probabilities.sum(dim=-1, keepdim=True)
-
-    @staticmethod
-    def _hard_support(
-        valid_mask: Tensor,
-        allowed_token_mask: Tensor | None,
-        pssm_log_odds: Tensor | None,
-        global_omit_token_mask: Tensor | None,
-        pssm_log_odds_threshold: float | None,
-    ) -> Tensor:
-        r"""Construct final per-row support once before autoregressive decoding.
-
-        The raw support starts all-True over every generatable class, including the
-        twenty-first (index 20 = ``AMINO_ACID_UNKNOWN_TOKEN`` = X / UNK). X is a
-        reachable generated class of the raw Model and is only removed when
-        ``global_omit_token_mask``, ``allowed_token_mask``, or the PSSM log-odds
-        threshold actually remove it; the Pipeline's default ``("X",)`` omission is
-        an operation default rather than a permanent support reduction.
-        """
-
-        support = torch.ones(
-            *valid_mask.shape,
-            len(AMINO_ACID_COMPONENT_IDS) + 1,
-            dtype=torch.bool,
-            device=valid_mask.device,
-        )
-        if global_omit_token_mask is not None:
-            support &= ~global_omit_token_mask.bool()
-        if allowed_token_mask is not None:
-            support &= allowed_token_mask.bool()
         if pssm_log_odds is not None and pssm_log_odds_threshold is not None:
-            support &= pssm_log_odds > pssm_log_odds_threshold
-        return support
+            log_odds_mask = pssm_log_odds > pssm_log_odds_threshold
+            probabilities = probabilities * log_odds_mask + probabilities * 0.001
+            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+        if allowed_token_mask is not None:
+            probabilities = probabilities * allowed_token_mask
+            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+        return probabilities
 
     @torch.inference_mode()
     def sample(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_samples: int = 1,
         temperature: float = 0.1,
@@ -725,12 +707,11 @@ class ProteinMpnnModel(nn.Module):
         pssm_mixture: float = 0.0,
         pssm_log_odds_threshold: float | None = None,
         generator: torch.Generator | None = None,
-    ) -> MpnnSamplingOutput:
+    ) -> ProteinMpnnSamplingOutput:
         r"""Sample sequences, resolving tied and untied groups on one causal path."""
 
-        self._require_single_target(input)
-        if type(num_samples) is not int or num_samples <= 0:
-            raise ValueError("num_samples must be a positive integer")
+        self._require_single_target(features)
+        num_samples = _positive_integer(num_samples, "num_samples")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
@@ -740,21 +721,12 @@ class ProteinMpnnModel(nn.Module):
             raise ValueError("pssm_mixture must be between zero and one")
         if pssm_log_odds_threshold is not None:
             pssm_log_odds_threshold = float(pssm_log_odds_threshold)
-            if not math.isfinite(pssm_log_odds_threshold):
-                raise ValueError("pssm_log_odds_threshold must be finite")
 
-        repeated = self._repeat_input(input, num_samples)
+        repeated = self._repeat_input(features, num_samples)
         device = repeated.backbone_coordinates.device
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
 
-        hard_support = self._hard_support(
-            repeated.valid_mask,
-            repeated.allowed_token_mask,
-            repeated.pssm_log_odds,
-            global_omit_token_mask,
-            pssm_log_odds_threshold,
-        )
         node_states, edge_states, neighbor_indices = self._encode(
             repeated.backbone_coordinates,
             repeated.valid_mask,
@@ -775,11 +747,11 @@ class ProteinMpnnModel(nn.Module):
             if decoding_ranks is None
             else decoding_ranks
         )
-        representative_positions = self._representative_positions(input.tied_group_ids)
+        representative_positions = self._representative_positions(features.tied_group_ids)
         ordered_group_ranks = torch.sort(ranks[:, representative_positions], dim=-1).values
         num_units = ordered_group_ranks.shape[1]
 
-        backward_mask, forward_mask = _autoregressive_masks(
+        backward_mask, forward_mask = autoregressive_masks(
             ranks,
             neighbor_indices,
             repeated.valid_mask.to(dtype=node_states.dtype),
@@ -849,11 +821,15 @@ class ProteinMpnnModel(nn.Module):
                 )
             )
             representatives = positions[segment_starts]
-            group_support = torch.segment_reduce(
-                hard_support[batch_indices, positions].to(logits.dtype),
-                "min",
-                lengths=member_counts,
-            ).bool()
+            group_allowed_token_mask = (
+                None
+                if repeated.allowed_token_mask is None
+                else torch.segment_reduce(
+                    repeated.allowed_token_mask[batch_indices, positions].to(logits.dtype),
+                    "min",
+                    lengths=member_counts,
+                ).bool()
+            )
             member_selected = (
                 repeated.valid_mask[batch_indices, positions] & repeated.design_mask[batch_indices, positions]
             )
@@ -871,16 +847,23 @@ class ProteinMpnnModel(nn.Module):
             anchor_positions = fixed_mask.long().argmax(dim=-1)
             anchor_tokens = repeated.sequence_tokens[sample_indices, anchor_positions]
             anchored = ~active & has_designed_member & (member_counts > 1)
-            anchor_allowed = group_support[sample_indices, anchor_tokens]
+            anchor_allowed = (
+                torch.ones_like(anchor_tokens, dtype=torch.bool)
+                if group_allowed_token_mask is None
+                else group_allowed_token_mask[sample_indices, anchor_tokens]
+            )
+            if global_omit_token_mask is not None:
+                anchor_allowed &= ~global_omit_token_mask[anchor_tokens].bool()
             torch._assert(
                 torch.all(~anchored | anchor_allowed),
-                "a tied anchor must remain in final hard support",
+                "a tied anchor must remain in allowed token support",
             )
 
             probabilities = self._sampling_distribution(
                 combined_logits,
                 temperature=temperature,
                 global_logit_bias=global_logit_bias,
+                global_omit_token_mask=global_omit_token_mask,
                 residue_logit_bias=(
                     None
                     if repeated.residue_logit_bias is None
@@ -897,15 +880,19 @@ class ProteinMpnnModel(nn.Module):
                     else repeated.pssm_probabilities[sample_indices, representatives]
                 ),
                 pssm_mixture=pssm_mixture,
-                hard_support=group_support,
+                pssm_log_odds=(
+                    None if repeated.pssm_log_odds is None else repeated.pssm_log_odds[sample_indices, representatives]
+                ),
+                pssm_log_odds_threshold=pssm_log_odds_threshold,
+                allowed_token_mask=group_allowed_token_mask,
             )
             drawn_tokens = torch.multinomial(
-                probabilities[active],
+                probabilities,
                 1,
                 generator=generator,
             ).squeeze(-1)
             group_tokens = anchor_tokens.clone()
-            group_tokens[active] = drawn_tokens
+            group_tokens[active] = drawn_tokens[active]
             sequences[batch_indices, positions] = group_tokens[batch_indices]
             anchor_probabilities = torch.zeros_like(probabilities).scatter(
                 1,
@@ -922,7 +909,7 @@ class ProteinMpnnModel(nn.Module):
             ] * member_selected.unsqueeze(-1)
             token_states[batch_indices, positions] = self.token_embedding(group_tokens[batch_indices])
 
-        return MpnnSamplingOutput(
+        return ProteinMpnnSamplingOutput(
             sequences=sequences,
             log_probabilities=log_probabilities,
             sampling_probabilities=sampling_probabilities,
@@ -947,6 +934,11 @@ class ProteinMpnnModel(nn.Module):
             )
             if reference is not None and selected
         }
+        changed_references = frozenset(
+            reference
+            for reference, replacement in replacements.items()
+            if system.component(reference).component_id != replacement.component_id
+        )
         realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
         for instance_id, entity_id in system.instances.items():
             entity = system.entities[entity_id]
@@ -1002,23 +994,13 @@ class ProteinMpnnModel(nn.Module):
                     instance_entities[instance_id] = output_id
         new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
         candidate = MolecularSystem(new_entities, new_instances)
-        retained_bonds = []
-        for bond in system.bonds:
-            try:
-                candidate.atom(bond.site_a)
-                candidate.atom(bond.site_b)
-                if bond.stereo_sites is not None:
-                    candidate.atom(bond.stereo_sites[0])
-                    candidate.atom(bond.stereo_sites[1])
-            except KeyError:
-                continue
-            retained_bonds.append(bond)
-        return MolecularSystem(new_entities, new_instances, frozenset(retained_bonds))
+        retained_bonds = system.retain_bonds_after_component_mutation(candidate, changed_references)
+        return MolecularSystem(new_entities, new_instances, retained_bonds)
 
     @torch.inference_mode()
     def design(
         self,
-        input: ProteinMpnnInput,
+        features: ProteinMpnnInput,
         *,
         num_candidates: int = 1,
         num_decoding_orders: int = 1,
@@ -1032,9 +1014,8 @@ class ProteinMpnnModel(nn.Module):
     ) -> ProteinMpnnDesignResult:
         r"""Design complete sequence candidates and retain the native input score."""
 
-        self._require_single_target(input)
-        if type(num_candidates) is not int or num_candidates <= 0:
-            raise ValueError("num_candidates must be a positive integer")
+        self._require_single_target(features)
+        num_candidates = _positive_integer(num_candidates, "num_candidates")
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
@@ -1046,13 +1027,13 @@ class ProteinMpnnModel(nn.Module):
         stream_seeds = torch.randint(
             torch.iinfo(torch.int64).max,
             (2,),
-            device=input.backbone_coordinates.device,
+            device=features.backbone_coordinates.device,
             generator=generator,
         ).tolist()
-        candidate_generator = torch.Generator(device=input.backbone_coordinates.device).manual_seed(stream_seeds[0])
-        score_generator = torch.Generator(device=input.backbone_coordinates.device).manual_seed(stream_seeds[1])
+        candidate_generator = torch.Generator(device=features.backbone_coordinates.device).manual_seed(stream_seeds[0])
+        score_generator = torch.Generator(device=features.backbone_coordinates.device).manual_seed(stream_seeds[1])
         sampled = self.sample(
-            input,
+            features,
             num_samples=num_candidates,
             temperature=temperature,
             backbone_noise=backbone_noise,
@@ -1063,7 +1044,7 @@ class ProteinMpnnModel(nn.Module):
             generator=candidate_generator,
         )
         input_score = self.score(
-            input,
+            features,
             num_decoding_orders=num_decoding_orders,
             backbone_noise=backbone_noise,
             generator=score_generator,
@@ -1073,11 +1054,13 @@ class ProteinMpnnModel(nn.Module):
             -1,
             sampled.sequences.unsqueeze(-1),
         ).squeeze(-1)
-        valid = input.valid_mask.repeat_interleave(num_candidates, dim=0).to(losses.dtype)
-        designed = (input.valid_mask & input.design_mask).repeat_interleave(num_candidates, dim=0).to(losses.dtype)
+        valid = features.valid_mask.repeat_interleave(num_candidates, dim=0).to(losses.dtype)
+        designed = (
+            (features.valid_mask & features.design_mask).repeat_interleave(num_candidates, dim=0).to(losses.dtype)
+        )
         designed_nll = (losses * designed).sum(dim=-1) / designed.sum(dim=-1)
         global_nll = (losses * valid).sum(dim=-1) / valid.sum(dim=-1)
-        recovery = (sampled.sequences == input.sequence_tokens.repeat_interleave(num_candidates, dim=0)).to(
+        recovery = (sampled.sequences == features.sequence_tokens.repeat_interleave(num_candidates, dim=0)).to(
             losses.dtype
         ).mul(designed).sum(dim=-1) / designed.sum(dim=-1)
         length = sampled.sequences.shape[1]
@@ -1085,8 +1068,8 @@ class ProteinMpnnModel(nn.Module):
             torch.cat(
                 (
                     sampled.sequences.reshape(-1),
-                    input.design_mask[0],
-                    input.valid_mask[0],
+                    features.design_mask[0],
+                    features.valid_mask[0],
                     torch.stack((designed_nll, global_nll, recovery), dim=-1).reshape(-1),
                 )
             )
@@ -1098,7 +1081,7 @@ class ProteinMpnnModel(nn.Module):
         host_design_mask = host_result[sequence_values : sequence_values + length].bool()
         host_valid_mask = host_result[sequence_values + length : sequence_values + 2 * length].bool()
         host_scores = host_result[sequence_values + 2 * length :].reshape(num_candidates, 3)
-        references = input.component_references[0]
+        references = features.component_references[0]
         designed_scope = frozenset(
             reference
             for reference, selected, present in zip(
@@ -1116,7 +1099,7 @@ class ProteinMpnnModel(nn.Module):
         candidates = []
         for index in range(num_candidates):
             system = self._realize_sequence(
-                input.structures[0].system,
+                features.structures[0].system,
                 references,
                 host_sequences[index],
                 host_design_mask,
@@ -1148,6 +1131,45 @@ class ProteinMpnnModel(nn.Module):
         return ProteinMpnnDesignResult(candidates=tuple(candidates), input_score=input_score)
 
 
+@dataclass(eq=False)
+class ProteinMpnnOutput:
+    r"""Raw logits and exact causal ranks from a ProteinMPNN sequence graph."""
+
+    logits: Tensor
+    decoding_ranks: Tensor
+
+    @property
+    def log_probabilities(self) -> Tensor:
+        r"""Return vocabulary log probabilities without storing a duplicate tensor."""
+
+        return self.logits.log_softmax(dim=-1)
+
+    @property
+    def probabilities(self) -> Tensor:
+        r"""Return vocabulary probabilities without storing a duplicate tensor."""
+
+        return self.logits.softmax(dim=-1)
+
+
+@dataclass(eq=False)
+class ProteinMpnnSamplingOutput:
+    r"""Complete aligned tensor output from the ProteinMPNN sequence sampler."""
+
+    sequences: Tensor
+    log_probabilities: Tensor
+    sampling_probabilities: Tensor
+    decoding_ranks: Tensor
+
+
+def _positive_integer(value: int, name: str) -> int:
+    r"""Normalize one positive index-valued operation count."""
+
+    result = operator.index(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 def _pair_radial_basis(
     source_coordinates: Tensor,
     target_coordinates: Tensor,
@@ -1160,7 +1182,7 @@ def _pair_radial_basis(
     neighbor_distances = torch.sqrt(
         torch.sum((source_coordinates.unsqueeze(-2) - neighbor_coordinates) ** 2, dim=-1) + 1e-6
     )
-    return _radial_basis(neighbor_distances, num_bins)
+    return radial_basis(neighbor_distances, num_bins)
 
 
 class CaProteinMpnnFeatures(nn.Module):
@@ -1251,7 +1273,7 @@ class CaProteinMpnnFeatures(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         r"""Build the nine-pair Cα-only neighbor graph."""
 
-        neighbor_distances, neighbor_indices = _nearest_neighbors(
+        neighbor_distances, neighbor_indices = nearest_neighbors(
             backbone_coordinates,
             valid_mask,
             self.num_neighbors,
@@ -1263,7 +1285,7 @@ class CaProteinMpnnFeatures(nn.Module):
         orientation = self.orientations(backbone_coordinates, neighbor_indices)
         distance_features = torch.cat(
             (
-                _radial_basis(neighbor_distances),
+                radial_basis(neighbor_distances),
                 _pair_radial_basis(previous, previous, neighbor_indices),
                 _pair_radial_basis(following, following, neighbor_indices),
                 _pair_radial_basis(previous, backbone_coordinates, neighbor_indices),
@@ -1285,8 +1307,7 @@ class CaProteinMpnnFeatures(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Family-owned tensor and result boundaries for ProteinMPNN (folded from
-# the former contract.py).
+# ProteinMPNN tensor and result records.
 # ---------------------------------------------------------------------------
 
 
@@ -1343,8 +1364,8 @@ def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
     r"""Return the per-token negative log likelihood of the observed tokens.
 
     Gathers ``-log_probabilities`` at each target token, matching upstream
-    ProteinMPNN's ``NLLLoss(reduction="none")`` without the caller-owned mask
-    reduction. The result has shape ``sequence_tokens.shape``.
+    ProteinMPNN's ``NLLLoss(reduction="none")`` before mask reduction. The
+    result has shape ``sequence_tokens.shape``.
     """
 
     return -log_probabilities.gather(-1, sequence_tokens.unsqueeze(-1)).squeeze(-1)

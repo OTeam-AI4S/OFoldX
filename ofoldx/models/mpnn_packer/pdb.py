@@ -1,11 +1,8 @@
-r"""The MpnnPacker family PDB visualization writer.
+r"""PDB visualization writer for MpnnPacker predictions.
 
-This module owns :func:`write_pdb`, the family-specific packed-PDB export that
-consumes one complete :class:`~ofoldx.results.PackPrediction`. It is the symmetric
-counterpart of the general :func:`ofoldx.io.read_pdb` reader, but it is a bounded
-family visualization (DESIGN.md §4.6.1) rather than a generic Structure exchange
-path, so it lives beside the model that produces the prediction instead of in
-``ofoldx.io``. It is reexported by :mod:`ofoldx.models.mpnn_packer`.
+:func:`write_pdb` serializes one complete :class:`~ofoldx.results.PackPrediction`
+using the packed-structure conventions produced by MpnnPacker. The output is
+intended for visualization rather than general ``Structure`` exchange.
 """
 
 from __future__ import annotations
@@ -15,16 +12,11 @@ from os import PathLike
 from pathlib import Path
 
 import numpy as np
-
-try:
-    # biotite >= 1.7 exposes hybrid-36 codecs from the Rust extension.
-    from biotite.rust.structure.io.pdb import encode_hybrid36
-except ImportError:  # pragma: no cover - older biotite layout
-    from biotite.structure.io.pdb.hybrid36 import encode_hybrid36
+from biotite.rust.structure.io.pdb import encode_hybrid36
 
 from ...data import is_water_component
-from ...data import residue_constants as rc
 from ...data.molecular import ComponentReference, PolymerSequence
+from ...modules import residue_constants as rc
 from ...results import PackPrediction
 
 

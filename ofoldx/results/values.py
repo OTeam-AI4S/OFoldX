@@ -120,22 +120,6 @@ class ScoreResult:
 
 
 @dataclass(eq=False)
-class AffinityResult:
-    r"""One two-stage Boltz-2 affinity result (DESIGN 5.4.3).
-
-    Flat by design: the selected second-pass ``target`` Structure, the
-    confidence-descending first-stage ``structure_predictions`` tuple, and the
-    flat affinity ``scores``/``metrics``. It is not a ``ScoreResult`` subclass;
-    first-pass coordinates are never merged into the second-pass ``target``.
-    """
-
-    target: Structure
-    structure_predictions: tuple[FoldPrediction, ...]
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-
-
-@dataclass(eq=False)
 class PackPrediction:
     r"""One packed structure and the metrics produced for that sample."""
 

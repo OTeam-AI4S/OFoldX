@@ -147,7 +147,7 @@ def convert_deepmind_alphafold2_checkpoint(
 
     params, resolved_model_name = _load_official_alphafold2_params(checkpoint_path, model_name=model_name)
     if _model_family(resolved_model_name) == "multimer":
-        # AF-Multimer is a second registered pair in this family sharing the trunk;
+        # AF-Multimer uses a separate registered model/processor pair with the shared trunk;
         # its converter builds AlphaFold2MultimerConfig/AlphaFold2MultimerModel and
         # applies the multimer key normalization. Imported lazily to avoid a
         # converters<->model import cycle at module load.

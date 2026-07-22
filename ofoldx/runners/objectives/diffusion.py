@@ -42,21 +42,23 @@ def edm_weight(sigma: Tensor, sigma_data: float) -> Tensor:
 
 @OBJECTIVES.register("diffusion")
 class DiffusionObjective:
-    r"""EDM-weighted mean-squared denoising error over valid atoms.
+    r"""EDM-weighted mean-squared denoising error over loss-eligible atoms.
 
     Contract (``__call__(model, batch) -> (output, loss)``):
 
-    - ``batch`` is a diffusion-family Input carrying ``target_positions`` and the
-      atom validity mask; ``model(batch)`` runs the single EDM denoising step and
-      returns an Output with ``denoised_coords``, ``augmented_target``, and
-      ``noise_level`` (the per-sample noise sigma).
-    - ``loss`` = mean over valid atoms of
+    - ``batch`` is a diffusion-family Input carrying ``target_positions``, the
+      atom validity mask, and optionally a distinct resolved-target mask;
+      ``model(batch)`` runs the single EDM denoising step and returns an Output
+      with ``denoised_coords``, ``augmented_target``, and ``noise_level`` (the
+      per-sample noise sigma).
+    - ``loss`` = mean over resolved target atoms of
       ``edm_weight(noise_level) * ||denoised_coords - augmented_target||^2``,
       where ``edm_weight(sigma) = (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2``
       is the family's standard EDM loss weight (use the family's own weight helper
       when present, e.g. ``boltz2/model.py``'s EDM weighting).
-    - Reduce over the sample axis (``num_samples``) and the batch, masking padded
-      atoms; return ``(output, loss)``.
+    - Reduce over the sample axis (``num_samples``) and the batch using
+      ``target_mask`` when supplied, otherwise ``atom_mask``; return
+      ``(output, loss)``. ``atom_mask`` remains the model's augmentation mask.
 
     ``sigma_data`` and ``num_samples`` are construction-time hyperparameters on
     this objective (defaults match the family config), not Model config fields.
@@ -83,9 +85,12 @@ class DiffusionObjective:
         weight = edm_weight(output.noise_level, self.sigma_data).reshape(batch_size, num_samples, 1)
         weighted_error = weight * squared_error
 
-        # Masked mean over valid atoms, reducing the sample and batch axes. The
-        # atom mask ``(B, M)`` is shared across samples, so broadcast it in.
-        mask = batch.atom_mask.unsqueeze(1).to(weighted_error.dtype).expand_as(weighted_error)
+        # Boltz families distinguish present atoms (used by augmentation) from
+        # resolved target atoms (used by the loss). Other diffusion contracts
+        # retain atom-mask semantics when they do not expose a target mask.
+        target_mask: Tensor | None = getattr(batch, "target_mask", None)
+        loss_mask = batch.atom_mask if target_mask is None else target_mask
+        mask = loss_mask.unsqueeze(1).to(weighted_error.dtype).expand_as(weighted_error)
         denominator = mask.sum().clamp_min(torch.finfo(weighted_error.dtype).tiny)
         loss = (weighted_error * mask).sum() / denominator
 

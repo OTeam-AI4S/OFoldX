@@ -1,14 +1,10 @@
-r"""
-Typed diffusion input contracts.
-
-The dataclass here is the frozen-shape contract handed to a coordinate denoiser: it bundles the step-invariant
-conditioning (atom features, trunk single/pair, relative-position features) with the per-step ``noisy_coords`` and
-``noise_level`` so the denoiser signature stays a single typed argument.
-"""
+r"""Coordinate-denoising input types."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeAlias
 
 from torch import Tensor
 
@@ -19,10 +15,10 @@ from ..embedding.position import RelativePositionBuckets
 @dataclass
 class CoordinateDenoisingInput:
     r"""
-    Typed input bundle for a single coordinate-denoising step.
+    Inputs for one coordinate-denoising step.
 
-    Groups the static conditioning tensors together with the step-specific ``noisy_coords`` and ``noise_level`` that a
-    a coordinate denoiser consumes. Built per step by
+    Static conditioning accompanies the step-specific ``noisy_coords`` and
+    ``noise_level``. Instances are built by
     [`CoordinateDenoiseContext.to_denoising_input`][ofoldx.modules.diffusion.sampling.CoordinateDenoiseContext].
 
     Attributes:
@@ -54,3 +50,6 @@ class CoordinateDenoisingInput:
     atom_mask: Tensor
     noisy_coords: Tensor
     local_geometry: LocalAtomGeometry | None
+
+
+CoordinateDenoiseFn: TypeAlias = Callable[[CoordinateDenoisingInput], Tensor]

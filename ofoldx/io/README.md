@@ -1,24 +1,29 @@
 # io
 
-`ofoldx.io` exposes complete canonical PDB/mmCIF structure I/O. Sequence-format I/O,
-including FASTA, belongs to the MultiMolecule dependency rather than being wrapped
-again here.
+`ofoldx.io` exposes canonical PDB/mmCIF structure exchange through
+`read_structure`, `read_structures`, `write_structure`, and `LossReport`.
 Readers construct referentially closed `MolecularSystem`/`Structure` values from
-package-audited or explicitly supplied component graphs, with explicit model,
+built-in or explicitly supplied component graphs, with explicit model,
 assembly, atom-layout, and alternate-location policies. mmCIF preserves the complete
-canonical value; PDB fails by default when it cannot and returns a `LossReport` only
-under explicit `allow_lossy=True`.
+canonical value; PDB refuses unacknowledged loss.
 
 ## Contents
 
-- `structure.py` — canonical `read_structure`, altloc-expanding `read_structures`,
-  `write_structure`, and `LossReport`. This is the general Structure-exchange entry
-  point: PDB and mmCIF, explicit model / assembly / altloc / atom-layout policies,
-  and an explicit fidelity contract.
-- `pdb.py` — `read_pdb`, the narrower policy-free reader the released MPNN models
-  parse their inputs through (hybrid-36 decoding, single-model / first-altloc,
-  audited protein-component reconstruction). It is what the model Pipelines call and
-  is **not** interchangeable with `read_structure`; neither reader delegates to the
-  other. The symmetric packed-PDB *writer* is a bounded family visualization and
-  lives with its model as `ofoldx.models.mpnn_packer.write_pdb`, not here.
-- `msa.py` — `read_msa`.
+- `structure.py` - public suffix dispatch, alternate-location and atom-layout
+  policies, canonical Structure materialization, and the `LossReport` facade.
+- `records.py` - public format-neutral `AtomRecord` and `ParsedStructure`
+  values, record normalization, source-site mapping, identity generation, and
+  output-bond ordering shared by PDB and mmCIF.
+- `pdb.py` - generic PDB parsing, CONECT bonds, lossy-field analysis, and writing.
+- `mmcif.py` - generic mmCIF parsing, canonical payload decoding, branched entities,
+  `struct_conn` bonds, and writing.
+- `msa.py` - `read_msa`.
+
+Canonical value serialization is the public `ofoldx.data.codec` boundary. It
+encodes and decodes `MolecularSystem`, `Structure`, MSA evidence, and templates;
+the mmCIF exchange path uses it for embedded canonical payloads.
+
+The released MPNN implementations use the public
+`ofoldx.models.mpnn_pdb.read_mpnn_pdb` parser for their shared model-specific
+input policy. It belongs to the model namespace and is not re-exported from
+`ofoldx.io`.

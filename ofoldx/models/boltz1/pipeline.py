@@ -6,48 +6,23 @@ from collections.abc import Mapping
 from os import PathLike
 
 import torch
-from typing_extensions import Self
 
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
-from ...pipelines import resolve_generator
+from ...pipelines import PairedPipeline, processor_device, resolve_generator
 from ...results import FoldResult
 from .model import Boltz1Model, Boltz1Pocket
 from .processor import Boltz1Processor
 
 
-class Boltz1Pipeline:
+class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
     r"""Bind one Boltz-1 Model-Processor pair for the released folding operation.
 
-    Owns the one Processor call and the one ``Boltz1Model.fold`` invocation, exposing the family-owned pocket
-    conditioning and Boltz-1x steering controls that the common ``fold`` verb cannot carry. The decoded output
-    is the shared ``FoldResult`` unchanged; the Pipeline is not a base class and shares no runtime request
-    object with any other family.
+    Runs one Processor call followed by one ``Boltz1Model.fold`` invocation, exposing
+    Boltz-1 pocket conditioning and Boltz-1x steering controls. The decoded output is the
+    shared ``FoldResult`` unchanged.
     """
-
-    model: Boltz1Model
-    processor: Boltz1Processor
-
-    def __init__(
-        self,
-        *,
-        model: Boltz1Model,
-        processor: Boltz1Processor,
-    ) -> None:
-        self.model = model
-        self.processor = processor
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Place the Model and Processor on one device and dtype in place."""
-
-        self.model.to(device=device, dtype=dtype)
-        self.processor.to(device=device, dtype=dtype)
-        return self
 
     def fold(
         self,
@@ -65,8 +40,8 @@ class Boltz1Pipeline:
     ) -> FoldResult:
         r"""Lower one folding input and run released Boltz-1 folding into a canonical ``FoldResult``."""
 
-        batch = self.processor(input, msa=msa, pocket=pocket)
-        generator = resolve_generator(seed, generator, device=batch.atom_mask.device)
+        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        batch = self.processor(input, msa=msa, pocket=pocket, generator=generator)
         return self.model.fold(
             batch,
             num_samples=num_samples,

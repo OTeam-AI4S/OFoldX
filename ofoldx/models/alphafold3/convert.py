@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 from os import PathLike
 from pathlib import Path
+from typing import cast
 
 import torch
 
-from ...artifacts import save_model
 from .config import AlphaFold3ProcessorConfig
 from .converters import deepmind
+from .model import AlphaFold3Model
+from .pipeline import AlphaFold3Pipeline
 from .processor import AlphaFold3Processor
 
 _DTYPES = {
@@ -24,6 +26,20 @@ _DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+def convert_alphafold3_model(
+    checkpoint_path: str | PathLike[str],
+    *,
+    model_name: str | None = None,
+    dtype: torch.dtype | None = None,
+) -> AlphaFold3Model:
+    r"""Strict-load official AF3 parameters into an in-memory native Model."""
+
+    return cast(
+        AlphaFold3Model,
+        deepmind.convert_official_alphafold3_checkpoint(checkpoint_path, model_name=model_name, dtype=dtype),
+    )
 
 
 def convert_alphafold3_checkpoint(
@@ -34,38 +50,28 @@ def convert_alphafold3_checkpoint(
     dtype: torch.dtype | None = None,
     repo_id: str | None = None,
     token: str | None = None,
-    private: bool = True,
+    private: bool = False,
 ) -> None:
     r"""Strict-load official AF3 parameters and write a standard OFoldX repository.
 
     Converts the DeepMind AlphaFold 3 parameter archive at ``checkpoint_path`` into a
-    native model, pairs it with the family :class:`AlphaFold3Processor`, and writes a
-    self-contained ``model.json`` / ``processor.json`` / safetensors repository to
-    ``output_dir`` via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
+    native model, pairs it with :class:`AlphaFold3Processor`, and writes a
+    routable ``model.json`` / ``processor.json`` / ``pipeline.json`` / safetensors
+    repository to ``output_dir`` through :class:`AlphaFold3Pipeline`.
 
-    Saving is local-only by default. Official DeepMind AlphaFold 3 parameters are **not
-    redistributable (RED)**: any Hub upload defaults to ``private=True`` and a public
-    upload is refused. When ``repo_id`` is given the fully written repository is uploaded
-    privately; passing ``private=False`` with a ``repo_id`` raises rather than publishing
-    the restricted weights. Omitting ``repo_id`` never touches the network.
+    Saving is local-only when ``repo_id`` is omitted.
     """
 
-    if repo_id is not None and not private:
-        raise ValueError(
-            "refusing to publish AlphaFold 3 parameters to a public Hub repository: the official "
-            "DeepMind AlphaFold 3 weights are NOT redistributable (RED). Upload privately "
-            "(private=True, the default) or save locally by omitting repo_id."
-        )
-
-    model = deepmind.convert_official_alphafold3_checkpoint(
+    model = convert_alphafold3_model(
         checkpoint_path,
         model_name=model_name,
         dtype=dtype,
     )
-    save_model(
-        output_dir,
+    AlphaFold3Pipeline(
         model=model,
         processor=AlphaFold3Processor(AlphaFold3ProcessorConfig()),
+    ).save(
+        output_dir,
         repo_id=repo_id,
         token=token,
         private=private,
@@ -84,12 +90,7 @@ def main(argv: list[str] | None = None) -> None:
         help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
     )
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
-    parser.add_argument(
-        "--private",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="upload the --repo-id repo as private; AF3 weights are RED, so --no-private is refused",
-    )
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
     convert_alphafold3_checkpoint(
         args.checkpoint,

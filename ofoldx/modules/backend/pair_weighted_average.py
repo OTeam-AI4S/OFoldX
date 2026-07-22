@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_pair_weighted_average = oops_kernel("pair_weighted_average")
@@ -55,9 +55,6 @@ def pair_weighted_average(
     Returns:
         ``(B, S, N, msa_size)`` MSA update, matching the shape of ``msa``.
 
-    Raises:
-        OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA tensors.
-
     Examples:
         >>> import torch
         >>> from ofoldx.modules.backend.pair_weighted_average import pair_weighted_average
@@ -94,21 +91,6 @@ def pair_weighted_average(
         public_default="eager",
     )
     if backend == "oops":
-        if not msa.is_cuda or not pair.is_cuda:
-            raise OOpsUnsupportedError(
-                "MsaPairWeightedAveraging backend 'oops' requires CUDA tensors; use operator_backend='eager'"
-            )
-        if pair_mask is not None and not pair_mask.is_cuda:
-            raise OOpsUnsupportedError(
-                "MsaPairWeightedAveraging backend 'oops' requires a CUDA pair_mask; use operator_backend='eager'"
-            )
-        # The fused kernel applies a single epsilon to both the MSA and pair LayerNorms; the eager path
-        # keeps them independent. Guard the mismatch instead of silently dropping norm_pair_eps.
-        if norm_msa_eps != norm_pair_eps:
-            raise OOpsUnsupportedError(
-                "MsaPairWeightedAveraging backend 'oops' requires norm_msa_eps == norm_pair_eps "
-                f"(got {norm_msa_eps} and {norm_pair_eps}); use operator_backend='eager'"
-            )
         return _oops_pair_weighted_average(
             msa,
             pair,
@@ -122,7 +104,8 @@ def pair_weighted_average(
             pair_logits_weight=pair_logits_weight,
             output_weight=output_weight,
             num_heads=num_heads,
-            eps=norm_msa_eps,
+            norm_msa_eps=norm_msa_eps,
+            norm_pair_eps=norm_pair_eps,
         )
 
     normalized = torch.nn.functional.layer_norm(msa, (msa.shape[-1],), norm_msa_weight, norm_msa_bias, norm_msa_eps)

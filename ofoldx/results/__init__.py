@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .mpnn import MpnnProbabilityResult
 from .values import (
-    AffinityResult,
     DesignCandidate,
     DesignResult,
     FoldPrediction,

@@ -15,8 +15,17 @@ from multimolecule.io import read_fasta_records
 from torch import Tensor
 from typing_extensions import Self
 
+from ...data import ATOMIC_NUMBER_BY_ELEMENT
 from ...data.components import get_component
-from ...data.evidence import MSA, MSACollection, Template
+from ...data.evidence import (
+    MSA,
+    MSACollection,
+    Template,
+    msa_binding_map,
+    msa_bindings,
+    resolve_msa_bindings,
+    select_msa_binding,
+)
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -28,6 +37,7 @@ from ...data.molecular import (
 from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...io.structure import read_structure
+from ...modules.geometry import uniform_random_rotation
 from ...references import classify_reference
 from .config import ProtenixConstraintProcessorConfig, ProtenixProcessorConfig
 from .model import ProtenixAtomContact, ProtenixInput, ProtenixPocket, ProtenixTokenContact
@@ -80,8 +90,7 @@ _UNKNOWN = _RESTYPE["UNK"]
 _GAP = _RESTYPE["-"]
 # MSA cells are UPPERCASE one-letter symbols (or the ``-`` gap), not ChemicalComponent IDs. This
 # projects the twenty standard protein one-letter codes onto their _RESTYPE indices; ``-`` becomes
-# the gap class and every other symbol (ambiguity codes B Z U J O X, etc.) becomes UNK -- matching
-# the pre-migration three-letter path, which resolved unmapped codes to _UNKNOWN and gaps to _GAP.
+# the gap class and every other symbol (ambiguity codes B Z U J O X, etc.) becomes UNK.
 _MSA_RESTYPE = {
     symbol: _RESTYPE[three]
     for symbol, three in {
@@ -108,21 +117,11 @@ _MSA_RESTYPE = {
     }.items()
 }
 _MSA_RESTYPE["-"] = _GAP
-_ELEMENTS = (  # noqa: SIM905  # periodic-table literal reads better as a whitespace-split string
-    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn "
-    "Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La "
-    "Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po "
-    "At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg "
-    "Cn Nh Fl Mc Lv Ts Og"
-).split()
-_ATOMIC_NUMBER = {element: index for index, element in enumerate(_ELEMENTS, start=1)}
 _FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 
 
 class ProtenixProcessor:
     r"""Build the exact v0.5 atom, token, MSA, constraint, and guidance tensors."""
-
-    config_class = ProtenixProcessorConfig
 
     def __init__(
         self,
@@ -163,11 +162,11 @@ class ProtenixProcessor:
         The default checkpoint has no constraint embedder, so this signature
         declares NO constraint keywords: passing ``atom_contacts``,
         ``token_contacts``, or ``pocket`` raises ``TypeError`` at the call
-        boundary (DESIGN §3.7.2 negative contract). Only the
+        boundary. Only the
         :class:`ProtenixConstraintProcessor` signature accepts them.
         """
 
-        return self._lower(input, msa=msa, templates=templates)
+        return self._lower(input, msa=msa, templates=templates, generator=generator)
 
     def _lower(
         self,
@@ -202,6 +201,7 @@ class ProtenixProcessor:
             pocket=pocket,
             generator=generator,
             max_msa_rows=self.config.max_msa_rows,
+            augment_reference_positions=self.config.augment_reference_positions,
             device=self.device,
             dtype=self.dtype,
         )
@@ -213,12 +213,10 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
     This is a DISTINCT Processor identity from the default one: its ``__call__``
     signature ADDS the ``atom_contacts``/``token_contacts``/``pocket`` keywords that
     the default :class:`ProtenixProcessor` signature deliberately omits. The two
-    signatures -- not a shared ``config.constraints`` runtime gate -- are what
-    separate the two architecture ids (DESIGN §3.7.2). Templates remain rejected --
+    signatures -- not a shared ``config.constraints`` runtime gate -- separate the
+    two architecture ids. Templates remain rejected --
     both v0.5 graphs disable template blocks.
     """
-
-    config_class = ProtenixConstraintProcessorConfig
 
     def __init__(
         self,
@@ -276,28 +274,26 @@ def _normalize_input(
         classified = classify_reference(input)
         if isinstance(classified, Path):
             if any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
-                sequences = tuple(
+                fasta_sequences = tuple(
                     (
                         record.id or f"chain_{index + 1}",
                         PolymerSequence.from_one_letter(record.sequence.strip().upper()),
                     )
                     for index, record in enumerate(read_fasta_records(classified))
                 )
-                return _sequence_system(sequences)
+                return _sequence_system(fasta_sequences)
             return read_structure(classified).system
         sequence = PolymerSequence.from_one_letter(classified.strip().upper())
         return _sequence_system((("protein", sequence),))
     if isinstance(input, PolymerSequence):
         return _sequence_system((("A", input),))
     if isinstance(input, Sequence):
-        sequences = tuple(input)
-        if not sequences or not all(isinstance(sequence, PolymerSequence) for sequence in sequences):
+        sequence_values = tuple(cast(Sequence[object], input))
+        if not sequence_values or not all(isinstance(sequence, PolymerSequence) for sequence in sequence_values):
             raise TypeError("Protenix sequence collections must contain PolymerSequence values")
+        polymer_sequences = cast(tuple[PolymerSequence, ...], sequence_values)
         return _sequence_system(
-            tuple(
-                (f"chain_{index + 1}", sequence)
-                for index, sequence in enumerate(cast(tuple[PolymerSequence, ...], sequences))
-            )
+            tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
     raise TypeError(
         "Protenix input must be an inline sequence, FASTA/structure path, PolymerSequence, "
@@ -328,20 +324,9 @@ def _normalize_msa(
     if msa is None:
         return None
     if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        for value in values:
-            # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over
-            # the primary system supplied here, so the Processor owns entity resolution, the protein
-            # gate, and the query-width check (the frozen MSA validates neither against an entity).
-            entity = system.entities.get(value.entity_id)
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+            if entity.polymer_type != "protein":
                 raise ValueError("released Protenix v0.5 consumes supplied MSA evidence only for proteins")
-            width = len(value.unpaired_sequences[0])
-            if width != len(entity.components):
-                raise ValueError(
-                    f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
-                    f"{len(entity.components)} components"
-                )
         return msa
 
     path = Path(msa).expanduser()
@@ -364,7 +349,7 @@ def _atom_constraint_residues(
     residues: set[ComponentReference] = set()
     for contact in atom_contacts:
         for site in (contact.atom_a, contact.atom_b):
-            if type(system.entities[system.instances[site.instance_id]]) is not Molecule:
+            if not isinstance(system.entities[system.instances[site.instance_id]], Molecule):
                 residues.add((site.instance_id, site.component_index))
     return frozenset(residues)
 
@@ -485,6 +470,7 @@ def _features(
     pocket: ProtenixPocket | None,
     generator: torch.Generator | None,
     max_msa_rows: int,
+    augment_reference_positions: bool,
     device: torch.device,
     dtype: torch.dtype,
 ) -> ProtenixInput:
@@ -496,9 +482,15 @@ def _features(
         for site in cast(tuple[AtomSite, ...], token["atoms"])
     }
     atom_to_token = torch.tensor([site_to_token[site] for site in atom_sites], dtype=torch.long)
-    reference_positions, reference_mask, reference_charges = _reference_features(system, atom_sites, site_to_atom)
-    atom_names = _model_atom_names(system, atom_sites)
-    element_indices = torch.tensor([_ATOMIC_NUMBER[system.atom(site).element] - 1 for site in atom_sites])
+    reference_positions, reference_mask, reference_charges = _reference_features(
+        system,
+        atom_sites,
+        site_to_atom,
+        augment=augment_reference_positions,
+        generator=generator,
+    )
+    atom_names = _model_atom_names(atom_sites)
+    element_indices = torch.tensor([ATOMIC_NUMBER_BY_ELEMENT[system.atom(site).element] - 1 for site in atom_sites])
     name_indices = torch.tensor(
         [[min(63, max(0, ord(character) - 32)) for character in name.ljust(4)[:4]] for name in atom_names],
         dtype=torch.long,
@@ -613,11 +605,8 @@ def _features(
     )
 
 
-def _model_atom_names(system: MolecularSystem, atom_sites: tuple[AtomSite, ...]) -> tuple[str, ...]:
-    # TODO(reopened): the committed Molecule carries no provenance, so SMILES-origin atoms can no
-    # longer be re-labelled by element as the released path did (old gate on
-    # provenance.source_format == "smiles"). Re-adding a Molecule.provenance field is out of this
-    # data-model facet, so every source atom_id is preserved until the provenance facet reopens.
+def _model_atom_names(atom_sites: tuple[AtomSite, ...]) -> tuple[str, ...]:
+    # Preserve canonical atom IDs; SMILES imports assign element-number IDs during construction.
     return tuple(site.atom_id for site in atom_sites)
 
 
@@ -625,6 +614,9 @@ def _reference_features(
     system: MolecularSystem,
     atom_sites: tuple[AtomSite, ...],
     site_to_atom: dict[AtomSite, int],
+    *,
+    augment: bool,
+    generator: torch.Generator | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     positions = torch.zeros(len(atom_sites), 3)
     mask = torch.zeros(len(atom_sites), dtype=torch.bool)
@@ -657,13 +649,14 @@ def _reference_features(
                 mask[global_index] = True
         indices = torch.tensor([site_to_atom[site] for site in sites])
         positions[indices] -= positions[indices].mean(dim=0)
+        if augment:
+            translation = torch.empty(3).uniform_(-1.0, 1.0, generator=generator)
+            rotation = uniform_random_rotation(dtype=positions.dtype, generator=generator)[0]
+            positions[indices] = torch.matmul(
+                positions[indices] + translation,
+                rotation.transpose(-1, -2),
+            )
     return positions, mask, charges
-
-
-def _msa_values(msa: MSA | MSACollection | None) -> tuple[MSA, ...]:
-    if msa is None:
-        return ()
-    return (msa,) if isinstance(msa, MSA) else msa.msas
 
 
 def _msa_polymer_type(system: MolecularSystem, entity_id: str) -> str | None:
@@ -675,7 +668,7 @@ def _msa_symbol_restype(symbol: str) -> int:
     # Cells are UPPERCASE one-letter MSA symbols or ``-``; the query axis binds column i to
     # ``entity.components[i]`` so ``monomer_index`` is the column directly (query_to_entity is now the
     # identity map). Standard residues resolve to their _RESTYPE index, ``-`` to the gap class, and
-    # every other symbol (ambiguity codes) to UNK -- exactly the pre-migration three-letter path.
+    # every other symbol (ambiguity codes) to UNK.
     return _MSA_RESTYPE.get(symbol, _UNKNOWN)
 
 
@@ -683,24 +676,24 @@ def _msa_descriptors(
     msa: MSA | MSACollection | None,
     *,
     max_rows: int,
-) -> list[tuple[dict[str, tuple[int, bool]], bool]]:
-    # Each descriptor maps a column's entity_id to ``(source_row, is_paired)``: the row index inside
-    # that column's pool and which pool (paired vs unpaired) supplies it. The bool is the query flag.
+) -> list[tuple[dict[tuple[str, str | None], tuple[int, bool]], bool]]:
+    # Each descriptor maps an entity-broadcast or exact-instance column binding to
+    # ``(source_row, is_paired)``. The bool is the query flag.
     if msa is None:
         return [({}, True)]
     if isinstance(msa, MSA):
         # A bare MSA is the entity's own deep alignment: enumerate its unpaired pool (row 0 is the
         # query), which the single-file reader packs as the full alignment.
-        return [({msa.entity_id: (row, False)}, row == 0) for row in range(min(len(msa.unpaired_sequences), max_rows))]
+        key = (msa.entity_id, None)
+        return [({key: (row, False)}, row == 0) for row in range(min(len(msa.unpaired_sequences), max_rows))]
 
     row_pairing = msa.row_pairing
     row_is_paired = msa.row_is_paired
-    entity_ids = tuple(value.entity_id for value in msa.msas)
+    bindings = msa_bindings(msa)
     plan_rows = int(row_pairing.shape[0])
 
     # A plan row is the query when every column selects source row 0 (no gaps); paired when >= 2
-    # columns are populated, unpaired otherwise -- the same partition the pre-migration list drew
-    # from the tuple plan, now read off the dense arrays.
+    # columns are populated and unpaired otherwise.
     is_query = np.all(row_pairing == 0, axis=1)
     populated = np.count_nonzero(row_pairing != -1, axis=1)
     paired = [row for row in range(plan_rows) if not is_query[row] and populated[row] >= 2]
@@ -712,17 +705,17 @@ def _msa_descriptors(
     ordered.extend(unpaired[: max_rows - len(ordered)])
     ordered = ordered[:max_rows]
 
-    descriptors: list[tuple[dict[str, tuple[int, bool]], bool]] = []
+    descriptors: list[tuple[dict[tuple[str, str | None], tuple[int, bool]], bool]] = []
     for row in ordered:
         if row is None:
             descriptors.append(({}, True))
             continue
-        mapping: dict[str, tuple[int, bool]] = {}
-        for column, entity_id in enumerate(entity_ids):
+        mapping: dict[tuple[str, str | None], tuple[int, bool]] = {}
+        for column, (value, target_instance_id) in enumerate(bindings):
             source = int(row_pairing[row, column])
             if source == -1:
                 continue
-            mapping[entity_id] = (source, bool(row_is_paired[row, column]))
+            mapping[(value.entity_id, target_instance_id)] = (source, bool(row_is_paired[row, column]))
         descriptors.append((mapping, False))
     return descriptors
 
@@ -734,22 +727,23 @@ def _msa_features(
     *,
     max_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    values = _msa_values(msa)
-    by_entity = {value.entity_id: value for value in values}
+    bindings = {} if msa is None else msa_binding_map(msa)
     descriptors = _msa_descriptors(msa, max_rows=max_rows)
     rows = torch.empty(len(descriptors), len(tokens), dtype=torch.long)
 
     for row_index, (descriptor, query) in enumerate(descriptors):
         for token_index, token in enumerate(tokens):
             entity_id = cast(str, token["entity_id"])
+            instance_id = cast(str, token["instance_id"])
             monomer_index = cast(int | None, token["monomer_index"])
-            value = by_entity.get(entity_id)
-            if query or value is None or _msa_polymer_type(system, entity_id) != "protein":
+            selected = select_msa_binding(bindings, entity_id, instance_id)
+            if query or selected is None or _msa_polymer_type(system, entity_id) != "protein":
                 rows[row_index, token_index] = cast(int, token["restype"])
-            elif entity_id not in descriptor:
+            elif selected[0] not in descriptor:
                 rows[row_index, token_index] = _GAP
             else:
-                source_row, is_paired = descriptor[entity_id]
+                key, value = selected
+                source_row, is_paired = descriptor[key]
                 pool = value.paired_sequences if is_paired else value.unpaired_sequences
                 rows[row_index, token_index] = _msa_symbol_restype(pool[source_row][cast(int, monomer_index)])
 
@@ -757,13 +751,15 @@ def _msa_features(
     deletion_mean = torch.zeros(len(tokens))
     for token_index, token in enumerate(tokens):
         entity_id = cast(str, token["entity_id"])
+        instance_id = cast(str, token["instance_id"])
         monomer_index = cast(int | None, token["monomer_index"])
-        value = by_entity.get(entity_id)
-        if value is None or _msa_polymer_type(system, entity_id) != "protein":
+        selected = select_msa_binding(bindings, entity_id, instance_id)
+        if selected is None or _msa_polymer_type(system, entity_id) != "protein":
             profile[token_index, cast(int, token["restype"])] = 1
             continue
+        _key, value = selected
         # The profile and deletion mean are the entity's own alignment statistics, taken over the full
-        # unpaired pool (query row included), matching the pre-migration single-pool computation.
+        # unpaired pool, including the query row.
         column = cast(int, monomer_index)
         encoded = [_msa_symbol_restype(sequence[column]) for sequence in value.unpaired_sequences]
         profile[token_index] = F.one_hot(torch.tensor(encoded), num_classes=32).float().mean(dim=0)
@@ -778,8 +774,7 @@ def _assembled_deletions(
     *,
     max_rows: int,
 ) -> Tensor:
-    values = _msa_values(msa)
-    by_entity = {value.entity_id: value for value in values}
+    bindings = {} if msa is None else msa_binding_map(msa)
     descriptors = _msa_descriptors(msa, max_rows=max_rows)
     deletions = torch.zeros(len(descriptors), len(tokens))
     for row_index, (descriptor, query) in enumerate(descriptors):
@@ -787,11 +782,13 @@ def _assembled_deletions(
             continue
         for token_index, token in enumerate(tokens):
             entity_id = cast(str, token["entity_id"])
+            instance_id = cast(str, token["instance_id"])
             monomer_index = cast(int | None, token["monomer_index"])
-            value = by_entity.get(entity_id)
-            if value is None or entity_id not in descriptor or _msa_polymer_type(system, entity_id) != "protein":
+            selected = select_msa_binding(bindings, entity_id, instance_id)
+            if selected is None or selected[0] not in descriptor or _msa_polymer_type(system, entity_id) != "protein":
                 continue
-            source_row, is_paired = descriptor[entity_id]
+            key, value = selected
+            source_row, is_paired = descriptor[key]
             pool = value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts
             deletions[row_index, token_index] = float(pool[source_row, cast(int, monomer_index)])
     return deletions
@@ -808,7 +805,7 @@ def _constraint_features(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     r"""Build the four released v0.5.3 constraint pair-bias channels.
 
-    Channel layout follows the trained checkpoint (see ``UPSTREAM_BUGS.md``):
+    The trained checkpoint maps atom contacts to channel 0 and token contacts to channel 1:
 
     * ``contact_atom`` -- an atom contact writes ``[max, 0]`` (channel 0 was the only
       trained atom column); symmetric.

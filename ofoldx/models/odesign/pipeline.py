@@ -1,4 +1,4 @@
-r"""ODesign design-and-assign composition (§4.11.6).
+r"""ODesign design-and-assign composition.
 
 The released ODesign protein deliverable is a two-stage composition under the single
 ``design`` verb: the ODesign core generates backbone coordinates (S seeds × M diffusion
@@ -7,33 +7,21 @@ variants). Upstream the OInvFold sequence module for the protein modality *is* t
 ProteinMPNN / LigandMPNN network (``mpnn_model_type`` dual-model dispatch,
 ``infer_runner.py:84-91``), so this Pipeline **composes the already-registered
 ``ofoldx/proteinmpnn`` and ``ofoldx/ligandmpnn`` Pipelines read-only** rather than
-re-vendoring the sequence network. The result is the family-owned M×S×K
-:class:`ODesignDesignResult`.
+re-vendoring the sequence network. The result is the M×S×K :class:`ODesignDesignResult`.
 
-Sampling knobs (§4.11.6) — "beam / temperature / top-k" for the protein modality:
+Sampling controls for the protein modality:
   * ``temperature`` (upstream ``invfold_temp``) → the MPNN sampler temperature;
   * ``num_sequences`` = top-k (upstream ``invfold_topk``) → MPNN ``num_candidates``;
   * ``use_beam`` is **inert for protein** and MUST NOT be a functional protein knob — the
     released ``proteinmpnn_inference`` ignores it (``proteinmpnn/inference.py`` ``_ = use_beam``).
-    Beam decoding exists only on the non-protein OInvFold checkpoints (``oinvfold_*.ckpt``,
-    gRNAde), which are not vendored and whose call type differs (§4.11.9 flag 6, owner-gated).
+    Beam decoding exists only on non-protein OInvFold checkpoints (``oinvfold_*.ckpt``,
+    gRNAde), which are not included here and expose a different call type.
     This Pipeline accepts ``use_beam`` and ignores it, exactly as the released protein path does.
 
-Owner-gated / node4-verification flags carried here (not verifiable by reading, no torch):
-  * FLAG(parse_invfold): the per-chain designed-position partition (upstream ``parse_invfold``
-    ``design_mask``) is realized here as "design every designable protein position of the
-    backbone" (``positions=None``), which is faithful for the released fully-de-novo binder
-    case. Partial motif-scaffolding (a backbone mixing fixed and designed residues) needs the
-    exact per-chain ``design_mask`` and is deferred with the §3.7.3 PlacementSpec contract.
-  * FLAG(model dispatch): upstream dispatches ProteinMPNN vs LigandMPNN *per designed chain*
-    by the released strict 8 Å atom-context cutoff. Here dispatch is per backbone by whether
-    the backbone system carries any non-protein (ligand / nucleic) context; LigandMPNN then
-    applies its own ``ligand_interface_cutoff=8.0``. The per-chain split is the refinement.
-  * FLAG(sequence-into-backbone): each candidate carries the assigned-sequence
-    ``MolecularSystem`` (from the MPNN candidate) as ``system`` and the ODesign backbone
-    ``Structure`` as ``structure``; rewriting the assigned sequence back into the backbone
-    ``Structure``'s atom rows (side-chain atom-count change vs the GLY backbone template) is a
-    downstream structural op left for node4.
+The protein vertical follows upstream ``parse_invfold`` at the composition boundary: each
+generated protein chain is sampled independently against the whole assembly, candidates are
+score-sorted per chain before rank-wise merging, and assigned identities are written back into
+the coordinate-bearing Structure while fixed motif/receptor positions remain unchanged.
 """
 
 from __future__ import annotations
@@ -41,22 +29,30 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from os import PathLike
-from typing import Literal
+from typing import Literal, cast
 
+import numpy as np
 import torch
 from typing_extensions import Self
 
-from ...data.molecular import MolecularSystem, PolymerSequence
+from ...data.bonds import SymbolicBond
+from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence, is_water_component
 from ...data.structure import Structure
+from ...modules.mpnn import (
+    AMINO_ACID_COMPONENT_IDS,
+    AMINO_ACID_TOKEN_BY_COMPONENT,
+    AMINO_ACID_UNKNOWN_TOKEN,
+)
 from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import Score
 from ..ligandmpnn import LigandMpnnPipeline
 from ..proteinmpnn import ProteinMpnnPipeline
+from ..proteinmpnn.model import ProteinMpnnModel
 from .model import (
-    Contact,
-    DesiredCovalentLink,
+    Hotspot,
     ODesignDesignCandidate,
     ODesignDesignResult,
+    ODesignInput,
     ODesignModel,
     ODesignPlacements,
     ReferenceCoordinates,
@@ -67,29 +63,33 @@ from .processor import ODesignProcessor
 def _has_atom_context(system: MolecularSystem) -> bool:
     r"""Report whether the backbone system carries non-protein (ligand / nucleic) context.
 
-    Any entity that is not a protein ``PolymerSequence`` is atom context for the released
-    LigandMPNN sequence model (small molecules, ions, and nucleic chains). A system of only
-    protein chains routes to the sequence-only ProteinMPNN model. (FLAG(model dispatch):
-    upstream refines this to a per-chain strict 8 Å test.)
+    Protein atoms and water are excluded exactly as in upstream ``parse_invfold``. Any other
+    heavy atom selects LigandMPNN globally for every designed protein chain; its processor then
+    applies the released strict 8 Å interface mask per residue.
     """
 
-    return any(
-        not (isinstance(entity, PolymerSequence) and entity.polymer_type == "protein")
-        for entity in system.entities.values()
-    )
+    for entity in system.entities.values():
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
+            continue
+        for component in entity.components:
+            if is_water_component(component):
+                continue
+            if any(atom.element != "H" for atom in component.atoms):
+                return True
+    return False
 
 
 def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str, Score]:
-    r"""Map the released MPNN per-sequence Scores to the §4.11.7 ODesign score table.
+    r"""Map the released MPNN per-sequence Scores to the ODesign score table.
 
-    The OInvFold protein module *is* the frozen ProteinMPNN / LigandMPNN network, so the
-    per-sequence Scores reuse the §5.3.2 frozen semantics verbatim (raw ``log_softmax``, not
+    The OInvFold protein module uses the ProteinMPNN / LigandMPNN network, so the
+    per-sequence Scores preserve its semantics (raw ``log_softmax``, not
     the tempered sampling distribution). ProteinMPNN emits ``designed_sequence_nll``
     (nat/residue) while LigandMPNN emits ``designed_sequence_confidence`` = ``exp(-nll)``;
     each is the exact inverse of the other, so both branches populate the same four keys with
     identical units / ``preferred`` / scope. ``ligand_interface_confidence`` is present only
     when the LigandMPNN atom-context model was used (its scope is the LigandMPNN interface
-    subset ``I``); the empty-scope / NaN rule of §5.3.2 is carried through unchanged from the
+    subset ``I``); empty-scope and NaN behavior is carried through unchanged from the
     source Score (LigandMPNN already emits ``scope=frozenset()`` + ``NaN`` for a chain with no
     ligand interface).
     """
@@ -133,24 +133,254 @@ def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str,
     return mapped
 
 
+def _generated_protein_chains(input: ODesignInput) -> tuple[tuple[ComponentReference, ...], ...]:
+    r"""Return generated protein positions partitioned in realized chain order."""
+
+    generated = {
+        reference
+        for placements in input.layout.placement_map.values()
+        for occurrences in placements.values()
+        for reference in occurrences
+    }
+    has_placements = input.layout.placement is not None
+    chains = []
+    for instance_id, entity_id in input.layout.system.instances.items():
+        entity = input.layout.system.entities[entity_id]
+        if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+            continue
+        positions = tuple(
+            (instance_id, component_index)
+            for component_index in range(len(entity))
+            if not has_placements or (instance_id, component_index) in generated
+        )
+        if positions:
+            chains.append(positions)
+    return tuple(chains)
+
+
+def _decoding_ranks(priorities: torch.Tensor, design_mask: torch.Tensor) -> torch.Tensor:
+    r"""Lower upstream ProteinMPNN ``randn`` priorities to explicit causal ranks."""
+
+    order = torch.argsort((design_mask.to(priorities.dtype) + 0.0001) * priorities.abs(), dim=-1)
+    ranks = torch.empty_like(order)
+    ranks.scatter_(
+        1,
+        order,
+        torch.arange(order.shape[1], device=order.device).expand_as(order),
+    )
+    return ranks
+
+
+def _protein_sequence_variants(
+    designer: ProteinMpnnPipeline,
+    structure: Structure,
+    positions: tuple[ComponentReference, ...],
+    *,
+    num_sequences: int,
+    temperature: float,
+    generator: torch.Generator | None,
+) -> tuple[tuple[dict[ComponentReference, int], dict[str, Score]], ...]:
+    r"""Run upstream-equivalent ProteinMPNN sampling for one target chain."""
+
+    features = designer.processor(structure, positions=positions)
+    device = features.backbone_coordinates.device
+    length = features.sequence_tokens.shape[1]
+    design_mask = (features.valid_mask & features.design_mask).expand(num_sequences, -1)
+    priorities = torch.randn(
+        num_sequences,
+        length,
+        device=device,
+        dtype=features.backbone_coordinates.dtype,
+        generator=generator,
+    )
+    omit = torch.zeros(len(AMINO_ACID_COMPONENT_IDS) + 1, dtype=torch.bool, device=device)
+    omit[AMINO_ACID_UNKNOWN_TOKEN] = True
+    sampled = designer.model.sample(
+        features,
+        num_samples=num_sequences,
+        temperature=temperature,
+        decoding_ranks=_decoding_ranks(priorities, design_mask),
+        global_omit_token_mask=omit,
+        generator=generator,
+    )
+
+    repeated_native = features.sequence_tokens.expand(num_sequences, -1)
+    losses = -torch.gather(sampled.log_probabilities, -1, sampled.sequences.unsqueeze(-1)).squeeze(-1)
+    selected = design_mask.to(losses.dtype)
+    selected_count = selected.sum(dim=-1)
+    nll = (losses * selected).sum(dim=-1) / selected_count
+    recovery = ((sampled.sequences == repeated_native).to(losses.dtype) * selected).sum(dim=-1) / selected_count
+    log_probability_sum = -(losses * selected).sum(dim=-1)
+
+    references = features.component_references[0]
+    selected_host = design_mask[0].detach().cpu().tolist()
+    scope = frozenset(
+        reference
+        for reference, selected_position in zip(references, selected_host)
+        if reference is not None and selected_position
+    )
+    sequences = sampled.sequences.detach().cpu().tolist()
+    nll_values = nll.detach().cpu().tolist()
+    recovery_values = recovery.detach().cpu().tolist()
+    ranking = torch.argsort(log_probability_sum, descending=True, stable=True).detach().cpu().tolist()
+
+    variants = []
+    for index in ranking:
+        replacements = {
+            reference: int(token)
+            for reference, token, selected_position in zip(references, sequences[index], selected_host)
+            if reference is not None and selected_position
+        }
+        variants.append(
+            (
+                replacements,
+                _odesign_scores(
+                    {
+                        "designed_sequence_nll": Score(
+                            float(nll_values[index]),
+                            unit="nat/residue",
+                            preferred="lower",
+                            scope=scope,
+                        ),
+                        "sequence_recovery": Score(
+                            float(recovery_values[index]),
+                            preferred="higher",
+                            scope=scope,
+                        ),
+                    },
+                    used_ligand=False,
+                ),
+            )
+        )
+    return tuple(variants)
+
+
+def _ligand_sequence_variants(
+    designer: LigandMpnnPipeline,
+    structure: Structure,
+    positions: tuple[ComponentReference, ...],
+    *,
+    num_sequences: int,
+    temperature: float,
+    generator: torch.Generator | None,
+) -> tuple[tuple[dict[ComponentReference, int], dict[str, Score]], ...]:
+    r"""Run LigandMPNN for one target chain and reproduce upstream score sorting."""
+
+    result = designer.design(
+        structure,
+        positions=positions,
+        num_candidates=num_sequences,
+        temperature=temperature,
+        generator=generator,
+    )
+    variants = []
+    for candidate in result.candidates:
+        scores = _odesign_scores(candidate.scores, used_ligand=True)
+        interface = scores["ligand_interface_confidence"]
+        rank_score = (
+            interface if interface.scope and math.isfinite(interface.value) else scores["designed_sequence_confidence"]
+        )
+        variants.append(
+            (
+                {
+                    reference: AMINO_ACID_TOKEN_BY_COMPONENT[candidate.system.component(reference).component_id]
+                    for reference in positions
+                },
+                scores,
+                rank_score.value,
+            )
+        )
+    variants.sort(key=lambda value: value[2], reverse=True)
+    return tuple((replacements, scores) for replacements, scores, _ in variants)
+
+
+def _combine_chain_scores(chain_scores: Sequence[dict[str, Score]]) -> dict[str, Score]:
+    r"""Combine disjoint per-chain averages into assembly-level per-residue Scores."""
+
+    def combine(name: str) -> tuple[float, frozenset]:
+        values = [scores[name] for scores in chain_scores]
+        scope = frozenset(reference for value in values for reference in value.scope or ())
+        count = sum(len(value.scope or ()) for value in values)
+        if count == 0:
+            return float("nan"), scope
+        combined = sum(value.value * len(value.scope or ()) for value in values) / count
+        return combined, scope
+
+    nll, designed_scope = combine("designed_sequence_nll")
+    recovery, recovery_scope = combine("sequence_recovery")
+    result = {
+        "designed_sequence_nll": Score(nll, unit="nat/residue", preferred="lower", scope=designed_scope),
+        "designed_sequence_confidence": Score(
+            math.exp(-nll) if math.isfinite(nll) else float("nan"),
+            preferred="higher",
+            scope=designed_scope,
+        ),
+        "sequence_recovery": Score(recovery, preferred="higher", scope=recovery_scope),
+    }
+    if any("ligand_interface_confidence" in scores for scores in chain_scores):
+        interface_scores = [scores["ligand_interface_confidence"] for scores in chain_scores]
+        interface_scope = frozenset(reference for value in interface_scores for reference in value.scope or ())
+        count = sum(len(value.scope or ()) for value in interface_scores)
+        interface_nll = (
+            sum(-math.log(value.value) * len(value.scope or ()) for value in interface_scores if value.scope) / count
+            if count
+            and all(value.value > 0 and math.isfinite(value.value) for value in interface_scores if value.scope)
+            else float("nan")
+        )
+        result["ligand_interface_confidence"] = Score(
+            math.exp(-interface_nll) if math.isfinite(interface_nll) else float("nan"),
+            preferred="higher",
+            scope=interface_scope,
+        )
+    return result
+
+
+def _realize_sequence_system(system: MolecularSystem, replacements: dict[ComponentReference, int]) -> MolecularSystem:
+    r"""Apply all chain assignments through ProteinMPNN's canonical entity-splitting rule."""
+
+    references = tuple(replacements)
+    tokens = torch.tensor(tuple(replacements.values()), dtype=torch.int64)
+    return ProteinMpnnModel._realize_sequence(system, references, tokens, torch.ones_like(tokens, dtype=torch.bool))
+
+
+def _structure_with_system(structure: Structure, system: MolecularSystem) -> Structure:
+    r"""Retain the generated backbone coordinates while replacing residue identities."""
+
+    retained = []
+    for index, site in enumerate(structure.sites):
+        try:
+            system.atom(site)
+        except KeyError:
+            continue
+        retained.append(index)
+    indices = np.asarray(retained, dtype=np.int64)
+    return Structure(
+        system=system,
+        sites=tuple(structure.sites[index] for index in retained),
+        coordinates=structure.coordinates[indices],
+        coordinate_mask=structure.coordinate_mask[indices],
+        occupancy=None if structure.occupancy is None else structure.occupancy[indices],
+        residue_numbers=structure.residue_numbers,
+    )
+
+
 class ODesignPipeline(CompositePipeline):
     r"""Compose the ODesign backbone designer with the OInvFold (MPNN) sequence step.
 
-    This is the full released protein deliverable (§4.11.6): ODesign generates backbones over
+    ODesign generates backbones over
     S seeds × M diffusion samples, and each backbone is assigned K sequence variants by the
     read-only ProteinMPNN / LigandMPNN Pipelines. It mirrors the ``ProteinMpnnDesignAndPack``
     composition structure — a coordinating object holding child Pipelines with a shared
     :meth:`to` — rather than the single-pair ``PairedPipeline``, because the sequence network
-    is a *separately registered* family loaded read-only, never re-vendored.
+    is loaded as a separately registered Model-Processor pair, never re-vendored.
 
-    It is a DESIGN §7.4 multi-pair concrete Pipeline (see ``_PAIR_LAYOUT`` below) and is registered
-    so the working protein deliverable routes through the repository factory. The remaining
-    de-novo ligand/NA generation gap is a runtime capability limit (see ``__init__.py`` / README),
-    not a registration gate.
+    This is a multi-pair Pipeline (see ``_PAIR_LAYOUT`` below), registered so repositories route
+    through the composite loader. De-novo ligand and nucleic-acid generation remains outside the
+    polymer-only placement representation.
     """
 
-    # DESIGN §7.4/§7.3 pair-layout: the ODesign backbone pair owns the runnable root, and the
-    # two read-only OInvFold sequence designers live at fixed sub-directories. Each designer is a
+    # The ODesign backbone pair owns the runnable root, and the two read-only OInvFold sequence
+    # designers live at fixed subdirectories. Each designer is a
     # single-pair child Pipeline, so its reloaded pair is wrapped back into its Pipeline class.
     _PAIR_LAYOUT = (
         CompositePair("", "model", "processor"),
@@ -188,6 +418,7 @@ class ODesignPipeline(CompositePipeline):
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         *,
+        placement: ODesignPlacements | None = None,
         num_candidates: int | None = None,
         num_seeds: int = 1,
         num_backbones: int = 1,
@@ -197,10 +428,9 @@ class ODesignPipeline(CompositePipeline):
         seed: int | None = None,
         generator: torch.Generator | None = None,
         receptor_mode: Literal["rigid", "flex"] | None = None,
-        conditions: Sequence[Contact | ODesignPlacements | DesiredCovalentLink | ReferenceCoordinates] = (),
+        conditions: Sequence[Hotspot | SymbolicBond | ReferenceCoordinates] = (),
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
-        use_beam: bool = False,
     ) -> ODesignDesignResult:
         r"""Generate the released M×S×K backbone-and-sequence design grid.
 
@@ -222,42 +452,65 @@ class ODesignPipeline(CompositePipeline):
             num_backbones = num_candidates
         if num_seeds <= 0 or num_backbones <= 0 or num_sequences <= 0:
             raise ValueError("num_seeds, num_backbones, and num_sequences must be positive")
-        # §4.11.6: use_beam is inert on the released protein path (upstream `_ = use_beam`).
-        # It is accepted for call-signature parity with the non-protein OInvFold paths and
-        # never influences protein decoding; beam is owner-gated (§4.11.9 flag 6).
-        _ = use_beam
 
         seed_list = self._resolve_seeds(num_seeds, seeds, seed, generator)
 
-        batch = self._build_batch(input, conditions, receptor_mode)
-
+        batch = self._build_batch(input, placement, conditions, receptor_mode)
         candidates: list[ODesignDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
-            backbones = self.model.design(
+            stream = resolve_generator(int(backbone_seed), None, device=batch.reference_positions.device)
+            backbones, realized_input = self.model._design_with_input(
                 batch,
                 num_candidates=num_backbones,
-                generator=resolve_generator(int(backbone_seed), None, device=batch.reference_positions.device),
+                generator=stream,
                 num_sampling_steps=num_sampling_steps,
                 partial_diffusion_snr=partial_diffusion_snr,
             )
-            for backbone_index, backbone in enumerate(backbones.candidates):
-                structure = backbone.structure
-                if structure is None:  # pragma: no cover - design always decodes a Structure
-                    raise RuntimeError("ODesign backbone candidate is missing its decoded Structure")
-                used_ligand = _has_atom_context(structure.system)
-                designer = self.ligand_designer if used_ligand else self.protein_designer
-                sequence_result = designer.design(
-                    structure,
-                    num_candidates=num_sequences,
-                    temperature=temperature,
-                    seed=int(backbone_seed) * 1_000_003 + backbone_index,
+            design_chains = _generated_protein_chains(realized_input)
+            if not design_chains:
+                raise ValueError(
+                    "ODesign protein sequence assignment requires at least one designable protein position"
                 )
-                for sequence_index, variant in enumerate(sequence_result.candidates):
+
+            for backbone_index, backbone in enumerate(backbones.candidates):
+                structure = cast(Structure, backbone.structure)
+                used_ligand = _has_atom_context(structure.system)
+                chain_variants = []
+                for positions in design_chains:
+                    variants = (
+                        _ligand_sequence_variants(
+                            self.ligand_designer,
+                            structure,
+                            positions,
+                            num_sequences=num_sequences,
+                            temperature=temperature,
+                            generator=stream,
+                        )
+                        if used_ligand
+                        else _protein_sequence_variants(
+                            self.protein_designer,
+                            structure,
+                            positions,
+                            num_sequences=num_sequences,
+                            temperature=temperature,
+                            generator=stream,
+                        )
+                    )
+                    chain_variants.append(variants)
+
+                for sequence_index in range(num_sequences):
+                    replacements = {
+                        reference: token
+                        for variants in chain_variants
+                        for reference, token in variants[sequence_index][0].items()
+                    }
+                    system = _realize_sequence_system(structure.system, replacements)
+                    assigned_structure = _structure_with_system(structure, system)
                     candidates.append(
                         ODesignDesignCandidate(
-                            system=variant.system,
-                            structure=structure,
-                            scores=_odesign_scores(variant.scores, used_ligand=used_ligand),
+                            system=system,
+                            structure=assigned_structure,
+                            scores=_combine_chain_scores([variants[sequence_index][1] for variants in chain_variants]),
                             seed_index=seed_index,
                             backbone_index=backbone_index,
                             sequence_index=sequence_index,
@@ -284,31 +537,30 @@ class ODesignPipeline(CompositePipeline):
             if not seed_list:
                 raise ValueError("seeds must not be empty")
             return seed_list
-        if generator is None:
-            generator = torch.Generator()
-            if seed is not None:
-                generator.manual_seed(seed)
+        if generator is None and seed is not None:
+            generator = torch.Generator().manual_seed(seed)
+        device = None if generator is None else generator.device
         drawn = torch.randint(
             1,
             torch.iinfo(torch.int32).max,
             (num_seeds,),
             generator=generator,
+            device=device,
         )
         return tuple(int(value) for value in drawn.tolist())
 
     def _build_batch(
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
-        conditions: Sequence[Contact | ODesignPlacements | DesiredCovalentLink | ReferenceCoordinates],
+        placement: ODesignPlacements | None,
+        conditions: Sequence[Hotspot | SymbolicBond | ReferenceCoordinates],
         receptor_mode: Literal["rigid", "flex"] | None,
     ):
         r"""Lower the canonical input once, honoring an optional per-call receptor_mode override."""
 
-        if receptor_mode is None:
-            return self.processor(input, conditions=conditions)
-        previous = self.processor.config.receptor_mode
-        self.processor.config.receptor_mode = receptor_mode
-        try:
-            return self.processor(input, conditions=conditions)
-        finally:
-            self.processor.config.receptor_mode = previous
+        return self.processor(
+            input,
+            placement=placement,
+            conditions=conditions,
+            receptor_mode=receptor_mode,
+        )

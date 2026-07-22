@@ -16,8 +16,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..backend import LayerNorm
-from ..transformer import ConditionedTransformer, TransitionKind
+from ..backend import LayerNorm, resolve_config_operator_backend
+from ..transformer import ConditionedTransformer, CrossAttentionKeySource, TransitionKind
 from .context import AtomContext, AtomToTokenOutput
 from .pair_encoding import encode_atom_pair
 from .transfer import (
@@ -51,8 +51,8 @@ class AtomToTokenEncoderBase(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         atom_feature_size: Width of the raw reference atom-feature vector.
-        operator_backend: Backend selector passed down to the attention stack (``"auto"`` picks OOps
-            kernels when available, else the public implementation).
+        operator_backend: Backend selector passed down to the attention stack (``"auto"`` picks the
+            OOps-owned implementation when available, else the public implementation).
 
     Examples:
         >>> import torch
@@ -76,8 +76,14 @@ class AtomToTokenEncoderBase(nn.Module):
         num_key_atoms: int = 128,
         atom_feature_size: int = 385,
         operator_backend: str = "auto",
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
+        self.operator_backend = resolve_config_operator_backend(
+            operator_backend,
+            supported=("oops", "eager"),
+            public_default="eager",
+        )
         self.atom_conditioner = AtomConditioner(atom_feature_size=atom_feature_size, atom_hidden_size=atom_hidden_size)
         self.atom_pair_encoder = AtomPairEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -93,7 +99,8 @@ class AtomToTokenEncoderBase(nn.Module):
             num_attention_heads=num_attention_heads,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
+            operator_backend=self.operator_backend,
+            cross_attention_key_source=cross_attention_key_source,
         )
         self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
         self.relu = nn.ReLU()
@@ -113,7 +120,7 @@ class AtomToTokenEncoderBase(nn.Module):
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
             num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window
                 (see [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]). Left unset by the
-                non-diffusion input-embedder path, which keeps the legacy zero-padded window.
+                non-diffusion input-embedder path, which keeps the fixed zero-padded window.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] carrying per-window
@@ -183,7 +190,13 @@ class AtomToTokenEncoderBase(nn.Module):
         """
 
         token_hidden = self.relu(self.token_projection(atom_query))
-        token_hidden = scatter_mean_to_tokens(token_hidden, atom_to_token, num_tokens, atom_mask)
+        token_hidden = scatter_mean_to_tokens(
+            token_hidden,
+            atom_to_token,
+            num_tokens,
+            atom_mask,
+            operator_backend=self.operator_backend,
+        )
         return AtomToTokenOutput(token_hidden=token_hidden, atom_query=atom_query, atom_context=atom_context)
 
 
@@ -285,6 +298,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
+            num_valid_atoms=None if local_geometry is None else local_geometry.window_info.num_valid_atoms,
         )
         return self.aggregate_to_tokens(
             atom_query,
@@ -341,6 +355,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         num_key_atoms: int = 128,
         atom_feature_size: int = 385,
         operator_backend: str = "auto",
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__(
             token_hidden_size=token_hidden_size,
@@ -352,6 +367,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
             operator_backend=operator_backend,
+            cross_attention_key_source=cross_attention_key_source,
         )
         self.token_to_atom_broadcast = TokenToAtomBroadcast()
         self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
@@ -436,7 +452,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         )
         # The clamped/shifted key window (DeepMind AF3) is selected by the valid-atom count carried on the
         # precomputed geometry; the pair broadcast and the attention key gather must use the same count so
-        # their key panes stay aligned. ``None`` (dense layout or legacy geometry) keeps the padded window.
+        # their key panes stay aligned. ``None`` (dense layout or fixed geometry) keeps the padded window.
         num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
         atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
         atom_pair = self._build_atom_pair(
@@ -851,7 +867,7 @@ class PackedAtomAttention(nn.Module):
         num_attention_heads: Number of attention heads per block.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        operator_backend: Backend selector for the transformer's attention/transition kernels.
+        operator_backend: Backend selector for the transformer's attention/transition implementations.
         cross_attention_mode: Whether the transformer runs in cross-attention mode (query/key panes differ).
         transition: Transition-block kind used inside each transformer block.
 
@@ -875,6 +891,7 @@ class PackedAtomAttention(nn.Module):
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
         cross_attention_mode: bool = True,
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
         transition: TransitionKind = "double",
     ) -> None:
         super().__init__()
@@ -887,6 +904,7 @@ class PackedAtomAttention(nn.Module):
             conditioning_size=conditioning_size,
             operator_backend=operator_backend,
             cross_attention_mode=cross_attention_mode,
+            cross_attention_key_source=cross_attention_key_source,
             transition=transition,
         )
 
@@ -916,7 +934,7 @@ class PackedAtomAttention(nn.Module):
             atom_mask: Optional `[..., N_atom]` attention mask; defaults to all-valid.
             attention_layout: Either ``"dense"`` (global) or ``"local"`` (windowed).
             num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather so the
-                windowed key panes match the pair-bias windows. Unset keeps the legacy zero-padded gather.
+                windowed key panes match the pair-bias windows. Unset keeps the fixed zero-padded gather.
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
@@ -1020,7 +1038,7 @@ class AtomSelfAttentionStack(nn.Module):
         num_attention_heads: Number of attention heads per block.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        operator_backend: Backend selector for the underlying attention/transition kernels.
+        operator_backend: Backend selector for the underlying attention/transition implementations.
 
     Examples:
         >>> import torch
@@ -1042,6 +1060,7 @@ class AtomSelfAttentionStack(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         # The pair is projected to per-head attention logits independently in each block.
@@ -1058,6 +1077,7 @@ class AtomSelfAttentionStack(nn.Module):
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
             cross_attention_mode=True,
+            cross_attention_key_source=cross_attention_key_source,
             transition="double",
         )
 
@@ -1152,6 +1172,7 @@ class TokenToAtomDecoder(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
@@ -1165,6 +1186,7 @@ class TokenToAtomDecoder(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
+            cross_attention_key_source=cross_attention_key_source,
         )
         self.query_norm = LayerNorm(atom_hidden_size, bias=False)
         self.output_projection = nn.Linear(atom_hidden_size, 3, bias=False)

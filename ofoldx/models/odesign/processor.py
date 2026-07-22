@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import replace
 from os import PathLike
 from pathlib import Path
 from typing import cast
@@ -15,8 +14,9 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing_extensions import Self
 
+from ...data.bonds import SymbolicBond
 from ...data.components import get_component
-from ...data.evidence import MSA, MSACollection, Template
+from ...data.evidence import MSA, MSACollection
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -27,14 +27,11 @@ from ...data.molecular import (
     SystemBond,
 )
 
-# §3.7.2 keeps the ODesign spatial condition API family-owned. The family envelopes
-# Hotspot / Contact / DesiredCovalentLink / ODesignPlacements / ReferenceCoordinates live in
-# ``.conditions``; the constraint payloads they carry are the FROZEN §3.7.4 cores — the
-# distance-free Hotspot and geometric Contact from ``ofoldx.data.conditions`` and the
-# SymbolicBond from ``ofoldx.data.bonds``. The removed generic Condition base and
-# validate_conditions pass (§3.7.3) stay dropped (ODesign validates inline below). The
+# Hotspot, SymbolicBond, ODesignPlacements, and ReferenceCoordinates are the exact controls
+# this Processor consumes. Hotspot and SymbolicBond reuse shared biological values from
+# ``ofoldx.data``; the Processor validates their ODesign semantics inline. The
 # generation-topology placement records (GeneratedSegment / ExistingSpan / SymbolicResidueSite
-# / SymbolicAtomSite) and the resolution helpers come from the FROZEN §3.7 placement core in
+# / SymbolicAtomSite) and resolution helpers come from
 # ``ofoldx.data.placement``.
 from ...data.placement import (
     ExistingSpan,
@@ -50,72 +47,35 @@ from ...data.structure import Structure
 from ...io.structure import read_structure
 from .config import ODesignProcessorConfig
 from .model import (
-    Contact,
-    DesiredCovalentLink,
+    ODESIGN_RESTYPE_INDEX,
+    ODESIGN_STANDARD_POLYMER_COMPONENTS,
     Hotspot,
     ODesignInput,
     ODesignLayout,
     ODesignPlacements,
     ReferenceCoordinates,
+    build_odesign_cyclic_period,
+    build_odesign_token_bonds,
+    build_odesign_token_indices,
+    build_odesign_tokens,
+    materialize_odesign_cyclic_links,
 )
-
-_RESTYPE_INDEX = {
-    "ALA": 0,
-    "ARG": 1,
-    "ASN": 2,
-    "ASP": 3,
-    "CYS": 4,
-    "GLN": 5,
-    "GLU": 6,
-    "GLY": 7,
-    "HIS": 8,
-    "ILE": 9,
-    "LEU": 10,
-    "LYS": 11,
-    "MET": 12,
-    "PHE": 13,
-    "PRO": 14,
-    "SER": 15,
-    "THR": 16,
-    "TRP": 17,
-    "TYR": 18,
-    "VAL": 19,
-    "UNK": 20,
-    "A": 21,
-    "G": 22,
-    "C": 23,
-    "U": 24,
-    "N": 25,
-    "DA": 26,
-    "DG": 27,
-    "DC": 28,
-    "DT": 29,
-    "DN": 30,
-    "-": 31,
-    "-P": 32,
-    "-N": 33,
-    "-L": 34,
-}
-_STANDARD_POLYMER_COMPONENTS = frozenset(_RESTYPE_INDEX) - {"-", "-P", "-N", "-L"}
 
 # The released ODesign generation surface realizes a de-novo polymer GeneratedSegment as a run
 # of placeholder components of the segment's polymer type (protein -> UNK, rna -> N, dna -> DN).
 # There is NO honest de-novo *ligand* realization: the released path emits placeholder ``-L`` atom
 # rows with fake bonds and binary NONE/ANY bond-type logits, not a real chemical graph. A generated
-# ligand segment therefore has no entry here and is GATED at the realization boundary below
-# (GAP-1; a de-novo molecule has no PlacementValue). Existing/fixed ligand context is unaffected.
+# ligand segment therefore has no entry here and is rejected at the realization boundary below:
+# a de-novo molecule has no PlacementValue. Existing or fixed ligand context is unaffected.
 _GENERATED_COMPONENT_ID = {"protein": "UNK", "rna": "N", "dna": "DN"}
 
-# MSA cells are UPPERCASE one-letter symbols (or the ``-`` gap), not ChemicalComponent IDs. These
-# project each polymer type's one-letter symbols onto their ``_RESTYPE_INDEX`` token, reproducing the
-# pre-migration component-id lowering: a standard symbol resolves to its residue token, ``-`` to the
-# gap token, and every other symbol (ambiguity codes) to ``UNK`` -- exactly what the old path did when
-# ``_RESTYPE_INDEX.get(component_id, 20)`` fell through for an unmapped component.
-_MSA_UNKNOWN = _RESTYPE_INDEX["UNK"]
-_MSA_GAP = _RESTYPE_INDEX["-"]
+# MSA cells are uppercase one-letter symbols or the ``-`` gap, not ChemicalComponent IDs.
+# Standard symbols resolve to residue tokens, gaps to the gap token, and ambiguity symbols to ``UNK``.
+_MSA_UNKNOWN = ODESIGN_RESTYPE_INDEX["UNK"]
+_MSA_GAP = ODESIGN_RESTYPE_INDEX["-"]
 _MSA_SYMBOL_TOKENS = {
     "protein": {
-        symbol: _RESTYPE_INDEX[component_id]
+        symbol: ODESIGN_RESTYPE_INDEX[component_id]
         for symbol, component_id in {
             "A": "ALA",
             "R": "ARG",
@@ -139,8 +99,8 @@ _MSA_SYMBOL_TOKENS = {
             "V": "VAL",
         }.items()
     },
-    "rna": {symbol: _RESTYPE_INDEX[symbol] for symbol in ("A", "G", "C", "U", "N")},
-    "dna": {symbol: _RESTYPE_INDEX["D" + symbol] for symbol in ("A", "G", "C", "T", "N")},
+    "rna": {symbol: ODESIGN_RESTYPE_INDEX[symbol] for symbol in ("A", "G", "C", "U", "N")},
+    "dna": {symbol: ODESIGN_RESTYPE_INDEX["D" + symbol] for symbol in ("A", "G", "C", "T", "N")},
 }
 
 
@@ -154,8 +114,6 @@ def _msa_symbol_token(symbol: str, polymer_type: str) -> int:
 
 class ODesignProcessor:
     r"""Lower canonical systems, evidence, and supported Conditions to ODesignInput."""
-
-    config_class = ODesignProcessorConfig
 
     def __init__(
         self,
@@ -186,66 +144,52 @@ class ODesignProcessor:
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         *,
+        placement: ODesignPlacements | None = None,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template | str | PathLike[str]] = (),
-        conditions: Sequence[Contact | Hotspot | ODesignPlacements | DesiredCovalentLink | ReferenceCoordinates] = (),
+        conditions: Sequence[Hotspot | SymbolicBond | ReferenceCoordinates] = (),
+        receptor_mode: str | None = None,
     ) -> ODesignInput:
         r"""Validate and lower one unbatched canonical ODesign example."""
 
         condition_values = tuple(conditions)
-        placements = tuple(value for value in condition_values if type(value) is ODesignPlacements)
-        if len(placements) > 1:
-            raise ValueError("ODesign accepts at most one PlacementSpec")
         for condition in condition_values:
-            if type(condition) is ReferenceCoordinates:
-                if condition.intent == "preference":
-                    raise ValueError("ODesign does not rank ReferenceCoordinates preferences")
-                if condition.intent == "soft" and condition.weight not in (None, 1.0):
-                    raise ValueError("released ODesign has no weighted ReferenceCoordinates signal")
-            elif type(condition) is Hotspot:
-                # §A2 learned per-residue label: the released channel is always an unweighted
-                # soft signal (the frozen Hotspot carries no weight; intent rides on the envelope).
-                if condition.intent != "soft":
-                    raise ValueError("released ODesign consumes Hotspot only as a soft learned signal")
-            elif type(condition) is Contact:
-                # §B geometric hard-distance verification (model._require_hard_conditions);
-                # the released record is unweighted.
-                if condition.weight not in (None, 1.0):
-                    raise ValueError("released ODesign has no weighted Contact signal")
-            elif type(condition) not in (ODesignPlacements, DesiredCovalentLink):
+            if not isinstance(condition, (ReferenceCoordinates, Hotspot, SymbolicBond)):
                 raise TypeError(f"ODesign cannot consume {type(condition).__name__}")
 
         normalized = _normalize_input(input)
-        # §3.7.3: the removed generic validate_conditions pass is dropped; ODesign validates its own
-        # condition semantics inline (intent/weight/type above; endpoint/atom/hotspot checks below).
-        structure = normalized if type(normalized) is Structure else None
+        # ODesign validates condition semantics inline: type and intent above, endpoints and
+        # referenced atoms below.
+        structure = normalized if isinstance(normalized, Structure) else None
         source_system = structure.system if structure is not None else normalized
-        # Frozen §3.7: a GeneratedSegment carries no embedded id — its identity is the
+        # A GeneratedSegment carries no embedded id; its identity is the
         # globally-unique ``placement_id`` inner key of the PlacementSpec mapping.
         segments = {
             placement_id: part
-            for placement in placements
-            for chain in placement.placements.values()
+            for chain in (() if placement is None else placement.placements.values())
             for placement_id, part in chain.items()
-            if type(part) is GeneratedSegment
+            if isinstance(part, GeneratedSegment)
         }
         for condition in condition_values:
-            if type(condition) is not Hotspot:
+            if not isinstance(condition, Hotspot):
                 continue
             for reference in condition.residues:
-                if type(reference) in (AtomSite, SymbolicAtomSite):
+                if isinstance(reference, (AtomSite, SymbolicAtomSite)):
                     continue
-                if type(reference) is str:
+                if isinstance(reference, str):
                     # A whole-placement reference is the bare globally-unique placement_id.
                     polymer_type = segments[reference].polymer_type
-                elif type(reference) is SymbolicResidueSite:
+                elif isinstance(reference, SymbolicResidueSite):
                     polymer_type = segments[reference.placement_id].polymer_type
                 else:
+                    if source_system is None:
+                        raise ValueError("existing Hotspot residues require molecular input")
                     reference_entity = source_system.entities[source_system.instances[reference[0]]]
-                    polymer_type = cast(PolymerSequence, reference_entity).polymer_type
+                    if not isinstance(reference_entity, PolymerSequence):
+                        raise ValueError("non-protein Hotspot residues require exact atom references")
+                    polymer_type = reference_entity.polymer_type
                 if polymer_type != "protein":
                     raise ValueError("non-protein Hotspot residues require exact atom references")
-        if placements:
+        if placement is not None:
             (
                 system,
                 sites,
@@ -253,7 +197,7 @@ class ODesignProcessor:
                 instance_of,
                 source_residue_map,
                 source_atom_map,
-            ) = _materialize_placement(placements[0], source_system)
+            ) = _materialize_placement(placement, source_system)
         else:
             if source_system is None:
                 raise ValueError("input=None requires one PlacementSpec that determines generated topology")
@@ -264,12 +208,12 @@ class ODesignProcessor:
             source_residue_map = {
                 (instance_id, component_index): (instance_id, component_index)
                 for instance_id, entity_id in system.instances.items()
-                if type(entity := system.entities[entity_id]) is PolymerSequence
+                if isinstance(entity := system.entities[entity_id], PolymerSequence)
                 for component_index in range(len(entity))
             }
             source_atom_map = {site: site for site in sites}
 
-        system, cyclic_instances, cyclic_links = _materialize_cyclic_links(
+        system, cyclic_instances, cyclic_links = materialize_odesign_cyclic_links(
             system,
             condition_values,
             placement_map,
@@ -280,17 +224,14 @@ class ODesignProcessor:
         unsupported_components = {
             component.component_id
             for entity in system.entities.values()
-            if type(entity) is PolymerSequence
+            if isinstance(entity, PolymerSequence)
             for component in entity.components
-            if component.component_id not in _STANDARD_POLYMER_COMPONENTS
+            if component.component_id not in ODESIGN_STANDARD_POLYMER_COMPONENTS
         }
         if unsupported_components:
             raise ValueError(
                 "released ODesign has no residue token for components " f"{sorted(unsupported_components)!r}"
             )
-        template_values = tuple(templates)
-        if template_values:
-            raise ValueError("released ODesign has no active template blocks; non-empty templates are unsupported")
         msa_value = _normalize_msa(msa, system)
 
         if not sites:
@@ -301,7 +242,7 @@ class ODesignProcessor:
             for occurrences in placements.values()
             for occurrence in occurrences
         }
-        token_sites, token_residues, token_entities = _tokens(system, sites)
+        token_sites, token_residues, token_entities = build_odesign_tokens(system, sites)
         site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
         site_to_atom = {site: index for index, site in enumerate(sites)}
         observed_positions = torch.zeros(len(sites), 3, dtype=torch.float32)
@@ -310,7 +251,10 @@ class ODesignProcessor:
             observed = {site: index for index, site in enumerate(structure.sites)}
             source_by_output = {output: source for source, output in source_atom_map.items()}
             for atom_index, output_site in enumerate(sites):
-                source_index = observed.get(source_by_output.get(output_site))
+                source_site = source_by_output.get(output_site)
+                if source_site is None:
+                    continue
+                source_index = observed.get(source_site)
                 if source_index is None or not bool(structure.coordinate_mask[source_index]):
                     continue
                 observed_positions[atom_index] = torch.from_numpy(structure.coordinates[source_index].copy())
@@ -323,7 +267,7 @@ class ODesignProcessor:
             entity_id = system.instances[site.instance_id]
             entity = system.entities[entity_id]
             component = system.component((site.instance_id, site.component_index))
-            if type(entity) is PolymerSequence:
+            if isinstance(entity, PolymerSequence):
                 if (
                     site.instance_id,
                     site.component_index,
@@ -358,7 +302,6 @@ class ODesignProcessor:
 
         hotspot = _hotspot_tokens(
             condition_values,
-            system,
             placement_map,
             instance_of,
             source_residue_map,
@@ -369,30 +312,35 @@ class ODesignProcessor:
         constraint_coordinate_mask = torch.zeros(len(sites), dtype=torch.bool)
         output_atom_by_source = source_atom_map
         for condition in condition_values:
-            if type(condition) is not ReferenceCoordinates:
+            if not isinstance(condition, ReferenceCoordinates):
                 continue
             for site in condition.sites:
-                output_site = output_atom_by_source.get(site)
-                if output_site not in site_to_atom:
+                condition_site = output_atom_by_source.get(site)
+                if condition_site is None or condition_site not in site_to_atom:
                     raise ValueError(f"ODesign atom layout does not contain reference site {site!r}")
-                atom_index = site_to_atom[output_site]
+                atom_index = site_to_atom[condition_site]
                 constraint_coordinate_mask[atom_index] = True
                 if condition.intent == "hard":
                     fixed_coordinate_mask[atom_index] = True
+                elif condition.intent != "soft":
+                    raise ValueError(f"unknown ReferenceCoordinates intent: {condition.intent!r}")
         if bool((constraint_coordinate_mask & ~observed_mask).any()):
             raise ValueError("ReferenceCoordinates must refer to observed input coordinates")
-        # §4.11.2 receptor_mode: "rigid" realizes the released ``diffusion`` condition by holding
+        # ``receptor_mode="rigid"`` realizes the ``diffusion`` condition by holding
         # every existing (non-generated) receptor heavy atom rigid — it is marked as a hard fixed
         # coordinate that the EDM sampler pins (model.sample reads ``fixed_coordinate_mask``).
         # This is additive over the per-atom ReferenceCoordinates route above and only fixes atoms
         # that are actually observed (a receptor without coordinates cannot be pinned). "flex"
         # regenerates the receptor and leaves this untouched, so only explicit hard
         # ReferenceCoordinates pin atoms.
-        if self.config.receptor_mode == "rigid":
+        mode = self.config.receptor_mode if receptor_mode is None else receptor_mode
+        if mode == "rigid":
             for atom_index, site in enumerate(sites):
                 is_generated = (site.instance_id, site.component_index) in generated_residues
                 if not is_generated and bool(observed_mask[atom_index]):
                     fixed_coordinate_mask[atom_index] = True
+        elif mode != "flex":
+            raise ValueError(f"unknown receptor_mode: {mode!r}")
 
         msa_features, msa_mask, profile, deletion_mean = _msa_features(
             msa_value,
@@ -410,7 +358,7 @@ class ODesignProcessor:
             else:
                 sequence = cast(PolymerSequence, system.entities[system.instances[residue[0]]])
                 restype = sequence.components[residue[1]].component_id
-            restype_index = _RESTYPE_INDEX.get(restype, 20)
+            restype_index = ODESIGN_RESTYPE_INDEX.get(restype, 20)
             token_features[token_index, 384 + restype_index] = 1.0
             token_features[token_index, 419 : 419 + 32] = profile[token_index]
             token_features[token_index, 451] = deletion_mean[token_index]
@@ -421,7 +369,12 @@ class ODesignProcessor:
             dtype=torch.int64,
         )
         atom_features = _atom_features(system, sites, reference_mask)
-        token_bonds = _token_bonds(system, token_sites, site_to_token, excluded=cyclic_links)
+        token_bonds = build_odesign_token_bonds(
+            system,
+            token_sites,
+            site_to_token,
+            excluded=cyclic_links,
+        )
         constraint_distogram = _constraint_distogram(
             system,
             sites,
@@ -429,7 +382,7 @@ class ODesignProcessor:
             observed_positions,
             constraint_coordinate_mask,
         )
-        chain_index, entity_index, symmetry_index, residue_index = _token_indices(
+        chain_index, entity_index, symmetry_index, residue_index = build_odesign_token_indices(
             system,
             token_sites,
             token_residues,
@@ -442,7 +395,7 @@ class ODesignProcessor:
             entity_index=entity_index.unsqueeze(0).to(self.device),
             symmetry_index=symmetry_index.unsqueeze(0).to(self.device),
             token_index=torch.arange(len(token_sites), dtype=torch.int64, device=self.device).unsqueeze(0),
-            cyclic_period=_cyclic_period(token_sites, cyclic_instances).unsqueeze(0).to(self.device),
+            cyclic_period=build_odesign_cyclic_period(token_sites, cyclic_instances).unsqueeze(0).to(self.device),
             token_features=token_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             token_bonds=token_bonds.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             atom_features=atom_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
@@ -467,6 +420,7 @@ class ODesignProcessor:
             layout=ODesignLayout(
                 system=system,
                 sites=sites,
+                placement=placement,
                 conditions=condition_values,
                 placement_map=placement_map,
                 instance_of=instance_of,
@@ -478,7 +432,7 @@ class ODesignProcessor:
 
 
 def _normalize_input(input):
-    if input is None or type(input) in (MolecularSystem, Structure):
+    if input is None or isinstance(input, (MolecularSystem, Structure)):
         return input
     if isinstance(input, str | PathLike):
         return read_structure(Path(input).expanduser())
@@ -493,7 +447,7 @@ def _sites_with_reference_coordinates(system: MolecularSystem) -> tuple[AtomSite
         if atom.element == "H":
             continue
         entity = system.entities[system.instances[site.instance_id]]
-        if type(entity) is PolymerSequence:
+        if isinstance(entity, PolymerSequence):
             component = entity.components[site.component_index]
             atom_index = next(index for index, member in enumerate(component.atoms) if member.atom_id == site.atom_id)
             if component.reference_coordinates and component.reference_coordinates[atom_index] is None:
@@ -515,14 +469,14 @@ def _materialize_placement(
 ]:
     r"""Materialize one exact mixed PlacementSpec and its source-to-output identity maps.
 
-    Returns the realized ``placement_map`` (frozen §3.7 output surface for generated
+    Returns the realized ``placement_map`` (the output surface for generated
     placements: ``declaration_group -> placement_id -> ordered ComponentReference tuple``)
     and its ``instance_of`` index (``placement_id -> declaration_group``, derived once from the
     PlacementSpec), alongside the source-residue and source-atom maps.
     """
 
     molecule_entities: dict[str, Molecule] = (
-        {entity_id: entity for entity_id, entity in source_system.entities.items() if type(entity) is Molecule}
+        {entity_id: entity for entity_id, entity in source_system.entities.items() if isinstance(entity, Molecule)}
         if source_system is not None
         else {}
     )
@@ -530,7 +484,7 @@ def _materialize_placement(
         {
             instance_id: entity_id
             for instance_id, entity_id in source_system.instances.items()
-            if type(source_system.entities[entity_id]) is Molecule
+            if isinstance(source_system.entities[entity_id], Molecule)
         }
         if source_system is not None
         else {}
@@ -545,18 +499,18 @@ def _materialize_placement(
     generated_component_ids: set[str] = set()
     new_entities_by_sequence: dict[tuple[PolymerType, tuple[ChemicalComponent, ...]], tuple[str, PolymerSequence]] = {}
 
-    # Frozen §3.7 realized-instance ids: the shared declaration-order allocator mints the
-    # canonical ``chain_{n}`` (uniform, 0-based, no family prefix) once per realized OUTPUT
+    # The shared declaration-order allocator mints the realized instance IDs:
+    # canonical ``chain_{n}`` (uniform and 0-based) once per realized output
     # chain that has >=1 occurrence. A declaration group whose parts all realize to zero length
     # mints NO chain and consumes NO index — it is recorded as () and skipped.
     instance_ids = InstanceIdAllocator()
     for chain_index, (group, chain) in enumerate(placement.placements.items()):
         if all(
-            part.max_length == 0 if type(part) is GeneratedSegment else part.stop == part.start
+            part.max_length == 0 if isinstance(part, GeneratedSegment) else part.stop == part.start
             for part in chain.values()
         ):
             for placement_id, part in chain.items():
-                if type(part) is GeneratedSegment:
+                if isinstance(part, GeneratedSegment):
                     placement_map.setdefault(group, {})[placement_id] = ()
             continue
         instance_id = instance_ids.allocate()
@@ -568,22 +522,14 @@ def _materialize_placement(
         segment_offsets: list[tuple[str, GeneratedSegment, int, int]] = []
         polymer_type: str | None = None
         for placement_id, part in chain.items():
-            if type(part) is GeneratedSegment:
+            if isinstance(part, GeneratedSegment):
                 part_polymer_type = part.polymer_type
                 start = len(components)
                 length = part.max_length
                 if part_polymer_type not in _GENERATED_COMPONENT_ID:
-                    # GAP-1 gate: a de-novo ligand segment (odesign
-                    # ``{"chain_type": "ligand", "sequence": "N-N"}`` = num_atoms) has no truthful
-                    # released realization — the released path yields placeholder ``-L`` atom rows,
-                    # fake bonds, and binary NONE/ANY bond logits, not a real chemical graph. Refuse
-                    # it here rather than silently emitting fake chemistry. Protein/nucleic de-novo
-                    # generation and fixed-ligand context are unaffected.
                     raise NotImplementedError(
-                        "de-novo ligand design is not supported: the released ODesign path realizes "
-                        "a generated ligand segment as placeholder -L atom rows with fake bonds and "
-                        "binary NONE/ANY bond-type logits, not a real chemical graph; only protein/"
-                        f"nucleic de-novo generation is supported (got polymer_type {part_polymer_type!r})"
+                        "ODesign cannot realize one dna_rna_hybrid segment without per-residue polymer "
+                        "identity; use separate DNA and RNA generated segments"
                     )
                 component_id = _GENERATED_COMPONENT_ID[part_polymer_type]
                 components.extend([get_component(component_id)] * length)
@@ -607,7 +553,7 @@ def _materialize_placement(
 
         reused_entity_id: str | None = None
         chain_parts = tuple(chain.values())
-        if len(chain_parts) == 1 and type(chain_parts[0]) is ExistingSpan and source_system is not None:
+        if len(chain_parts) == 1 and isinstance(chain_parts[0], ExistingSpan) and source_system is not None:
             span = chain_parts[0]
             source_entity_id = source_system.instances[span.instance_id]
             candidate = cast(PolymerSequence, source_system.entities[source_entity_id])
@@ -668,13 +614,13 @@ def _materialize_placement(
         if residue in generated_residues:
             if cast(PolymerSequence, entity).polymer_type == "protein" and site.atom_id not in {"N", "CA", "C", "O"}:
                 continue
-        elif type(entity) is PolymerSequence:
+        elif isinstance(entity, PolymerSequence):
             source_residue = source_residue_by_output[residue]
             if AtomSite(source_residue[0], source_residue[1], site.atom_id) not in source_sites:
                 continue
         sites.append(site)
-    sites = tuple(sites)
-    output_sites = set(sites)
+    site_tuple = tuple(sites)
+    output_sites = set(site_tuple)
     source_atom_map: dict[AtomSite, AtomSite] = {}
     if source_system is not None:
         source_sites_by_residue: dict[tuple[str, int], list[AtomSite]] = {}
@@ -697,6 +643,8 @@ def _materialize_placement(
         for bond in source_system.bonds:
             site_a = mapped_atoms.get(bond.site_a)
             site_b = mapped_atoms.get(bond.site_b)
+            if (site_a is None) != (site_b is None):
+                raise ValueError(f"ODesign placement cuts exactly one endpoint of source bond {bond!r}")
             if site_a is None or site_b is None:
                 continue
             stereo_sites = (
@@ -722,382 +670,11 @@ def _materialize_placement(
     )
     return (
         system,
-        sites,
+        site_tuple,
         placement_map,
         _placement_instance_of(placement.placements),
         source_residue_map,
         source_atom_map,
-    )
-
-
-def _materialize_cyclic_links(
-    system: MolecularSystem,
-    conditions: tuple[Contact | Hotspot | ODesignPlacements | DesiredCovalentLink | ReferenceCoordinates, ...],
-    placement_map: PlacementMap,
-    instance_of: dict[str, str],
-    source_atom_map: dict[AtomSite, AtomSite],
-) -> tuple[MolecularSystem, frozenset[str], frozenset[frozenset[AtomSite]]]:
-    r"""Materialize requested head-to-tail polymer closures."""
-
-    source_atoms = source_atom_map
-    bonds = set(system.bonds)
-    cyclic_instances = set()
-    cyclic_links = set()
-    for bond in bonds:
-        if bond.site_a.instance_id != bond.site_b.instance_id:
-            continue
-        instance_id = bond.site_a.instance_id
-        entity = system.entities[system.instances[instance_id]]
-        if type(entity) is not PolymerSequence:
-            continue
-        first = entity.components[0].previous_attachment
-        last = entity.components[-1].next_attachment
-        if first is None or last is None:
-            continue
-        expected = frozenset(
-            (
-                AtomSite(instance_id, 0, first.atom_id),
-                AtomSite(instance_id, len(entity) - 1, last.atom_id),
-            )
-        )
-        if frozenset((bond.site_a, bond.site_b)) == expected:
-            cyclic_instances.add(instance_id)
-    # TODO(§3.3 reopened): cyclic closure as an explicit SystemBond is reopened. Committed
-    # PolymerAttachment no longer carries order/aromatic (§3.2), so the synthesized head-to-tail
-    # bond uses the polymer_rule default (order=1.0, aromatic=False) and the attachment-chemistry
-    # compatibility checks that previously read previous/following order+aromatic are dropped until
-    # the cyclic-closure SystemBond contract freezes.
-    for condition in conditions:
-        if type(condition) is not DesiredCovalentLink:
-            continue
-        # Frozen §3.7.4 payload: endpoints ride on the SymbolicBond (site_a/site_b over the
-        # promoted SymbolicBondSite union). An existing-atom endpoint (AtomSite) is remapped
-        # source -> output through source_atom_map; a generated-atom endpoint (SymbolicAtomSite)
-        # resolves its SymbolicResidueSite through the frozen placement resolve().
-        bond = condition.bond
-        endpoints = []
-        for reference in (bond.site_a, bond.site_b):
-            if type(reference) is AtomSite:
-                site = source_atoms.get(reference)
-                if site is None:
-                    raise ValueError(f"ODesign atom layout does not contain covalent-link site {reference!r}")
-            else:
-                residue = _resolve_site(reference.residue, placement_map, instance_of)
-                site = AtomSite(residue[0], residue[1], reference.atom_id)
-            system.atom(site)
-            endpoints.append(site)
-
-        site_a, site_b = endpoints
-        if site_a.instance_id != site_b.instance_id:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-        instance_id = site_a.instance_id
-        entity = system.entities[system.instances[instance_id]]
-        if type(entity) is not PolymerSequence:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-        previous = entity.components[0].previous_attachment
-        following = entity.components[-1].next_attachment
-        if previous is None or following is None:
-            raise ValueError("cyclic polymer endpoints require previous and next attachments")
-        expected = frozenset(
-            (
-                AtomSite(instance_id, 0, previous.atom_id),
-                AtomSite(instance_id, len(entity) - 1, following.atom_id),
-            )
-        )
-        endpoint_set = frozenset((site_a, site_b))
-        if endpoint_set != expected:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-
-        existing = next(
-            (bond for bond in bonds if frozenset((bond.site_a, bond.site_b)) == endpoint_set),
-            None,
-        )
-        if existing is None:
-            bonds.add(
-                SystemBond(
-                    site_a,
-                    site_b,
-                    order=bond.order,
-                    aromatic=bond.aromatic,
-                    stereo=bond.stereo,
-                    origin="user",
-                )
-            )
-        cyclic_instances.add(instance_id)
-        cyclic_links.add(endpoint_set)
-
-    if not cyclic_instances:
-        return system, frozenset(), frozenset()
-    return (
-        MolecularSystem(
-            system.entities,
-            system.instances,
-            frozenset(bonds),
-        ),
-        frozenset(cyclic_instances),
-        frozenset(cyclic_links),
-    )
-
-
-def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> ODesignInput:
-    placement = next((condition for condition in input.layout.conditions if type(condition) is ODesignPlacements), None)
-    if placement is None:
-        return input
-    ranged = {
-        placement_id: part
-        for chain in placement.placements.values()
-        for placement_id, part in chain.items()
-        if type(part) is GeneratedSegment and part.min_length != part.max_length
-    }
-    if not ranged:
-        return input
-    lengths = {}
-    chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
-    for chain, chain_length in zip(placement.placements.values(), chain_lengths):
-        chain_ranges = [
-            (placement_id, part)
-            for placement_id, part in chain.items()
-            if type(part) is GeneratedSegment and placement_id in ranged
-        ]
-        if chain_length is None:
-            for placement_id, segment in chain_ranges:
-                lengths[placement_id] = int(
-                    torch.randint(
-                        segment.min_length,
-                        segment.max_length + 1,
-                        (),
-                        device=input.reference_positions.device,
-                        generator=generator,
-                    )
-                )
-            continue
-
-        for placement_id, segment in chain_ranges:
-            lengths[placement_id] = segment.min_length
-        remaining = chain_length - sum(
-            part.min_length if type(part) is GeneratedSegment else part.stop - part.start for part in chain.values()
-        )
-        for _ in range(remaining):
-            available = [
-                (placement_id, segment)
-                for placement_id, segment in chain_ranges
-                if lengths[placement_id] < segment.max_length
-            ]
-            selected = int(
-                torch.randint(
-                    len(available),
-                    (),
-                    device=input.reference_positions.device,
-                    generator=generator,
-                )
-            )
-            lengths[available[selected][0]] += 1
-    if all(length == ranged[placement_id].max_length for placement_id, length in lengths.items()):
-        return input
-
-    polymer_instances = [
-        instance_id
-        for instance_id, entity_id in input.layout.system.instances.items()
-        if type(input.layout.system.entities[entity_id]) is PolymerSequence
-    ]
-    residue_map = {}
-    placement_map: PlacementMap = {}
-    realized_sequences = []
-    sequence_by_signature = {}
-    used_entity_ids = {
-        entity_id for entity_id, entity in input.layout.system.entities.items() if type(entity) is Molecule
-    }
-    # Walk declaration groups in order, indexing the realized polymer instances by declaration
-    # position among NON-EMPTY groups only: a zero-length declaration group mints no realized
-    # chain (matching _materialize_placement), so it is recorded as () and skipped here too.
-    chain_position = 0
-    for group, chain in placement.placements.items():
-        if all(
-            part.max_length == 0 if type(part) is GeneratedSegment else part.stop == part.start
-            for part in chain.values()
-        ):
-            for placement_id, part in chain.items():
-                if type(part) is GeneratedSegment:
-                    placement_map.setdefault(group, {})[placement_id] = ()
-            continue
-        instance_id = polymer_instances[chain_position]
-        chain_position += 1
-        old_entity_id = input.layout.system.instances[instance_id]
-        old_entity = cast(PolymerSequence, input.layout.system.entities[old_entity_id])
-        old_index = 0
-        new_index = 0
-        components = []
-        for placement_id, part in chain.items():
-            old_length = part.max_length if type(part) is GeneratedSegment else part.stop - part.start
-            new_length = lengths.get(placement_id, part.max_length) if type(part) is GeneratedSegment else old_length
-            occurrences = []
-            for offset in range(new_length):
-                residue_map[(instance_id, old_index + offset)] = (instance_id, new_index + offset)
-                components.append(old_entity.components[old_index + offset])
-                if type(part) is GeneratedSegment:
-                    occurrences.append((instance_id, new_index + offset))
-            if type(part) is GeneratedSegment:
-                placement_map.setdefault(group, {})[placement_id] = tuple(occurrences)
-            old_index += old_length
-            new_index += new_length
-
-        signature = (old_entity.polymer_type, tuple(components))
-        existing_entity = sequence_by_signature.get(signature)
-        if existing_entity is None:
-            entity_id = old_entity_id
-            while entity_id in used_entity_ids:
-                entity_id += "_"
-            sequence = PolymerSequence(old_entity.polymer_type, tuple(components))
-            sequence_by_signature[signature] = (entity_id, sequence)
-            used_entity_ids.add(entity_id)
-        else:
-            entity_id, sequence = existing_entity
-        realized_sequences.append((instance_id, entity_id, sequence))
-
-    molecule_entities = {
-        entity_id: entity for entity_id, entity in input.layout.system.entities.items() if type(entity) is Molecule
-    }
-    molecule_instances = {
-        instance_id: entity_id
-        for instance_id, entity_id in input.layout.system.instances.items()
-        if type(input.layout.system.entities[entity_id]) is Molecule
-    }
-    instances = {
-        **{instance_id: entity_id for instance_id, entity_id, _ in realized_sequences},
-        **molecule_instances,
-    }
-    entities = {
-        **{entity_id: sequence for _, entity_id, sequence in realized_sequences},
-        **molecule_entities,
-    }
-
-    def map_site(site: AtomSite) -> AtomSite | None:
-        if type(input.layout.system.entities[input.layout.system.instances[site.instance_id]]) is Molecule:
-            return site
-        residue = residue_map.get((site.instance_id, site.component_index))
-        return None if residue is None else AtomSite(residue[0], residue[1], site.atom_id)
-
-    bonds = []
-    for bond in input.layout.system.bonds:
-        site_a = map_site(bond.site_a)
-        site_b = map_site(bond.site_b)
-        if site_a is None or site_b is None:
-            continue
-        stereo_sites = None
-        if bond.stereo_sites is not None:
-            stereo_a = map_site(bond.stereo_sites[0])
-            stereo_b = map_site(bond.stereo_sites[1])
-            if stereo_a is None or stereo_b is None:
-                continue
-            stereo_sites = (stereo_a, stereo_b)
-        bonds.append(
-            SystemBond(
-                site_a,
-                site_b,
-                order=bond.order,
-                aromatic=bond.aromatic,
-                stereo=bond.stereo,
-                stereo_sites=stereo_sites,
-                origin=bond.origin,
-            )
-        )
-    system = MolecularSystem(entities, instances, frozenset(bonds))
-    source_residue_map = {
-        source: residue_map[output]
-        for source, output in input.layout.source_residue_map.items()
-        if output in residue_map
-    }
-    source_atom_map = {
-        source: mapped
-        for source, output in input.layout.source_atom_map.items()
-        if (mapped := map_site(output)) is not None
-    }
-    system, cyclic_instances, cyclic_links = _materialize_cyclic_links(
-        system,
-        input.layout.conditions,
-        placement_map,
-        input.layout.instance_of,
-        source_atom_map,
-    )
-
-    old_to_new_site = {site: mapped for site in input.layout.sites if (mapped := map_site(site)) is not None}
-    sites = tuple(old_to_new_site.values())
-    new_to_old_site = {new: old for old, new in old_to_new_site.items()}
-    old_atom_index = {site: index for index, site in enumerate(input.layout.sites)}
-    atom_indices = torch.tensor(
-        [old_atom_index[new_to_old_site[site]] for site in sites],
-        dtype=torch.int64,
-        device=input.atom_mask.device,
-    )
-    token_sites, token_residues, token_entities = _tokens(system, sites)
-    old_token_indices = torch.tensor(
-        [int(input.atom_to_token[0, old_atom_index[new_to_old_site[group[0]]]]) for group in token_sites],
-        dtype=torch.int64,
-        device=input.token_mask.device,
-    )
-    atom_to_token = torch.tensor(
-        [token_index for token_index, group in enumerate(token_sites) for _ in group],
-        dtype=torch.int64,
-        device=input.atom_to_token.device,
-    ).unsqueeze(0)
-    site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
-    chain_index, entity_index, symmetry_index, residue_index = (
-        value.unsqueeze(0).to(input.residue_index.device)
-        for value in _token_indices(system, token_sites, token_residues, token_entities)
-    )
-    selected_reference_spaces = input.reference_space_id.index_select(1, atom_indices)
-    reference_space_map = {}
-    reference_space_id = []
-    for value in selected_reference_spaces[0].tolist():
-        if value not in reference_space_map:
-            reference_space_map[value] = len(reference_space_map)
-        reference_space_id.append(reference_space_map[value])
-    reference_space_id = torch.tensor(
-        reference_space_id,
-        dtype=torch.int64,
-        device=input.reference_space_id.device,
-    ).unsqueeze(0)
-    observed_positions = input.observed_positions.index_select(1, atom_indices)
-    observed_mask = input.observed_mask.index_select(1, atom_indices)
-    fixed_coordinate_mask = input.fixed_coordinate_mask.index_select(1, atom_indices)
-    token_bonds = _token_bonds(system, token_sites, site_to_token, excluded=cyclic_links).to(input.token_bonds)
-    constraint_distogram = input.constraint_distogram.index_select(1, old_token_indices).index_select(
-        2,
-        old_token_indices,
-    )
-    layout = replace(
-        input.layout,
-        system=system,
-        sites=sites,
-        placement_map=placement_map,
-        source_residue_map=source_residue_map,
-        source_atom_map=source_atom_map,
-    )
-    return replace(
-        input,
-        token_mask=input.token_mask.index_select(1, old_token_indices),
-        residue_index=residue_index,
-        chain_index=chain_index,
-        entity_index=entity_index,
-        symmetry_index=symmetry_index,
-        token_index=torch.arange(len(token_sites), device=input.token_index.device).unsqueeze(0),
-        cyclic_period=_cyclic_period(token_sites, cyclic_instances).unsqueeze(0).to(input.cyclic_period.device),
-        token_features=input.token_features.index_select(1, old_token_indices),
-        token_bonds=token_bonds.unsqueeze(0),
-        atom_features=input.atom_features.index_select(1, atom_indices),
-        atom_to_token=atom_to_token,
-        atom_mask=input.atom_mask.index_select(1, atom_indices),
-        reference_positions=input.reference_positions.index_select(1, atom_indices),
-        reference_space_id=reference_space_id,
-        reference_mask=input.reference_mask.index_select(1, atom_indices),
-        reference_charges=input.reference_charges.index_select(1, atom_indices),
-        observed_positions=observed_positions,
-        observed_mask=observed_mask,
-        fixed_coordinate_mask=fixed_coordinate_mask,
-        constraint_distogram=constraint_distogram,
-        msa_features=input.msa_features.index_select(2, old_token_indices),
-        msa_mask=input.msa_mask.index_select(2, old_token_indices),
-        layout=layout,
     )
 
 
@@ -1110,7 +687,7 @@ def _normalize_msa(
     if isinstance(msa, MSA | MSACollection):
         values = (msa,) if isinstance(msa, MSA) else msa.msas
         # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` and closes
-        # over this system, so the Processor resolves the entity and checks the query width (the frozen
+        # over this system, so the Processor resolves the entity and checks the query width (the
         # MSA validates neither against an entity). Column ``i`` binds to ``entity.components[i]``.
         for value in values:
             entity = system.entities.get(value.entity_id)
@@ -1123,7 +700,9 @@ def _normalize_msa(
                 )
         return msa
     path = Path(msa).expanduser()
-    polymers = [(entity_id, entity) for entity_id, entity in system.entities.items() if type(entity) is PolymerSequence]
+    polymers = [
+        (entity_id, entity) for entity_id, entity in system.entities.items() if isinstance(entity, PolymerSequence)
+    ]
     if len(polymers) != 1:
         raise ValueError("a FASTA MSA path is unambiguous only for a single-polymer system; pass MSACollection")
     from multimolecule.io import read_fasta_records
@@ -1151,66 +730,6 @@ def _aligned_symbols(sequence: str) -> str:
     return "".join("-" if symbol in "-." else symbol for symbol in sequence.upper())
 
 
-def _tokens(system: MolecularSystem, sites: tuple[AtomSite, ...]):
-    sites_by_residue: dict[tuple[str, int], list[AtomSite]] = {}
-    for site in sites:
-        if type(system.entities[system.instances[site.instance_id]]) is PolymerSequence:
-            sites_by_residue.setdefault((site.instance_id, site.component_index), []).append(site)
-    token_sites = []
-    token_residues = []
-    token_entities = []
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if type(entity) is PolymerSequence:
-            for component_index in range(len(entity)):
-                residue = (instance_id, component_index)
-                residue_sites = tuple(sites_by_residue[residue])
-                if entity.components[component_index].component_id in _STANDARD_POLYMER_COMPONENTS:
-                    token_sites.append(residue_sites)
-                    token_residues.append(residue)
-                    token_entities.append(entity)
-                else:
-                    for site in residue_sites:
-                        token_sites.append((site,))
-                        token_residues.append(residue)
-                        token_entities.append(entity)
-        else:
-            for site in sites:
-                if site.instance_id == instance_id:
-                    token_sites.append((site,))
-                    token_residues.append(None)
-                    token_entities.append(entity)
-    return tuple(token_sites), tuple(token_residues), tuple(token_entities)
-
-
-def _token_indices(system, token_sites, token_residues, token_entities):
-    chain_by_instance = {instance_id: index for index, instance_id in enumerate(system.instances)}
-    entity_ids = []
-    for entity_id in system.instances.values():
-        if entity_id not in entity_ids:
-            entity_ids.append(entity_id)
-    entity_index_by_id = {value: index for index, value in enumerate(entity_ids)}
-    seen_by_entity: dict[str, int] = {}
-    symmetry_by_instance = {}
-    for instance_id, entity_id in system.instances.items():
-        symmetry_by_instance[instance_id] = seen_by_entity.get(entity_id, 0)
-        seen_by_entity[entity_id] = symmetry_by_instance[instance_id] + 1
-    chain = []
-    entity = []
-    symmetry = []
-    residue = []
-    for group, reference, _definition in zip(token_sites, token_residues, token_entities):
-        instance_id = reference[0] if reference is not None else group[0].instance_id
-        chain.append(chain_by_instance[instance_id])
-        entity.append(entity_index_by_id[system.instances[instance_id]])
-        symmetry.append(symmetry_by_instance[instance_id])
-        if reference is None:
-            residue.append(0)
-        else:
-            residue.append(reference[1])
-    return tuple(torch.tensor(values, dtype=torch.int64) for values in (chain, entity, symmetry, residue))
-
-
 def _atom_features(system: MolecularSystem, sites: tuple[AtomSite, ...], reference_mask: Tensor) -> Tensor:
     from rdkit.Chem import GetPeriodicTable
 
@@ -1232,33 +751,8 @@ def _atom_features(system: MolecularSystem, sites: tuple[AtomSite, ...], referen
     return torch.cat([reference_mask.float().unsqueeze(-1), element, characters.flatten(-2)], dim=-1)
 
 
-def _token_bonds(system, token_sites, site_to_token, *, excluded):
-    bonds = torch.zeros(len(token_sites), len(token_sites), dtype=torch.float32)
-    for bond in system.iter_bonds():
-        if frozenset((bond.site_a, bond.site_b)) in excluded:
-            continue
-        if bond.site_a not in site_to_token or bond.site_b not in site_to_token:
-            continue
-        left, right = site_to_token[bond.site_a], site_to_token[bond.site_b]
-        if left != right:
-            bonds[left, right] = bonds[right, left] = 1.0
-    return bonds
-
-
-def _cyclic_period(token_sites, cyclic_instances):
-    counts = {
-        instance_id: sum(group[0].instance_id == instance_id for group in token_sites)
-        for instance_id in cyclic_instances
-    }
-    return torch.tensor(
-        [counts.get(group[0].instance_id, 0) for group in token_sites],
-        dtype=torch.int64,
-    )
-
-
 def _hotspot_tokens(
     conditions,
-    system,
     placement_map,
     instance_of,
     source_residue_map,
@@ -1267,17 +761,16 @@ def _hotspot_tokens(
 ):
     hotspot = torch.zeros(max(site_to_token.values()) + 1, dtype=torch.bool)
     for condition in conditions:
-        if type(condition) is not Hotspot:
+        if not isinstance(condition, Hotspot):
             continue
         selected = False
         for reference in condition.residues:
             # Skip generated endpoints: a whole-placement ``placement_id`` (str), one symbolic
             # residue, or one symbolic atom — hotspots mark EXISTING input residues only.
-            if type(reference) in (str, SymbolicResidueSite, SymbolicAtomSite):
+            if isinstance(reference, (str, SymbolicResidueSite, SymbolicAtomSite)):
                 continue
             for site in _reference_sites(
                 reference,
-                system,
                 placement_map,
                 instance_of,
                 source_residue_map,
@@ -1305,9 +798,9 @@ def _constraint_distogram(
         if not bool(constraint_coordinate_mask[atom_index]):
             continue
         entity = system.entities[system.instances[site.instance_id]]
-        if type(entity) is PolymerSequence:
+        if isinstance(entity, PolymerSequence):
             component_id = entity.components[site.component_index].component_id
-            if component_id in _STANDARD_POLYMER_COMPONENTS:
+            if component_id in ODESIGN_STANDARD_POLYMER_COMPONENTS:
                 center_atom = "CA" if entity.polymer_type == "protein" else "C1'"
                 if site.atom_id != center_atom:
                     continue
@@ -1322,22 +815,21 @@ def _constraint_distogram(
 
 def _reference_sites(
     reference,
-    system,
     placement_map,
     instance_of,
     source_residue_map,
     source_atom_map,
     available_sites,
 ):
-    if type(reference) is AtomSite:
+    if isinstance(reference, AtomSite):
         return (source_atom_map[reference],)
-    if type(reference) is SymbolicAtomSite:
+    if isinstance(reference, SymbolicAtomSite):
         residue = _resolve_site(reference.residue, placement_map, instance_of)
         return (AtomSite(residue[0], residue[1], reference.atom_id),)
-    if type(reference) is str:
+    if isinstance(reference, str):
         # A bare globally-unique placement_id names the whole generated placement, in order.
         residues = placement_map[instance_of[reference]][reference]
-    elif type(reference) is SymbolicResidueSite:
+    elif isinstance(reference, SymbolicResidueSite):
         residues = (_resolve_site(reference, placement_map, instance_of),)
     else:
         residues = (source_residue_map[reference],)
@@ -1360,7 +852,7 @@ def _msa_features(msa, system, token_residues, token_entities, generated_residue
                 if residue is None or residue in generated_residues
                 else token_entities[index].components[residue[1]].component_id
             )
-            token = min(_RESTYPE_INDEX.get(component, 20), 31)
+            token = min(ODESIGN_RESTYPE_INDEX.get(component, 20), 31)
             profile[index, token] = 1.0
             row[index] = token
         features = torch.cat(
@@ -1368,7 +860,7 @@ def _msa_features(msa, system, token_residues, token_entities, generated_residue
             dim=-1,
         ).unsqueeze(0)
         return features, torch.ones(1, token_count, dtype=torch.bool), profile, deletion_mean
-    msas = (msa,) if type(msa) is MSA else msa.msas
+    msas = (msa,) if isinstance(msa, MSA) else msa.msas
     # The MSA holds no PolymerSequence: column ``c`` binds ``msas[c].entity_id`` to a system entity and
     # ``query_to_entity`` is the identity map, so a token's component index is the aligned-row column.
     # ``polymer_types[c]`` resolves the one-letter-symbol lowering; ``tokens_by_entity`` groups every
@@ -1381,7 +873,7 @@ def _msa_features(msa, system, token_residues, token_entities, generated_residue
         tokens_by_entity.setdefault(system.instances[residue[0]], []).append((token_index, residue[1]))
     # A bare MSA replays its unpaired pool (row 0 is the query); a collection replays its dense
     # row_pairing/row_is_paired plan, selecting the paired or unpaired pool per column (``-1`` = gap).
-    if type(msa) is MSA:
+    if isinstance(msa, MSA):
         plan: list[tuple[tuple[int, int, bool], ...]] = [
             ((0, source_row, False),) for source_row in range(len(msa.unpaired_sequences))
         ]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_transition = oops_kernel("transition")
@@ -33,7 +33,7 @@ def transition(
     Apply the SwiGLU transition ``down(silu(gate(norm(x))) * up(norm(x)))`` on the selected backend.
 
     Pre-normalizes ``hidden`` with LayerNorm, gates the up-projection by the SiLU of the gate-projection,
-    and projects back down. The ``"oops"`` backend delegates to the fused kernel; ``"eager"`` runs the
+    and projects back down. The ``"oops"`` backend delegates to the OOps-owned implementation; ``"eager"`` runs the
     equivalent pure-PyTorch composition.
 
     Args:
@@ -48,9 +48,6 @@ def transition(
 
     Returns:
         ``[..., hidden_size]`` transformed activations.
-
-    Raises:
-        OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA tensors.
 
     Examples:
         >>> import torch
@@ -78,8 +75,6 @@ def transition(
         public_default="eager",
     )
     if backend == "oops":
-        if not hidden.is_cuda:
-            raise OOpsUnsupportedError("operator_backend 'oops' for transition requires CUDA tensors")
         return _oops_transition(
             hidden,
             norm_weight=norm_weight,

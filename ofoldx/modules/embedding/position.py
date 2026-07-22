@@ -228,7 +228,12 @@ def generate_relative_position_features(
         min=0,
         max=2 * max_relative_chain,
     )
-    chain_survives = same_entity if chain_gate == "same_entity" else ~same_chain
+    if chain_gate == "same_entity":
+        chain_survives = same_entity
+    elif chain_gate == "not_same_chain":
+        chain_survives = ~same_chain
+    else:
+        raise ValueError(f"unknown chain_gate: {chain_gate!r}")
     chain_bucket = torch.where(
         chain_survives,
         chain_offset,

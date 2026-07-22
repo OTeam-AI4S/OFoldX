@@ -18,7 +18,7 @@ class Transition(nn.Module):
     Layer-norms the input, then applies a gated linear unit: the SiLU-activated ``gate_projection``
     modulates the ``value_projection`` before ``output_projection`` maps back to ``hidden_size``.
     The computation is dispatched through
-    [ofoldx.modules.backend][], so it can run on the fused ``oops`` kernel or an eager fallback.
+    [ofoldx.modules.backend][], which selects the OOps-owned implementation or an eager reference.
 
     Args:
         hidden_size: Input and output hidden width.
@@ -52,9 +52,6 @@ class Transition(nn.Module):
 
         Returns:
             Transition output with the same shape as ``hidden``.
-
-        Raises:
-            OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA tensors.
 
         Examples:
             >>> import torch

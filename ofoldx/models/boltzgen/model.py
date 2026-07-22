@@ -1,12 +1,4 @@
-r"""BoltzGen raw-tensor design models.
-
-Model-first order: the public ``BoltzGenModel`` (structure design) and ``BoltzGenIFoldModel``
-(inverse folding) come first, then their supporting ``nn.Module`` layers/helpers, then the typed
-contract dataclasses (Input/Output/Layout/Result) and family-local conditions last. The family is
-registered (see ``__init__``); its multi-stage ``design`` / ``inverse_fold`` flow is carried by the
-concrete ``BoltzGenPipeline``, exported for manual construction and not yet routed through the
-(unfrozen) concrete-Pipeline registry.
-"""
+r"""BoltzGen structure-design and inverse-folding models with their typed tensor contracts."""
 
 from __future__ import annotations
 
@@ -21,11 +13,12 @@ from torch import Tensor, nn
 from typing_extensions import Self
 
 from ...data.bonds import SymbolicBond
-from ...data.conditions import Contact, Hotspot
+from ...data.conditions import Endpoint, Hotspot
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.placement import (
     PlacementMap,
     PlacementSpec,
+    SymbolicResidueSite,
     validate_placement,
 )
 from ...data.structure import Structure
@@ -40,7 +33,7 @@ from ...modules.atom.transfer import (
 from ...modules.atom.window import gather_key_windows
 from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
-from ...modules.diffusion.conditioning import condition_pair, condition_single
+from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.embedding.fourier import FrozenFourierEmbedding
 from ...modules.embedding.position import RelativePositionEmbedder, generate_relative_position_features
@@ -308,8 +301,9 @@ class BoltzGenModel(nn.Module):
         denoising loss is computed. This is the compile-friendly gradient path.
 
         Args:
-            input: Typed model input. ``target_positions`` supplies the training target; ``coords`` is the
-                fallback when it is absent.
+            input: Typed model input; training requires ``target_positions``. ``target_mask`` is the
+                resolved-atom mask for the training objective; the upstream diffusion augmentation is
+                centered over ``atom_mask`` instead.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             generator: Optional PyTorch random generator for the augmentation, noise level, and Gaussian noise.
 
@@ -332,7 +326,7 @@ class BoltzGenModel(nn.Module):
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
         )
-        target = input.coords if input.target_positions is None else input.target_positions
+        target = cast(Tensor, input.target_positions)
         atom_mask = input.atom_mask
         augmented_target = _center_random_augmentation(target, atom_mask, generator=generator)
         sigmas = self.structure_module.noise_distribution(
@@ -375,8 +369,7 @@ class BoltzGenModel(nn.Module):
     ) -> BoltzGenOutput:
         r"""Sample whole-assembly design coordinates (canonical expert operation).
 
-        Thin public wrapper over the parity-passing ``_design`` reverse-diffusion body;
-        the numerics are unchanged. Produces ``pred_coords [B, num_samples, A, 3]`` plus
+        Runs the reverse-diffusion body and produces ``pred_coords [B, num_samples, A, 3]`` plus
         the trunk ``distogram_logits`` and ``bfactor_logits``. Sequence assignment and the
         canonical ``BoltzGenDesignResult`` decoding are owned by ``BoltzGenPipeline``.
 
@@ -426,8 +419,6 @@ class BoltzGenModel(nn.Module):
             generator: Optional PyTorch random generator for diffusion noise.
             step_scale: Optional per-call sampler step-scale override.
             noise_scale: Optional per-call sampler noise-scale override.
-
-        This remains private until a processor can decode it into the canonical design result.
 
         """
 
@@ -496,7 +487,7 @@ class BoltzGenModel(nn.Module):
             method_feature=input.method_feature,
             modified=input.modified,
             cyclic_period=input.cyclic_period,
-            chain_type=input.chain_type,
+            molecule_type=input.molecule_type,
             binding_type=input.binding_type,
             design_mask=input.design_mask,
             ss_type=input.ss_type,
@@ -665,7 +656,7 @@ class BoltzGenIFoldModel(nn.Module):
             method_feature=input.method_feature,
             modified=input.modified,
             cyclic_period=input.cyclic_period,
-            chain_type=input.chain_type,
+            molecule_type=input.molecule_type,
         )
         edge_index, valid_mask, node, edge = self.encoder(input, single_inputs=single_inputs)
         return BoltzGenIFoldOutput(
@@ -683,8 +674,7 @@ class BoltzGenIFoldModel(nn.Module):
     ) -> BoltzGenIFoldOutput:
         r"""Design residue tokens on a fixed backbone (canonical expert operation).
 
-        Thin public wrapper over the parity-passing ``_design`` autoregressive body;
-        the numerics are unchanged. Returns per-token ``logits`` and sampled ``tokens``.
+        Runs the autoregressive body and returns per-token ``logits`` and sampled ``tokens``.
 
         Args:
             input: Typed inverse-fold input from ``BoltzGenIFoldProcessor``.
@@ -741,7 +731,7 @@ class BoltzGenIFoldModel(nn.Module):
             method_feature=input.method_feature,
             modified=input.modified,
             cyclic_period=input.cyclic_period,
-            chain_type=input.chain_type,
+            molecule_type=input.molecule_type,
         )
         edge_index, valid_mask, node, edge = self.encoder(input, single_inputs=single_inputs)
         logits, residue_type = self.decoder.sample(
@@ -888,7 +878,7 @@ class AtomConditionedInputEmbedder(nn.Module):
         method_feature: Tensor | None = None,
         modified: Tensor | None = None,
         cyclic_period: Tensor | None = None,
-        chain_type: Tensor | None = None,
+        molecule_type: Tensor | None = None,
         binding_type: Tensor | None = None,
         design_mask: Tensor | None = None,
         ss_type: Tensor | None = None,
@@ -908,7 +898,7 @@ class AtomConditionedInputEmbedder(nn.Module):
             method_feature: Optional experimental-method ids ``(B, N_token)``.
             modified: Optional modified-residue flags ``(B, N_token)``.
             cyclic_period: Optional cyclic-position periods ``(B, N_token)``.
-            chain_type: Optional molecule-type ids ``(B, N_token)``.
+            molecule_type: Optional molecule-type ids ``(B, N_token)``.
             binding_type: Optional binding-specification ids ``(B, N_token)``.
             design_mask: Optional designable-token mask ``(B, N_token)``.
             ss_type: Optional secondary-structure ids ``(B, N_token)``.
@@ -940,7 +930,7 @@ class AtomConditionedInputEmbedder(nn.Module):
                 cast(Tensor, cyclic_period).clamp(max=1.0).unsqueeze(-1).to(single.dtype)
             )
         if self.molecule_type_embedding is not None:
-            single = single + self.molecule_type_embedding(cast(Tensor, chain_type))
+            single = single + self.molecule_type_embedding(cast(Tensor, molecule_type))
         if self.binding_specification_embedding is not None:
             single = single + self.binding_specification_embedding(cast(Tensor, binding_type))
         if self.design_mask_embedding is not None:
@@ -1082,7 +1072,7 @@ class AtomEncoder(nn.Module):
         mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
         space_id = pad_atoms(reference_space_id)
         uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
-        uid_keys = to_keys(space_id.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).long()
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
         pair_bias = None
@@ -1797,7 +1787,9 @@ class DiffusionConditioning(nn.Module):
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
-            pair_size=pair_size, relative_position_size=pair_size, num_transitions=num_conditioning_transitions
+            pair_size=pair_size,
+            relative_position_size=pair_size,
+            num_transitions=num_conditioning_transitions,
         )
         self.atom_encoder = AtomEncoder(
             atom_feature_size=atom_feature_size,
@@ -1889,55 +1881,6 @@ class DiffusionConditioning(nn.Module):
             "atom_dec_bias": atom_dec_bias,
             "token_trans_bias": token_trans_bias,
         }
-
-
-class PairwiseConditioning(nn.Module):
-    r"""
-    Condition the trunk pair representation with the relative-position encoding.
-
-    Args:
-        pair_size: Width of the pair representation channel.
-        relative_position_size: Width of the relative-position encoding concatenated with the pair.
-        num_transitions: Number of refinement transition layers.
-        transition_expansion: Feed-forward expansion factor of each transition.
-    """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        relative_position_size: int = 128,
-        num_transitions: int = 2,
-        transition_expansion: int = 2,
-    ) -> None:
-        super().__init__()
-        self.init_projection = nn.Sequential(
-            LayerNorm(pair_size + relative_position_size),
-            nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
-        )
-        self.transitions = nn.ModuleList(
-            Transition(pair_size, expansion=transition_expansion) for _ in range(num_transitions)
-        )
-
-    def forward(self, pair_trunk: Tensor, relative_position_encoding: Tensor) -> Tensor:
-        r"""
-        Concatenate trunk pair and relative-position encoding, project to ``pair_size``, then refine via transitions.
-
-        Args:
-            pair_trunk: Trunk pair representation ``(B, N_token, N_token, pair_size)``.
-            relative_position_encoding: Relative-position pair features
-                ``(B, N_token, N_token, relative_position_size)``.
-
-        Returns:
-            Conditioned pair representation ``(B, N_token, N_token, pair_size)``.
-        """
-
-        return condition_pair(
-            pair_trunk,
-            relative_position_encoding,
-            norm=self.init_projection[0],
-            projection=self.init_projection[1],
-            transitions=self.transitions,
-        )
 
 
 class DiffusionScoreModel(nn.Module):
@@ -2377,13 +2320,11 @@ class AtomDiffusion(nn.Module):
 
         coords = sigmas[0] * randn()
         denoised = None
-        # The EDM *step math* matches BoltzGenCoordinateEdmSampler (the shared sampler subclass that injects
-        # BoltzGen's faithful ``noise_scale**2 * sqrt(sigma_hat**2 - sigma_current**2)`` churn factor) plus the
-        # opt-in ``alignment_reverse_diff`` mid-step align. The loop stays in-model for the same three
-        # RNG-load-bearing framing divergences as Boltz-2 -- here with the *dilated* Karras schedule
-        # (sample_schedule_dilated) rather than EdmScheduler, the right-multiply (R^T @ x) augmentation
-        # convention, and torch.randn draws the structure_diffusion_parity harness patches. Genuine structural
-        # divergence in the sampler framing, so it is left separate (Frankenstein principle).
+        # This loop preserves BoltzGen's released
+        # ``noise_scale**2 * sqrt(sigma_hat**2 - sigma_current**2)`` churn factor and the optional
+        # ``alignment_reverse_diff`` mid-step alignment. The sampler also defines the dilated Karras
+        # schedule, right-multiply (R^T @ x) augmentation, and ``torch.randn`` call sites used by the parity
+        # harness, so the complete loop remains here.
         # The fixed Python loop controls denoiser invocation; schedule values stay as tensors so sampling does not
         # synchronize them to the host on every step.
         for index in range(len(sigmas) - 1):
@@ -2498,9 +2439,8 @@ class BFactorHead(nn.Module):
         return self.projection(single)
 
 
-# Scoring heads (Boltz-2 backbone; reused verbatim by BoltzGen). Opt-in, so the design-only generator keeps its
-# base parameter count. Faithful to the OFoldX Boltz-2 confidence/affinity heads (forward-parity-verified
-# against boltz2_conf / boltz2_aff), which are in turn the upstream boltzgen ConfidenceModule / AffinityModule.
+# Scoring heads use the Boltz-2 backbone and are optional, so the design-only generator keeps its
+# base parameter count. They implement the upstream BoltzGen ``ConfidenceModule`` and ``AffinityModule``.
 
 
 def _gather_backbone4(
@@ -2563,8 +2503,8 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
 
 NUM_BOND_TYPES = 6
 
-# const.chain_type_ids = {PROTEIN, DNA, RNA, NONPOLYMER}.
-NUM_CHAIN_TYPES = 4
+# Molecular categories are protein, DNA, RNA, and non-polymer.
+NUM_MOLECULE_TYPES = 4
 
 NUM_RESIDUE_TYPES = 33  # const.num_tokens
 
@@ -2949,8 +2889,8 @@ class InverseFoldingDecoder(nn.Module):
         constraints (``input.aa_constraint_mask`` + call-time ``inverse_fold_restriction``, combined into an additive
         canonical-logit mask via ``_build_constraint_logit_mask``) and, when ``tie_symmetric_sequences`` is set,
         homomer-symmetry tying (logits are averaged across a symmetric group, sampled once, and applied to every
-        copy). Input-side masks (``aa_constraint_mask``, ``symmetric_group``) must be supplied by the caller until
-        the canonical Processor exists.
+        copy). ``BoltzGenIFoldProcessor`` supplies the input-side ``aa_constraint_mask`` and
+        ``symmetric_group`` tensors.
 
         Args:
             node: Packed encoder node states of shape `[num_valid, node_size]`.
@@ -3581,7 +3521,7 @@ class BroadcastGaussianSmearing(nn.Module):
 
 class GaussianSmearing(nn.Module):
     r"""
-    Radial-basis distance featurization (frozen ``offset`` buffer).
+    Radial-basis distance featurization with a registered ``offset`` buffer.
 
     Args:
         start: Lowest RBF center.
@@ -3770,14 +3710,15 @@ class BoltzGenInput:
         type_bonds: Token-level bond type ids.
         contact_conditioning: Pairwise contact-conditioning class one-hot features.
         contact_threshold: Pairwise contact threshold values.
-        chain_type: Chain type ids in the model vocabulary.
+        molecule_type: Molecular category ids in the model vocabulary.
         center_coords: Per-token representative atom coords.
         token_to_bb4_atoms: Per-token ``(N, CA, C, O)`` atom indices.
-        coords: Training or conditioning atom coords.
+        coords: Atom coords used by geometric conditioning features; never a training-label fallback.
         token_distance_mask: Pairwise token-distance conditioning mask.
-        target_positions: Optional experimental atom coords for training.
-        target_mask: Optional experimental-coordinate validity mask.
-        molecule_type: Optional molecule type id per token.
+        target_positions: Experimental atom coords consumed exclusively by the training forward. It is optional
+            on the shared input because ``design`` does not consume a training target.
+        target_mask: Resolved experimental-coordinate mask consumed by the training objective. It is distinct
+            from ``atom_mask`` and does not define the centroid of the upstream rigid augmentation.
         frame_atom_index: Optional frame atom indices for frame-aligned losses.
         frame_mask: Optional frame validity mask.
         method_feature: Optional experimental-method ids.
@@ -3823,14 +3764,13 @@ class BoltzGenInput:
     type_bonds: Tensor
     contact_conditioning: Tensor
     contact_threshold: Tensor
-    chain_type: Tensor
+    molecule_type: Tensor
     center_coords: Tensor
     token_to_bb4_atoms: Tensor
     coords: Tensor
     token_distance_mask: Tensor
     target_positions: Tensor | None = None
     target_mask: Tensor | None = None
-    molecule_type: Tensor | None = None
     frame_atom_index: Tensor | None = None
     frame_mask: Tensor | None = None
     method_feature: Tensor | None = None
@@ -3853,9 +3793,8 @@ class BoltzGenInput:
     binding_type: Tensor | None = None
     design_mask: Tensor | None = None
     ss_type: Tensor | None = None
-    # Additive, backward-compatible: the canonical identity layout populated by
-    # ``BoltzGenProcessor`` and read by ``BoltzGenPipeline`` when it decodes rows back into
-    # molecular identities. Ignored by the model graph. See ``BoltzGenLayout`` below.
+    # Canonical identity layout used by ``BoltzGenPipeline`` to decode tensor rows back
+    # into molecular identities. The model graph does not consume it.
     layout: BoltzGenLayout | None = None
 
 
@@ -3876,7 +3815,7 @@ class BoltzGenIFoldInput:
     deletion_mean: Tensor
     token_bonds: Tensor
     type_bonds: Tensor
-    chain_type: Tensor
+    molecule_type: Tensor
     center_coords: Tensor
     token_to_bb4_atoms: Tensor
     coords: Tensor
@@ -3886,14 +3825,13 @@ class BoltzGenIFoldInput:
     design_mask: Tensor | None = None
     aa_constraint_mask: Tensor | None = None
     symmetric_group: Tensor | None = None
-    # Additive, backward-compatible: the canonical identity layout populated by
-    # ``BoltzGenIFoldProcessor`` and read by ``BoltzGenPipeline``. Ignored by the model
-    # graph. See ``BoltzGenIFoldLayout`` below.
+    # Canonical identity layout used by ``BoltzGenPipeline`` to decode inverse-folding
+    # tensor rows. The model graph does not consume it.
     layout: BoltzGenIFoldLayout | None = None
 
 
 # ---------------------------------------------------------------------------
-# Canonical identity layouts (folded in from the former ``contract.py``).
+# Canonical identity layouts.
 #
 # These are the non-tensor leaves the design/inverse-fold Processors populate and
 # the design Pipeline reads when it decodes tensor rows back into canonical molecular
@@ -3909,10 +3847,9 @@ class BoltzGenLayout:
     minted rows), so ``output_residues[i]`` names token row ``i`` as either an
     existing canonical [`ComponentReference`][ofoldx.data.molecular.ComponentReference]
     or one symbolic generated residue
-    ([`SymbolicResidueSite`][ofoldx.models.boltzgen.model.SymbolicResidueSite]).
-    The symbolic rows follow the RFdiffusion pattern (§3.7 owner-gated): the shared
-    PlacementSpec / placement_map core stays unresolved, so these are family-local
-    provisional identities, not a frozen public placement contract.
+    ([`SymbolicResidueSite`][ofoldx.data.placement.SymbolicResidueSite]).
+    Symbolic rows use the shared PlacementSpec reference vocabulary and resolve through
+    ``placement_map`` before canonical output structures are constructed.
 
     Attributes:
         system: The canonical molecular system the tensor batch was lowered from
@@ -3923,7 +3860,7 @@ class BoltzGenLayout:
         output_residues: Per-token canonical identity (existing residue or symbolic generated residue).
         output_instance_ids: Per-token owning instance id (explicit because generated rows have no
             canonical instance until the placement core resolves).
-        placement_map: Frozen §3.7 realized output surface for a whole-assembly ``total_len``
+        placement_map: Realized output surface for a whole-assembly ``total_len``
             generation (``declaration_group -> placement_id -> ordered ComponentReference
             occurrences``). Empty for an existing-input design that generates no topology.
         instance_of: The derived ``placement_id -> declaration_group`` index (built once from the
@@ -3963,31 +3900,18 @@ class BoltzGenIFoldLayout:
 
 
 @dataclass(frozen=True)
-class SymbolicResidueSite:
-    r"""A pre-realization reference to one generated residue by segment and offset.
-
-    §3.7 owner-gated family-local placeholder (RFdiffusion spelling). Used only to
-    name rows of a fully-generated ``total_len`` assembly before the shared
-    placement core resolves; NOT a frozen public shape.
-    """
-
-    segment_id: str
-    offset: int
-
-
-@dataclass(frozen=True)
 class BoltzGenPlacements:
-    r"""One BoltzGen whole-assembly generation-topology request (frozen §3.7 core, X1-B).
+    r"""One BoltzGen whole-assembly generation-topology request.
 
-    ``placements`` is the frozen core :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``placements`` is a :data:`~ofoldx.data.placement.PlacementSpec` mapping
     ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
-    unique across the whole mapping and is the SOLE pre-realization reference target
-    (validated at construction). Unlike ODesign — which declares one group **per output
+    unique across the whole mapping and is the sole pre-realization reference target;
+    ``__post_init__`` validates this invariant. Unlike ODesign — which declares one group **per output
     chain** — a BoltzGen assembly is ONE declaration group whose inner placements are its
     chains, so the outer group key is a pure whole-assembly grouping label that no reference
-    names (frozen §3.7 "BoltzGen whole-assembly handling (X1-B)").
+    names.
 
-    Per-chain lengths are drawn at realization from the family-owned whole-assembly
+    Per-chain lengths are drawn at realization from BoltzGen's whole-assembly
     ``total_len`` budget (the shared core carries no total-length field), so a ranged
     :class:`~ofoldx.data.placement.GeneratedSegment` (``min_length != max_length``) is resolved
     against ``total_len`` rather than fixed on the core. ``total_len is None`` realizes every
@@ -3997,8 +3921,7 @@ class BoltzGenPlacements:
     placements: PlacementSpec
 
     def __post_init__(self) -> None:
-        # Frozen §3.7: a placement_id must be globally unique across the whole PlacementSpec; this is
-        # the construction-time uniqueness check (raises ValueError on any duplicate).
+        # Every placement_id must be globally unique across the whole PlacementSpec.
         validate_placement(self.placements)
 
 
@@ -4017,12 +3940,11 @@ class BoltzGenDesignMask:
 class BoltzGenBinding:
     r"""Binding-specification conditioning → ``binding_type`` ids.
 
-    ``binding`` is the frozen §3.7.4 shared :class:`~ofoldx.data.conditions.Hotspot` — the
-    distance-free per-residue POSITIVE binding label (owner verdict D3: BoltzGen ``binding`` is
-    the canonical hotspot analog). ``not_binding`` is the BoltzGen-owned NEGATIVE signed label
-    (embedding id 2) that has no analog in the other families, so — like ``kind`` on
-    :class:`BoltzGenContact` — it stays on this family envelope rather than on the shared
-    ``Hotspot`` core. Realized as the released binding-specification embedding ids
+    ``binding`` is the shared :class:`~ofoldx.data.conditions.Hotspot`: a distance-free,
+    per-residue positive binding label. ``not_binding`` is the BoltzGen-specific negative label
+    (embedding id 2) that has no analog in the shared input types, so it remains on
+    :class:`BoltzGenBinding` rather than on the shared ``Hotspot`` core. Realized as the released
+    binding-specification embedding ids
     (0 = unspecified, 1 = binding, 2 = not-binding).
     """
 
@@ -4046,15 +3968,12 @@ class BoltzGenSecondaryStructure:
 class BoltzGenStructureGroup:
     r"""One structure group → per-token ``structure_group`` → ``token_distance_mask``.
 
-    §3.7 family-owned (not fixed coordinates): geometry is exposed only *within* the
+    Geometry is exposed only *within* the
     same **nonzero** group and distinct groups move independently. Realized through the
     per-token ``structure_group`` id and its pairwise ``token_distance_mask``, never by
-    writing absolute coordinates; ``reference_space_id`` stays per-residue (the released
-    featurizer does NOT regroup it). ``group_id == 0`` is the free (ungrouped) class.
-    Ratified/frozen under the §3.7.2 family-owned spatial-conditioning contract,
-    validated exact-equal to the released featurizer (``process_token_features``,
-    2026-07-19); see the Processor lowering (``_structure_group_ids`` /
-    ``_token_distance_mask``).
+    writing absolute coordinates; ``reference_space_id`` stays per-residue because the released
+    featurizer does not regroup it. ``group_id == 0`` is the free (ungrouped) class. See the
+    Processor lowering in ``_structure_group_ids`` and ``_token_distance_mask``.
     """
 
     members: tuple[ComponentReference, ...]
@@ -4078,16 +3997,15 @@ class BoltzGenResidueConstraint:
 class BoltzGenContact:
     r"""A pairwise contact declaration → ``contact_conditioning`` / ``contact_threshold``.
 
-    ``contact`` is the frozen §3.7.4 shared two-sided geometric
-    :class:`~ofoldx.data.conditions.Contact`; its ``side_a`` / ``side_b`` name the two
-    contacting endpoint sets and its ``cutoff_angstrom`` is the contact distance cutoff used by
-    the released contact-conditioning encoder (BoltzGen writes it as the ``contact_threshold``
-    matrix). ``kind`` is the BoltzGen-owned released directed contact CLASS
-    (``pocket>binder`` / ``binder>pocket`` / ``contact``); directionality is a family-owned
-    extension that stays OFF the symmetric shared core and rides on this envelope.
+    ``side_a`` and ``side_b`` retain order because BoltzGen has directional
+    ``pocket>binder`` and ``binder>pocket`` classes. A shared
+    :class:`~ofoldx.data.conditions.Contact` is deliberately not wrapped here: that record is
+    symmetric, while swapping these sides changes a directional BoltzGen condition.
     """
 
-    contact: Contact
+    side_a: tuple[Endpoint, ...]
+    side_b: tuple[Endpoint, ...]
+    cutoff_angstrom: float
     kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
 
 
@@ -4095,16 +4013,15 @@ class BoltzGenContact:
 class BoltzGenCovalentBond:
     r"""A requested covalent link → derived ``cyclic_period`` (envelope over ``SymbolicBond``).
 
-    ``bond`` is the frozen §3.7.4 shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
+    ``bond`` is a shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
     may be EXISTING input atoms (:class:`~ofoldx.data.molecular.AtomSite`) or GENERATED atoms
-    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the frozen placement
+    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the placement
     core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
     :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
     released head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
-    input system already carried (this family declares NO physical topology beyond that — a
-    non-terminal link simply surfaces as a token bond). ``intent`` is the BoltzGen-owned
-    hard/soft label kept OFF the shared bond core, per owner verdict (no ``intent`` on
-    ``SymbolicBond``).
+    input system already carried. The request declares no additional physical topology; a
+    non-terminal link simply surfaces as a token bond. ``intent`` is a BoltzGen-specific hard/soft
+    label and is not stored on the shared ``SymbolicBond``.
     """
 
     bond: SymbolicBond
@@ -4125,11 +4042,10 @@ class BoltzGenSymmetry:
 
 # The ``conditions=`` parameter type on ``BoltzGenProcessor`` (structure design). The
 # inverse-fold Processor consumes ``BoltzGenResidueConstraint`` / ``BoltzGenSymmetry``
-# through their own dedicated keyword arguments, not this union. ``BoltzGenPlacements`` carries
-# the frozen §3.7 whole-assembly generation topology (X1-B) alongside the spatial records.
+# through their own dedicated keyword arguments, not this union. Generation topology is the
+# Processor and Pipeline's separate ``placement`` argument.
 BoltzGenSchema = (
-    BoltzGenPlacements
-    | BoltzGenDesignMask
+    BoltzGenDesignMask
     | BoltzGenBinding
     | BoltzGenSecondaryStructure
     | BoltzGenStructureGroup
@@ -4149,13 +4065,13 @@ def symbolic_residue_aliases(
     the shared placement core resolves.
     """
 
-    segments: dict[str, list[SymbolicResidueSite]] = {}
+    placements: dict[str, list[SymbolicResidueSite]] = {}
     for reference in references:
-        if type(reference) is SymbolicResidueSite:
-            segments.setdefault(reference.segment_id, []).append(reference)
+        if isinstance(reference, SymbolicResidueSite):
+            placements.setdefault(reference.placement_id, []).append(reference)
     return {
-        SymbolicResidueSite(segment_id, index - len(rows)): reference
-        for segment_id, rows in segments.items()
+        SymbolicResidueSite(placement_id, index - len(rows)): reference
+        for placement_id, rows in placements.items()
         for index, reference in enumerate(rows)
     }
 
@@ -4166,7 +4082,7 @@ class BoltzGenDesignCandidate:
 
     Each candidate owns the complete ``Structure`` of the designed assembly. The
     assembly length varies across candidates, which is the coordinate-producing,
-    variable-length property that forbids reuse of the frozen fixed-length
+    variable-length property that prevents reuse of the fixed-length
     ``DesignCandidate``.
 
     Attributes:

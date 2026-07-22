@@ -47,7 +47,7 @@ def convert_deepmind_multimer_checkpoint(
     r"""Convert official AlphaFold-Multimer parameters into a strict-loaded native model."""
 
     converted = convert_official_multimer_state_dict(params, dtype=dtype)
-    model_config = AlphaFold2MultimerConfig(_multimer_config_overrides(model_name))
+    model_config = AlphaFold2MultimerConfig(_multimer_config_overrides())
     with torch.device("meta"):
         model = AlphaFold2MultimerModel(model_config)
     model.load_state_dict(converted, strict=True, assign=True)
@@ -203,7 +203,7 @@ def normalize_multimer_param_key(key: str) -> str:
     return normalized
 
 
-def _multimer_config_overrides(model_name: str) -> dict[str, object]:
+def _multimer_config_overrides() -> dict[str, object]:
     r"""AF-Multimer v3 always carries templates and the interface-TM head."""
 
     return {

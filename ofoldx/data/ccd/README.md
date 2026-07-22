@@ -38,8 +38,9 @@ tuple, and polymer attachments only for polymer components.
 
 The CCD is distributed as a Hub **`dataset`** repository, `ofoldx/ccd`, stored as
 Parquet with **one component per row**. The resolver downloads it through the same
-`huggingface_hub.snapshot_download` mechanism `ofoldx.hub` uses for model
-repositories (here with `repo_type="dataset"` and `allow_patterns=["*.parquet"]`).
+`huggingface_hub.snapshot_download` mechanism used by
+`ofoldx._repository.resolve_repository` for model repositories (here with
+`repo_type="dataset"` and `allow_patterns=["*.parquet"]`).
 
 **Revision = wwPDB snapshot date.** Each dataset revision corresponds to one wwPDB
 CCD snapshot; passing that date as `revision` fixes exact provenance.
@@ -55,13 +56,13 @@ Each row is one component. List-valued columns for atoms are all aligned to
 | `chem_type` | `str` | `protein` / `rna` / `dna` / `dna_rna_hybrid` / `non-polymer`. Determines whether polymer attachments apply. |
 | `atom_ids` | `list[str]` | Component-local atom IDs, in canonical order. |
 | `elements` | `list[str]` | Element symbol per atom. |
-| `formal_charges` | `list[int]` | Formal charge per atom. |
-| `aromatic` | `list[bool]` | Aromatic flag per atom. |
+| `formal_charges` | `list[int \| None]` | Formal charge per atom; `None` when the CCD source is unspecified. |
+| `aromatic` | `list[bool \| None]` | Aromatic flag per atom; `None` when incident bond aromaticity is unspecified. |
 | `stereo` | `list[str \| None]` | Per-atom stereo config (`R`/`S`/…), `None` when unspecified. |
 | `bond_atom_a` | `list[str]` | First endpoint atom ID per bond. |
 | `bond_atom_b` | `list[str]` | Second endpoint atom ID per bond. |
-| `bond_orders` | `list[float]` | Bond order per bond (`1.0`, `1.5` aromatic, `2.0`, `3.0`). |
-| `bond_aromatic` | `list[bool]` | Aromatic flag per bond. |
+| `bond_orders` | `list[float \| None]` | Bond order per bond (`1.0`, `1.5` aromatic, `2.0`, `3.0`); `None` when unspecified. |
+| `bond_aromatic` | `list[bool \| None]` | Aromatic flag per bond; `None` when unspecified. |
 | `bond_stereo` | `list[str \| None]` | Per-bond stereo config, `None` when unspecified. |
 | `ref_coords` | `list[[float,float,float] \| None]` | Ideal reference coordinate per atom (aligned to `atom_ids`); `None` where absent. |
 | `previous_attachment_atom` | `str \| None` | Polymer previous-link anchor atom (e.g. protein `N`, nucleic `P`). |
@@ -74,14 +75,13 @@ resolver omits polymer attachments.
 
 ## Building the dataset
 
-`build.py` is the offline converter stub: wwPDB `components.cif` (optionally
+`build.py` is the offline converter: wwPDB `components.cif` (optionally
 gzipped) → the Parquet rows above. Its parse follows the reference generator
 `alphafold3/constants/converters/ccd_pickle_gen.py` (read the multi-data mmCIF,
 split into one dict per `data_` block), and the field lowering mirrors
 `alphafold3/structure/chemical_components.py` (`parse_atom_data` /
-`parse_bond_data`). `row_from_block` performs the complete field mapping; the
-mmCIF read and Parquet write are left as explicit `NotImplementedError`
-boundaries so the module carries no heavy parser/writer dependency.
+`parse_bond_data`). The mmCIF and Parquet dependencies are imported lazily by the
+build entry points.
 
 `build.py` is a build-time tool only — it is never imported during modeling and
 never runs during tensor compute.

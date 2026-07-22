@@ -34,7 +34,7 @@ class TriangleAttention(nn.Module):
             ``1.0`` to open the gate near init).
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
             to the ``sdpa`` reference otherwise. A bias-free module on the ``oops`` backend uses the
-            dedicated flash ``triangle_attention`` kernel.
+            dedicated OOps-owned ``triangle_attention`` implementation.
 
     Examples:
         >>> import torch
@@ -66,7 +66,7 @@ class TriangleAttention(nn.Module):
         # *pre-transpose* pair, whereas the OpenFold-style ending node (this module, fed the already
         # transposed pair by the caller) derives it from the transposed pair. When ``transpose_bias``
         # is set, the bias is taken from the other orientation so the two conventions agree. Defaults
-        # off to preserve the OpenFold behaviour other model families depend on.
+        # off to preserve the OpenFold behaviour used by other model implementations.
         self.transpose_bias = transpose_bias
         self.attention = GatedMultiheadAttention(
             pair_size,
@@ -193,10 +193,6 @@ class TriangleMultiplication(nn.Module):
 
         Returns:
             Updated pair representation `[..., N, N, pair_size]`.
-
-        Raises:
-            OOpsUnsupportedError: If ``operator_backend="oops"`` and ``pair`` / ``pair_mask`` are not CUDA
-                tensors (the fused ``triangle_multiplication`` kernel is CUDA-only).
 
         Examples:
             >>> import torch

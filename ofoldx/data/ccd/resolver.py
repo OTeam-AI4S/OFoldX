@@ -1,30 +1,14 @@
-r"""Import-time resolver from a Hub CCD dataset row to a `ChemicalComponent`.
+r"""Lower a Hub CCD dataset row to a :class:`ChemicalComponent`.
 
-This resolver is the boundary-time counterpart to
-`ofoldx.data.components.get_component`. `get_component` is audited-only and does
-zero I/O (Principle 7): it only ever returns one of the package-audited standard
-components and never guesses a graph from a residue name. `resolve_ccd_component`
-is the opposite tool for a different job — a family that folds arbitrary CCD-code
-ligands calls it once, at its importer / Processor boundary, to fetch the wwPDB
-CCD snapshot and lower one component row into a canonical `ChemicalComponent`
-VALUE. The family then embeds the returned values in its `MolecularSystem`;
-nothing here runs during tensor compute, and there is no live registry lookup.
-
-The lowering here mirrors `ofoldx.data.components._build_protein_component` and
-`_build_nucleic_component`: the same `ChemicalAtom` / `ChemicalBond` /
-`PolymerAttachment` value shape, per-atom `reference_coordinates` aligned to the
-atom tuple, and polymer attachments only for polymer components.
-
-The CCD is a Hub `dataset` repository (`ofoldx/ccd`), Parquet, one component per
-row, with `revision` pinned to the wwPDB snapshot date. See `README.md` for the
-exact row schema and `build.py` for the wwPDB `components.cif` converter.
+The dataset stores one component per Parquet row. ``revision`` pins the wwPDB
+snapshot used for resolution.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from ..components import _component_from_raw
+from ..components import component_from_rows
 from ..molecular import (
     ChemicalComponent,
     PolymerAttachment,
@@ -37,16 +21,11 @@ _POLYMER_CHEM_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
 def resolve_ccd_component(component_id: str, *, revision: str) -> ChemicalComponent:
-    r"""Fetch and lower one wwPDB CCD component to a canonical value.
+    r"""Fetch and lower one wwPDB CCD component.
 
-    ``component_id`` is an exact wwPDB CCD code (for example ``"HEM"`` or
-    ``"ATP"``). ``revision`` is the wwPDB snapshot date that pins the Hub dataset
-    commit, so the returned value is reproducible and provenance-tagged.
-
-    This performs network / disk I/O and is therefore an import-time (boundary)
-    operation only. Call it once while building a `MolecularSystem` and embed the
-    returned value; never call it during tensor compute. Unknown ``component_id``
-    raises `KeyError`; a malformed row raises `ValueError` or `TypeError`.
+    ``component_id`` is an exact CCD code and ``revision`` pins the Hub snapshot.
+    Unknown IDs raise ``KeyError``; malformed rows raise ``ValueError`` or
+    ``TypeError``.
     """
 
     snapshot = _resolve_ccd_snapshot(revision=revision)
@@ -57,13 +36,7 @@ def resolve_ccd_component(component_id: str, *, revision: str) -> ChemicalCompon
 
 
 def _resolve_ccd_snapshot(*, revision: str) -> Path:
-    r"""Download the pinned CCD dataset snapshot, reusing the hub mechanism.
-
-    This reuses the same `huggingface_hub.snapshot_download` mechanism that
-    `ofoldx.hub` uses for model repositories, but targets a ``dataset`` repo and
-    restricts the download to Parquet shards. ``revision`` pins the exact wwPDB
-    snapshot commit.
-    """
+    r"""Download the pinned CCD dataset's Parquet shards."""
 
     from huggingface_hub import snapshot_download
 
@@ -78,41 +51,29 @@ def _resolve_ccd_snapshot(*, revision: str) -> Path:
 
 
 def _read_component_row(snapshot: Path, component_id: str) -> dict[str, object] | None:
-    r"""Return the single Parquet row for ``component_id`` as a plain dict.
+    r"""Return the unique Parquet row for ``component_id``, or ``None``."""
 
-    One component per row: the first shard that contains the code wins, and a code
-    absent from every shard yields ``None``. Reading uses ``pyarrow`` lazily so no
-    tensor or array dependency is imported.
-    """
+    import pyarrow.dataset as ds
 
-    import pyarrow.parquet as pq
-    from pyarrow import compute
-
-    for shard in sorted(snapshot.glob("*.parquet")):
-        table = pq.read_table(shard)
-        mask = compute.equal(table.column("component_id"), component_id)
-        selected = table.filter(mask)
-        if selected.num_rows == 0:
-            continue
-        if selected.num_rows != 1:
-            raise ValueError(f"CCD component {component_id!r} occurs in {selected.num_rows} rows")
-        return {name: column[0].as_py() for name, column in zip(selected.column_names, selected.columns)}
-    return None
+    shards = sorted(snapshot.glob("*.parquet"))
+    if not shards:
+        return None
+    selected = ds.dataset(shards, format="parquet").to_table(filter=ds.field("component_id") == component_id)
+    if selected.num_rows == 0:
+        return None
+    if selected.num_rows != 1:
+        raise ValueError(f"CCD component {component_id!r} occurs in {selected.num_rows} rows")
+    return {name: column[0].as_py() for name, column in zip(selected.column_names, selected.columns)}
 
 
 def _lower_row(row: dict[str, object]) -> ChemicalComponent:
-    r"""Lower one CCD Parquet row to a `ChemicalComponent` value.
-
-    Mirrors the value shape produced by
-    `ofoldx.data.components._build_protein_component` /
-    `_build_nucleic_component`.
-    """
+    r"""Lower one CCD Parquet row to a :class:`ChemicalComponent`."""
 
     component_id = _require_str(row, "component_id")
     atom_ids = _require_str_list(row, "atom_ids")
     elements = _require_str_list(row, "elements")
-    formal_charges = _require_int_list(row, "formal_charges")
-    aromatic = _require_bool_list(row, "aromatic")
+    formal_charges = _require_optional_int_list(row, "formal_charges")
+    aromatic = _require_optional_bool_list(row, "aromatic")
     stereo = _require_optional_str_list(row, "stereo")
 
     count = len(atom_ids)
@@ -138,7 +99,7 @@ def _lower_row(row: dict[str, object]) -> ChemicalComponent:
         previous_attachment = None
         next_attachment = None
 
-    return _component_from_raw(
+    return component_from_rows(
         component_id,
         atom_rows,
         bond_rows,
@@ -156,8 +117,8 @@ def _lower_bond_rows(
 
     atom_a = _require_str_list(row, "bond_atom_a")
     atom_b = _require_str_list(row, "bond_atom_b")
-    orders = _require_float_list(row, "bond_orders")
-    aromatic = _require_bool_list(row, "bond_aromatic")
+    orders = _require_optional_float_list(row, "bond_orders")
+    aromatic = _require_optional_bool_list(row, "bond_aromatic")
     stereo = _require_optional_str_list(row, "bond_stereo")
 
     count = len(atom_a)
@@ -170,7 +131,16 @@ def _lower_bond_rows(
         if len(values) != count:
             raise ValueError(f"CCD row {component_id!r} bond field {name!r} misaligns with bond_atom_a")
 
-    return list(zip(atom_a, atom_b, orders, aromatic, stereo))
+    result: list[tuple[str, str, float, bool, str | None]] = []
+    for index, (first, second, order, is_aromatic, bond_stereo) in enumerate(
+        zip(atom_a, atom_b, orders, aromatic, stereo)
+    ):
+        if order is None:
+            raise ValueError(f"CCD row {component_id!r} bond {index} has no bond order")
+        if is_aromatic is None:
+            raise ValueError(f"CCD row {component_id!r} bond {index} has no aromaticity flag")
+        result.append((first, second, order, is_aromatic, bond_stereo))
+    return result
 
 
 def _lower_reference_coordinates(
@@ -248,29 +218,38 @@ def _require_str_list(row: dict[str, object], name: str) -> list[str]:
     return [_as_str(value) for value in _require_list(row, name)]
 
 
-def _require_int_list(row: dict[str, object], name: str) -> list[int]:
-    result: list[int] = []
+def _require_optional_int_list(row: dict[str, object], name: str) -> list[int | None]:
+    result: list[int | None] = []
     for value in _require_list(row, name):
+        if value is None:
+            result.append(None)
+            continue
         if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"CCD row field {name!r} must contain integers")
+            raise TypeError(f"CCD row field {name!r} must contain integers or None")
         result.append(value)
     return result
 
 
-def _require_float_list(row: dict[str, object], name: str) -> list[float]:
-    result: list[float] = []
+def _require_optional_float_list(row: dict[str, object], name: str) -> list[float | None]:
+    result: list[float | None] = []
     for value in _require_list(row, name):
+        if value is None:
+            result.append(None)
+            continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError(f"CCD row field {name!r} must contain numbers")
+            raise TypeError(f"CCD row field {name!r} must contain numbers or None")
         result.append(float(value))
     return result
 
 
-def _require_bool_list(row: dict[str, object], name: str) -> list[bool]:
-    result: list[bool] = []
+def _require_optional_bool_list(row: dict[str, object], name: str) -> list[bool | None]:
+    result: list[bool | None] = []
     for value in _require_list(row, name):
+        if value is None:
+            result.append(None)
+            continue
         if not isinstance(value, bool):
-            raise TypeError(f"CCD row field {name!r} must contain booleans")
+            raise TypeError(f"CCD row field {name!r} must contain booleans or None")
         result.append(value)
     return result
 

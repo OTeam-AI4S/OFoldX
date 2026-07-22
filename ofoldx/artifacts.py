@@ -3,18 +3,51 @@ r"""Write standard OFoldX model repositories."""
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
+from typing import Protocol, cast
 
-from torch import nn
+import torch
 
 from .models.registry import MODELS
+
+
+class SaveableModel(Protocol):
+    r"""Model capabilities required by the repository writer and paired Pipelines."""
+
+    @property
+    def config(self) -> Mapping[str, object]: ...
+
+    def state_dict(self) -> dict[str, torch.Tensor]: ...
+
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> object: ...
+
+
+class SaveableProcessor(Protocol):
+    r"""Configured Processor state written to ``processor.json``."""
+
+    @property
+    def config(self) -> Mapping[str, object]: ...
+
+
+def _config_json(config: Mapping[str, object], *, architecture: str | None = None) -> str:
+    values = dict(config)
+    if "architecture" in values:
+        raise ValueError("Config must not contain repository architecture metadata")
+    if architecture is not None:
+        values["architecture"] = architecture
+    return json.dumps(values, indent=2, sort_keys=True, allow_nan=False) + "\n"
 
 
 def save_model(
     directory: str | PathLike[str],
     *,
-    model: nn.Module,
+    model: SaveableModel,
     processor: object,
     max_shard_size: int | str = "5GB",
     repo_id: str | None = None,
@@ -25,28 +58,19 @@ def save_model(
     r"""Write one registered Model/Processor repository, and optionally publish it.
 
     Saving is local-only by default. When ``repo_id`` is given, the fully written and
-    validated repository is uploaded to that Hugging Face Hub repo via
-    [`ofoldx.hub`][ofoldx.hub]. Nothing is published unless a caller passes an explicit
-    ``repo_id``; ``token`` (or the ambient Hugging Face credential) supplies authentication.
-    No organization or token is assumed.
+    validated repository is uploaded to that Hugging Face Hub repo. Nothing is published
+    unless a caller passes an explicit ``repo_id``; ``token`` (or the ambient Hugging Face
+    credential) supplies authentication. No organization or token is assumed.
     """
 
     from huggingface_hub import save_torch_state_dict
 
     registration = MODELS.for_pair(model, processor)
-    model_values = dict(model.config)  # type: ignore[attr-defined]
-    if "architecture" in model_values:
-        raise ValueError("Model config must not contain architecture")
-    model_values["architecture"] = registration.id
-
-    model_json = json.dumps(model_values, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    config_class = getattr(registration.processor, "config_class", None)
+    model_json = _config_json(model.config, architecture=registration.id)
+    processor_config = registration.processor_config
     processor_json = None
-    if config_class is not None:
-        processor_values = dict(processor.config)  # type: ignore[attr-defined]
-        if "architecture" in processor_values:
-            raise ValueError("Processor config must not contain architecture")
-        processor_json = json.dumps(processor_values, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if processor_config is not None:
+        processor_json = _config_json(cast(SaveableProcessor, processor).config)
 
     destination = Path(directory).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
@@ -95,9 +119,9 @@ def save_model(
         raise RuntimeError("safetensors elided model state-dict keys; the repository cannot be round-tripped")
 
     if repo_id is not None:
-        from .hub import _upload_repository
+        from ._repository import upload_repository
 
-        _upload_repository(
+        upload_repository(
             destination,
             repo_id,
             token=token,

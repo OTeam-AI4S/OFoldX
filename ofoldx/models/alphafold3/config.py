@@ -48,6 +48,7 @@ class AlphaFold3Config(Config):
         single_size: Width of the single (token) representation.
         pair_size: Width of the pair representation.
         recycling_steps: Number of trunk recycling passes.
+        rank_metric_eps: Denominator epsilon for the contact-weighted PAE ranking metric.
 
     Examples:
         >>> config = AlphaFold3Config()
@@ -79,3 +80,4 @@ class AlphaFold3Config(Config):
     denoiser: DenoiserConfig = DenoiserConfig()
     sampler: SamplerConfig = SamplerConfig()
     recycling_steps: int = 4
+    rank_metric_eps: float = 1e-6

@@ -49,10 +49,6 @@ class ConfidenceConfig(Config):
         num_triangle_attention_heads: Number of triangle-attention heads.
         expansion: Feed-forward expansion factor inside the Pairformer transition.
         pairformer_dropout: Dropout probability applied inside the confidence Pairformer.
-        rank_metric_eps: Denominator epsilon for the contact-weighted PAE ranking metric
-            ``-(pae * contact).sum() / (contact.sum() + rank_metric_eps)`` (DeepMind AF3 ``rank_metric``,
-            upstream ``1e-6``). Only consumed by the AF3 ranking reduction; unused by families without a
-            contact-weighted rank metric.
 
     Examples:
         >>> config = ConfidenceConfig()
@@ -76,7 +72,6 @@ class ConfidenceConfig(Config):
     num_triangle_attention_heads: int = 4
     expansion: int = 4
     pairformer_dropout: float = 0.0
-    rank_metric_eps: float = 1e-6
 
 
 class TrunkConfig(Config):

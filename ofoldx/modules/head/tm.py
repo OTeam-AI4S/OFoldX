@@ -2,9 +2,9 @@ r"""
 Predicted-TM (pTM / ipTM) inner kernel.
 
 The length-dependent TM-score normalization ``d0(n)`` and the per-bin TM-score weight
-``1 / (1 + (d / d0)^2)`` are bit-for-bit identical across every structure-model family
-(AlphaFold2, AlphaFold3, Protenix, Boltz-1, Boltz-2). Only the *outer* reductions differ and stay
-family-owned: which token pairs enter each average, which token count feeds ``d0`` (AF3 uses a
+``1 / (1 + (d / d0)^2)`` are bit-for-bit identical across the AlphaFold2, AlphaFold3,
+Protenix, Boltz-1, and Boltz-2 implementations. Only the *outer* reductions differ and stay
+with each caller: which token pairs enter each average, which token count feeds ``d0`` (AF3 uses a
 per-pair interface count, Boltz/AF2 a global count, Protenix per-chain-pair sub-blocks), the
 ligand/protein interface masks, and how the row/frame max is taken. This module owns just the
 shared inner kernel those reductions call.
@@ -79,7 +79,7 @@ def tm_weight_from_pae(pae_logits: Tensor, num_tokens: Tensor | float, *, bin_ce
     r"""
     Full inner kernel: softmax ``pae_logits`` over bins, weight by :func:`tm_bin_weights`, and sum.
 
-    Uses a plain ``softmax(-1)``. Families that upcast to float around the softmax or reuse a
+    Uses a plain ``softmax(-1)``. Callers that upcast to float around the softmax or reuse a
     pre-decoded probability tensor call :func:`tm_bin_weights` directly on their own distribution
     instead of this convenience wrapper.
 

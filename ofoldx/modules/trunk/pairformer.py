@@ -36,6 +36,8 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
         expansion: Feed-forward expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
+        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
+            pre-transpose pair (the DeepMind AlphaFold 3 convention).
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -63,6 +65,7 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
+        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -78,6 +81,7 @@ class PairformerStack(nn.Module):
                     num_pair_attention_heads=num_pair_attention_heads,
                     expansion=expansion,
                     dropout=dropout,
+                    ending_node_transpose_bias=ending_node_transpose_bias,
                     operator_backend=operator_backend,
                 )
                 for _ in range(num_blocks)
@@ -142,6 +146,8 @@ class PairformerBlock(nn.Module):
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
         expansion: Feed-forward expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
+        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
+            pre-transpose pair (the DeepMind AlphaFold 3 convention).
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -167,6 +173,7 @@ class PairformerBlock(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
+        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -192,6 +199,7 @@ class PairformerBlock(nn.Module):
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
+            transpose_bias=ending_node_transpose_bias,
             operator_backend=operator_backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)

@@ -1,10 +1,9 @@
 r"""Fixtures for the public task-API surface (registry, pipelines, repository round-trip).
 
 The registrations these tests exercise live in the registry objects
-(``ofoldx.models.registry.MODELS`` and ``ofoldx.pipelines.registry.PIPELINES``, both ``dict``
-subclasses). A test that
+(``ofoldx.models.registry.MODELS`` and ``ofoldx.pipelines.registry.PIPELINES``). A test that
 registers a synthetic architecture would otherwise leak it into every later test in the process, so
-``_isolate_registries`` snapshots and restores those dicts around each test -- exactly the pattern the
+``_isolate_registries`` snapshots and restores those mappings around each test -- exactly the pattern the
 suite already uses for the global RNG in ``tests/conftest.py``.
 
 The synthetic Model/Processor pair is deliberately tiny: one real ``nn.Parameter`` so the safetensors
@@ -57,14 +56,13 @@ def _build_tiny_classes():
     class TinyProcessor:
         r"""A config-less Processor that yields a one-tensor carrier."""
 
-        config_class = None
-
         def __init__(self, *, device=None, dtype=None):
             self.device = device
             self.dtype = dtype
+            self.received = None
 
         def __call__(self, input, **kwargs):
-            # A single tensor is enough for ``inputs_device`` to read placement off the carrier.
+            self.received = kwargs
             return {"x": torch.zeros(1)}
 
         def to(self, device=None, dtype=None):

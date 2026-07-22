@@ -12,7 +12,6 @@ from .data.molecular import MolecularSystem, PolymerSequence
 from .data.structure import Structure
 from .pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
 from .results import (
-    AffinityResult,
     DesignCandidate,
     DesignResult,
     FoldPrediction,

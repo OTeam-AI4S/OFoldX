@@ -9,8 +9,7 @@ import numpy as np
 import torch
 from typing_extensions import Self
 
-from ...data import is_water_component
-from ...data import residue_constants as rc
+from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
 from ...data.components import get_component
 from ...data.molecular import (
     AtomSite,
@@ -22,21 +21,19 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io import read_pdb
-from ...io.pdb import ATOMIC_NUMBER_BY_ELEMENT
+from ...modules import residue_constants as rc
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
+from ..mpnn_pdb import read_mpnn_pdb
 from .config import MpnnPackerProcessorConfig
 from .model import MpnnPackerInput
 
 
 class MpnnPackerProcessor:
     r"""Lower one canonical Structure to the released MpnnPacker."""
-
-    config_class = MpnnPackerProcessorConfig
 
     def __init__(
         self,
@@ -73,14 +70,13 @@ class MpnnPackerProcessor:
     ) -> MpnnPackerInput:
         r"""Lower fixed identity, selected residues, coordinates, and nearest-atom context."""
 
-        structure = read_pdb(input) if isinstance(input, (str, PathLike)) else input
+        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         system = structure.system
-        protein_instances = tuple(
-            (instance_id, system.entities[entity_id])
-            for instance_id, entity_id in system.instances.items()
-            if isinstance(system.entities[entity_id], PolymerSequence)
-            and system.entities[entity_id].polymer_type == "protein"
-        )
+        protein_instances: list[tuple[str, PolymerSequence]] = []
+        for instance_id, entity_id in system.instances.items():
+            entity = system.entities[entity_id]
+            if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
+                protein_instances.append((instance_id, entity))
         if isinstance(sequence, str):
             if len(protein_instances) != 1:
                 raise ValueError("a bare packing sequence requires exactly one protein instance")
@@ -133,8 +129,8 @@ class MpnnPackerProcessor:
 
                 groups: dict[tuple[str, ...], list[str]] = {}
                 for instance_id in entity_instances:
-                    components = target_components[instance_id]
-                    component_ids = tuple(component.component_id for component in components)
+                    instance_components = target_components[instance_id]
+                    component_ids = tuple(component.component_id for component in instance_components)
                     groups.setdefault(component_ids, []).append(instance_id)
                 original_ids = tuple(component.component_id for component in entity.components)
                 ordered_ids = tuple(groups)
@@ -310,7 +306,7 @@ class MpnnPackerProcessor:
                 duplicate_count += 1
             adjusted_rows.append((reference, component_id, chain_index, residue_index + duplicate_count))
             previous_residue_index = residue_index
-        rows = tuple(adjusted_rows)
+        rows = adjusted_rows
         unresolved_expected_atoms: list[tuple[str, ...]] = []
         for reference, component_id, _chain_index, _residue_index in rows:
             if component_id not in AMINO_ACID_COMPONENT_IDS:
@@ -358,15 +354,17 @@ class MpnnPackerProcessor:
             if unknown:
                 raise ValueError(f"packing positions are outside the observed protein layout: {sorted(unknown)!r}")
             selected = tuple(residue in selected_references for residue in row_references)
-            for row, is_selected, is_valid, unresolved in zip(rows, selected, valid, unresolved_expected_atoms):
+            for row, is_selected, is_valid, unresolved_atom_ids in zip(
+                rows, selected, valid, unresolved_expected_atoms
+            ):
                 if not is_selected:
                     continue
                 if row[1] not in AMINO_ACID_COMPONENT_IDS:
                     raise ValueError(f"MpnnPacker cannot pack residue identity {row[1]!r} at {row[0]!r}")
-                if unresolved:
+                if unresolved_atom_ids:
                     raise ValueError(
                         f"MpnnPacker cannot pack residue {row[0]!r} because expected atom14 sites "
-                        f"do not resolve: {unresolved!r}"
+                        f"do not resolve: {unresolved_atom_ids!r}"
                     )
                 if not is_valid:
                     raise ValueError(f"MpnnPacker cannot pack residue {row[0]!r} without complete backbone coordinates")

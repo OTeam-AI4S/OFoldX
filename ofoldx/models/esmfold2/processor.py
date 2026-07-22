@@ -14,7 +14,7 @@ from multimolecule import ProteinTokenizer
 from multimolecule.io import read_fasta_records
 from typing_extensions import Self
 
-from ...data.evidence import MSA, MSACollection
+from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
     AtomSite,
     MolecularSystem,
@@ -67,17 +67,14 @@ _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
 _PROTEIN_UNKNOWN = 22
 _MSA_GAP = 1
 
-# Binder-design mask token: framework/fixed positions carry their amino-acid letter, mutable
-# design positions carry '#' (binder_design.py L86). Chothia is the numbering scheme the
-# released antibody path annotates CDRs under (binder_design.py L392, L406).
+# Binder-design prompts use amino-acid letters for fixed positions and ``#`` for
+# mutable positions. Antibody CDRs use Chothia numbering.
 _MUTABLE_TOKEN = "#"
 _ANTIBODY_CDR_SCHEME = "chothia"
 
 
 class ESMFold2Processor:
     r"""Lower complete canonical ESMFold2 inputs without changing their chemistry."""
-
-    config_class = ESMFold2ProcessorConfig
 
     def __init__(
         self,
@@ -110,15 +107,12 @@ class ESMFold2Processor:
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
     ) -> ESMFold2Input:
-        r"""Lower one molecular system and optional released MSA evidence."""
+        r"""Lower one molecular system and optional MSA evidence."""
 
         if msa is not None and not self.config.msa_conditioning:
             raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
         if isinstance(input, Structure):
-            raise ValueError(
-                "released ESMFold2 cannot consume observed coordinates; pass input.system " "for topology-only folding"
-            )
-
+            input = input.system
         system = input if isinstance(input, MolecularSystem) else molecular_system(input)
         normalized_msa = normalize_msa(msa, system)
         return prepare_esmfold2_features(
@@ -135,13 +129,11 @@ class ESMFold2ExperimentalProcessor:
 
     Paired with [`ESMFold2ExperimentalModel`][ofoldx.models.esmfold2.ESMFold2ExperimentalModel].
     The experimental design/inversion checkpoints are single-sequence
-    (``disable_msa_features``), so this Processor reuses the released ESMFold2 token/atom
+    (``disable_msa_features``), so this Processor uses the ESMFold2 token/atom
     lowering with MSA conditioning off and rejects MSA evidence. The soft one-hot
     ``res_type_soft`` design tensor consumed by the differentiable trunk is assembled by
     the binder-design Pipeline, not here (it depends on the per-step optimisation logits).
     """
-
-    config_class = ESMFold2ExperimentalConfig
 
     def __init__(
         self,
@@ -177,7 +169,7 @@ class ESMFold2ExperimentalProcessor:
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
     ) -> ESMFold2Input:
@@ -234,7 +226,7 @@ def molecular_system(
 
 
 def _default_chain_id(index: int) -> str:
-    r"""Assign a default entity/instance key when the input carries none (§3.1)."""
+    r"""Assign a default entity and instance key."""
 
     return chr(ord("A") + index) if index < 26 else f"chain_{index + 1}"
 
@@ -248,15 +240,9 @@ def normalize_msa(
     if msa is None:
         return None
     if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        for value in values:
-            if value.entity_id not in system.entities:
-                raise ValueError("MSA entity disagrees with ESMFold2 input")
-            entity = system.entities[value.entity_id]
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+            if entity.polymer_type != "protein":
                 raise ValueError("released ESMFold2 consumes MSA evidence only for protein entities")
-            if len(value.unpaired_sequences[0]) != len(entity):
-                raise ValueError("MSA query width disagrees with the ESMFold2 entity length")
         return msa
 
     path = Path(msa).expanduser()
@@ -308,7 +294,7 @@ def aligned_protein_row(
 
 
 def _msa_residue_type(symbol: str) -> int:
-    r"""Map one uppercase MSA symbol (or ``-`` gap) to a released residue-type index."""
+    r"""Map one uppercase MSA symbol or gap to a residue-type index."""
 
     if symbol == "-":
         return _MSA_GAP
@@ -324,7 +310,7 @@ def prepare_esmfold2_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> ESMFold2Input:
-    r"""Build the released token/atom layout from canonical identity and topology."""
+    r"""Build the token and atom layout from canonical identity and topology."""
 
     token_groups: list[tuple[AtomSite, ...]] = []
     token_sites: list[AtomSite | tuple[str, int]] = []
@@ -346,7 +332,7 @@ def prepare_esmfold2_features(
 
     for asym_id, (instance_id, entity_key) in enumerate(system.instances.items()):
         entity = system.entities[entity_key]
-        entity_id = entity_index_by_id.setdefault(entity_key, len(entity_index_by_id))
+        entity_id = entity_index_by_id.setdefault(entity_key, len(entity_index_by_id) + 1)
         sym_id = instance_count_by_entity.get(entity_key, 0)
         instance_count_by_entity[entity_key] = sym_id + 1
 
@@ -441,7 +427,7 @@ def prepare_esmfold2_features(
             atom = system.atom(site)
             reference_coordinates.append((0.0, 0.0, 0.0) if coordinate is None else coordinate)
             atomic_numbers.append(int(periodic_table.GetAtomicNumber(atom.element)))
-            formal_charges.append(atom.formal_charge)
+            formal_charges.append(0 if atom.formal_charge is None else atom.formal_charge)
             entity = system.entities[system.instances[site.instance_id]]
             atom_name = site.atom_id
             if isinstance(entity, Molecule) and not valid_atom_name(atom_name):
@@ -480,8 +466,8 @@ def prepare_esmfold2_features(
     token_bonds = token_bond_matrix(system, site_to_token, token_count)
     msa_features = msa_tensors(
         msa,
-        system=system,
         token_entity_ids=token_entity_ids,
+        token_instance_ids=token_instance_ids,
         token_monomer_indices=token_monomer_indices,
         residue_types=residue_types,
     )
@@ -547,7 +533,7 @@ def reference_coordinate(
 
 
 def valid_atom_name(atom_name: str) -> bool:
-    r"""Return whether the released four-character atom encoding is lossless."""
+    r"""Return whether the four-character atom encoding is lossless."""
 
     return len(atom_name) <= 4 and all(32 <= ord(character) < 96 for character in atom_name)
 
@@ -558,7 +544,7 @@ def representative_atom(
     residue_type: int,
     site_to_atom: dict[AtomSite, int],
 ) -> int:
-    r"""Select the released representative atom for one structure token."""
+    r"""Select the representative atom for one structure token."""
 
     by_name = {site.atom_id: site_to_atom[site] for site in group}
     fallback = site_to_atom[group[0]]
@@ -591,7 +577,7 @@ def token_bond_matrix(
     protein_standards = _STANDARD_COMPONENTS["protein"]
     for bond in system.iter_bonds():
         if bond.origin == "polymer_rule":
-            # Released ESMFold2 encodes an explicit token bond only for a protein backbone
+            # Encode an explicit token bond only for a protein backbone
             # link at a non-standard junction; standard peptide adjacency and every nucleic
             # backbone link stay implicit in the token/residue index and are skipped here.
             entity = system.entities[system.instances[bond.site_a.instance_id]]
@@ -612,12 +598,12 @@ def token_bond_matrix(
 def msa_tensors(
     msa: MSA | MSACollection | None,
     *,
-    system: MolecularSystem,
     token_entity_ids: list[str],
+    token_instance_ids: list[str],
     token_monomer_indices: list[int | None],
     residue_types: list[int],
 ) -> dict[str, torch.Tensor]:
-    r"""Construct released paired/unpaired MSA rows over structure tokens."""
+    r"""Construct paired and unpaired MSA rows over structure tokens."""
 
     token_count = len(residue_types)
     if msa is None:
@@ -628,7 +614,8 @@ def msa_tensors(
         # entity, and query_to_entity is the identity map, so a token's monomer index is directly the
         # aligned-row column. A bare MSA is a single-chain plan over its unpaired pool; a collection
         # replays its dense row_pairing/row_is_paired plan across the paired and unpaired pools.
-        columns = (msa,) if isinstance(msa, MSA) else msa.msas
+        bindings = msa_bindings(msa)
+        columns = tuple(value for value, _target_instance_id in bindings)
         if isinstance(msa, MSA):
             plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
                 ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
@@ -649,12 +636,19 @@ def msa_tensors(
             deletion_row = torch.zeros(token_count, dtype=torch.float32)
             for column_index, source_row, is_paired in selections:
                 value = columns[column_index]
+                target_instance_id = bindings[column_index][1]
                 aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
                 deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
                     source_row
                 ]
-                for token_index, (entity_id, monomer_index) in enumerate(zip(token_entity_ids, token_monomer_indices)):
-                    if entity_id != value.entity_id or monomer_index is None:
+                for token_index, (entity_id, instance_id, monomer_index) in enumerate(
+                    zip(token_entity_ids, token_instance_ids, token_monomer_indices)
+                ):
+                    if (
+                        entity_id != value.entity_id
+                        or (target_instance_id is not None and instance_id != target_instance_id)
+                        or monomer_index is None
+                    ):
                         continue
                     row[token_index] = _msa_residue_type(aligned[monomer_index])
                     deletion_row[token_index] = float(deletion_source[monomer_index])
@@ -736,58 +730,52 @@ def esmc_tensors(
     )
 
 
-# ---- Antibody input preparation: CDR annotation (abnumber / ANARCI, Chothia) ----
-#
-# The design mask for an antibody Fv is per-input data: ANARCI numbers the Fv under Chothia and
-# the CDR-H1/H2/H3 + L1/L2/L3 loops become the mutable design positions while framework stays
-# fixed. This is the antibody input-preparation step (it produces the ``binder_prompt`` design
-# mask consumed by ``ESMFold2Pipeline.design``); the design verb never annotates CDRs itself.
-# Faithful port of binder_design.py L386-L420.
-
-
-def _load_abnumber() -> tuple:
-    r"""Import abnumber's ``Chain`` and ``_anarci_align`` or raise an actionable error."""
-
-    try:
-        from abnumber import Chain
-        from abnumber.common import _anarci_align
-    except ModuleNotFoundError as error:  # pragma: no cover - environment dependent
-        raise ModuleNotFoundError(
-            "antibody CDR annotation needs 'abnumber' (with the 'anarci' + 'hmmer' backend). "
-            "Install abnumber and ANARCI to prepare or score antibody Fv binders."
-        ) from error
-    return Chain, _anarci_align
+# Antibody Fv prompts use ANARCI Chothia numbering. CDR-H1/H2/H3 and
+# CDR-L1/L2/L3 are mutable; framework positions remain fixed.
 
 
 def is_antibody_sequence(sequence: str) -> bool:
     r"""Return ``True`` when ANARCI recognises ``sequence`` as antibody variable domain(s).
 
-    Mirrors the released detection (binder_design.py L386-L397): mutable ``'#'`` marks are
-    substituted with alanine before numbering, and every detected domain must be a heavy
+    Mutable ``#`` marks are substituted with alanine before numbering, and every
+    detected domain must be a heavy
     (``H``) or light (``K``/``L``) variable domain.
     """
 
-    _, _anarci_align = _load_abnumber()
+    from abnumber import Chain, ChainParseError
+
     resolved = sequence.replace(_MUTABLE_TOKEN, "A")
-    result = _anarci_align(sequences=[resolved], scheme=_ANTIBODY_CDR_SCHEME, allowed_species=None)[0]
-    if not result:
+    try:
+        chains = Chain.multiple_domains(
+            resolved,
+            scheme=_ANTIBODY_CDR_SCHEME,
+            cdr_definition=_ANTIBODY_CDR_SCHEME,
+            allowed_species=None,
+            use_anarcii=False,
+        )
+    except ChainParseError:
         return False
     valid_chain_types = {"H", "K", "L"}
-    return all(chain_type in valid_chain_types for _, chain_type, *_ in result)
+    return all(chain.chain_type in valid_chain_types for chain in chains)
 
 
 def antibody_cdr_indices(sequence: str) -> list[int]:
     r"""0-based indices of every Chothia CDR residue (H1/H2/H3, L1/L2/L3) in an Fv ``sequence``.
 
-    Faithful port of the released ``_cdr_indices`` (binder_design.py L400-L420): ANARCI splits
-    the Fv into its variable domains, the heavy domain is ordered first, and each domain's
-    ``cdr1/cdr2/cdr3`` loops are located back in the input sequence. These indices are the
+    ANARCI splits the Fv into variable domains, orders the heavy domain first, and locates
+    each domain's ``cdr1/cdr2/cdr3`` loops in the input sequence. These indices are the
     CDR-only design positions (framework fixed) and the CDR ipTM-proxy scoring rows.
     """
 
-    Chain, _anarci_align = _load_abnumber()
-    result = _anarci_align(sequences=[sequence], scheme=_ANTIBODY_CDR_SCHEME, allowed_species=None)[0]
-    chains = [Chain("".join(result[i][0].values()), scheme=_ANTIBODY_CDR_SCHEME) for i in range(len(result))]
+    from abnumber import Chain
+
+    chains = Chain.multiple_domains(
+        sequence,
+        scheme=_ANTIBODY_CDR_SCHEME,
+        cdr_definition=_ANTIBODY_CDR_SCHEME,
+        allowed_species=None,
+        use_anarcii=False,
+    )
     if len(chains) == 2 and not chains[0].is_heavy_chain():
         chains.reverse()
     indices: list[int] = []
@@ -805,12 +793,11 @@ def antibody_cdr_prompt(fv_sequence: str) -> str:
 
     The antibody input-preparation step: ANARCI annotates the Chothia CDRs and the returned
     prompt fixes every framework residue to its input amino acid while marking every CDR
-    position with the mutable ``'#'`` token (the released antibody-framework mask,
-    binder_design.py L110/L204). The prompt is the per-input design mask —
-    [`ESMFold2Pipeline.design`][ofoldx.models.esmfold2.pipeline.ESMFold2Pipeline.design] then
-    optimises exactly the marked CDR positions with no antibody-specific branch. Construct the
-    bound model from a config carrying ``language_model_weight=0.05`` to complete the released
-    antibody-framework setup (general binders keep the ``0.15`` default).
+    position with the mutable ``#`` token. The prompt is the per-input design mask;
+    [`ESMFold2DesignPipeline.design`][ofoldx.models.esmfold2.pipeline.ESMFold2DesignPipeline.design] then
+    optimises exactly the marked CDR positions with no antibody-specific branch.
+    Antibody framework design uses ``language_model_weight=0.05``; general binders
+    use the ``0.15`` default.
     """
 
     cdr_indices = set(antibody_cdr_indices(fv_sequence))

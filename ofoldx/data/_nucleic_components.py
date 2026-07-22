@@ -1,16 +1,14 @@
-r"""Audited literal chemistry used by the released ODesign nucleic path.
+r"""Built-in nucleic component graphs and reference coordinates.
 
 The eight standard components are graph and ideal-coordinate facts from the wwPDB
 ``components.v20240608.cif`` snapshot (SHA-256
 ``7240b17369ccfbbcc86e2d02dc8c9db59f46c32e0420f58889c6c121c60bfef0``).
 CCD aromatic flags are represented by OFoldX's canonical aromatic bond order ``1.5``.
-``N`` and ``DN`` are ODesign's generated placeholders: respectively the ``C`` and
-``DC`` heavy backbone induced subgraphs with ``N1`` renamed to ``N``, exactly as in
-OTeam-AI4S/ODesign revision ``cc95c2f8f915af4d87b1db3f44c4db2df8566a41``.
+``N`` and ``DN`` are generic unknown RNA and DNA placeholders used by permissive
+one-letter resolution. Their graphs are, respectively, the ``C`` and ``DC`` heavy
+backbone induced subgraphs with ``N1`` renamed to ``N``.
 
-This private module is a static audited data asset, not a provider, registry, helper
-API, or replaceable chemistry backend. Construction and public access remain in
-``ofoldx.data.components``.
+Construction and public access live in :mod:`ofoldx.data.components`.
 """
 
 from __future__ import annotations
@@ -19,12 +17,11 @@ from collections.abc import Mapping
 
 _RawAtom = tuple[str, str, int, bool, str | None]
 _RawBond = tuple[str, str, float, bool]
-_RawComponent = tuple[tuple[_RawAtom, ...], tuple[_RawBond, ...]]
+ComponentRows = tuple[tuple[_RawAtom, ...], tuple[_RawBond, ...]]
 _RawCoordinate = tuple[float, float, float]
 _RawReferenceCoordinates = tuple[tuple[str, _RawCoordinate], ...]
-_RawAtomMapping = tuple[tuple[str, str], ...]
 
-_AUDITED_NUCLEIC_COMPONENT_DATA: Mapping[str, _RawComponent] = {
+COMPONENT_ROWS: Mapping[str, ComponentRows] = {
     "A": (
         (
             ("OP3", "O", 0, False, None),
@@ -723,7 +720,7 @@ _AUDITED_NUCLEIC_COMPONENT_DATA: Mapping[str, _RawComponent] = {
     ),
 }
 
-_AUDITED_NUCLEIC_REFERENCE_COORDINATES: Mapping[str, _RawReferenceCoordinates] = {
+REFERENCE_COORDINATE_ROWS: Mapping[str, _RawReferenceCoordinates] = {
     "A": (
         ("P", (1.024, -0.137, -4.723)),
         ("OP1", (1.633, 1.19, -4.488)),
@@ -935,37 +932,5 @@ _AUDITED_NUCLEIC_REFERENCE_COORDINATES: Mapping[str, _RawReferenceCoordinates] =
         ("C2'", (-2.322, -0.04, 1.288)),
         ("C1'", (-1.106, -0.981, 1.395)),
         ("N", (-0.267, -0.584, 2.528)),
-    ),
-}
-
-_GENERATED_NUCLEIC_ATOM_MAPPINGS: Mapping[str, _RawAtomMapping] = {
-    "N": (
-        ("P", "P"),
-        ("OP1", "OP1"),
-        ("OP2", "OP2"),
-        ("O5'", "O5'"),
-        ("C5'", "C5'"),
-        ("C4'", "C4'"),
-        ("O4'", "O4'"),
-        ("C3'", "C3'"),
-        ("O3'", "O3'"),
-        ("C2'", "C2'"),
-        ("O2'", "O2'"),
-        ("C1'", "C1'"),
-        ("N1", "N"),
-    ),
-    "DN": (
-        ("P", "P"),
-        ("OP1", "OP1"),
-        ("OP2", "OP2"),
-        ("O5'", "O5'"),
-        ("C5'", "C5'"),
-        ("C4'", "C4'"),
-        ("O4'", "O4'"),
-        ("C3'", "C3'"),
-        ("O3'", "O3'"),
-        ("C2'", "C2'"),
-        ("C1'", "C1'"),
-        ("N1", "N"),
     ),
 }

@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
+from typing import cast
 
 import chanfig
 import torch
@@ -80,18 +81,18 @@ def load_rfdiffusion_checkpoint(
 def rfdiffusion_config_from_checkpoint(checkpoint: Mapping[str, object]) -> RFdiffusionConfig:
     r"""Recover only persistent network/diffusion/preprocess architecture."""
 
-    source = checkpoint["config_dict"]
+    source = cast(Mapping[str, object], checkpoint["config_dict"])
     values = {}
     for source_name, target_name, renames in (
         ("model", "network", _NETWORK_RENAMES),
         ("diffuser", "diffuser", _DIFFUSER_RENAMES),
         ("preprocess", "preprocess", _PREPROCESS_RENAMES),
     ):
-        group = source[source_name]
+        group = cast(Mapping[str, object], source[source_name])
         normalized = {target: group[key] for key, target in renames.items()}
         if target_name == "network":
             for key in ("se3_param_full", "se3_param_topk"):
-                nested = normalized[key]
+                nested = cast(Mapping[object, object], normalized[key])
                 normalized[key] = {
                     ("num_attention_heads" if item_key == "n_heads" else str(item_key)): item
                     for item_key, item in nested.items()
@@ -145,7 +146,10 @@ def convert_rfdiffusion_checkpoint(
     config = rfdiffusion_config_from_checkpoint(loaded)
     with torch.device("meta"):
         model = RFdiffusionModel(config)
-    state = convert_rfdiffusion_state_dict(loaded["model_state_dict"], dtype=dtype)
+    state = convert_rfdiffusion_state_dict(
+        cast(Mapping[str, Tensor], loaded["model_state_dict"]),
+        dtype=dtype,
+    )
     for name, array in rfdiffusion_schedule(schedule_source).items():
         state[f"igso3_{name}"] = torch.as_tensor(array, dtype=torch.float64)
     model.load_state_dict(state, strict=True, assign=True)
@@ -166,10 +170,10 @@ def save_rfdiffusion_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
-    pairs it with the family :class:`RFdiffusionProcessor`, and writes ``model.json`` /
+    pairs it with :class:`RFdiffusionProcessor`, and writes ``model.json`` /
     ``processor.json`` / safetensors via
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair keeps
-    ``standard_tasks=()`` (§6.1), so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
+    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair has no
+    generic standard task, so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
     is written to route ``pipeline("design", model=dir)`` to :class:`RFdiffusionPipeline` rather than
     the generic standard ``design`` route.
 
@@ -187,9 +191,9 @@ def save_rfdiffusion_checkpoint(
     save_model(destination, model=model, processor=RFdiffusionProcessor())
     chanfig.NestedDict({"pipeline": PIPELINES.id_for(RFdiffusionPipeline)}).dump(destination / "pipeline.json")
     if repo_id is not None:
-        from ...hub import _upload_repository
+        from ..._repository import upload_repository
 
-        _upload_repository(destination, repo_id, token=token, private=private)
+        upload_repository(destination, repo_id, token=token, private=private)
 
 
 def main(argv: list[str] | None = None) -> None:

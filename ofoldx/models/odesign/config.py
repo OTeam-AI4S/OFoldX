@@ -74,16 +74,16 @@ class ODesignConfig(Config):
 class ODesignProcessorConfig(Config):
     r"""Persistent configuration for canonical ODesign lowering.
 
-    ``receptor_mode`` (§4.11.1/§4.11.2) selects the released flex/rigid receptor
-    conditioning. It is the *only* thing that differs between the two released protein
+    ``receptor_mode`` selects flex or rigid receptor conditioning. It is the only setting
+    that differs between the two protein
     repositories ``ofoldx/odesign-base-prot-flex`` and ``ofoldx/odesign-base-prot-rigid``:
     the graph, the ``ODesignConfig``, the ``__call__`` signature, and the
-    ``ODesignInput``/``ODesignOutput`` types are byte-identical, so under §7 ("separate
-    arch only on a signature/type difference") this is one architecture + config, not two
-    registered architecture pairs. ``"rigid"`` marks every existing (non-generated)
+    ``ODesignInput``/``ODesignOutput`` types are identical. Both repositories therefore use
+    the same architecture and select behavior through processor configuration. ``"rigid"``
+    marks every existing (non-generated)
     receptor heavy atom as a hard fixed coordinate (the released ``diffusion`` condition,
     receptor held rigid); ``"flex"`` regenerates receptor coordinates and pins only atoms
-    named by an explicit hard ``ReferenceCoordinates``. This is additive over the working
+    named by an explicit hard ``ReferenceCoordinates``. This is additive over the
     per-atom ``ReferenceCoordinates`` path in ``processor.py``.
     """
 

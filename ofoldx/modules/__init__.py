@@ -1,8 +1,8 @@
 r"""
-Shared building blocks (attention, transitions, geometry) reused across model families.
+Reusable mathematical building blocks for model implementations.
 
-This package holds only code shared by at least two families; it is the canonical reference for
-naming and API. Its public surface is re-exported here for convenient import:
+This package contains reusable attention, transition, geometry, and graph components.
+Its public surface is re-exported here for convenient import:
 
 - [GatedMultiheadAttention][ofoldx.modules.attention.GatedMultiheadAttention] and
   [MultiheadAttentionProjection][ofoldx.modules.attention.MultiheadAttentionProjection]

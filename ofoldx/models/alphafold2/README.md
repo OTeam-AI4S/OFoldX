@@ -25,6 +25,9 @@ heads, and the AF2 geometry utilities:
 - `ofoldx.alphafold2` — monomer and monomer-pTM (`AlphaFold2Model` / `AlphaFold2Processor`);
 - `ofoldx.alphafold2_multimer` — AlphaFold-Multimer (`AlphaFold2MultimerModel` / `AlphaFold2MultimerProcessor`).
 
+Their Processor implementations live in [`processor.py`](processor.py) and
+[`multimer_processor.py`](multimer_processor.py), respectively.
+
 The two IDs exist because their Processor call signature and required input/output
 type differ (Principle 7): the monomer Processor lowers one unbound protein instance
 with an entity-bound `MSA`; the multimer Processor lowers a multi-instance

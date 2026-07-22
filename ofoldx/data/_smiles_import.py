@@ -3,6 +3,8 @@ r"""Private lossless SMILES import for the canonical molecular graph."""
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from typing import Protocol
 
 from .molecular import (
     ChemicalAtom,
@@ -22,6 +24,20 @@ _RDKIT_BOND_TYPES = frozenset({"SINGLE", "DOUBLE", "TRIPLE", "QUADRUPLE", "AROMA
 _RDKIT_DIRECTIONAL_BONDS = frozenset({"ENDUPRIGHT", "ENDDOWNRIGHT"})
 _BRACKET_ATOM = re.compile(r"\[([^\[\]]*)\]")
 _BRACKET_PREFIX = re.compile(r"(?P<isotope>\d+)?(?:\*|[A-Z][a-z]?|[a-z]{1,2})(?P<rest>.*)")
+
+
+class _RdkitBond(Protocol):
+    def GetBeginAtomIdx(self) -> int: ...
+
+    def GetEndAtomIdx(self) -> int: ...
+
+    def GetStereo(self) -> object: ...
+
+    def GetStereoAtoms(self) -> Iterable[int]: ...
+
+
+class _RdkitMolecule(Protocol):
+    def GetBonds(self) -> Iterable[_RdkitBond]: ...
 
 
 def molecule_from_smiles(
@@ -222,7 +238,7 @@ def _validate_bracket_atom_numbers(smiles: str) -> None:
                 raise ValueError("SMILES bracket formal charge must be within -128..127")
 
 
-def _direction_is_encoded(molecule: object, directed_bond: object) -> bool:
+def _direction_is_encoded(molecule: _RdkitMolecule, directed_bond: _RdkitBond) -> bool:
     r"""Return whether a directional RDKit bond is captured by stored E/Z stereo."""
 
     from rdkit import Chem

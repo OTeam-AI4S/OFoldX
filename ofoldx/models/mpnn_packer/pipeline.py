@@ -9,26 +9,15 @@ import torch
 
 from ...data.molecular import ComponentReference
 from ...data.structure import Structure
-from ...io import read_pdb
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import PackPrediction, PackResult
-from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, _pack_candidate
+from ..mpnn_pdb import read_mpnn_pdb
+from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, pack_candidate
 from .processor import MpnnPackerProcessor
 
 
-class MpnnPackerPipeline(PairedPipeline):
+class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
     r"""Bind the released side-chain packer Model and Processor."""
-
-    model: MpnnPackerModel
-    processor: MpnnPackerProcessor
-
-    def __init__(
-        self,
-        *,
-        model: MpnnPackerModel,
-        processor: MpnnPackerProcessor,
-    ) -> None:
-        super().__init__(model=model, processor=processor)
 
     def pack(
         self,
@@ -46,16 +35,16 @@ class MpnnPackerPipeline(PairedPipeline):
     ) -> PackResult:
         r"""Pack the selected side chains with the released iterative sampler."""
 
-        input = self.processor(
+        features = self.processor(
             input,
             sequence=sequence,
             positions=positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=input.sequence_tokens.device)
+        generator = resolve_generator(seed, generator, device=features.sequence_tokens.device)
         return self.model.pack(
-            input,
+            features,
             num_samples=num_samples,
             num_denoising_steps=num_denoising_steps,
             num_torsion_samples=num_torsion_samples,
@@ -78,7 +67,7 @@ class MpnnPackerPipeline(PairedPipeline):
     ) -> tuple[PackResult, ...]:
         r"""Pack several target sequences against one source Structure."""
 
-        structure = read_pdb(input) if isinstance(input, (str, PathLike)) else input
+        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         inputs = tuple(
             self.processor(
                 structure,
@@ -141,6 +130,6 @@ class MpnnPackerPipeline(PairedPipeline):
                     mix_logits=packed.mix_logits[index : index + 1],
                     input_chi_sin_cos=packed.input_chi_sin_cos[index : index + 1],
                 )
-                predictions[index].append(_pack_candidate(item, candidate))
+                predictions[index].append(pack_candidate(item, candidate))
 
         return tuple(PackResult(predictions=tuple(items)) for items in predictions)

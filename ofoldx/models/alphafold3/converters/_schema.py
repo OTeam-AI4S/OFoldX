@@ -1,17 +1,15 @@
 r"""
-Shared OFoldX-AlphaFold 3 parameter key schema.
+OFoldX AlphaFold 3 parameter-key schema for checkpoint conversion.
 
-The DeepMind official converter ([`deepmind`][ofoldx.models.alphafold3.converters.deepmind]) and the
-Protenix-family converter ([`_protenix_convert`][ofoldx.models._protenix_convert]) both translate the *same*
-OFoldX-AF3 model-key tree onto two different upstream vocabularies. This module owns that tree ONCE, as a
-source-agnostic submodule dispatch: [`resolve`][ofoldx.models.alphafold3.converters._schema.resolve] routes an
-OFoldX-AF3 model key to the submodule ``section`` it belongs to, its within-section ``context``, the leaf
-``rest`` inside that submodule, and the stack ``block`` index (if any).
+The DeepMind checkpoint converter
+([`deepmind`][ofoldx.models.alphafold3.converters.deepmind]) uses
+[`resolve`][ofoldx.models.alphafold3.converters._schema.resolve] to map each OFoldX model key to its
+submodule ``section``, within-section ``context``, leaf ``rest``, and optional stack ``block`` index.
+DeepMind parameter names and tensor-layout transforms remain in the converter; this module describes only
+the OFoldX model-key tree.
 
-Each converter supplies only its own per-node source-name table and layout transforms; neither re-derives the
-submodule/stack structure. The block index is carried out-of-band because it never participates in a target
-name -- DeepMind consumes it as a stacked-tensor index and Protenix keeps it in the ``.blocks.{i}.`` path -- so
-sharing the dispatch here does not couple the two vocabularies.
+The block index is carried separately from ``rest`` because stacked Haiku tensors consume it as an array
+index rather than as part of the source parameter name.
 """
 
 from __future__ import annotations

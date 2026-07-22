@@ -195,7 +195,8 @@ The common signatures are:
 def fold(
     input: str | PathLike[str] | PolymerSequence | MolecularSystem | Structure,
     *, model: str | PathLike[str], revision: str | None = None,
-    device: torch.device | str | None = None, dtype: torch.dtype | None = None,
+    token: str | None = None, device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
     msa: MSA | MSACollection | None = None, templates: Sequence[Template] = (),
     num_samples: int = 1,
     seed: int | None = None, generator: torch.Generator | None = None,
@@ -204,7 +205,8 @@ def fold(
 def design(
     input: MolecularSystem | Structure | str | PathLike[str],
     *, model: str | PathLike[str],
-    revision: str | None = None, device: torch.device | str | None = None,
+    revision: str | None = None, token: str | None = None,
+    device: torch.device | str | None = None,
     dtype: torch.dtype | None = None, msa: MSA | MSACollection | None = None,
     templates: Sequence[Template] = (),
     conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
@@ -215,14 +217,16 @@ def design(
 def score(
     input: MolecularSystem | Structure | str | PathLike[str],
     *, model: str | PathLike[str], revision: str | None = None,
-    device: torch.device | str | None = None, dtype: torch.dtype | None = None,
+    token: str | None = None, device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
     seed: int | None = None, generator: torch.Generator | None = None,
 ) -> Any: ...
 
 def pack(
     input: Structure | str | PathLike[str],
     *, model: str | PathLike[str], revision: str | None = None,
-    device: torch.device | str | None = None, dtype: torch.dtype | None = None,
+    token: str | None = None, device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
     sequence: str | Mapping[str, str | Sequence[str]] | None = None,
     positions: Sequence[ComponentReference] | None = None, num_samples: int = 1,
     seed: int | None = None, generator: torch.Generator | None = None,
@@ -324,7 +328,8 @@ The task-first factory is:
 def pipeline(
     task: Literal["fold", "design", "score", "pack"],
     *, model: str | PathLike[str],
-    revision: str | None = None, device: torch.device | str | None = None,
+    revision: str | None = None, token: str | None = None,
+    device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Any: ...
 ~~~
@@ -366,7 +371,8 @@ OFoldX owns construction, architecture dispatch, loading, and Model/Processor pa
 ~~~python
 AutoModel(
     pretrained: str | PathLike[str], *, revision: str | None = None,
-    device: torch.device | str | None = None, dtype: torch.dtype | None = None,
+    token: str | None = None, device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> ConcreteModel
 AutoModel(
     config: ConcreteModelConfig, *, device: torch.device | str | None = None,
@@ -374,7 +380,8 @@ AutoModel(
 ) -> ConcreteModel
 AutoProcessor(
     pretrained: str | PathLike[str], *, revision: str | None = None,
-    device: torch.device | str | None = None, dtype: torch.dtype | None = None,
+    token: str | None = None, device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> ConcreteProcessor
 ~~~
 
@@ -2442,8 +2449,8 @@ the existing public MPNN module rather than to Packer ownership or a rejected
 generic structure reader:
 
 ~~~python
-# ofoldx.io.pdb, reexported by ofoldx.io
-def read_pdb(
+# ofoldx.models.mpnn_pdb
+def read_mpnn_pdb(
     path: str | PathLike[str],
     *,
     chains: Sequence[str] | None = None,
@@ -2464,7 +2471,7 @@ def __call__(
 ) -> MpnnPackerInput: ...
 ~~~
 
-`processor(path, ...)` is exactly `processor(read_pdb(path), ...)`; no path-only
+`processor(path, ...)` is exactly `processor(read_mpnn_pdb(path), ...)`; no path-only
 payload survives canonical construction. The reader interprets plain PDB text and
 a `.gz` path as gzip-compressed PDB text. It does not inspect content to guess a
 format, accept mmCIF, fall back to another parser, or introduce a format enum.
@@ -3334,13 +3341,13 @@ The Structure arm has the deliberately different updated semantics:
   equals the immediately previous integer, never resets at a chain boundary, and
   is added to every subsequent emitted integer.
 
-Composing the shared `ofoldx.io.pdb.read_pdb(path, chains=...)` selects the
+Composing the shared `ofoldx.models.mpnn_pdb.read_mpnn_pdb(path, chains=...)` selects the
 Structure arm and therefore also selects that reader's first-model, blank/A-altloc,
 gzip, hybrid36, static-chemistry, and retained-occupancy semantics. The two public
 expressions are intentionally not equivalent:
 
 ~~~python
-processor(path) != processor(mpnn.read_pdb(path))
+processor(path) != processor(read_mpnn_pdb(path))
 ~~~
 
 Validity and selection remain independent. `positions=None` selects all valid
@@ -3688,7 +3695,7 @@ class ProteinMpnnDesignAndPackPipeline:
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]: ...
 ~~~
 
-A path is parsed exactly once with `ofoldx.io.pdb.read_pdb`; that canonical
+A path is parsed exactly once with `ofoldx.models.mpnn_pdb.read_mpnn_pdb`; that canonical
 `Structure` is the only source given to both stages. The designer stage lowers it
 through `designer.processor.process_structure`, including the explicit
 `filter_by_occupancy` value, physical-CA order, and updated MSE semantics, before
@@ -4737,7 +4744,7 @@ not enter frequent CI or committed package history.
 
 Shared ownership stops at concrete graph primitives in `ofoldx.modules.mpnn`: the
 gather functions, `MpnnProteinFeatures`, relative-position, feed-forward, message,
-encoder, and decoder Modules; the public MPNN reader now lives in `ofoldx.io.pdb`
+encoder, and decoder Modules; the public MPNN reader lives in `ofoldx.models.mpnn_pdb`
 and the amino-acid/element/water facts in `ofoldx.data`. `CaProteinMpnnFeatures` remains Protein-owned,
 `LigandMpnnFeatures` remains Ligand-owned, and `MembraneMpnnFeatures` remains
 Membrane-owned and public because its live three-class node projection is a
@@ -4795,7 +4802,7 @@ class GlobalMembraneMpnnDesignAndPackPipeline:
     ) -> tuple[DesignResult, tuple[PackResult, ...]]: ...
 ~~~
 
-The composition parses a path once with `ofoldx.io.pdb.read_pdb` and gives
+The composition parses a path once with `ofoldx.models.mpnn_pdb.read_mpnn_pdb` and gives
 the resulting `Structure` to both child Pipelines. `transmembrane` remains the
 global designer's biological input; it is not translated to a per-residue label
 mapping or a composition mode. With `repack_everything=False`, the Packer receives
@@ -4874,7 +4881,7 @@ Status: frozen — a follow-up audit and adversarial review of NA-MPNN revision
 `aafa32c87b65046a02db152f6e6235a7078e5fef`, both released checkpoints, inference,
 training objectives, preprocessing, evaluation, and output paths resolve every
 open boundary below and support the complete `ofoldx.nampnn` Model, Processor, and
-Pipeline. The family is a registered `register_model`/`register_pipeline` pair so
+Pipeline. The family is a registered `MODELS.register`/`PIPELINES.register` pair so
 `convert -> save -> AutoModel/Pipeline` round-trips; contrary upstream fact or
 execution evidence reopens only this subsection.
 
@@ -5759,7 +5766,7 @@ registry contract.
 Model registration is normal explicit Python:
 
 ~~~python
-register_model(
+MODELS.register(
     "ofoldx.alphafold3",
     model=AlphaFold3Model,
     processor=AlphaFold3Processor,
@@ -5767,10 +5774,10 @@ register_model(
 )
 ~~~
 
-Its complete signature is:
+Its complete method signature on the `MODELS` registry is:
 
 ~~~python
-register_model(
+MODELS.register(
     id: str,
     *,
     model: type[torch.nn.Module],
@@ -5817,16 +5824,16 @@ evidence for this subsection.
 Concrete registration is normal explicit Python:
 
 ~~~python
-register_pipeline(
+PIPELINES.register(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
 )
 ~~~
 
-Its complete signature is:
+Its complete method signature on the `PIPELINES` registry is:
 
 ~~~python
-register_pipeline(id: str, *, pipeline: type) -> None
+PIPELINES.register(id: str, *, pipeline: type) -> None
 ~~~
 
 The ID is an exact nonempty string. ID and exact class are each unique; the reverse
@@ -6255,13 +6262,13 @@ repository or commit.
 
 #### Registration and Auto
 
-`register_model(id, *, model, processor, standard_tasks=())` records one exact pair,
+`MODELS.register(id, *, model, processor, standard_tasks=())` records one exact pair,
 the Model's declared config class, and its set of shared task words. It protects
 only dispatch meaning: the ID is a nonempty string; Model, Processor, and Model
 config are classes of the required ordinary kinds; standard tasks are among fold,
 design, score, and pack; and exact ID, Model-config, or pair mappings cannot
 conflict. Exact indexes serve ID, Model-config, and pair lookup. The
-`register_model(...)` call does not inspect signatures, annotations, methods,
+`MODELS.register(...)` call does not inspect signatures, annotations, methods,
 fields, state keys, package layout, or runtime placement and performs no package
 scan, owner-module import, locking, or plugin discovery. Exact architecture lookup
 may import only the literal built-in owner on a miss, as specified in Section 7.2.

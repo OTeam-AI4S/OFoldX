@@ -1,41 +1,24 @@
-r"""
-LigandMpnn protein/ligand sequence-design model.
-
-Re-exports the public surface of the OFoldX-native LigandMpnn sequence family. Raw forward, sampling, and
-the four probability operations return the shared carriers in
-[`ofoldx.models.mpnn`][ofoldx.models.mpnn]; ``design`` returns the shared
-[`DesignResult`][ofoldx.results.DesignResult]. The context-aware designer and its design-and-pack
-composition are the frozen §4.8/§4.8.1 pair.
-"""
+r"""LigandMPNN protein-sequence design implementation."""
 
 from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import LigandMpnnConfig, LigandMpnnProcessorConfig
-from .model import LigandMpnnFeatures, LigandMpnnInput, LigandMpnnModel, tied_groups_from_ids
+from .model import LigandMpnnInput, LigandMpnnModel
 from .pipeline import LigandMpnnDesignAndPackPipeline, LigandMpnnPipeline
 from .processor import LigandMpnnProcessor
 
-__all__ = [
-    "LigandMpnnConfig",
-    "LigandMpnnProcessorConfig",
-    "LigandMpnnModel",
-    "LigandMpnnProcessor",
-    "LigandMpnnInput",
-    "LigandMpnnPipeline",
-    "LigandMpnnDesignAndPackPipeline",
-    "LigandMpnnFeatures",
-    "tied_groups_from_ids",
-]
-
-MODELS.register(
+MODELS.register_model(
     "ofoldx.ligandmpnn",
     model=LigandMpnnModel,
     processor=LigandMpnnProcessor,
+    processor_config=LigandMpnnProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.ligandmpnn",
     pipeline=LigandMpnnPipeline,
+    tasks=("design",),
+    architectures=("ofoldx.ligandmpnn",),
 )

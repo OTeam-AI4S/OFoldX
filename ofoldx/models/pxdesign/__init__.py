@@ -1,4 +1,4 @@
-r"""Public tensor-level API of the PxDesign family."""
+r"""PxDesign protein-structure design implementation."""
 
 from __future__ import annotations
 
@@ -13,59 +13,26 @@ from .config import (
 )
 from .model import (
     PxDesignCandidate,
-    PxDesignConditionalTemplateEmbedder,
-    PxDesignConditionEmbedder,
     PxDesignInput,
     PxDesignLayout,
     PxDesignModel,
     PxDesignOutput,
     PxDesignResult,
-    PxDesignSampler,
 )
 from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
-# The PxDesign family deliberately publishes a tensor-level API (§docstring): its Sampler,
-# condition embedders, and Layout are part of the intended public surface and are kept here.
-__all__ = [
-    "PxDesignConfig",
-    "PxDesignConditionEmbedderConfig",
-    "PxDesignDenoiserConfig",
-    "PxDesignProcessorConfig",
-    "PxDesignSamplerConfig",
-    "PxDesignModel",
-    "PxDesignProcessor",
-    "PxDesignPipeline",
-    "PxDesignInput",
-    "PxDesignOutput",
-    "PxDesignResult",
-    "PxDesignCandidate",
-    "PxDesignLayout",
-    "PxDesignSampler",
-    "PxDesignConditionEmbedder",
-    "PxDesignConditionalTemplateEmbedder",
-    "TargetChain",
-    "from_binder",
-    "to_binder",
-]
-
-# `standard_tasks` stays () (§6.1, mirroring rfdiffusion): the root pair must NOT be wrapped by
-# the generic standard `DesignPipeline`, which returns the shared coordinate-free `DesignResult`
-# and lowers `AllowedResidueIdentities`/`TiedResidueIdentities`. PxDesign is coordinate-producing:
-# its `design` returns the family-owned `PxDesignResult` (§5.3) over its own `PlacementSpec`/
-# `Hotspot` conditions. Publication (Principle 13) is therefore the concrete `PxDesignPipeline`
-# registered below — exactly as `PxDesignPipeline` mirrors `ProteinMpnnPipeline` (pipeline.py).
-# The suite *composition* pipeline (backbone -> ProteinMPNN -> AF2-IG / Protenix -> `pxdbench`
-# ranking) is intentionally ABSENT from this surface (Principle 13: reexport IS publication): it
-# is dependency-gated on the AF2-IG fold entry point and the un-vendored `pxdbench` submodule, so
-# it stays unpublished until those land rather than shipping a placeholder that only raises.
-MODELS.register(
+# Coordinate-bearing results require the concrete design pipeline.
+MODELS.register_model(
     "ofoldx.pxdesign",
     model=PxDesignModel,
     processor=PxDesignProcessor,
+    processor_config=PxDesignProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.pxdesign",
     pipeline=PxDesignPipeline,
+    tasks=("design",),
+    architectures=("ofoldx.pxdesign",),
 )

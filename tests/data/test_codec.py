@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from ofoldx.data._codec import decode_structure, decode_system, encode_structure, encode_system
+from ofoldx.data.codec import decode_structure, decode_system, encode_structure, encode_system
 from ofoldx.data.components import get_component
 from ofoldx.data.molecular import (
     AtomSite,

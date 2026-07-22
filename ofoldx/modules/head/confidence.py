@@ -1,9 +1,9 @@
 r"""
-Shared confidence head for the AlphaFold 3 / Protenix families.
+Shared confidence head for the AlphaFold 3 and Protenix implementations.
 
 Predicts pLDDT, PAE, PDE, and resolved logits from the trunk single/pair states and the predicted
 coordinates. AlphaFold 3 and Protenix share this parameterized head; the real architectural
-differences between the two families are exposed as constructor flags rather than duplicated code
+differences between the two implementations are exposed as constructor flags rather than duplicated code
 (mirroring the shared :class:`~ofoldx.modules.head.distogram.DistogramHead` precedent):
 
 - ``single_max_abs`` -- clamp on the trunk single before scoring (AlphaFold 3 ``None`` / unclamped,
@@ -30,6 +30,13 @@ from ..atom import TokenToAtomBroadcast
 from ..backend import LayerNorm
 from ..trunk import PairformerStack
 from .frames import gather_atoms_by_index, insert_sample_axis
+
+
+def expected_plddt(logits: Tensor) -> Tensor:
+    r"""Expected pLDDT on the conventional 0--100 scale from per-bin logits."""
+
+    centers = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype) + 0.5
+    return (logits.softmax(dim=-1) * centers * (100.0 / logits.shape[-1])).sum(dim=-1)
 
 
 class ConfidenceHead(nn.Module):
@@ -59,6 +66,8 @@ class ConfidenceHead(nn.Module):
         num_triangle_attention_heads: Number of triangle-attention heads.
         expansion: Feed-forward expansion factor in the Pairformer transitions.
         dropout: Pairformer dropout probability.
+        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
+            pre-transpose pair (the DeepMind AlphaFold 3 convention).
         single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
         use_single_norm: Whether to apply a ``LayerNorm`` to the single before the sample loop (Protenix).
         use_distance_projection: Whether the pair embedder adds a raw-distance projection channel (Protenix).
@@ -87,6 +96,7 @@ class ConfidenceHead(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.0,
+        ending_node_transpose_bias: bool = False,
         single_max_abs: float | None = 512.0,
         use_single_norm: bool = False,
         use_distance_projection: bool = True,
@@ -115,6 +125,7 @@ class ConfidenceHead(nn.Module):
             num_pair_attention_heads=num_pair_attention_heads,
             expansion=expansion,
             dropout=dropout,
+            ending_node_transpose_bias=ending_node_transpose_bias,
         )
         self.atom_projector = AtomConfidenceProjector(
             single_size=single_size,
@@ -164,7 +175,7 @@ class ConfidenceHead(nn.Module):
         # Select each token's representative-atom coordinate by gathering on the per-token global atom index
         # (replaces a boolean mask over the atom axis; supports batched/sampled leading dims). pred_coords
         # is ``[..., N_sample, N_atom, 3]``; insert the sample axis into the per-token index before gathering.
-        rep_index = token_to_rep_atom.to(device=pred_coords.device, dtype=torch.long)
+        rep_index = token_to_rep_atom
         num_samples = pred_coords.shape[-3]
         sample_rep_index = insert_sample_axis(rep_index, num_samples)
         representative_coords = gather_atoms_by_index(pred_coords, sample_rep_index)
@@ -258,11 +269,11 @@ class ConfidencePairEmbedder(nn.Module):
         # torch.cdist does not implement CUDA bf16; keep the cast local to this distance calculation.
         distance = torch.cdist(representative_coords.to(torch.float32), representative_coords.to(torch.float32))
         distance_bins = ((distance[..., None] > self.lower_bins) & (distance[..., None] < self.upper_bins)).to(
-            distance.dtype
+            pair.dtype
         )
         pair = pair + self.distance_one_hot_projection(distance_bins)
         if self.distance_projection is not None:
-            pair = pair + self.distance_projection(distance.unsqueeze(-1))
+            pair = pair + self.distance_projection(distance.to(pair.dtype).unsqueeze(-1))
         return pair
 
 
@@ -322,8 +333,10 @@ class AtomConfidenceProjector(nn.Module):
         atom_token_index = atom_token_index.to(device=single.device, dtype=torch.long)
         plddt_weight = self._gather_atom_weight(self.plddt_weight, atom_token_index)
         resolved_weight = self._gather_atom_weight(self.resolved_weight, atom_token_index)
-        plddt_logits = torch.einsum("...nc,...ncb->...nb", self.plddt_norm(atom_single), plddt_weight)
-        resolved_logits = torch.einsum("...nc,...ncb->...nb", self.resolved_norm(atom_single), resolved_weight)
+        plddt_hidden = self.plddt_norm(atom_single)
+        resolved_hidden = self.resolved_norm(atom_single)
+        plddt_logits = torch.einsum("...nc,...ncb->...nb", plddt_hidden, plddt_weight.to(plddt_hidden))
+        resolved_logits = torch.einsum("...nc,...ncb->...nb", resolved_hidden, resolved_weight.to(resolved_hidden))
         return plddt_logits, resolved_logits
 
     def _gather_atom_weight(self, weight: Tensor, atom_token_index: Tensor) -> Tensor:
@@ -346,7 +359,7 @@ class PairConfidenceProjector(nn.Module):
     Project the pair representation to PAE and (symmetrized) PDE logits.
 
     PAE is projected from the normalized pair state. The PDE symmetrization convention differs between
-    families and is selected by ``symmetrize_before_projection``:
+    the AlphaFold 3 and Protenix implementations and is selected by ``symmetrize_before_projection``:
 
     - ``False`` (AlphaFold 3): symmetrize the projected distance-error *logits* --
       ``left = pde_projection(pde_norm(pair)); pde = left + left.transpose(-2, -3)`` -- matching DeepMind
@@ -391,15 +404,17 @@ class PairConfidenceProjector(nn.Module):
             ``(..., N_token, N_token, num_pde_bins)``.
         """
 
-        pae_logits = self.pae_projection(self.pae_norm(pair))
+        pae_pair = pair.to(dtype=self.pae_projection.weight.dtype)
+        pde_pair = pair.to(dtype=self.pde_projection.weight.dtype)
+        pae_logits = self.pae_projection(self.pae_norm(pae_pair))
         if self.symmetrize_before_projection:
-            pde_logits = self.pde_projection(self.pde_norm(pair + pair.transpose(-2, -3)))
+            pde_logits = self.pde_projection(self.pde_norm(pde_pair + pde_pair.transpose(-2, -3)))
         else:
             # DeepMind symmetrizes the distance-error LOGITS, not the pair state: it projects the raw
             # (unsymmetrized) pair through ``LayerNorm`` + ``left_half_distance_logits`` and only then
             # adds the transpose (``confidence_head.py``: ``left + swapaxes(left, -2, -3)``).  Because
             # ``LayerNorm`` is non-linear, symmetrizing the pair *before* the norm/projection is a
             # different function and diverges from the checkpoint; symmetrize after.
-            left_distance_logits = self.pde_projection(self.pde_norm(pair))
+            left_distance_logits = self.pde_projection(self.pde_norm(pde_pair))
             pde_logits = left_distance_logits + left_distance_logits.transpose(-2, -3)
         return pae_logits, pde_logits

@@ -1,36 +1,7 @@
-r"""Frozen pre-realization covalent-link core — ``SymbolicBond`` (§3.7.4).
+r"""Covalent links between existing or generated atoms.
 
-This is the constraint-layer counterpart that rides on top of the now-frozen placement
-core (:mod:`ofoldx.data.placement`) and the exact covalent surface
-(:mod:`ofoldx.data.molecular`). A :class:`SymbolicBond` is a covalent link declared
-BEFORE realization: unlike :class:`~ofoldx.data.molecular.SystemBond` (whose endpoints are
-already-realized :class:`~ofoldx.data.molecular.AtomSite` occurrences), a
-``SymbolicBond`` endpoint may be a *generated* atom named through the frozen placement
-reference vocabulary (:class:`~ofoldx.data.placement.SymbolicAtomSite` over the two-field
-:class:`~ofoldx.data.placement.SymbolicResidueSite`). Once realized, it lowers to a
-``SystemBond`` via :meth:`SymbolicBond.resolve`.
-
-Owner verdicts ratified 2026-07-19:
-
-* **D1 — explicit leaving atoms.** A generated-atom endpoint has no finalized
-  ``ChemicalComponent`` to carry :attr:`PolymerAttachment.leaving_atom_ids`, so the
-  leaving atoms deleted on bond formation ride EXPLICITLY on the bond as
-  ``leaving_a`` / ``leaving_b`` (``frozenset[str]`` of ``atom_id``). This is lossless and
-  can always be re-derived by a family helper later; inference-only could not be added back
-  without breaking identity.
-* **D2 — unordered physical identity.** Identity is the UNORDERED endpoint set (a
-  ``frozenset`` of the two endpoints), mirroring ``SystemBond`` (whose identity is enforced
-  as a frozenset on ``MolecularSystem``). ``site_a`` / ``site_b`` positional order is
-  retained ONLY to anchor per-endpoint leaving-atom attribution (``leaving_a`` pairs with
-  ``site_a``, ``leaving_b`` with ``site_b``); it carries no directional chemistry.
-
-There is deliberately **no** ``intent`` field: hard/soft is family-owned (it rides on the
-family condition envelope, exactly as the placement freeze re-homed ``intent`` /
-``chain_lengths``). Chemistry (``order`` / ``aromatic`` / ``stereo``) is kept so the
-lowering to ``SystemBond`` is lossless — ODesign's hardcoded ``1.0`` / ``False`` becomes
-explicit rather than lost.
-
-``@dataclass(frozen=True)`` denotes runtime immutability.
+Symbolic bonds resolve generated endpoints through a :data:`PlacementMap`. Endpoint
+identity is unordered, while each leaving-atom set remains associated with its site.
 """
 
 from __future__ import annotations
@@ -45,14 +16,7 @@ from .placement import (
     resolve,
 )
 
-#: One atom-granularity bond endpoint, promoted from the per-family ``AtomReference`` alias
-#: (``rfdiffusion``/``odesign`` ``conditions.py``). Either an EXISTING realized atom
-#: (:class:`~ofoldx.data.molecular.AtomSite`, whose ``(instance_id, component_index)`` IS a
-#: :data:`~ofoldx.data.molecular.ComponentReference`) or a GENERATED atom
-#: (:class:`~ofoldx.data.placement.SymbolicAtomSite` over the frozen two-field
-#: :class:`~ofoldx.data.placement.SymbolicResidueSite`). The whole resolution chain is
-#: closed by the placement freeze:
-#: ``SymbolicAtomSite -> SymbolicResidueSite -> resolve() -> ComponentReference -> AtomSite``.
+#: An existing atom or a generated atom with a symbolic residue reference.
 SymbolicBondSite: TypeAlias = AtomSite | SymbolicAtomSite
 
 
@@ -61,14 +25,7 @@ def resolve_bond_site(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> AtomSite:
-    r"""Lower one :data:`SymbolicBondSite` endpoint to a realized :class:`AtomSite`.
-
-    An :class:`AtomSite` endpoint is already realized and returned unchanged. A
-    :class:`~ofoldx.data.placement.SymbolicAtomSite` endpoint resolves its
-    :class:`~ofoldx.data.placement.SymbolicResidueSite` to a
-    :data:`~ofoldx.data.molecular.ComponentReference` through the frozen placement
-    :func:`~ofoldx.data.placement.resolve`, then re-attaches the named ``atom_id``.
-    """
+    r"""Resolve a symbolic bond site, or return an existing atom site unchanged."""
 
     if isinstance(site, AtomSite):
         return site
@@ -78,20 +35,10 @@ def resolve_bond_site(
 
 @dataclass(frozen=True, eq=False)
 class SymbolicBond:
-    r"""A pre-realization covalent bond; endpoints reference the frozen placement model.
+    r"""A covalent bond with existing or symbolic endpoints.
 
-    Physical identity is the UNORDERED endpoint set (:attr:`endpoints`), mirroring
-    :class:`~ofoldx.data.molecular.SystemBond`. ``site_a`` / ``site_b`` order is retained
-    ONLY to anchor per-endpoint leaving-atom attribution: ``leaving_a`` names ``atom_id``
-    values deleted from ``site_a`` on bond formation and ``leaving_b`` from ``site_b``.
-    Each :class:`~ofoldx.data.placement.SymbolicAtomSite` endpoint resolves to a
-    :class:`~ofoldx.data.molecular.AtomSite`; an ``AtomSite`` endpoint is already realized.
-    The pair lowers to
-    ``SystemBond(site_a, site_b, order, aromatic, stereo, origin="user")`` via
-    :meth:`resolve` (leaving atoms are family-deleted from the realized components, not
-    carried on ``SystemBond``, which has no leaving-atom concept).
-
-    There is deliberately no ``intent`` field: hard/soft is family-owned.
+    Equality and hashing are unordered over ``(site, leaving_atoms)`` pairs. Bond
+    order, aromaticity, and stereochemistry are preserved by :meth:`resolve`.
     """
 
     site_a: SymbolicBondSite
@@ -108,19 +55,12 @@ class SymbolicBond:
 
     @property
     def endpoints(self) -> frozenset[SymbolicBondSite]:
-        r"""The UNORDERED physical identity: the ``frozenset`` of both endpoints."""
+        r"""Return both endpoints as an unordered set."""
 
         return frozenset((self.site_a, self.site_b))
 
     def _identity(self) -> tuple[object, ...]:
-        r"""The UNORDERED equality/hash key (§3.7.4 D2).
-
-        Endpoints are physically UNORDERED, so identity is the ``frozenset`` of the two
-        ``(site, leaving)`` pairs — the leaving-atom set rides WITH its site, so swapping
-        ``site_a`` / ``site_b`` (and correspondingly ``leaving_a`` / ``leaving_b``) names
-        the same bond. Directionless chemistry (``order`` / ``aromatic`` / ``stereo``)
-        completes the key.
-        """
+        r"""Return the unordered equality and hash key."""
 
         return (
             frozenset(((self.site_a, self.leaving_a), (self.site_b, self.leaving_b))),
@@ -142,14 +82,7 @@ class SymbolicBond:
         placement_map: PlacementMap,
         instance_of: dict[str, str],
     ) -> SystemBond:
-        r"""Lower to a realized :class:`~ofoldx.data.molecular.SystemBond`.
-
-        Each endpoint is resolved by :func:`resolve_bond_site`; the chemistry
-        (``order`` / ``aromatic`` / ``stereo``) is carried through unchanged and ``origin``
-        is fixed to ``"user"``. Leaving atoms (``leaving_a`` / ``leaving_b``) are NOT placed
-        on the ``SystemBond`` (which has no leaving-atom concept); a family strips them from
-        the realized components separately.
-        """
+        r"""Resolve both endpoints to a user-origin :class:`SystemBond`."""
 
         return SystemBond(
             site_a=resolve_bond_site(self.site_a, placement_map, instance_of),

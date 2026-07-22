@@ -16,20 +16,11 @@ BondOrigin: TypeAlias = Literal[
     "user",
 ]
 
-# ── One-letter symbol -> component_id: one canonical table, explicit policy ──
-# Single source of truth for the one-letter-code -> chemical-component-id concept,
-# formerly split between molecular._ONE_LETTER_COMPONENTS (strict: U->SEC/O->PYL,
-# raises on X/N/B/Z) and residue_constants.{restype_1to3, restype_1to3_with_unknown,
-# dna_1to3, rna_1to3} (permissive: X->UNK, N->N/DN). The tables genuinely diverged on
-# how a symbol resolves; here one canonical set per polymer type is resolved under an
-# explicit ``SymbolPolicy`` that selects reject-vs-fallback on unresolved symbols:
-#   * ``"strict"``    resolve exact chemistry (standard residues plus the rare-but-
-#                     unambiguous extensions SEC/PYL/inosine); raise on anything else.
-#   * ``"permissive"`` resolve the common standard core only; every other symbol falls
-#                     back to the polymer's unknown-residue placeholder component.
+# One-letter symbols resolve against a shared standard core. Strict mode includes
+# unambiguous extensions; permissive mode uses polymer-specific unknown components.
 SymbolPolicy: TypeAlias = Literal["strict", "permissive"]
 
-# The common standard core every caller agrees on.
+# Standard residues shared by both symbol policies.
 _STANDARD_COMPONENTS: dict[str, dict[str, str]] = {
     "protein": {
         "A": "ALA",
@@ -79,7 +70,7 @@ def one_letter_to_component(
     extensions (protein ``U``->``SEC``/``O``->``PYL``, nucleic inosine, DNA ``U``) and
     raises ``KeyError`` on any other symbol. ``policy="permissive"`` resolves only the
     standard core and returns the polymer's unknown-residue placeholder for everything
-    else (matching the former ``.get(symbol, <unknown>)`` maps).
+    else.
     """
 
     standard = _STANDARD_COMPONENTS[polymer_type]
@@ -93,22 +84,18 @@ def one_letter_to_component(
     raise KeyError(symbol)
 
 
-# ── Neutral one-letter <-> component_id maps (relocated from residue_constants) ──
-# These are coordinate-free chemistry facts keyed on component_id, not AF2 torsion
-# geometry, so they live in this neutral home; residue_constants re-exports them for
-# its historical importers. Derived from the canonical tables above so there is one
-# source of truth.
+# Coordinate-free one-letter/component mappings derived from the canonical tables.
 restype_1to3: dict[str, str] = dict(_STANDARD_COMPONENTS["protein"])
 restype_3to1: dict[str, str] = {component: letter for letter, component in restype_1to3.items()}
 # The 20 standard amino-acid component ids as an order-independent membership set, for
 # callers that only need "is this a standard amino acid" (e.g. the PDB reader). This is a
 # general chemistry fact, distinct from any model's token ordering (e.g. the MPNN vocab).
 STANDARD_AMINO_ACID_IDS: frozenset[str] = frozenset(restype_3to1)
-# ``restype_1to3`` extended with the unknown-residue letter ``X`` -> ``UNK`` (the official
-# Protenix ``json_parser.PROTEIN_1to3`` map). Kept distinct so callers opt in to ``X``.
+# ``restype_1to3`` extended with the unknown-residue letter ``X`` -> ``UNK``. Kept
+# distinct so callers opt in to ``X``.
 restype_1to3_with_unknown: dict[str, str] = {**restype_1to3, "X": "UNK"}
-# One-letter -> CCD-code maps for nucleic polymers (upstream ``json_parser.DNA_1to3`` /
-# ``RNA_1to3``): standard core plus the strict extensions plus the permissive unknowns.
+# One-letter -> CCD-code maps for nucleic polymers: standard core plus the strict
+# extensions and permissive unknowns.
 dna_1to3: dict[str, str] = {
     **_STANDARD_COMPONENTS["dna"],
     **_EXTENDED_COMPONENTS["dna"],
@@ -251,7 +238,7 @@ class PolymerSequence:
         *,
         polymer_type: PolymerType = "protein",
     ) -> PolymerSequence:
-        r"""Resolve an unambiguous one-letter sequence to audited components."""
+        r"""Resolve an unambiguous one-letter sequence to built-in components."""
 
         if polymer_type == "dna_rna_hybrid":
             raise ValueError("a DNA/RNA hybrid requires explicit component occurrences")
@@ -443,7 +430,7 @@ class MolecularSystem:
                     yield AtomSite(instance_id, component_index, atom.atom_id), atom
 
     def iter_bonds(self) -> Iterator[SystemBond]:
-        r"""Materialize the known covalent graph as one SystemBond per owner-layer edge."""
+        r"""Materialize the known covalent graph as one SystemBond per stored covalent edge."""
 
         realized = {site for site, _ in self.iter_atoms()}
         for instance_id, entity_id in self.instances.items():
@@ -465,15 +452,15 @@ class MolecularSystem:
                             origin="component",
                         )
             if isinstance(entity, Molecule):
-                for bond in entity.bonds:
-                    site_a = AtomSite(instance_id, bond.component_a, bond.atom_a)
-                    site_b = AtomSite(instance_id, bond.component_b, bond.atom_b)
+                for molecule_bond in entity.bonds:
+                    site_a = AtomSite(instance_id, molecule_bond.component_a, molecule_bond.atom_a)
+                    site_b = AtomSite(instance_id, molecule_bond.component_b, molecule_bond.atom_b)
                     if site_a in realized and site_b in realized:
                         yield SystemBond(
                             site_a,
                             site_b,
-                            order=bond.order,
-                            aromatic=bond.aromatic,
+                            order=molecule_bond.order,
+                            aromatic=molecule_bond.aromatic,
                             stereo=None,
                             stereo_sites=None,
                             origin="molecule",
@@ -497,3 +484,29 @@ class MolecularSystem:
                             )
 
         yield from self.bonds
+
+    def retain_bonds_after_component_mutation(
+        self,
+        mutated: MolecularSystem,
+        changed_components: set[ComponentReference] | frozenset[ComponentReference],
+    ) -> frozenset[SystemBond]:
+        r"""Drop a stored bond only when component mutation removed one of its sites."""
+
+        retained = []
+        for bond in self.bonds:
+            sites = (
+                (bond.site_a, bond.site_b)
+                if bond.stereo_sites is None
+                else (bond.site_a, bond.site_b, *bond.stereo_sites)
+            )
+            removed_by_mutation = False
+            for site in sites:
+                try:
+                    mutated.atom(site)
+                except KeyError:
+                    if (site.instance_id, site.component_index) not in changed_components:
+                        raise
+                    removed_by_mutation = True
+            if not removed_by_mutation:
+                retained.append(bond)
+        return frozenset(retained)

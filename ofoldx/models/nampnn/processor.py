@@ -17,12 +17,12 @@ from ...data.structure import Structure
 from ...io.structure import read_structure
 from .config import NaMpnnProcessorConfig
 from .model import (
-    _DNA_TOKENS,
-    _PROTEIN_TOKENS,
-    _RNA_SEPARATE_TOKENS,
-    _RNA_SHARED_TOKENS,
+    DNA_GENERATABLE_TOKEN_IDS,
     MIXED_POLYMER_ATOM_NAMES,
     MIXED_POLYMER_TOKEN_BY_COMPONENT,
+    PROTEIN_GENERATABLE_TOKEN_IDS,
+    RNA_SEPARATE_GENERATABLE_TOKEN_IDS,
+    RNA_SHARED_GENERATABLE_TOKEN_IDS,
     NaMpnnInput,
 )
 
@@ -63,8 +63,6 @@ class NaMpnnProcessor:
     token.
     """
 
-    config_class = NaMpnnProcessorConfig
-
     def __init__(
         self,
         config: NaMpnnProcessorConfig | None = None,
@@ -91,7 +89,7 @@ class NaMpnnProcessor:
 
     def __call__(
         self,
-        input: Structure | MolecularSystem | str | PathLike[str],
+        input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         positions: Sequence[ComponentReference] | None = None,
@@ -123,9 +121,7 @@ class NaMpnnProcessor:
     # ------------------------------------------------------------------
     # Shared lowering.
     # ------------------------------------------------------------------
-    def _read(self, input: Structure | MolecularSystem | str | PathLike[str]) -> Structure:
-        if isinstance(input, MolecularSystem):
-            raise ValueError("NA-MPNN requires backbone coordinates; pass a Structure or local structure path")
+    def _read(self, input: Structure | str | PathLike[str]) -> Structure:
         if isinstance(input, (str, PathLike)):
             input = read_structure(Path(input).expanduser())
         if not isinstance(input, Structure):
@@ -139,7 +135,7 @@ class NaMpnnProcessor:
             return "dna"
         if component_id in _RNA_COMPONENTS:
             return "rna"
-        return "protein"
+        raise ValueError(f"NA-MPNN cannot consume polymer type {entity.polymer_type!r}")
 
     def _lower_rows(self, structure: Structure) -> list[_Row]:
         r"""Lower every polymer residue to aligned coordinates, masks, and identity."""
@@ -169,7 +165,6 @@ class NaMpnnProcessor:
                     present = (
                         index is not None
                         and bool(structure.coordinate_mask[index])
-                        and bool(np.isfinite(structure.coordinates[index]).all())
                         and (occupancy is None or bool(np.isnan(occupancy[index])) or float(occupancy[index]) > 0.0)
                     )
                     row_mask.append(present)
@@ -228,10 +223,14 @@ class NaMpnnProcessor:
 
     def _generatable_tokens(self, polymer_type: str) -> tuple[int, ...]:
         if polymer_type == "protein":
-            return _PROTEIN_TOKENS
+            return PROTEIN_GENERATABLE_TOKEN_IDS
         if polymer_type == "dna":
-            return _DNA_TOKENS
-        return _RNA_SHARED_TOKENS if self.config.shared_nucleic_tokens else _RNA_SEPARATE_TOKENS
+            return DNA_GENERATABLE_TOKEN_IDS
+        return (
+            RNA_SHARED_GENERATABLE_TOKEN_IDS
+            if self.config.shared_nucleic_tokens
+            else RNA_SEPARATE_GENERATABLE_TOKEN_IDS
+        )
 
     def _tensor(self, values: list, dtype: torch.dtype) -> Tensor:
         return torch.tensor(values, device=self.device, dtype=dtype).unsqueeze(0)
@@ -297,6 +296,11 @@ class NaMpnnProcessor:
             for row in rows
         ]
         selected = None if positions is None else set(positions)
+        if selected is not None:
+            references = {row[0] for row in rows}
+            missing = selected - references
+            if missing:
+                raise ValueError(f"NA-MPNN positions are not polymer residues: {sorted(missing)!r}")
         design_mask = [bool(row[7] and (selected is None or row[0] in selected)) for row in rows]
         token_group_ids = list(range(len(rows)))
         return self._base_input(
@@ -338,7 +342,7 @@ class NaMpnnProcessor:
             if isinstance(value, str):
                 component_ids = tuple(
                     component.component_id
-                    for component in PolymerSequence.from_one_letter(value, entity.polymer_type).components
+                    for component in PolymerSequence.from_one_letter(value, polymer_type=entity.polymer_type).components
                 )
             else:
                 component_ids = tuple(value)
@@ -422,16 +426,17 @@ class NaMpnnProcessor:
                 union(members[0], member)
         restrictions: list[set[str] | None] = [None] * length
         for condition in conditions:
-            if type(condition) is TiedResidueIdentities:
+            if isinstance(condition, TiedResidueIdentities):
                 for group in condition.groups:
                     members = [index_by_reference[reference] for reference in group]
                     for member in members[1:]:
                         union(members[0], member)
-            elif type(condition) is AllowedResidueIdentities:
+            elif isinstance(condition, AllowedResidueIdentities):
                 for target in condition.positions:
                     index = index_by_reference[target]
                     allowed = set(condition.component_ids)
-                    restrictions[index] = allowed if restrictions[index] is None else restrictions[index] & allowed
+                    current = restrictions[index]
+                    restrictions[index] = allowed if current is None else current & allowed
             else:
                 raise TypeError("NA-MPNN conditions must be AllowedResidueIdentities or TiedResidueIdentities")
 
@@ -443,13 +448,17 @@ class NaMpnnProcessor:
         for members in groups.values():
             polymer_types = {rows[index][2] for index in members}
             exact_tie = any(
-                type(condition) is TiedResidueIdentities
+                isinstance(condition, TiedResidueIdentities)
                 and any(index_by_reference[reference] in members for group in condition.groups for reference in group)
                 for condition in conditions
             )
             if exact_tie and len(polymer_types) != 1:
                 raise ValueError("NA-MPNN cannot tie exact residue identities across different polymer types")
-            declared = [restrictions[index] for index in members if restrictions[index] is not None]
+            declared: list[set[str]] = []
+            for index in members:
+                restriction = restrictions[index]
+                if restriction is not None:
+                    declared.append(restriction)
             if declared:
                 allowed = set.intersection(*declared)
                 for index in members:
@@ -502,9 +511,9 @@ class NaMpnnProcessor:
                 raise ValueError(f"unknown NA-MPNN omit token {token!r}")
         mask = torch.zeros(1, len(rows), _VOCAB_SIZE, dtype=torch.bool, device=self.device)
         for index, row in enumerate(rows):
-            for token in self._generatable_tokens(row[2]):
-                if token not in omit_tokens:
-                    mask[0, index, token] = True
+            for generated_token in self._generatable_tokens(row[2]):
+                if generated_token not in omit_tokens:
+                    mask[0, index, generated_token] = True
         return mask
 
     def _dense_ids(self, roots: list[int]) -> list[int]:

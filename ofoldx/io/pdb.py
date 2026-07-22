@@ -1,403 +1,350 @@
-r"""Canonical PDB reader shared by the released MPNN models.
-
-This module owns :func:`read_pdb`, the reader the released MPNN models (ProteinMPNN,
-LigandMPNN, MpnnPacker) parse their inputs through. It reproduces those models'
-exact PDB semantics: hybrid-36 residue-number decoding with the biotite layout
-fallback, single-model / first-altloc selection, and audited protein-component
-reconstruction from the package component tables.
-
-This is deliberately distinct from :func:`ofoldx.io.read_structure`, the general
-canonical structure reader in :mod:`ofoldx.io.structure`. ``read_structure`` handles
-both PDB and mmCIF, exposes explicit model / assembly / altloc / atom-layout policies
-and a ``LossReport`` fidelity contract, and is the entry point for generic Structure
-exchange. ``read_pdb`` is the narrower, policy-free MPNN-input path and is what the
-released model Pipelines call; prefer ``read_structure`` for anything outside that
-model-input boundary. The two are not interchangeable and neither silently delegates
-to the other.
-"""
+r"""Generic PDB codec for canonical :class:`ofoldx.data.Structure` values."""
 
 from __future__ import annotations
 
-import gzip
-from collections.abc import Sequence
-from os import PathLike
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
-try:
-    # biotite >= 1.7 exposes hybrid-36 codecs from the Rust extension.
-    from biotite.rust.structure.io.pdb import decode_hybrid36
-except ImportError:  # pragma: no cover - older biotite layout
-    from biotite.structure.io.pdb.hybrid36 import decode_hybrid36
-
-from ..data import STANDARD_AMINO_ACID_IDS
 from ..data.components import get_component
-from ..data.molecular import (
-    AtomSite,
-    ChemicalAtom,
-    ChemicalComponent,
-    ComponentReference,
-    MolecularSystem,
-    Molecule,
-    PolymerSequence,
+from ..data.molecular import AtomSite, Molecule, PolymerSequence, SystemBond
+from ..data.structure import Structure
+from .records import (
+    AtomRecord,
+    ParsedStructure,
+    atom_record_residue_key,
+    atom_records_from_array,
+    ordered_output_bonds,
+    reject_duplicate_atom_records,
+    selected_source_sites,
+    source_record_key,
 )
-from ..data.structure import ResidueNumber, Structure
-
-_ELEMENTS = (
-    "H",
-    "He",
-    "Li",
-    "Be",
-    "B",
-    "C",
-    "N",
-    "O",
-    "F",
-    "Ne",
-    "Na",
-    "Mg",
-    "Al",
-    "Si",
-    "P",
-    "S",
-    "Cl",
-    "Ar",
-    "K",
-    "Ca",
-    "Sc",
-    "Ti",
-    "V",
-    "Cr",
-    "Mn",
-    "Fe",
-    "Co",
-    "Ni",
-    "Cu",
-    "Zn",
-    "Ga",
-    "Ge",
-    "As",
-    "Se",
-    "Br",
-    "Kr",
-    "Rb",
-    "Sr",
-    "Y",
-    "Zr",
-    "Nb",
-    "Mo",
-    "Tc",
-    "Ru",
-    "Rh",
-    "Pd",
-    "Ag",
-    "Cd",
-    "In",
-    "Sn",
-    "Sb",
-    "Te",
-    "I",
-    "Xe",
-    "Cs",
-    "Ba",
-    "La",
-    "Ce",
-    "Pr",
-    "Nd",
-    "Pm",
-    "Sm",
-    "Eu",
-    "Gd",
-    "Tb",
-    "Dy",
-    "Ho",
-    "Er",
-    "Tm",
-    "Yb",
-    "Lu",
-    "Hf",
-    "Ta",
-    "W",
-    "Re",
-    "Os",
-    "Ir",
-    "Pt",
-    "Au",
-    "Hg",
-    "Tl",
-    "Pb",
-    "Bi",
-    "Po",
-    "At",
-    "Rn",
-    "Fr",
-    "Ra",
-    "Ac",
-    "Th",
-    "Pa",
-    "U",
-    "Np",
-    "Pu",
-    "Am",
-    "Cm",
-    "Bk",
-    "Cf",
-    "Es",
-    "Fm",
-    "Md",
-    "No",
-    "Lr",
-    "Rf",
-    "Db",
-    "Sg",
-    "Bh",
-    "Hs",
-    "Mt",
-    "Ds",
-    "Rg",
-    "Cn",
-    "Nh",
-    "Fl",
-    "Mc",
-    "Lv",
-    "Ts",
-    "Og",
-)
-ATOMIC_NUMBER_BY_ELEMENT = {element: index for index, element in enumerate(_ELEMENTS, 1)}
-_PROTEIN_COMPONENT_IDS = frozenset(
-    {
-        *STANDARD_AMINO_ACID_IDS,
-        "ASX",
-        "GLX",
-        "CME",
-        "CSB",
-        "CSO",
-        "GLH",
-        "HIP",
-        "HSE",
-        "LYN",
-        "MEN",
-        "MSE",
-        "PHD",
-        "PTR",
-        "SEC",
-        "SEP",
-        "TPO",
-        "UNK",
-    }
-)
-_ATOM_RECORD_PROTEIN_COMPONENT_IDS = frozenset({"ASH", "ARN", "CYX", "HID", "HIE", "HSD", "HSP", "TYM", "XAA", "XLE"})
 
 
-def read_pdb(
-    path: str | PathLike[str],
-    *,
-    chains: Sequence[str] | None = None,
-) -> Structure:
-    r"""Read the PDB representation shared by the released MPNN models."""
+@dataclass(frozen=True, slots=True)
+class PdbAtomRecord:
+    r"""One fully materialized PDB output row."""
 
-    source = Path(path).expanduser()
-    if source.suffix == ".gz":
-        handle = gzip.open(source, mode="rt", encoding="ascii")
-    else:
-        handle = source.open(encoding="ascii")
-    component_ids: dict[tuple[str, int, str], str] = {}
-    occurrence_order: list[tuple[str, int, str]] = []
-    atom_occurrences: set[tuple[str, int, str]] = set()
-    atom_rows: dict[
-        tuple[str, int, str],
-        list[tuple[str, str, int | None]],
-    ] = {}
-    rows: list[
-        tuple[
-            tuple[str, int, str],
-            str,
-            tuple[float, float, float],
-            float,
-        ]
-    ] = []
-    explicit_model = False
-    implicit_model = False
-    with handle:
-        for line in handle:
-            record = line[:6].strip()
-            if record == "MODEL":
-                if explicit_model or implicit_model:
-                    break
-                explicit_model = True
-                continue
-            if record == "ENDMDL":
-                if explicit_model:
-                    break
-                continue
-            if record not in {"ATOM", "HETATM"}:
-                continue
-            implicit_model = not explicit_model
+    site: AtomSite
+    serial: int
+    group: Literal["ATOM", "HETATM"]
+    atom_name: str
+    altloc_id: str
+    component_id: str
+    chain_id: str
+    residue_id: int
+    insertion_code: str
+    coordinates: tuple[float, float, float]
+    occupancy: float
+    b_factor: float
+    element: str
+    charge: int
 
-            chain_id = line[21:22].strip()
-            if chains is not None and chain_id not in chains:
-                continue
-            if line[16:17].strip() not in {"", "A"}:
-                continue
 
-            number = decode_hybrid36(line[22:26])
-            insertion_code = line[26:27].strip()
-            occurrence = (chain_id, number, insertion_code)
-            component_id = line[17:20].strip()
-            previous_component_id = component_ids.get(occurrence)
-            if previous_component_id is None:
-                component_ids[occurrence] = component_id
-            elif previous_component_id != component_id:
-                raise ValueError(
-                    f"PDB occurrence {occurrence!r} has conflicting component IDs "
-                    f"{previous_component_id!r} and {component_id!r}"
-                )
-            if record == "ATOM":
-                atom_occurrences.add(occurrence)
-            if occurrence not in atom_rows:
-                occurrence_order.append(occurrence)
-                atom_rows[occurrence] = []
+def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStructure:
+    r"""Parse one PDB model or assembly into format-neutral atom records."""
 
-            atom_id = line[12:16].strip()
-            element = line[76:78].strip().title()
-            isotope = None
-            if element == "D":
-                element = "H"
-                isotope = 2
-            elif element == "T":
-                element = "H"
-                isotope = 3
-            coordinates = tuple(float(line[start : start + 8]) for start in (30, 38, 46))
-            occupancy_text = line[54:60].strip()
-            occupancy = float(occupancy_text) if occupancy_text else np.nan
-            atom_rows[occurrence].append((atom_id, element, isotope))
-            rows.append((occurrence, atom_id, coordinates, occupancy))
+    from biotite.structure.io.pdb import PDBFile
 
-    protein_occurrences: dict[str, list[tuple[str, int, str]]] = {}
-    is_protein: dict[tuple[str, int, str], bool] = {}
-    components: dict[tuple[str, int, str], ChemicalComponent] = {}
-    for occurrence in occurrence_order:
-        component_id = component_ids[occurrence]
-        protein = component_id in _PROTEIN_COMPONENT_IDS or (
-            component_id in _ATOM_RECORD_PROTEIN_COMPONENT_IDS and occurrence in atom_occurrences
-        )
-        is_protein[occurrence] = protein
-        if protein:
-            protein_occurrences.setdefault(occurrence[0], []).append(occurrence)
-        if protein and (component_id in STANDARD_AMINO_ACID_IDS or component_id == "UNK"):
-            audited = get_component(component_id)
-            audited_atoms = {atom.atom_id: atom for atom in audited.atoms}
-            retained_atoms: dict[str, tuple[str, int | None]] = {}
-            for atom_id, element, isotope in atom_rows[occurrence]:
-                audited_atom = audited_atoms.get(atom_id)
-                if audited_atom is None:
-                    continue
-                if atom_id in retained_atoms:
-                    raise ValueError(f"PDB occurrence {occurrence!r} contains duplicate atom {atom_id!r}")
-                if not element:
-                    element = audited_atom.element
-                    isotope = audited_atom.isotope
-                elif element not in ATOMIC_NUMBER_BY_ELEMENT:
-                    raise ValueError(
-                        f"PDB atom {atom_id!r} in occurrence {occurrence!r} has invalid element {element!r}"
-                    )
-                elif element != audited_atom.element:
-                    raise ValueError(
-                        f"PDB atom {atom_id!r} in occurrence {occurrence!r} has element {element!r}, "
-                        f"expected {audited_atom.element!r}"
-                    )
-                retained_atoms[atom_id] = (element, isotope)
-            declared_atoms = {
-                atom.atom_id
-                for atom in audited.atoms
-                if component_id in STANDARD_AMINO_ACID_IDS and atom.element != "H" and atom.atom_id != "OXT"
-            }
-            declared_atoms.update(retained_atoms)
-            components[occurrence] = ChemicalComponent(
-                component_id=component_id,
-                atoms=tuple(
-                    ChemicalAtom(
-                        atom_id=atom.atom_id,
-                        element=retained_atoms.get(atom.atom_id, (atom.element, atom.isotope))[0],
-                        isotope=retained_atoms.get(atom.atom_id, (atom.element, atom.isotope))[1],
-                    )
-                    for atom in audited.atoms
-                    if atom.atom_id in declared_atoms
-                ),
-                bonds=None,
+    pdb_file = PDBFile.read(str(path))
+    try:
+        if assembly_id is None:
+            array = pdb_file.get_structure(
+                model=model,
+                altloc="all",
+                extra_fields=["atom_id", "b_factor", "occupancy", "charge"],
+                include_bonds=False,
             )
         else:
-            atoms: list[ChemicalAtom] = []
-            for atom_id, element, isotope in atom_rows[occurrence]:
-                if not element or element not in ATOMIC_NUMBER_BY_ELEMENT:
-                    raise ValueError(
-                        f"PDB atom {atom_id!r} in occurrence {occurrence!r} has invalid element {element!r}"
-                    )
-                atoms.append(ChemicalAtom(atom_id=atom_id, element=element, isotope=isotope))
-            components[occurrence] = ChemicalComponent(
-                component_id=component_id,
-                atoms=tuple(atoms),
-                bonds=None,
+            array = pdb_file.get_assembly(
+                assembly_id=assembly_id,
+                model=model,
+                altloc="all",
+                extra_fields=["atom_id", "b_factor", "occupancy", "charge"],
+                include_bonds=False,
             )
-
-    component_references: dict[tuple[str, int, str], ComponentReference] = {}
-    entities: dict[str, PolymerSequence | Molecule] = {}
-    instances: dict[str, str] = {}
-    protein_component_indices: dict[tuple[str, int, str], int] = {}
-    for occurrences in protein_occurrences.values():
-        for component_index, occurrence in enumerate(occurrences):
-            protein_component_indices[occurrence] = component_index
-
-    seen_protein_chains: set[str] = set()
-    molecule_count = 0
-    for occurrence in occurrence_order:
-        if is_protein[occurrence]:
-            chain_id = occurrence[0]
-            component_references[occurrence] = (
-                chain_id,
-                protein_component_indices[occurrence],
-            )
-            if chain_id in seen_protein_chains:
-                continue
-            seen_protein_chains.add(chain_id)
-            entity = PolymerSequence(
-                "protein",
-                tuple(components[item] for item in protein_occurrences[chain_id]),
-            )
-            entities[chain_id] = entity
-            instances[chain_id] = chain_id
-        else:
-            molecule_count += 1
-            instance_id = f"molecule_{molecule_count}"
-            component_references[occurrence] = (instance_id, 0)
-            entities[instance_id] = Molecule((components[occurrence],))
-            instances[instance_id] = instance_id
-
-    system = MolecularSystem(entities, instances)
-    realized_sites = {site for site, _atom in system.iter_atoms()}
-    sites: list[AtomSite] = []
-    coordinates: list[tuple[float, float, float]] = []
-    occupancies: list[float] = []
-    for occurrence, atom_id, coordinate, occupancy in rows:
-        instance_id, component_index = component_references[occurrence]
-        site = AtomSite(instance_id, component_index, atom_id)
-        if site not in realized_sites:
-            continue
-        sites.append(site)
-        coordinates.append(coordinate)
-        occupancies.append(occupancy)
-
-    residue_numbers = {
-        component_references[occurrence]: ResidueNumber(occurrence[1], occurrence[2])
-        for occurrence in occurrence_order
-        if is_protein[occurrence]
-    }
-    return Structure(
-        system,
-        tuple(sites),
-        np.asarray(coordinates).reshape((-1, 3)),
-        np.ones(len(sites), dtype=np.bool_),
-        np.asarray(occupancies),
-        residue_numbers,
+    except IndexError as error:
+        raise ValueError(f"PDB does not contain requested model {model}") from error
+    except KeyError as error:
+        raise ValueError(f"PDB does not contain requested assembly {assembly_id!r}") from error
+    rows = atom_records_from_array(array, format_name="pdb")
+    reject_duplicate_atom_records(rows)
+    try:
+        lines = tuple(path.read_text(encoding="ascii").splitlines())
+    except UnicodeDecodeError as error:
+        raise ValueError("PDB input must be ASCII text") from error
+    return ParsedStructure(
+        format="pdb",
+        rows=rows,
+        canonical_payload=None,
+        pdb_lines=lines,
     )
+
+
+def read_pdb_bonds(
+    parsed: ParsedStructure,
+    selected_rows: tuple[AtomRecord, ...],
+    site_by_row_index: dict[int, AtomSite],
+) -> tuple[SystemBond, ...]:
+    r"""Decode PDB ``CONECT`` declarations against selected canonical sites."""
+
+    conect_lines = [line for line in parsed.pdb_lines if line.startswith("CONECT")]
+    directed_counts: dict[tuple[str, str], int] = {}
+    for line in conect_lines:
+        source_serial = line[6:11].strip()
+        if not source_serial:
+            continue
+        targets = [line[start : start + 5].strip() for start in range(11, len(line), 5)]
+        targets = [target for target in targets if target]
+        for target_serial in set(targets):
+            directed_counts[(source_serial, target_serial)] = max(
+                directed_counts.get((source_serial, target_serial), 0), targets.count(target_serial)
+            )
+    source_row_by_serial: dict[tuple[str | None, str], AtomRecord] = {}
+    for row in parsed.rows:
+        if row.serial is None:
+            continue
+        key = (row.symmetry_id, row.serial)
+        previous = source_row_by_serial.get(key)
+        if previous is not None and atom_record_residue_key(previous) != atom_record_residue_key(row):
+            raise ValueError(f"PDB atom serial {row.serial!r} is ambiguous")
+        source_row_by_serial[key] = row
+    declared_serials = {serial for pair in directed_counts for serial in pair}
+    available_serials = {serial for _, serial in source_row_by_serial}
+    missing_serials = declared_serials - available_serials
+    if missing_serials:
+        raise ValueError(f"PDB CONECT references unknown atom serials: {sorted(missing_serials)!r}")
+    selected_sites = selected_source_sites(selected_rows, site_by_row_index)
+    symmetry_ids = {row.symmetry_id for row in selected_rows}
+    bonds: dict[tuple[str | None, frozenset[str]], SystemBond] = {}
+    undirected_serials = {frozenset(pair) for pair in directed_counts if pair[0] != pair[1]}
+    for symmetry_id in symmetry_ids:
+        for serials in undirected_serials:
+            if len(serials) != 2:
+                continue
+            serial_a, serial_b = sorted(serials)
+            row_a = source_row_by_serial.get((symmetry_id, serial_a))
+            row_b = source_row_by_serial.get((symmetry_id, serial_b))
+            if row_a is None or row_b is None:
+                continue
+            site_a = selected_sites.get(source_record_key(row_a))
+            site_b = selected_sites.get(source_record_key(row_b))
+            if site_a is None or site_b is None or site_a == site_b:
+                continue
+            order = max(
+                directed_counts.get((serial_a, serial_b), 0),
+                directed_counts.get((serial_b, serial_a), 0),
+                1,
+            )
+            if order > 4:
+                raise ValueError(f"unsupported PDB CONECT bond multiplicity {order}")
+            bond = SystemBond(
+                site_a,
+                site_b,
+                order=float(order),
+                origin="source",
+            )
+            bonds[(symmetry_id, serials)] = bond
+    return tuple(bonds.values())
+
+
+def pdb_loss_fields(
+    structure: Structure,
+    atoms: tuple[PdbAtomRecord, ...],
+    dropped: set[str],
+    rewritten: set[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    r"""Return sorted canonical fields dropped or rewritten by PDB output."""
+
+    # LossReport covers information represented by Structure and MolecularSystem;
+    # unrepresented source annotations are outside its scope.
+    system = structure.system
+    written_sites = {atom.site for atom in atoms}
+    atoms_by_instance: dict[str, list[PdbAtomRecord]] = {}
+    for atom in atoms:
+        atoms_by_instance.setdefault(atom.site.instance_id, []).append(atom)
+    for instance_id, entity_id in system.instances.items():
+        instance_atoms = atoms_by_instance.get(instance_id, [])
+        if not instance_atoms:
+            dropped.add("system.instances")
+            continue
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            observed_components = {atom.site.component_index for atom in instance_atoms}
+            if observed_components != set(range(len(entity))):
+                dropped.add("system.polymer_sequence")
+    if any(bond.site_a not in written_sites or bond.site_b not in written_sites for bond in system.bonds):
+        dropped.add("system.bonds")
+    if any(bond.origin != "source" for bond in system.bonds):
+        rewritten.add("system.bond_origins")
+    if any(isinstance(entity, Molecule) for entity in system.entities.values()):
+        dropped.add("system.nonpolymer_graph")
+    polymer_components = {
+        component.component_id: component
+        for entity in system.entities.values()
+        if isinstance(entity, PolymerSequence)
+        for component in entity.components
+    }
+    for component in polymer_components.values():
+        try:
+            builtin = get_component(component.component_id)
+        except KeyError:
+            dropped.add("system.nonstandard_components")
+            break
+        if builtin != component:
+            dropped.add("system.nonstandard_components")
+            break
+    if any(bond.stereo is not None or bond.aromatic or bond.order not in {1.0, 2.0, 3.0, 4.0} for bond in system.bonds):
+        dropped.add("system.bond_semantics")
+    return tuple(sorted(dropped)), tuple(sorted(rewritten))
+
+
+def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], set[str], set[str]]:
+    r"""Materialize PDB rows and collect dropped or rewritten field tokens."""
+
+    # Structure has no source-identity, alternate-location, or B-factor fields. The
+    # writer derives identity columns, emits one conformer, and writes B factor 0.
+    residue_numbers = structure.residue_numbers or {}
+    dropped: set[str] = set()
+    rewritten: set[str] = set()
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    instance_sites: dict[str, list[AtomSite]] = {}
+    for site in structure.sites:
+        instance_sites.setdefault(site.instance_id, []).append(site)
+    if len(instance_sites) > len(alphabet):
+        raise ValueError("PDB supports at most 62 distinct one-character chain IDs")
+    chain_by_instance: dict[str, str] = {}
+    used_chains: set[str] = set()
+    for instance_id in instance_sites:
+        preferred = instance_id
+        if len(preferred) == 1 and preferred not in used_chains and preferred.isalnum():
+            chain = preferred
+        else:
+            chain = next(value for value in alphabet if value not in used_chains)
+            rewritten.add("system.instance_ids")
+        chain_by_instance[instance_id] = chain
+        used_chains.add(chain)
+
+    atoms: list[PdbAtomRecord] = []
+    names_by_residue: dict[tuple[str, int, str], set[str]] = {}
+    for site_index, site in enumerate(structure.sites):
+        if not bool(structure.coordinate_mask[site_index]):
+            dropped.add("structure.coordinate_mask")
+            continue
+        if len(atoms) >= 99999:
+            raise ValueError("PDB atom serial limit of 99999 was exceeded")
+        entity = structure.system.entities[structure.system.instances[site.instance_id]]
+        component = structure.system.component((site.instance_id, site.component_index))
+        canonical_component_id = component.component_id
+        canonical_residue_id = site.component_index + 1
+        residue_number = residue_numbers.get((site.instance_id, site.component_index))
+        if isinstance(entity, PolymerSequence):
+            try:
+                get_component(canonical_component_id)
+            except KeyError:
+                group: Literal["ATOM", "HETATM"] = "HETATM"
+            else:
+                group = "ATOM"
+        else:
+            group = "HETATM"
+        component_id = str(canonical_component_id)
+        if len(component_id) > 3:
+            component_id = component_id[:3]
+            rewritten.add("system.component_ids")
+        residue_id = residue_number.number if residue_number is not None else canonical_residue_id
+        residue_id = int(residue_id)
+        if residue_id < -999 or residue_id > 9999:
+            residue_id = canonical_residue_id
+            rewritten.add("structure.author_residue_ids")
+        insertion_code = residue_number.insertion_code if residue_number is not None else ""
+        if len(insertion_code) > 1:
+            insertion_code = insertion_code[0]
+            rewritten.add("structure.insertion_codes")
+        atom_name = site.atom_id
+        if len(atom_name) > 4:
+            atom_name = atom_name[:4]
+            rewritten.add("system.atom_ids")
+        residue_key = (chain_by_instance[site.instance_id], residue_id, insertion_code)
+        used_names = names_by_residue.setdefault(residue_key, set())
+        if atom_name in used_names:
+            raise ValueError(f"PDB atom-name rewrite collides within residue {residue_key!r}: {atom_name!r}")
+        used_names.add(atom_name)
+        altloc_id = ""
+        coordinate = tuple(float(value) for value in structure.coordinates[site_index])
+        if any(not np.isfinite(value) or value < -999.999 or value > 9999.999 for value in coordinate):
+            raise ValueError("PDB coordinate field range was exceeded")
+        rounded_coordinate = tuple(round(value, 3) for value in coordinate)
+        if not np.array_equal(np.asarray(rounded_coordinate, dtype=np.float32), structure.coordinates[site_index]):
+            rewritten.add("structure.coordinates")
+        if structure.occupancy is None or np.isnan(structure.occupancy[site_index]):
+            occupancy = 1.0
+            rewritten.add("structure.occupancy")
+        else:
+            occupancy = float(structure.occupancy[site_index])
+            if not np.isfinite(occupancy) or len(f"{occupancy:6.2f}") > 6:
+                raise ValueError("PDB occupancy field range was exceeded")
+            if np.float32(round(occupancy, 2)) != structure.occupancy[site_index]:
+                rewritten.add("structure.occupancy")
+        b_factor = 0.0
+        chemical_atom = structure.system.atom(site)
+        charge = chemical_atom.formal_charge or 0
+        if abs(charge) > 9:
+            dropped.add("system.formal_charge")
+            charge = 0
+        atoms.append(
+            PdbAtomRecord(
+                site=site,
+                serial=len(atoms) + 1,
+                group=group,
+                atom_name=atom_name,
+                altloc_id=altloc_id,
+                component_id=component_id,
+                chain_id=chain_by_instance[site.instance_id],
+                residue_id=residue_id,
+                insertion_code=insertion_code,
+                coordinates=rounded_coordinate,  # type: ignore[arg-type]
+                occupancy=round(occupancy, 2),
+                b_factor=round(b_factor, 2),
+                element=chemical_atom.element,
+                charge=charge,
+            )
+        )
+    return tuple(atoms), dropped, rewritten
+
+
+def write_pdb(structure: Structure, path: Path, atoms: tuple[PdbAtomRecord, ...]) -> None:
+    r"""Write prepared PDB atom records and representable system bonds."""
+
+    lines: list[str] = []
+    serial_by_site = {atom.site: atom.serial for atom in atoms}
+    for atom in atoms:
+        x, y, z = atom.coordinates
+        atom_name = _format_pdb_atom_name(atom.atom_name, atom.element)
+        charge = "  " if atom.charge == 0 else f"{abs(atom.charge)}{'+' if atom.charge > 0 else '-'}"
+        lines.append(
+            f"{atom.group:<6}{atom.serial:>5} {atom_name}{atom.altloc_id or ' '}{atom.component_id:>3} "
+            f"{atom.chain_id}{atom.residue_id:>4}{atom.insertion_code or ' '}   "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{atom.occupancy:>6.2f}{atom.b_factor:>6.2f}          "
+            f"{atom.element:>2}{charge:>2}"
+        )
+    for bond in ordered_output_bonds(structure.system):
+        source_serial = serial_by_site.get(bond.site_a)
+        target_serial = serial_by_site.get(bond.site_b)
+        if source_serial is None or target_serial is None:
+            continue
+        multiplicity = int(bond.order) if bond.order in {1.0, 2.0, 3.0, 4.0} else 1
+        targets = [target_serial] * multiplicity
+        for start in range(0, len(targets), 4):
+            lines.append(f"CONECT{source_serial:>5}" + "".join(f"{serial:>5}" for serial in targets[start : start + 4]))
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def _format_pdb_atom_name(atom_name: str, element: str) -> str:
+    if len(atom_name) >= 4:
+        return atom_name[:4]
+    if len(element) == 1 and not atom_name[0].isdigit():
+        return f" {atom_name:<3}"
+    return f"{atom_name:<4}"

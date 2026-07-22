@@ -40,9 +40,10 @@ def weighted_rigid_align(*, source: Tensor, target: Tensor, weight: Tensor, eps:
     """
 
     with torch.no_grad(), torch.autocast(device_type=source.device.type, enabled=False):
-        source_f = source.float()
-        target_f = target.float()
-        weight_f = weight.float().unsqueeze(-1)
+        work_dtype = torch.float32 if source.dtype in (torch.float16, torch.bfloat16) else source.dtype
+        source_f = source.to(dtype=work_dtype)
+        target_f = target.to(dtype=work_dtype)
+        weight_f = weight.to(dtype=work_dtype).unsqueeze(-1)
         weight_sum = weight_f.sum(dim=-2, keepdim=True).clamp_min(eps)
         source_centroid = (source_f * weight_f).sum(dim=-2, keepdim=True) / weight_sum
         target_centroid = (target_f * weight_f).sum(dim=-2, keepdim=True) / weight_sum
@@ -58,7 +59,7 @@ def weighted_rigid_align(*, source: Tensor, target: Tensor, weight: Tensor, eps:
         correction[..., -1, -1] = torch.det(rotation)
         rotation = torch.einsum("...ij,...jk,...lk->...il", u, correction, v)
         aligned = torch.einsum("...ni,...ji->...nj", source_centered, rotation) + target_centroid
-    return aligned.detach()
+    return aligned.to(dtype=source.dtype).detach()
 
 
 def uniform_random_rotation(

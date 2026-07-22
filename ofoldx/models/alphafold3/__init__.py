@@ -1,9 +1,8 @@
-r"""
-AlphaFold 3 model.
-"""
+r"""AlphaFold 3 structure-prediction implementation."""
 
 from __future__ import annotations
 
+from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import AlphaFold3Config, AlphaFold3ProcessorConfig
 from .model import (
@@ -13,25 +12,21 @@ from .model import (
     AlphaFold3Output,
     AlphaFold3SeedGroup,
 )
+from .pipeline import AlphaFold3Pipeline
 from .processor import AlphaFold3Processor
 
-__all__ = [
-    "AlphaFold3Config",
-    "AlphaFold3ProcessorConfig",
-    "AlphaFold3Model",
-    "AlphaFold3Processor",
-    "AlphaFold3Input",
-    "AlphaFold3Output",
-    "AlphaFold3FoldResult",
-    "AlphaFold3SeedGroup",
-]
-
-# ``fold`` returns the family-owned ``AlphaFold3FoldResult`` (seed groups preserved), which is
-# not losslessly wrappable by the generic standard fold Pipeline, so no standard task is
-# registered -- ``fold`` is called directly as a family method (frozen DESIGN 7.2).
-MODELS.register(
+# Seed-group results require the concrete folding pipeline.
+MODELS.register_model(
     "ofoldx.alphafold3",
     model=AlphaFold3Model,
     processor=AlphaFold3Processor,
+    processor_config=AlphaFold3ProcessorConfig,
     standard_tasks=(),
+)
+
+PIPELINES.register_pipeline(
+    "ofoldx.alphafold3",
+    pipeline=AlphaFold3Pipeline,
+    tasks=("fold",),
+    architectures=("ofoldx.alphafold3",),
 )

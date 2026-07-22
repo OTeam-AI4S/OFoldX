@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ._oops import OOpsUnsupportedError, oops_kernel
+from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
 _oops_triangle_multiplication = oops_kernel("triangle_multiplication")
@@ -48,8 +48,8 @@ def triangle_multiplication(
 
     Layer-norms the input, forms gated left/right factors ``(..., N, N, hidden_size)``, contracts them
     over the shared node (``ikh,jkh->ijh`` outgoing, else ``kih,kjh->ijh`` incoming), then norms, projects
-    back to ``pair_size`` and gates by the normalized input. The ``"oops"`` backend delegates to the fused
-    ``triangle_multiplication`` kernel; ``"eager"`` runs the equivalent pure-PyTorch composition.
+    back to ``pair_size`` and gates by the normalized input. The ``"oops"`` backend delegates to the OOps-owned
+    ``triangle_multiplication`` implementation; ``"eager"`` runs the equivalent pure-PyTorch composition.
 
     Args:
         pair: ``(..., N, N, pair_size)`` pair representation.
@@ -68,14 +68,10 @@ def triangle_multiplication(
         operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
         left_value_bias, left_gate_bias, right_value_bias, right_gate_bias, output_bias,
             output_gate_bias: Optional per-projection biases (AlphaFold 2 lineage). Default ``None`` ⇒
-            the projection is applied bias-free, byte-identical to the AlphaFold 3 lineage. The fused
-            ``oops`` kernel takes no bias tensors, so any non-``None`` bias forces the ``eager`` path.
+            the projection is applied bias-free, byte-identical to the AlphaFold 3 lineage.
 
     Returns:
         ``(..., N, N, pair_size)`` pair update, matching the shape of ``pair``.
-
-    Raises:
-        OOpsUnsupportedError: If the resolved backend is ``"oops"`` on non-CUDA ``pair``/``pair_mask``.
 
     Examples:
         >>> import torch
@@ -110,26 +106,7 @@ def triangle_multiplication(
         supported=_SUPPORTED,
         public_default="eager",
     )
-    biases = (
-        left_value_bias,
-        left_gate_bias,
-        right_value_bias,
-        right_gate_bias,
-        output_bias,
-        output_gate_bias,
-    )
-    if backend == "oops" and any(bias is not None for bias in biases):
-        # The fused ``oops`` kernel has no bias arguments; the biased AlphaFold 2 path must run eager.
-        backend = "eager"
     if backend == "oops":
-        if not pair.is_cuda:
-            raise OOpsUnsupportedError(
-                "TriangleMultiplication backend 'oops' requires CUDA tensors; use operator_backend='eager'"
-            )
-        if pair_mask is not None and not pair_mask.is_cuda:
-            raise OOpsUnsupportedError(
-                "TriangleMultiplication backend 'oops' requires a CUDA pair_mask; use operator_backend='eager'"
-            )
         return _oops_triangle_multiplication(
             pair,
             pair_mask,
@@ -144,6 +121,12 @@ def triangle_multiplication(
             norm_output_bias=norm_output_bias,
             output_weight=output_weight,
             output_gate_weight=output_gate_weight,
+            left_value_bias=left_value_bias,
+            left_gate_bias=left_gate_bias,
+            right_value_bias=right_value_bias,
+            right_gate_bias=right_gate_bias,
+            output_bias=output_bias,
+            output_gate_bias=output_gate_bias,
             eps=eps,
         )
     hidden_size = left_value_weight.shape[0]

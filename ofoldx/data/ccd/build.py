@@ -1,4 +1,4 @@
-r"""Converter stub: wwPDB ``components.cif`` -> CCD Parquet rows.
+r"""Convert wwPDB ``components.cif`` to CCD Parquet rows.
 
 This is the offline producer for the ``ofoldx/ccd`` Hub dataset. It parses the
 wwPDB Chemical Component Dictionary mmCIF (``components.cif`` / ``components.cif.gz``)
@@ -28,47 +28,61 @@ field extraction below mirrors ``alphafold3/structure/chemical_components.py``
 The dataset revision is set (out of band, at upload time) to the wwPDB snapshot
 date so that `resolve_ccd_component(..., revision=...)` pins exact provenance.
 
-This module is a STUB: the field-lowering helpers below are complete, but reading
-mmCIF blocks and writing Parquet are left as ``NotImplementedError`` boundaries so
-this file carries no heavy parser/writer dependency and imports cleanly.
+The CIF and Parquet dependencies are imported only by the two build-time entry
+points. Importing this module during modeling does not load either dependency.
 """
 
 from __future__ import annotations
 
+import gzip
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 
 # CCD ``_chem_comp_bond.value_order`` tokens -> canonical bond order.
 _VALUE_ORDER = {"SING": 1.0, "DOUB": 2.0, "TRIP": 3.0, "QUAD": 4.0, "AROM": 1.5}
-
-# wwPDB ``_chem_comp.type`` is descriptive free text; these substrings classify the
-# polymer family that determines default linear-polymer attachments. Anything else
-# is treated as non-polymer (no attachments).
-_PROTEIN_TYPE_HINT = "PEPTIDE"
-_RNA_TYPE_HINT = "RNA LINKING"
-_DNA_TYPE_HINT = "DNA LINKING"
 
 
 def build_rows(components_cif_path: str) -> list[dict[str, object]]:
     r"""Parse a wwPDB ``components.cif`` into resolver-schema rows.
 
-    STUB: wire this to the mmCIF reader (see ``ccd_pickle_gen.py``) and pass each
-    parsed component block to `row_from_block`.
+    The input may be the plain or gzip-compressed multi-data CCD file. Component
+    identifiers must be unique across data blocks.
     """
 
-    raise NotImplementedError(
-        "wire build_rows to a multi-data mmCIF reader (see the reference "
-        "ccd_pickle_gen.py) and map each data_ block through row_from_block"
-    )
+    from biotite.structure.io.pdbx import CIFFile
+
+    path = Path(components_cif_path)
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt") as file:
+            cif = CIFFile.read(file)
+    else:
+        cif = CIFFile.read(path)
+
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for block in cif.values():
+        flat = {
+            f"_{category_name}.{item_name}": column.as_array(str).tolist()
+            for category_name, category in block.items()
+            for item_name, column in category.items()
+        }
+        row = row_from_block(flat)
+        component_id = str(row["component_id"])
+        if component_id in seen:
+            raise ValueError(f"CCD component {component_id!r} occurs in multiple data blocks")
+        seen.add(component_id)
+        rows.append(row)
+    return rows
 
 
 def write_parquet(rows: Iterable[dict[str, object]], output_path: str) -> None:
-    r"""Write resolver-schema rows to a single Parquet shard.
+    r"""Write resolver-schema rows to a single Parquet shard."""
 
-    STUB: serialize ``rows`` with ``pyarrow.parquet`` (imported lazily at the real
-    call site) preserving the list-valued columns the resolver expects.
-    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    raise NotImplementedError("wire write_parquet to pyarrow.parquet.write_table")
+    pq.write_table(pa.Table.from_pylist(list(rows)), output_path)
 
 
 def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
@@ -83,31 +97,37 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
 
     atom_ids = list(block.get("_chem_comp_atom.atom_id", []))
     n_atoms = len(atom_ids)
-    elements = list(block.get("_chem_comp_atom.type_symbol", []))
-    formal_charges = [_to_int(value) for value in _column(block, "_chem_comp_atom.charge", n_atoms)]
+    elements = _required_column(block, "_chem_comp_atom.type_symbol", n_atoms)
+    formal_charges = [_to_optional_int(value) for value in _column(block, "_chem_comp_atom.charge", n_atoms)]
     atom_stereo = [_stereo(value) for value in _column(block, "_chem_comp_atom.pdbx_stereo_config", n_atoms)]
     leaving_flags = _column(block, "_chem_comp_atom.pdbx_leaving_atom_flag", n_atoms)
     ref_coords = _reference_coordinates(block, n_atoms)
 
     bond_atom_a = list(block.get("_chem_comp_bond.atom_id_1", []))
-    bond_atom_b = list(block.get("_chem_comp_bond.atom_id_2", []))
+    bond_atom_b = _required_column(block, "_chem_comp_bond.atom_id_2", len(bond_atom_a))
     n_bonds = len(bond_atom_a)
-    bond_orders = [
-        _VALUE_ORDER.get(token.upper(), 1.0) for token in _column(block, "_chem_comp_bond.value_order", n_bonds)
-    ]
-    bond_aromatic = [_flag(value) for value in _column(block, "_chem_comp_bond.pdbx_aromatic_flag", n_bonds)]
+    bond_orders = [_bond_order(value) for value in _column(block, "_chem_comp_bond.value_order", n_bonds)]
+    bond_aromatic = [_optional_flag(value) for value in _column(block, "_chem_comp_bond.pdbx_aromatic_flag", n_bonds)]
     bond_stereo = [_stereo(value) for value in _column(block, "_chem_comp_bond.pdbx_stereo_config", n_bonds)]
 
     # Per-atom aromaticity is derived: an atom is aromatic when it participates in
     # any aromatic bond (CCD marks aromaticity on bonds, not atoms).
-    aromatic_atoms = set()
+    aromatic_by_atom: dict[str, bool | None] = dict.fromkeys(atom_ids, False)
     for atom_a, atom_b, is_aromatic in zip(bond_atom_a, bond_atom_b, bond_aromatic):
-        if is_aromatic:
-            aromatic_atoms.add(atom_a)
-            aromatic_atoms.add(atom_b)
-    aromatic = [atom_id in aromatic_atoms for atom_id in atom_ids]
+        for atom_id in (atom_a, atom_b):
+            if is_aromatic is True:
+                aromatic_by_atom[atom_id] = True
+            elif is_aromatic is None and aromatic_by_atom.get(atom_id) is not True:
+                aromatic_by_atom[atom_id] = None
+    aromatic = [aromatic_by_atom[atom_id] for atom_id in atom_ids]
 
-    previous_atom, previous_leaving, next_atom, next_leaving = _attachments(chem_type, atom_ids, leaving_flags)
+    previous_atom, previous_leaving, next_atom, next_leaving = _attachments(
+        chem_type,
+        atom_ids,
+        leaving_flags,
+        bond_atom_a,
+        bond_atom_b,
+    )
 
     return {
         "component_id": component_id,
@@ -132,12 +152,12 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
 
 def _classify_chem_type(raw_type: str) -> str:
     upper = raw_type.upper()
-    if _PROTEIN_TYPE_HINT in upper:
+    if "PEPTIDE" in upper and upper != "PEPTIDE-LIKE":
         return "protein"
-    if _RNA_TYPE_HINT in upper:
-        return "rna"
-    if _DNA_TYPE_HINT in upper:
+    if "DNA" in upper:
         return "dna"
+    if "RNA" in upper:
+        return "rna"
     return "non-polymer"
 
 
@@ -145,41 +165,80 @@ def _attachments(
     chem_type: str,
     atom_ids: Sequence[str],
     leaving_flags: Sequence[str],
+    bond_atom_a: Sequence[str] = (),
+    bond_atom_b: Sequence[str] = (),
 ) -> tuple[str | None, list[str], str | None, list[str]]:
     r"""Derive default linear-polymer attachments for a polymer component.
 
     Non-polymer components carry no attachments. For polymers the backbone anchor
     atoms follow the standard convention (protein ``N``/``C``, nucleic ``P``/``O3'``)
-    and the leaving atoms are the CCD ``pdbx_leaving_atom_flag == 'Y'`` atoms bonded
-    at each terminus. This stub records the leaving set as declared by the flag and
-    leaves precise terminus partitioning to the real build.
+    and each leaving group is assigned to the anchor to which that connected group
+    is bonded. Source-declared leaving atoms attached elsewhere are not linear-
+    polymer attachment atoms.
     """
 
     if chem_type == "protein":
-        previous_anchor, next_anchor = "N", "C"
+        previous_anchor_name, next_anchor_name = "N", "C"
     elif chem_type in {"rna", "dna"}:
-        previous_anchor, next_anchor = "P", "O3'"
+        previous_anchor_name, next_anchor_name = "P", "O3'"
     else:
         return None, [], None, []
 
     present = set(atom_ids)
-    leaving = [atom_id for atom_id, flag in zip(atom_ids, leaving_flags) if _flag(flag)]
-    previous_anchor = previous_anchor if previous_anchor in present else None
-    next_anchor = next_anchor if next_anchor in present else None
-    return previous_anchor, leaving, next_anchor, leaving
+    leaving = {atom_id for atom_id, flag in zip(atom_ids, leaving_flags) if _flag(flag)}
+    previous_anchor: str | None = previous_anchor_name if previous_anchor_name in present else None
+    next_anchor: str | None = next_anchor_name if next_anchor_name in present else None
+
+    adjacency: dict[str, set[str]] = {atom_id: set() for atom_id in atom_ids}
+    for atom_a, atom_b in zip(bond_atom_a, bond_atom_b):
+        if atom_a not in present or atom_b not in present:
+            raise ValueError("CCD bond references an unknown atom")
+        adjacency[atom_a].add(atom_b)
+        adjacency[atom_b].add(atom_a)
+
+    groups: list[set[str]] = []
+    unseen = set(leaving)
+    while unseen:
+        start = unseen.pop()
+        group = {start}
+        queue = deque((start,))
+        while queue:
+            atom_id = queue.popleft()
+            for neighbor in adjacency[atom_id] & unseen:
+                unseen.remove(neighbor)
+                group.add(neighbor)
+                queue.append(neighbor)
+        groups.append(group)
+
+    previous_leaving: set[str] = set()
+    next_leaving: set[str] = set()
+    for group in groups:
+        neighbors = {neighbor for atom_id in group for neighbor in adjacency[atom_id] if neighbor not in leaving}
+        if previous_anchor is not None and previous_anchor in neighbors:
+            previous_leaving.update(group)
+        if next_anchor is not None and next_anchor in neighbors:
+            next_leaving.update(group)
+
+    order = {atom_id: index for index, atom_id in enumerate(atom_ids)}
+    return (
+        previous_anchor,
+        sorted(previous_leaving, key=order.__getitem__),
+        next_anchor,
+        sorted(next_leaving, key=order.__getitem__),
+    )
 
 
 def _reference_coordinates(
     block: Mapping[str, Sequence[str]],
     n_atoms: int,
-) -> list[tuple[float, float, float] | None]:
+) -> list[list[float] | None]:
     xs = _column(block, "_chem_comp_atom.pdbx_model_Cartn_x_ideal", n_atoms)
     ys = _column(block, "_chem_comp_atom.pdbx_model_Cartn_y_ideal", n_atoms)
     zs = _column(block, "_chem_comp_atom.pdbx_model_Cartn_z_ideal", n_atoms)
-    coordinates: list[tuple[float, float, float] | None] = []
+    coordinates: list[list[float] | None] = []
     for x, y, z in zip(xs, ys, zs):
         triple = (_to_float(x), _to_float(y), _to_float(z))
-        coordinates.append(None if None in triple else triple)  # type: ignore[arg-type]
+        coordinates.append(None if None in triple else list(triple))  # type: ignore[arg-type]
     return coordinates
 
 
@@ -187,7 +246,16 @@ def _column(block: Mapping[str, Sequence[str]], key: str, length: int) -> list[s
     values = block.get(key)
     if values is None:
         return ["?"] * length
-    return list(values)
+    result = list(values)
+    if len(result) != length:
+        raise ValueError(f"CCD item {key!r} has {len(result)} values; expected {length}")
+    return result
+
+
+def _required_column(block: Mapping[str, Sequence[str]], key: str, length: int) -> list[str]:
+    if key not in block and length:
+        raise ValueError(f"CCD block is missing required item {key!r}")
+    return _column(block, key, length)
 
 
 def _one(block: Mapping[str, Sequence[str]], key: str, *, default: str | None = None) -> str:
@@ -200,7 +268,18 @@ def _one(block: Mapping[str, Sequence[str]], key: str, *, default: str | None = 
 
 
 def _flag(value: str) -> bool:
-    return value.strip().upper() == "Y"
+    return _optional_flag(value) is True
+
+
+def _optional_flag(value: str) -> bool | None:
+    token = value.strip().upper()
+    if token in {"", "?", "."}:
+        return None
+    if token == "Y":
+        return True
+    if token == "N":
+        return False
+    raise ValueError(f"unknown CCD flag {value!r}")
 
 
 def _stereo(value: str) -> str | None:
@@ -210,11 +289,21 @@ def _stereo(value: str) -> str | None:
     return token
 
 
-def _to_int(value: str) -> int:
+def _to_optional_int(value: str) -> int | None:
     token = value.strip()
     if token in {"", "?", "."}:
-        return 0
+        return None
     return int(token)
+
+
+def _bond_order(value: str) -> float | None:
+    token = value.strip().upper()
+    if token in {"", "?", "."}:
+        return None
+    try:
+        return _VALUE_ORDER[token]
+    except KeyError as error:
+        raise ValueError(f"unknown CCD bond order {value!r}") from error
 
 
 def _to_float(value: str) -> float | None:

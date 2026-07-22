@@ -2,7 +2,7 @@ r"""Canonical Structure lowering for LigandMPNN."""
 
 from __future__ import annotations
 
-import math
+import operator
 from collections.abc import Mapping, Sequence
 from os import PathLike
 
@@ -11,9 +11,7 @@ import torch
 from torch import Tensor
 from typing_extensions import Self
 
-from ...data import (
-    is_water_component,
-)
+from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import (
     AtomSite,
@@ -22,14 +20,13 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io import read_pdb
-from ...io.pdb import ATOMIC_NUMBER_BY_ELEMENT
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
-    _virtual_beta_carbon,
+    virtual_beta_carbon,
 )
+from ..mpnn_pdb import read_mpnn_pdb
 from .config import LigandMpnnProcessorConfig
 from .model import LigandMpnnInput
 
@@ -94,8 +91,6 @@ _LoweredRows = tuple[
 class LigandMpnnProcessor:
     r"""Lower one canonical protein/context Structure to the released LigandMPNN tensors."""
 
-    config_class = LigandMpnnProcessorConfig
-
     def __init__(
         self,
         config: LigandMpnnProcessorConfig | None = None,
@@ -104,7 +99,7 @@ class LigandMpnnProcessor:
         dtype: torch.dtype | None = None,
     ) -> None:
         config = LigandMpnnProcessorConfig() if config is None else config
-        num_context_atoms = int(config.num_context_atoms)
+        num_context_atoms = operator.index(config.num_context_atoms)
         if num_context_atoms < 1:
             raise ValueError("num_context_atoms must be a positive integer")
         self.config = config
@@ -178,15 +173,15 @@ class LigandMpnnProcessor:
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Lower a PDB path exactly as ``processor(read_pdb(path), ...)``.
+        r"""Lower a PDB path exactly as ``processor(read_mpnn_pdb(path), ...)``.
 
         Chain filtering stays on the shared reader's ``chains`` argument rather than a
-        path-only Processor option; a caller needing it invokes ``read_pdb`` directly
+        path-only Processor option; a caller needing it invokes ``read_mpnn_pdb`` directly
         and passes the resulting Structure.
         """
 
         return self.process_structure(
-            read_pdb(path),
+            read_mpnn_pdb(path),
             positions=positions,
             conditions=conditions,
             tied_weights=tied_weights,
@@ -215,12 +210,10 @@ class LigandMpnnProcessor:
         if not isinstance(structure, Structure):
             raise TypeError("LigandMpnnProcessor.process_structure requires a Structure")
         cutoff = float(ligand_interface_cutoff)
-        if not math.isfinite(cutoff) or cutoff <= 0:
-            raise ValueError("ligand_interface_cutoff must be a finite positive number")
 
         system = structure.system
         for condition in conditions:
-            if type(condition) not in (AllowedResidueIdentities, TiedResidueIdentities):
+            if not isinstance(condition, AllowedResidueIdentities | TiedResidueIdentities):
                 raise TypeError(f"LigandMPNN cannot consume {type(condition).__name__}")
 
         observed = structure.coordinate_mask
@@ -275,8 +268,8 @@ class LigandMpnnProcessor:
             atom37_mask = np.zeros(len(_ATOM37), dtype=np.bool_)
             for atom_index, atom_id in enumerate(_ATOM37):
                 if atom_id == "OXT":
-                    # The released feature build reserves the OXT slot but never fills
-                    # it; leaving it empty keeps the 32-slot residue context in parity.
+                    # OXT remains empty so atom37[_RESIDUE_CONTEXT_START:] retains
+                    # the released 32-slot residue-context layout.
                     continue
                 position = coordinate_index.get(AtomSite(site.instance_id, site.component_index, atom_id))
                 if position is not None and bool(observed[position]):
@@ -359,7 +352,7 @@ class LigandMpnnProcessor:
             context_coordinates.append(np.zeros(3, dtype=np.float32))
             context_atomic_numbers.append(0)
         return (
-            np.stack(context_coordinates).astype(np.float32),
+            np.stack(context_coordinates),
             np.asarray(context_atomic_numbers, dtype=np.int64),
         )
 
@@ -375,9 +368,9 @@ class LigandMpnnProcessor:
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""Select the nearest padded context atoms per residue and the interface mask."""
 
-        num_context_atoms = int(self.config.num_context_atoms)
+        num_context_atoms = operator.index(self.config.num_context_atoms)
         length = backbone.shape[0]
-        cb = _virtual_beta_carbon(backbone[:, 0], backbone[:, 1], backbone[:, 2])
+        cb = virtual_beta_carbon(backbone[:, 0], backbone[:, 1], backbone[:, 2])
         context_mask = context_atomic_numbers != 0
         squared_distance = ((cb[:, None] - context_coordinates[None]) ** 2).sum(dim=-1)
         pair_mask = valid_mask[:, None] & context_mask[None]

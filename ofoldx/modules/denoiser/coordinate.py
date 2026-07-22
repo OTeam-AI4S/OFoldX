@@ -26,6 +26,7 @@ from ..diffusion.edm import EdmPreconditioner
 from ..diffusion.types import CoordinateDenoisingInput
 from ..embedding.fourier import FrozenFourierEmbedding
 from ..embedding.position import RelativePositionBuckets, RelativePositionEmbedder
+from ..transformer import CrossAttentionKeySource
 from ..transition import Transition
 
 
@@ -93,6 +94,7 @@ class CoordinateDenoiser(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
+        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
@@ -116,6 +118,7 @@ class CoordinateDenoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
             operator_backend=operator_backend,
+            cross_attention_key_source=cross_attention_key_source,
         )
         self.token_refiner = DenoisingTokenRefiner(
             num_blocks=num_encoder_blocks,
@@ -134,6 +137,7 @@ class CoordinateDenoiser(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
+            cross_attention_key_source=cross_attention_key_source,
         )
 
     def build_local_geometry(

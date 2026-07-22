@@ -1,4 +1,6 @@
-r"""ESMFold2 architecture, processor, tensor contracts, and scientific modules."""
+r"""ESMFold2 folding and experimental design implementations."""
+
+from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
@@ -19,6 +21,7 @@ from .config import (
     ESMFold2StructureHeadConfig,
 )
 from .model import (
+    ESMFold2BackendSettings,
     ESMFold2DesignCandidate,
     ESMFold2DesignResult,
     ESMFold2ExperimentalModel,
@@ -26,7 +29,7 @@ from .model import (
     ESMFold2Model,
     ESMFold2Output,
 )
-from .pipeline import ESMFold2Pipeline, cdr_distogram_iptm_proxy
+from .pipeline import ESMFold2DesignPipeline, ESMFold2Pipeline, cdr_distogram_iptm_proxy
 from .processor import (
     ESMFold2ExperimentalProcessor,
     ESMFold2Processor,
@@ -35,65 +38,33 @@ from .processor import (
     is_antibody_sequence,
 )
 
-__all__ = [
-    "ESMFold2AtomAttentionConfig",
-    "ESMFold2ConfidenceHeadConfig",
-    "ESMFold2Config",
-    "ESMFold2DiffusionModuleConfig",
-    "ESMFold2ESMCConfig",
-    "ESMFold2ExperimentalConfidenceHeadConfig",
-    "ESMFold2ExperimentalConfig",
-    "ESMFold2FoldingTrunkConfig",
-    "ESMFold2InputsEmbedderConfig",
-    "ESMFold2LMEncoderConfig",
-    "ESMFold2MSAEncoderConfig",
-    "ESMFold2ParcaeConfig",
-    "ESMFold2ProcessorConfig",
-    "ESMFold2StructureHeadConfig",
-    "ESMFold2Model",
-    "ESMFold2ExperimentalModel",
-    "ESMFold2Processor",
-    "ESMFold2ExperimentalProcessor",
-    "ESMFold2Pipeline",
-    "ESMFold2Input",
-    "ESMFold2Output",
-    "ESMFold2DesignCandidate",
-    "ESMFold2DesignResult",
-    "cdr_distogram_iptm_proxy",
-    "antibody_cdr_indices",
-    "antibody_cdr_prompt",
-    "is_antibody_sequence",
-]
-
-MODELS.register(
+MODELS.register_model(
     "ofoldx.esmfold2",
     model=ESMFold2Model,
     processor=ESMFold2Processor,
+    processor_config=ESMFold2ProcessorConfig,
     standard_tasks={"fold"},
 )
 
-# The second architecture id `ofoldx.esmfold2_experimental` (the released binder-inversion
-# notebook's `type="experimental"` recurrent graph, a genuinely different graph and
-# confidence contract than `ESMFold2Model`) follows the two-arch-one-directory pattern of
-# `ofoldx.alphafold2` / `ofoldx.alphafold2_multimer` and `ofoldx.protenix` /
-# `ofoldx.protenix_constraint`. It carries no standard task: its published surface is the
-# family-owned binder-design verb `ESMFold2Pipeline.design`, not a shared standard task.
-MODELS.register(
+# The experimental graph uses a distinct processor and the concrete design pipeline.
+MODELS.register_model(
     "ofoldx.esmfold2_experimental",
     model=ESMFold2ExperimentalModel,
     processor=ESMFold2ExperimentalProcessor,
+    processor_config=ESMFold2ExperimentalConfig,
     standard_tasks=(),
 )
 
-# One concrete Pipeline binds either architecture's pair and owns both released biological verbs:
-# ``fold`` (the released ``ESMFold2Model`` pair) and the family-owned ``design`` binder-inversion verb
-# (the experimental ``ESMFold2ExperimentalModel`` pair). Registering it closes the design
-# repository->task loop: an ``ofoldx.esmfold2_experimental`` repo carrying the
-# ``pipeline.json = {"pipeline": "ofoldx.esmfold2"}`` marker routes ``pipeline("design", model=dir)``
-# here (a single class-owned pair, so the factory takes the one-pair (model, processor) call — no
-# ``_PAIR_LAYOUT``). The released fold repos stay marker-less and route through the generic standard
-# ``fold`` Pipeline (``standard_tasks={"fold"}``) exactly as before.
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.esmfold2",
     pipeline=ESMFold2Pipeline,
+    tasks=("fold",),
+    architectures=("ofoldx.esmfold2",),
+)
+PIPELINES.register_pipeline(
+    "ofoldx.esmfold2_design",
+    pipeline=ESMFold2DesignPipeline,
+    tasks=("design",),
+    architectures=("ofoldx.esmfold2_experimental",),
+    repository_loader=ESMFold2DesignPipeline.from_repository,
 )

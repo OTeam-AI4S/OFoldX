@@ -1,39 +1,30 @@
-r"""OFoldX's biological operation boundary for the released BoltzGen design pipeline.
+r"""Multi-stage biological design operations for BoltzGen.
 
-``BoltzGenPipeline`` binds the two family Model/Processor pairs and the optionally composed
+``BoltzGenPipeline`` binds the structure-design and inverse-fold Model/Processor pairs
+with optionally composed
 fold / affinity stages into the released multi-stage flow
 (``design -> inverse_folding -> folding -> affinity -> analysis/filter``, upstream
-``cli/boltzgen.py`` ``step_names``) and returns the family-owned ``BoltzGenDesignResult``. It is
-not a base class and shares no runtime request object with any other family (mirroring
-``Boltz1Pipeline``).
+``cli/boltzgen.py`` ``step_names``) and returns ``BoltzGenDesignResult``.
 
-§4 composition (neutral hub): the folding and affinity stages compose against the GENERIC
-OFoldX fold / score interface (:class:`_FoldModel` ``.fold(batch) -> FoldResult`` /
-:class:`_ScoreModel` ``.score(batch) -> ScoreResult``), so ANY OFoldX fold/score family
-(af2/af3/boltz1/boltz2/esmfold2/protenix) can be injected — not just boltz2. ``fold`` /
+The folding and affinity stages depend on structural fold and score protocols
+(:class:`BoltzGenFoldModel` ``.fold(batch) -> FoldResult`` /
+:class:`BoltzGenScoreModel` ``.score(batch) -> ScoreResult``), so any compatible
+implementation can be injected. ``fold`` /
 ``affinity`` and their Processors are **injected optional dependencies** typed against these
-Protocols; BoltzGen never adds a verb to the composed family.
+Protocols; BoltzGen does not alter the composed model interfaces.
 
 Composition IS the switch: the refold stage runs iff a fold Model+Processor is composed in
 and the affinity stage runs iff a score Model+Processor is composed in. There are no
 ``do_refold`` / ``do_affinity`` mode flags.
 
-Predicted-sequence remap (implemented, validated): released BoltzGen WRITES the designed
+Released BoltzGen writes the designed
 sequence back into the output structure — ``DesignWriter.write_on_batch_end`` (inverse_fold)
 sets ``sample["ccd"][design_mask] = argmax(res_type)`` (via ``const.tokens`` id->name) before
 ``Structure.from_feat`` + ``add_side_chains``. :func:`_remap_designed_sequence` reproduces this:
 the inverse-fold argmax residue identities are written into the output ``Structure`` at the
 design positions (backbone coords carried, designed side chains added at the origin marked
 present, per released ``add_side_chains``), so the candidate ``Structure`` carries the DESIGNED
-sequence and the refold folds it. Validated exact vs the released ``const.tokens`` / ``convert_ccd``
-id->name remap. The per-residue NLL remains exposed as a ``Metric`` axis.
-
-Decode + inverse-fold re-lowering (faithful port): the tensor->Structure decode and the
-designed-backbone -> inverse-fold re-lowering are faithful ports of the released contracts. The
-two upstream contract bugs are fixed, the upstream ``token_bonds`` / constraint ports are matched,
-and the path runs with an EXACT residue-identity round-trip. The only residual is that no released
-end-to-end decode reference exists, so bit-level numeric parity is not asserted against a reference
-(there is nothing published to assert it against) — no claim of numeric parity is made here.
+sequence and the refold folds it. The per-residue NLL remains exposed as a ``Metric`` axis.
 """
 
 from __future__ import annotations
@@ -58,18 +49,20 @@ from .model import (
     BoltzGenIFoldModel,
     BoltzGenIFoldOutput,
     BoltzGenInput,
+    BoltzGenLayout,
     BoltzGenModel,
+    BoltzGenPlacements,
     BoltzGenResidueConstraint,
     BoltzGenSchema,
 )
 from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
 
 
-class _FoldModel(Protocol):
-    r"""Generic fold-capable OFoldX Model: any family exposing ``.fold(batch) -> FoldResult``.
+class BoltzGenFoldModel(Protocol):
+    r"""A fold-capable OFoldX Model exposing ``.fold(batch) -> FoldResult``.
 
-    BoltzGen composes the folding stage against this structural interface rather than a single
-    family, so any OFoldX fold model (af2/af3/boltz1/boltz2/esmfold2/protenix) can be injected.
+    BoltzGen composes the folding stage through this structural interface, allowing any
+    conforming OFoldX fold model to be injected.
     """
 
     def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
@@ -77,15 +70,15 @@ class _FoldModel(Protocol):
     def fold(self, batch: object, *, num_samples: int = ..., generator: torch.Generator | None = ...) -> FoldResult: ...
 
 
-class _ScoreModel(Protocol):
-    r"""Generic score-capable OFoldX Model: any family exposing ``.score(batch) -> ScoreResult``."""
+class BoltzGenScoreModel(Protocol):
+    r"""A score-capable OFoldX Model exposing ``.score(batch) -> ScoreResult``."""
 
     def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
 
     def score(self, batch: object, *, generator: torch.Generator | None = ...) -> ScoreResult: ...
 
 
-class _Processor(Protocol):
+class BoltzGenStageProcessor(Protocol):
     r"""Generic OFoldX Processor: a device-placeable callable lowering an input to a batch."""
 
     def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
@@ -101,13 +94,13 @@ class BoltzGenPipeline(CompositePipeline):
         design_processor: Its lowering Processor.
         ifold_model: The inverse-folding designer.
         ifold_processor: Its lowering Processor.
-        fold: Optional injected fold-capable Model (any OFoldX ``.fold`` family; refold runs iff present).
+        fold: Optional injected fold-capable Model; refold runs iff present.
         fold_processor: Optional injected fold Processor paired with ``fold``.
-        affinity: Optional injected score-capable Model (any OFoldX ``.score`` family; affinity runs iff present).
+        affinity: Optional injected score-capable Model; affinity runs iff present.
         affinity_processor: Optional injected affinity Processor paired with ``affinity``.
     """
 
-    # DESIGN §7.4/§7.3 pair-layout: the structure-design pair owns the runnable root, the
+    # The structure-design pair owns the repository root, the
     # inverse-fold pair lives at ``ifold/``, and the composed fold/affinity stages are optional
     # sub-pairs (``required=False``) — written and reloaded only when they were injected.
     _PAIR_LAYOUT = (
@@ -124,10 +117,10 @@ class BoltzGenPipeline(CompositePipeline):
         design_processor: BoltzGenProcessor,
         ifold_model: BoltzGenIFoldModel,
         ifold_processor: BoltzGenIFoldProcessor,
-        fold: _FoldModel | None = None,
-        fold_processor: _Processor | None = None,
-        affinity: _ScoreModel | None = None,
-        affinity_processor: _Processor | None = None,
+        fold: BoltzGenFoldModel | None = None,
+        fold_processor: BoltzGenStageProcessor | None = None,
+        affinity: BoltzGenScoreModel | None = None,
+        affinity_processor: BoltzGenStageProcessor | None = None,
     ) -> None:
         self.design_model = design_model
         self.design_processor = design_processor
@@ -152,14 +145,14 @@ class BoltzGenPipeline(CompositePipeline):
 
     def design(
         self,
-        input: object | None = None,
+        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
         *,
+        placement: BoltzGenPlacements | None = None,
         total_len: int | None = None,
         conditions: Sequence[BoltzGenSchema] = (),
         num_candidates: int = 1,
         num_sampling_steps: int | None = None,
         temperature: float | None = None,
-        ranking: str | Sequence[tuple[str, float]] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> BoltzGenDesignResult:
@@ -173,13 +166,12 @@ class BoltzGenPipeline(CompositePipeline):
 
         Args:
             input: Optional target/context system, structure, or path.
-            total_len: Family-owned whole-assembly token count (owner-gated when it mints rows).
-            conditions: Family-owned §3.7.2 schema records.
+            total_len: Whole-assembly token budget used when generated rows are materialized.
+            conditions: BoltzGen conditioning records.
             num_candidates: Number of designs (structure samples) to draw — the standard
                 OFoldX design-count axis, forwarded to the design model as ``num_samples``.
             num_sampling_steps: Optional EDM sampling steps.
             temperature: Optional inverse-fold sampling temperature.
-            ranking: Optional single Score name or weighted key; not frozen into the Result.
             seed: Optional integer seed (mutually exclusive with ``generator``).
             generator: Optional RNG for reproducible sampling.
 
@@ -189,7 +181,13 @@ class BoltzGenPipeline(CompositePipeline):
 
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
 
-        design_batch = self.design_processor(input, total_len=total_len, conditions=tuple(conditions))
+        design_batch = self.design_processor(
+            input,
+            placement=placement,
+            total_len=total_len,
+            conditions=tuple(conditions),
+            generator=generator,
+        )
         design_output = self.design_model.design(
             design_batch,
             num_samples=num_candidates,
@@ -284,18 +282,18 @@ class BoltzGenPipeline(CompositePipeline):
         structure = _remap_designed_sequence(backbone, ifold_batch, ifold_output)
         # Composition IS the switch: refold runs iff a fold Model+Processor is composed in, affinity
         # runs iff a score Model+Processor is composed in. No mode flags.
-        if self.fold is not None and self.fold_processor is not None:
-            fold_batch = self.fold_processor(structure)
-            fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)
+        if self.fold is not None or self.fold_processor is not None:
+            fold_batch = self.fold_processor(structure)  # type: ignore[misc]
+            fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)  # type: ignore[union-attr]
             prediction = fold_result.predictions[0]
             structure = prediction.structure
             for name in ("plddt", "ptm", "iptm"):
                 if name in prediction.scores:
                     scores[name] = prediction.scores[name]
 
-        if self.affinity is not None and self.affinity_processor is not None:
-            affinity_batch = self.affinity_processor(structure)
-            affinity_result = self.affinity.score(affinity_batch, generator=generator)
+        if self.affinity is not None or self.affinity_processor is not None:
+            affinity_batch = self.affinity_processor(structure)  # type: ignore[misc]
+            affinity_result = self.affinity.score(affinity_batch, generator=generator)  # type: ignore[union-attr]
             if "affinity_pred_value" in affinity_result.scores:
                 scores["binding_affinity"] = affinity_result.scores["affinity_pred_value"]
             if "affinity_probability_binary" in affinity_result.scores:
@@ -307,9 +305,8 @@ class BoltzGenPipeline(CompositePipeline):
 def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
     r"""Map one sample's model atom coords back onto canonical sites → ``Structure``.
 
-    Mirrors ``Boltz2AffinityModel.score``'s decode: place the model atom order onto the
-    system's complete heavy-atom sites. Faithful port with an exact residue-identity round-trip;
-    no released end-to-end decode reference exists for bit-level parity.
+    Mirrors ``Boltz2AffinityModel.score`` by placing model atom order onto the system's complete
+    heavy-atom sites while preserving residue identity.
     """
 
     layout = input.layout
@@ -320,8 +317,12 @@ def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
     complete_index = {site: index for index, site in enumerate(complete_sites)}
     coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
     coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-    model_coords = coords[: len(layout.atom_sites)].float().cpu().numpy()
-    for site, values in zip(layout.atom_sites, model_coords):
+    model_coords = coords.float().cpu().numpy()
+    if len(model_coords) != len(layout.atom_sites):
+        raise ValueError(
+            f"BoltzGen returned {len(model_coords)} atom coordinates for a {len(layout.atom_sites)}-atom layout"
+        )
+    for site, values in zip(layout.atom_sites, model_coords, strict=True):
         index = complete_index[site]
         coordinates[index] = values
         coordinate_mask[index] = True
@@ -371,10 +372,8 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
     from a not-yet-materialized assembly is skipped — the decode path always materializes first).
     """
 
-    layout = design_batch.layout
-    mask = design_batch.design_mask
-    if layout is None or mask is None:
-        return ()
+    layout = cast(BoltzGenLayout, design_batch.layout)
+    mask = cast(torch.Tensor, design_batch.design_mask)
     flags = mask[0].bool().tolist()
     return tuple(
         reference for reference, flag in zip(layout.output_residues, flags) if flag and isinstance(reference, tuple)
@@ -384,7 +383,7 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
 def _remap_designed_sequence(
     backbone: Structure,
     ifold_batch: BoltzGenIFoldInput,
-    ifold_output: object,
+    ifold_output: BoltzGenIFoldOutput,
 ) -> Structure:
     r"""Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
 
@@ -395,15 +394,12 @@ def _remap_designed_sequence(
     identity; backbone ``{N, CA, C, O}`` coordinates are carried from the sampled backbone and the
     designed residue's remaining heavy atoms are added as origin (zero-coordinate) sites marked
     present — the exact dummy side-chain convention of released ``add_side_chains``. Non-design
-    residues (fixed context) are carried verbatim. Returns ``backbone`` unchanged when there is no
-    design mask (nothing to remap).
+    residues (fixed context) are carried verbatim.
     """
 
-    layout = ifold_batch.layout
-    tokens = getattr(ifold_output, "tokens", None)
-    design_mask = ifold_batch.design_mask
-    if layout is None or tokens is None or design_mask is None:
-        return backbone
+    layout = cast(BoltzGenLayout, ifold_batch.layout)
+    tokens = cast(torch.Tensor, ifold_output.tokens)
+    design_mask = cast(torch.Tensor, ifold_batch.design_mask)
 
     token_ids = tokens[0].long().tolist()
     flags = design_mask[0].bool().tolist()
@@ -411,9 +407,7 @@ def _remap_designed_sequence(
     for token_index, reference in enumerate(layout.output_residues):
         if not flags[token_index]:
             continue
-        name = _DESIGN_TOKEN_TO_COMPONENT.get(token_ids[token_index])
-        if name is not None:
-            designed[reference] = name
+        designed[cast(ComponentReference, reference)] = _DESIGN_TOKEN_TO_COMPONENT[token_ids[token_index]]
     if not designed:
         return backbone
     return _write_designed_structure(backbone, designed)
@@ -448,18 +442,7 @@ def _write_designed_structure(backbone: Structure, designed: dict[ComponentRefer
         new_entities.setdefault(entity_id, entity)
         new_instances[instance_id] = entity_id
 
-    def _resolves(candidate_system: MolecularSystem, site: AtomSite) -> bool:
-        try:
-            candidate_system.atom(site)
-        except (KeyError, IndexError):
-            return False
-        return True
-
-    bondless = MolecularSystem(cast(dict, new_entities), new_instances)
-    kept_bonds = frozenset(
-        bond for bond in system.bonds if _resolves(bondless, bond.site_a) and _resolves(bondless, bond.site_b)
-    )
-    new_system = MolecularSystem(cast(dict, new_entities), new_instances, kept_bonds)
+    new_system = MolecularSystem(cast(dict, new_entities), new_instances, system.bonds)
 
     old_coordinates = {
         site: (backbone.coordinates[index], bool(backbone.coordinate_mask[index]))

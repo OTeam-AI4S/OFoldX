@@ -7,13 +7,13 @@ import json
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import chanfig
 import torch
-from multimolecule import EsmCModel
+from multimolecule import AutoModel, AutoTokenizer, EsmCForMaskedLM, EsmCModel, ProteinTokenizer
 from safetensors.torch import load_file
 from torch import Tensor
+from transformers import AutoModelForMaskedLM
 
 from ...artifacts import save_model
 from ...references import classify_reference
@@ -59,10 +59,14 @@ def convert_esmfold2_checkpoint(
         raise ValueError("esmc and esmc_source are mutually exclusive")
     if esmc is None:
         esmc_source = _DEFAULT_ESMC_REPOSITORY if esmc_source is None else esmc_source
-        esmc = EsmCModel.from_pretrained(
-            esmc_source,
-            cache_dir=None if cache_dir is None else str(cache_dir),
-            local_files_only=local_files_only,
+        esmc = cast(
+            EsmCModel,
+            AutoModel.from_pretrained(
+                esmc_source,
+                cache_dir=None if cache_dir is None else str(cache_dir),
+                local_files_only=local_files_only,
+                token=token,
+            ),
         )
 
     checkpoint_path, resolved_config_path = resolve_esmfold2_source(
@@ -70,6 +74,7 @@ def convert_esmfold2_checkpoint(
         config_path=config_path,
         cache_dir=cache_dir,
         local_files_only=local_files_only,
+        token=token,
     )
     esmc_config = ESMFold2ESMCConfig({name: getattr(esmc.config, name) for name in ESMFold2ESMCConfig().dict()})
     raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
@@ -112,6 +117,7 @@ def resolve_esmfold2_source(
     config_path: str | PathLike[str] | None = None,
     cache_dir: str | PathLike[str] | None = None,
     local_files_only: bool = False,
+    token: str | None = None,
 ) -> tuple[Path, Path]:
     r"""Resolve the upstream folding-head checkpoint and its source config."""
 
@@ -134,6 +140,7 @@ def resolve_esmfold2_source(
                 filename="model.safetensors",
                 cache_dir=None if cache_dir is None else str(cache_dir),
                 local_files_only=local_files_only,
+                token=token,
             )
         )
         config = (
@@ -145,6 +152,7 @@ def resolve_esmfold2_source(
                     filename="config.json",
                     cache_dir=None if cache_dir is None else str(cache_dir),
                     local_files_only=local_files_only,
+                    token=token,
                 )
             )
         )
@@ -187,7 +195,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "pair_size": raw_config["d_pair"],
         "num_relative_residue_bins": raw_config["n_relative_residx_bins"],
         "num_relative_chain_bins": raw_config["n_relative_chain_bins"],
-        "num_loops": raw_config["num_loops"],
+        "recycling_steps": int(raw_config["num_loops"]) + 1,
         "language_model_mask_probability": language_model_mask_probability,
         "msa_encoder_overwrite": raw_config["msa_encoder_overwrite"],
         "inputs": {
@@ -250,7 +258,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             "msa_head_dim": msa["msa_head_width"],
         },
         # enabled/poisson_mean/min_steps/max_steps are not read by the released
-        # Model; it always runs num_loops + 1 updates and always builds the coda.
+        # Model; recycling_steps stores the total updates and always builds the coda.
         "parcae": {"num_coda_blocks": parcae["coda_n_layers"]},
         "lm_encoder": {
             "enabled": lm_encoder["enabled"],
@@ -278,7 +286,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     config.pair_size = raw_config["d_pair"]
     config.num_relative_residue_bins = raw_config["n_relative_residx_bins"]
     config.num_relative_chain_bins = raw_config["n_relative_chain_bins"]
-    config.num_loops = raw_config["num_loops"]
+    config.recycling_steps = int(raw_config["num_loops"]) + 1
     config.disable_msa_features = raw_config["disable_msa_features"]
     config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
     config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
@@ -357,10 +365,11 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
 def load_experimental_esmfold2(
     checkpoint_or_repo: str | PathLike[str],
     *,
-    esmc: EsmCModel | None = None,
+    esmc: EsmCModel | EsmCForMaskedLM | None = None,
     config_path: str | PathLike[str] | None = None,
     cache_dir: str | PathLike[str] | None = None,
     local_files_only: bool = False,
+    token: str | None = None,
 ) -> ESMFold2ExperimentalModel:
     r"""Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
 
@@ -374,6 +383,7 @@ def load_experimental_esmfold2(
         config_path=config_path,
         cache_dir=cache_dir,
         local_files_only=local_files_only,
+        token=token,
     )
     raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
     config = experimental_config_from_biohub(raw_config)
@@ -389,6 +399,7 @@ def save_experimental_esmfold2_checkpoint(
     checkpoint_or_repo: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
+    esmc_source: str | PathLike[str] = _DEFAULT_ESMC_REPOSITORY,
     config_path: str | PathLike[str] | None = None,
     dtype: torch.dtype | None = None,
     cache_dir: str | PathLike[str] | None = None,
@@ -401,40 +412,53 @@ def save_experimental_esmfold2_checkpoint(
 
     Strict-loads the ``type="experimental"`` recurrent head via
     [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
-    ``esmc=None`` — so the saved ``state_dict`` is exactly the experimental head (the frozen ESMC child
-    is attached separately at run time) — pairs it with the :class:`ESMFold2ExperimentalProcessor`, and
-    writes ``model.json`` / ``processor.json`` / safetensors via
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The experimental pair keeps
-    ``standard_tasks=()``, so a ``pipeline.json = {"pipeline": "ofoldx.esmfold2"}`` marker is written to
-    route ``pipeline("design", model=dir)`` to :class:`ESMFold2Pipeline.design`.
+    ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
+    MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
+    :class:`ESMFold2DesignPipeline`, whose save contract persists them under ``esmc/`` and
+    writes the ``ofoldx.esmfold2_design`` marker. The resulting repository is self-contained
+    and routes ``pipeline("design", model=dir)`` to :meth:`ESMFold2DesignPipeline.design`.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.
     """
 
-    from ...pipelines.registry import PIPELINES
-    from .pipeline import ESMFold2Pipeline
+    from .pipeline import ESMFold2DesignPipeline
 
+    esmc = cast(
+        EsmCForMaskedLM,
+        AutoModelForMaskedLM.from_pretrained(
+            esmc_source,
+            cache_dir=None if cache_dir is None else str(cache_dir),
+            local_files_only=local_files_only,
+            dtype=dtype,
+            token=token,
+        ),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        esmc_source,
+        cache_dir=None if cache_dir is None else str(cache_dir),
+        local_files_only=local_files_only,
+        token=token,
+    )
     model = load_experimental_esmfold2(
         checkpoint_or_repo,
         esmc=None,
         config_path=config_path,
         cache_dir=cache_dir,
         local_files_only=local_files_only,
+        token=token,
     )
     if dtype is not None:
         model.to(dtype=dtype)
-    destination = Path(output_dir).expanduser()
-    save_model(
-        destination,
-        model=model,
-        processor=ESMFold2ExperimentalProcessor(model.config),
+    model.load_esmc(esmc)
+    processor = ESMFold2ExperimentalProcessor(model.config)
+    processor._base.tokenizer = cast(ProteinTokenizer, tokenizer)
+    ESMFold2DesignPipeline(model=model, processor=processor).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
     )
-    chanfig.NestedDict({"pipeline": PIPELINES.id_for(ESMFold2Pipeline)}).dump(destination / "pipeline.json")
-    if repo_id is not None:
-        from ...hub import _upload_repository
-
-        _upload_repository(destination, repo_id, token=token, private=private)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -451,13 +475,13 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
     )
-    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for source access and --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     parser.add_argument(
         "--experimental",
         action="store_true",
         help="convert the type='experimental' recurrent binder-inversion head (design pipeline); "
-        "saves the head only, the frozen ESMC child is attached at run time",
+        "persists the selected ESMC model and tokenizer with the head",
     )
     args = parser.parse_args(argv)
     dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
@@ -465,6 +489,7 @@ def main(argv: list[str] | None = None) -> None:
         save_experimental_esmfold2_checkpoint(
             args.checkpoint_or_repo,
             args.output_dir,
+            esmc_source=args.esmc,
             config_path=args.config,
             dtype=dtype,
             cache_dir=args.cache_dir,

@@ -2,8 +2,10 @@ r"""Convert released ``ligandmpnn_sc`` checkpoints to MpnnPacker repositories.""
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping
 from os import PathLike
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -164,7 +166,7 @@ def convert_mpnn_packer_checkpoint(
     )
     model = MpnnPackerModel(config)
     state_dict = convert_mpnn_packer_state_dict(checkpoint["model_state_dict"])
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(state_dict, strict=True, assign=True)
     processor = MpnnPackerProcessor(MpnnPackerProcessorConfig(num_context_atoms=config.num_context_atoms))
     MpnnPackerPipeline(model=model, processor=processor).save(
         output_dir,
@@ -172,3 +174,30 @@ def convert_mpnn_packer_checkpoint(
         token=token,
         private=private,
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    r"""Convert one released MPNN Packer checkpoint from the command line."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
+    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    args = parser.parse_args(argv)
+    convert_mpnn_packer_checkpoint(
+        args.checkpoint,
+        args.output_dir,
+        repo_id=args.repo_id,
+        token=args.token,
+        private=args.private,
+    )
+
+
+if __name__ == "__main__":
+    main()

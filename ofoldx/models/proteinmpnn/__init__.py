@@ -1,33 +1,24 @@
-r"""OFoldX-native ProteinMPNN architecture."""
+r"""ProteinMPNN inverse-folding implementation."""
 
 from __future__ import annotations
 
-from ...modules.mpnn import MpnnProteinFeatures
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
-from .model import CaProteinMpnnFeatures, ProteinMpnnDesignResult, ProteinMpnnInput, ProteinMpnnModel
+from .model import ProteinMpnnDesignResult, ProteinMpnnInput, ProteinMpnnModel
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
-__all__ = [
-    "ProteinMpnnConfig",
-    "ProteinMpnnProcessorConfig",
-    "ProteinMpnnModel",
-    "ProteinMpnnProcessor",
-    "ProteinMpnnInput",
-    "ProteinMpnnDesignResult",
-    "ProteinMpnnPipeline",
-    "ProteinMpnnDesignAndPackPipeline",
-]
-
-MODELS.register(
+MODELS.register_model(
     "ofoldx.proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
+    processor_config=ProteinMpnnProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register(
+PIPELINES.register_pipeline(
     "ofoldx.proteinmpnn",
     pipeline=ProteinMpnnPipeline,
+    tasks=("design", "score"),
+    architectures=("ofoldx.proteinmpnn",),
 )

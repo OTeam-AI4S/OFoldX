@@ -101,7 +101,7 @@ def translate_official_alphafold3_state(
     """
 
     translated = {}
-    used_official_keys = set()
+    used_official_keys: set[str] = set()
 
     for model_key, model_tensor in model.state_dict().items():
         ref = _official_ref_for_model_key(model_key)
@@ -211,12 +211,8 @@ def _open_model_stream(model_files: Sequence[Path], *, compressed: bool) -> Iter
         handles = [stack.enter_context(path.open("rb")) for path in model_files]
         stream = _ConcatenatedBinaryReader(handles)
         if compressed:
-            try:
-                import zstandard
-            except ImportError as error:  # pragma: no cover - depends on optional local install state.
-                raise ImportError(
-                    "reading official AlphaFold 3 .zst parameter files requires the 'zstandard' package"
-                ) from error
+            import zstandard
+
             zstd_stream = zstandard.ZstdDecompressor().stream_reader(io.BufferedReader(stream))
             try:
                 yield zstd_stream
@@ -356,6 +352,7 @@ def _official_ref_for_model_key(model_key: str) -> _OfficialParamRef | None:
         base, stack, include_trunk = _ATOM_ENCODER_CONTEXTS[node.context]
         return _atom_encoder_ref(node.rest, base=base, stack=stack, include_trunk=include_trunk)
     if node.section == "pairformer":
+        assert node.block is not None
         scope, with_single, pair_transition_target = _PAIRFORMER_CONTEXTS[node.context]
         return _pairformer_block_ref(
             node.rest, node.block, scope, with_single=with_single, pair_transition_target=pair_transition_target
@@ -364,8 +361,10 @@ def _official_ref_for_model_key(model_key: str) -> _OfficialParamRef | None:
         entry = _MSA_TOP_LEVEL.get(node.rest)
         return None if entry is None else _ref(_k(entry[0], "weights"), entry[1])
     if node.section == "msa_outer_product_mean":
+        assert node.block is not None
         return _outer_product_mean_ref(node.rest, node.block, _MSA_STACK_SCOPE)
     if node.section == "msa_attention":
+        assert node.block is not None
         return _msa_attention_ref(node.rest, node.block, _MSA_STACK_SCOPE)
     if node.section == "msa_transition":
         return _transition_ref(node.rest, node.block, f"{_MSA_STACK_SCOPE}/msa_transition")
@@ -584,7 +583,7 @@ def _atom_encoder_ref(rest: str, *, base: str, stack: str, include_trunk: bool) 
             "atom_feature_projection",
         ),
         "atom_pair_encoder.distance_vector_projection.weight": _ref(
-            _k(f"{base}_embed_pair_offsets_1", "weights"), "linear", negate=True
+            _k(f"{base}_embed_pair_offsets_1", "weights"), "linear"
         ),
         "atom_pair_encoder.inverse_distance_projection.weight": _ref(
             _k(f"{base}_embed_pair_distances_1", "weights"), "linear"
@@ -898,7 +897,9 @@ def _apply_official_transform(ref: _OfficialParamRef, tensors: tuple[Tensor, ...
         source = selected[0]
         return source.reshape(-1, source.shape[-1]).t().contiguous()
     if ref.transform == "template_projection":
-        return torch.cat([_linear_weight(tensor, None) for tensor in selected], dim=1)
+        # Official features project residue j before residue i; the native packed layout stores i then j.
+        ordered = (*selected[:2], selected[3], selected[2], *selected[4:])
+        return torch.cat([_linear_weight(tensor, None) for tensor in ordered], dim=1)
     if ref.transform == "atom_feature_projection":
         return torch.cat([_linear_weight(tensor, None) for tensor in selected], dim=1)
     if ref.transform == "atom_confidence_weight":

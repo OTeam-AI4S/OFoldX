@@ -1,4 +1,4 @@
-r"""OFoldX-native implementation of the released RFdiffusion architecture."""
+r"""RFdiffusion protein-backbone design implementation."""
 
 from __future__ import annotations
 
@@ -6,44 +6,28 @@ from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import RFdiffusionConfig, RFdiffusionProcessorConfig
 from .model import (
-    ComputeAllAtomCoords,
+    RFdiffusionConditionEvaluation,
     RFdiffusionDesignCandidate,
+    RFdiffusionDesignResult,
     RFdiffusionInput,
     RFdiffusionModel,
     RFdiffusionOutput,
-    RFdiffusionDesignResult,
 )
 from .pipeline import RFdiffusionPipeline
 from .processor import RFdiffusionProcessor
 
-__all__ = [
-    "RFdiffusionConfig",
-    "RFdiffusionProcessorConfig",
-    "RFdiffusionModel",
-    "RFdiffusionProcessor",
-    "RFdiffusionPipeline",
-    "RFdiffusionInput",
-    "RFdiffusionOutput",
-    "RFdiffusionDesignResult",
-    "RFdiffusionDesignCandidate",
-    "ComputeAllAtomCoords",
-]
-
-MODELS.register(
+MODELS.register_model(
     "ofoldx.rfdiffusion",
     model=RFdiffusionModel,
     processor=RFdiffusionProcessor,
+    processor_config=RFdiffusionProcessorConfig,
     standard_tasks=(),
 )
 
-# `standard_tasks` stays empty (§6.1): the root pair must NOT be wrapped by the generic standard
-# "design" Pipeline, because `design` returns the family-owned `RFdiffusionDesignResult`, which is not
-# losslessly the shared `DesignResult` (§7). Instead the concrete coordinate-producing
-# `RFdiffusionPipeline` is published under the family id, exactly as `ProteinMpnnPipeline` is: a
-# checkpoint shipping `pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}` routes `design` to it and
-# receives the family-owned Result (see `api/tasks.py`). Publication is wired now (Principle 13): the
-# validated combined-length + hotspot `design` verb has a working Pipeline + Result carrier.
-PIPELINES.register(
+# Coordinate-bearing results require the concrete design pipeline.
+PIPELINES.register_pipeline(
     "ofoldx.rfdiffusion",
     pipeline=RFdiffusionPipeline,
+    tasks=("design",),
+    architectures=("ofoldx.rfdiffusion",),
 )
