@@ -1,0 +1,345 @@
+r"""Format-neutral atom records shared by the canonical structure codecs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Protocol
+
+import numpy as np
+from numpy.typing import NDArray
+
+from ..data.molecular import AtomSite, MolecularSystem, SystemBond
+
+if TYPE_CHECKING:
+    from biotite.structure.io.pdbx import CIFFile
+
+
+@dataclass(frozen=True, slots=True)
+class AtomRecord:
+    r"""One normalized atom row from a PDB or mmCIF source."""
+
+    row_index: int
+    group: Literal["ATOM", "HETATM"]
+    serial: str | None
+    element: str
+    charge: int | None
+    atom_name: str
+    component_id: str
+    chain_id: str
+    entity_id: str | None
+    label_seq_id: int | None
+    residue_id: int | None
+    auth_chain_id: str | None
+    auth_residue_id: int | None
+    insertion_code: str | None
+    auth_component_id: str | None
+    auth_atom_name: str | None
+    altloc_id: str | None
+    occupancy: float | None
+    b_factor: float | None
+    coordinates: tuple[float, float, float]
+    coordinate_present: bool
+    symmetry_id: str | None = None
+    canonical_site: AtomSite | None = None
+
+
+@dataclass(frozen=True)
+class ParsedStructure:
+    r"""Format-neutral parser output consumed by canonical Structure decoding."""
+
+    format: Literal["pdb", "mmcif"]
+    rows: tuple[AtomRecord, ...]
+    canonical_payload: dict[str, object] | None
+    mmcif_file: CIFFile | None = None
+    pdb_lines: tuple[str, ...] = ()
+
+
+class AtomArray(Protocol):
+    r"""Structural Biotite atom-array contract required by record normalization."""
+
+    chain_id: NDArray[np.str_]
+    res_id: NDArray[np.integer]
+    coord: NDArray[np.floating]
+    hetero: NDArray[np.bool_]
+    element: NDArray[np.str_]
+    atom_name: NDArray[np.str_]
+    res_name: NDArray[np.str_]
+    ins_code: NDArray[np.str_]
+
+    def get_annotation_categories(self) -> list[str]:
+        r"""Return the available annotation names."""
+
+        ...
+
+    def array_length(self) -> int:
+        r"""Return the number of atom rows."""
+
+        ...
+
+    def get_annotation(self, name: str) -> NDArray:
+        r"""Return values for one annotation."""
+
+        ...
+
+
+def atom_records_from_array(
+    array: AtomArray,
+    *,
+    format_name: Literal["pdb", "mmcif"],
+) -> tuple[AtomRecord, ...]:
+    r"""Normalize one Biotite atom array into format-neutral atom records."""
+
+    categories = set(array.get_annotation_categories())
+    length = int(array.array_length())
+
+    def annotation(name: str) -> NDArray | None:
+        if name not in categories:
+            return None
+        return array.get_annotation(name)
+
+    atom_serials = annotation("atom_id")
+    charges = annotation("charge")
+    occupancies = annotation("occupancy")
+    b_factors = annotation("b_factor")
+    altloc_ids = annotation("altloc_id")
+    sym_ids = annotation("sym_id")
+    auth_asym_ids = annotation("auth_asym_id")
+    auth_seq_ids = annotation("auth_seq_id")
+    auth_comp_ids = annotation("auth_comp_id")
+    auth_atom_ids = annotation("auth_atom_id")
+    label_entity_ids = annotation("label_entity_id")
+    label_asym_ids = annotation("label_asym_id")
+    label_seq_ids = annotation("label_seq_id")
+    canonical_instances = annotation("ofoldx_instance_id")
+    canonical_components = annotation("ofoldx_component_index")
+    canonical_atoms = annotation("ofoldx_atom_id")
+    coordinate_masks = annotation("ofoldx_coordinate_mask")
+
+    rows: list[AtomRecord] = []
+    for index in range(length):
+        chain_id = present_string(_at(label_asym_ids, index)) or present_string(array.chain_id[index]) or "_"
+        label_seq_id = optional_integer(_at(label_seq_ids, index))
+        residue_id = label_seq_id
+        if residue_id is None:
+            residue_id = int(array.res_id[index])
+        canonical_site = None
+        canonical_instance = present_string(_at(canonical_instances, index))
+        canonical_component = present_string(_at(canonical_components, index))
+        canonical_atom = present_string(_at(canonical_atoms, index))
+        if canonical_instance is not None or canonical_component is not None or canonical_atom is not None:
+            if canonical_instance is None or canonical_component is None or canonical_atom is None:
+                raise ValueError("OFoldX canonical atom identity fields must be supplied together")
+            canonical_component_index = optional_integer(canonical_component)
+            if canonical_component_index is None:
+                raise ValueError("ofoldx_component_index must be an integer")
+            canonical_site = AtomSite(canonical_instance, canonical_component_index, canonical_atom)
+        coordinate_present = True
+        mask_text = present_string(_at(coordinate_masks, index))
+        if mask_text is not None:
+            if mask_text not in {"0", "1"}:
+                raise ValueError("ofoldx_coordinate_mask values must be 0 or 1")
+            coordinate_present = mask_text == "1"
+        x, y, z = array.coord[index]
+        coordinate = (float(x), float(y), float(z))
+        charge = optional_integer(_at(charges, index))
+        if format_name == "pdb" and charge == 0:
+            charge = None
+        rows.append(
+            AtomRecord(
+                row_index=index,
+                group="HETATM" if bool(array.hetero[index]) else "ATOM",
+                serial=present_string(_at(atom_serials, index)),
+                element=str(array.element[index]).strip().capitalize(),
+                charge=charge,
+                atom_name=str(array.atom_name[index]),
+                component_id=str(array.res_name[index]),
+                chain_id=chain_id,
+                entity_id=present_string(_at(label_entity_ids, index)),
+                label_seq_id=label_seq_id,
+                residue_id=residue_id,
+                auth_chain_id=(
+                    present_string(_at(auth_asym_ids, index))
+                    if format_name == "mmcif"
+                    else present_string(array.chain_id[index])
+                ),
+                auth_residue_id=(
+                    optional_integer(_at(auth_seq_ids, index)) if format_name == "mmcif" else int(array.res_id[index])
+                ),
+                insertion_code=present_string(array.ins_code[index]),
+                auth_component_id=(
+                    present_string(_at(auth_comp_ids, index)) if format_name == "mmcif" else str(array.res_name[index])
+                ),
+                auth_atom_name=(
+                    present_string(_at(auth_atom_ids, index)) if format_name == "mmcif" else str(array.atom_name[index])
+                ),
+                altloc_id=present_string(_at(altloc_ids, index)),
+                occupancy=_optional_float(_at(occupancies, index)),
+                b_factor=_optional_float(_at(b_factors, index)),
+                coordinates=coordinate,
+                coordinate_present=coordinate_present,
+                symmetry_id=present_string(_at(sym_ids, index)),
+                canonical_site=canonical_site,
+            )
+        )
+    return tuple(rows)
+
+
+def _at(values: NDArray | None, index: int) -> object | None:
+    return None if values is None else values[index]
+
+
+def present_string(value: object | None) -> str | None:
+    r"""Strip source text and map absent PDBx markers to ``None``."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text in {"", ".", "?"} else text
+
+
+def optional_integer(value: object | None) -> int | None:
+    r"""Parse an optional source identity integer."""
+
+    text = present_string(value)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(f"expected an integer identity, got {text!r}") from None
+
+
+def _optional_float(value: object | None) -> float | None:
+    text = present_string(value)
+    if text is None:
+        return None
+    number = float(text)
+    return number if np.isfinite(number) else None
+
+
+def reject_duplicate_atom_records(records: tuple[AtomRecord, ...]) -> None:
+    r"""Reject duplicate declarations of one source atom identity."""
+
+    seen: set[tuple[object, ...]] = set()
+    for row in records:
+        key = (
+            row.symmetry_id,
+            row.chain_id,
+            row.residue_id,
+            row.auth_residue_id,
+            row.insertion_code,
+            row.component_id,
+            row.atom_name,
+            row.altloc_id,
+        )
+        if key in seen:
+            raise ValueError(f"duplicate source atom declaration: {key!r}")
+        seen.add(key)
+
+
+def atom_record_residue_key(record: AtomRecord) -> tuple[object, ...]:
+    r"""Return the source residue identity key for an atom record."""
+
+    return (
+        record.symmetry_id,
+        record.chain_id,
+        record.residue_id,
+        record.auth_residue_id,
+        record.insertion_code,
+        record.component_id,
+    )
+
+
+def selected_source_sites(
+    selected_records: tuple[AtomRecord, ...], site_by_row_index: dict[int, AtomSite]
+) -> dict[tuple[object, ...], AtomSite]:
+    r"""Map unambiguous label and author atom identities to canonical sites."""
+
+    mapping: dict[tuple[object, ...], AtomSite] = {}
+    ambiguous: set[tuple[object, ...]] = set()
+    for row in selected_records:
+        site = site_by_row_index[row.row_index]
+        label_key = (
+            row.symmetry_id,
+            row.chain_id,
+            row.label_seq_id,
+            row.insertion_code,
+            row.component_id,
+            row.atom_name,
+        )
+        auth_key = (
+            row.symmetry_id,
+            row.auth_chain_id,
+            row.auth_residue_id,
+            row.insertion_code,
+            row.auth_component_id,
+            row.auth_atom_name,
+        )
+        for key in (label_key, auth_key):
+            if key in ambiguous:
+                continue
+            previous = mapping.get(key)
+            if previous is not None and previous != site:
+                mapping.pop(key)
+                ambiguous.add(key)
+                continue
+            mapping[key] = site
+    return mapping
+
+
+def source_record_key(record: AtomRecord) -> tuple[object, ...]:
+    r"""Return the source atom key used for PDB bond resolution."""
+
+    return (
+        record.symmetry_id,
+        record.chain_id,
+        record.residue_id,
+        record.insertion_code,
+        record.component_id,
+        record.atom_name,
+    )
+
+
+def unique_identifier(seed: str, used: set[str]) -> str:
+    r"""Reserve and return a unique identifier derived from ``seed``."""
+
+    candidate = seed or "_"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{seed}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def ordered_output_bonds(system: MolecularSystem) -> tuple[SystemBond, ...]:
+    r"""Return system bonds with normalized endpoints and stable output order."""
+
+    bonds: list[SystemBond] = []
+    for bond in system.iter_bonds():
+        key_a = (bond.site_a.instance_id, bond.site_a.component_index, bond.site_a.atom_id)
+        key_b = (bond.site_b.instance_id, bond.site_b.component_index, bond.site_b.atom_id)
+        if key_b < key_a:
+            bond = SystemBond(
+                bond.site_b,
+                bond.site_a,
+                order=bond.order,
+                aromatic=bond.aromatic,
+                stereo=bond.stereo,
+                stereo_sites=None if bond.stereo_sites is None else bond.stereo_sites[::-1],
+                origin=bond.origin,
+            )
+        bonds.append(bond)
+    return tuple(
+        sorted(
+            bonds,
+            key=lambda bond: (
+                bond.site_a.instance_id,
+                bond.site_a.component_index,
+                bond.site_a.atom_id,
+                bond.site_b.instance_id,
+                bond.site_b.component_index,
+                bond.site_b.atom_id,
+            ),
+        )
+    )
