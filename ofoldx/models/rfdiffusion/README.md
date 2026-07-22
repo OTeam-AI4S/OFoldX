@@ -27,7 +27,7 @@ The OFFICIAL repository of RFdiffusion is at [RosettaCommons/RFdiffusion](https:
 
 RFdiffusion is a generative model that produces novel protein backbones by reversing a denoising-diffusion process over residue frames. A RoseTTAFold-style structure network serves as the denoising trunk: at each diffusion timestep it consumes the current noised backbone (through MSA, pair, and template embedders) and predicts a cleaner set of residue frames, refined by an SE(3)-equivariant structure module. A native reverse-diffusion sampler drives a single design trajectory from Gaussian noise down to a finished backbone, coupling a Euclidean diffuser for C-alpha translations with an IGSO3 diffuser for backbone-frame rotations. OFoldX expresses de novo segments, motif scaffolding, inpainting, interfaces, compactness, smooth coordination, substrate interactions, point-group symmetry, cyclic closure, and fold conditioning through canonical conditions rather than RFdiffusion-specific strings. Fold-conditioned checkpoints consume one canonical `Template`; its explicit target-to-template alignment conditions the aligned output rows, while unaligned target rows remain masked.
 
-`RFdiffusionModel.forward(batch)` is the differentiable denoiser and returns every released training head. `RFdiffusionModel.design(batch)` runs reverse diffusion. Operator selection belongs to the Model: `model.set_backend("torch")`, `model.set_backend("oops")`, or `model.set_backend("auto")`.
+`RfDiffusionModel.forward(batch)` is the differentiable denoiser and returns every released training head. `RfDiffusionModel.design(batch)` runs reverse diffusion. Operator selection belongs to the Model: `model.set_backend("torch")`, `model.set_backend("oops")`, or `model.set_backend("auto")`.
 
 An `ExistingSpan` keeps its canonical sequence visible by default, matching the
 released contig-map semantics. Sequence is masked only when the caller explicitly
@@ -46,20 +46,20 @@ linear-interpolation endpoints; a different endpoint with a constant schedule is
 error rather than a silent no-op. The timestep-one endpoint is not itself sampled
 when the final step returns the denoiser's raw `pX0`.
 
-The raw sampler returns that upstream `pX0`. `RFdiffusionModel.design` separately
+The raw sampler returns that upstream `pX0`. `RfDiffusionModel.design` separately
 Kabsch-aligns it to a fixed motif when requested and then restores the fixed rows as
 a canonical Result postcondition. Final pLDDT, `pX0`, and `x_{t-1}` diagnostics are
 always present. Full reverse-order trajectories (`T, T-1, ..., final_step`) are
 retained on CPU only with `return_trajectory=True`.
 
 Because RFdiffusion is coordinate-producing and variable-topology (`ContigMap.length`
-is sampled per candidate), `design` returns the family-owned `RFdiffusionResult`, not
+is sampled per candidate), `design` returns the family-owned `RfDiffusionDesignResult`, not
 the shared coordinate-free `DesignResult`. It lives in this family's own directory and
 is not a subclass or widening of the shared record (DESIGN.md §5.3.1/§5.3.3), mirroring
-the migrated `ESMFold2DesignResult`. Each `RFdiffusionDesignCandidate` owns the complete
+the migrated `ESMFold2DesignResult`. Each `RfDiffusionDesignCandidate` owns the complete
 decoded backbone `Structure` (which owns its `MolecularSystem` via `Structure.system`);
-tuple position in `RFdiffusionResult.candidates` is sample identity, and
-`RFdiffusionResult.best("mean_plddt")` selects the earliest best design under one named
+tuple position in `RfDiffusionDesignResult.candidates` is sample identity, and
+`RfDiffusionDesignResult.best("mean_plddt")` selects the earliest best design under one named
 Score. The Result carries two mapped values and nothing else (no logits, distograms,
 torsion/backbone trajectories, timesteps, or `pX0`/`x_{t-1}`; no conditions or run
 controls):
@@ -97,25 +97,25 @@ argument. OFoldX does not copy the upstream `t3` alias or the inert
 
 > [!NOTE]
 > These dimensions describe the released `base` RFdiffusion checkpoint as configured in
-> [`RFdiffusionConfig`][ofoldx.models.rfdiffusion.config.RFdiffusionConfig]. The equivariant refinement network uses
-> an SE(3)-transformer structure module (a single layer of 32 channels across 2 degrees for the main blocks, and a
+> [`RfDiffusionConfig`][ofoldx.models.rfdiffusion.config.RfDiffusionConfig]. The equivariant refinement network uses
+> an SE(3)-transformer structure module (a single block of 32 channels across 2 degrees for the main blocks, and a
 > wider 64-scalar top-k refinement stack). The parameter count is omitted here because RFdiffusion is a large trunk
 > model that OFoldX does not instantiate at card-build time.
 
 OFoldX represents auxiliary geometry through canonical conditions instead of upstream potential strings. In
-particular, monomer and binder compactness use `RadiusOfGyration`. Dimer compactness is expressed by one
-`RadiusOfGyration` condition per monomer, normally with half the desired total weight on each condition. Each term
+particular, monomer and binder compactness use `RfDiffusionRadiusOfGyration`. Dimer compactness is expressed by one
+`RfDiffusionRadiusOfGyration` condition per monomer, normally with half the desired total weight on each condition. Each term
 uses its own monomer centroid. This intentionally corrects the released `dimer_ROG` helper's unambiguous typo, which
 computes the second monomer's radius around the first monomer's centroid.
 
-The released contact-number potentials map to `Coordination`; OFoldX evaluates their analytic
+The released contact-number potentials map to `RfDiffusionCoordination`; OFoldX evaluates their analytic
 `1 / (1 + x**6)` form, removing the upstream quotient's undefined `0 / 0` points without changing the scientific
-function. `SubstrateInteraction` implements the released default nearest-substrate attraction and clearance using
+function. `RfDiffusionSubstrateInteraction` implements the released default nearest-substrate attraction and clearance using
 protein C-alpha distances and a substrate frame anchored to the fixed motif. The
 released `rep_r_min=0` branch instead switches repulsion to an all-pairs
 calculation. That is distinct scientific behavior and the complete family API must
 retain it as an explicit RFdiffusion potential control rather than hide it behind
-the default `SubstrateInteraction` meaning.
+the default `RfDiffusionSubstrateInteraction` meaning.
 
 ### Links
 
@@ -151,7 +151,7 @@ covers all seven official checkpoints—`Base_ckpt.pt`, `Complex_base_ckpt.pt`, 
 network outputs: the four geometric heads, sequence and resolved logits, backbone and torsion trajectories, and pLDDT
 logits.
 
-Only checkpoint fields read by the audited graph or sampler become `RFdiffusionConfig`. Stored but inert fields such as
+Only checkpoint fields read by the audited graph or sampler become `RfDiffusionConfig`. Stored but inert fields such as
 `d_time_emb`, `use_motif_timestep`, `aa_decode_steps`, and `sequence_decode` are not turned into public configuration;
 `freeze_track_motif`, which does change the structure track, is retained.
 
@@ -161,7 +161,7 @@ RosettaCommons/RFdiffusion revision `2d0c003df46b9db41d119321f15403dec3716cd9`. 
 `cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23`; the packaged archive SHA-256 is
 `89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8`. It retains all five float64 arrays exactly.
 
-The maintained [`scripts/parity/rfdiffusion_network.py`](../../../scripts/parity/rfdiffusion_network.py)
+The maintained [`scripts/parity/rfdiffusion_denoiser.py`](../../../scripts/parity/rfdiffusion_denoiser.py)
 and companion RFdiffusion scripts reproduce the reference comparisons from code in
 `~/reference` and checkpoints in `~/weights`; generated reports remain local.
 Family-specific qualification lives in those maintained parity scripts. Frequent CI

@@ -4,7 +4,7 @@ Official DeepMind AlphaFold-Multimer checkpoint conversion.
 AF-Multimer parameters ship as ``params_model_{1..5}_multimer_v3.npz`` inside
 ``alphafold_params_2022-12-06.tar``. They share the flat Haiku ``scope//name``
 convention with the monomer parameters, so this module reuses the monomer tensor
-layout conversion and stacked-block expansion and only overrides the scope
+layout conversion and stacked-layer expansion and only overrides the scope
 normalization that differs on the multimer surface: the chain-relative input
 embedder (``position_activations``), the multimer template embedder, the 22-class
 masked-MSA head, and the interface-TM head.
@@ -67,7 +67,7 @@ def convert_official_multimer_state_dict(
         target = _convert_multimer_tensor(source_key, tensor)
         if dtype is not None and target.is_floating_point():
             target = target.to(dtype=dtype)
-        expanded = deepmind._expand_stacked_block_tensor(source_key, target_key, tensor, target)
+        expanded = deepmind._expand_stacked_tensor(source_key, target_key, tensor, target)
         for expanded_key, expanded_tensor in expanded.items():
             for final_key, final_tensor in _split_multimer_tensor(expanded_key, expanded_tensor):
                 if final_key in converted:
@@ -188,17 +188,17 @@ def normalize_multimer_param_key(key: str) -> str:
         embedder_part = parts[2] if parts[1] == "~_relative_encoding" and len(parts) >= 3 else parts[1]
         mapped = _MULTIMER_INPUT_EMBEDDING_SCOPE_MAP.get(embedder_part)
         if mapped is not None:
-            return ".".join(["input_embedding", mapped, *deepmind._normalize_parameter_parts(name)])
+            return ".".join(["input_embeddings", mapped, *deepmind._normalize_parameter_parts(name)])
     normalized = deepmind.normalize_official_param_key(key)
     # The multimer template embedder's per-iteration pair stack ships as a bare Haiku
-    # ``hk.layer_stack`` (leading block dim, no ``__layer_stack_no_state`` scope marker), so
+    # ``hk.layer_stack`` (leading layer dimension, no ``__layer_stack_no_state`` scope marker), so
     # the shared normalizer maps it to ``template_embedding_iteration.pair_stack.*`` without a
-    # ``blocks.stacked`` marker. Insert the marker so ``_expand_stacked_block_tensor`` unrolls
-    # the two blocks into ``template_embedding_iteration.blocks.{0,1}.pair_stack.*``.
+    # ``layers.stacked`` marker. Insert it so ``_expand_stacked_layer_tensor`` unrolls
+    # the two layers into ``template_embedding_iteration.layers.{0,1}.pair_stack.*``.
     if ".template_embedding_iteration.pair_stack." in normalized:
         normalized = normalized.replace(
             ".template_embedding_iteration.pair_stack.",
-            ".template_embedding_iteration.blocks.stacked.pair_stack.",
+            ".template_embedding_iteration.layers.stacked.pair_stack.",
         )
     return normalized
 

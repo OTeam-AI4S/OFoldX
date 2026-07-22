@@ -56,7 +56,7 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         if pipeline_id is not None:
             chanfig.NestedDict({"pipeline": pipeline_id}).dump(Path(directory).expanduser() / "pipeline.json")
         if repo_id is not None:
-            from .._repository import upload_repository
+            from ..hub import upload_repository
 
             upload_repository(
                 directory,

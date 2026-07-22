@@ -12,6 +12,46 @@ from __future__ import annotations
 from chanfig import Config
 
 
+class Boltz2InputEmbeddingsConfig(Config):
+    r"""
+    Boltz-2 input embedder (atom-attention encoder + token-level conditioning).
+
+    The atom-attention encoder is a SEPARATE instance from the diffusion atom encoder (its own
+    weights, ``structure_prediction=False`` so no ``s_to_c``/``z_to_p``/``r_to_q`` projections).
+    The four ``add_*`` conditioning terms are all enabled in ``boltz2_conf.ckpt``.
+
+    Attributes:
+        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
+        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
+        vocab_size: Residue-type vocabulary size (``res_type_encoding``: ``Linear(33 -> single_size)``).
+        msa_profile_size: Width of the MSA-profile feature (profile(33) + deletion_mean(1)).
+        num_method_types: Number of experimental-method ids for method conditioning.
+        num_molecule_types: Number of molecule types for molecule-type conditioning.
+        add_method_conditioning: Whether to add the experimental-method embedding.
+        add_modified_flag: Whether to add the modified-residue embedding.
+        add_cyclic_flag: Whether to add the cyclic-position projection.
+        add_mol_type_feat: Whether to add the molecule-type embedding.
+
+    Examples:
+        >>> config = Boltz2InputEmbeddingsConfig()
+        >>> config.num_atom_encoder_blocks
+        3
+        >>> config.add_method_conditioning
+        True
+    """
+
+    num_atom_encoder_blocks: int = 3
+    num_atom_encoder_attention_heads: int = 4
+    vocab_size: int = 33  # res_type_encoding: Linear(33 -> single_size)
+    msa_profile_size: int = 34  # msa_profile_encoding: Linear(profile(33) + deletion_mean(1))
+    num_method_types: int = 12  # method_conditioning_init: Embedding(12, single_size)
+    num_molecule_types: int = 4  # mol_type_conditioning_init: Embedding(4, single_size)
+    add_method_conditioning: bool = True
+    add_modified_flag: bool = True
+    add_cyclic_flag: bool = True
+    add_mol_type_feat: bool = True
+
+
 class Boltz2TrunkConfig(Config):
     r"""
     Boltz-2 representation trunk (pairformer + MSA).
@@ -60,46 +100,6 @@ class Boltz2TrunkConfig(Config):
     msa_dropout: float = 0.15
 
 
-class Boltz2InputEmbedderConfig(Config):
-    r"""
-    Boltz-2 input embedder (atom-attention encoder + token-level conditioning).
-
-    The atom-attention encoder is a SEPARATE instance from the diffusion atom encoder (its own
-    weights, ``structure_prediction=False`` so no ``s_to_c``/``z_to_p``/``r_to_q`` projections).
-    The four ``add_*`` conditioning terms are all enabled in ``boltz2_conf.ckpt``.
-
-    Attributes:
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        vocab_size: Residue-type vocabulary size (``res_type_encoding``: ``Linear(33 -> single_size)``).
-        msa_profile_size: Width of the MSA-profile feature (profile(33) + deletion_mean(1)).
-        num_method_types: Number of experimental-method ids for method conditioning.
-        num_molecule_types: Number of molecule types for molecule-type conditioning.
-        add_method_conditioning: Whether to add the experimental-method embedding.
-        add_modified_flag: Whether to add the modified-residue embedding.
-        add_cyclic_flag: Whether to add the cyclic-position projection.
-        add_mol_type_feat: Whether to add the molecule-type embedding.
-
-    Examples:
-        >>> config = Boltz2InputEmbedderConfig()
-        >>> config.num_atom_encoder_blocks
-        3
-        >>> config.add_method_conditioning
-        True
-    """
-
-    num_atom_encoder_blocks: int = 3
-    num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33  # res_type_encoding: Linear(33 -> single_size)
-    msa_profile_size: int = 34  # msa_profile_encoding: Linear(profile(33) + deletion_mean(1))
-    num_method_types: int = 12  # method_conditioning_init: Embedding(12, single_size)
-    num_molecule_types: int = 4  # mol_type_conditioning_init: Embedding(4, single_size)
-    add_method_conditioning: bool = True
-    add_modified_flag: bool = True
-    add_cyclic_flag: bool = True
-    add_mol_type_feat: bool = True
-
-
 class Boltz2TemplateConfig(Config):
     r"""
     Boltz-2 (V2) template embedding (on-the-fly distogram / unit-vector).
@@ -138,9 +138,9 @@ class Boltz2TemplateConfig(Config):
     max_distance: float = 50.75
 
 
-class Boltz2DiffusionConfig(Config):
+class Boltz2DenoiserConfig(Config):
     r"""
-    Boltz-2 diffusion / structure module (EDM score network).
+    Boltz-2 learned coordinate denoiser (EDM score network).
 
     Attributes:
         num_token_transformer_blocks: Number of conditioned token-transformer blocks in the score model.
@@ -157,7 +157,7 @@ class Boltz2DiffusionConfig(Config):
         alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step.
 
     Examples:
-        >>> config = Boltz2DiffusionConfig()
+        >>> config = Boltz2DenoiserConfig()
         >>> config.num_token_transformer_blocks
         24
         >>> config.sigma_data
@@ -201,19 +201,19 @@ class Boltz2SamplerConfig(Config):
     rho: float = 7.0
     max_noise_level: float = 160.0
     # The released CLI replaces the older values serialized in the checkpoint
-    # (4e-4, 1.0, 1.0) with Boltz2DiffusionParams for every Boltz-2 prediction.
+    # (4e-4, 1.0, 1.0) with released inference values for every Boltz-2 prediction.
     min_noise_level: float = 1e-4
     step_scale: float = 1.5
     noise_scale: float = 1.003
     churn_rate: float = 0.8
 
 
-class Boltz2ConfidenceConfig(Config):
+class Boltz2ConfidenceModuleConfig(Config):
     r"""
-    Boltz-2 confidence head (token-level, separate intra/inter PAE/PDE).
+    Boltz-2 confidence module (token-level, separate intra/inter PAE/PDE).
 
     Attributes:
-        num_pairformer_blocks: Number of Pairformer blocks in the confidence head
+        num_pairformer_blocks: Number of Pairformer blocks in the confidence module
             (``confidence_model_args.pairformer_args.num_blocks``).
         num_pair_attention_heads: Head count for the confidence pair-biased attention.
         num_distogram_bins: Number of distogram bins used to bin representative-atom distances.
@@ -223,7 +223,7 @@ class Boltz2ConfidenceConfig(Config):
         num_pde_bins: Number of predicted-distance-error output bins.
 
     Examples:
-        >>> config = Boltz2ConfidenceConfig()
+        >>> config = Boltz2ConfidenceModuleConfig()
         >>> config.num_pairformer_blocks
         8
     """
@@ -237,16 +237,16 @@ class Boltz2ConfidenceConfig(Config):
     num_pde_bins: int = 64
 
 
-class Boltz2AffinityHeadConfig(Config):
+class Boltz2AffinityModuleConfig(Config):
     r"""
-    Configure one Boltz-2 affinity head and its pair-only Pairformer stack.
+    Configure one Boltz-2 affinity module and its pair-only Pairformer stack.
 
     The public affinity checkpoint is a full Boltz-2 model with an extra masked pair head. These defaults follow
     the artifact shape: distogram-conditioned pair features, a pair-only Pairformer stack, then two scalar affinity
     branches.
 
     Attributes:
-        num_pairformer_blocks: Number of pair-only Pairformer blocks in the affinity head.
+        num_pairformer_blocks: Number of pair-only Pairformer blocks in the affinity module.
         num_distogram_bins: Number of distogram bins used to condition the pair features.
         max_distance: Upper edge of the distogram binning range, in angstroms.
         num_conditioning_transitions: Number of transition blocks in the pairwise conditioner.
@@ -256,7 +256,7 @@ class Boltz2AffinityHeadConfig(Config):
         dropout: Dropout applied in the affinity Pairformer stack.
 
     Examples:
-        >>> config = Boltz2AffinityHeadConfig()
+        >>> config = Boltz2AffinityModuleConfig()
         >>> config.num_pairformer_blocks
         4
     """
@@ -275,7 +275,7 @@ class Boltz2Config(Config):
     r"""
     Boltz-2-shaped model configuration (folding + confidence).
 
-    Aggregates the per-subsystem configs (input embedder, trunk, template, diffusion, sampler, confidence)
+    Aggregates the per-subsystem configs (input embeddings, trunk, template, denoiser, sampler, confidence module)
     with the top-level token/pair widths and architecture flags verified against ``boltz2_conf.ckpt``.
 
     Attributes:
@@ -293,12 +293,12 @@ class Boltz2Config(Config):
         predict_bfactor: Whether the B-factor head is instantiated.
         conditioning_cutoff_min: Lower distance cutoff for contact conditioning, in angstroms.
         conditioning_cutoff_max: Upper distance cutoff for contact conditioning, in angstroms.
-        input_embedder: Input-embedder sub-config.
+        input_embeddings: Input-embeddings sub-config.
         trunk: Representation-trunk sub-config.
         template: Template-embedder sub-config.
-        diffusion: Diffusion / structure-module sub-config.
+        denoiser: Learned coordinate-denoiser sub-config.
         sampler: EDM-sampler sub-config.
-        confidence: Confidence-head sub-config.
+        confidence_module: Pairformer confidence-module sub-config.
 
     Examples:
         >>> config = Boltz2Config()
@@ -326,12 +326,12 @@ class Boltz2Config(Config):
 
     conditioning_cutoff_min: float = 4.0
     conditioning_cutoff_max: float = 20.0
-    input_embedder: Boltz2InputEmbedderConfig = Boltz2InputEmbedderConfig()
+    input_embeddings: Boltz2InputEmbeddingsConfig = Boltz2InputEmbeddingsConfig()
     trunk: Boltz2TrunkConfig = Boltz2TrunkConfig()
     template: Boltz2TemplateConfig = Boltz2TemplateConfig()
-    diffusion: Boltz2DiffusionConfig = Boltz2DiffusionConfig()
+    denoiser: Boltz2DenoiserConfig = Boltz2DenoiserConfig()
     sampler: Boltz2SamplerConfig = Boltz2SamplerConfig()
-    confidence: Boltz2ConfidenceConfig = Boltz2ConfidenceConfig()
+    confidence_module: Boltz2ConfidenceModuleConfig = Boltz2ConfidenceModuleConfig()
 
 
 class Boltz2AffinityConfig(Boltz2Config):
@@ -343,12 +343,12 @@ class Boltz2AffinityConfig(Boltz2Config):
 
     Attributes:
         recycling_steps: Released affinity-pass recycle count.
-        affinity1: First ensemble affinity head (8 pair-only Pairformer blocks).
-        affinity2: Second ensemble affinity head (4 pair-only Pairformer blocks).
+        affinity_module1: First affinity module (8 pair-only Pairformer blocks).
+        affinity_module2: Second affinity module (4 pair-only Pairformer blocks).
 
     Examples:
         >>> config = Boltz2AffinityConfig()
-        >>> config.affinity1.num_pairformer_blocks
+        >>> config.affinity_module1.num_pairformer_blocks
         8
         >>> from ofoldx.models.boltz2 import Boltz2AffinityModel
         >>> model = Boltz2AffinityModel(config)  # doctest: +SKIP
@@ -358,5 +358,5 @@ class Boltz2AffinityConfig(Boltz2Config):
     predict_bfactor: bool = False
     recycling_steps: int = 6
 
-    affinity1: Boltz2AffinityHeadConfig = Boltz2AffinityHeadConfig({"num_pairformer_blocks": 8})
-    affinity2: Boltz2AffinityHeadConfig = Boltz2AffinityHeadConfig({"num_pairformer_blocks": 4})
+    affinity_module1: Boltz2AffinityModuleConfig = Boltz2AffinityModuleConfig({"num_pairformer_blocks": 8})
+    affinity_module2: Boltz2AffinityModuleConfig = Boltz2AffinityModuleConfig({"num_pairformer_blocks": 4})

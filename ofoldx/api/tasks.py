@@ -8,7 +8,7 @@ from typing import Any, TypeAlias
 
 import torch
 
-from .._repository import (
+from ..hub import (
     PROCESSOR_METADATA,
     hydrate_weights,
     load_json_object,
@@ -21,8 +21,9 @@ from .._repository import (
 from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ..data.structure import Structure
+from ..models.registry import Task
 from ..pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
-from ..pipelines.registry import PIPELINES, PipelineRegistration, PipelineTask
+from ..pipelines.registry import PIPELINES, PipelineRegistration
 
 FoldInput: TypeAlias = (
     str
@@ -48,7 +49,7 @@ _STANDARD_PIPELINE_CLASSES = {
 
 
 def pipeline(
-    task: PipelineTask,
+    task: Task,
     *,
     model: str | PathLike[str],
     revision: str | None = None,
@@ -249,7 +250,7 @@ def pack(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-    positions: Sequence[ComponentReference] | None = None,
+    pack_positions: Sequence[ComponentReference] | None = None,
     num_samples: int = 1,
     seed: int | None = None,
     generator: torch.Generator | None = None,
@@ -261,7 +262,7 @@ def pack(
     arguments.update(
         {
             "sequence": sequence,
-            "positions": positions,
+            "pack_positions": pack_positions,
             "num_samples": num_samples,
         }
     )

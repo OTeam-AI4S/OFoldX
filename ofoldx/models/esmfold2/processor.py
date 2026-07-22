@@ -25,8 +25,8 @@ from ...data.molecular import (
 )
 from ...data.structure import Structure
 from ...references import classify_reference
-from .config import ESMFold2ExperimentalConfig, ESMFold2ProcessorConfig
-from .model import ESMFold2Input, ESMFold2Layout
+from .config import EsmFold2ExperimentalProcessorConfig, EsmFold2ProcessorConfig
+from .model import EsmFold2Input, EsmFold2Layout
 
 _PROTEIN_RESIDUE_TYPES = {
     component_id: index
@@ -73,17 +73,17 @@ _MUTABLE_TOKEN = "#"
 _ANTIBODY_CDR_SCHEME = "chothia"
 
 
-class ESMFold2Processor:
+class EsmFold2Processor:
     r"""Lower complete canonical ESMFold2 inputs without changing their chemistry."""
 
     def __init__(
         self,
-        config: ESMFold2ProcessorConfig | None = None,
+        config: EsmFold2ProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.config = ESMFold2ProcessorConfig() if config is None else config
+        self.config = EsmFold2ProcessorConfig() if config is None else config
         self.device = torch.device("cpu" if device is None else device)
         self.dtype = torch.float32 if dtype is None else dtype
         self.tokenizer = ProteinTokenizer()
@@ -106,7 +106,7 @@ class ESMFold2Processor:
         input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-    ) -> ESMFold2Input:
+    ) -> EsmFold2Input:
         r"""Lower one molecular system and optional MSA evidence."""
 
         if msa is not None and not self.config.msa_conditioning:
@@ -124,58 +124,30 @@ class ESMFold2Processor:
         )
 
 
-class ESMFold2ExperimentalProcessor:
+class EsmFold2ExperimentalProcessor(EsmFold2Processor):
     r"""Lower target|binder complexes for the experimental recurrent ESMFold2 design graph.
 
-    Paired with [`ESMFold2ExperimentalModel`][ofoldx.models.esmfold2.ESMFold2ExperimentalModel].
-    The experimental design/inversion checkpoints are single-sequence
-    (``disable_msa_features``), so this Processor uses the ESMFold2 token/atom
-    lowering with MSA conditioning off and rejects MSA evidence. The soft one-hot
-    ``res_type_soft`` design tensor consumed by the differentiable trunk is assembled by
-    the binder-design Pipeline, not here (it depends on the per-step optimisation logits).
+    Paired with [`EsmFold2ExperimentalModel`][ofoldx.models.esmfold2.EsmFold2ExperimentalModel].
+    It uses the same ESMFold2 token/atom lowering, while its independent config
+    records whether the paired checkpoint accepts MSA evidence. The soft residue
+    probabilities consumed by the differentiable trunk are assembled by the
+    binder-design Pipeline because they depend on the per-step optimisation logits.
     """
 
     def __init__(
         self,
-        config: ESMFold2ExperimentalConfig | None = None,
+        config: EsmFold2ExperimentalProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.config = ESMFold2ExperimentalConfig() if config is None else config
-        self._base = ESMFold2Processor(
-            ESMFold2ProcessorConfig({"msa_conditioning": not self.config.disable_msa_features}),
+        config = EsmFold2ExperimentalProcessorConfig() if config is None else config
+        super().__init__(
+            EsmFold2ProcessorConfig({"msa_conditioning": config.msa_conditioning}),
             device=device,
             dtype=dtype,
         )
-
-    @property
-    def device(self) -> torch.device:
-        return self._base.device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._base.dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        self._base.to(device, dtype)
-        return self
-
-    def __call__(
-        self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
-        *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
-    ) -> ESMFold2Input:
-        r"""Lower one target|binder complex to experimental ESMFold2 tensors (no MSA)."""
-
-        return self._base(input, msa=msa)
+        self.config = config
 
 
 def molecular_system(
@@ -309,7 +281,7 @@ def prepare_esmfold2_features(
     tokenizer: ProteinTokenizer,
     device: torch.device,
     dtype: torch.dtype,
-) -> ESMFold2Input:
+) -> EsmFold2Input:
     r"""Build the token and atom layout from canonical identity and topology."""
 
     token_groups: list[tuple[AtomSite, ...]] = []
@@ -440,19 +412,19 @@ def prepare_esmfold2_features(
                 [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
             )
 
-    ref_pos = torch.zeros(padded_atom_count, 3, dtype=torch.float32)
+    reference_positions = torch.zeros(padded_atom_count, 3, dtype=torch.float32)
     ref_element = torch.zeros(padded_atom_count, dtype=torch.long)
     ref_charge = torch.zeros(padded_atom_count, dtype=torch.int8)
     ref_atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
     ref_space_uid = torch.zeros(padded_atom_count, dtype=torch.long)
-    atom_attention_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
+    atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_pos[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
+    reference_positions[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
     ref_element[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
     ref_charge[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
     ref_atom_name_chars[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
     ref_space_uid[:real_atom_count] = torch.tensor(reference_space_ids, dtype=torch.long)
-    atom_attention_mask[:real_atom_count] = True
+    atom_mask[:real_atom_count] = True
     atom_to_token[:real_atom_count] = torch.tensor(
         [token_index for token_index, group in enumerate(token_groups) for _ in group],
         dtype=torch.long,
@@ -485,16 +457,16 @@ def prepare_esmfold2_features(
         "chain_index": torch.tensor(asym_ids, dtype=torch.long),
         "symmetry_index": torch.tensor(sym_ids, dtype=torch.long),
         "entity_index": torch.tensor(entity_ids, dtype=torch.long),
-        "mol_type": torch.tensor(molecule_types, dtype=torch.long),
-        "res_type": torch.tensor(residue_types, dtype=torch.long),
+        "molecule_type": torch.tensor(molecule_types, dtype=torch.long),
+        "residue_type": torch.tensor(residue_types, dtype=torch.long),
         "token_bonds": token_bonds,
-        "token_attention_mask": torch.ones(token_count, dtype=torch.bool),
-        "ref_pos": ref_pos,
+        "token_mask": torch.ones(token_count, dtype=torch.bool),
+        "reference_positions": reference_positions,
         "ref_element": ref_element,
         "ref_charge": ref_charge,
         "ref_atom_name_chars": ref_atom_name_chars,
         "ref_space_uid": ref_space_uid,
-        "atom_attention_mask": atom_attention_mask,
+        "atom_mask": atom_mask,
         "atom_to_token": atom_to_token,
         "distogram_atom_idx": torch.tensor(representative_atoms, dtype=torch.long),
         "token_has_esmc": token_has_esmc,
@@ -504,12 +476,12 @@ def prepare_esmfold2_features(
         name: tensor.to(device=device, dtype=dtype) if tensor.is_floating_point() else tensor.to(device=device)
         for name, tensor in features.items()
     }
-    return ESMFold2Input(
+    return EsmFold2Input(
         **{name: value.unsqueeze(0) for name, value in placed.items()},
         esmc_input_ids=esmc_input_ids.to(device=device),
         esmc_attention_mask=esmc_attention_mask.to(device=device),
         token_to_esmc=token_to_esmc.unsqueeze(0).to(device=device),
-        layout=ESMFold2Layout(
+        layout=EsmFold2Layout(
             system=system,
             atom_sites=atom_sites,
             token_sites=tuple(token_sites),
@@ -794,7 +766,7 @@ def antibody_cdr_prompt(fv_sequence: str) -> str:
     The antibody input-preparation step: ANARCI annotates the Chothia CDRs and the returned
     prompt fixes every framework residue to its input amino acid while marking every CDR
     position with the mutable ``#`` token. The prompt is the per-input design mask;
-    [`ESMFold2DesignPipeline.design`][ofoldx.models.esmfold2.pipeline.ESMFold2DesignPipeline.design] then
+    [`EsmFold2DesignPipeline.design`][ofoldx.models.esmfold2.pipeline.EsmFold2DesignPipeline.design] then
     optimises exactly the marked CDR positions with no antibody-specific branch.
     Antibody framework design uses ``language_model_weight=0.05``; general binders
     use the ``0.15`` default.

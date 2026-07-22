@@ -11,6 +11,11 @@ from .model import (
     AlphaFold3Model,
     AlphaFold3Output,
     AlphaFold3SeedGroup,
+    alphafold3_confidence_summary,
+    alphafold3_has_clash,
+    alphafold3_pae_bin_centers,
+    alphafold3_predicted_tm_score,
+    alphafold3_ranking_score,
 )
 from .pipeline import AlphaFold3Pipeline
 from .processor import AlphaFold3Processor

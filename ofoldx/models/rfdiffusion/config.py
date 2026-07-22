@@ -5,10 +5,10 @@ from __future__ import annotations
 from chanfig import Config
 
 
-class RFdiffusionSE3Config(Config):
+class RfDiffusionSe3Config(Config):
     r"""Architecture of one released SE(3)-Transformer stack."""
 
-    num_layers: int = 1
+    num_blocks: int = 1
     num_channels: int = 32
     num_degrees: int = 2
     num_attention_heads: int = 4
@@ -20,7 +20,7 @@ class RFdiffusionSE3Config(Config):
     num_edge_features: int = 32
 
 
-class RFdiffusionNetworkConfig(Config):
+class RfDiffusionDenoiserConfig(Config):
     r"""RoseTTAFold denoiser dimensions stored in official checkpoints."""
 
     vocab_size: int = 21
@@ -37,8 +37,8 @@ class RFdiffusionNetworkConfig(Config):
     hidden_size: int = 32
     template_hidden_size: int = 32
     dropout: float = 0.15
-    se3_param_full: RFdiffusionSE3Config = RFdiffusionSE3Config()
-    se3_param_topk: RFdiffusionSE3Config = RFdiffusionSE3Config(
+    trunk_se3: RfDiffusionSe3Config = RfDiffusionSe3Config()
+    refinement_se3: RfDiffusionSe3Config = RfDiffusionSe3Config(
         {
             "l0_in_features": 64,
             "l0_out_features": 64,
@@ -48,7 +48,7 @@ class RFdiffusionNetworkConfig(Config):
     freeze_track_motif: bool = False
 
 
-class RFdiffusionDiffuserConfig(Config):
+class RfDiffusionDiffuserConfig(Config):
     r"""Forward-diffusion process the checkpoint was trained against."""
 
     num_timesteps: int = 50
@@ -64,7 +64,7 @@ class RFdiffusionDiffuserConfig(Config):
     max_rotation_sigma: float = 1.5
 
 
-class RFdiffusionPreprocessConfig(Config):
+class RfDiffusionPreprocessConfig(Config):
     r"""Checkpoint-dependent input feature schema."""
 
     sidechain_input: bool = False
@@ -74,7 +74,7 @@ class RFdiffusionPreprocessConfig(Config):
     structure_self_conditioning: bool = False
 
 
-class RFdiffusionConfig(Config):
+class RfDiffusionConfig(Config):
     r"""Exact persistent configuration of one RFdiffusion denoiser.
 
     Sampling steps, noise scales, symmetry, conditions, paths, placement, logging,
@@ -82,9 +82,9 @@ class RFdiffusionConfig(Config):
     are execution inputs, not checkpoint architecture.
     """
 
-    network: RFdiffusionNetworkConfig = RFdiffusionNetworkConfig()
-    diffuser: RFdiffusionDiffuserConfig = RFdiffusionDiffuserConfig()
-    preprocess: RFdiffusionPreprocessConfig = RFdiffusionPreprocessConfig()
+    denoiser: RfDiffusionDenoiserConfig = RfDiffusionDenoiserConfig()
+    diffuser: RfDiffusionDiffuserConfig = RfDiffusionDiffuserConfig()
+    preprocess: RfDiffusionPreprocessConfig = RfDiffusionPreprocessConfig()
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -102,5 +102,5 @@ class RFdiffusionConfig(Config):
             raise ValueError("preprocess.template_2d_size must be 44 or 47")
 
 
-class RFdiffusionProcessorConfig(Config):
+class RfDiffusionProcessorConfig(Config):
     r"""RFdiffusion lowering has no persistent options."""

@@ -9,9 +9,9 @@ import torch
 
 from ...data.molecular import ComponentReference
 from ...data.structure import Structure
+from ...io import read_mpnn_pdb
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import PackPrediction, PackResult
-from ..mpnn_pdb import read_mpnn_pdb
 from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, pack_candidate
 from .processor import MpnnPackerProcessor
 
@@ -24,7 +24,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        pack_positions: Sequence[ComponentReference] | None = None,
         use_atom_context: bool = True,
         filter_by_occupancy: bool = True,
         num_samples: int = 1,
@@ -35,16 +35,16 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
     ) -> PackResult:
         r"""Pack the selected side chains with the released iterative sampler."""
 
-        features = self.processor(
+        model_input = self.processor(
             input,
             sequence=sequence,
-            positions=positions,
+            pack_positions=pack_positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
         )
-        generator = resolve_generator(seed, generator, device=features.sequence_tokens.device)
+        generator = resolve_generator(seed, generator, device=model_input.sequence_tokens.device)
         return self.model.pack(
-            features,
+            model_input,
             num_samples=num_samples,
             num_denoising_steps=num_denoising_steps,
             num_torsion_samples=num_torsion_samples,
@@ -56,7 +56,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         input: Structure | str | PathLike[str],
         *,
         sequences: Sequence[str | Mapping[str, str | Sequence[str]]],
-        positions: Sequence[ComponentReference] | None = None,
+        pack_positions: Sequence[ComponentReference] | None = None,
         use_atom_context: bool = True,
         filter_by_occupancy: bool = True,
         num_samples: int = 1,
@@ -72,7 +72,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             self.processor(
                 structure,
                 sequence=sequence,
-                positions=positions,
+                pack_positions=pack_positions,
                 use_atom_context=use_atom_context,
                 filter_by_occupancy=filter_by_occupancy,
             )
@@ -106,7 +106,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             context_mask=torch.cat([item.context_mask for item in inputs]),
             atom37_coordinates=torch.cat([item.atom37_coordinates for item in inputs]),
             atom37_mask=torch.cat([item.atom37_mask for item in inputs]),
-            pack_mask=torch.cat([item.pack_mask for item in inputs]),
+            pack_positions=torch.cat([item.pack_positions for item in inputs]),
             structure=inputs[0].structure,
             component_references=inputs[0].component_references,
         )

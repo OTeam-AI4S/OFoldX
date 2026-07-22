@@ -4,28 +4,25 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from importlib import import_module
-from typing import Any, Literal, NamedTuple, Protocol, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import chanfig
-from torch import nn
 
-StandardTask = Literal["fold", "design", "score", "pack"]
-_STANDARD_TASKS: frozenset[StandardTask] = frozenset({"fold", "design", "score", "pack"})
+from ..model import Model
 
-
-class _ConfiguredModel(Protocol):
-    config_class: type[chanfig.Config]
+Task = Literal["fold", "design", "score", "pack"]
+TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
 
 
 class ModelRegistration(NamedTuple):
     r"""Classes and standard tasks belonging to one model identity."""
 
     id: str
-    model: type[nn.Module]
+    model: type[Model]
     processor: type[Any]
     processor_config: type[chanfig.Config] | None
     model_config: type[chanfig.Config]
-    standard_tasks: frozenset[StandardTask]
+    standard_tasks: frozenset[Task]
 
 
 _BUILTIN_MODEL_MODULES = {
@@ -63,7 +60,7 @@ class ModelRegistry(chanfig.Registry):
     """
 
     by_config: dict[type[chanfig.Config], ModelRegistration]
-    by_pair: dict[tuple[type[nn.Module], type[Any]], ModelRegistration]
+    by_pair: dict[tuple[type[Model], type[Any]], ModelRegistration]
 
     def __init__(self) -> None:
         super().__init__(case_sensitive=True)
@@ -75,22 +72,21 @@ class ModelRegistry(chanfig.Registry):
         self,
         id: str,
         *,
-        model: type[nn.Module],
+        model: type[Model],
         processor: type[Any],
         processor_config: type[chanfig.Config] | None,
-        standard_tasks: Collection[str] = (),
+        standard_tasks: Collection[Task] = (),
     ) -> None:
         r"""Register one Model/Processor pair."""
 
         self._import_builtin(id)
 
-        model_config = cast(_ConfiguredModel, model).config_class
+        model_config = model.config_class
 
         standard_task_values = frozenset(standard_tasks)
-        unknown = standard_task_values - _STANDARD_TASKS
+        unknown = standard_task_values - TASKS
         if unknown:
             raise ValueError(f"unknown standard tasks: {unknown!r}")
-        validated_tasks = cast(frozenset[StandardTask], standard_task_values)
 
         pair = (model, processor)
         if pair in self.by_pair:
@@ -105,7 +101,7 @@ class ModelRegistry(chanfig.Registry):
             processor=processor,
             processor_config=processor_config,
             model_config=model_config,
-            standard_tasks=validated_tasks,
+            standard_tasks=standard_task_values,
         )
         super().register(registration, id)
         self.by_pair[pair] = registration
@@ -130,7 +126,8 @@ class ModelRegistry(chanfig.Registry):
     def for_pair(self, model: object, processor: object) -> ModelRegistration:
         r"""Return the registration for an exact Model/Processor class pair."""
 
-        return self.by_pair[type(model), type(processor)]
+        model_class = cast(type[Model], type(model))
+        return self.by_pair[model_class, type(processor)]
 
 
 MODELS = ModelRegistry()

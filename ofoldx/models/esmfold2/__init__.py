@@ -3,68 +3,72 @@ r"""ESMFold2 folding and experimental design implementations."""
 from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ..registry import MODELS, Task
 from .config import (
-    ESMFold2AtomAttentionConfig,
-    ESMFold2ConfidenceHeadConfig,
-    ESMFold2Config,
-    ESMFold2DiffusionModuleConfig,
-    ESMFold2ESMCConfig,
-    ESMFold2ExperimentalConfidenceHeadConfig,
-    ESMFold2ExperimentalConfig,
-    ESMFold2FoldingTrunkConfig,
-    ESMFold2InputsEmbedderConfig,
-    ESMFold2LMEncoderConfig,
-    ESMFold2MSAEncoderConfig,
-    ESMFold2ParcaeConfig,
-    ESMFold2ProcessorConfig,
-    ESMFold2StructureHeadConfig,
+    EsmFold2AtomEncoderConfig,
+    EsmFold2ConfidenceHeadConfig,
+    EsmFold2Config,
+    EsmFold2DiffusionModuleConfig,
+    EsmFold2DiffusionStructureHeadConfig,
+    EsmFold2EsmCConfig,
+    EsmFold2ExperimentalConfidenceHeadConfig,
+    EsmFold2ExperimentalConfig,
+    EsmFold2ExperimentalProcessorConfig,
+    EsmFold2FoldingTrunkConfig,
+    EsmFold2InputEmbeddingsConfig,
+    EsmFold2LmEncoderConfig,
+    EsmFold2MsaEncoderConfig,
+    EsmFold2ParcaeConfig,
+    EsmFold2ProcessorConfig,
 )
 from .model import (
-    ESMFold2BackendSettings,
-    ESMFold2DesignCandidate,
-    ESMFold2DesignResult,
-    ESMFold2ExperimentalModel,
-    ESMFold2Input,
-    ESMFold2Model,
-    ESMFold2Output,
+    EsmFold2BackendSettings,
+    EsmFold2DesignCandidate,
+    EsmFold2DesignResult,
+    EsmFold2ExperimentalModel,
+    EsmFold2Input,
+    EsmFold2Model,
+    EsmFold2Output,
 )
-from .pipeline import ESMFold2DesignPipeline, ESMFold2Pipeline, cdr_distogram_iptm_proxy
+from .pipeline import EsmFold2DesignPipeline, EsmFold2Pipeline, cdr_distogram_iptm_proxy
 from .processor import (
-    ESMFold2ExperimentalProcessor,
-    ESMFold2Processor,
+    EsmFold2ExperimentalProcessor,
+    EsmFold2Processor,
     antibody_cdr_indices,
     antibody_cdr_prompt,
     is_antibody_sequence,
 )
 
+_FOLD_TASKS: tuple[Task, ...] = ("fold",)
+_DESIGN_TASKS: tuple[Task, ...] = ("design",)
+
 MODELS.register_model(
     "ofoldx.esmfold2",
-    model=ESMFold2Model,
-    processor=ESMFold2Processor,
-    processor_config=ESMFold2ProcessorConfig,
-    standard_tasks={"fold"},
+    model=EsmFold2Model,
+    processor=EsmFold2Processor,
+    processor_config=EsmFold2ProcessorConfig,
+    standard_tasks=_FOLD_TASKS,
 )
 
 # The experimental graph uses a distinct processor and the concrete design pipeline.
 MODELS.register_model(
     "ofoldx.esmfold2_experimental",
-    model=ESMFold2ExperimentalModel,
-    processor=ESMFold2ExperimentalProcessor,
-    processor_config=ESMFold2ExperimentalConfig,
+    model=EsmFold2ExperimentalModel,
+    processor=EsmFold2ExperimentalProcessor,
+    processor_config=EsmFold2ExperimentalProcessorConfig,
     standard_tasks=(),
 )
 
 PIPELINES.register_pipeline(
     "ofoldx.esmfold2",
-    pipeline=ESMFold2Pipeline,
-    tasks=("fold",),
+    pipeline=EsmFold2Pipeline,
+    tasks=_FOLD_TASKS,
     architectures=("ofoldx.esmfold2",),
 )
 PIPELINES.register_pipeline(
     "ofoldx.esmfold2_design",
-    pipeline=ESMFold2DesignPipeline,
-    tasks=("design",),
+    pipeline=EsmFold2DesignPipeline,
+    tasks=_DESIGN_TASKS,
     architectures=("ofoldx.esmfold2_experimental",),
-    repository_loader=ESMFold2DesignPipeline.from_repository,
+    repository_loader=EsmFold2DesignPipeline.from_repository,
 )

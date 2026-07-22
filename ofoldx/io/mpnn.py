@@ -1,4 +1,4 @@
-r"""Rich-PDB lowering consumed by ProteinMPNN, LigandMPNN, and MpnnPacker.
+r"""MPNN-specific PDB reading for ProteinMPNN, LigandMPNN, and MpnnPacker.
 
 ``read_mpnn_pdb`` reads the first physical model, retains blank and ``A`` alternate
 locations in source order after optional chain filtering, and decodes hybrid-36

@@ -14,7 +14,7 @@ import chanfig
 import torch
 from torch import nn
 
-from .._repository import ResolvedRepository, load_model, load_processor, resolve_repository
+from ..hub import ResolvedRepository, load_model, load_processor, resolve_repository
 from ..artifacts import save_model
 from .registry import PIPELINES
 
@@ -121,7 +121,7 @@ class CompositePipeline:
         chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
 
         if repo_id is not None:
-            from .._repository import upload_repository
+            from ..hub import upload_repository
 
             upload_repository(
                 destination,

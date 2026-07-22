@@ -17,8 +17,9 @@ from typing import Any
 import danling as dl
 import torch
 from danling.runners.utils import RunnerMode
-from torch import Tensor, nn
+from torch import Tensor
 
+from ..model import Model
 from .collate import collate
 from .config import RunnerConfig
 from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
@@ -55,7 +56,7 @@ class Runner(dl.Runner):
 
     # -- construction --------------------------------------------------------
 
-    def build_model(self) -> nn.Module:
+    def build_model(self) -> Model:
         r"""Build the Model from ``config.model`` and record its architecture id.
 
         ``config.model.pretrained`` loads a registered Model with weights;

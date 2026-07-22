@@ -19,20 +19,20 @@ CrossAttentionKeySource = Literal["raw", "normalized"]
 
 class ConditionedTransformer(nn.Module):
     r"""
-    Stack of [ConditionedTransformerLayer][ofoldx.modules.transformer.ConditionedTransformerLayer]
-    that slices the precomputed per-layer pair bias.
+    Stack of [ConditionedTransformerBlock][ofoldx.modules.transformer.ConditionedTransformerBlock]
+    that slices the precomputed per-block pair bias.
 
     The pair bias is computed once and packed as ``num_blocks * heads`` channels on the last axis;
-    the stack hands each layer its own head-block slice, so no per-layer bias projection is needed.
+    the stack hands each block its own per-head slice, so no per-block bias projection is needed.
     Args:
-        num_blocks: Number of transformer layers.
-        num_attention_heads: Number of attention heads per layer.
+        num_blocks: Number of transformer blocks.
+        num_attention_heads: Number of attention heads per block.
         hidden_size: Width of the token/atom channel that flows through the stack.
         conditioning_size: Width of the conditioning channel; defaults to ``hidden_size``.
         operator_backend: Which operator backend the attention runs; see
             [ofoldx.modules.backend][].
-        cross_attention_mode: Whether each layer adds a second adaptive norm on the key/value path.
-        transition: Which conditioned transition each layer uses, ``"triple"`` or ``"double"``.
+        cross_attention_mode: Whether each block adds a second adaptive norm on the key/value path.
+        transition: Which conditioned transition each block uses, ``"triple"`` or ``"double"``.
     Examples:
         >>> import torch
         >>> transformer = ConditionedTransformer(
@@ -62,8 +62,8 @@ class ConditionedTransformer(nn.Module):
     ) -> None:
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
-        self.layers = nn.ModuleList(
-            ConditionedTransformerLayer(
+        self.blocks = nn.ModuleList(
+            ConditionedTransformerBlock(
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
@@ -84,19 +84,19 @@ class ConditionedTransformer(nn.Module):
         to_keys: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
         r"""
-        Run the layer stack, feeding each layer its own slice of the packed pair bias.
+        Run the block stack, feeding each block its own slice of the packed pair bias.
 
         ``bias`` of shape `[..., q, k, num_blocks * heads]` is reshaped to
-        `[..., q, k, num_blocks, heads]`, and the ``index``-th head block is handed to layer
+        `[..., q, k, num_blocks, heads]`, and the ``index``-th head slice is handed to block
         ``index``; ``hidden``, ``conditioning``, ``mask``, and ``to_keys`` are forwarded unchanged.
         Args:
             hidden: `[..., q, hidden_size]` token/atom activations.
             conditioning: `[..., q, conditioning_size]` conditioning activations.
             bias: `[..., q, k, num_blocks * heads]` precomputed per-head attention bias, packed for
                 the whole stack on the last axis.
-            mask: Optional `[..., k]` key-validity mask, forwarded to every layer.
+            mask: Optional `[..., k]` key-validity mask, forwarded to every block.
             to_keys: Optional windowed-key selector that gathers the key set for local attention;
-                when ``None`` each layer self-attends over the full axis.
+                when ``None`` each block self-attends over the full axis.
 
         Returns:
             Updated hidden activations of shape `[..., q, hidden_size]`.
@@ -113,21 +113,21 @@ class ConditionedTransformer(nn.Module):
             >>> transformer(hidden, conditioning, bias).shape
             torch.Size([1, 5, 8])
         """
-        # The precomputed bias packs (num_blocks * heads) on the last axis; one slice feeds each layer.
+        # The precomputed bias packs (num_blocks * heads) on the last axis; one slice feeds each block.
         *prefix, packed = bias.shape
-        num_blocks = len(self.layers)
+        num_blocks = len(self.blocks)
         bias = bias.view(*prefix, num_blocks, packed // num_blocks)
-        for index, layer in enumerate(self.layers):
-            hidden = layer(hidden, conditioning, bias[..., index, :], mask, to_keys)
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden, conditioning, bias[..., index, :], mask, to_keys)
         return hidden
 
 
-class ConditionedTransformerLayer(nn.Module):
+class ConditionedTransformerBlock(nn.Module):
     r"""
-    One conditioned-transformer layer: gated pair-biased attention plus a conditioned transition.
+    One conditioned-transformer block: gated pair-biased attention plus a conditioned transition.
 
     The pair bias is supplied precomputed, already projected to per-head logits. ``to_keys``
-    selects the windowed key set for local atom attention; when ``None`` the layer self-attends
+    selects the windowed key set for local atom attention; when ``None`` the block self-attends
     over the full token/atom axis. ``cross_attention_mode`` adds a second adaptive norm on the
     key/value path. ``cross_attention_key_source`` selects whether that norm consumes the raw hidden
     (DeepMind AF3) or the already query-normalized activation (Protenix and descendants). ``transition``
@@ -149,11 +149,11 @@ class ConditionedTransformerLayer(nn.Module):
 
     Examples:
         >>> import torch
-        >>> layer = ConditionedTransformerLayer(8, 4, num_attention_heads=2, operator_backend="eager")
+        >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="eager")
         >>> hidden = torch.randn(1, 5, 8)
         >>> conditioning = torch.randn(1, 5, 4)
-        >>> bias = torch.randn(1, 5, 5, 2)  # per-head bias for this layer
-        >>> layer(hidden, conditioning, bias).shape
+        >>> bias = torch.randn(1, 5, 5, 2)  # per-head bias for this block
+        >>> block(hidden, conditioning, bias).shape
         torch.Size([1, 5, 8])
     """
 
@@ -210,10 +210,10 @@ class ConditionedTransformerLayer(nn.Module):
         Args:
             hidden: `[..., q, hidden_size]` query-side token/atom activations.
             conditioning: `[..., q, conditioning_size]` conditioning activations.
-            bias: `[..., q, k, heads]` per-head attention bias for this layer; internally moved to
+            bias: `[..., q, k, heads]` per-head attention bias for this block; internally moved to
                 `[..., heads, q, k]` for the attention op.
             mask: Optional key-validity mask, either `[..., k]` or a pair mask `[..., q, k]`.
-            to_keys: Optional windowed-key selector; when ``None`` the layer self-attends over the
+            to_keys: Optional windowed-key selector; when ``None`` the block self-attends over the
                 full axis.
 
         Returns:
@@ -221,11 +221,11 @@ class ConditionedTransformerLayer(nn.Module):
 
         Examples:
             >>> import torch
-            >>> layer = ConditionedTransformerLayer(8, 4, num_attention_heads=2, operator_backend="eager")
+            >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="eager")
             >>> hidden = torch.randn(1, 5, 8)
             >>> conditioning = torch.randn(1, 5, 4)
             >>> bias = torch.randn(1, 5, 5, 2)
-            >>> layer(hidden, conditioning, bias).shape
+            >>> block(hidden, conditioning, bias).shape
             torch.Size([1, 5, 8])
         """
         normalized = self.conditioned_norm(hidden, conditioning)

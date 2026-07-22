@@ -5,7 +5,7 @@ from __future__ import annotations
 from chanfig import Config
 
 
-class PxDesignConditionEmbedderConfig(Config):
+class PxDesignConditionEmbeddingsConfig(Config):
     r"""Widths and block counts of the released design-condition embedder."""
 
     atom_hidden_size: int = 128
@@ -44,8 +44,8 @@ class PxDesignSamplerConfig(Config):
     max_noise_level: float = 160.0
     min_noise_level: float = 4e-4
     rho: float = 7.0
-    gamma_0: float = 1.0
-    gamma_min: float = 0.01
+    churn_rate: float = 1.0
+    min_churn_noise_level: float = 0.01
     noise_scale: float = 1.003
     step_scale_min: float = 1.0
     step_scale_max: float = 2.5
@@ -61,7 +61,7 @@ class PxDesignConfig(Config):
     atom_feature_size: int = 385
     num_template_bins: int = 64
 
-    condition_embedder: PxDesignConditionEmbedderConfig = PxDesignConditionEmbedderConfig()
+    condition_embeddings: PxDesignConditionEmbeddingsConfig = PxDesignConditionEmbeddingsConfig()
     denoiser: PxDesignDenoiserConfig = PxDesignDenoiserConfig()
     sampler: PxDesignSamplerConfig = PxDesignSamplerConfig()
 

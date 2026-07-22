@@ -17,7 +17,7 @@ _PACKER_TOP_LEVEL = {
     "W_e": "edge_embedding",
     "W_v": "node_embedding",
     "W_f": "decode_edge_embedding",
-    "W_v_sc": "side_chain_node_embedding",
+    "W_v_sc": "sidechain_node_embedding",
     "linear_down": "linear_down",
     "W_torsions": "torsion_projection",
     "W_c": "residue_context_input",
@@ -26,23 +26,23 @@ _PACKER_TOP_LEVEL = {
     "W_edges_y": "atom_edge_embedding",
     "V_C": "context_output",
     "V_C_norm": "context_norm",
-    "features.enc_edge_embedding": "features.edge_projection",
-    "features.enc_norm_edges": "features.edge_norm",
-    "features.enc_node_embedding": "features.node_projection",
-    "features.enc_norm_nodes": "features.node_norm",
-    "features.W_XY_project_down1": "features.context_down_projection",
-    "features.dec_edge_embedding1": "features.decode_edge_projection",
-    "features.dec_norm_edges1": "features.decode_edge_norm",
-    "features.dec_node_embedding1": "features.decode_node_projection",
-    "features.dec_norm_nodes1": "features.decode_node_norm",
-    "features.node_project_down": "features.context_node_projection",
-    "features.norm_nodes": "features.context_node_norm",
-    "features.type_linear": "features.element_projection",
-    "features.y_nodes": "features.atom_node_projection",
-    "features.y_edges": "features.atom_edge_projection",
-    "features.norm_y_edges": "features.atom_edge_norm",
-    "features.norm_y_nodes": "features.atom_node_norm",
-    "features.positional_embeddings.linear": "features.relative_position.linear",
+    "features.enc_edge_embedding": "feature_encoder.edge_projection",
+    "features.enc_norm_edges": "feature_encoder.edge_norm",
+    "features.enc_node_embedding": "feature_encoder.node_projection",
+    "features.enc_norm_nodes": "feature_encoder.node_norm",
+    "features.W_XY_project_down1": "feature_encoder.context_down_projection",
+    "features.dec_edge_embedding1": "feature_encoder.decode_edge_projection",
+    "features.dec_norm_edges1": "feature_encoder.decode_edge_norm",
+    "features.dec_node_embedding1": "feature_encoder.decode_node_projection",
+    "features.dec_norm_nodes1": "feature_encoder.decode_node_norm",
+    "features.node_project_down": "feature_encoder.context_node_projection",
+    "features.norm_nodes": "feature_encoder.context_node_norm",
+    "features.type_linear": "feature_encoder.element_projection",
+    "features.y_nodes": "feature_encoder.atom_node_projection",
+    "features.y_edges": "feature_encoder.atom_edge_projection",
+    "features.norm_y_edges": "feature_encoder.atom_edge_norm",
+    "features.norm_y_nodes": "feature_encoder.atom_node_norm",
+    "features.positional_embeddings.linear": "feature_encoder.relative_position.linear",
 }
 _PACKER_ENCODER_SUBLAYER = {
     "norm1": "node_norm",
@@ -72,55 +72,6 @@ _PACKER_LAYER_GROUPS = {
     "context_encoder_layers": ("context_layers", _PACKER_DECODER_SUBLAYER),
     "y_context_encoder_layers": ("atom_context_layers", _PACKER_DECODER_SUBLAYER),
 }
-
-
-def convert_mpnn_packer_state_dict(
-    state_dict: Mapping[str, Tensor],
-) -> dict[str, Tensor]:
-    r"""
-    Convert an official LigandMPNN side-chain MpnnPacker checkpoint to native OFoldX keys.
-
-    The MpnnPacker is the ``ligandmpnn_sc`` checkpoint family (Von Mises torsion weights), distinct from
-    the sequence backbone. Load the result into
-    [`MpnnPackerModel`][ofoldx.models.mpnn_packer.model.MpnnPackerModel].
-
-    Args:
-        state_dict: The official side-chain packer state dict.
-    Returns:
-        State dict with OFoldX MpnnPacker tensor names.
-
-    Raises:
-        KeyError: If a checkpoint tensor name is not recognized.
-    """
-
-    return {_convert_packer_key(key): value for key, value in state_dict.items()}
-
-
-def _convert_packer_key(key: str) -> str:
-    r"""Translate one official MpnnPacker tensor name to the native OFoldX name.
-
-    Args:
-        key: An official ``ligandmpnn_sc`` MpnnPacker tensor name.
-
-    Returns:
-        The corresponding native MpnnPacker tensor name.
-
-    Raises:
-        KeyError: If the key matches no known MpnnPacker layer-group or top-level pattern.
-    """
-
-    for prefix, (target, sublayer) in _PACKER_LAYER_GROUPS.items():
-        if key.startswith(prefix + "."):
-            parts = key.split(".")
-            remainder = ".".join(parts[2:])
-            for original, replacement in sublayer.items():
-                if remainder.startswith(original + "."):
-                    return f"{target}.{parts[1]}.{replacement}{remainder[len(original):]}"
-            raise KeyError(f"unrecognized MpnnPacker sublayer key: {key}")
-    for original, replacement in _PACKER_TOP_LEVEL.items():
-        if key in (f"{original}.weight", f"{original}.bias"):
-            return replacement + key[len(original) :]
-    raise KeyError(f"unrecognized MpnnPacker checkpoint key: {key}")
 
 
 def convert_mpnn_packer_checkpoint(
@@ -174,6 +125,55 @@ def convert_mpnn_packer_checkpoint(
         token=token,
         private=private,
     )
+
+
+def convert_mpnn_packer_state_dict(
+    state_dict: Mapping[str, Tensor],
+) -> dict[str, Tensor]:
+    r"""
+    Convert an official LigandMPNN side-chain MpnnPacker checkpoint to native OFoldX keys.
+
+    The MpnnPacker is the ``ligandmpnn_sc`` checkpoint family (Von Mises torsion weights), distinct from
+    the sequence backbone. Load the result into
+    [`MpnnPackerModel`][ofoldx.models.mpnn_packer.model.MpnnPackerModel].
+
+    Args:
+        state_dict: The official side-chain packer state dict.
+    Returns:
+        State dict with OFoldX MpnnPacker tensor names.
+
+    Raises:
+        KeyError: If a checkpoint tensor name is not recognized.
+    """
+
+    return {_convert_packer_key(key): value for key, value in state_dict.items()}
+
+
+def _convert_packer_key(key: str) -> str:
+    r"""Translate one official MpnnPacker tensor name to the native OFoldX name.
+
+    Args:
+        key: An official ``ligandmpnn_sc`` MpnnPacker tensor name.
+
+    Returns:
+        The corresponding native MpnnPacker tensor name.
+
+    Raises:
+        KeyError: If the key matches no known MpnnPacker layer-group or top-level pattern.
+    """
+
+    for prefix, (target, sublayer) in _PACKER_LAYER_GROUPS.items():
+        if key.startswith(prefix + "."):
+            parts = key.split(".")
+            remainder = ".".join(parts[2:])
+            for original, replacement in sublayer.items():
+                if remainder.startswith(original + "."):
+                    return f"{target}.{parts[1]}.{replacement}{remainder[len(original):]}"
+            raise KeyError(f"unrecognized MpnnPacker sublayer key: {key}")
+    for original, replacement in _PACKER_TOP_LEVEL.items():
+        if key in (f"{original}.weight", f"{original}.bias"):
+            return replacement + key[len(original) :]
+    raise KeyError(f"unrecognized MpnnPacker checkpoint key: {key}")
 
 
 def main(argv: list[str] | None = None) -> None:

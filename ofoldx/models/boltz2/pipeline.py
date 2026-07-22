@@ -16,20 +16,6 @@ from .model import Boltz2AffinityModel, Boltz2Model
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
 
-@dataclass(eq=False)
-class Boltz2AffinityResult:
-    r"""One two-stage Boltz-2 affinity result.
-
-    Contains the selected second-pass ``target``, confidence-sorted first-pass
-    ``structure_predictions``, and affinity scores and metrics.
-    """
-
-    target: Structure
-    structure_predictions: tuple[FoldPrediction, ...]
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-
-
 class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
     r"""Bind the Boltz-2 structure Model and Processor."""
 
@@ -164,3 +150,17 @@ class Boltz2AffinityPipeline(CompositePipeline):
             scores=score_result.scores,
             metrics=score_result.metrics,
         )
+
+
+@dataclass(eq=False)
+class Boltz2AffinityResult:
+    r"""One two-stage Boltz-2 affinity result.
+
+    Contains the selected second-pass ``target``, confidence-sorted first-pass
+    ``structure_predictions``, and affinity scores and metrics.
+    """
+
+    target: Structure
+    structure_predictions: tuple[FoldPrediction, ...]
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)

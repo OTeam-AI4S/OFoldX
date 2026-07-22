@@ -9,11 +9,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from typing_extensions import Self
 
 from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
+from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
@@ -31,16 +31,16 @@ from ...results import Metric, Score
 from .config import PxDesignConfig
 
 
-class PxDesignModel(nn.Module):
+class PxDesignModel(Model):
     r"""PxDesign's released condition embedder and coordinate-diffusion model."""
 
     config_class = PxDesignConfig
+    config: PxDesignConfig
 
     def __init__(self, config: PxDesignConfig | None = None) -> None:
         config = PxDesignConfig() if config is None else config
-        super().__init__()
-        self.config = config
-        self.condition_embedder = PxDesignConditionEmbedder(config)
+        super().__init__(config)
+        self.condition_embeddings = PxDesignConditionEmbeddings(config)
 
         denoiser = config.denoiser
         self.coordinate_denoiser = CoordinateDenoiser(
@@ -65,12 +65,9 @@ class PxDesignModel(nn.Module):
         self.coordinate_sampler = PxDesignSampler(config)
         self.set_backend("auto")
 
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the public PyTorch or OOps operator path."""
+    def _set_backend(self, backend: ModelBackend) -> None:
+        r"""Apply the public PyTorch or OOps operator path."""
 
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
-        self.backend = backend
         operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
@@ -85,7 +82,6 @@ class PxDesignModel(nn.Module):
                 ),
             ):
                 module.operator_backend = operator_backend
-        return self
 
     def forward(
         self,
@@ -140,7 +136,7 @@ class PxDesignModel(nn.Module):
         generator: torch.Generator | None = None,
         num_sampling_steps: int = 400,
         sample_chunk_size: int | None = 10,
-    ) -> PxDesignResult:
+    ) -> PxDesignDesignResult:
         r"""Generate canonical target--binder backbone Structure candidates.
 
         The caller-supplied ``generator`` (resolved once at the Pipeline boundary) is the
@@ -157,7 +153,7 @@ class PxDesignModel(nn.Module):
             generator=generator,
         )
         candidates = tuple(
-            PxDesignCandidate(
+            PxDesignDesignCandidate(
                 structure=Structure(
                     system=input.layout.system,
                     sites=input.layout.sites,
@@ -168,11 +164,11 @@ class PxDesignModel(nn.Module):
             for index in range(num_candidates)
         )
         # PxDesign is coordinate-producing, so each backbone sample is carried by a
-        # PxDesignCandidate containing the decoded Structure and collected in a
-        # PxDesignResult. The coordinate-free shared DesignResult cannot represent this output.
+        # PxDesignDesignCandidate containing the decoded Structure and collected in a
+        # PxDesignDesignResult. The coordinate-free shared DesignResult cannot represent this output.
         # The released sampler decodes no per-sample score or metric (its plddt input is
         # zeros and it has no confidence head), so scores/metrics stay empty.
-        return PxDesignResult(candidates=candidates)
+        return PxDesignDesignResult(candidates=candidates)
 
     def encode_condition(
         self,
@@ -180,7 +176,7 @@ class PxDesignModel(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
         r"""Compute the released token, zero-single, pair, and relative conditioning."""
 
-        token_embedding, pair = self.condition_embedder(input)
+        token_embedding, pair = self.condition_embeddings(input)
         single = token_embedding.new_zeros(*token_embedding.shape[:-1], self.config.single_size)
         relative_features = generate_relative_position_features(
             residue_index=input.residue_index,
@@ -221,12 +217,12 @@ class PxDesignModel(nn.Module):
         )
 
 
-class PxDesignConditionEmbedder(nn.Module):
+class PxDesignConditionEmbeddings(nn.Module):
     r"""Released PxDesign atom, token, and conditional-template embedder."""
 
     def __init__(self, config: PxDesignConfig) -> None:
         super().__init__()
-        embedder = config.condition_embedder
+        embedder = config.condition_embeddings
         self.atom_encoder = AtomToTokenEncoder(
             token_hidden_size=embedder.token_hidden_size,
             atom_hidden_size=embedder.atom_hidden_size,
@@ -246,7 +242,7 @@ class PxDesignConditionEmbedder(nn.Module):
             + 2 * embedder.add_feature_size
         )
         self.input_map = nn.Linear(input_size, config.token_feature_size)
-        self.template_embedder = PxDesignConditionalTemplateEmbedder(
+        self.template_embeddings = PxDesignConditionalTemplateEmbeddings(
             num_template_bins=config.num_template_bins,
             pair_size=config.pair_size,
         )
@@ -286,11 +282,11 @@ class PxDesignConditionEmbedder(nn.Module):
                 dim=-1,
             )
         )
-        pair = self.template_embedder(input.conditional_templ, input.conditional_templ_mask)
+        pair = self.template_embeddings(input.conditional_templ, input.conditional_templ_mask)
         return token_embedding, pair.to(token_embedding)
 
 
-class PxDesignConditionalTemplateEmbedder(nn.Module):
+class PxDesignConditionalTemplateEmbeddings(nn.Module):
     r"""Embed released conditional-template distance-bin IDs."""
 
     def __init__(self, *, num_template_bins: int = 64, pair_size: int = 128) -> None:
@@ -316,8 +312,8 @@ class PxDesignSampler(nn.Module):
             rho=sampler.rho,
             sigma_data=config.denoiser.sigma_data,
         )
-        self.gamma_0 = sampler.gamma_0
-        self.gamma_min = sampler.gamma_min
+        self.churn_rate = sampler.churn_rate
+        self.min_churn_noise_level = sampler.min_churn_noise_level
         self.noise_scale = sampler.noise_scale
         self.step_scale_min = sampler.step_scale_min
         self.step_scale_max = sampler.step_scale_max
@@ -381,8 +377,8 @@ class PxDesignSampler(nn.Module):
                 coordinates = coordinates + translations.unsqueeze(-2)
 
                 gamma = torch.where(
-                    sigma_next > self.gamma_min,
-                    sigma_next.new_tensor(self.gamma_0),
+                    sigma_next > self.min_churn_noise_level,
+                    sigma_next.new_tensor(self.churn_rate),
                     sigma_next.new_zeros(()),
                 )
                 sigma_hat = sigma_prev * (gamma + 1)
@@ -474,7 +470,7 @@ def _augment_reference_conformers(
 # PxDesign tensor inputs and outputs
 # ============================================================================
 # ``Score`` and ``Metric`` are shared scientific value types. PxDesign defines standalone
-# ``PxDesignCandidate`` and ``PxDesignResult`` records because its candidates carry coordinates;
+# ``PxDesignDesignCandidate`` and ``PxDesignDesignResult`` records because its candidates carry coordinates;
 # it does not reuse the coordinate-free shared candidate and result records.
 #
 # ``PlacementSpec`` and ``PlacementMap`` are shared records in ``ofoldx.data``. ``Hotspot`` is
@@ -529,7 +525,7 @@ class PxDesignOutput:
 
 
 @dataclass(eq=False)
-class PxDesignCandidate:
+class PxDesignDesignCandidate:
     r"""One ranked, evaluated PXDesign target--binder backbone design sample.
 
     PXDesign is coordinate-producing, so this candidate is a standalone record,
@@ -538,7 +534,7 @@ class PxDesignCandidate:
     :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignCandidate`: each candidate owns
     the decoded backbone :class:`~ofoldx.data.structure.Structure` (which owns its
     ``MolecularSystem`` via ``Structure.system``), so no separate ``system`` field is carried.
-    These coordinate-bearing candidates are collected by :class:`PxDesignResult`, not
+    These coordinate-bearing candidates are collected by :class:`PxDesignDesignResult`, not
     the shared coordinate-free ``DesignResult``.
 
     Fields:
@@ -567,7 +563,7 @@ class PxDesignCandidate:
 
 
 @dataclass(eq=False)
-class PxDesignResult:
+class PxDesignDesignResult:
     r"""One generation-ordered collection of ranked, evaluated PXDesign candidates.
 
     This result carries coordinate-bearing PXDesign candidates and therefore
@@ -581,7 +577,7 @@ class PxDesignResult:
     ``bucket`` / ``rank`` / ``pass_*`` Scores that this carrier only needs to order over.
     """
 
-    candidates: tuple[PxDesignCandidate, ...]
+    candidates: tuple[PxDesignDesignCandidate, ...]
 
     def _validated_scores(self, score: str) -> tuple[Score, ...]:
         r"""Return the per-candidate Scores after the shared single-Score checks."""
@@ -598,7 +594,7 @@ class PxDesignResult:
             raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
         return scores
 
-    def best(self, score: str) -> PxDesignCandidate:
+    def best(self, score: str) -> PxDesignDesignCandidate:
         r"""Return the earliest best candidate under one explicit score."""
 
         scores = self._validated_scores(score)
@@ -606,7 +602,7 @@ class PxDesignResult:
             return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
         return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
 
-    def ranked(self, score: str) -> tuple[PxDesignCandidate, ...]:
+    def ranked(self, score: str) -> tuple[PxDesignDesignCandidate, ...]:
         r"""Return the candidates ordered best-first under one explicit score.
 
         The ordering is stable, so candidates that tie on ``score`` keep their generation

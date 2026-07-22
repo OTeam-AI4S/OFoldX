@@ -17,11 +17,23 @@ from transformers import AutoModelForMaskedLM
 
 from ...artifacts import save_model
 from ...references import classify_reference
-from .config import ESMFold2Config, ESMFold2ESMCConfig, ESMFold2ExperimentalConfig, ESMFold2ProcessorConfig
-from .model import ESMFold2ExperimentalModel, ESMFold2Model
-from .processor import ESMFold2ExperimentalProcessor, ESMFold2Processor
+from .config import (
+    EsmFold2Config,
+    EsmFold2EsmCConfig,
+    EsmFold2ExperimentalConfig,
+    EsmFold2ExperimentalProcessorConfig,
+    EsmFold2ProcessorConfig,
+)
+from .model import EsmFold2ExperimentalModel, EsmFold2Model
+from .processor import EsmFold2ExperimentalProcessor, EsmFold2Processor
 
 _DEFAULT_ESMC_REPOSITORY = "multimolecule/esmc-6b"
+_BIOHUB_STATE_PREFIXES = (
+    ("inputs_embedder.", "input_embeddings."),
+    ("rel_pos.", "relative_position_encoding."),
+    ("language_model.", "language_model_pair_encoder."),
+    ("structure_head.", "diffusion_structure_head."),
+)
 _BIOHUB_UNUSED_STATE_KEYS = (
     "confidence_head.s_input_to_s.weight",
     "confidence_head.s_inputs_to_single.weight",
@@ -76,14 +88,14 @@ def convert_esmfold2_checkpoint(
         local_files_only=local_files_only,
         token=token,
     )
-    esmc_config = ESMFold2ESMCConfig({name: getattr(esmc.config, name) for name in ESMFold2ESMCConfig().dict()})
+    esmc_config = EsmFold2EsmCConfig({name: getattr(esmc.config, name) for name in EsmFold2EsmCConfig().dict()})
     raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
     if raw_config["model_type"] != "esmfold2" or raw_config["type"] != "release":
         raise ValueError("checkpoint config is not the released Biohub ESMFold2 architecture")
     translated = _translate_biohub_config(raw_config)
     translated["esmc"] = esmc_config.dict()
-    config = ESMFold2Config(translated)
-    model = ESMFold2Model(config, esmc=esmc)
+    config = EsmFold2Config(translated)
+    model = EsmFold2Model(config, esmc=esmc)
 
     head_state = load_esmfold2_state_dict(checkpoint_path)
     for name in _BIOHUB_UNUSED_STATE_KEYS:
@@ -104,7 +116,7 @@ def convert_esmfold2_checkpoint(
     save_model(
         output_dir,
         model=model,
-        processor=ESMFold2Processor(ESMFold2ProcessorConfig({"msa_conditioning": config.msa_encoder.enabled})),
+        processor=EsmFold2Processor(EsmFold2ProcessorConfig({"msa_conditioning": config.msa_encoder.enabled})),
         repo_id=repo_id,
         token=token,
         private=private,
@@ -167,7 +179,27 @@ def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, 
     r"""Load the released folding head, excluding Transformers bookkeeping tensors."""
 
     state = load_file(str(checkpoint_path), device="cpu")
-    return {name: tensor for name, tensor in state.items() if not name.endswith("._extra_state")}
+    return {
+        _translate_biohub_state_key(name): tensor
+        for name, tensor in state.items()
+        if not name.endswith("._extra_state")
+    }
+
+
+def _translate_biohub_state_key(name: str) -> str:
+    diffusion_transformer_prefix = "structure_head.diffusion_module.token_transformer."
+    if name.startswith(f"{diffusion_transformer_prefix}attn_blocks."):
+        block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}attn_blocks.").split(".", 1)
+        name = f"diffusion_structure_head.diffusion_module.token_transformer.blocks.{block}.attention.{suffix}"
+    elif name.startswith(f"{diffusion_transformer_prefix}transition_blocks."):
+        block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}transition_blocks.").split(".", 1)
+        name = f"diffusion_structure_head.diffusion_module.token_transformer.blocks.{block}.transition.{suffix}"
+
+    for upstream_prefix, canonical_prefix in _BIOHUB_STATE_PREFIXES:
+        if name.startswith(upstream_prefix):
+            name = f"{canonical_prefix}{name.removeprefix(upstream_prefix)}"
+            break
+    return name.replace("._engine.", ".layer.")
 
 
 def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -198,7 +230,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "recycling_steps": int(raw_config["num_loops"]) + 1,
         "language_model_mask_probability": language_model_mask_probability,
         "msa_encoder_overwrite": raw_config["msa_encoder_overwrite"],
-        "inputs": {
+        "input_embeddings": {
             "input_size": inputs["d_inputs"],
             "atom_encoder": {
                 "atom_hidden_size": atom_encoder["d_atom"],
@@ -214,9 +246,9 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             },
         },
         # n_heads/dropout are inert upstream dataclass leftovers: the released
-        # PairUpdateBlock has neither an attention nor a dropout operation.
+        # upstream PairUpdateBlock has neither an attention nor a dropout operation.
         "folding_trunk": {"num_blocks": folding_trunk["n_layers"]},
-        "structure_head": {
+        "diffusion_structure_head": {
             "diffusion_module": {
                 "sigma_data": diffusion["sigma_data"],
                 "atom_hidden_size": diffusion["c_atom"],
@@ -232,7 +264,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             },
             "num_distogram_bins": structure["distogram_bins"],
             "churn_rate": structure["gamma_0"],
-            "gamma_min": structure["gamma_min"],
+            "min_churn_noise_level": structure["gamma_min"],
             "noise_scale": structure["noise_scale"],
             "step_scale": structure["step_scale"],
             "max_noise_level": structure["inference_s_max"],
@@ -269,8 +301,8 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2ExperimentalConfig:
-    r"""Build an [`ESMFold2ExperimentalConfig`][ofoldx.models.esmfold2.ESMFold2ExperimentalConfig]
+def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2ExperimentalConfig:
+    r"""Build an [`EsmFold2ExperimentalConfig`][ofoldx.models.esmfold2.EsmFold2ExperimentalConfig]
     from a ``type="experimental"`` recurrent-graph checkpoint ``config.json``.
 
     Every graph dimension is read from the checkpoint (the Fast inversion model ships 24
@@ -281,7 +313,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     if raw_config.get("model_type") != "esmfold2" or raw_config.get("type") != "experimental":
         raise ValueError("checkpoint config is not the experimental Biohub ESMFold2 architecture")
 
-    config = ESMFold2ExperimentalConfig()
+    config = EsmFold2ExperimentalConfig()
     config.single_size = raw_config["d_single"]
     config.pair_size = raw_config["d_pair"]
     config.num_relative_residue_bins = raw_config["n_relative_residx_bins"]
@@ -291,7 +323,8 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
     config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
     config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
 
-    # ESMC trunk width/depth the folding head projects from (``LanguageModelPairEncoder``
+    # ESMC trunk width/depth the folding head projects from
+    # (``EsmFold2LanguageModelPairEncoder``
     # base_z_linear/base_z_combine): read from the checkpoint so the smaller scaling-study
     # trunks strict-load. The 6B checkpoints ship 2560/80 (the defaults); the 300M/600M
     # scaling critics ship 960/30 and 1152/36.
@@ -300,8 +333,8 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
 
     inputs = raw_config["inputs"]
     atom_encoder = inputs["atom_encoder"]
-    config.inputs.input_size = inputs["d_inputs"]
-    ae = config.inputs.atom_encoder
+    config.input_embeddings.input_size = inputs["d_inputs"]
+    ae = config.input_embeddings.atom_encoder
     ae.atom_hidden_size = atom_encoder["d_atom"]
     ae.token_hidden_size = atom_encoder["d_token"]
     ae.num_blocks = atom_encoder["n_blocks"]
@@ -317,10 +350,10 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> ESMFold2Ex
 
     structure = raw_config["structure_head"]
     diffusion = structure["diffusion_module"]
-    sh = config.structure_head
+    sh = config.diffusion_structure_head
     sh.num_distogram_bins = structure["distogram_bins"]
     sh.churn_rate = structure["gamma_0"]
-    sh.gamma_min = structure["gamma_min"]
+    sh.min_churn_noise_level = structure["gamma_min"]
     sh.noise_scale = structure["noise_scale"]
     sh.step_scale = structure["step_scale"]
     sh.max_noise_level = structure["inference_s_max"]
@@ -370,12 +403,12 @@ def load_experimental_esmfold2(
     cache_dir: str | PathLike[str] | None = None,
     local_files_only: bool = False,
     token: str | None = None,
-) -> ESMFold2ExperimentalModel:
+) -> EsmFold2ExperimentalModel:
     r"""Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
 
     The MultiMolecule ESMC child is loaded separately (the head safetensors does not carry
     it): the head strict-loads first with ``esmc=None`` and the optional ``esmc`` is attached
-    afterwards via [`load_esmc`][ofoldx.models.esmfold2.ESMFold2ExperimentalModel.load_esmc].
+    afterwards via [`load_esmc`][ofoldx.models.esmfold2.EsmFold2ExperimentalModel.load_esmc].
     """
 
     checkpoint_path, resolved_config_path = resolve_esmfold2_source(
@@ -387,7 +420,7 @@ def load_experimental_esmfold2(
     )
     raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
     config = experimental_config_from_biohub(raw_config)
-    model = ESMFold2ExperimentalModel(config, esmc=None)
+    model = EsmFold2ExperimentalModel(config, esmc=None)
     head_state = load_esmfold2_state_dict(checkpoint_path)
     model.load_state_dict(head_state, strict=True)
     if esmc is not None:
@@ -414,15 +447,15 @@ def save_experimental_esmfold2_checkpoint(
     [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
     ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
     MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
-    :class:`ESMFold2DesignPipeline`, whose save contract persists them under ``esmc/`` and
+    :class:`EsmFold2DesignPipeline`, whose save contract persists them under ``esmc/`` and
     writes the ``ofoldx.esmfold2_design`` marker. The resulting repository is self-contained
-    and routes ``pipeline("design", model=dir)`` to :meth:`ESMFold2DesignPipeline.design`.
+    and routes ``pipeline("design", model=dir)`` to :meth:`EsmFold2DesignPipeline.design`.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.
     """
 
-    from .pipeline import ESMFold2DesignPipeline
+    from .pipeline import EsmFold2DesignPipeline
 
     esmc = cast(
         EsmCForMaskedLM,
@@ -451,9 +484,11 @@ def save_experimental_esmfold2_checkpoint(
     if dtype is not None:
         model.to(dtype=dtype)
     model.load_esmc(esmc)
-    processor = ESMFold2ExperimentalProcessor(model.config)
-    processor._base.tokenizer = cast(ProteinTokenizer, tokenizer)
-    ESMFold2DesignPipeline(model=model, processor=processor).save(
+    processor = EsmFold2ExperimentalProcessor(
+        EsmFold2ExperimentalProcessorConfig({"msa_conditioning": not model.config.disable_msa_features})
+    )
+    processor.tokenizer = cast(ProteinTokenizer, tokenizer)
+    EsmFold2DesignPipeline(model=model, processor=processor).save(
         output_dir,
         repo_id=repo_id,
         token=token,

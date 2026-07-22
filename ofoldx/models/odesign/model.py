@@ -3,16 +3,14 @@ r"""The released ODesign core graph and its canonical task methods."""
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
-from typing import Literal, cast, get_args
+from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
-from typing_extensions import Self
 
 from ...data.bonds import SymbolicBond
 from ...data.conditions import Hotspot
@@ -21,24 +19,20 @@ from ...data.evidence import MSA, MSACollection
 # ODesign's spatial and placement records drive the hard-condition checks below.
 from ...data.molecular import (
     AtomSite,
-    ChemicalComponent,
     MolecularSystem,
-    Molecule,
-    PolymerSequence,
     PolymerType,
-    SystemBond,
 )
 from ...data.placement import (
-    ExistingSpan,
-    GeneratedSegment,
     PlacementMap,
     PlacementSpec,
-    SymbolicAtomSite,
     SymbolicResidueSite,
 )
 from ...data.placement import resolve as _resolve_site
-from ...data.placement import validate_placement
+from ...data.placement import (
+    validate_placement,
+)
 from ...data.structure import Structure
+from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
@@ -61,50 +55,51 @@ from ...modules.head import DistogramHead
 from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
-from ...results import DesignCandidate, Metric
+from ...results import Metric, Score
 from .config import ODesignConfig
 
 
-class ODesignModel(nn.Module):
+class ODesignModel(Model):
     r"""Released all-atom ODesign coordinate-design model."""
 
     config_class = ODesignConfig
+    config: ODesignConfig
 
     def __init__(self, config: ODesignConfig | None = None) -> None:
         config = ODesignConfig() if config is None else config
-        super().__init__()
-        self.config = config
-        self.relative_position_embedder = RelativePositionEmbedder(
-            config.relative_position_size,
-            config.pair_size,
+        super().__init__(config)
+        self._recycling_steps = config.recycling_steps
+        self.input_embeddings = ODesignInputEmbeddings(
+            single_size=config.single_size,
+            atom_feature_size=config.atom_feature_size,
+        )
+        self.constraint_embeddings = ODesignConstraintEmbeddings(
+            pair_size=config.pair_size,
+            hidden_size=config.constraint_embeddings.hidden_size,
+            num_blocks=config.constraint_embeddings.num_blocks,
+            num_bins=config.constraint_embeddings.num_bins,
+            min_distance=config.constraint_embeddings.min_distance,
+            max_distance=config.constraint_embeddings.max_distance,
+            dropout=config.constraint_embeddings.dropout,
         )
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
-        self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
-        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
-        self.pair_recycle_norm = LayerNorm(config.pair_size)
-        self.single_recycle_norm = LayerNorm(config.single_size)
-        self.input_embedder = InputEmbedder(
-            single_size=config.single_size,
-            atom_feature_size=config.atom_feature_size,
+        self.relative_position_embedder = RelativePositionEmbedder(
+            config.relative_position_size,
+            config.pair_size,
         )
+        self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
+        self.pair_recycle_norm = LayerNorm(config.pair_size)
+        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
+        self.single_recycle_norm = LayerNorm(config.single_size)
+        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
             num_blocks=config.trunk.num_msa_blocks,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
-        )
-        self.constraint_distogram_embedder = ConstraintDistogramEmbedder(
-            pair_size=config.pair_size,
-            hidden_size=config.constraint.hidden_size,
-            num_blocks=config.constraint.num_blocks,
-            num_bins=config.constraint.num_bins,
-            min_distance=config.constraint.min_distance,
-            max_distance=config.constraint.max_distance,
-            dropout=config.constraint.dropout,
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
@@ -133,7 +128,7 @@ class ODesignModel(nn.Module):
         )
         self.coordinate_sampler = CoordinateEdmSampler(reverse_augmentation=True)
         self.distogram_head = DistogramHead(config.pair_size, config.pairwise.num_distogram_bins)
-        self.token_bond_type_head = TokenBondTypeHead(
+        self.token_bond_type_head = ODesignTokenBondTypeHead(
             pair_size=config.pair_size,
             hidden_size=config.pairwise.bond_hidden_size,
             num_bond_types=config.pairwise.num_bond_types,
@@ -143,15 +138,11 @@ class ODesignModel(nn.Module):
         nn.init.zeros_(self.distogram_head.linear.weight)
         if self.distogram_head.linear.bias is not None:
             nn.init.zeros_(self.distogram_head.linear.bias)
-        self.recycling_steps = config.recycling_steps
         self.set_backend("auto")
 
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the public PyTorch or OOps operator path."""
+    def _set_backend(self, backend: ModelBackend) -> None:
+        r"""Apply the public PyTorch or OOps operator path."""
 
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
-        self.backend = backend
         operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
@@ -169,7 +160,6 @@ class ODesignModel(nn.Module):
                 ),
             ):
                 module.operator_backend = operator_backend
-        return self
 
     def forward(
         self,
@@ -181,11 +171,11 @@ class ODesignModel(nn.Module):
     ) -> ODesignOutput:
         r"""Denoise caller-supplied coordinates at one caller-supplied EDM noise level."""
 
-        steps = self.recycling_steps if recycling_steps is None else recycling_steps
+        steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
             raise ValueError("recycling_steps must be positive")
-        token_embedding, single, pair, relative_features = self._run_trunk(input, recycling_steps=steps)
-        context = self._denoise_context(input, token_embedding, single, pair, relative_features)
+        trunk = self._run_trunk(input, recycling_steps=steps)
+        context = self._denoise_context(input, trunk)
 
         def denoise(noisy_chunk: Tensor, noise_chunk: Tensor) -> Tensor:
             return self.coordinate_denoiser(
@@ -214,8 +204,8 @@ class ODesignModel(nn.Module):
         coordinates = torch.cat(coordinate_chunks, dim=-3)
         return ODesignOutput(
             coordinates=coordinates,
-            distogram_logits=self.distogram_head(pair),
-            token_bond_type_logits=self.token_bond_type_head(pair),
+            distogram_logits=self.distogram_head(trunk.pair),
+            token_bond_type_logits=self.token_bond_type_head(trunk.pair),
         )
 
     @torch.inference_mode()
@@ -236,30 +226,6 @@ class ODesignModel(nn.Module):
         diffusion sampling remains model-intrinsic.
         """
 
-        result, _ = self._design_with_input(
-            input,
-            num_candidates=num_candidates,
-            generator=generator,
-            recycling_steps=recycling_steps,
-            num_sampling_steps=num_sampling_steps,
-            partial_diffusion_snr=partial_diffusion_snr,
-        )
-        return result
-
-    @torch.inference_mode()
-    def _design_with_input(
-        self,
-        input: ODesignInput,
-        *,
-        num_candidates: int = 1,
-        generator: torch.Generator | None = None,
-        recycling_steps: int | None = None,
-        num_sampling_steps: int = 200,
-        partial_diffusion_snr: float | None = None,
-    ) -> tuple[ODesignDesignResult, ODesignInput]:
-        r"""Design candidates and retain the realized variable-length semantic input."""
-
-        input = _realize_ranges(input, generator)
         output = self.sample(
             input,
             num_samples=num_candidates,
@@ -275,12 +241,9 @@ class ODesignModel(nn.Module):
         )
         for structure in structures:
             _require_hard_conditions(structure, input)
-        # The shared DesignCandidate is coordinate-free. ODesign is coordinate-generating, so each sample
-        # is carried by ODesignDesignCandidate, which adds the
-        # decoded Structure and a per-sample metrics map (empty: the released core exposes no
-        # per-sample confidence head). ``system`` mirrors ``structure.system``. Raw
-        # distogram/token-bond logits stay on the ODesignOutput; run provenance and
-        # generated-identity maps are not carried here.
+        # ODesign candidates own the decoded Structure and per-sample metrics. Raw
+        # distogram/token-bond logits stay on ODesignOutput; run provenance and
+        # generated-identity maps are not duplicated on each candidate.
         # One Model.design call produces one seed's M backbones (num_model_seeds=1). The
         # ODesignDesignResult carries these coordinate-bearing candidates.
         # This is the backbone-only stage, so
@@ -289,20 +252,16 @@ class ODesignModel(nn.Module):
         # ``seed_index`` stays 0 (the S loop is owned by the Pipeline, one seed per Model.design).
         candidates = tuple(
             ODesignDesignCandidate(
-                system=structure.system,
                 structure=structure,
                 backbone_index=index,
             )
             for index, structure in enumerate(structures)
         )
-        return (
-            ODesignDesignResult(
-                candidates=candidates,
-                num_seeds=1,
-                num_backbones=num_candidates,
-                num_sequences=0,
-            ),
-            input,
+        return ODesignDesignResult(
+            candidates=candidates,
+            num_seeds=1,
+            num_backbones=num_candidates,
+            num_sequences=0,
         )
 
     @torch.inference_mode()
@@ -319,7 +278,7 @@ class ODesignModel(nn.Module):
     ) -> ODesignOutput:
         r"""Run the released multi-seed sampler without discarding its pairwise heads."""
 
-        steps = self.recycling_steps if recycling_steps is None else recycling_steps
+        steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
             raise ValueError("recycling_steps must be positive")
         partial_diffusion = partial_diffusion_snr is not None
@@ -330,13 +289,13 @@ class ODesignModel(nn.Module):
         distograms = []
         bond_logits = []
         for _ in range(num_model_seeds):
-            token_embedding, single, pair, relative_features = self._run_trunk(input, recycling_steps=steps)
-            distograms.append(self.distogram_head(pair))
-            bond_logits.append(self.token_bond_type_head(pair))
+            trunk = self._run_trunk(input, recycling_steps=steps)
+            distograms.append(self.distogram_head(trunk.pair))
+            bond_logits.append(self.token_bond_type_head(trunk.pair))
             coordinates.append(
                 self.coordinate_sampler(
                     self.coordinate_denoiser,
-                    context=self._denoise_context(input, token_embedding, single, pair, relative_features),
+                    context=self._denoise_context(input, trunk),
                     num_samples=num_samples,
                     num_sampling_steps=num_sampling_steps,
                     sample_chunk_size=1,
@@ -358,12 +317,12 @@ class ODesignModel(nn.Module):
         input: ODesignInput,
         *,
         recycling_steps: int,
-    ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
-        local_geometry = self.input_embedder.build_local_geometry(
+    ) -> _ODesignTrunkOutput:
+        local_geometry = self.input_embeddings.build_local_geometry(
             input.reference_positions,
             input.reference_space_id,
         )
-        token_embedding = self.input_embedder(
+        token_embedding = self.input_embeddings(
             input.atom_features,
             reference_positions=input.reference_positions,
             reference_charges=input.reference_charges,
@@ -393,7 +352,7 @@ class ODesignModel(nn.Module):
         for cycle in range(recycling_steps):
             with torch.set_grad_enabled(grad_enabled and (not self.training or cycle == recycling_steps - 1)):
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
-                pair = pair + self.constraint_distogram_embedder(
+                pair = pair + self.constraint_embeddings(
                     pair,
                     input.constraint_distogram,
                     pair_mask=pair_mask,
@@ -407,7 +366,12 @@ class ODesignModel(nn.Module):
                 )
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
-        return token_embedding, single, pair, relative_features
+        return _ODesignTrunkOutput(
+            token_embedding=token_embedding,
+            single=single,
+            pair=pair,
+            relative_position_features=relative_features,
+        )
 
     def _initial_pair(
         self,
@@ -424,10 +388,7 @@ class ODesignModel(nn.Module):
     def _denoise_context(
         self,
         input: ODesignInput,
-        token_embedding: Tensor,
-        single: Tensor,
-        pair: Tensor,
-        relative_features: RelativePositionBuckets,
+        trunk: _ODesignTrunkOutput,
     ) -> CoordinateDenoiseContext:
         return CoordinateDenoiseContext(
             atom_features=input.atom_features,
@@ -436,10 +397,10 @@ class ODesignModel(nn.Module):
             reference_charges=input.reference_charges,
             reference_mask=input.reference_mask,
             atom_mask=input.atom_mask,
-            token_embedding=token_embedding,
-            single=single,
-            pair=pair,
-            relative_features=relative_features,
+            token_embedding=trunk.token_embedding,
+            single=trunk.single,
+            pair=trunk.pair,
+            relative_features=trunk.relative_position_features,
             local_geometry=self.coordinate_denoiser.build_local_geometry(
                 input.reference_positions,
                 input.reference_space_id,
@@ -447,7 +408,7 @@ class ODesignModel(nn.Module):
         )
 
 
-class InputEmbedder(nn.Module):
+class ODesignInputEmbeddings(nn.Module):
     r"""Aggregate reference atoms and append ODesign token features."""
 
     def __init__(
@@ -497,21 +458,7 @@ class InputEmbedder(nn.Module):
         return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id)
 
 
-class TokenBondTypeHead(nn.Module):
-    r"""Predict whether each ODesign token pair is covalently connected."""
-
-    def __init__(self, *, pair_size: int = 128, hidden_size: int = 128, num_bond_types: int = 2) -> None:
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(pair_size, hidden_size),
-            nn.Linear(hidden_size, num_bond_types),
-        )
-
-    def forward(self, pair: Tensor) -> Tensor:
-        return self.classifier(pair)
-
-
-class ConstraintDistogramEmbedder(nn.Module):
+class ODesignConstraintEmbeddings(nn.Module):
     r"""Embed pairwise target distances into the ODesign pair representation."""
 
     def __init__(
@@ -557,13 +504,27 @@ class ConstraintDistogramEmbedder(nn.Module):
         return self.output_projection(self.activation(self.hidden_norm(hidden)))
 
 
+class ODesignTokenBondTypeHead(nn.Module):
+    r"""Predict whether each ODesign token pair is covalently connected."""
+
+    def __init__(self, *, pair_size: int = 128, hidden_size: int = 128, num_bond_types: int = 2) -> None:
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(pair_size, hidden_size),
+            nn.Linear(hidden_size, num_bond_types),
+        )
+
+    def forward(self, pair: Tensor) -> Tensor:
+        return self.classifier(pair)
+
+
 def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> Structure:
     values = coordinates.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
     sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
     site_index = {site: index for index, site in enumerate(sites)}
     complete = np.zeros((len(sites), 3), dtype=np.float32)
     coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
-    for predicted_index, site in enumerate(layout.sites):
+    for predicted_index, site in enumerate(layout.atom_sites):
         output_index = site_index[site]
         complete[output_index] = values[predicted_index]
         coordinate_mask[output_index] = True
@@ -585,10 +546,10 @@ def _require_hard_conditions(structure: Structure, input: ODesignInput) -> None:
     coordinates = {site: structure.coordinates[index] for index, site in enumerate(structure.sites)}
     reference = {
         site: input.observed_positions[0, index].detach().to(device="cpu", dtype=torch.float32).numpy()
-        for index, site in enumerate(input.layout.sites)
+        for index, site in enumerate(input.layout.atom_sites)
     }
     for index, condition in enumerate(input.layout.conditions):
-        if not isinstance(condition, ReferenceCoordinates) or condition.intent != "hard":
+        if not isinstance(condition, ODesignReferenceCoordinates) or condition.intent != "hard":
             continue
         sites = tuple(
             _resolve_atom(site, source_residues, placement_map, instance_of, source_atoms) for site in condition.sites
@@ -635,6 +596,79 @@ def _resolve_atom(reference, source_residues, placement_map, instance_of, source
 
 
 @dataclass
+class _ODesignTrunkOutput:
+    r"""Named representations produced by the ODesign trunk."""
+
+    token_embedding: Tensor
+    single: Tensor
+    pair: Tensor
+    relative_position_features: RelativePositionBuckets
+
+
+@dataclass(frozen=True)
+class ODesignPlacements:
+    r"""One ODesign generation-topology request over the shared PlacementSpec.
+
+    ``placements`` is the :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
+    unique across the whole mapping and is the SOLE pre-realization reference target
+    (validated at construction). Each declaration group is one ODesign output chain and its
+    declared order is the chain layout order.
+
+    ``chain_lengths`` is a per-chain exact-length field aligned with
+    ``placements`` group order.
+    """
+
+    placements: PlacementSpec
+    chain_lengths: tuple[int | None, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # A placement_id must be globally unique across the whole PlacementSpec.
+        validate_placement(self.placements)
+
+
+@dataclass(frozen=True)
+class ODesignReferenceCoordinates:
+    r"""Fixed or constrained coordinates for a set of existing input atoms.
+
+    ``intent == "hard"`` fixes the coordinates during EDM sampling; both modes feed the
+    learned constraint distogram.
+    """
+
+    sites: tuple[AtomSite, ...]
+    tolerance_angstrom: float
+    intent: Literal["hard", "soft"] = "hard"
+
+
+@dataclass(frozen=True)
+class ODesignDesignedResidue:
+    r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
+
+    Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
+    one declaration group run-length-collapse into a single :class:`GeneratedSegment`.
+    """
+
+    polymer_type: PolymerType
+
+
+@dataclass(frozen=True)
+class ODesignFixedResidue:
+    r"""One realized output residue copied verbatim from a source residue — a ``design_mask``
+    ``False`` row.
+
+    ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
+    residues drawn contiguously (increasing ``source_index``) from one source instance
+    run-length-collapse into a single half-open :class:`ExistingSpan`.
+    """
+
+    instance_id: str
+    source_index: int
+
+
+ODesignResidueSpec = ODesignDesignedResidue | ODesignFixedResidue
+
+
+@dataclass
 class ODesignLayout:
     r"""Canonical identity needed to turn ODesign coordinates into Results.
 
@@ -646,9 +680,9 @@ class ODesignLayout:
     """
 
     system: MolecularSystem
-    sites: tuple[AtomSite, ...]
+    atom_sites: tuple[AtomSite, ...]
     placement: ODesignPlacements | None
-    conditions: tuple[Hotspot | SymbolicBond | ReferenceCoordinates, ...]
+    conditions: tuple[Hotspot | SymbolicBond | ODesignReferenceCoordinates, ...]
     placement_map: PlacementMap = field(default_factory=dict)
     instance_of: dict[str, str] = field(default_factory=dict)
     source_residue_map: dict[tuple[str, int], tuple[str, int]] = field(default_factory=dict)
@@ -708,19 +742,18 @@ class ODesignOutput:
     token_bond_type_logits: Tensor
 
 
-@dataclass(eq=False)
-class ODesignDesignCandidate(DesignCandidate):
+@dataclass
+class ODesignDesignCandidate:
     r"""One coordinate-bearing ODesign design sample.
 
-    ODesign generates coordinates, so its candidate carries a decoded
-    :class:`~ofoldx.data.structure.Structure` and per-sample ``metrics`` alongside the
-    shared coordinate-free ``system`` and ``scores``. It subclasses
-    :class:`~ofoldx.results.DesignCandidate` so :class:`~ofoldx.results.DesignResult` can carry
-    it unchanged. The released ODesign core exposes no per-sample confidence head, so ``metrics``
-    is empty today; the distogram / token-bond logits stay on :class:`ODesignOutput`.
+    The decoded :class:`~ofoldx.data.structure.Structure` is the single owner of
+    molecular identity and coordinates. The released core exposes no per-sample
+    confidence head, so ``metrics`` is empty today; distogram and token-bond logits
+    stay on :class:`ODesignOutput`.
     """
 
-    structure: Structure | None = None
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
     seed_index: int = 0
     backbone_index: int = 0
@@ -768,797 +801,3 @@ class ODesignDesignResult:
         if directions == {"higher"}:
             return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
         return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
-
-
-# There is no shared ``Condition`` base, union endpoint, or generic condition bag. ODesign owns
-# the concrete spatial records it consumes; shared identity conditions remain in
-# ``ofoldx.data.conditions``.
-#
-# The generation-topology placement records (:class:`~ofoldx.data.placement.GeneratedSegment`,
-# :class:`~ofoldx.data.placement.ExistingSpan`, :class:`~ofoldx.data.placement.SymbolicResidueSite`,
-# :class:`~ofoldx.data.placement.SymbolicAtomSite`) come from ``ofoldx.data.placement``. Identity is
-# placement-keyed: a placement's identity is the globally-unique ``placement_id`` inner key of
-# the core :data:`~ofoldx.data.placement.PlacementSpec` mapping, so :class:`GeneratedSegment` carries NO
-# embedded id and a pre-realization reference is exactly the two fields
-# ``SymbolicResidueSite(placement_id, offset)``. :class:`ODesignPlacements` adds per-chain
-# ``chain_lengths`` alongside the core placement mapping.
-#
-# The covalent-link record (:class:`~ofoldx.data.bonds.SymbolicBond`
-# over the promoted :data:`~ofoldx.data.bonds.SymbolicBondSite` endpoint union) and the
-# target-conditioning core (the distance-free :class:`~ofoldx.data.conditions.Hotspot` label)
-# are shared and imported directly.
-# ======================================================================================
-
-
-# --------------------------------------------------------------------------------------
-# ODesign placement condition.
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ODesignPlacements:
-    r"""One ODesign generation-topology request over the shared PlacementSpec.
-
-    ``placements`` is the :data:`~ofoldx.data.placement.PlacementSpec` mapping
-    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
-    unique across the whole mapping and is the SOLE pre-realization reference target
-    (validated at construction). Each declaration group is one ODesign output chain and its
-    declared order is the chain layout order.
-
-    ``chain_lengths`` is a per-chain exact-length field aligned with
-    ``placements`` group order.
-    """
-
-    placements: PlacementSpec
-    chain_lengths: tuple[int | None, ...] | None = None
-
-    def __post_init__(self) -> None:
-        # A placement_id must be globally unique across the whole PlacementSpec.
-        validate_placement(self.placements)
-
-
-# --------------------------------------------------------------------------------------
-# ODesign spatial conditions.
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ReferenceCoordinates:
-    r"""Fixed or constrained coordinates for a set of existing input atoms.
-
-    ``intent == "hard"`` fixes the coordinates during EDM sampling; both modes feed the
-    learned constraint distogram.
-    """
-
-    sites: tuple[AtomSite, ...]
-    tolerance_angstrom: float
-    intent: Literal["hard", "soft"] = "hard"
-
-
-# --------------------------------------------------------------------------------------
-# design_mask <-> PlacementSpec projection.
-# --------------------------------------------------------------------------------------
-#
-# ODesign natively selects fixed-vs-generated positions per output residue through a
-# per-residue design mask (the ``res`` condition-mask driven by the ``sequence`` tokens:
-# an ``N-M`` / ``N-N`` run designs a de-novo polymer interval, an ``X/A-B`` token copies a
-# source span). These two functions are the lossless bridge between that native
-# per-residue design-mask surface and the run-length
-# :data:`~ofoldx.data.placement.PlacementSpec` representation.
-
-#: The core :data:`~ofoldx.data.molecular.PolymerType` values a generated polymer placement
-#: may take. Small-molecule generation is deliberately absent because the shared placement core
-#: represents polymers; ODesign's released placeholder-ligand rows are not a chemical graph.
-_CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
-
-
-@dataclass(frozen=True)
-class DesignedResidue:
-    r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
-
-    Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
-    one declaration group run-length-collapse into a single :class:`GeneratedSegment`.
-    """
-
-    polymer_type: PolymerType
-
-
-@dataclass(frozen=True)
-class FixedResidue:
-    r"""One realized output residue copied verbatim from a source residue — a ``design_mask``
-    ``False`` row.
-
-    ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
-    residues drawn contiguously (increasing ``source_index``) from one source instance
-    run-length-collapse into a single half-open :class:`ExistingSpan`.
-    """
-
-    instance_id: str
-    source_index: int
-
-
-#: One per-output-residue design-mask cell: either a de-novo designed residue
-#: (:class:`DesignedResidue`) or a fixed copy of a source residue (:class:`FixedResidue`).
-ResidueSpec = DesignedResidue | FixedResidue
-
-
-def from_design_mask(
-    residues: Sequence[ResidueSpec],
-    *,
-    group_of: Callable[[int], str],
-    placement_id_of: Callable[[int], str],
-) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a run-length :data:`PlacementSpec`.
-
-    ``residues`` is the realized output layout in order; ``group_of(i)`` labels residue ``i``'s
-    declaration group (its ODesign output chain) and ``placement_id_of(i)`` its placement.
-    Maximal consecutive runs that share one ``(group, placement_id)`` collapse into one
-    placement: a run of :class:`DesignedResidue` of one ``polymer_type`` becomes
-    ``GeneratedSegment(polymer_type, n, n)`` (exact realized length), and a run of
-    :class:`FixedResidue` drawn contiguously from one source instance becomes the half-open
-    ``ExistingSpan(instance_id, start, stop)``. A run also breaks when ``polymer_type`` changes,
-    when the source instance changes, or when ``source_index`` is not the previous ``+ 1`` — so
-    interleaving and discontiguous crops are preserved as ordered placements within the group.
-
-    Losslessness: lossless over ODesign's polymer surface — the per-residue designed flag,
-    each designed residue's ``polymer_type``, and each fixed residue's exact source residue are
-    all recoverable (see :func:`to_design_mask` for the inverse). A designed non-polymer
-    (ligand ``num_atoms``) residue has no ``PlacementValue`` and is
-    rejected here rather than silently dropped. The partition is exhaustive — every input
-    residue belongs to exactly one placement, so no realized row is unaddressable.
-    """
-
-    placement: PlacementSpec = {}
-    seen: set[str] = set()
-
-    current_group: str | None = None
-    current_placement_id: str | None = None
-    current_polymer_type: PolymerType | None = None
-    current_instance_id: str | None = None
-    run_start_source: int = 0
-    run_next_source: int = 0
-    run_length: int = 0
-
-    def flush() -> None:
-        if current_placement_id is None:
-            return
-        assert current_group is not None
-        if current_polymer_type is not None:
-            value: GeneratedSegment | ExistingSpan = GeneratedSegment(current_polymer_type, run_length, run_length)
-        else:
-            assert current_instance_id is not None
-            value = ExistingSpan(current_instance_id, run_start_source, run_next_source)
-        placement.setdefault(current_group, {})[current_placement_id] = value
-
-    for index, residue in enumerate(residues):
-        group = group_of(index)
-        placement_id = placement_id_of(index)
-        if isinstance(residue, DesignedResidue):
-            if residue.polymer_type not in _CORE_POLYMER_TYPES:
-                raise ValueError(
-                    f"designed residue {index} has non-core polymer_type "
-                    f"{residue.polymer_type!r}; a de-novo non-polymer (ligand num_atoms) has no "
-                    f"PlacementValue (GAP-1) and cannot be projected onto the placement core"
-                )
-            extends = (
-                group == current_group
-                and placement_id == current_placement_id
-                and current_polymer_type == residue.polymer_type
-            )
-            if extends:
-                run_length += 1
-                continue
-            flush()
-            if placement_id in seen:
-                raise ValueError(
-                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
-                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
-                )
-            seen.add(placement_id)
-            current_group = group
-            current_placement_id = placement_id
-            current_polymer_type = residue.polymer_type
-            current_instance_id = None
-            run_length = 1
-        else:
-            assert isinstance(residue, FixedResidue)
-            extends = (
-                group == current_group
-                and placement_id == current_placement_id
-                and current_polymer_type is None
-                and current_instance_id == residue.instance_id
-                and run_next_source == residue.source_index
-            )
-            if extends:
-                run_next_source = residue.source_index + 1
-                continue
-            flush()
-            if placement_id in seen:
-                raise ValueError(
-                    f"placement_id {placement_id!r} reused by a non-contiguous run at residue "
-                    f"{index}; a placement_id must be globally unique across the PlacementSpec"
-                )
-            seen.add(placement_id)
-            current_group = group
-            current_placement_id = placement_id
-            current_polymer_type = None
-            current_instance_id = residue.instance_id
-            run_start_source = residue.source_index
-            run_next_source = residue.source_index + 1
-
-    flush()
-    # Enforce globally unique placement IDs across the PlacementSpec.
-    validate_placement(placement)
-    return placement
-
-
-def to_design_mask(
-    placement: PlacementSpec,
-    placement_map: PlacementMap,
-) -> tuple[list[bool], list[str]]:
-    r"""Project a realized :data:`PlacementSpec` back onto a per-output-residue design mask.
-
-    Returns ``(design_mask, groups)`` over the realized output rows in declared order: a
-    :class:`GeneratedSegment` occurrence (its realized length read from ``placement_map``, so
-    ranged ``min != max`` segments resolve to their sampled length) contributes ``True`` rows,
-    an :class:`ExistingSpan` contributes ``stop - start`` ``False`` rows, and each row carries
-    its declaration group (the outer key). This is the exact inverse of :func:`from_design_mask`
-    over the polymer surface. Coverage is exhaustive: exactly one mask row is emitted per
-    realized residue with no gap or overlap; zero-length placements contribute no rows. Thus
-    ``design_mask`` and ``groups`` partition the whole realized layout.
-    """
-
-    design_mask: list[bool] = []
-    groups: list[str] = []
-    for group, chain in placement.items():
-        for placement_id, value in chain.items():
-            if isinstance(value, GeneratedSegment):
-                length = len(placement_map[group][placement_id])
-                designed = True
-            else:
-                length = value.stop - value.start
-                designed = False
-            design_mask.extend([designed] * length)
-            groups.extend([group] * length)
-    return design_mask, groups
-
-
-ODESIGN_RESTYPE_INDEX: dict[str, int] = {
-    "ALA": 0,
-    "ARG": 1,
-    "ASN": 2,
-    "ASP": 3,
-    "CYS": 4,
-    "GLN": 5,
-    "GLU": 6,
-    "GLY": 7,
-    "HIS": 8,
-    "ILE": 9,
-    "LEU": 10,
-    "LYS": 11,
-    "MET": 12,
-    "PHE": 13,
-    "PRO": 14,
-    "SER": 15,
-    "THR": 16,
-    "TRP": 17,
-    "TYR": 18,
-    "VAL": 19,
-    "UNK": 20,
-    "A": 21,
-    "G": 22,
-    "C": 23,
-    "U": 24,
-    "N": 25,
-    "DA": 26,
-    "DG": 27,
-    "DC": 28,
-    "DT": 29,
-    "DN": 30,
-    "-": 31,
-    "-P": 32,
-    "-N": 33,
-    "-L": 34,
-}
-ODESIGN_STANDARD_POLYMER_COMPONENTS: frozenset[str] = frozenset(ODESIGN_RESTYPE_INDEX) - {
-    "-",
-    "-P",
-    "-N",
-    "-L",
-}
-
-
-def materialize_odesign_cyclic_links(
-    system: MolecularSystem,
-    conditions: tuple[Hotspot | SymbolicBond | ReferenceCoordinates, ...],
-    placement_map: PlacementMap,
-    instance_of: dict[str, str],
-    source_atom_map: dict[AtomSite, AtomSite],
-) -> tuple[MolecularSystem, frozenset[str], frozenset[frozenset[AtomSite]]]:
-    r"""Materialize requested head-to-tail polymer closures."""
-
-    source_atoms = source_atom_map
-    bonds = set(system.bonds)
-    cyclic_instances = set()
-    cyclic_links = set()
-    for existing_bond in bonds:
-        if existing_bond.site_a.instance_id != existing_bond.site_b.instance_id:
-            continue
-        instance_id = existing_bond.site_a.instance_id
-        entity = system.entities[system.instances[instance_id]]
-        if not isinstance(entity, PolymerSequence):
-            continue
-        first = entity.components[0].previous_attachment
-        last = entity.components[-1].next_attachment
-        if first is None or last is None:
-            continue
-        expected = frozenset(
-            (
-                AtomSite(instance_id, 0, first.atom_id),
-                AtomSite(instance_id, len(entity) - 1, last.atom_id),
-            )
-        )
-        if frozenset((existing_bond.site_a, existing_bond.site_b)) == expected:
-            cyclic_instances.add(instance_id)
-            cyclic_links.add(expected)
-    for condition in conditions:
-        if not isinstance(condition, SymbolicBond):
-            continue
-        # Endpoints ride on the SymbolicBond (site_a/site_b over the
-        # promoted SymbolicBondSite union). An existing-atom endpoint (AtomSite) is remapped
-        # source -> output through source_atom_map; a generated-atom endpoint (SymbolicAtomSite)
-        # resolves its SymbolicResidueSite through the shared placement resolver.
-        symbolic_bond = condition
-        endpoints: list[AtomSite] = []
-        for reference in (symbolic_bond.site_a, symbolic_bond.site_b):
-            if isinstance(reference, AtomSite):
-                site = source_atoms.get(reference)
-                if site is None:
-                    raise ValueError(f"ODesign atom layout does not contain covalent-link site {reference!r}")
-            else:
-                assert isinstance(reference, SymbolicAtomSite)
-                residue = _resolve_site(reference.residue, placement_map, instance_of)
-                site = AtomSite(residue[0], residue[1], reference.atom_id)
-            system.atom(site)
-            endpoints.append(site)
-
-        site_a, site_b = endpoints
-        if site_a.instance_id != site_b.instance_id:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-        instance_id = site_a.instance_id
-        entity = system.entities[system.instances[instance_id]]
-        if not isinstance(entity, PolymerSequence):
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-        previous = entity.components[0].previous_attachment
-        following = entity.components[-1].next_attachment
-        if previous is None or following is None:
-            raise ValueError("cyclic polymer endpoints require previous and next attachments")
-        expected = frozenset(
-            (
-                AtomSite(instance_id, 0, previous.atom_id),
-                AtomSite(instance_id, len(entity) - 1, following.atom_id),
-            )
-        )
-        endpoint_set = frozenset((site_a, site_b))
-        if endpoint_set != expected:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
-
-        existing_bonds = tuple(
-            candidate for candidate in bonds if frozenset((candidate.site_a, candidate.site_b)) == endpoint_set
-        )
-        requested_chemistry = (symbolic_bond.order, symbolic_bond.aromatic, symbolic_bond.stereo, None)
-        for candidate in existing_bonds:
-            if (candidate.order, candidate.aromatic, candidate.stereo, candidate.stereo_sites) != requested_chemistry:
-                raise ValueError("conflicting ODesign cyclic bond already exists at the requested endpoints")
-        if not existing_bonds:
-            bonds.add(
-                SystemBond(
-                    site_a,
-                    site_b,
-                    order=symbolic_bond.order,
-                    aromatic=symbolic_bond.aromatic,
-                    stereo=symbolic_bond.stereo,
-                    origin="user",
-                )
-            )
-        cyclic_instances.add(instance_id)
-        cyclic_links.add(endpoint_set)
-
-    if not cyclic_instances:
-        return system, frozenset(), frozenset()
-    return (
-        MolecularSystem(
-            system.entities,
-            system.instances,
-            frozenset(bonds),
-        ),
-        frozenset(cyclic_instances),
-        frozenset(cyclic_links),
-    )
-
-
-def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> ODesignInput:
-    placement = input.layout.placement
-    if placement is None:
-        return input
-    ranged = {
-        placement_id: part
-        for chain in placement.placements.values()
-        for placement_id, part in chain.items()
-        if isinstance(part, GeneratedSegment) and part.min_length != part.max_length
-    }
-    if not ranged:
-        return input
-    lengths = {}
-    chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
-    for chain, chain_length in zip(placement.placements.values(), chain_lengths):
-        chain_ranges = [
-            (placement_id, part)
-            for placement_id, part in chain.items()
-            if isinstance(part, GeneratedSegment) and placement_id in ranged
-        ]
-        if chain_length is None:
-            for placement_id, segment in chain_ranges:
-                lengths[placement_id] = int(
-                    torch.randint(
-                        segment.min_length,
-                        segment.max_length + 1,
-                        (),
-                        device=input.reference_positions.device,
-                        generator=generator,
-                    )
-                )
-            continue
-
-        for placement_id, segment in chain_ranges:
-            lengths[placement_id] = segment.min_length
-        remaining = chain_length - sum(
-            part.min_length if isinstance(part, GeneratedSegment) else part.stop - part.start for part in chain.values()
-        )
-        for _ in range(remaining):
-            available = [
-                (placement_id, segment)
-                for placement_id, segment in chain_ranges
-                if lengths[placement_id] < segment.max_length
-            ]
-            selected = int(
-                torch.randint(
-                    len(available),
-                    (),
-                    device=input.reference_positions.device,
-                    generator=generator,
-                )
-            )
-            lengths[available[selected][0]] += 1
-    if all(length == ranged[placement_id].max_length for placement_id, length in lengths.items()):
-        return input
-
-    polymer_instances = [
-        instance_id
-        for instance_id, entity_id in input.layout.system.instances.items()
-        if isinstance(input.layout.system.entities[entity_id], PolymerSequence)
-    ]
-    residue_map: dict[tuple[str, int], tuple[str, int]] = {}
-    placement_map: PlacementMap = {}
-    realized_sequences: list[tuple[str, str, PolymerSequence]] = []
-    sequence_by_signature: dict[
-        tuple[PolymerType, tuple[ChemicalComponent, ...]],
-        tuple[str, PolymerSequence],
-    ] = {}
-    used_entity_ids = {
-        entity_id for entity_id, entity in input.layout.system.entities.items() if isinstance(entity, Molecule)
-    }
-    # Walk declaration groups in order, indexing the realized polymer instances by declaration
-    # position among NON-EMPTY groups only: a zero-length declaration group mints no realized
-    # chain (matching _materialize_placement), so it is recorded as () and skipped here too.
-    chain_position = 0
-    for group, chain in placement.placements.items():
-        if all(
-            part.max_length == 0 if isinstance(part, GeneratedSegment) else part.stop == part.start
-            for part in chain.values()
-        ):
-            for placement_id, part in chain.items():
-                if isinstance(part, GeneratedSegment):
-                    placement_map.setdefault(group, {})[placement_id] = ()
-            continue
-        instance_id = polymer_instances[chain_position]
-        chain_position += 1
-        old_entity_id = input.layout.system.instances[instance_id]
-        old_entity = cast(PolymerSequence, input.layout.system.entities[old_entity_id])
-        old_index = 0
-        new_index = 0
-        components: list[ChemicalComponent] = []
-        for placement_id, part in chain.items():
-            old_length = part.max_length if isinstance(part, GeneratedSegment) else part.stop - part.start
-            new_length = (
-                lengths.get(placement_id, part.max_length) if isinstance(part, GeneratedSegment) else old_length
-            )
-            occurrences: list[tuple[str, int]] = []
-            for offset in range(new_length):
-                residue_map[(instance_id, old_index + offset)] = (instance_id, new_index + offset)
-                components.append(old_entity.components[old_index + offset])
-                if isinstance(part, GeneratedSegment):
-                    occurrences.append((instance_id, new_index + offset))
-            if isinstance(part, GeneratedSegment):
-                placement_map.setdefault(group, {})[placement_id] = tuple(occurrences)
-            old_index += old_length
-            new_index += new_length
-
-        signature = (old_entity.polymer_type, tuple(components))
-        existing_entity = sequence_by_signature.get(signature)
-        if existing_entity is None:
-            entity_id = old_entity_id
-            while entity_id in used_entity_ids:
-                entity_id += "_"
-            sequence = PolymerSequence(old_entity.polymer_type, tuple(components))
-            sequence_by_signature[signature] = (entity_id, sequence)
-            used_entity_ids.add(entity_id)
-        else:
-            entity_id, sequence = existing_entity
-        realized_sequences.append((instance_id, entity_id, sequence))
-
-    molecule_entities = {
-        entity_id: entity for entity_id, entity in input.layout.system.entities.items() if isinstance(entity, Molecule)
-    }
-    molecule_instances = {
-        instance_id: entity_id
-        for instance_id, entity_id in input.layout.system.instances.items()
-        if isinstance(input.layout.system.entities[entity_id], Molecule)
-    }
-    instances: dict[str, str] = {
-        **{instance_id: entity_id for instance_id, entity_id, _ in realized_sequences},
-        **molecule_instances,
-    }
-    entities: dict[str, PolymerSequence | Molecule] = {
-        **{entity_id: sequence for _, entity_id, sequence in realized_sequences},
-        **molecule_entities,
-    }
-
-    def map_site(site: AtomSite) -> AtomSite | None:
-        if isinstance(input.layout.system.entities[input.layout.system.instances[site.instance_id]], Molecule):
-            return site
-        residue = residue_map.get((site.instance_id, site.component_index))
-        return None if residue is None else AtomSite(residue[0], residue[1], site.atom_id)
-
-    bonds = []
-    for bond in input.layout.system.bonds:
-        site_a = map_site(bond.site_a)
-        site_b = map_site(bond.site_b)
-        if site_a is None or site_b is None:
-            continue
-        stereo_sites = None
-        if bond.stereo_sites is not None:
-            stereo_a = map_site(bond.stereo_sites[0])
-            stereo_b = map_site(bond.stereo_sites[1])
-            if stereo_a is None or stereo_b is None:
-                continue
-            stereo_sites = (stereo_a, stereo_b)
-        bonds.append(
-            SystemBond(
-                site_a,
-                site_b,
-                order=bond.order,
-                aromatic=bond.aromatic,
-                stereo=bond.stereo,
-                stereo_sites=stereo_sites,
-                origin=bond.origin,
-            )
-        )
-    system = MolecularSystem(entities, instances, frozenset(bonds))
-    source_residue_map = {
-        source: residue_map[output]
-        for source, output in input.layout.source_residue_map.items()
-        if output in residue_map
-    }
-    source_atom_map = {
-        source: mapped
-        for source, output in input.layout.source_atom_map.items()
-        if (mapped := map_site(output)) is not None
-    }
-    system, cyclic_instances, cyclic_links = materialize_odesign_cyclic_links(
-        system,
-        input.layout.conditions,
-        placement_map,
-        input.layout.instance_of,
-        source_atom_map,
-    )
-
-    old_to_new_site = {site: mapped for site in input.layout.sites if (mapped := map_site(site)) is not None}
-    sites = tuple(old_to_new_site.values())
-    new_to_old_site = {new: old for old, new in old_to_new_site.items()}
-    old_atom_index = {site: index for index, site in enumerate(input.layout.sites)}
-    atom_indices = torch.tensor(
-        [old_atom_index[new_to_old_site[site]] for site in sites],
-        dtype=torch.int64,
-        device=input.atom_mask.device,
-    )
-    token_sites, token_residues, token_entities = build_odesign_tokens(system, sites)
-    old_token_indices = torch.tensor(
-        [int(input.atom_to_token[0, old_atom_index[new_to_old_site[group[0]]]]) for group in token_sites],
-        dtype=torch.int64,
-        device=input.token_mask.device,
-    )
-    atom_to_token = torch.tensor(
-        [token_index for token_index, group in enumerate(token_sites) for _ in group],
-        dtype=torch.int64,
-        device=input.atom_to_token.device,
-    ).unsqueeze(0)
-    site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
-    chain_index, entity_index, symmetry_index, residue_index = (
-        value.unsqueeze(0).to(input.residue_index.device)
-        for value in build_odesign_token_indices(system, token_sites, token_residues, token_entities)
-    )
-    selected_reference_spaces = input.reference_space_id.index_select(1, atom_indices)
-    reference_space_map: dict[int, int] = {}
-    reference_space_id: list[int] = []
-    for value in selected_reference_spaces[0].tolist():
-        if value not in reference_space_map:
-            reference_space_map[value] = len(reference_space_map)
-        reference_space_id.append(reference_space_map[value])
-    reference_space_id = torch.tensor(
-        reference_space_id,
-        dtype=torch.int64,
-        device=input.reference_space_id.device,
-    ).unsqueeze(0)
-    observed_positions = input.observed_positions.index_select(1, atom_indices)
-    observed_mask = input.observed_mask.index_select(1, atom_indices)
-    fixed_coordinate_mask = input.fixed_coordinate_mask.index_select(1, atom_indices)
-    token_bonds = build_odesign_token_bonds(
-        system,
-        token_sites,
-        site_to_token,
-        excluded=cyclic_links,
-    ).to(input.token_bonds)
-    constraint_distogram = input.constraint_distogram.index_select(1, old_token_indices).index_select(
-        2,
-        old_token_indices,
-    )
-    layout = replace(
-        input.layout,
-        system=system,
-        sites=sites,
-        placement_map=placement_map,
-        source_residue_map=source_residue_map,
-        source_atom_map=source_atom_map,
-    )
-    return replace(
-        input,
-        token_mask=input.token_mask.index_select(1, old_token_indices),
-        residue_index=residue_index,
-        chain_index=chain_index,
-        entity_index=entity_index,
-        symmetry_index=symmetry_index,
-        token_index=torch.arange(len(token_sites), device=input.token_index.device).unsqueeze(0),
-        cyclic_period=build_odesign_cyclic_period(token_sites, cyclic_instances)
-        .unsqueeze(0)
-        .to(input.cyclic_period.device),
-        token_features=input.token_features.index_select(1, old_token_indices),
-        token_bonds=token_bonds.unsqueeze(0),
-        atom_features=input.atom_features.index_select(1, atom_indices),
-        atom_to_token=atom_to_token,
-        atom_mask=input.atom_mask.index_select(1, atom_indices),
-        reference_positions=input.reference_positions.index_select(1, atom_indices),
-        reference_space_id=reference_space_id,
-        reference_mask=input.reference_mask.index_select(1, atom_indices),
-        reference_charges=input.reference_charges.index_select(1, atom_indices),
-        observed_positions=observed_positions,
-        observed_mask=observed_mask,
-        fixed_coordinate_mask=fixed_coordinate_mask,
-        constraint_distogram=constraint_distogram,
-        msa_features=input.msa_features.index_select(2, old_token_indices),
-        msa_mask=input.msa_mask.index_select(2, old_token_indices),
-        layout=layout,
-    )
-
-
-def build_odesign_tokens(
-    system: MolecularSystem,
-    sites: tuple[AtomSite, ...],
-) -> tuple[
-    tuple[tuple[AtomSite, ...], ...],
-    tuple[tuple[str, int] | None, ...],
-    tuple[PolymerSequence | Molecule, ...],
-]:
-    r"""Build the ODesign token groups and their molecular identities."""
-
-    sites_by_residue: dict[tuple[str, int], list[AtomSite]] = {}
-    for site in sites:
-        if isinstance(system.entities[system.instances[site.instance_id]], PolymerSequence):
-            sites_by_residue.setdefault((site.instance_id, site.component_index), []).append(site)
-    token_sites: list[tuple[AtomSite, ...]] = []
-    token_residues: list[tuple[str, int] | None] = []
-    token_entities: list[PolymerSequence | Molecule] = []
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            for component_index in range(len(entity)):
-                residue = (instance_id, component_index)
-                residue_sites = tuple(sites_by_residue[residue])
-                if entity.components[component_index].component_id in ODESIGN_STANDARD_POLYMER_COMPONENTS:
-                    token_sites.append(residue_sites)
-                    token_residues.append(residue)
-                    token_entities.append(entity)
-                else:
-                    for site in residue_sites:
-                        token_sites.append((site,))
-                        token_residues.append(residue)
-                        token_entities.append(entity)
-        else:
-            for site in sites:
-                if site.instance_id == instance_id:
-                    token_sites.append((site,))
-                    token_residues.append(None)
-                    token_entities.append(entity)
-    return tuple(token_sites), tuple(token_residues), tuple(token_entities)
-
-
-def build_odesign_token_indices(
-    system: MolecularSystem,
-    token_sites: Sequence[Sequence[AtomSite]],
-    token_residues: Sequence[tuple[str, int] | None],
-    token_entities: Sequence[PolymerSequence | Molecule],
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Build ODesign chain, entity, symmetry, and residue index tensors."""
-
-    chain_by_instance = {instance_id: index for index, instance_id in enumerate(system.instances)}
-    entity_ids = []
-    for entity_id in system.instances.values():
-        if entity_id not in entity_ids:
-            entity_ids.append(entity_id)
-    entity_index_by_id = {value: index for index, value in enumerate(entity_ids)}
-    seen_by_entity: dict[str, int] = {}
-    symmetry_by_instance = {}
-    for instance_id, entity_id in system.instances.items():
-        symmetry_by_instance[instance_id] = seen_by_entity.get(entity_id, 0)
-        seen_by_entity[entity_id] = symmetry_by_instance[instance_id] + 1
-    chain = []
-    entity = []
-    symmetry = []
-    residue = []
-    for group, reference, _definition in zip(token_sites, token_residues, token_entities):
-        instance_id = reference[0] if reference is not None else group[0].instance_id
-        chain.append(chain_by_instance[instance_id])
-        entity.append(entity_index_by_id[system.instances[instance_id]])
-        symmetry.append(symmetry_by_instance[instance_id])
-        if reference is None:
-            residue.append(0)
-        else:
-            residue.append(reference[1])
-    return tuple(torch.tensor(values, dtype=torch.int64) for values in (chain, entity, symmetry, residue))
-
-
-def build_odesign_token_bonds(
-    system: MolecularSystem,
-    token_sites: Sequence[Sequence[AtomSite]],
-    site_to_token: dict[AtomSite, int],
-    *,
-    excluded: frozenset[frozenset[AtomSite]],
-) -> Tensor:
-    r"""Build the symmetric ODesign token-bond adjacency tensor."""
-
-    bonds = torch.zeros(len(token_sites), len(token_sites), dtype=torch.float32)
-    for bond in system.iter_bonds():
-        if frozenset((bond.site_a, bond.site_b)) in excluded:
-            continue
-        if bond.site_a not in site_to_token or bond.site_b not in site_to_token:
-            continue
-        left, right = site_to_token[bond.site_a], site_to_token[bond.site_b]
-        if left != right:
-            bonds[left, right] = bonds[right, left] = 1.0
-    return bonds
-
-
-def build_odesign_cyclic_period(
-    token_sites: Sequence[Sequence[AtomSite]],
-    cyclic_instances: frozenset[str],
-) -> Tensor:
-    r"""Build the cyclic-polymer period associated with each ODesign token."""
-
-    counts = {
-        instance_id: sum(group[0].instance_id == instance_id for group in token_sites)
-        for instance_id in cyclic_instances
-    }
-    return torch.tensor(
-        [counts.get(group[0].instance_id, 0) for group in token_sites],
-        dtype=torch.int64,
-    )

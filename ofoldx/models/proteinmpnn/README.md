@@ -78,7 +78,7 @@ Pass mmCIF through the canonical `Structure` API instead of passing an mmCIF pat
 this family Processor.
 
 Full-backbone mode requires finite observed N/CA/C/O coordinates. CA-only mode
-requires finite observed CA coordinates. `positions` selects canonical
+requires finite observed CA coordinates. `design_positions` selects canonical
 `(instance_id, component_index)` references. `sequence` supplies an alternate target
 for scoring. The Processor also accepts the family-owned controls
 `AllowedResidueIdentities`, `TiedResidueIdentities`, tied weights, per-residue logit

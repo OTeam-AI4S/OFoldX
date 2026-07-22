@@ -16,7 +16,6 @@ from typing import Literal, cast
 import numpy as np
 import torch
 from torch import Tensor, nn
-from typing_extensions import Self
 
 from ...data.molecular import (
     AtomSite,
@@ -26,6 +25,7 @@ from ...data.molecular import (
     restype_3to1,
 )
 from ...data.structure import Structure
+from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
@@ -60,7 +60,7 @@ from ...results import FoldPrediction, Metric, PairMetric, Score
 from .config import AlphaFold3Config
 
 
-class AlphaFold3Model(nn.Module):
+class AlphaFold3Model(Model):
     r"""
     AlphaFold 3 structure-prediction model assembled from the shared OFoldX modules.
 
@@ -74,24 +74,43 @@ class AlphaFold3Model(nn.Module):
     """
 
     config_class = AlphaFold3Config
+    config: AlphaFold3Config
 
     def __init__(self, config: AlphaFold3Config | None = None) -> None:
         config = AlphaFold3Config() if config is None else config
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self._recycling_steps = config.recycling_steps
-        self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, config.pair_size)
+        self.input_embeddings = AlphaFold3InputEmbeddings(
+            single_size=config.single_size,
+            atom_feature_size=config.atom_feature_size,
+        )
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.token_feature_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.token_feature_size, config.pair_size, bias=False)
+        self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, config.pair_size)
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
-        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.pair_recycle_norm = LayerNorm(config.pair_size)
+        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
         self.single_recycle_norm = LayerNorm(config.single_size)
-        self.input_embedder = InputEmbedder(
-            single_size=config.single_size,
-            atom_feature_size=config.atom_feature_size,
+        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
+        self.template_embedder = TemplateEmbedder(
+            pair_size=config.pair_size,
+            hidden_size=config.template.hidden_size,
+            num_blocks=config.template.num_blocks,
+            vocab_size=config.template.vocab_size,
+            num_distogram_bins=config.template.num_distogram_bins,
+            triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
+            num_triangle_attention_heads=config.template.num_triangle_attention_heads,
+            expansion=config.template.expansion,
+            dropout=config.template.dropout,
+            ending_node_transpose_bias=True,
+        )
+        self.msa_trunk = MsaTrunk(
+            pair_size=config.pair_size,
+            token_feature_size=config.token_feature_size,
+            msa_dropout=config.trunk.msa_dropout,
+            pair_dropout=config.trunk.pair_dropout,
+            ending_node_transpose_bias=True,
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
@@ -164,25 +183,6 @@ class AlphaFold3Model(nn.Module):
             symmetrize_pde_before_projection=False,
             persistent_distance_bins=False,
         )
-        self.msa_trunk = MsaTrunk(
-            pair_size=config.pair_size,
-            token_feature_size=config.token_feature_size,
-            msa_dropout=config.trunk.msa_dropout,
-            pair_dropout=config.trunk.pair_dropout,
-            ending_node_transpose_bias=True,
-        )
-        self.template_embedder = TemplateEmbedder(
-            pair_size=config.pair_size,
-            hidden_size=config.template.hidden_size,
-            num_blocks=config.template.num_blocks,
-            vocab_size=config.template.vocab_size,
-            num_distogram_bins=config.template.num_distogram_bins,
-            triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
-            num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-            expansion=config.template.expansion,
-            dropout=config.template.dropout,
-            ending_node_transpose_bias=True,
-        )
         self.reset_parameters()
         # Atom cross-attention adaptively normalizes queries and keys from the raw hidden state.
         self.set_backend("auto")
@@ -205,12 +205,9 @@ class AlphaFold3Model(nn.Module):
         nn.init.zeros_(self.confidence_head.pair_projector.pae_projection.weight)
         nn.init.zeros_(self.confidence_head.pair_projector.pde_projection.weight)
 
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the public PyTorch or OOps operator path."""
+    def _set_backend(self, backend: ModelBackend) -> None:
+        r"""Apply the public PyTorch or OOps operator path."""
 
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
-        self.backend = backend
         operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
@@ -228,11 +225,10 @@ class AlphaFold3Model(nn.Module):
                 ),
             ):
                 module.operator_backend = operator_backend
-        return self
 
     def forward(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
@@ -243,19 +239,19 @@ class AlphaFold3Model(nn.Module):
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
-        representations = self._run_trunk(features, recycling_steps=recycling_steps)
+        representations = self._run_trunk(input, recycling_steps=recycling_steps)
         coordinates = self._denoise(
-            self._denoise_context(features, representations).to_denoising_input(
+            self._denoise_context(input, representations).to_denoising_input(
                 noisy_coords=noisy_coordinates,
                 noise_level=noise_level,
             )
         )
-        return self._assemble_output(features, representations, coordinates)
+        return self._assemble_output(input, representations, coordinates)
 
     @torch.inference_mode()
     def _sample(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         recycling_steps: int | None = None,
         num_samples: int = 1,
@@ -267,20 +263,20 @@ class AlphaFold3Model(nn.Module):
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
-        representations = self._run_trunk(features, recycling_steps=recycling_steps)
+        representations = self._run_trunk(input, recycling_steps=recycling_steps)
         pred_coords = self.coordinate_sampler(
             self._denoise,
-            context=self._denoise_context(features, representations),
+            context=self._denoise_context(input, representations),
             num_samples=num_samples,
             num_sampling_steps=self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps,
             generator=generator,
         )
-        return self._assemble_output(features, representations, pred_coords)
+        return self._assemble_output(input, representations, pred_coords)
 
     @torch.inference_mode()
     def fold(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
@@ -296,7 +292,7 @@ class AlphaFold3Model(nn.Module):
         ``generator`` drives the rollouts; ``None`` uses the ambient PyTorch RNG.
 
         Args:
-            features: A Processor-built input carrying ``system``, ``atom_sites``, and ``token_sites``.
+            input: A Processor-built carrier containing ``system``, ``atom_sites``, and ``token_sites``.
             num_samples: Diffusion rollouts drawn for the seed group (default 5).
             generator: The already-resolved RNG driving the diffusion rollouts; ``None`` uses the
                 ambient RNG.
@@ -316,14 +312,14 @@ class AlphaFold3Model(nn.Module):
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
-        if features.system is None or not features.atom_sites or not features.token_sites:
+        if input.system is None or not input.atom_sites or not input.token_sites:
             raise ValueError(
                 "fold requires a Processor-built input carrying system, atom_sites, and token_sites; "
                 "bare-tensor inputs can only drive forward/_sample"
             )
 
         group = self._decode_seed_group(
-            features,
+            input,
             num_samples=num_samples,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
@@ -334,7 +330,7 @@ class AlphaFold3Model(nn.Module):
 
     def _decode_seed_group(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         num_samples: int,
         recycling_steps: int,
@@ -350,19 +346,19 @@ class AlphaFold3Model(nn.Module):
         """
 
         output = self._sample(
-            features,
+            input,
             recycling_steps=recycling_steps,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
         )
 
-        assert features.system is not None
-        atom_count = len(features.atom_sites)
-        token_count = len(features.token_sites)
-        complete_sites = [site for site, atom in features.system.iter_atoms() if atom.element != "H"]
+        assert input.system is not None
+        atom_count = len(input.atom_sites)
+        token_count = len(input.token_sites)
+        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray([complete_index[site] for site in features.atom_sites], dtype=np.intp)
+        model_to_complete = np.asarray([complete_index[site] for site in input.atom_sites], dtype=np.intp)
 
         coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
         atom_plddt = output.plddt[0, :, :atom_count].to(device="cpu", dtype=torch.float32)
@@ -371,18 +367,18 @@ class AlphaFold3Model(nn.Module):
         resolved_logits = output.resolved_logits[0, :, :atom_count].float().cpu()
         distogram_logits = output.distogram_logits[0, :token_count, :token_count].float().cpu()
 
-        pae = _expected_bin_value(pae_logits, pae_bin_centers(pae_logits.shape[-1]).cpu())
+        pae = _expected_bin_value(pae_logits, alphafold3_pae_bin_centers(pae_logits.shape[-1]).cpu())
         pde = _expected_bin_value(pde_logits, _uniform_bin_centers(pde_logits.shape[-1], 0.0, 32.0))
         resolved_probability = resolved_logits.softmax(dim=-1)[..., 1]
         contact_probability = _contact_probability(distogram_logits).numpy()
-        ptm, iptm, ptm_iptm_average = (value[0].cpu() for value in self.confidence_summary(output, features))
+        ptm, iptm, ptm_iptm_average = (value[0].cpu() for value in self.confidence_summary(output, input))
 
         # Chain-level confidence summaries operate on decoded per-sample arrays.
         full_pae = pae.numpy()
         full_pde = pde.numpy()
-        asym_ids = features.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
-        frame_mask = features.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
-        instance_ids = tuple(features.system.instances.keys())
+        asym_ids = input.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
+        frame_mask = input.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
+        instance_ids = tuple(input.system.instances.keys())
         unique_chain = np.unique(asym_ids)
         chain_axis = tuple(instance_ids[int(index)] for index in unique_chain)
         multi_chain = unique_chain.shape[0] > 1
@@ -413,20 +409,22 @@ class AlphaFold3Model(nn.Module):
             complete_coordinates[model_to_complete] = coordinates[sample_index]
             coordinate_mask[model_to_complete] = True
             structure = Structure(
-                system=features.system,
+                system=input.system,
                 sites=tuple(complete_sites),
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
             )
             disorder = fraction_disordered(structure)
-            clash = has_clash(structure)
-            sample_ranking_score = ranking_score(float(ptm[sample_index]), float(iptm[sample_index]), disorder, clash)
+            clash = alphafold3_has_clash(structure)
+            sample_ranking_score = alphafold3_ranking_score(
+                float(ptm[sample_index]), float(iptm[sample_index]), disorder, clash
+            )
             ranking_confidence = float(ptm_iptm_average[sample_index]) if multi_chain else float(ptm[sample_index])
             predictions.append(
                 FoldPrediction(
                     structure=structure,
                     scores={
-                        "plddt": Score(float(atom_plddt[sample_index].mean()), preferred="higher"),
+                        "mean_plddt": Score(float(atom_plddt[sample_index].mean()), preferred="higher"),
                         "ptm": Score(float(ptm[sample_index]), preferred="higher"),
                         "iptm": Score(float(iptm[sample_index]), preferred="higher"),
                         "ptm_iptm_average": Score(float(ptm_iptm_average[sample_index]), preferred="higher"),
@@ -439,13 +437,13 @@ class AlphaFold3Model(nn.Module):
                         "has_clash": Score(float(clash), preferred="lower"),
                     },
                     metrics={
-                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=features.atom_sites),
+                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=input.atom_sites),
                         "resolved_probability": Metric(
-                            values=resolved_probability[sample_index].numpy(), axis=features.atom_sites
+                            values=resolved_probability[sample_index].numpy(), axis=input.atom_sites
                         ),
                         "predicted_distance_error": Metric(
                             values=pde_full_chain[sample_index],
-                            axis=features.token_sites,
+                            axis=input.token_sites,
                             unit="angstrom",
                         ),
                         "chain_ptm": Metric(values=chain_metrics["iptm_ichain"][sample_index], axis=chain_axis),
@@ -466,20 +464,20 @@ class AlphaFold3Model(nn.Module):
                     pair_metrics={
                         "pae": PairMetric(
                             values=pae[sample_index].numpy(),
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                             unit="angstrom",
                         ),
                         "pde": PairMetric(
                             values=pde[sample_index].numpy(),
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                             unit="angstrom",
                         ),
                         "contact_probs": PairMetric(
                             values=contact_probability,
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                         ),
                         "chain_pair_iptm": PairMetric(
                             values=chain_metrics["chain_pair_iptm"][sample_index],
@@ -511,22 +509,24 @@ class AlphaFold3Model(nn.Module):
 
     def _assemble_output(
         self,
-        features: AlphaFold3Input,
-        representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
+        input: AlphaFold3Input,
+        representations: _AlphaFold3TrunkOutput,
         coordinates: Tensor,
     ) -> AlphaFold3Output:
         r"""Compute distogram and confidence predictions."""
 
-        token_embedding, single, pair, _ = representations
+        token_embedding = representations.token_embedding
+        single = representations.single
+        pair = representations.pair
         confidence_dtype = self.confidence_head.pair_embedder.left_token_projection.weight.dtype
         plddt_logits, pae_logits, pde_logits, resolved_logits = self.confidence_head(
             single.to(dtype=confidence_dtype),
             pair=pair.to(dtype=confidence_dtype),
             token_embedding=token_embedding.to(dtype=confidence_dtype),
             pred_coords=coordinates,
-            token_to_rep_atom=features.token_to_rep_atom,
-            atom_to_token=features.atom_to_token,
-            atom_token_index=features.atom_token_index,
+            token_to_rep_atom=input.token_to_rep_atom,
+            atom_to_token=input.atom_to_token,
+            atom_token_index=input.atom_token_index,
         )
         with torch.autocast(device_type=pair.device.type, enabled=False):
             distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.linear.weight.dtype))
@@ -541,30 +541,29 @@ class AlphaFold3Model(nn.Module):
 
     def _denoise_context(
         self,
-        features: AlphaFold3Input,
-        representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
+        input: AlphaFold3Input,
+        representations: _AlphaFold3TrunkOutput,
     ) -> CoordinateDenoiseContext:
         r"""Assemble conditioning shared by ``forward`` and the sampler."""
 
-        token_embedding, single, pair, relative_features = representations
         return CoordinateDenoiseContext(
-            atom_features=features.atom_features,
-            atom_to_token=features.atom_to_token,
-            reference_positions=features.reference_positions,
-            reference_charges=features.reference_charges,
-            reference_mask=features.reference_mask,
-            atom_mask=features.atom_mask,
-            token_embedding=token_embedding,
-            single=single,
-            pair=pair,
-            relative_features=relative_features,
+            atom_features=input.atom_features,
+            atom_to_token=input.atom_to_token,
+            reference_positions=input.reference_positions,
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            atom_mask=input.atom_mask,
+            token_embedding=representations.token_embedding,
+            single=representations.single,
+            pair=representations.pair,
+            relative_features=representations.relative_features,
             local_geometry=_build_alphafold3_local_geometry(
                 self.coordinate_denoiser.atom_encoder.atom_pair_encoder.local_geometry_builder.windowing,
-                reference_positions=features.reference_positions,
-                reference_space_id=features.reference_space_id,
-                atom_to_token=features.atom_to_token,
-                atom_mask=features.atom_mask,
-                num_tokens=features.token_features.shape[-2],
+                reference_positions=input.reference_positions,
+                reference_space_id=input.reference_space_id,
+                atom_to_token=input.atom_to_token,
+                atom_mask=input.atom_mask,
+                num_tokens=input.token_features.shape[-2],
             ),
         )
 
@@ -577,7 +576,7 @@ class AlphaFold3Model(nn.Module):
     def confidence_summary(
         self,
         output: AlphaFold3Output,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         max_error_bin: float = 31.0,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -585,9 +584,9 @@ class AlphaFold3Model(nn.Module):
         Compute the pTM / ipTM / ptm_iptm_average summary from a model output.
 
         This is an opt-in, parameter-free post-processing step over the PAE logits already produced by
-        the confidence head: callers run `forward` and then pass the output plus the features here to
-        get the scalar tensor summaries. Chains are read from ``features.chain_index`` and the valid frame
-        mask from ``features.token_mask``.
+        the confidence head: callers run `forward` and then pass the output plus the input here to
+        get the scalar tensor summaries. Chains are read from ``input.chain_index`` and the valid frame
+        mask from ``input.token_mask``.
 
         The third element is ``0.8 * ipTM + 0.2 * pTM``. ``ranking_score`` also
         includes DSSP disorder and clash terms, which require a decoded Structure
@@ -595,7 +594,7 @@ class AlphaFold3Model(nn.Module):
 
         Args:
             output: Structure-prediction output carrying ``pae_logits``.
-            features: The model input the output was produced from.
+            input: The model input the output was produced from.
             max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
 
         Returns:
@@ -603,21 +602,21 @@ class AlphaFold3Model(nn.Module):
 
         Examples:
             >>> model = AlphaFold3Model(AlphaFold3Config()).eval()  # doctest: +SKIP
-            >>> features = processor("complex.cif")  # doctest: +SKIP
-            >>> ptm, iptm, ptm_iptm_average = model.confidence_summary(model(features), features)  # doctest: +SKIP
+            >>> input = processor("complex.cif")  # doctest: +SKIP
+            >>> ptm, iptm, ptm_iptm_average = model.confidence_summary(model(input), input)  # doctest: +SKIP
             >>> ptm_iptm_average.shape  # doctest: +SKIP
             torch.Size([1, 1])
         """
 
         num_tokens = output.pae_logits.shape[-2]
-        frame_mask = features.token_mask.to(torch.bool)
+        frame_mask = input.token_mask.to(torch.bool)
         # Broadcast token-axis fields across the per-sample logit axis so the summary is per-sample.
         sample_axes = output.pae_logits.dim() - 3
-        asym_id = features.chain_index
+        asym_id = input.chain_index
         for _ in range(sample_axes - asym_id.dim() + 1):
             asym_id = asym_id.unsqueeze(1)
             frame_mask = frame_mask.unsqueeze(1)
-        return confidence_summary(
+        return alphafold3_confidence_summary(
             output.pae_logits,
             frame_mask=frame_mask.expand(*output.pae_logits.shape[:-3], num_tokens),
             asym_id=asym_id.expand(*output.pae_logits.shape[:-3], num_tokens),
@@ -626,39 +625,39 @@ class AlphaFold3Model(nn.Module):
 
     def _run_trunk(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         *,
         recycling_steps: int,
-    ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
+    ) -> _AlphaFold3TrunkOutput:
         r"""
         Build the token embedding and run the recycled trunk to final single/pair representations.
 
         Args:
-            features: Typed model input.
+            input: Typed model input.
             recycling_steps: Number of recycling passes to run.
 
         Returns:
-            Trunk representations (token embedding, single, pair, relative features, pair mask).
+            Named token embedding, single, pair, and relative-position representations.
         """
 
-        atom_dtype = self.input_embedder.atom_encoder.atom_conditioner.atom_feature_projection.weight.dtype
-        reference_positions = features.reference_positions.to(dtype=atom_dtype)
-        token_embedding = self.input_embedder(
-            features.atom_features.to(dtype=atom_dtype),
-            token_features=features.token_features,
+        atom_dtype = self.input_embeddings.atom_encoder.atom_conditioner.atom_feature_projection.weight.dtype
+        reference_positions = input.reference_positions.to(dtype=atom_dtype)
+        token_embedding = self.input_embeddings(
+            input.atom_features.to(dtype=atom_dtype),
+            token_features=input.token_features,
             reference_positions=reference_positions,
-            reference_charges=features.reference_charges.to(dtype=atom_dtype),
-            reference_mask=features.reference_mask,
-            atom_to_token=features.atom_to_token,
-            num_tokens=features.token_features.shape[-2],
-            atom_mask=features.atom_mask,
-            token_mask=features.token_mask,
-            local_geometry=self.input_embedder.build_local_geometry(
+            reference_charges=input.reference_charges.to(dtype=atom_dtype),
+            reference_mask=input.reference_mask,
+            atom_to_token=input.atom_to_token,
+            num_tokens=input.token_features.shape[-2],
+            atom_mask=input.atom_mask,
+            token_mask=input.token_mask,
+            local_geometry=self.input_embeddings.build_local_geometry(
                 reference_positions,
-                features.reference_space_id,
-                atom_to_token=features.atom_to_token,
-                atom_mask=features.atom_mask,
-                num_tokens=features.token_features.shape[-2],
+                input.reference_space_id,
+                atom_to_token=input.atom_to_token,
+                atom_mask=input.atom_mask,
+                num_tokens=input.token_features.shape[-2],
             ),
         )
         # Per-atom conditioning remains float32 until entering the Evoformer projection dtype.
@@ -666,18 +665,18 @@ class AlphaFold3Model(nn.Module):
 
         single_init = self.single_init_projection(token_embedding)
         relative_features = generate_relative_position_features(
-            residue_index=features.residue_index,
-            chain_index=features.chain_index,
-            entity_index=features.entity_index,
-            symmetry_index=features.symmetry_index,
-            token_index=features.token_index,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
             dtype=single_init.dtype,
         )
-        pair_init = self._initial_pair(token_embedding, features, relative_features)
+        pair_init = self._initial_pair(token_embedding, input, relative_features)
 
-        pair_mask = pair_mask_from_token_mask(features.token_mask)
+        pair_mask = pair_mask_from_token_mask(input.token_mask)
         single, pair = self._run_recycling(
-            features,
+            input,
             token_embedding,
             single_init,
             pair_init,
@@ -685,11 +684,16 @@ class AlphaFold3Model(nn.Module):
             recycling_steps,
         )
 
-        return token_embedding, single, pair, relative_features
+        return _AlphaFold3TrunkOutput(
+            token_embedding=token_embedding,
+            single=single,
+            pair=pair,
+            relative_features=relative_features,
+        )
 
     def _run_recycling(
         self,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         token_embedding: Tensor,
         single_init: Tensor,
         pair_init: Tensor,
@@ -698,7 +702,7 @@ class AlphaFold3Model(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Run the differentiable recycling loop."""
 
-        template_features = features.template_features
+        template_features = input.template_features
         if template_features is not None:
             template_features = TemplateFeatures(
                 distogram=template_features.distogram.to(dtype=pair_init.dtype),
@@ -709,8 +713,8 @@ class AlphaFold3Model(nn.Module):
                 template_mask=template_features.template_mask,
             )
         msa_features = None
-        if features.msa_features is not None:
-            msa_features = features.msa_features.to(dtype=pair_init.dtype)
+        if input.msa_features is not None:
+            msa_features = input.msa_features.to(dtype=pair_init.dtype)
 
         # Recycled representations are stored in float32 and cast to the activation
         # dtype at the start of each pass.
@@ -722,7 +726,7 @@ class AlphaFold3Model(nn.Module):
                 pair = pair + self.template_embedder(pair, template_features, pair_mask=pair_mask)
             if msa_features is not None:
                 _, pair = self.msa_trunk(
-                    msa_features, pair, token_embedding, msa_mask=features.msa_mask, pair_mask=pair_mask
+                    msa_features, pair, token_embedding, msa_mask=input.msa_mask, pair_mask=pair_mask
                 )
             single = single_init + self.single_recycle_projection(
                 self.single_recycle_norm(single.to(dtype=single_init.dtype))
@@ -736,7 +740,7 @@ class AlphaFold3Model(nn.Module):
     def _initial_pair(
         self,
         token_embedding: torch.Tensor,
-        features: AlphaFold3Input,
+        input: AlphaFold3Input,
         relative_features: RelativePositionBuckets,
     ) -> torch.Tensor:
         r"""
@@ -744,7 +748,7 @@ class AlphaFold3Model(nn.Module):
 
         Args:
             token_embedding: Initial target-feature representation ``(..., N_token, token_feature_size)``.
-            features: Typed model input (provides token bonds and the token mask).
+            input: Typed model input (provides token bonds and the token mask).
             relative_features: Relative-position bucket features for the pair embedder.
 
         Returns:
@@ -753,18 +757,18 @@ class AlphaFold3Model(nn.Module):
 
         left = self.pair_left_projection(token_embedding).unsqueeze(-2)
         right = self.pair_right_projection(token_embedding).unsqueeze(-3)
-        token_bonds = features.token_bonds.to(device=token_embedding.device, dtype=token_embedding.dtype)
+        token_bonds = input.token_bonds.to(device=token_embedding.device, dtype=token_embedding.dtype)
         token_bonds = torch.broadcast_to(token_bonds, (*token_embedding.shape[:-1], token_embedding.shape[-2]))
         token_bonds = token_bonds.unsqueeze(-1)
         pair = left + right
         pair = pair + self.relative_position_embedder(relative_features)
         pair = pair + self.token_bond_projection(token_bonds)
 
-        pair_mask = pair_mask_from_token_mask(features.token_mask)
+        pair_mask = pair_mask_from_token_mask(input.token_mask)
         return pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
 
 
-class InputEmbedder(nn.Module):
+class AlphaFold3InputEmbeddings(nn.Module):
     r"""
     Build token input embeddings by encoding atoms to tokens and appending the token-feature tail.
 
@@ -941,7 +945,9 @@ def _contact_probability(distogram_logits: Tensor) -> Tensor:
     return distogram_logits.softmax(dim=-1)[..., centers < 8.0].sum(dim=-1)
 
 
-def pae_bin_centers(num_bins: int, max_error_bin: float = 31.0, *, device: torch.device | None = None) -> Tensor:
+def alphafold3_pae_bin_centers(
+    num_bins: int, max_error_bin: float = 31.0, *, device: torch.device | None = None
+) -> Tensor:
     r"""
     Return the PAE-bin center distances used to take the expected aligned error.
 
@@ -961,12 +967,12 @@ def pae_bin_centers(num_bins: int, max_error_bin: float = 31.0, *, device: torch
 
     Examples:
         >>> import torch
-        >>> centers = pae_bin_centers(4)
+        >>> centers = alphafold3_pae_bin_centers(4)
         >>> centers.shape
         torch.Size([4])
         >>> centers.round(decimals=3).tolist()
         [7.75, 23.25, 38.75, 54.25]
-        >>> pae_bin_centers(1)
+        >>> alphafold3_pae_bin_centers(1)
         Traceback (most recent call last):
             ...
         ValueError: num_bins must be at least 2, got 1
@@ -1018,7 +1024,7 @@ def tm_adjusted_pae(
     """
 
     num_bins = pae_logits.shape[-1]
-    centers = pae_bin_centers(num_bins, max_error_bin, device=pae_logits.device).to(pae_logits.dtype)
+    centers = alphafold3_pae_bin_centers(num_bins, max_error_bin, device=pae_logits.device).to(pae_logits.dtype)
     probs = torch.softmax(pae_logits.float(), dim=-1).to(pae_logits.dtype)
     pair_mask = pair_mask.to(pae_logits.dtype)
 
@@ -1036,7 +1042,9 @@ def tm_adjusted_pae(
     return (probs * tm_bin_weights(centers, num_tokens)).sum(dim=-1)
 
 
-def predicted_tm_score(adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tensor, interface: bool) -> Tensor:
+def alphafold3_predicted_tm_score(
+    adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tensor, interface: bool
+) -> Tensor:
     r"""
     Reduce a TM-adjusted PAE matrix to a scalar pTM or ipTM.
 
@@ -1060,7 +1068,7 @@ def predicted_tm_score(adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tens
         >>> mask = torch.ones(1, 3, dtype=torch.bool)
         >>> pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
         >>> asym_id = torch.tensor([[0, 0, 1]])
-        >>> predicted_tm_score(adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False).shape
+        >>> alphafold3_predicted_tm_score(adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False).shape
         torch.Size([1])
     """
 
@@ -1074,7 +1082,7 @@ def predicted_tm_score(adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tens
     return torch.where(empty, torch.full_like(score, float("nan")), score)
 
 
-def confidence_summary(
+def alphafold3_confidence_summary(
     pae_logits: Tensor,
     *,
     frame_mask: Tensor,
@@ -1103,7 +1111,9 @@ def confidence_summary(
         >>> logits = torch.randn(1, 3, 3, 4)
         >>> frame_mask = torch.ones(1, 3, dtype=torch.bool)
         >>> asym_id = torch.tensor([[0, 0, 1]])
-        >>> ptm, iptm, ptm_iptm_average = confidence_summary(logits, frame_mask=frame_mask, asym_id=asym_id)
+        >>> ptm, iptm, ptm_iptm_average = alphafold3_confidence_summary(
+        ...     logits, frame_mask=frame_mask, asym_id=asym_id
+        ... )
         >>> ptm.shape
         torch.Size([1])
         >>> ptm_iptm_average.shape
@@ -1118,8 +1128,8 @@ def confidence_summary(
     interface_adjusted = tm_adjusted_pae(
         pae_logits, pair_mask=pair_mask, asym_id=asym_id, interface=True, max_error_bin=max_error_bin
     )
-    ptm = predicted_tm_score(global_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False)
-    iptm = predicted_tm_score(interface_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=True)
+    ptm = alphafold3_predicted_tm_score(global_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False)
+    iptm = alphafold3_predicted_tm_score(interface_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=True)
     ptm_iptm_average = torch.where(torch.isnan(iptm), ptm, _IPTM_WEIGHT * iptm + (1.0 - _IPTM_WEIGHT) * ptm)
     return ptm, iptm, ptm_iptm_average
 
@@ -1346,7 +1356,7 @@ _RASA_WINDOW = 25
 _POLYMER_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
-def ranking_score(ptm: float, iptm: float, fraction_disordered_: float, has_clash_: bool) -> float:
+def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered_: float, has_clash_: bool) -> float:
     r"""Return the AlphaFold 3 ranking score for one sample.
 
     ``ptm_iptm_average + 0.5 * fraction_disordered - 100 * has_clash``, with pTM
@@ -1409,7 +1419,7 @@ def fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RAS
     return float(np.mean(np.asarray(rasa) > rasa_disorder_cutoff))
 
 
-def has_clash(
+def alphafold3_has_clash(
     structure: Structure,
     cutoff_radius: float = 1.1,
     min_clashes_for_overlap: int = 100,
@@ -1659,6 +1669,16 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
 
     tree = spatial.cKDTree(coordinates)
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _AlphaFold3TrunkOutput:
+    r"""Named representations returned by the AlphaFold 3 recycling trunk."""
+
+    token_embedding: Tensor
+    single: Tensor
+    pair: Tensor
+    relative_features: RelativePositionBuckets
 
 
 @dataclass(kw_only=True)

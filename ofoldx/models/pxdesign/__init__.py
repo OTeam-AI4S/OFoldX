@@ -5,19 +5,19 @@ from __future__ import annotations
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import (
-    PxDesignConditionEmbedderConfig,
+    PxDesignConditionEmbeddingsConfig,
     PxDesignConfig,
     PxDesignDenoiserConfig,
     PxDesignProcessorConfig,
     PxDesignSamplerConfig,
 )
 from .model import (
-    PxDesignCandidate,
+    PxDesignDesignCandidate,
+    PxDesignDesignResult,
     PxDesignInput,
     PxDesignLayout,
     PxDesignModel,
     PxDesignOutput,
-    PxDesignResult,
 )
 from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder

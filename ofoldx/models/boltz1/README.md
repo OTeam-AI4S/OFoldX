@@ -31,8 +31,9 @@ All-atom structure prediction for tokenized biomolecular complexes, combining a 
 > no distance is recomputed at fold time and `pocket=None` keeps the all-`UNSPECIFIED` released default. Pocket
 > conditioning and Boltz-1x steering are reached through the concrete `Boltz1Pipeline.fold(pocket=..., use_potentials=...)`.
 >
-> **Trunk embeddings.** `Boltz1Model.embeddings(...)` is the expert method for the released `--write_embeddings`
-> outputs: it returns the raw trunk `single` `[B, N, 384]` and `pair` `[B, N, N, 128]` tensors as `Boltz1Embeddings`,
+> **Trunk representations.** `Boltz1Model.representations(...)` is the expert method for the released
+> `--write_embeddings` outputs: it returns the raw trunk `single` `[B, N, 384]` and `pair` `[B, N, N, 128]`
+> tensors as `Boltz1Representations`,
 > retaining autograd under grad. These carry vocabulary/layout axes and are deliberately **not** folded into `FoldResult`.
 >
 > **Family-specific `FoldResult` names and units.** Beyond the cross-family `plddt`/`pae`/`pde`/`ptm`/`iptm` names,
@@ -84,7 +85,7 @@ The upstream Boltz-1 training corpus is not recorded in the OFoldX metadata for 
 
 ### Training Procedure
 
-OFoldX converts the released Boltz-1 checkpoint (`boltz1_conf.ckpt`) into a strict-loaded native model in memory. The converter splits the upstream monolithic score model, moving the invariant pair/atom conditioning into `diffusion_conditioning` while keeping the denoising layers under `structure_module.score_model`, and preserves the clean OFoldX parameter names. With the canonical `Boltz1Processor` and `FoldResult` decoder now in place, repository persistence via `ofoldx.artifacts.save_model` is unblocked. Exact upstream training-loop parity is not a Model Hub requirement; details of the upstream training schedule remain weight provenance.
+OFoldX converts the released Boltz-1 checkpoint (`boltz1_conf.ckpt`) into a strict-loaded native model in memory. The converter splits the upstream monolithic score model, moving invariant pair/atom conditioning into `denoiser_conditioning` and learned denoising layers into `coordinate_diffusion.denoiser`, while preserving checkpoint tensor meaning. With the canonical `Boltz1Processor` and `FoldResult` decoder now in place, repository persistence via `ofoldx.artifacts.save_model` is unblocked. Exact upstream training-loop parity is not a Model Hub requirement; details of the upstream training schedule remain weight provenance.
 
 ## Citation
 

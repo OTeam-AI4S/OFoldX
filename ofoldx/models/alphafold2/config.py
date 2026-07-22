@@ -5,6 +5,35 @@ from __future__ import annotations
 from chanfig import Config
 
 
+class AlphaFold2InputEmbeddingsConfig(Config):
+    r"""
+    Input feature embedding config.
+    """
+
+    target_feature_size: int = 22
+    msa_feature_size: int = 49
+    extra_msa_feature_size: int = 25
+    max_relative_feature: int = 32
+
+
+class AlphaFold2MultimerInputEmbeddingsConfig(Config):
+    r"""
+    Chain-relative input feature embedding config.
+
+    ``max_relative_idx`` bounds the within-chain relative position one-hot and
+    ``max_relative_chain`` bounds the cross-chain (asym) relative index. When
+    ``use_chain_relative`` is set the positional encoding also carries a
+    same-entity flag.
+    """
+
+    target_feature_size: int = 21
+    msa_feature_size: int = 49
+    extra_msa_feature_size: int = 25
+    max_relative_idx: int = 32
+    max_relative_chain: int = 2
+    use_chain_relative: bool = True
+
+
 class AlphaFold2PrevPosConfig(Config):
     r"""
     Previous-position distogram recycling bins.
@@ -15,7 +44,17 @@ class AlphaFold2PrevPosConfig(Config):
     num_distogram_bins: int = 15
 
 
-class AlphaFold2MSARowAttentionWithPairBiasConfig(Config):
+class AlphaFold2RecyclingConfig(Config):
+    r"""
+    Recycling feature config.
+    """
+
+    recycle_features: bool = True
+    recycle_pos: bool = True
+    prev_pos: AlphaFold2PrevPosConfig = AlphaFold2PrevPosConfig()
+
+
+class AlphaFold2MsaRowAttentionWithPairBiasConfig(Config):
     num_heads: int = 8
     dropout: float = 0.15
 
@@ -40,7 +79,7 @@ class AlphaFold2OuterProductMeanConfig(Config):
     """
 
     first: bool = False
-    num_outer_channel: int = 32
+    hidden_size: int = 32
 
 
 class AlphaFold2TriangleMultiplicationConfig(Config):
@@ -48,25 +87,7 @@ class AlphaFold2TriangleMultiplicationConfig(Config):
     Triangle multiplicative update config.
     """
 
-    num_intermediate_channel: int = 128
-
-
-class AlphaFold2EvoformerIterationConfig(Config):
-    r"""
-    Module-level settings for one Evoformer iteration.
-
-    The graph uses one shared width/head/dropout specification for the
-    two triangle orientations and one MSA head count for row and column attention.
-    """
-
-    msa_row_attention_with_pair_bias: AlphaFold2MSARowAttentionWithPairBiasConfig = (
-        AlphaFold2MSARowAttentionWithPairBiasConfig()
-    )
-    msa_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig()
-    outer_product_mean: AlphaFold2OuterProductMeanConfig = AlphaFold2OuterProductMeanConfig()
-    triangle_multiplication_outgoing: AlphaFold2TriangleMultiplicationConfig = AlphaFold2TriangleMultiplicationConfig()
-    triangle_attention_starting_node: AlphaFold2TriangleAttentionConfig = AlphaFold2TriangleAttentionConfig()
-    pair_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig()
+    hidden_size: int = 128
 
 
 class AlphaFold2TemplatePairStackConfig(Config):
@@ -74,13 +95,13 @@ class AlphaFold2TemplatePairStackConfig(Config):
     Template pair stack config.
     """
 
-    num_block: int = 2
-    num_channels: int = 64
+    num_layers: int = 2
+    pair_size: int = 64
     triangle_attention_starting_node: AlphaFold2TriangleAttentionConfig = AlphaFold2TriangleAttentionConfig(
         {"value_dim": 16}
     )
     triangle_multiplication_outgoing: AlphaFold2TriangleMultiplicationConfig = AlphaFold2TriangleMultiplicationConfig(
-        {"num_intermediate_channel": 64}
+        {"hidden_size": 64}
     )
     pair_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig({"expansion": 2})
 
@@ -109,25 +130,43 @@ class AlphaFold2TemplateConfig(Config):
     attention: AlphaFold2TemplatePointwiseAttentionConfig = AlphaFold2TemplatePointwiseAttentionConfig()
 
 
-class AlphaFold2InputEmbeddingConfig(Config):
+class AlphaFold2MultimerTemplateConfig(Config):
     r"""
-    Input feature embedding config.
+    Multimer template embedding config.
+
+    The multimer template embedder consumes atom37 template coordinates and emits
+    the pseudo-beta distogram plus a backbone unit-vector; it carries no template
+    torsion-angle MSA row (``embed_torsion_angles`` is therefore ``False``) and
+    always uses the template unit-vector (``use_template_unit_vector`` is ``True``).
     """
 
-    target_feature_size: int = 22
-    msa_feature_size: int = 49
-    extra_msa_feature_size: int = 25
-    max_relative_feature: int = 32
+    enabled: bool = True
+    embed_torsion_angles: bool = False
+    min_distance: float = 3.25
+    max_distance: float = 50.75
+    num_distogram_bins: int = 39
+    vocab_size: int = 22
+    use_template_unit_vector: bool = True
+    template_pair_stack: AlphaFold2TemplatePairStackConfig = AlphaFold2TemplatePairStackConfig()
+    attention: AlphaFold2TemplatePointwiseAttentionConfig = AlphaFold2TemplatePointwiseAttentionConfig()
 
 
-class AlphaFold2RecyclingConfig(Config):
+class AlphaFold2EvoformerBlockConfig(Config):
     r"""
-    Recycling feature config.
+    Module-level settings for one Evoformer block.
+
+    The graph uses one shared width/head/dropout specification for the
+    two triangle orientations and one MSA head count for row and column attention.
     """
 
-    recycle_features: bool = True
-    recycle_pos: bool = True
-    prev_pos: AlphaFold2PrevPosConfig = AlphaFold2PrevPosConfig()
+    msa_row_attention_with_pair_bias: AlphaFold2MsaRowAttentionWithPairBiasConfig = (
+        AlphaFold2MsaRowAttentionWithPairBiasConfig()
+    )
+    msa_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig()
+    outer_product_mean: AlphaFold2OuterProductMeanConfig = AlphaFold2OuterProductMeanConfig()
+    triangle_multiplication_outgoing: AlphaFold2TriangleMultiplicationConfig = AlphaFold2TriangleMultiplicationConfig()
+    triangle_attention_starting_node: AlphaFold2TriangleAttentionConfig = AlphaFold2TriangleAttentionConfig()
+    pair_transition: AlphaFold2TransitionConfig = AlphaFold2TransitionConfig()
 
 
 class AlphaFold2EvoformerConfig(Config):
@@ -136,12 +175,55 @@ class AlphaFold2EvoformerConfig(Config):
     """
 
     num_blocks: int = 48
-    extra_msa_num_blocks: int = 4
+    num_extra_msa_blocks: int = 4
     msa_size: int = 256
     extra_msa_size: int = 64
     pair_size: int = 128
     single_size: int = 384
-    iteration: AlphaFold2EvoformerIterationConfig = AlphaFold2EvoformerIterationConfig()
+    block: AlphaFold2EvoformerBlockConfig = AlphaFold2EvoformerBlockConfig()
+
+
+class AlphaFold2SidechainConfig(Config):
+    r"""
+    Sidechain architecture used by the official structure module.
+    """
+
+    hidden_size: int = 128
+    num_layers: int = 2
+
+
+class AlphaFold2StructureModuleConfig(Config):
+    r"""
+    Official StructureModule config surface.
+
+    The model consumes every field to construct the native PyTorch structure
+    module.
+    """
+
+    dropout: float = 0.1
+    hidden_size: int = 384
+    num_heads: int = 12
+    num_layers: int = 8
+    num_transition_layers: int = 3
+    num_point_qk: int = 4
+    num_point_v: int = 8
+    num_scalar_qk: int = 16
+    num_scalar_v: int = 16
+    position_scale: float = 10.0
+    sidechain: AlphaFold2SidechainConfig = AlphaFold2SidechainConfig()
+
+
+# AlphaFold-Multimer configuration.
+
+
+class AlphaFold2MultimerStructureModuleConfig(AlphaFold2StructureModuleConfig):
+    r"""AF-Multimer structure module surface.
+
+    Identical to the monomer surface except for a backbone translation scale of
+    ``20`` rather than ``10``.
+    """
+
+    position_scale: float = 20.0
 
 
 class AlphaFold2DistogramHeadConfig(Config):
@@ -164,13 +246,30 @@ class AlphaFold2PredictedAlignedErrorHeadConfig(Config):
     num_bins: int = 64
 
 
-class AlphaFold2PredictedLDDTHeadConfig(Config):
+class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
+    r"""
+    Predicted-aligned-error / weighted-pTM head config.
+
+    The multimer TM head is always enabled and additionally produces an interface
+    ipTM branch. ``ranking_score`` is
+    ``iptm_weight * iptm + ptm_weight * ptm``.
+    """
+
+    enabled: bool = True
+    max_error_bin: float = 31.0
+    num_bins: int = 64
+    interface: bool = True
+    ptm_weight: float = 0.2
+    iptm_weight: float = 0.8
+
+
+class AlphaFold2PredictedLddtHeadConfig(Config):
     r"""
     Predicted lDDT confidence head config.
     """
 
     num_bins: int = 50
-    num_channels: int = 128
+    hidden_size: int = 128
 
 
 class AlphaFold2ExperimentallyResolvedHeadConfig(Config):
@@ -181,7 +280,7 @@ class AlphaFold2ExperimentallyResolvedHeadConfig(Config):
     num_atom_types: int = 37
 
 
-class AlphaFold2MaskedMSAHeadConfig(Config):
+class AlphaFold2MaskedMsaHeadConfig(Config):
     r"""
     Masked-MSA reconstruction head config.
     """
@@ -189,34 +288,25 @@ class AlphaFold2MaskedMSAHeadConfig(Config):
     num_output: int = 23
 
 
-class AlphaFold2SidechainConfig(Config):
+class AlphaFold2MultimerMaskedMsaHeadConfig(Config):
     r"""
-    Sidechain architecture used by the official structure module.
+    Masked-MSA reconstruction head config.
+
+    The multimer masked-MSA head emits ``22`` classes rather than the monomer's
+    ``23``.
     """
 
-    num_channel: int = 128
-    num_residual_block: int = 2
+    num_output: int = 22
 
 
-class AlphaFold2StructureModuleHeadConfig(Config):
+class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
     r"""
-    Official StructureModule config surface.
+    Chain center-of-mass head config.
 
-    The model consumes every field to construct the native PyTorch structure
-    module.
+    This head is inference-inert but remains part of the parameterized module set.
     """
 
-    dropout: float = 0.1
-    num_channel: int = 384
-    num_heads: int = 12
-    num_layer: int = 8
-    num_layer_in_transition: int = 3
-    num_point_qk: int = 4
-    num_point_v: int = 8
-    num_scalar_qk: int = 16
-    num_scalar_v: int = 16
-    position_scale: float = 10.0
-    sidechain: AlphaFold2SidechainConfig = AlphaFold2SidechainConfig()
+    enabled: bool = True
 
 
 class AlphaFold2HeadsConfig(Config):
@@ -225,14 +315,30 @@ class AlphaFold2HeadsConfig(Config):
     """
 
     distogram: AlphaFold2DistogramHeadConfig = AlphaFold2DistogramHeadConfig()
-    masked_msa: AlphaFold2MaskedMSAHeadConfig = AlphaFold2MaskedMSAHeadConfig()
+    masked_msa: AlphaFold2MaskedMsaHeadConfig = AlphaFold2MaskedMsaHeadConfig()
     predicted_aligned_error: AlphaFold2PredictedAlignedErrorHeadConfig = AlphaFold2PredictedAlignedErrorHeadConfig()
-    predicted_lddt: AlphaFold2PredictedLDDTHeadConfig = AlphaFold2PredictedLDDTHeadConfig()
-    structure_module: AlphaFold2StructureModuleHeadConfig = AlphaFold2StructureModuleHeadConfig()
+    predicted_lddt: AlphaFold2PredictedLddtHeadConfig = AlphaFold2PredictedLddtHeadConfig()
     experimentally_resolved: AlphaFold2ExperimentallyResolvedHeadConfig = AlphaFold2ExperimentallyResolvedHeadConfig()
 
 
-class AlphaFold2MSAConfig(Config):
+class AlphaFold2MultimerHeadsConfig(Config):
+    r"""
+    Multimer ``model.heads`` config group.
+    """
+
+    distogram: AlphaFold2DistogramHeadConfig = AlphaFold2DistogramHeadConfig()
+    masked_msa: AlphaFold2MultimerMaskedMsaHeadConfig = AlphaFold2MultimerMaskedMsaHeadConfig()
+    predicted_aligned_error: AlphaFold2MultimerPredictedAlignedErrorHeadConfig = (
+        AlphaFold2MultimerPredictedAlignedErrorHeadConfig()
+    )
+    predicted_lddt: AlphaFold2PredictedLddtHeadConfig = AlphaFold2PredictedLddtHeadConfig()
+    experimentally_resolved: AlphaFold2ExperimentallyResolvedHeadConfig = AlphaFold2ExperimentallyResolvedHeadConfig()
+    chain_center_of_mass: AlphaFold2MultimerChainCenterOfMassHeadConfig = (
+        AlphaFold2MultimerChainCenterOfMassHeadConfig()
+    )
+
+
+class AlphaFold2MsaConfig(Config):
     r"""Stochastic MSA realization settings.
 
     The Model realizes MSA features once per representation-ensemble member and
@@ -254,146 +360,7 @@ class AlphaFold2MSAConfig(Config):
     masked_msa_same_prob: float = 0.10
 
 
-class AlphaFold2Config(Config):
-    r"""
-    Configuration for [`AlphaFold2Model`][ofoldx.models.alphafold2.AlphaFold2Model].
-
-    The nested fields expose AF2's executable architectural boundaries.
-    ``num_ensembles`` is model-level because every member repeats the complete
-    embedding and Evoformer trunk before representation averaging.
-    """
-
-    input_embedding: AlphaFold2InputEmbeddingConfig = AlphaFold2InputEmbeddingConfig()
-    recycling: AlphaFold2RecyclingConfig = AlphaFold2RecyclingConfig()
-    evoformer: AlphaFold2EvoformerConfig = AlphaFold2EvoformerConfig()
-    template: AlphaFold2TemplateConfig = AlphaFold2TemplateConfig()
-    heads: AlphaFold2HeadsConfig = AlphaFold2HeadsConfig()
-    msa: AlphaFold2MSAConfig = AlphaFold2MSAConfig()
-
-    recycling_steps: int = 4
-    num_ensembles: int = 1
-
-
-class AlphaFold2ProcessorConfig(Config):
-    r"""Deterministic limits applied while lowering template evidence.
-
-    The Processor lowers the *raw* alignment pool (all rows, query-projected) and
-    the full-MSA HHblits profile; the stochastic sample/mask/cluster/crop limits
-    now live on :class:`AlphaFold2MSAConfig` because the Model owns that draw.
-    """
-
-    max_templates: int = 4
-
-
-# AlphaFold-Multimer configuration.
-
-
-class AlphaFold2MultimerStructureModuleHeadConfig(AlphaFold2StructureModuleHeadConfig):
-    r"""AF-Multimer structure module surface.
-
-    Identical to the monomer surface except for a backbone translation scale of
-    ``20`` rather than ``10``.
-    """
-
-    position_scale: float = 20.0
-
-
-class AlphaFold2MultimerInputEmbeddingConfig(Config):
-    r"""
-    Chain-relative input feature embedding config.
-
-    ``max_relative_idx`` bounds the within-chain relative position one-hot and
-    ``max_relative_chain`` bounds the cross-chain (asym) relative index. When
-    ``use_chain_relative`` is set the positional encoding also carries a
-    same-entity flag.
-    """
-
-    target_feature_size: int = 21
-    msa_feature_size: int = 49
-    extra_msa_feature_size: int = 25
-    max_relative_idx: int = 32
-    max_relative_chain: int = 2
-    use_chain_relative: bool = True
-
-
-class AlphaFold2MultimerTemplateConfig(Config):
-    r"""
-    Multimer template embedding config.
-
-    The multimer template embedder consumes atom37 template coordinates and emits
-    the pseudo-beta distogram plus a backbone unit-vector; it carries no template
-    torsion-angle MSA row (``embed_torsion_angles`` is therefore ``False``) and
-    always uses the template unit-vector (``use_template_unit_vector`` is ``True``).
-    """
-
-    enabled: bool = True
-    embed_torsion_angles: bool = False
-    min_distance: float = 3.25
-    max_distance: float = 50.75
-    num_distogram_bins: int = 39
-    vocab_size: int = 22
-    use_template_unit_vector: bool = True
-    template_pair_stack: AlphaFold2TemplatePairStackConfig = AlphaFold2TemplatePairStackConfig()
-    attention: AlphaFold2TemplatePointwiseAttentionConfig = AlphaFold2TemplatePointwiseAttentionConfig()
-
-
-class AlphaFold2MultimerMaskedMSAHeadConfig(Config):
-    r"""
-    Masked-MSA reconstruction head config.
-
-    The multimer masked-MSA head emits ``22`` classes rather than the monomer's
-    ``23``.
-    """
-
-    num_output: int = 22
-
-
-class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
-    r"""
-    Predicted-aligned-error / weighted-pTM head config.
-
-    The multimer TM head is always enabled and additionally produces an interface
-    ipTM branch. ``ranking_score`` is
-    ``iptm_weight * iptm + ptm_weight * ptm``.
-    """
-
-    enabled: bool = True
-    max_error_bin: float = 31.0
-    num_bins: int = 64
-    interface: bool = True
-    ptm_weight: float = 0.2
-    iptm_weight: float = 0.8
-
-
-class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
-    r"""
-    Chain center-of-mass head config.
-
-    This head is inference-inert but remains part of the parameterized module set.
-    """
-
-    enabled: bool = True
-
-
-class AlphaFold2MultimerHeadsConfig(Config):
-    r"""
-    Multimer ``model.heads`` config group.
-    """
-
-    distogram: AlphaFold2DistogramHeadConfig = AlphaFold2DistogramHeadConfig()
-    masked_msa: AlphaFold2MultimerMaskedMSAHeadConfig = AlphaFold2MultimerMaskedMSAHeadConfig()
-    predicted_aligned_error: AlphaFold2MultimerPredictedAlignedErrorHeadConfig = (
-        AlphaFold2MultimerPredictedAlignedErrorHeadConfig()
-    )
-    predicted_lddt: AlphaFold2PredictedLDDTHeadConfig = AlphaFold2PredictedLDDTHeadConfig()
-    structure_module: AlphaFold2MultimerStructureModuleHeadConfig = AlphaFold2MultimerStructureModuleHeadConfig()
-    experimentally_resolved: AlphaFold2ExperimentallyResolvedHeadConfig = AlphaFold2ExperimentallyResolvedHeadConfig()
-    chain_center_of_mass: AlphaFold2MultimerChainCenterOfMassHeadConfig = (
-        AlphaFold2MultimerChainCenterOfMassHeadConfig()
-    )
-
-
-class AlphaFold2MultimerMSAConfig(Config):
+class AlphaFold2MultimerMsaConfig(Config):
     r"""AlphaFold-Multimer stochastic MSA realization settings.
 
     The Model realizes MSA features once per representation-ensemble member and
@@ -417,6 +384,27 @@ class AlphaFold2MultimerMSAConfig(Config):
     masked_msa_same_prob: float = 0.10
 
 
+class AlphaFold2Config(Config):
+    r"""
+    Configuration for [`AlphaFold2Model`][ofoldx.models.alphafold2.AlphaFold2Model].
+
+    The nested fields expose AF2's executable architectural boundaries.
+    ``num_ensembles`` is model-level because every member repeats the complete
+    embedding and Evoformer trunk before representation averaging.
+    """
+
+    input_embeddings: AlphaFold2InputEmbeddingsConfig = AlphaFold2InputEmbeddingsConfig()
+    recycling: AlphaFold2RecyclingConfig = AlphaFold2RecyclingConfig()
+    template: AlphaFold2TemplateConfig = AlphaFold2TemplateConfig()
+    evoformer: AlphaFold2EvoformerConfig = AlphaFold2EvoformerConfig()
+    structure_module: AlphaFold2StructureModuleConfig = AlphaFold2StructureModuleConfig()
+    heads: AlphaFold2HeadsConfig = AlphaFold2HeadsConfig()
+    msa: AlphaFold2MsaConfig = AlphaFold2MsaConfig()
+
+    recycling_steps: int = 4
+    num_ensembles: int = 1
+
+
 class AlphaFold2MultimerConfig(Config):
     r"""
     Configuration for
@@ -428,19 +416,29 @@ class AlphaFold2MultimerConfig(Config):
     embedding and Evoformer trunk before representation averaging.
     """
 
-    input_embedding: AlphaFold2MultimerInputEmbeddingConfig = AlphaFold2MultimerInputEmbeddingConfig()
+    input_embeddings: AlphaFold2MultimerInputEmbeddingsConfig = AlphaFold2MultimerInputEmbeddingsConfig()
     recycling: AlphaFold2RecyclingConfig = AlphaFold2RecyclingConfig()
     # AF-Multimer applies outer-product mean before the other Evoformer updates;
     # the monomer configuration applies it last.
-    evoformer: AlphaFold2EvoformerConfig = AlphaFold2EvoformerConfig(
-        {"iteration": {"outer_product_mean": {"first": True}}}
-    )
+    evoformer: AlphaFold2EvoformerConfig = AlphaFold2EvoformerConfig({"block": {"outer_product_mean": {"first": True}}})
     template: AlphaFold2MultimerTemplateConfig = AlphaFold2MultimerTemplateConfig()
+    structure_module: AlphaFold2MultimerStructureModuleConfig = AlphaFold2MultimerStructureModuleConfig()
     heads: AlphaFold2MultimerHeadsConfig = AlphaFold2MultimerHeadsConfig()
-    msa: AlphaFold2MultimerMSAConfig = AlphaFold2MultimerMSAConfig()
+    msa: AlphaFold2MultimerMsaConfig = AlphaFold2MultimerMsaConfig()
 
     recycling_steps: int = 21
     num_ensembles: int = 1
+
+
+class AlphaFold2ProcessorConfig(Config):
+    r"""Deterministic limits applied while lowering template evidence.
+
+    The Processor lowers the *raw* alignment pool (all rows, query-projected) and
+    the full-MSA HHblits profile; the stochastic sample/mask/cluster/crop limits
+    now live on :class:`AlphaFold2MsaConfig` because the Model owns that draw.
+    """
+
+    max_templates: int = 4
 
 
 class AlphaFold2MultimerProcessorConfig(Config):

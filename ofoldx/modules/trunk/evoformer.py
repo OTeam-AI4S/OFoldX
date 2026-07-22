@@ -3,8 +3,8 @@ AlphaFold 2 style Evoformer blocks.
 
 This module owns OFoldX's canonical Evoformer implementation. The block order and
 parameter-bearing submodule boundaries follow the official AlphaFold 2
-``EvoformerIteration`` closely enough for AF2 checkpoints to load through a thin
-architecture-specific alias layer.
+``EvoformerIteration`` closely enough for the architecture-specific converter to
+load AF2 checkpoints directly.
 """
 
 from __future__ import annotations
@@ -387,7 +387,7 @@ class GlobalAttentionProjection(nn.Module):
 
 class EvoformerTransition(nn.Module):
     r"""
-    AF2 transition block.
+    AF2 transition module.
     """
 
     def __init__(self, hidden_size: int, *, expansion: int) -> None:

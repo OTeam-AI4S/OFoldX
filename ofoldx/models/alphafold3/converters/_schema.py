@@ -47,8 +47,8 @@ def resolve(model_key: str) -> AF3Node | None:
     before it consults this schema).
     """
 
-    if model_key.startswith("input_embedder.atom_encoder."):
-        return AF3Node("atom_encoder", "input", model_key.removeprefix("input_embedder.atom_encoder."), None)
+    if model_key.startswith("input_embeddings.atom_encoder."):
+        return AF3Node("atom_encoder", "input", model_key.removeprefix("input_embeddings.atom_encoder."), None)
     if model_key.startswith("pairformer_stack."):
         match = _PAIRFORMER_BLOCK.fullmatch(model_key.removeprefix("pairformer_stack."))
         if match is not None:

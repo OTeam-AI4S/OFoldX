@@ -107,7 +107,7 @@ Please contact the authors of the [AlphaFold 3 paper](https://doi.org/10.1038/s4
 
 ## Numerical epsilon note
 
-- **Confidence normalization eps** is per-family and **upstream-faithful — keep, do not unify.** AF3 uses `1e-8` for the pTM per-alignment normalization (`model.py:976,1046,1144`) and `1e-6` for the contact-weighted PAE rank metric (`model.py:1232`), both faithful to DeepMind `confidences.py`. AF3 and Protenix already agree at `1e-8` on the pTM reduction; Boltz's `1e-5` is the outlier. A shared confidence-eps constant would regress whichever family it does not match. See `EPSILON_ANALYSIS.md`.
+- **Confidence normalization** is family-local. `alphafold3_predicted_tm_score` divides by the valid-pair count plus `torch.finfo(mask.dtype).tiny`; the contact-weighted PAE rank metric uses `AlphaFold3Config.rank_metric_eps` (`1e-6` by default). These are separate numerical contracts and should not share one epsilon.
 
 ## License
 

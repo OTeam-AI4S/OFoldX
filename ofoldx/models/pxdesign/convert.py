@@ -3,19 +3,22 @@ r"""Strict translation of the official PxDesign v0.1 checkpoint."""
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 import chanfig
 import torch
 from torch import Tensor, nn
 
 from ...artifacts import save_model
-from .. import _protenix_conversion
 from .config import PxDesignConfig
 from .model import PxDesignModel
+
+_ReferenceKey: TypeAlias = str | tuple[str, ...]
+_ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
 
 _DTYPES = {
     "float32": torch.float32,
@@ -35,7 +38,7 @@ def translate_pxdesign_state(
     if dtype is not None and not dtype.is_floating_point:
         raise TypeError("dtype must be a floating-point torch dtype")
     reference_state = _extract_reference_state(checkpoint_or_state_dict)
-    converted = _protenix_conversion.translate_reference_state(model, reference_state, _pxdesign_reference_key)
+    converted = _translate_reference_state(model, reference_state, _pxdesign_reference_key)
 
     expected_reference_keys: set[str] = set()
     for model_key in model.state_dict():
@@ -90,7 +93,7 @@ def save_pxdesign_checkpoint(
     has no generic standard task, so a
     ``pipeline.json = {"pipeline": "ofoldx.pxdesign"}`` marker is written to route
     ``pipeline("design", model=dir)`` to :class:`PxDesignPipeline` — which returns the
-    coordinate-producing ``PxDesignResult`` — rather than the generic standard ``design`` route.
+    coordinate-producing ``PxDesignDesignResult`` — rather than the generic standard ``design`` route.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
@@ -106,7 +109,7 @@ def save_pxdesign_checkpoint(
     save_model(destination, model=model, processor=PxDesignProcessor())
     chanfig.NestedDict({"pipeline": PIPELINES.id_for(PxDesignPipeline)}).dump(destination / "pipeline.json")
     if repo_id is not None:
-        from ..._repository import upload_repository
+        from ...hub import upload_repository
 
         upload_repository(destination, repo_id, token=token, private=private)
 
@@ -147,18 +150,18 @@ def _extract_reference_state(checkpoint_or_state_dict: Mapping[str, Any]) -> dic
     return normalized
 
 
-def _pxdesign_reference_key(model_key: str) -> str | tuple[str, ...]:
-    if model_key.startswith("condition_embedder.input_map."):
+def _pxdesign_reference_key(model_key: str) -> _ReferenceKey:
+    if model_key.startswith("condition_embeddings.input_map."):
         return "design_condition_embedder.input_embedder.input_map." + model_key.removeprefix(
-            "condition_embedder.input_map."
+            "condition_embeddings.input_map."
         )
-    if model_key.startswith("condition_embedder.template_embedder.embedding."):
+    if model_key.startswith("condition_embeddings.template_embeddings.embedding."):
         return "design_condition_embedder.condition_template_embedder.embedder." + model_key.removeprefix(
-            "condition_embedder.template_embedder.embedding."
+            "condition_embeddings.template_embeddings.embedding."
         )
-    if model_key.startswith("condition_embedder.atom_encoder."):
-        reference_key = _protenix_conversion.reference_key(
-            "input_embedder.atom_encoder." + model_key.removeprefix("condition_embedder.atom_encoder.")
+    if model_key.startswith("condition_embeddings.atom_encoder."):
+        reference_key = _reference_key(
+            "input_embeddings.atom_encoder." + model_key.removeprefix("condition_embeddings.atom_encoder.")
         )
         source = "input_embedder.atom_attention_encoder."
         target = "design_condition_embedder.input_embedder.atom_attention_encoder."
@@ -166,8 +169,265 @@ def _pxdesign_reference_key(model_key: str) -> str | tuple[str, ...]:
             return tuple(target + key[len(source) :] if key.startswith(source) else key for key in reference_key)
         return target + reference_key[len(source) :] if reference_key.startswith(source) else reference_key
     if model_key.startswith("coordinate_denoiser."):
-        return _protenix_conversion.reference_key(model_key)
+        return _reference_key(model_key)
     return model_key
+
+
+def _reference_key(model_key: str) -> _ReferenceKey:
+    r"""Return the released PxDesign checkpoint key for an OFoldX model key."""
+
+    key = _replace_top_level(model_key)
+    key = _replace_token_stack_key(key)
+    key = _replace_denoiser_key(key)
+    key = _replace_atom_stack_key(key)
+    key = _replace_atom_key(key)
+    key = _replace_attention_key(key)
+    key = _replace_attention_projection_key(key)
+    key = _replace_transition_key(key)
+    return _replace_conditioned_norm_key(key)
+
+
+def _lookup_reference_value(reference_state: Mapping[str, Tensor], reference_key: _ReferenceKey) -> _ReferenceValue:
+    r"""Read the source tensor or tensors named by one target key."""
+
+    if isinstance(reference_key, tuple):
+        return tuple(reference_state[key] for key in reference_key)
+    return reference_state[reference_key]
+
+
+def _transform_reference_value(model_key: str, reference_value: _ReferenceValue) -> Tensor:
+    r"""Apply tensor transforms required by the released PxDesign format."""
+
+    if isinstance(reference_value, tuple):
+        if model_key.endswith(".conditioning_projection.weight"):
+            return torch.cat(reference_value, dim=0)
+        raise RuntimeError(f"unexpected multi-tensor reference mapping for {model_key}")
+
+    if model_key.endswith(".noise_embedding.projection.weight") and reference_value.dim() == 1:
+        return reference_value.unsqueeze(-1)
+    return reference_value
+
+
+def _translate_reference_state(
+    model: nn.Module,
+    reference_state: Mapping[str, Tensor],
+    key_fn: Callable[[str], _ReferenceKey],
+) -> dict[str, Tensor]:
+    r"""Translate source names and values for one target state dict."""
+
+    translated = {}
+    for model_key in model.state_dict():
+        reference_key = key_fn(model_key)
+        reference_value = _lookup_reference_value(reference_state, reference_key)
+        translated[model_key] = _transform_reference_value(model_key, reference_value)
+    return translated
+
+
+def _remap_token_transformer_blocks(key: str) -> str:
+    r"""Map a consolidated token transformer onto Protenix block names."""
+
+    rules = [
+        (r"\.pair_norms\.(\d+)\.", r".blocks.\1.attention_pair_bias.layernorm_z."),
+        (r"\.bias_projections\.(\d+)\.", r".blocks.\1.attention_pair_bias.linear_nobias_z."),
+        (r"\.transformer\.blocks\.(\d+)\.transition\.", r".blocks.\1.conditioned_transition_block."),
+        (r"\.transformer\.blocks\.(\d+)\.conditioned_norm\.", r".blocks.\1.attention_pair_bias.layernorm_a."),
+        (r"\.transformer\.blocks\.(\d+)\.attention\.", r".blocks.\1.attention_pair_bias.attention."),
+        (
+            r"\.transformer\.blocks\.(\d+)\.output_gate_projection\.",
+            r".blocks.\1.attention_pair_bias.linear_a_last.",
+        ),
+    ]
+    for pattern, replacement in rules:
+        key = re.sub(pattern, replacement, key)
+    return key
+
+
+def _replace_top_level(key: str) -> str:
+    replacements = {
+        "input_embeddings.atom_encoder": "input_embedder.atom_attention_encoder",
+        "coordinate_denoiser": "diffusion_module",
+    }
+    for source, target in replacements.items():
+        if key == source or key.startswith(source + "."):
+            return target + key[len(source) :]
+    return key
+
+
+def _replace_token_stack_key(key: str) -> str:
+    if ".token_encoder." not in key:
+        return key
+    key = key.replace(".token_refiner.token_encoder.", ".diffusion_transformer.")
+    return _remap_token_transformer_blocks(key)
+
+
+def _replace_denoiser_key(key: str) -> str:
+    if not key.startswith("diffusion_module."):
+        return key
+    return _replace_many(
+        key,
+        {
+            ".conditioner.relative_position_embedder.": ".diffusion_conditioning.relpe.",
+            ".diffusion_conditioning.relpe.output_projection.": ".diffusion_conditioning.relpe.linear_no_bias.",
+            ".conditioner.pair_input_norm.": ".diffusion_conditioning.layernorm_z.",
+            ".conditioner.pair_projection.": ".diffusion_conditioning.linear_no_bias_z.",
+            ".conditioner.pair_feed_forward_1.": ".diffusion_conditioning.transition_z1.",
+            ".conditioner.pair_feed_forward_2.": ".diffusion_conditioning.transition_z2.",
+            ".conditioner.single_conditioning_norm.": ".diffusion_conditioning.layernorm_s.",
+            ".conditioner.single_conditioning_projection.": ".diffusion_conditioning.linear_no_bias_s.",
+            ".conditioner.noise_embedding.projection.weight": ".diffusion_conditioning.fourier_embedding.w",
+            ".conditioner.noise_embedding.projection.bias": ".diffusion_conditioning.fourier_embedding.b",
+            ".conditioner.noise_norm.": ".diffusion_conditioning.layernorm_n.",
+            ".conditioner.noise_projection.": ".diffusion_conditioning.linear_no_bias_n.",
+            ".conditioner.single_feed_forward_1.": ".diffusion_conditioning.transition_s1.",
+            ".conditioner.single_feed_forward_2.": ".diffusion_conditioning.transition_s2.",
+            ".atom_encoder.": ".atom_attention_encoder.",
+            ".token_refiner.single_norm.": ".layernorm_s.",
+            ".token_refiner.single_to_token_projection.": ".linear_no_bias_s.",
+            ".token_refiner.token_encoder.": ".diffusion_transformer.",
+            ".token_refiner.token_norm.": ".layernorm_a.",
+            ".atom_decoder.": ".atom_attention_decoder.",
+        },
+    )
+
+
+def _replace_atom_stack_key(key: str) -> str:
+    if ".atom_attention_stack." not in key:
+        return key
+    block = r".atom_transformer.diffusion_transformer.blocks.\1"
+    source_block = r"\.atom_attention_stack\.atom_attention\.transformer\.blocks\.(\d+)\."
+    rules = [
+        (r"\.atom_attention_stack\.pair_norms\.(\d+)\.", block + r".attention_pair_bias.layernorm_z."),
+        (
+            r"\.atom_attention_stack\.bias_projections\.(\d+)\.",
+            block + r".attention_pair_bias.linear_nobias_z.",
+        ),
+        (source_block + r"transition\.", block + r".conditioned_transition_block."),
+        (source_block + r"conditioned_norm\.", block + r".attention_pair_bias.layernorm_a."),
+        (source_block + r"key_value_norm\.", block + r".attention_pair_bias.layernorm_kv."),
+        (source_block + r"attention\.", block + r".attention_pair_bias.attention."),
+        (source_block + r"output_gate_projection\.", block + r".attention_pair_bias.linear_a_last."),
+    ]
+    for pattern, replacement in rules:
+        key = re.sub(pattern, replacement, key)
+    return key
+
+
+def _replace_atom_key(key: str) -> str:
+    return _replace_many(
+        key,
+        {
+            ".atom_conditioner.reference_position_projection.": ".linear_no_bias_ref_pos.",
+            ".atom_conditioner.reference_charge_projection.": ".linear_no_bias_ref_charge.",
+            ".atom_conditioner.atom_feature_projection.": ".linear_no_bias_f.",
+            ".atom_pair_encoder.distance_vector_projection.": ".linear_no_bias_d.",
+            ".atom_pair_encoder.inverse_distance_projection.": ".linear_no_bias_invd.",
+            ".atom_pair_encoder.distance_mask_projection.": ".linear_no_bias_v.",
+            ".atom_pair_encoder.left_atom_projection.": ".linear_no_bias_cl.",
+            ".atom_pair_encoder.right_atom_projection.": ".linear_no_bias_cm.",
+            ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
+            ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
+            ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
+            ".atom_attention_stack.": ".atom_transformer.diffusion_transformer.",
+            ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
+            ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",
+            ".single_norm.": ".layernorm_s.",
+            ".single_to_atom_projection.": ".linear_no_bias_s.",
+            ".atom_attention_encoder.norm_pair.": ".atom_attention_encoder.layernorm_z.",
+            ".pair_projection.": ".linear_no_bias_z.",
+            ".noisy_position_projection.": ".linear_no_bias_r.",
+            ".atom_attention_decoder.output_projection.": ".atom_attention_decoder.linear_no_bias_out.",
+            ".atom_attention_decoder.query_norm.": ".atom_attention_decoder.layernorm_q.",
+        },
+    )
+
+
+def _replace_attention_key(key: str) -> str:
+    return _replace_many(
+        key,
+        {
+            ".pair_attention.": ".attention_pair_bias.",
+            ".hidden_norm.": ".layernorm_a.",
+            ".atom_norm.": ".layernorm_a.",
+            ".key_value_norm.": ".layernorm_kv.",
+            ".attention_pair_bias.norm_pair.": ".attention_pair_bias.layernorm_z.",
+            ".attention_pair_bias.bias_projection.": ".attention_pair_bias.linear_nobias_z.",
+            ".attention_pair_bias.conditioning_gate_projection.": ".attention_pair_bias.linear_a_last.",
+        },
+    )
+
+
+def _replace_attention_projection_key(key: str) -> str:
+    return _replace_many(
+        key,
+        {
+            "relative_position_encoding.output_projection.": "relative_position_encoding.linear_no_bias.",
+            ".diffusion_conditioning.relpe.output_projection.": ".diffusion_conditioning.relpe.linear_no_bias.",
+            ".fourier_embedding.frequency": ".fourier_embedding.w",
+            ".fourier_embedding.phase": ".fourier_embedding.b",
+            ".attention.projection.query_projection.": ".attention.linear_q.",
+            ".attention.projection.key_projection.": ".attention.linear_k.",
+            ".attention.projection.value_projection.": ".attention.linear_v.",
+            ".attention.projection.output_projection.": ".attention.linear_o.",
+            ".attention.projection.gate_projection.": ".attention.linear_g.",
+            ".mha.query_projection.": ".mha.linear_q.",
+            ".mha.key_projection.": ".mha.linear_k.",
+            ".mha.value_projection.": ".mha.linear_v.",
+            ".mha.output_projection.": ".mha.linear_o.",
+            ".mha.gate_projection.": ".mha.linear_g.",
+            ".relative_position_encoding.output_projection.": ".relative_position_encoding.linear_no_bias.",
+        },
+    )
+
+
+def _replace_transition_key(key: str) -> str:
+    return _replace_many(
+        key,
+        {
+            ".norm_input.": ".layernorm1.",
+            ".conditioned_norm.": ".adaln.",
+            ".feed_forward.": ".conditioned_transition_block.",
+            ".conditioned_transition_block.gate_projection.": ".conditioned_transition_block.linear_nobias_a1.",
+            ".conditioned_transition_block.value_projection.": ".conditioned_transition_block.linear_nobias_a2.",
+            ".conditioned_transition_block.output_projection.": ".conditioned_transition_block.linear_nobias_b.",
+            ".conditioned_transition_block.conditioning_gate_projection.": ".conditioned_transition_block.linear_s.",
+            ".transition_z1.gate_projection.": ".transition_z1.linear_no_bias_a.",
+            ".transition_z1.value_projection.": ".transition_z1.linear_no_bias_b.",
+            ".transition_z1.output_projection.": ".transition_z1.linear_no_bias.",
+            ".transition_z2.gate_projection.": ".transition_z2.linear_no_bias_a.",
+            ".transition_z2.value_projection.": ".transition_z2.linear_no_bias_b.",
+            ".transition_z2.output_projection.": ".transition_z2.linear_no_bias.",
+            ".transition_s1.gate_projection.": ".transition_s1.linear_no_bias_a.",
+            ".transition_s1.value_projection.": ".transition_s1.linear_no_bias_b.",
+            ".transition_s1.output_projection.": ".transition_s1.linear_no_bias.",
+            ".transition_s2.gate_projection.": ".transition_s2.linear_no_bias_a.",
+            ".transition_s2.value_projection.": ".transition_s2.linear_no_bias_b.",
+            ".transition_s2.output_projection.": ".transition_s2.linear_no_bias.",
+        },
+    )
+
+
+def _replace_conditioned_norm_key(key: str) -> _ReferenceKey:
+    if key.endswith(".conditioning_projection.weight"):
+        base = key[: -len("conditioning_projection.weight")]
+        return (base + "linear_s.weight", base + "linear_nobias_s.weight")
+    if key.endswith(".conditioning_scale_bias"):
+        base = key[: -len("conditioning_scale_bias")]
+        return base + "linear_s.bias"
+    return _replace_many(
+        key,
+        {
+            ".hidden_norm.": ".layernorm_a.",
+            ".conditioning_norm.": ".layernorm_s.",
+            ".gate_projection.": ".linear_s.",
+            ".shift_projection.": ".linear_nobias_s.",
+        },
+    )
+
+
+def _replace_many(key: str, replacements: Mapping[str, str]) -> str:
+    for source, target in replacements.items():
+        key = key.replace(source, target)
+    return key
 
 
 if __name__ == "__main__":

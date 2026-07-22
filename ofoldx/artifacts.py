@@ -119,7 +119,7 @@ def save_model(
         raise RuntimeError("safetensors elided model state-dict keys; the repository cannot be round-tripped")
 
     if repo_id is not None:
-        from ._repository import upload_repository
+        from .hub import upload_repository
 
         upload_repository(
             destination,

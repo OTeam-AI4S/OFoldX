@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
+from .model import ProteinMpnnModel
 
 # The first edge-embedding Linear (``features.edge_embedding``) consumes a
 # 167-dim edge feature in the Cα graph
@@ -19,6 +20,49 @@ from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
 # Membrane checkpoints keep a live ``W_v``, so ``W_v`` presence does not identify
 # a Cα checkpoint; the 167-wide edge input does.
 CA_EDGE_INPUT_WIDTH = 167
+
+
+def convert_proteinmpnn_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""Convert one released ProteinMPNN checkpoint and save its paired Pipeline.
+
+    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
+    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
+    and nothing is published without an explicit ``repo_id``.
+    """
+
+    from .pipeline import ProteinMpnnPipeline
+    from .processor import ProteinMpnnProcessor
+
+    checkpoint = torch.load(
+        Path(checkpoint_path).expanduser(),
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    state_dict = checkpoint["model_state_dict"]
+    config = ProteinMpnnConfig(
+        hidden_size=state_dict["W_s.weight"].shape[1],
+        num_encoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
+        num_decoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
+        num_neighbors=checkpoint["num_edges"],
+        ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
+    )
+    model = ProteinMpnnModel(config)
+    model.load_state_dict(convert_proteinmpnn_state_dict(state_dict), strict=True, assign=True)
+    processor = ProteinMpnnProcessor(ProteinMpnnProcessorConfig(ca_only=config.ca_only))
+    ProteinMpnnPipeline(model=model, processor=processor).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
 
 
 def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
@@ -105,50 +149,6 @@ def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str
                 raise KeyError(f"unrecognized ProteinMPNN checkpoint tensor: {key}")
         converted[target] = value
     return converted
-
-
-def convert_proteinmpnn_checkpoint(
-    checkpoint_path: str | PathLike[str],
-    output_dir: str | PathLike[str],
-    *,
-    repo_id: str | None = None,
-    token: str | None = None,
-    private: bool = False,
-) -> None:
-    r"""Convert one released ProteinMPNN checkpoint and save its paired Pipeline.
-
-    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
-    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
-    and nothing is published without an explicit ``repo_id``.
-    """
-
-    from .model import ProteinMpnnModel
-    from .pipeline import ProteinMpnnPipeline
-    from .processor import ProteinMpnnProcessor
-
-    checkpoint = torch.load(
-        Path(checkpoint_path).expanduser(),
-        map_location="cpu",
-        weights_only=True,
-        mmap=True,
-    )
-    state_dict = checkpoint["model_state_dict"]
-    config = ProteinMpnnConfig(
-        hidden_size=state_dict["W_s.weight"].shape[1],
-        num_encoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
-        num_decoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
-        num_neighbors=checkpoint["num_edges"],
-        ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
-    )
-    model = ProteinMpnnModel(config)
-    model.load_state_dict(convert_proteinmpnn_state_dict(state_dict), strict=True, assign=True)
-    processor = ProteinMpnnProcessor(ProteinMpnnProcessorConfig(ca_only=config.ca_only))
-    ProteinMpnnPipeline(model=model, processor=processor).save(
-        output_dir,
-        repo_id=repo_id,
-        token=token,
-        private=private,
-    )
 
 
 def main(argv: list[str] | None = None) -> None:

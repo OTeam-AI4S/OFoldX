@@ -11,16 +11,53 @@ import torch
 from torch import Tensor
 
 from .config import NaMpnnConfig
+from .model import NaMpnnModel
 
 # NA-MPNN uses a fixed 32-neighbor residue graph; the value is not stored in the
 # released state dict, so conversion pins it directly.
 _K_NEIGHBORS = 32
 
+_ENCODER_SUBLAYERS = {
+    "norm1.weight": "node_norm.weight",
+    "norm1.bias": "node_norm.bias",
+    "norm2.weight": "feed_forward_norm.weight",
+    "norm2.bias": "feed_forward_norm.bias",
+    "norm3.weight": "edge_norm.weight",
+    "norm3.bias": "edge_norm.bias",
+    "W1.weight": "node_message.input.weight",
+    "W1.bias": "node_message.input.bias",
+    "W2.weight": "node_message.middle.weight",
+    "W2.bias": "node_message.middle.bias",
+    "W3.weight": "node_message.output.weight",
+    "W3.bias": "node_message.output.bias",
+    "W11.weight": "edge_message.input.weight",
+    "W11.bias": "edge_message.input.bias",
+    "W12.weight": "edge_message.middle.weight",
+    "W12.bias": "edge_message.middle.bias",
+    "W13.weight": "edge_message.output.weight",
+    "W13.bias": "edge_message.output.bias",
+    "dense.W_in.weight": "feed_forward.input.weight",
+    "dense.W_in.bias": "feed_forward.input.bias",
+    "dense.W_out.weight": "feed_forward.output.weight",
+    "dense.W_out.bias": "feed_forward.output.bias",
+}
 
-def convert_nampnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    r"""Translate every released NA-MPNN tensor name to its native OFoldX name."""
-
-    return {_convert_key(key): value for key, value in state_dict.items()}
+_DECODER_SUBLAYERS = {
+    "norm1.weight": "message_norm.weight",
+    "norm1.bias": "message_norm.bias",
+    "norm2.weight": "feed_forward_norm.weight",
+    "norm2.bias": "feed_forward_norm.bias",
+    "W1.weight": "message.input.weight",
+    "W1.bias": "message.input.bias",
+    "W2.weight": "message.middle.weight",
+    "W2.bias": "message.middle.bias",
+    "W3.weight": "message.output.weight",
+    "W3.bias": "message.output.bias",
+    "dense.W_in.weight": "feed_forward.input.weight",
+    "dense.W_in.bias": "feed_forward.input.bias",
+    "dense.W_out.weight": "feed_forward.output.weight",
+    "dense.W_out.bias": "feed_forward.output.bias",
+}
 
 
 def convert_nampnn_checkpoint(
@@ -38,7 +75,6 @@ def convert_nampnn_checkpoint(
     and nothing is published without an explicit ``repo_id``.
     """
 
-    from .model import NaMpnnModel
     from .pipeline import NaMpnnPipeline
     from .processor import NaMpnnProcessor
 
@@ -65,6 +101,12 @@ def convert_nampnn_checkpoint(
         token=token,
         private=private,
     )
+
+
+def convert_nampnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    r"""Translate every released NA-MPNN tensor name to its native OFoldX name."""
+
+    return {_convert_key(key): value for key, value in state_dict.items()}
 
 
 def _convert_key(key: str) -> str:
@@ -96,48 +138,6 @@ def _convert_key(key: str) -> str:
         layer, _, sublayer = key.removeprefix("decoder_layers.").partition(".")
         return f"decoder_layers.{layer}.{_DECODER_SUBLAYERS[sublayer]}"
     raise KeyError(f"unrecognized NA-MPNN checkpoint tensor: {key}")
-
-
-_ENCODER_SUBLAYERS = {
-    "norm1.weight": "node_norm.weight",
-    "norm1.bias": "node_norm.bias",
-    "norm2.weight": "feed_forward_norm.weight",
-    "norm2.bias": "feed_forward_norm.bias",
-    "norm3.weight": "edge_norm.weight",
-    "norm3.bias": "edge_norm.bias",
-    "W1.weight": "node_message.input.weight",
-    "W1.bias": "node_message.input.bias",
-    "W2.weight": "node_message.middle.weight",
-    "W2.bias": "node_message.middle.bias",
-    "W3.weight": "node_message.output.weight",
-    "W3.bias": "node_message.output.bias",
-    "W11.weight": "edge_message.input.weight",
-    "W11.bias": "edge_message.input.bias",
-    "W12.weight": "edge_message.middle.weight",
-    "W12.bias": "edge_message.middle.bias",
-    "W13.weight": "edge_message.output.weight",
-    "W13.bias": "edge_message.output.bias",
-    "dense.W_in.weight": "feed_forward.input.weight",
-    "dense.W_in.bias": "feed_forward.input.bias",
-    "dense.W_out.weight": "feed_forward.output.weight",
-    "dense.W_out.bias": "feed_forward.output.bias",
-}
-_DECODER_SUBLAYERS = {
-    "norm1.weight": "message_norm.weight",
-    "norm1.bias": "message_norm.bias",
-    "norm2.weight": "feed_forward_norm.weight",
-    "norm2.bias": "feed_forward_norm.bias",
-    "W1.weight": "message.input.weight",
-    "W1.bias": "message.input.bias",
-    "W2.weight": "message.middle.weight",
-    "W2.bias": "message.middle.bias",
-    "W3.weight": "message.output.weight",
-    "W3.bias": "message.output.bias",
-    "dense.W_in.weight": "feed_forward.input.weight",
-    "dense.W_in.bias": "feed_forward.input.bias",
-    "dense.W_out.weight": "feed_forward.output.weight",
-    "dense.W_out.bias": "feed_forward.output.bias",
-}
 
 
 def main(argv: list[str] | None = None) -> None:

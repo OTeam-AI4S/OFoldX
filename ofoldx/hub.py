@@ -1,4 +1,4 @@
-r"""OFoldX model-repository resolution and loading.
+r"""Hugging Face Hub repository resolution, publication, and loading.
 
 The Hugging Face Hub supplies snapshots and safetensors mechanics. OFoldX owns the
 repository schema, architecture dispatch, Model/Processor pairing, and construction.
@@ -14,8 +14,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple, NoReturn, cast
 
 import torch
-from torch import nn
 
+from .model import Model
 from .models.registry import (
     MODELS,
     ModelRegistration,
@@ -235,7 +235,7 @@ def load_model(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     token: str | None = None,
-) -> nn.Module:
+) -> Model:
     registration, values = model_values(repository.path)
     return load_registered_model(
         hydrate_weights(repository, token=token),
@@ -253,7 +253,7 @@ def load_registered_model(
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> nn.Module:
+) -> Model:
     from safetensors.torch import load_file
 
     single_path = repository.path / "model.safetensors"

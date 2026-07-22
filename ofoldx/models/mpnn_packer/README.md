@@ -42,7 +42,7 @@ reports remain local.
 lowers backbone N/CA/C/O coordinates, the residue sequence tokens to pack, residue
 and chain indices, observed atom37 coordinates, and the nearest 16 non-protein heavy
 atoms as atomic context. A target `sequence` (string, or a per-chain mapping) may
-replace the observed identities before packing, and `positions` restricts packing to
+replace the observed identities before packing, and `pack_positions` restricts packing to
 selected `ComponentReference` residues. `use_atom_context` toggles the ligand
 context and `filter_by_occupancy` drops unoccupied observed atoms.
 

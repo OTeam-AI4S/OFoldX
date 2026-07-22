@@ -45,14 +45,14 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         r"""Lower one input and run released Protenix folding."""
 
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(
+        model_input = self.processor(
             input,
             msa=msa,
             templates=templates,
             generator=generator,
         )
         return self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,
@@ -87,7 +87,7 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         """
 
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(
+        model_input = self.processor(
             input,
             atom_contacts=atom_contacts,
             token_contacts=token_contacts,
@@ -97,7 +97,7 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             generator=generator,
         )
         return self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,

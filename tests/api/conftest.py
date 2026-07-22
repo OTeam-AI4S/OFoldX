@@ -16,9 +16,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import chanfig
 import pytest
 import torch
 from torch import nn
+
+from ofoldx import Model
 
 
 @pytest.fixture(autouse=True)
@@ -47,11 +50,8 @@ def _isolate_registries():
 def _build_tiny_classes():
     r"""Create a fresh, uniquely-typed synthetic Model/Processor/Config triple."""
 
-    class TinyConfig(dict):
+    class TinyConfig(chanfig.Config):
         r"""A config that is just its own mapping of values."""
-
-        def __init__(self, values=None):
-            super().__init__(values or {})
 
     class TinyProcessor:
         r"""A config-less Processor that yields a one-tensor carrier."""
@@ -70,14 +70,15 @@ def _build_tiny_classes():
             self.dtype = dtype
             return self
 
-    class TinyModel(nn.Module):
+    class TinyModel(Model):
         r"""A one-parameter Model whose task methods record what the Pipeline forwarded."""
 
         config_class = TinyConfig
+        config: TinyConfig
 
         def __init__(self, config):
-            super().__init__()
-            self.config = TinyConfig(dict(config))
+            config = TinyConfig(dict(config))
+            super().__init__(config)
             self.weight = nn.Parameter(torch.zeros(int(self.config.get("dim", 3))))
             self.received = None
 

@@ -13,8 +13,8 @@ import torch
 from torch import Tensor
 
 from ...artifacts import save_model
-from .config import RFdiffusionConfig
-from .model import RFdiffusionModel, rfdiffusion_schedule
+from .config import RfDiffusionConfig
+from .model import RfDiffusionModel, rfdiffusion_schedule
 
 _DTYPES = {
     "float32": torch.float32,
@@ -22,7 +22,7 @@ _DTYPES = {
     "bfloat16": torch.bfloat16,
 }
 
-_NETWORK_RENAMES = {
+_DENOISER_RENAMES = {
     "n_extra_block": "num_extra_blocks",
     "n_main_block": "num_main_blocks",
     "n_ref_block": "num_refinement_blocks",
@@ -37,8 +37,8 @@ _NETWORK_RENAMES = {
     "d_hidden_templ": "template_hidden_size",
     "p_drop": "dropout",
     "freeze_track_motif": "freeze_track_motif",
-    "SE3_param_full": "se3_param_full",
-    "SE3_param_topk": "se3_param_topk",
+    "SE3_param_full": "trunk_se3",
+    "SE3_param_topk": "refinement_se3",
 }
 _DIFFUSER_RENAMES = {
     "T": "num_timesteps",
@@ -61,6 +61,111 @@ _PREPROCESS_RENAMES = {
     "str_self_cond": "structure_self_conditioning",
 }
 
+_DENOISER_ROOT_RENAMES = {
+    "latent_emb": "msa_embeddings",
+    "full_emb": "extra_msa_embeddings",
+    "templ_emb": "template_embeddings",
+    "recycle": "recycling_embeddings",
+    "simulator": "trunk",
+    "c6d_pred": "pairwise_geometry_head",
+    "aa_pred": "masked_token_head",
+    "lddt_pred": "predicted_lddt_head",
+    "exp_pred": "experimentally_resolved_head",
+}
+
+_DENOISER_STRUCTURE_RENAMES = (
+    ("msa_embeddings.pos.emb.", "msa_embeddings.relative_position_embedding.embedding."),
+    ("msa_embeddings.emb_state.", "msa_embeddings.state_embedding."),
+    ("msa_embeddings.emb_right.", "msa_embeddings.right_pair_embedding."),
+    ("msa_embeddings.emb_left.", "msa_embeddings.left_pair_embedding."),
+    ("msa_embeddings.emb_q.", "msa_embeddings.query_embedding."),
+    ("msa_embeddings.emb.", "msa_embeddings.input_projection."),
+    ("extra_msa_embeddings.emb_q.", "extra_msa_embeddings.query_embedding."),
+    ("extra_msa_embeddings.emb.", "extra_msa_embeddings.input_projection."),
+    ("template_embeddings.templ_stack.block.", "template_embeddings.template_pair_stack.blocks."),
+    ("template_embeddings.templ_stack.", "template_embeddings.template_pair_stack."),
+    ("template_embeddings.emb_t1d.", "template_embeddings.single_input_projection."),
+    ("template_embeddings.proj_t1d.", "template_embeddings.single_output_projection."),
+    ("template_embeddings.attn_tor.", "template_embeddings.state_attention."),
+    ("template_embeddings.attn.", "template_embeddings.pair_attention."),
+    ("template_embeddings.emb.", "template_embeddings.pair_projection."),
+    ("recycling_embeddings.proj_dist.", "recycling_embeddings.pair_projection."),
+    ("trunk.proj_state2.", "trunk.state_output_projection."),
+    ("trunk.proj_state.", "trunk.state_input_projection."),
+    ("trunk.extra_block.", "trunk.extra_blocks."),
+    ("trunk.main_block.", "trunk.main_blocks."),
+    ("trunk.str_refiner.", "trunk.refinement_update."),
+    ("pairwise_geometry_head.proj_asymm.", "pairwise_geometry_head.asymmetric_projection."),
+    ("pairwise_geometry_head.proj_symm.", "pairwise_geometry_head.symmetric_projection."),
+    ("masked_token_head.proj.", "masked_token_head.projection."),
+    ("predicted_lddt_head.proj.", "predicted_lddt_head.projection."),
+    ("experimentally_resolved_head.proj.", "experimentally_resolved_head.projection."),
+    (".msa2msa.", ".msa_block."),
+    (".msa2pair.", ".outer_product_mean."),
+    (".pair2pair.", ".pair_block."),
+    (".str2str.", ".structure_update."),
+    (".sc_predictor.", ".torsion_head."),
+    (".se3.se3.", ".structure_module.transformer."),
+)
+
+_DENOISER_LEAF_RENAMES = (
+    (".norm_msa.", ".msa_norm."),
+    (".norm_pair.", ".pair_norm."),
+    (".norm_state.", ".state_norm."),
+    (".norm_bias.", ".bias_norm."),
+    (".proj_pair.", ".pair_projection."),
+    (".proj_state.", ".state_projection."),
+    (".emb_rbf.", ".radial_embedding."),
+    (".proj_rbf.", ".radial_projection."),
+    (".row_attn.", ".row_attention."),
+    (".col_attn.", ".column_attention."),
+    (".seq_weight.", ".sequence_weighting."),
+    (".ff.", ".transition."),
+    (".transition.norm.", ".transition.input_norm."),
+    (".transition.linear1.", ".transition.input_projection."),
+    (".transition.linear2.", ".transition.output_projection."),
+    (".outer_product_mean.norm.", ".outer_product_mean.msa_norm."),
+    (".outer_product_mean.proj_left.", ".outer_product_mean.left_projection."),
+    (".outer_product_mean.proj_right.", ".outer_product_mean.right_projection."),
+    (".outer_product_mean.proj_out.", ".outer_product_mean.output_projection."),
+    (".structure_update.embed_x.", ".structure_update.node_projection."),
+    (".structure_update.norm_node.", ".structure_update.node_norm."),
+    (".structure_update.embed_e1.", ".structure_update.pair_projection."),
+    (".structure_update.norm_edge1.", ".structure_update.pair_edge_norm."),
+    (".structure_update.embed_e2.", ".structure_update.geometry_projection."),
+    (".structure_update.norm_edge2.", ".structure_update.geometry_norm."),
+    (".refinement_update.embed_x.", ".refinement_update.node_projection."),
+    (".refinement_update.norm_node.", ".refinement_update.node_norm."),
+    (".refinement_update.embed_e1.", ".refinement_update.pair_projection."),
+    (".refinement_update.norm_edge1.", ".refinement_update.pair_edge_norm."),
+    (".refinement_update.embed_e2.", ".refinement_update.geometry_projection."),
+    (".refinement_update.norm_edge2.", ".refinement_update.geometry_norm."),
+    (".torsion_head.norm_s0.", ".torsion_head.msa_norm."),
+    (".torsion_head.linear_s0.", ".torsion_head.msa_projection."),
+    (".torsion_head.norm_si.", ".torsion_head.state_norm."),
+    (".torsion_head.linear_si.", ".torsion_head.state_projection."),
+    (".torsion_head.linear_1.", ".torsion_head.first_transition_input."),
+    (".torsion_head.linear_2.", ".torsion_head.first_transition_output."),
+    (".torsion_head.linear_3.", ".torsion_head.second_transition_input."),
+    (".torsion_head.linear_4.", ".torsion_head.second_transition_output."),
+    (".torsion_head.linear_out.", ".torsion_head.output_projection."),
+    (".to_key_value.", ".key_value_projection."),
+    (".to_query.", ".query_projection."),
+    (".to_key.", ".key_projection."),
+    (".to_q.", ".query_projection."),
+    (".to_k.", ".key_projection."),
+    (".to_v.", ".value_projection."),
+    (".to_b.", ".bias_projection."),
+    (".to_g.", ".gate_projection."),
+    (".to_out.", ".output_projection."),
+    (".project.", ".output_projection."),
+    (".conv_in.", ".input_convolutions."),
+    (".conv_out.", ".output_convolutions."),
+    (".radial_func.", ".radial_profile."),
+    (".net.", ".mlp."),
+    (".to_kernel_self.", ".self_interaction_weights."),
+)
+
 
 def load_rfdiffusion_checkpoint(
     checkpoint: str | PathLike[str],
@@ -78,39 +183,63 @@ def load_rfdiffusion_checkpoint(
     return dict(value)
 
 
-def rfdiffusion_config_from_checkpoint(checkpoint: Mapping[str, object]) -> RFdiffusionConfig:
-    r"""Recover only persistent network/diffusion/preprocess architecture."""
+def rfdiffusion_config_from_checkpoint(checkpoint: Mapping[str, object]) -> RfDiffusionConfig:
+    r"""Recover only persistent denoiser/diffusion/preprocess architecture."""
 
     source = cast(Mapping[str, object], checkpoint["config_dict"])
     values = {}
     for source_name, target_name, renames in (
-        ("model", "network", _NETWORK_RENAMES),
+        ("model", "denoiser", _DENOISER_RENAMES),
         ("diffuser", "diffuser", _DIFFUSER_RENAMES),
         ("preprocess", "preprocess", _PREPROCESS_RENAMES),
     ):
         group = cast(Mapping[str, object], source[source_name])
         normalized = {target: group[key] for key, target in renames.items()}
-        if target_name == "network":
-            for key in ("se3_param_full", "se3_param_topk"):
+        if target_name == "denoiser":
+            for key in ("trunk_se3", "refinement_se3"):
                 nested = cast(Mapping[object, object], normalized[key])
                 normalized[key] = {
-                    ("num_attention_heads" if item_key == "n_heads" else str(item_key)): item
+                    {
+                        "n_heads": "num_attention_heads",
+                        "num_layers": "num_blocks",
+                    }.get(str(item_key), str(item_key)): item
                     for item_key, item in nested.items()
                 }
         values[target_name] = normalized
-    return RFdiffusionConfig(values)
+    return RfDiffusionConfig(values)
 
 
 def convert_rfdiffusion_state_dict_key(key: str) -> str:
     r"""Translate one official tensor name to the public Model module tree."""
 
     key = key.removeprefix("module.")
-    if key.startswith("c6d_pred."):
-        key = "coords_6d_pred." + key[len("c6d_pred.") :]
-    key = key.replace("templ_emb.emb_t1d.", "templ_emb.emb_template_1d.")
-    key = key.replace("templ_emb.proj_t1d.", "templ_emb.proj_template_1d.")
-    key = key.replace(".ff.", ".feed_forward.")
-    return f"network.{key}"
+    source_root, separator, remainder = key.partition(".")
+    target_root = _DENOISER_ROOT_RENAMES.get(source_root, source_root)
+    key = target_root + separator + remainder
+    for source, target in _DENOISER_STRUCTURE_RENAMES:
+        key = key.replace(source, target)
+    key = _convert_rfdiffusion_se3_key(key)
+    for source, target in _DENOISER_LEAF_RENAMES:
+        key = key.replace(source, target)
+    return f"denoiser.{key}"
+
+
+def _convert_rfdiffusion_se3_key(key: str) -> str:
+    r"""Translate the upstream interleaved SE(3) module list into named blocks and output."""
+
+    marker = ".structure_module.transformer.graph_modules."
+    prefix, separator, suffix = key.partition(marker)
+    if not separator:
+        return key
+    module_index_text, _, remainder = suffix.partition(".")
+    module_index = int(module_index_text)
+    if remainder.startswith(("to_key_value.", "to_query.", "project.")):
+        target = f".structure_module.transformer.blocks.{module_index // 2}."
+    elif remainder.startswith("group_norm."):
+        target = f".structure_module.transformer.blocks.{module_index // 2}.output_norm."
+    else:
+        target = ".structure_module.transformer.output_projection."
+    return prefix + target + remainder
 
 
 def convert_rfdiffusion_state_dict(
@@ -133,7 +262,7 @@ def convert_rfdiffusion_checkpoint(
     *,
     dtype: torch.dtype | None = None,
     schedule_source: str | PathLike[str] | None = None,
-) -> RFdiffusionModel:
+) -> RfDiffusionModel:
     r"""Return one native Model loaded strictly from an official checkpoint.
 
     The released IGSO(3) schedule table is copied verbatim from ``schedule_source`` (an ``.npz`` or
@@ -145,7 +274,7 @@ def convert_rfdiffusion_checkpoint(
     loaded = load_rfdiffusion_checkpoint(checkpoint)
     config = rfdiffusion_config_from_checkpoint(loaded)
     with torch.device("meta"):
-        model = RFdiffusionModel(config)
+        model = RfDiffusionModel(config)
     state = convert_rfdiffusion_state_dict(
         cast(Mapping[str, Tensor], loaded["model_state_dict"]),
         dtype=dtype,
@@ -170,11 +299,11 @@ def save_rfdiffusion_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
-    pairs it with :class:`RFdiffusionProcessor`, and writes ``model.json`` /
+    pairs it with :class:`RfDiffusionProcessor`, and writes ``model.json`` /
     ``processor.json`` / safetensors via
     [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair has no
     generic standard task, so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
-    is written to route ``pipeline("design", model=dir)`` to :class:`RFdiffusionPipeline` rather than
+    is written to route ``pipeline("design", model=dir)`` to :class:`RfDiffusionPipeline` rather than
     the generic standard ``design`` route.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
@@ -183,15 +312,15 @@ def save_rfdiffusion_checkpoint(
     """
 
     from ...pipelines.registry import PIPELINES
-    from .pipeline import RFdiffusionPipeline
-    from .processor import RFdiffusionProcessor
+    from .pipeline import RfDiffusionPipeline
+    from .processor import RfDiffusionProcessor
 
     model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype, schedule_source=schedule_source)
     destination = Path(output_dir).expanduser()
-    save_model(destination, model=model, processor=RFdiffusionProcessor())
-    chanfig.NestedDict({"pipeline": PIPELINES.id_for(RFdiffusionPipeline)}).dump(destination / "pipeline.json")
+    save_model(destination, model=model, processor=RfDiffusionProcessor())
+    chanfig.NestedDict({"pipeline": PIPELINES.id_for(RfDiffusionPipeline)}).dump(destination / "pipeline.json")
     if repo_id is not None:
-        from ..._repository import upload_repository
+        from ...hub import upload_repository
 
         upload_repository(destination, repo_id, token=token, private=private)
 

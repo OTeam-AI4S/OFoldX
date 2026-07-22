@@ -853,7 +853,7 @@ class AtomPairEncoder(nn.Module):
 
 class PackedAtomAttention(nn.Module):
     r"""
-    Run atom attention over an already-packed per-layer pair bias.
+    Run atom attention over an already-packed per-block pair bias.
 
     ``packed_bias`` stores all block/head pair-bias projections on the last axis, so the underlying
     [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer] can slice its per-block

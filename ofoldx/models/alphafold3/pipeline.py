@@ -38,9 +38,9 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
         """
 
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(input, msa=msa, templates=templates)
+        model_input = self.processor(input, msa=msa, templates=templates)
         result = self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,

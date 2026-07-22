@@ -10,6 +10,30 @@ from __future__ import annotations
 from chanfig import Config
 
 
+class Boltz1InputEmbeddingsConfig(Config):
+    r"""
+    Input-embedder knobs for Boltz-1: the atom-attention encoder and its token-level feature widths.
+
+    Attributes:
+        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
+        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
+        vocab_size: Residue-type vocabulary size feeding the one-hot residue feature.
+        pocket_feature_size: Width of the token-level pocket one-hot conditioning feature.
+        no_atom_encoder: When ``True``, skip the atom encoder and emit zeroed token-from-atom states.
+
+    Examples:
+        >>> config = Boltz1InputEmbeddingsConfig()
+        >>> config.num_atom_encoder_blocks
+        3
+    """
+
+    num_atom_encoder_blocks: int = 3
+    num_atom_encoder_attention_heads: int = 4
+    vocab_size: int = 33
+    pocket_feature_size: int = 4
+    no_atom_encoder: bool = False
+
+
 class Boltz1TrunkConfig(Config):
     r"""
     Representation-trunk knobs for Boltz-1: the Pairformer stack and the optional MSA module.
@@ -54,31 +78,7 @@ class Boltz1TrunkConfig(Config):
     msa_dropout: float = 0.0
 
 
-class Boltz1InputEmbedderConfig(Config):
-    r"""
-    Input-embedder knobs for Boltz-1: the atom-attention encoder and its token-level feature widths.
-
-    Attributes:
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        vocab_size: Residue-type vocabulary size feeding the one-hot residue feature.
-        pocket_feature_size: Width of the token-level pocket one-hot conditioning feature.
-        no_atom_encoder: When ``True``, skip the atom encoder and emit zeroed token-from-atom states.
-
-    Examples:
-        >>> config = Boltz1InputEmbedderConfig()
-        >>> config.num_atom_encoder_blocks
-        3
-    """
-
-    num_atom_encoder_blocks: int = 3
-    num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33
-    pocket_feature_size: int = 4
-    no_atom_encoder: bool = False
-
-
-class Boltz1DiffusionConfig(Config):
+class Boltz1DenoiserConfig(Config):
     r"""
     EDM denoising-module knobs for Boltz-1: the token transformer, atom encoder/decoder, and score-model widths.
 
@@ -97,7 +97,7 @@ class Boltz1DiffusionConfig(Config):
         alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step to the denoised coords.
 
     Examples:
-        >>> config = Boltz1DiffusionConfig()
+        >>> config = Boltz1DenoiserConfig()
         >>> config.num_token_transformer_blocks
         24
     """
@@ -146,9 +146,9 @@ class Boltz1SamplerConfig(Config):
     step_scale: float = 1.0
 
 
-class Boltz1ConfidenceConfig(Config):
+class Boltz1ConfidenceModuleConfig(Config):
     r"""
-    Boltz-1 confidence head and ranking configuration.
+    Boltz-1 confidence module and ranking configuration.
 
     The released ``boltz1_conf.ckpt`` uses the trunk-imitating confidence module, computes PAE/pTM metrics
     (``alpha_pae > 0`` in upstream Boltz), and conditions on the final diffusion token representation.
@@ -172,7 +172,7 @@ class Boltz1ConfidenceConfig(Config):
         ranking_ptm_weight: Weight on pTM/ipTM when forming the combined ranking score.
 
     Examples:
-        >>> config = Boltz1ConfidenceConfig()
+        >>> config = Boltz1ConfidenceModuleConfig()
         >>> config.enabled
         True
     """
@@ -200,7 +200,7 @@ class Boltz1Config(Config):
     Top-level configuration for the Boltz-1 structure-prediction model.
 
     Instantiating with the defaults reproduces the public Boltz-1 inference entry point. The nested sub-configs
-    hold the trunk, input-embedder, diffusion, sampler, and confidence values; the top-level fields
+    hold the input-embeddings, trunk, denoiser, sampler, and confidence-module values; the top-level fields
     below set the shared representation widths and the recycling/distogram parameters.
 
     Attributes:
@@ -214,11 +214,11 @@ class Boltz1Config(Config):
         relative_position_size: Width of the relative-position feature fed to the position embedder.
         recycling_steps: Total number of trunk passes.
         no_msa: When ``True``, build the model without the MSA module.
-        input_embedder: Nested input-embedder configuration.
+        input_embeddings: Nested input-embeddings configuration.
         trunk: Nested representation-trunk configuration.
-        diffusion: Nested EDM denoising-module configuration.
+        denoiser: Nested EDM denoiser configuration.
         sampler: Nested reverse-diffusion sampler configuration.
-        confidence: Nested confidence/ranking configuration.
+        confidence_module: Nested confidence/ranking module configuration.
 
     Examples:
         >>> config = Boltz1Config()
@@ -237,8 +237,8 @@ class Boltz1Config(Config):
     recycling_steps: int = 4
     no_msa: bool = False
 
-    input_embedder: Boltz1InputEmbedderConfig = Boltz1InputEmbedderConfig()
+    input_embeddings: Boltz1InputEmbeddingsConfig = Boltz1InputEmbeddingsConfig()
     trunk: Boltz1TrunkConfig = Boltz1TrunkConfig()
-    diffusion: Boltz1DiffusionConfig = Boltz1DiffusionConfig()
+    denoiser: Boltz1DenoiserConfig = Boltz1DenoiserConfig()
     sampler: Boltz1SamplerConfig = Boltz1SamplerConfig()
-    confidence: Boltz1ConfidenceConfig = Boltz1ConfidenceConfig()
+    confidence_module: Boltz1ConfidenceModuleConfig = Boltz1ConfidenceModuleConfig()

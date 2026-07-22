@@ -21,13 +21,13 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...io import read_mpnn_pdb
 from ...modules import residue_constants as rc
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
-from ..mpnn_pdb import read_mpnn_pdb
 from .config import MpnnPackerProcessorConfig
 from .model import MpnnPackerInput
 
@@ -64,7 +64,7 @@ class MpnnPackerProcessor:
         input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        pack_positions: Sequence[ComponentReference] | None = None,
         use_atom_context: bool = True,
         filter_by_occupancy: bool = True,
     ) -> MpnnPackerInput:
@@ -280,15 +280,15 @@ class MpnnPackerProcessor:
             observed = observed & (structure.occupancy > 0)
 
         rows: list[tuple[ComponentReference, str, int, int]] = []
-        chain_indices: dict[str, int] = {}
+        chain_index_by_instance: dict[str, int] = {}
         for site, present in zip(structure.sites, observed):
             if not present or site.atom_id != "CA":
                 continue
             entity = system.entities[system.instances[site.instance_id]]
             if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
                 continue
-            if site.instance_id not in chain_indices:
-                chain_indices[site.instance_id] = len(chain_indices)
+            if site.instance_id not in chain_index_by_instance:
+                chain_index_by_instance[site.instance_id] = len(chain_index_by_instance)
             reference = (site.instance_id, site.component_index)
             component = entity.components[site.component_index]
             residue_index = (
@@ -296,15 +296,22 @@ class MpnnPackerProcessor:
                 if structure.residue_numbers is None
                 else structure.residue_numbers[reference].number
             )
-            rows.append((reference, component.component_id, chain_indices[site.instance_id], residue_index))
+            rows.append(
+                (
+                    reference,
+                    component.component_id,
+                    chain_index_by_instance[site.instance_id],
+                    residue_index,
+                )
+            )
 
         adjusted_rows: list[tuple[ComponentReference, str, int, int]] = []
         duplicate_count = 0
         previous_residue_index: int | None = None
-        for reference, component_id, chain_index, residue_index in rows:
+        for reference, component_id, row_chain_index, residue_index in rows:
             if previous_residue_index == residue_index:
                 duplicate_count += 1
-            adjusted_rows.append((reference, component_id, chain_index, residue_index + duplicate_count))
+            adjusted_rows.append((reference, component_id, row_chain_index, residue_index + duplicate_count))
             previous_residue_index = residue_index
         rows = adjusted_rows
         unresolved_expected_atoms: list[tuple[str, ...]] = []
@@ -339,7 +346,7 @@ class MpnnPackerProcessor:
             backbone.append(all_atom[row_index, (0, 1, 2, 4)])
             valid.append(bool(all_atom_mask[row_index, (0, 1, 2, 4)].all()))
         row_references = tuple(row[0] for row in rows)
-        if positions is None:
+        if pack_positions is None:
             selected = tuple(
                 is_valid and component_id in AMINO_ACID_COMPONENT_IDS and not unresolved
                 for (_residue, component_id, _chain_index, _residue_index), is_valid, unresolved in zip(
@@ -349,7 +356,7 @@ class MpnnPackerProcessor:
                 )
             )
         else:
-            selected_references = set(positions)
+            selected_references = set(pack_positions)
             unknown = selected_references - set(row_references)
             if unknown:
                 raise ValueError(f"packing positions are outside the observed protein layout: {sorted(unknown)!r}")
@@ -441,7 +448,7 @@ class MpnnPackerProcessor:
             context_mask=selected_mask.unsqueeze(0),
             atom37_coordinates=torch.as_tensor(all_atom, device=self.device, dtype=self.dtype).unsqueeze(0),
             atom37_mask=torch.as_tensor(all_atom_mask, device=self.device).unsqueeze(0),
-            pack_mask=torch.tensor(selected, device=self.device, dtype=torch.bool).unsqueeze(0),
+            pack_positions=torch.tensor(selected, device=self.device, dtype=torch.bool).unsqueeze(0),
             structure=structure,
             component_references=row_references,
         )

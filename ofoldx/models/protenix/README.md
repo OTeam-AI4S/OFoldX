@@ -32,7 +32,7 @@ Protenix is an AlphaFold 3-shaped all-atom biomolecular structure predictor. Inp
 Distinctive to this family is the Protenix constraint pair-bias path: pocket, token-contact, atom-contact, and substructure constraint features are embedded by four dedicated sub-embedders and added to the initial pair representation before the recycling trunk. The default checkpoint omits the constraint subgraph; the constraint checkpoint always contains all four embedders.
 
 > [!NOTE]
-> The two on-disk v0.5 checkpoints are two genuinely different graphs (the constraint checkpoint carries a live four-branch `constraint_embedder`; the default has none) with two different INPUT contracts, so under §3.7.2 they register as two architecture ids: `ofoldx.protenix` (default, artifact repo `ofoldx/protenix`) and `ofoldx.protenix_constraint` (constraint, artifact repo `ofoldx/protenix-constraint`). Each returns `FoldResult`. What separates them is the Processor `__call__` signature: only `ProtenixConstraintProcessor` declares the pocket / token-contact / atom-contact keywords; the default `ProtenixProcessor` signature omits them, so passing any of them raises `TypeError` at the call boundary rather than being gated by a shared runtime flag.
+> The two on-disk v0.5 checkpoints are two genuinely different graphs (the constraint checkpoint carries live four-branch `constraint_embeddings`; the default has none) with two different INPUT contracts, so under §3.7.2 they register as two architecture ids: `ofoldx.protenix` (default, artifact repo `ofoldx/protenix`) and `ofoldx.protenix_constraint` (constraint, artifact repo `ofoldx/protenix-constraint`). Each returns `FoldResult`. What separates them is the Processor `__call__` signature: only `ProtenixConstraintProcessor` declares the pocket / token-contact / atom-contact keywords; the default `ProtenixProcessor` signature omits them, so passing any of them raises `TypeError` at the call boundary rather than being gated by a shared runtime flag.
 
 ### Model Specification
 
@@ -111,7 +111,7 @@ Please contact the authors of the [Protenix paper](https://doi.org/10.1101/2025.
 
 ## Numerical epsilon note
 
-- **Confidence normalization eps `1e-8`** (`model.py:868` ipTM per-alignment, `:956` contact-weighted PDE) is **upstream-faithful — keep, do not unify.** Faithful to Protenix `sample_confidence`; matches AF3's `1e-8` pTM reduction. The per-family confidence-eps spread (protenix 1e-8 / af3 1e-8+1e-6 / boltz 1e-5 / esmfold2 1e-6) is an inherent cross-model difference, not an OFoldX inconsistency; a shared constant would regress a family. See `EPSILON_ANALYSIS.md`.
+- **Confidence normalization** uses the current tensor dtype's smallest positive normal, `torch.finfo(dtype).tiny`, when a valid-pair or contact count is empty. This is a Protenix-local numerical contract rather than a shared cross-family epsilon.
 
 ## License
 
@@ -126,8 +126,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 - Protenix is an AF3-class folding model shipped with the `default` and `constraint`
   v0.5.0 checkpoints; the diffusion sampler is stochastic and global scores are the
   qualified surface.
-- The confidence epsilon `1e-8` is kept upstream-faithful (see the Numerical epsilon
-  note) and is not unified with other families.
+- Confidence normalization follows the dtype-aware `torch.finfo(dtype).tiny` behavior
+  described above and is not unified with other families.
 - A parity run applies only to the checkpoints and settings supplied to the script.
 
 ## Licensing & redistribution

@@ -16,7 +16,7 @@ from ..results import FoldResult
 from ._paired import PairedPipeline
 from .generator import PipelineProcessor, processor_device, resolve_generator
 
-_FeaturesT = TypeVar("_FeaturesT")
+_ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
 _ModelInputT_contra = TypeVar("_ModelInputT_contra", contravariant=True)
 
@@ -42,8 +42,8 @@ class _FoldModel(SaveableModel, Protocol[_ModelInputT_contra]):
 
 
 class FoldPipeline(
-    PairedPipeline[_FoldModel[_FeaturesT], _FoldProcessor[_FeaturesT]],
-    Generic[_FeaturesT],
+    PairedPipeline[_FoldModel[_ModelInputT], _FoldProcessor[_ModelInputT]],
+    Generic[_ModelInputT],
 ):
     r"""Bind one folding Model to its paired Processor."""
 
@@ -58,9 +58,9 @@ class FoldPipeline(
         generator: torch.Generator | None = None,
     ) -> FoldResult:
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(input, msa=msa, templates=templates)
+        model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
         )

@@ -30,18 +30,18 @@ _ATTENTION_PROJECTION_MAP = {
     "linear_g": "gate_projection",
 }
 _TOP_LEVEL_PREFIX_MAP = {
-    "input_embedder.linear_tf_m.": "input_embedding.preprocess_1d.",
-    "input_embedder.linear_msa_m.": "input_embedding.preprocess_msa.",
-    "input_embedder.linear_tf_z_i.": "input_embedding.left_single.",
-    "input_embedder.linear_tf_z_j.": "input_embedding.right_single.",
-    "input_embedder.linear_relpos.": "input_embedding.relpos_projection.",
-    "recycling_embedder.linear.": "recycling_embedding.prev_pos_linear.",
-    "recycling_embedder.layer_norm_m.": "recycling_embedding.prev_msa_first_row_norm.",
-    "recycling_embedder.layer_norm_z.": "recycling_embedding.prev_pair_norm.",
-    "extra_msa_embedder.linear.": "extra_msa_embedding.extra_msa_projection.",
-    "evoformer.linear.": "single_activations.",
-    "template_angle_embedder.linear_1.": "template_msa_embedding.template_single_embedding.",
-    "template_angle_embedder.linear_2.": "template_msa_embedding.template_projection.",
+    "input_embedder.linear_tf_m.": "input_embeddings.preprocess_1d.",
+    "input_embedder.linear_msa_m.": "input_embeddings.preprocess_msa.",
+    "input_embedder.linear_tf_z_i.": "input_embeddings.left_single.",
+    "input_embedder.linear_tf_z_j.": "input_embeddings.right_single.",
+    "input_embedder.linear_relpos.": "input_embeddings.relpos_projection.",
+    "recycling_embedder.linear.": "recycling_embeddings.prev_pos_linear.",
+    "recycling_embedder.layer_norm_m.": "recycling_embeddings.prev_msa_first_row_norm.",
+    "recycling_embedder.layer_norm_z.": "recycling_embeddings.prev_pair_norm.",
+    "extra_msa_embedder.linear.": "extra_msa_embeddings.extra_msa_projection.",
+    "evoformer.linear.": "single_projection.",
+    "template_angle_embedder.linear_1.": "template_msa_embeddings.template_single_embedding.",
+    "template_angle_embedder.linear_2.": "template_msa_embeddings.template_projection.",
     "template_pair_embedder.linear.": "template_embedder.single_template_embedding.embedding2d.",
     "template_pair_stack.layer_norm.": "template_embedder.single_template_embedding.output_layer_norm.",
     "aux_heads.distogram.linear.": "distogram_head.linear.",
@@ -57,27 +57,19 @@ _STRUCTURE_PREFIX_MAP = {
     "structure_module.layer_norm_s.": "structure_module.single_layer_norm.",
     "structure_module.linear_in.": "structure_module.initial_projection.",
     "structure_module.layer_norm_z.": "structure_module.pair_layer_norm.",
-    "structure_module.ipa.head_weights": (
-        "structure_module.fold_iteration.invariant_point_attention.trainable_point_weights"
-    ),
-    "structure_module.ipa.linear_q.": "structure_module.fold_iteration.invariant_point_attention.q_scalar.",
-    "structure_module.ipa.linear_kv.": "structure_module.fold_iteration.invariant_point_attention.kv_scalar.",
-    "structure_module.ipa.linear_q_points.": (
-        "structure_module.fold_iteration.invariant_point_attention.q_point_local."
-    ),
-    "structure_module.ipa.linear_kv_points.": (
-        "structure_module.fold_iteration.invariant_point_attention.kv_point_local."
-    ),
-    "structure_module.ipa.linear_b.": "structure_module.fold_iteration.invariant_point_attention.attention_2d.",
-    "structure_module.ipa.linear_out.": (
-        "structure_module.fold_iteration.invariant_point_attention.output_projection."
-    ),
-    "structure_module.layer_norm_ipa.": "structure_module.fold_iteration.attention_layer_norm.",
-    "structure_module.transition.layer_norm.": "structure_module.fold_iteration.transition_layer_norm.",
-    "structure_module.bb_update.linear.": "structure_module.fold_iteration.affine_update.",
-    "structure_module.angle_resnet.linear_in.": "structure_module.fold_iteration.sidechain.input_projection.0.",
-    "structure_module.angle_resnet.linear_initial.": "structure_module.fold_iteration.sidechain.input_projection.1.",
-    "structure_module.angle_resnet.linear_out.": "structure_module.fold_iteration.sidechain.unnormalized_angles.",
+    "structure_module.ipa.head_weights": ("structure_module.layer.invariant_point_attention.trainable_point_weights"),
+    "structure_module.ipa.linear_q.": "structure_module.layer.invariant_point_attention.q_scalar.",
+    "structure_module.ipa.linear_kv.": "structure_module.layer.invariant_point_attention.kv_scalar.",
+    "structure_module.ipa.linear_q_points.": ("structure_module.layer.invariant_point_attention.q_point_local."),
+    "structure_module.ipa.linear_kv_points.": ("structure_module.layer.invariant_point_attention.kv_point_local."),
+    "structure_module.ipa.linear_b.": "structure_module.layer.invariant_point_attention.attention_2d.",
+    "structure_module.ipa.linear_out.": ("structure_module.layer.invariant_point_attention.output_projection."),
+    "structure_module.layer_norm_ipa.": "structure_module.layer.attention_layer_norm.",
+    "structure_module.transition.layer_norm.": "structure_module.layer.transition_layer_norm.",
+    "structure_module.bb_update.linear.": "structure_module.layer.backbone_update.",
+    "structure_module.angle_resnet.linear_in.": "structure_module.layer.sidechain.input_projection.0.",
+    "structure_module.angle_resnet.linear_initial.": "structure_module.layer.sidechain.input_projection.1.",
+    "structure_module.angle_resnet.linear_out.": "structure_module.layer.sidechain.unnormalized_angles.",
 }
 
 
@@ -150,10 +142,10 @@ def normalize_openfold_state_key(key: str) -> str:
 
     template_match = _TEMPLATE_BLOCK_KEY_RE.fullmatch(key)
     if template_match is not None:
-        block_index, rest = template_match.groups()
+        layer_index, rest = template_match.groups()
         return (
-            "template_embedder.single_template_embedding.template_pair_stack.blocks."
-            f"{block_index}.pair_stack.{_normalize_pair_stack_key(rest)}"
+            "template_embedder.single_template_embedding.template_pair_stack.layers."
+            f"{layer_index}.{_normalize_pair_stack_key(rest)}"
         )
 
     block_match = _BLOCK_KEY_RE.fullmatch(key)
@@ -327,12 +319,12 @@ def _normalize_structure_module_key(key: str) -> str | None:
         linear_index, _, suffix = rest.partition(".")
         if linear_index in {"1", "2", "3"} and suffix:
             target_index = int(linear_index) - 1
-            return f"structure_module.fold_iteration.transition.layers.{target_index}.{suffix}"
+            return f"structure_module.layer.transition.layers.{target_index}.{suffix}"
     angle_match = re.fullmatch(r"structure_module\.angle_resnet\.layers\.(\d+)\.linear_([12])\.(.+)", key)
     if angle_match is not None:
         block_index, linear_index, suffix = angle_match.groups()
-        target_name = "resblock1" if linear_index == "1" else "resblock2"
-        return f"structure_module.fold_iteration.sidechain.resblocks.{block_index}.{target_name}.{suffix}"
+        target_name = "linear1" if linear_index == "1" else "linear2"
+        return f"structure_module.layer.sidechain.layers.{block_index}.{target_name}.{suffix}"
     return None
 
 

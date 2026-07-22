@@ -6,10 +6,10 @@ from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import (
     BoltzGenConfig,
-    BoltzGenDiffusionConfig,
-    BoltzGenIFoldConfig,
-    BoltzGenIFoldModuleConfig,
-    BoltzGenInputEmbedderConfig,
+    BoltzGenDenoiserConfig,
+    BoltzGenInverseFoldingConfig,
+    BoltzGenInverseFoldingModuleConfig,
+    BoltzGenInputEmbeddingsConfig,
     BoltzGenSamplerConfig,
     BoltzGenStructureDesignConfig,
     BoltzGenTemplateConfig,
@@ -21,9 +21,9 @@ from .model import (
     BoltzGenDesignCandidate,
     BoltzGenDesignMask,
     BoltzGenDesignResult,
-    BoltzGenIFoldInput,
-    BoltzGenIFoldModel,
-    BoltzGenIFoldOutput,
+    BoltzGenInverseFoldingInput,
+    BoltzGenInverseFoldingModel,
+    BoltzGenInverseFoldingOutput,
     BoltzGenInput,
     BoltzGenModel,
     BoltzGenOutput,
@@ -35,7 +35,7 @@ from .model import (
     BoltzGenSymmetry,
 )
 from .pipeline import BoltzGenFoldModel, BoltzGenPipeline, BoltzGenScoreModel, BoltzGenStageProcessor
-from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
+from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 from .projection import DesignMaskResidue, from_design_mask, to_design_mask
 
 # Design loads the structure and inverse-folding pairs through the concrete multi-pair pipeline.
@@ -48,8 +48,8 @@ MODELS.register_model(
 )
 MODELS.register_model(
     "ofoldx.boltzgen_ifold",
-    model=BoltzGenIFoldModel,
-    processor=BoltzGenIFoldProcessor,
+    model=BoltzGenInverseFoldingModel,
+    processor=BoltzGenInverseFoldingProcessor,
     processor_config=None,
     standard_tasks=(),
 )

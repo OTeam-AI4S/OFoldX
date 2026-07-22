@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from typing_extensions import Self
 
 from ...data.molecular import (
     AtomSite,
@@ -18,6 +17,7 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import (
     AtomToTokenEncoder,
@@ -51,7 +51,7 @@ from ...results import (
 from .config import ProtenixConfig, ProtenixConstraintConfig
 
 
-class ProtenixModel(nn.Module):
+class ProtenixModel(Model):
     r"""
     Protenix v0.5 structure-prediction model.
 
@@ -66,24 +66,40 @@ class ProtenixModel(nn.Module):
     """
 
     config_class = ProtenixConfig
+    config: ProtenixConfig
 
     def __init__(self, config: ProtenixConfig | None = None) -> None:
         config = ProtenixConfig() if config is None else config
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self._recycling_steps = config.recycling_steps
-        self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, config.pair_size)
+        self.input_embeddings = ProtenixInputEmbeddings(
+            single_size=config.single_size,
+            atom_feature_size=config.atom_feature_size,
+        )
+        self.constraint_embeddings = ProtenixConstraintEmbeddings(config.pair_size) if config.constraints else None
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
+        self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, config.pair_size)
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
-        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.pair_recycle_norm = LayerNorm(config.pair_size)
+        self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
         self.single_recycle_norm = LayerNorm(config.single_size)
-        self.input_embedder = InputEmbedder(
-            single_size=config.single_size,
-            atom_feature_size=config.atom_feature_size,
+        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
+        self.template_embedder = TemplateEmbedder(
+            pair_size=config.pair_size,
+            hidden_size=config.template.hidden_size,
+            num_blocks=config.template.num_blocks,
+            vocab_size=config.template.vocab_size,
+            num_distogram_bins=config.template.num_distogram_bins,
+            expansion=config.template.expansion,
+            dropout=config.template.dropout,
+        )
+        self.msa_trunk = MsaTrunk(
+            pair_size=config.pair_size,
+            token_feature_size=config.token_feature_size,
+            msa_dropout=config.trunk.msa_dropout,
+            pair_dropout=config.trunk.pair_dropout,
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
@@ -154,22 +170,6 @@ class ProtenixModel(nn.Module):
             symmetrize_pde_before_projection=True,
             persistent_distance_bins=True,
         )
-        self.msa_trunk = MsaTrunk(
-            pair_size=config.pair_size,
-            token_feature_size=config.token_feature_size,
-            msa_dropout=config.trunk.msa_dropout,
-            pair_dropout=config.trunk.pair_dropout,
-        )
-        self.template_embedder = TemplateEmbedder(
-            pair_size=config.pair_size,
-            hidden_size=config.template.hidden_size,
-            num_blocks=config.template.num_blocks,
-            vocab_size=config.template.vocab_size,
-            num_distogram_bins=config.template.num_distogram_bins,
-            expansion=config.template.expansion,
-            dropout=config.template.dropout,
-        )
-        self.constraint_embedder = ProtenixConstraintEmbedder(config.pair_size) if config.constraints else None
         self.reset_parameters()
         self.set_backend("auto")
 
@@ -186,15 +186,12 @@ class ProtenixModel(nn.Module):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.confidence_head.pair_projector.pae_projection.weight)
         nn.init.zeros_(self.confidence_head.pair_projector.pde_projection.weight)
-        if self.constraint_embedder is not None:
-            self.constraint_embedder.reset_parameters()
+        if self.constraint_embeddings is not None:
+            self.constraint_embeddings.reset_parameters()
 
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the public PyTorch or OOps operator path."""
+    def _set_backend(self, backend: ModelBackend) -> None:
+        r"""Apply the public PyTorch or OOps operator path."""
 
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
-        self.backend = backend
         operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
@@ -212,11 +209,10 @@ class ProtenixModel(nn.Module):
                 ),
             ):
                 module.operator_backend = operator_backend
-        return self
 
     def forward(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
@@ -228,26 +224,26 @@ class ProtenixModel(nn.Module):
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
         representations = self._run_trunk(
-            features,
+            input,
             recycling_steps=recycling_steps,
-            reference_positions=features.reference_positions,
+            reference_positions=input.reference_positions,
         )
         coordinates = self.coordinate_denoiser(
             self._denoise_context(
-                features,
+                input,
                 representations,
-                reference_positions=features.reference_positions,
+                reference_positions=input.reference_positions,
             ).to_denoising_input(
                 noisy_coords=noisy_coordinates,
                 noise_level=noise_level,
             )
         )
-        return self._assemble_output(features, representations, coordinates)
+        return self._assemble_output(input, representations, coordinates)
 
     @torch.inference_mode()
     def fold(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         *,
         num_samples: int | None = None,
         generator: torch.Generator | None = None,
@@ -266,13 +262,13 @@ class ProtenixModel(nn.Module):
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
 
-        reference_positions = features.reference_positions
+        reference_positions = input.reference_positions
         msa_indices = tuple(
-            self._sample_msa_indices(features.msa.shape[-2], features.msa.device, generator=generator)
+            self._sample_msa_indices(input.msa.shape[-2], input.msa.device, generator=generator)
             for _ in range(recycling_steps)
         )
         output = self._sample(
-            features,
+            input,
             recycling_steps=recycling_steps,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
@@ -281,12 +277,12 @@ class ProtenixModel(nn.Module):
             msa_indices=msa_indices,
         )
 
-        atom_count = len(features.atom_sites)
-        token_count = len(features.token_sites)
-        complete_sites = [site for site, atom in features.system.iter_atoms() if atom.element != "H"]
+        atom_count = len(input.atom_sites)
+        token_count = len(input.token_sites)
+        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         model_to_complete = np.asarray(
-            [complete_index[site] for site in features.atom_sites],
+            [complete_index[site] for site in input.atom_sites],
             dtype=np.intp,
         )
 
@@ -310,21 +306,21 @@ class ProtenixModel(nn.Module):
         contact_probability = _protenix_contact_probability(distogram_logits)
         token_has_frame = _protenix_token_has_frame(
             reference_positions,
-            reference_mask=features.reference_mask,
-            reference_space_id=features.reference_space_id,
-            token_to_rep_atom=features.token_to_rep_atom,
-            atom_sites=features.atom_sites,
-            token_sites=features.token_sites,
+            reference_mask=input.reference_mask,
+            reference_space_id=input.reference_space_id,
+            token_to_rep_atom=input.token_to_rep_atom,
+            atom_sites=input.atom_sites,
+            token_sites=input.token_sites,
         )
-        token_chain = features.chain_index[0, :token_count].to(device=pae_logits.device, dtype=torch.long)
-        atom_to_token = features.atom_to_token[0, :atom_count].to(device=pae_logits.device, dtype=torch.long)
+        token_chain = input.chain_index[0, :token_count].to(device=pae_logits.device, dtype=torch.long)
+        atom_to_token = input.atom_to_token[0, :atom_count].to(device=pae_logits.device, dtype=torch.long)
         atom_is_polymer = torch.tensor(
             [
                 isinstance(
-                    features.system.entities[features.system.instances[site.instance_id]],
+                    input.system.entities[input.system.instances[site.instance_id]],
                     PolymerSequence,
                 )
-                for site in features.atom_sites
+                for site in input.atom_sites
             ],
             dtype=torch.bool,
             device=pae_logits.device,
@@ -358,7 +354,7 @@ class ProtenixModel(nn.Module):
 
         contact_numpy = contact_probability.cpu().numpy()
         token_instance_ids = tuple(
-            site.instance_id if isinstance(site, AtomSite) else site[0] for site in features.token_sites
+            site.instance_id if isinstance(site, AtomSite) else site[0] for site in input.token_sites
         )
         token_chain_numpy = token_chain.cpu().numpy()
         chain_axis = tuple(
@@ -371,7 +367,7 @@ class ProtenixModel(nn.Module):
             complete_coordinates[model_to_complete] = coordinates[sample_index]
             coordinate_mask[model_to_complete] = True
             structure = Structure(
-                system=features.system,
+                system=input.system,
                 sites=tuple(complete_sites),
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
@@ -384,7 +380,7 @@ class ProtenixModel(nn.Module):
                 FoldPrediction(
                     structure=structure,
                     scores={
-                        "plddt": Score(float(atom_plddt[sample_index].mean()), preferred="higher"),
+                        "mean_plddt": Score(float(atom_plddt[sample_index].mean()), preferred="higher"),
                         "gpde": Score(float(gpde[sample_index]), unit="angstrom", preferred="lower"),
                         "ptm": Score(float(ptm[sample_index]), preferred="higher"),
                         "iptm": Score(float(iptm[sample_index]), preferred="higher"),
@@ -393,10 +389,10 @@ class ProtenixModel(nn.Module):
                         "ranking_score": Score(float(ranking_score[sample_index]), preferred="higher"),
                     },
                     metrics={
-                        "plddt": Metric(values=sample_plddt, axis=features.atom_sites),
+                        "plddt": Metric(values=sample_plddt, axis=input.atom_sites),
                         "resolved_probability": Metric(
                             values=sample_resolved_probability,
-                            axis=features.atom_sites,
+                            axis=input.atom_sites,
                         ),
                         "chain_plddt": Metric(
                             values=chain_plddt[sample_index].cpu().numpy(),
@@ -419,20 +415,20 @@ class ProtenixModel(nn.Module):
                     pair_metrics={
                         "pae": PairMetric(
                             values=sample_pae,
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                             unit="angstrom",
                         ),
                         "pde": PairMetric(
                             values=sample_pde,
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                             unit="angstrom",
                         ),
                         "contact_probs": PairMetric(
                             values=contact_numpy,
-                            row_axis=features.token_sites,
-                            column_axis=features.token_sites,
+                            row_axis=input.token_sites,
+                            column_axis=input.token_sites,
                         ),
                         "chain_pair_iptm": PairMetric(
                             values=chain_pair_iptm[sample_index].cpu().numpy(),
@@ -464,7 +460,7 @@ class ProtenixModel(nn.Module):
     @torch.inference_mode()
     def _sample(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         *,
         recycling_steps: int,
         num_samples: int,
@@ -476,42 +472,41 @@ class ProtenixModel(nn.Module):
         r"""Run the released Protenix trunk, sampler, and prediction heads."""
 
         representations = self._run_trunk(
-            features,
+            input,
             recycling_steps=recycling_steps,
             reference_positions=reference_positions,
             msa_indices=msa_indices,
         )
         coordinates = self._predict_coords(
-            features,
+            input,
             representations=representations,
             reference_positions=reference_positions,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
         )
-        return self._assemble_output(features, representations, coordinates)
+        return self._assemble_output(input, representations, coordinates)
 
     def _assemble_output(
         self,
-        features: ProtenixInput,
-        representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
+        input: ProtenixInput,
+        representations: _ProtenixTrunkOutput,
         coordinates: Tensor,
     ) -> ProtenixOutput:
         r"""Compute the released distogram and confidence predictions."""
 
-        token_embedding, single, pair, _ = representations
         plddt_logits, pae_logits, pde_logits, resolved_logits = self.confidence_head(
-            single,
-            pair=pair,
-            token_embedding=token_embedding,
+            representations.single,
+            pair=representations.pair,
+            token_embedding=representations.token_embedding,
             pred_coords=coordinates,
-            token_to_rep_atom=features.token_to_rep_atom,
-            atom_to_token=features.atom_to_token,
-            atom_token_index=features.atom_token_index,
+            token_to_rep_atom=input.token_to_rep_atom,
+            atom_to_token=input.atom_to_token,
+            atom_token_index=input.atom_token_index,
         )
         return ProtenixOutput(
             coordinates=coordinates,
-            distogram_logits=self.distogram_head(pair),
+            distogram_logits=self.distogram_head(representations.pair),
             plddt_logits=plddt_logits,
             pae_logits=pae_logits,
             pde_logits=pde_logits,
@@ -520,69 +515,68 @@ class ProtenixModel(nn.Module):
 
     def _denoise_context(
         self,
-        features: ProtenixInput,
-        representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
+        input: ProtenixInput,
+        representations: _ProtenixTrunkOutput,
         *,
         reference_positions: Tensor,
     ) -> CoordinateDenoiseContext:
         r"""Assemble conditioning shared by forward and the sampler."""
 
-        token_embedding, single, pair, relative_features = representations
         return CoordinateDenoiseContext(
-            atom_features=features.atom_features,
-            atom_to_token=features.atom_to_token,
+            atom_features=input.atom_features,
+            atom_to_token=input.atom_to_token,
             reference_positions=reference_positions,
-            reference_charges=features.reference_charges,
-            reference_mask=features.reference_mask,
-            atom_mask=features.atom_mask,
-            token_embedding=token_embedding,
-            single=single,
-            pair=pair,
-            relative_features=relative_features,
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            atom_mask=input.atom_mask,
+            token_embedding=representations.token_embedding,
+            single=representations.single,
+            pair=representations.pair,
+            relative_features=representations.relative_features,
             local_geometry=self.coordinate_denoiser.build_local_geometry(
                 reference_positions,
-                features.reference_space_id,
+                input.reference_space_id,
             ),
         )
 
     def _run_trunk(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         *,
         recycling_steps: int,
         reference_positions: Tensor,
         msa_indices: tuple[Tensor, ...] | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
+    ) -> _ProtenixTrunkOutput:
         r"""Embed the inputs and run the released recycling trunk."""
 
-        token_embedding = self.input_embedder(
-            features.atom_features,
-            token_features=features.token_features,
+        token_embedding = self.input_embeddings(
+            input.atom_features,
+            token_features=input.token_features,
             reference_positions=reference_positions,
-            reference_charges=features.reference_charges,
-            reference_mask=features.reference_mask,
-            atom_to_token=features.atom_to_token,
-            num_tokens=features.token_features.shape[-2],
-            atom_mask=features.atom_mask,
-            token_mask=features.token_mask,
-            local_geometry=self.input_embedder.build_local_geometry(
+            reference_charges=input.reference_charges,
+            reference_mask=input.reference_mask,
+            atom_to_token=input.atom_to_token,
+            num_tokens=input.token_features.shape[-2],
+            atom_mask=input.atom_mask,
+            token_mask=input.token_mask,
+            local_geometry=self.input_embeddings.build_local_geometry(
                 reference_positions,
-                features.reference_space_id,
+                input.reference_space_id,
             ),
         )
         single_init = self.single_init_projection(token_embedding)
         relative_features = generate_relative_position_features(
-            residue_index=features.residue_index,
-            chain_index=features.chain_index,
-            entity_index=features.entity_index,
-            symmetry_index=features.symmetry_index,
-            token_index=features.token_index,
+            residue_index=input.residue_index,
+            chain_index=input.chain_index,
+            entity_index=input.entity_index,
+            symmetry_index=input.symmetry_index,
+            token_index=input.token_index,
             dtype=single_init.dtype,
         )
-        pair_init = self._initial_pair(single_init, features, relative_features)
-        pair_mask = pair_mask_from_token_mask(features.token_mask)
+        pair_init = self._initial_pair(single_init, input, relative_features)
+        pair_mask = pair_mask_from_token_mask(input.token_mask)
         single, pair = self._run_recycling(
-            features,
+            input,
             token_embedding,
             single_init,
             pair_init,
@@ -590,11 +584,16 @@ class ProtenixModel(nn.Module):
             recycling_steps,
             msa_indices=msa_indices,
         )
-        return token_embedding, single, pair, relative_features
+        return _ProtenixTrunkOutput(
+            token_embedding=token_embedding,
+            single=single,
+            pair=pair,
+            relative_features=relative_features,
+        )
 
     def _run_recycling(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         token_embedding: Tensor,
         single_init: Tensor,
         pair_init: Tensor,
@@ -611,7 +610,7 @@ class ProtenixModel(nn.Module):
             pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
             indices = None if msa_indices is None else msa_indices[cycle]
             _, pair = self.msa_trunk(
-                self._msa_features(features, indices),
+                self._msa_features(input, indices),
                 pair,
                 token_embedding,
                 pair_mask=pair_mask,
@@ -621,18 +620,18 @@ class ProtenixModel(nn.Module):
         return single, pair
 
     @staticmethod
-    def _msa_features(features: ProtenixInput, indices: Tensor | None) -> Tensor:
+    def _msa_features(input: ProtenixInput, indices: Tensor | None) -> Tensor:
         r"""Build the released 32+1+1 MSA feature vector for selected rows."""
 
         if indices is None:
-            msa = features.msa
-            has_deletion = features.has_deletion
-            deletion_value = features.deletion_value
+            msa = input.msa
+            has_deletion = input.has_deletion
+            deletion_value = input.deletion_value
         else:
-            msa = torch.index_select(features.msa, -2, indices)
-            has_deletion = torch.index_select(features.has_deletion, -2, indices)
-            deletion_value = torch.index_select(features.deletion_value, -2, indices)
-        one_hot = F.one_hot(msa.long(), num_classes=32).to(dtype=features.token_features.dtype)
+            msa = torch.index_select(input.msa, -2, indices)
+            has_deletion = torch.index_select(input.has_deletion, -2, indices)
+            deletion_value = torch.index_select(input.deletion_value, -2, indices)
+        one_hot = F.one_hot(msa.long(), num_classes=32).to(dtype=input.token_features.dtype)
         return torch.cat(
             (
                 one_hot,
@@ -645,33 +644,33 @@ class ProtenixModel(nn.Module):
     def _initial_pair(
         self,
         single: Tensor,
-        features: ProtenixInput,
+        input: ProtenixInput,
         relative_features: RelativePositionBuckets,
     ) -> Tensor:
         r"""Build the initial pair representation and optional constraint bias."""
 
         left = self.pair_left_projection(single).unsqueeze(-2)
         right = self.pair_right_projection(single).unsqueeze(-3)
-        token_bonds = features.token_bonds.to(device=single.device, dtype=single.dtype)
+        token_bonds = input.token_bonds.to(device=single.device, dtype=single.dtype)
         token_bonds = torch.broadcast_to(token_bonds, (*single.shape[:-1], single.shape[-2]))
         pair = left + right
         pair = pair + self.relative_position_embedder(relative_features)
         pair = pair + self.token_bond_projection(token_bonds.unsqueeze(-1))
-        if self.constraint_embedder is not None:
-            pair = pair + self.constraint_embedder(
-                features.pocket,
-                features.contact,
-                features.contact_atom,
-                features.substructure,
+        if self.constraint_embeddings is not None:
+            pair = pair + self.constraint_embeddings(
+                input.pocket,
+                input.contact,
+                input.contact_atom,
+                input.substructure,
             )
-        pair_mask = pair_mask_from_token_mask(features.token_mask)
+        pair_mask = pair_mask_from_token_mask(input.token_mask)
         return pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
 
     def _predict_coords(
         self,
-        features: ProtenixInput,
+        input: ProtenixInput,
         *,
-        representations: tuple[Tensor, Tensor, Tensor, RelativePositionBuckets],
+        representations: _ProtenixTrunkOutput,
         reference_positions: Tensor,
         num_samples: int,
         num_sampling_steps: int,
@@ -682,7 +681,7 @@ class ProtenixModel(nn.Module):
         return self.coordinate_sampler(
             self.coordinate_denoiser,
             context=self._denoise_context(
-                features,
+                input,
                 representations,
                 reference_positions=reference_positions,
             ),
@@ -721,15 +720,170 @@ class ProtenixConstraintModel(ProtenixModel):
     r"""Released ``protenix_base_constraint_v0.5.0`` graph (four-branch constraint pair bias).
 
     Adds nothing to the base graph beyond selecting the constraint
-    configuration; the ``constraint_embedder`` submodule is built conditionally by
+    configuration; the ``constraint_embeddings`` submodule is built conditionally by
     ``ProtenixModel.__init__`` when ``config.constraints`` is ``True``. No numeric
     method is overridden, so both classes execute the same numerical path.
     """
 
     config_class = ProtenixConstraintConfig
+    config: ProtenixConstraintConfig
 
     def __init__(self, config: ProtenixConstraintConfig | None = None) -> None:
         super().__init__(ProtenixConstraintConfig() if config is None else config)
+
+
+class ProtenixInputEmbeddings(nn.Module):
+    r"""
+    Build token input embeddings from packed atom and token features.
+
+    Runs the atom-to-token encoder to produce the leading token-single channels, then concatenates
+    the trailing token-feature tail so the output width matches the token feature contract.
+
+    Args:
+        single_size: Width of the atom-derived token-single channel.
+        atom_feature_size: Width of the per-atom input features consumed by the atom encoder.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        atom_feature_size: int = 385,
+    ) -> None:
+        super().__init__()
+        self.single_size = single_size
+        self.atom_encoder = AtomToTokenEncoder(
+            token_hidden_size=single_size,
+            atom_feature_size=atom_feature_size,
+            cross_attention_key_source="normalized",
+        )
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        *,
+        reference_positions: Tensor,
+        reference_charges: Tensor,
+        reference_mask: Tensor,
+        token_features: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        atom_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
+        local_geometry: LocalAtomGeometry | None = None,
+    ) -> Tensor:
+        r"""
+        Return token embeddings concatenating atom-derived channels and the token-feature tail.
+
+        Args:
+            atom_features: Per-atom input features ``[..., N_atom, atom_feature_size]``.
+            reference_positions: Reference conformer atom positions ``[..., N_atom, 3]``.
+            reference_charges: Per-atom reference charges ``[..., N_atom, 1]`` (arcsinh-compressed here).
+            reference_mask: Per-atom reference validity mask ``[..., N_atom]``.
+            token_features: Packed per-token features ``[..., N_token, token_feature_size]``.
+            atom_to_token: Token index per atom ``[..., N_atom]``.
+            num_tokens: Number of tokens.
+            atom_mask: Optional per-atom validity mask ``[..., N_atom]``.
+            token_mask: Optional per-token validity mask ``[..., N_token]``; zeroes masked rows.
+            local_geometry: Optional precomputed local atom geometry.
+
+        Returns:
+            Token embeddings ``[..., N_token, single_size + tail]`` with the token-feature tail appended.
+        """
+
+        encoder_reference_charges = torch.arcsinh(reference_charges)
+        atom_encoder_output = self.atom_encoder(
+            atom_features,
+            reference_positions=reference_positions,
+            reference_charges=encoder_reference_charges,
+            reference_mask=reference_mask,
+            atom_mask=atom_mask,
+            atom_to_token=atom_to_token,
+            num_tokens=num_tokens,
+            local_geometry=local_geometry,
+        )
+        token_single = atom_encoder_output.token_hidden
+
+        token_tail = token_features[..., self.single_size :].to(token_single)
+        token_embedding = torch.cat([token_single, token_tail], dim=-1)
+
+        if token_mask is not None:
+            token_embedding = token_embedding * token_mask.unsqueeze(-1).to(dtype=token_embedding.dtype)
+        return token_embedding
+
+    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
+        r"""
+        Build local atom geometry using the input atom encoder layout.
+
+        Args:
+            reference_positions: Reference conformer atom positions ``[..., N_atom, 3]``.
+            reference_space_id: Per-atom reference-space grouping id ``[..., N_atom]``.
+
+        Returns:
+            Local atom geometry for the input atom encoder.
+        """
+
+        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id)
+
+
+class ProtenixConstraintEmbeddings(nn.Module):
+    r"""Complete four-branch pair-bias embedder from the constraint checkpoint."""
+
+    def __init__(self, pair_size: int = 128) -> None:
+        super().__init__()
+        self.pocket_z_embedder = nn.Linear(1, pair_size, bias=False)
+        self.contact_z_embedder = nn.Linear(2, pair_size, bias=False)
+        self.contact_atom_z_embedder = nn.Linear(2, pair_size, bias=False)
+        self.substructure_z_embedder = ProtenixConstraintSubstructureEmbeddings(pair_size)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        r"""Zero every released linear weight without changing PyTorch biases."""
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.weight)
+
+    def forward(
+        self,
+        pocket: Tensor,
+        contact: Tensor,
+        contact_atom: Tensor,
+        substructure: Tensor,
+    ) -> Tensor:
+        r"""Project and sum all four mandatory constraint features."""
+
+        return (
+            self.pocket_z_embedder(pocket)
+            + self.contact_z_embedder(contact)
+            + self.contact_atom_z_embedder(contact_atom)
+            + self.substructure_z_embedder(substructure)
+        )
+
+
+class ProtenixConstraintSubstructureEmbeddings(nn.Module):
+    r"""Released transformer over the flattened token-pair substructure grid."""
+
+    def __init__(self, pair_size: int = 128) -> None:
+        super().__init__()
+        hidden_size = 128
+        self.input_proj = nn.Linear(4, hidden_size, bias=False)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=4,
+            dim_feedforward=hidden_size * 4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.output_proj = nn.Linear(hidden_size, pair_size, bias=False)
+
+    def forward(self, substructure: Tensor) -> Tensor:
+        r"""Embed a four-channel token-pair substructure feature."""
+
+        shape = substructure.shape
+        flattened = substructure.reshape(-1, shape[-3] * shape[-2], shape[-1])
+        hidden = self.transformer(self.input_proj(flattened))
+        return self.output_proj(hidden).reshape(*shape[:-1], -1)
 
 
 def _protenix_bin_centers(
@@ -1014,225 +1168,19 @@ def _protenix_has_clash(
     return has_clash
 
 
-class InputEmbedder(nn.Module):
-    r"""
-    Build token input embeddings from packed atom and token features.
-
-    Runs the atom-to-token encoder to produce the leading token-single channels, then concatenates
-    the trailing token-feature tail so the output width matches the token feature contract.
-
-    Args:
-        single_size: Width of the atom-derived token-single channel.
-        atom_feature_size: Width of the per-atom input features consumed by the atom encoder.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        atom_feature_size: int = 385,
-    ) -> None:
-        super().__init__()
-        self.single_size = single_size
-        self.atom_encoder = AtomToTokenEncoder(
-            token_hidden_size=single_size,
-            atom_feature_size=atom_feature_size,
-            cross_attention_key_source="normalized",
-        )
-
-    def forward(
-        self,
-        atom_features: Tensor,
-        *,
-        reference_positions: Tensor,
-        reference_charges: Tensor,
-        reference_mask: Tensor,
-        token_features: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-        atom_mask: Tensor | None = None,
-        token_mask: Tensor | None = None,
-        local_geometry: LocalAtomGeometry | None = None,
-    ) -> Tensor:
-        r"""
-        Return token embeddings concatenating atom-derived channels and the token-feature tail.
-
-        Args:
-            atom_features: Per-atom input features ``[..., N_atom, atom_feature_size]``.
-            reference_positions: Reference conformer atom positions ``[..., N_atom, 3]``.
-            reference_charges: Per-atom reference charges ``[..., N_atom, 1]`` (arcsinh-compressed here).
-            reference_mask: Per-atom reference validity mask ``[..., N_atom]``.
-            token_features: Packed per-token features ``[..., N_token, token_feature_size]``.
-            atom_to_token: Token index per atom ``[..., N_atom]``.
-            num_tokens: Number of tokens.
-            atom_mask: Optional per-atom validity mask ``[..., N_atom]``.
-            token_mask: Optional per-token validity mask ``[..., N_token]``; zeroes masked rows.
-            local_geometry: Optional precomputed local atom geometry.
-
-        Returns:
-            Token embeddings ``[..., N_token, single_size + tail]`` with the token-feature tail appended.
-        """
-
-        encoder_reference_charges = torch.arcsinh(reference_charges)
-        atom_encoder_output = self.atom_encoder(
-            atom_features,
-            reference_positions=reference_positions,
-            reference_charges=encoder_reference_charges,
-            reference_mask=reference_mask,
-            atom_mask=atom_mask,
-            atom_to_token=atom_to_token,
-            num_tokens=num_tokens,
-            local_geometry=local_geometry,
-        )
-        token_single = atom_encoder_output.token_hidden
-
-        token_tail = token_features[..., self.single_size :].to(token_single)
-        token_embedding = torch.cat([token_single, token_tail], dim=-1)
-
-        if token_mask is not None:
-            token_embedding = token_embedding * token_mask.unsqueeze(-1).to(dtype=token_embedding.dtype)
-        return token_embedding
-
-    def build_local_geometry(self, reference_positions: Tensor, reference_space_id: Tensor) -> LocalAtomGeometry:
-        r"""
-        Build local atom geometry using the input atom encoder layout.
-
-        Args:
-            reference_positions: Reference conformer atom positions ``[..., N_atom, 3]``.
-            reference_space_id: Per-atom reference-space grouping id ``[..., N_atom]``.
-
-        Returns:
-            Local atom geometry for the input atom encoder.
-        """
-
-        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id)
-
-
-class ProtenixConstraintEmbedder(nn.Module):
-    r"""Complete four-branch pair-bias embedder from the constraint checkpoint."""
-
-    def __init__(self, pair_size: int = 128) -> None:
-        super().__init__()
-        self.pocket_z_embedder = nn.Linear(1, pair_size, bias=False)
-        self.contact_z_embedder = nn.Linear(2, pair_size, bias=False)
-        self.contact_atom_z_embedder = nn.Linear(2, pair_size, bias=False)
-        self.substructure_z_embedder = ProtenixConstraintSubstructureEmbedder(pair_size)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        r"""Zero every released linear weight without changing PyTorch biases."""
-
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.zeros_(module.weight)
-
-    def forward(
-        self,
-        pocket: Tensor,
-        contact: Tensor,
-        contact_atom: Tensor,
-        substructure: Tensor,
-    ) -> Tensor:
-        r"""Project and sum all four mandatory constraint features."""
-
-        return (
-            self.pocket_z_embedder(pocket)
-            + self.contact_z_embedder(contact)
-            + self.contact_atom_z_embedder(contact_atom)
-            + self.substructure_z_embedder(substructure)
-        )
-
-
-class ProtenixConstraintSubstructureEmbedder(nn.Module):
-    r"""Released transformer over the flattened token-pair substructure grid."""
-
-    def __init__(self, pair_size: int = 128) -> None:
-        super().__init__()
-        hidden_size = 128
-        self.input_proj = nn.Linear(4, hidden_size, bias=False)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=4,
-            dim_feedforward=hidden_size * 4,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        self.output_proj = nn.Linear(hidden_size, pair_size, bias=False)
-
-    def forward(self, substructure: Tensor) -> Tensor:
-        r"""Embed a four-channel token-pair substructure feature."""
-
-        shape = substructure.shape
-        flattened = substructure.reshape(-1, shape[-3] * shape[-2], shape[-1])
-        hidden = self.transformer(self.input_proj(flattened))
-        return self.output_proj(hidden).reshape(*shape[:-1], -1)
-
-
 # =====================================================================================
 # Typed tensor and semantic boundary of the released Protenix v0.5 graph.
 # =====================================================================================
 
 
-@dataclass(kw_only=True, eq=False, repr=False)
-class ProtenixInput:
-    r"""Named compute tensors and canonical identities consumed by Protenix.
+@dataclass(frozen=True, kw_only=True)
+class _ProtenixTrunkOutput:
+    r"""Named representations returned by the Protenix recycling trunk."""
 
-    ``msa``, ``has_deletion``, and ``deletion_value`` retain every deterministic
-    MSA row. ``fold`` samples rows independently for each recycle; ``forward``
-    consumes all rows without drawing randomness. Full-MSA profile and deletion
-    means are already present in ``token_features``.
-
-    ``pocket``, ``contact``, ``contact_atom``, and ``substructure`` are the four
-    constraint pair-bias channels of the v0.5.3 checkpoint (all zero for the default
-    v0.5.0 graph, whose model ignores them). ``system``, ``atom_sites``, and
-    ``token_sites`` carry the canonical identities used to reconstruct the result.
-    """
-
-    token_mask: Tensor
-    residue_index: Tensor
-    chain_index: Tensor
-    entity_index: Tensor
-    symmetry_index: Tensor
-    token_index: Tensor
-    atom_features: Tensor
-    atom_to_token: Tensor
-    atom_mask: Tensor
-    reference_positions: Tensor
-    reference_space_id: Tensor
-    atom_token_index: Tensor
-    token_to_rep_atom: Tensor
-    token_features: Tensor
-    reference_mask: Tensor
-    reference_charges: Tensor
-    token_bonds: Tensor
-    msa: Tensor
-    has_deletion: Tensor
-    deletion_value: Tensor
-    pocket: Tensor
-    contact: Tensor
-    contact_atom: Tensor
-    substructure: Tensor
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | ComponentReference, ...]
-
-
-@dataclass(eq=False, repr=False)
-class ProtenixOutput:
-    r"""Predictions computed by one Protenix denoising call."""
-
-    coordinates: Tensor
-    distogram_logits: Tensor
-    plddt_logits: Tensor
-    pae_logits: Tensor
-    pde_logits: Tensor
-    resolved_logits: Tensor
-
-    @property
-    def plddt(self) -> Tensor:
-        r"""Expected pLDDT on the conventional 0--100 scale."""
-
-        return expected_plddt(self.plddt_logits)
+    token_embedding: Tensor
+    single: Tensor
+    pair: Tensor
+    relative_features: RelativePositionBuckets
 
 
 # Spatial conditioning records for the Protenix v0.5.3 constraint graph.
@@ -1319,3 +1267,65 @@ class ProtenixPocket:
                 raise ValueError("ProtenixPocket contact residues must be residue references, not AtomSite atoms")
             if residue[0] == self.binder:
                 raise ValueError("a Protenix pocket residue cannot belong to the binder chain")
+
+
+@dataclass(kw_only=True, eq=False, repr=False)
+class ProtenixInput:
+    r"""Named compute tensors and canonical identities consumed by Protenix.
+
+    ``msa``, ``has_deletion``, and ``deletion_value`` retain every deterministic
+    MSA row. ``fold`` samples rows independently for each recycle; ``forward``
+    consumes all rows without drawing randomness. Full-MSA profile and deletion
+    means are already present in ``token_features``.
+
+    ``pocket``, ``contact``, ``contact_atom``, and ``substructure`` are the four
+    constraint pair-bias channels of the v0.5.3 checkpoint (all zero for the default
+    v0.5.0 graph, whose model ignores them). ``system``, ``atom_sites``, and
+    ``token_sites`` carry the canonical identities used to reconstruct the result.
+    """
+
+    token_mask: Tensor
+    residue_index: Tensor
+    chain_index: Tensor
+    entity_index: Tensor
+    symmetry_index: Tensor
+    token_index: Tensor
+    atom_features: Tensor
+    atom_to_token: Tensor
+    atom_mask: Tensor
+    reference_positions: Tensor
+    reference_space_id: Tensor
+    atom_token_index: Tensor
+    token_to_rep_atom: Tensor
+    token_features: Tensor
+    reference_mask: Tensor
+    reference_charges: Tensor
+    token_bonds: Tensor
+    msa: Tensor
+    has_deletion: Tensor
+    deletion_value: Tensor
+    pocket: Tensor
+    contact: Tensor
+    contact_atom: Tensor
+    substructure: Tensor
+    system: MolecularSystem
+    atom_sites: tuple[AtomSite, ...]
+    token_sites: tuple[AtomSite | ComponentReference, ...]
+
+
+@dataclass(eq=False, repr=False)
+class ProtenixOutput:
+    r"""Predictions computed by one Protenix denoising call."""
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    plddt_logits: Tensor
+    pae_logits: Tensor
+    pde_logits: Tensor
+    resolved_logits: Tensor
+
+    @property
+    def plddt(self) -> Tensor:
+        r"""Expected pLDDT on the conventional 0--100 scale."""
+
+        return expected_plddt(self.plddt_logits)

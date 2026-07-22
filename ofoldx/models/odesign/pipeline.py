@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from os import PathLike
-from typing import Literal, cast
+from typing import Literal
 
 import numpy as np
 import torch
@@ -55,7 +55,7 @@ from .model import (
     ODesignInput,
     ODesignModel,
     ODesignPlacements,
-    ReferenceCoordinates,
+    ODesignReferenceCoordinates,
 )
 from .processor import ODesignProcessor
 
@@ -182,21 +182,21 @@ def _protein_sequence_variants(
 ) -> tuple[tuple[dict[ComponentReference, int], dict[str, Score]], ...]:
     r"""Run upstream-equivalent ProteinMPNN sampling for one target chain."""
 
-    features = designer.processor(structure, positions=positions)
-    device = features.backbone_coordinates.device
-    length = features.sequence_tokens.shape[1]
-    design_mask = (features.valid_mask & features.design_mask).expand(num_sequences, -1)
+    model_input = designer.processor(structure, design_positions=positions)
+    device = model_input.backbone_coordinates.device
+    length = model_input.sequence_tokens.shape[1]
+    design_mask = (model_input.residue_mask & model_input.design_positions).expand(num_sequences, -1)
     priorities = torch.randn(
         num_sequences,
         length,
         device=device,
-        dtype=features.backbone_coordinates.dtype,
+        dtype=model_input.backbone_coordinates.dtype,
         generator=generator,
     )
     omit = torch.zeros(len(AMINO_ACID_COMPONENT_IDS) + 1, dtype=torch.bool, device=device)
     omit[AMINO_ACID_UNKNOWN_TOKEN] = True
     sampled = designer.model.sample(
-        features,
+        model_input,
         num_samples=num_sequences,
         temperature=temperature,
         decoding_ranks=_decoding_ranks(priorities, design_mask),
@@ -204,7 +204,7 @@ def _protein_sequence_variants(
         generator=generator,
     )
 
-    repeated_native = features.sequence_tokens.expand(num_sequences, -1)
+    repeated_native = model_input.sequence_tokens.expand(num_sequences, -1)
     losses = -torch.gather(sampled.log_probabilities, -1, sampled.sequences.unsqueeze(-1)).squeeze(-1)
     selected = design_mask.to(losses.dtype)
     selected_count = selected.sum(dim=-1)
@@ -212,7 +212,7 @@ def _protein_sequence_variants(
     recovery = ((sampled.sequences == repeated_native).to(losses.dtype) * selected).sum(dim=-1) / selected_count
     log_probability_sum = -(losses * selected).sum(dim=-1)
 
-    references = features.component_references[0]
+    references = model_input.component_references[0]
     selected_host = design_mask[0].detach().cpu().tolist()
     scope = frozenset(
         reference
@@ -268,7 +268,7 @@ def _ligand_sequence_variants(
 
     result = designer.design(
         structure,
-        positions=positions,
+        design_positions=positions,
         num_candidates=num_sequences,
         temperature=temperature,
         generator=generator,
@@ -428,7 +428,7 @@ class ODesignPipeline(CompositePipeline):
         seed: int | None = None,
         generator: torch.Generator | None = None,
         receptor_mode: Literal["rigid", "flex"] | None = None,
-        conditions: Sequence[Hotspot | SymbolicBond | ReferenceCoordinates] = (),
+        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
     ) -> ODesignDesignResult:
@@ -455,12 +455,13 @@ class ODesignPipeline(CompositePipeline):
 
         seed_list = self._resolve_seeds(num_seeds, seeds, seed, generator)
 
-        batch = self._build_batch(input, placement, conditions, receptor_mode)
+        model_input = self._build_batch(input, placement, conditions, receptor_mode)
         candidates: list[ODesignDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
-            stream = resolve_generator(int(backbone_seed), None, device=batch.reference_positions.device)
-            backbones, realized_input = self.model._design_with_input(
-                batch,
+            stream = resolve_generator(int(backbone_seed), None, device=model_input.reference_positions.device)
+            realized_input = self.processor.realize_ranges(model_input, generator=stream)
+            backbones = self.model.design(
+                realized_input,
                 num_candidates=num_backbones,
                 generator=stream,
                 num_sampling_steps=num_sampling_steps,
@@ -473,7 +474,7 @@ class ODesignPipeline(CompositePipeline):
                 )
 
             for backbone_index, backbone in enumerate(backbones.candidates):
-                structure = cast(Structure, backbone.structure)
+                structure = backbone.structure
                 used_ligand = _has_atom_context(structure.system)
                 chain_variants = []
                 for positions in design_chains:
@@ -508,7 +509,6 @@ class ODesignPipeline(CompositePipeline):
                     assigned_structure = _structure_with_system(structure, system)
                     candidates.append(
                         ODesignDesignCandidate(
-                            system=system,
                             structure=assigned_structure,
                             scores=_combine_chain_scores([variants[sequence_index][1] for variants in chain_variants]),
                             seed_index=seed_index,
@@ -553,9 +553,9 @@ class ODesignPipeline(CompositePipeline):
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         placement: ODesignPlacements | None,
-        conditions: Sequence[Hotspot | SymbolicBond | ReferenceCoordinates],
+        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates],
         receptor_mode: Literal["rigid", "flex"] | None,
-    ):
+    ) -> ODesignInput:
         r"""Lower the canonical input once, honoring an optional per-call receptor_mode override."""
 
         return self.processor(

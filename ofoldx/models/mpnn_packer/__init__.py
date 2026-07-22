@@ -2,11 +2,14 @@ r"""MPNN side-chain packing implementation."""
 
 from __future__ import annotations
 
+from typing import cast
+
 from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ..registry import MODELS, Task
 from .config import MpnnPackerConfig, MpnnPackerProcessorConfig
 from .model import (
     MpnnPackerFeatures,
+    MpnnPackerFrame,
     MpnnPackerInput,
     MpnnPackerModel,
     MpnnPackerOutput,
@@ -27,6 +30,6 @@ MODELS.register_model(
 PIPELINES.register_pipeline(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
-    tasks=("pack",),
+    tasks=cast(tuple[Task], ("pack",)),
     architectures=("ofoldx.mpnn_packer",),
 )

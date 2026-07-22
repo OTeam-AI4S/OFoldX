@@ -21,7 +21,7 @@ Structure-based biomolecular design family for universal binder design, controll
 
 > [!NOTE]
 > This family registers two Model/Processor pairs (`ofoldx.boltzgen`, `ofoldx.boltzgen_ifold`) and exposes the
-> canonical Processors (`BoltzGenProcessor`, `BoltzGenIFoldProcessor`), a family-owned result
+> canonical Processors (`BoltzGenProcessor`, `BoltzGenInverseFoldingProcessor`), a family-owned result
 > (`BoltzGenResult` / `BoltzGenCandidate` — a coordinate-producing, variable-topology result that does **not**
 > reuse the frozen coordinate-free `DesignResult`), and the multi-stage `BoltzGenPipeline`. The released system
 > is a 7-stage pipeline (`design -> inverse_folding -> design_folding -> folding -> affinity -> analysis ->
@@ -54,7 +54,7 @@ The OFFICIAL repository of BoltzGen is at [HannesStark/boltzgen](https://github.
 
 ## Model Details
 
-BoltzGen is a structure-based biomolecular design family with two architectures. `BoltzGenModel` refines single and pair representations with a Pairformer / MSA trunk, adds a v1 template module, token-distance conditioning, and binding / design-mask / secondary-structure conditioning, then samples complex coordinates with EDM diffusion. `BoltzGenIFoldModel` instead encodes a backbone into a k-nearest-neighbour token graph and autoregressively decodes residue types with amino-acid and symmetry constraints. The released structure checkpoints do not contain confidence or affinity heads; those belong to the Boltz-2 families.
+BoltzGen is a structure-based biomolecular design family with two architectures. `BoltzGenModel` refines single and pair representations with a Pairformer / MSA trunk, adds a v1 template module, token-distance conditioning, and binding / design-mask / secondary-structure conditioning, then samples complex coordinates with EDM diffusion. `BoltzGenInverseFoldingModel` instead encodes a backbone into a k-nearest-neighbour token graph and autoregressively decodes residue types with amino-acid and symmetry constraints. The released structure checkpoints do not contain confidence or affinity heads; those belong to the Boltz-2 families.
 
 ### Model Specification
 

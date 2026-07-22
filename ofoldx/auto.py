@@ -7,13 +7,14 @@ from typing import Any
 
 import torch
 
-from ._repository import (
+from .hub import (
     MODEL_METADATA,
     PROCESSOR_METADATA,
     load_model,
     load_processor,
     resolve_repository,
 )
+from .model import Model
 from .models.registry import MODELS
 
 
@@ -28,7 +29,7 @@ class AutoModel:
         token: str | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> Any:
+    ) -> Model:
         if not isinstance(pretrained_or_config, str | PathLike):
             if revision is not None:
                 raise ValueError("revision is valid only when AutoModel loads a model repository")
@@ -56,7 +57,7 @@ class AutoModel:
         token: str | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> Any:
+    ) -> Model:
         r"""Thin familiar spelling of ``AutoModel(pretrained, ...)``."""
 
         return cls(pretrained, revision=revision, token=token, device=device, dtype=dtype)

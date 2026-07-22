@@ -45,9 +45,9 @@ from ...results import FoldResult, Metric, Score, ScoreResult
 from .model import (
     BoltzGenDesignCandidate,
     BoltzGenDesignResult,
-    BoltzGenIFoldInput,
-    BoltzGenIFoldModel,
-    BoltzGenIFoldOutput,
+    BoltzGenInverseFoldingInput,
+    BoltzGenInverseFoldingModel,
+    BoltzGenInverseFoldingOutput,
     BoltzGenInput,
     BoltzGenLayout,
     BoltzGenModel,
@@ -55,7 +55,7 @@ from .model import (
     BoltzGenResidueConstraint,
     BoltzGenSchema,
 )
-from .processor import BoltzGenIFoldProcessor, BoltzGenProcessor
+from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 
 
 class BoltzGenFoldModel(Protocol):
@@ -92,8 +92,8 @@ class BoltzGenPipeline(CompositePipeline):
     Args:
         design_model: The structure-diffusion designer.
         design_processor: Its lowering Processor.
-        ifold_model: The inverse-folding designer.
-        ifold_processor: Its lowering Processor.
+        inverse_folding_model: The inverse-folding designer.
+        inverse_folding_processor: Its lowering Processor.
         fold: Optional injected fold-capable Model; refold runs iff present.
         fold_processor: Optional injected fold Processor paired with ``fold``.
         affinity: Optional injected score-capable Model; affinity runs iff present.
@@ -105,7 +105,7 @@ class BoltzGenPipeline(CompositePipeline):
     # sub-pairs (``required=False``) — written and reloaded only when they were injected.
     _PAIR_LAYOUT = (
         CompositePair("", "design_model", "design_processor"),
-        CompositePair("ifold", "ifold_model", "ifold_processor"),
+        CompositePair("ifold", "inverse_folding_model", "inverse_folding_processor"),
         CompositePair("fold", "fold", "fold_processor", required=False),
         CompositePair("affinity", "affinity", "affinity_processor", required=False),
     )
@@ -115,8 +115,8 @@ class BoltzGenPipeline(CompositePipeline):
         *,
         design_model: BoltzGenModel,
         design_processor: BoltzGenProcessor,
-        ifold_model: BoltzGenIFoldModel,
-        ifold_processor: BoltzGenIFoldProcessor,
+        inverse_folding_model: BoltzGenInverseFoldingModel,
+        inverse_folding_processor: BoltzGenInverseFoldingProcessor,
         fold: BoltzGenFoldModel | None = None,
         fold_processor: BoltzGenStageProcessor | None = None,
         affinity: BoltzGenScoreModel | None = None,
@@ -124,8 +124,8 @@ class BoltzGenPipeline(CompositePipeline):
     ) -> None:
         self.design_model = design_model
         self.design_processor = design_processor
-        self.ifold_model = ifold_model
-        self.ifold_processor = ifold_processor
+        self.inverse_folding_model = inverse_folding_model
+        self.inverse_folding_processor = inverse_folding_processor
         self.fold = fold
         self.fold_processor = fold_processor
         self.affinity = affinity
@@ -136,8 +136,8 @@ class BoltzGenPipeline(CompositePipeline):
 
         self.design_model.to(device=device, dtype=dtype)
         self.design_processor.to(device=device, dtype=dtype)
-        self.ifold_model.to(device=device, dtype=dtype)
-        self.ifold_processor.to(device=device, dtype=dtype)
+        self.inverse_folding_model.to(device=device, dtype=dtype)
+        self.inverse_folding_processor.to(device=device, dtype=dtype)
         for component in (self.fold, self.fold_processor, self.affinity, self.affinity_processor):
             if component is not None:
                 component.to(device=device, dtype=dtype)
@@ -202,13 +202,13 @@ class BoltzGenPipeline(CompositePipeline):
 
         candidates: list[BoltzGenDesignCandidate] = []
         for sample_index in range(num_candidates):
-            backbone = _decode_structure(design_batch, design_output.pred_coords[0, sample_index])
-            ifold_batch = self.ifold_processor(backbone, design=design_references)
-            ifold_output = self.ifold_model.design(ifold_batch, temperature=temperature, generator=generator)
+            backbone = _decode_structure(design_batch, design_output.coordinates[0, sample_index])
+            inverse_folding_input = self.inverse_folding_processor(backbone, design=design_references)
+            inverse_folding_output = self.inverse_folding_model.design(inverse_folding_input, temperature=temperature, generator=generator)
             candidate = self._analyze(
                 backbone=backbone,
-                ifold_batch=ifold_batch,
-                ifold_output=ifold_output,
+                inverse_folding_input=inverse_folding_input,
+                inverse_folding_output=inverse_folding_output,
                 generator=generator,
             )
             candidates.append(candidate)
@@ -227,16 +227,16 @@ class BoltzGenPipeline(CompositePipeline):
     ) -> BoltzGenDesignResult:
         r"""Run inverse folding (stage 2) standalone on a fixed backbone."""
 
-        ifold_batch = self.ifold_processor(input, design=design, aa_constraints=aa_constraints, symmetry=symmetry)
+        inverse_folding_input = self.inverse_folding_processor(input, design=design, aa_constraints=aa_constraints, symmetry=symmetry)
         backbone = _fixed_backbone_structure(input)
         candidates: list[BoltzGenDesignCandidate] = []
         for _ in range(num_sequences):
-            ifold_output = self.ifold_model.design(ifold_batch, temperature=temperature, generator=generator)
+            inverse_folding_output = self.inverse_folding_model.design(inverse_folding_input, temperature=temperature, generator=generator)
             candidates.append(
                 self._analyze(
                     backbone=backbone,
-                    ifold_batch=ifold_batch,
-                    ifold_output=ifold_output,
+                    inverse_folding_input=inverse_folding_input,
+                    inverse_folding_output=inverse_folding_output,
                     generator=generator,
                 )
             )
@@ -246,8 +246,8 @@ class BoltzGenPipeline(CompositePipeline):
         self,
         *,
         backbone: Structure,
-        ifold_batch: BoltzGenIFoldInput,
-        ifold_output: BoltzGenIFoldOutput,
+        inverse_folding_input: BoltzGenInverseFoldingInput,
+        inverse_folding_output: BoltzGenInverseFoldingOutput,
         generator: torch.Generator | None,
     ) -> BoltzGenDesignCandidate:
         r"""Assemble one candidate: remap the designed sequence, attach the NLL metric and scores.
@@ -259,14 +259,14 @@ class BoltzGenPipeline(CompositePipeline):
         that designed sequence. The per-residue NLL is additionally exposed as a ``Metric`` axis.
         """
 
-        layout = ifold_batch.layout
+        layout = inverse_folding_input.layout
         assert layout is not None
         scores: dict[str, Score] = {}
         metrics: dict[str, Metric] = {}
 
-        logits = ifold_output.logits
+        logits = inverse_folding_output.logits
         log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-        tokens = ifold_output.tokens
+        tokens = inverse_folding_output.tokens
         axis = tuple(layout.output_residues)
         if tokens is not None:
             per_residue_nll = -log_probs.gather(-1, tokens[0].long().unsqueeze(-1)).squeeze(-1)
@@ -279,7 +279,7 @@ class BoltzGenPipeline(CompositePipeline):
         # Released remap: write the inverse-fold argmax residue identities into the output Structure
         # at the design positions, so the candidate carries the DESIGNED sequence (not placeholders)
         # and the refold folds it.
-        structure = _remap_designed_sequence(backbone, ifold_batch, ifold_output)
+        structure = _remap_designed_sequence(backbone, inverse_folding_input, inverse_folding_output)
         # Composition IS the switch: refold runs iff a fold Model+Processor is composed in, affinity
         # runs iff a score Model+Processor is composed in. No mode flags.
         if self.fold is not None or self.fold_processor is not None:
@@ -382,8 +382,8 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
 
 def _remap_designed_sequence(
     backbone: Structure,
-    ifold_batch: BoltzGenIFoldInput,
-    ifold_output: BoltzGenIFoldOutput,
+    inverse_folding_input: BoltzGenInverseFoldingInput,
+    inverse_folding_output: BoltzGenInverseFoldingOutput,
 ) -> Structure:
     r"""Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
 
@@ -397,9 +397,9 @@ def _remap_designed_sequence(
     residues (fixed context) are carried verbatim.
     """
 
-    layout = cast(BoltzGenLayout, ifold_batch.layout)
-    tokens = cast(torch.Tensor, ifold_output.tokens)
-    design_mask = cast(torch.Tensor, ifold_batch.design_mask)
+    layout = cast(BoltzGenLayout, inverse_folding_input.layout)
+    tokens = cast(torch.Tensor, inverse_folding_output.tokens)
+    design_mask = cast(torch.Tensor, inverse_folding_input.design_mask)
 
     token_ids = tokens[0].long().tolist()
     flags = design_mask[0].bool().tolist()

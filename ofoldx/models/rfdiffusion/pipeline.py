@@ -1,8 +1,8 @@
 r"""RFdiffusion generation and design pipeline.
 
-``design`` lowers one generation input through :class:`RFdiffusionProcessor`, runs the released
-reverse-diffusion sampler via :meth:`RFdiffusionModel.design`, and returns the coordinate-producing
-:class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignResult`. A single caller-controlled
+``design`` lowers one generation input through :class:`RfDiffusionProcessor`, runs the released
+reverse-diffusion sampler via :meth:`RfDiffusionModel.design`, and returns the coordinate-producing
+:class:`~ofoldx.models.rfdiffusion.model.RfDiffusionDesignResult`. A single caller-controlled
 ``seed`` or ``generator`` supplies the random stream for every requested candidate without
 unintended reseeding.
 
@@ -28,45 +28,45 @@ from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline, resolve_generator
 from .model import (
-    Coordination,
-    Distance,
     Hotspot,
-    PointGroupSymmetry,
-    RadiusOfGyration,
-    ReferenceCoordinates,
-    RFdiffusionDesignResult,
-    RFdiffusionModel,
-    RFdiffusionPlacements,
-    SecondaryStructure,
-    SubstrateInteraction,
+    RfDiffusionCoordination,
+    RfDiffusionDesignResult,
+    RfDiffusionDistance,
+    RfDiffusionModel,
+    RfDiffusionPlacements,
+    RfDiffusionPointGroupSymmetry,
+    RfDiffusionRadiusOfGyration,
+    RfDiffusionReferenceCoordinates,
+    RfDiffusionSecondaryStructure,
+    RfDiffusionSubstrateInteraction,
 )
-from .processor import RFdiffusionProcessor
+from .processor import RfDiffusionProcessor
 
 
-class RFdiffusionPipeline(PairedPipeline[RFdiffusionModel, RFdiffusionProcessor]):
+class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]):
     r"""Bind one RFdiffusion Model-Processor pair for coordinate-producing design.
 
     Marker id ``"ofoldx.rfdiffusion"``. :meth:`design` returns an
-    :class:`RFdiffusionDesignResult`.
+    :class:`RfDiffusionDesignResult`.
     """
 
     def design(
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None = None,
         *,
-        placement: RFdiffusionPlacements | None = None,
+        placement: RfDiffusionPlacements | None = None,
         templates: Sequence[Template] = (),
         conditions: Sequence[
             AllowedResidueIdentities
             | Hotspot
-            | Coordination
+            | RfDiffusionCoordination
             | SymbolicBond
-            | Distance
-            | PointGroupSymmetry
-            | RadiusOfGyration
-            | ReferenceCoordinates
-            | SecondaryStructure
-            | SubstrateInteraction
+            | RfDiffusionDistance
+            | RfDiffusionPointGroupSymmetry
+            | RfDiffusionRadiusOfGyration
+            | RfDiffusionReferenceCoordinates
+            | RfDiffusionSecondaryStructure
+            | RfDiffusionSubstrateInteraction
         ] = (),
         inpaint_sequence: Sequence[ComponentReference] = (),
         length: tuple[int, int] | None = None,
@@ -89,14 +89,14 @@ class RFdiffusionPipeline(PairedPipeline[RFdiffusionModel, RFdiffusionProcessor]
         guidance_decay: str = "constant",
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> RFdiffusionDesignResult:
-        r"""Lower one generation input and run released RFdiffusion design into an ``RFdiffusionDesignResult``.
+    ) -> RfDiffusionDesignResult:
+        r"""Lower one generation input and run released RFdiffusion design into an ``RfDiffusionDesignResult``.
 
         Lowers base, complex, inpaint, active-site, or fold conditioning through the Processor,
         honoring ``inpaint_sequence`` and the RFdiffusion ``length``
         (``ContigMap.length``, combined generated length across inpaint chains, excluding receptor)
         -- then forwards every effective released sampling control to
-        :meth:`RFdiffusionModel.design`. ``seed`` and ``generator`` are mutually exclusive and are
+        :meth:`RfDiffusionModel.design`. ``seed`` and ``generator`` are mutually exclusive and are
         the single caller-controlled run-level random stream for the ``num_candidates`` samples.
         Each candidate contains the complete decoded backbone ``Structure`` of one generated design.
         """

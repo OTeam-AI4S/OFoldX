@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Collection
 from importlib import import_module
 from os import PathLike
-from typing import Literal, NamedTuple, Protocol, cast
+from typing import NamedTuple, Protocol, cast
 
 import chanfig
 import torch
 
-PipelineTask = Literal["fold", "design", "score", "pack"]
-_PIPELINE_TASKS = frozenset({"fold", "design", "score", "pack"})
+from ..models.registry import TASKS, Task
 
 _BUILTIN_PIPELINE_MODULES = {
     "ofoldx.alphafold2": "ofoldx.models.alphafold2",
@@ -54,7 +53,7 @@ class PipelineRegistration(NamedTuple):
 
     id: str
     pipeline: type[object]
-    tasks: frozenset[PipelineTask]
+    tasks: frozenset[Task]
     architectures: frozenset[str]
     repository_loader: RepositoryLoader | None
 
@@ -80,7 +79,7 @@ class PipelineRegistry(chanfig.Registry):
         id: str,
         *,
         pipeline: type[object],
-        tasks: Collection[str],
+        tasks: Collection[Task],
         architectures: Collection[str] = (),
         repository_loader: RepositoryLoader | None = None,
     ) -> None:
@@ -92,10 +91,9 @@ class PipelineRegistry(chanfig.Registry):
             raise ValueError(f"pipeline class is already registered as {self.ids[pipeline]!r}")
 
         task_values = frozenset(tasks)
-        unknown = task_values - _PIPELINE_TASKS
+        unknown = task_values - TASKS
         if unknown:
             raise ValueError(f"unknown pipeline tasks: {unknown!r}")
-        validated_tasks = cast(frozenset[PipelineTask], task_values)
 
         architecture_values = frozenset(architectures)
         for architecture in architecture_values:
@@ -106,7 +104,7 @@ class PipelineRegistry(chanfig.Registry):
         registration = PipelineRegistration(
             id=id,
             pipeline=pipeline,
-            tasks=validated_tasks,
+            tasks=task_values,
             architectures=architecture_values,
             repository_loader=repository_loader,
         )

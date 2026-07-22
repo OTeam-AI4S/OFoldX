@@ -1,7 +1,7 @@
 r"""Input processing for BoltzGen structure design and inverse folding.
 
 ``BoltzGenProcessor`` materializes generated placements and design conditioning.
-``BoltzGenIFoldProcessor`` lowers a fixed backbone and inverse-fold constraints.
+``BoltzGenInverseFoldingProcessor`` lowers a fixed backbone and inverse-fold constraints.
 This module owns their token, atom, MSA, template, and conditioning features.
 """
 
@@ -33,7 +33,9 @@ from ...data.placement import (
     SymbolicResidueSite,
 )
 from ...data.placement import instance_of as _placement_instance_of
-from ...data.placement import resolve
+from ...data.placement import (
+    resolve,
+)
 from ...data.structure import Structure
 from ...io.structure import read_structure
 from .model import (
@@ -43,8 +45,8 @@ from .model import (
     BoltzGenContact,
     BoltzGenCovalentBond,
     BoltzGenDesignMask,
-    BoltzGenIFoldInput,
-    BoltzGenIFoldLayout,
+    BoltzGenInverseFoldingInput,
+    BoltzGenInverseFoldingLayout,
     BoltzGenInput,
     BoltzGenLayout,
     BoltzGenPlacements,
@@ -690,8 +692,8 @@ class BoltzGenProcessor:
         return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
 
 
-class BoltzGenIFoldProcessor:
-    r"""Lower one fixed backbone and its inverse-fold constraints to ``BoltzGenIFoldInput``.
+class BoltzGenInverseFoldingProcessor:
+    r"""Lower one fixed backbone and its inverse-fold constraints to ``BoltzGenInverseFoldingInput``.
 
     Supported constraints are ``design`` positions (``design_mask``), per-residue
     amino-acid constraints (``aa_constraints`` → ``aa_constraint_mask``), and symmetric
@@ -720,13 +722,13 @@ class BoltzGenIFoldProcessor:
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-    ) -> BoltzGenIFoldInput:
+    ) -> BoltzGenInverseFoldingInput:
         r"""Validate and lower one fixed backbone to inverse-fold input."""
 
         if isinstance(input, str | PathLike):
             input = read_structure(Path(input).expanduser())
         if not isinstance(input, Structure):
-            raise TypeError("BoltzGenIFoldProcessor requires a fixed backbone Structure or structure path")
+            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure or structure path")
         system = input.system
         if not system.instances:
             raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
@@ -748,7 +750,7 @@ class BoltzGenIFoldProcessor:
         design: tuple[ComponentReference, ...],
         aa_constraints: tuple[BoltzGenResidueConstraint, ...],
         symmetry: tuple[tuple[ComponentReference, ...], ...],
-    ) -> BoltzGenIFoldInput:
+    ) -> BoltzGenInverseFoldingInput:
         r"""Lower a fixed or generated backbone to inverse-folding tensors and constraint masks."""
 
         system = structure.system
@@ -839,14 +841,14 @@ class BoltzGenIFoldProcessor:
             )
             for name, value in tensor_values.items()
         }
-        layout = BoltzGenIFoldLayout(
+        layout = BoltzGenInverseFoldingLayout(
             system=system,
             atom_sites=atom_sites,
             token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
             output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
         )
-        return BoltzGenIFoldInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
+        return BoltzGenInverseFoldingInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
 
 
 # Shared BoltzGen featurization helpers.
@@ -1341,7 +1343,7 @@ def _aa_constraint_mask(
     r"""Realize per-residue AA constraints into the ``[N, 20]`` canonical-AA block mask.
 
     The ``[N, 20]`` mask follows ``CANONICAL_TOKENS`` order, where ``0`` is allowed and ``1`` disallowed;
-    the default is all-zero (unconstrained). ``BoltzGenIFoldModel._build_constraint_logit_mask``
+    the default is all-zero (unconstrained). ``BoltzGenInverseFoldingModel._build_constraint_logit_mask``
     consumes it as ``> 0`` -> ``-1e6`` additive logit bias. Each ``allowed`` whitelist blocks every
     canonical AA except the listed codes, accumulated with ``max`` so overlapping constraints
     intersect (only AAs allowed by every covering constraint survive).
@@ -1419,7 +1421,7 @@ def _template_channels(
     r"""Lower aligned :class:`~ofoldx.data.evidence.Template` evidence into the BoltzGen template tensors.
 
     Returns ``None`` when no templates are supplied, so the model skips the template module.
-    Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by ``TemplateModule``:
+    Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by ``BoltzGenTemplateModule``:
     residue-type one-hot
     (``num_tokens == 33``), ``compute_frame`` backbone frame (protein, all of N/CA/C resolved),
     CB (``disto``) coords + mask, CA (``center``) coords, ``template_mask`` / ``visibility_ids`` set

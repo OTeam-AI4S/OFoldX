@@ -40,90 +40,10 @@ class _LoweredRows(NamedTuple):
     coordinates: tuple[np.ndarray, ...]
     tokens: tuple[int, ...]
     valid: tuple[bool, ...]
-    residue_indices: tuple[int, ...]
-    chain_indices: tuple[int, ...]
+    residue_index: tuple[int, ...]
+    chain_index: tuple[int, ...]
     design: tuple[bool, ...]
     component_ids: tuple[str | None, ...]
-
-
-def _read_proteinmpnn_pdb(
-    path: str | PathLike[str],
-    chains: Sequence[str] | None = None,
-) -> Structure:
-    r"""Read the exact fixed-column PDB slice released with ProteinMPNN."""
-
-    residue_keys_by_chain: dict[str, list[tuple[str, int, str]]] = {}
-    component_id_by_residue: dict[tuple[str, int, str], str] = {}
-    atoms_by_residue: dict[
-        tuple[str, int, str],
-        dict[str, tuple[np.ndarray, str]],
-    ] = {}
-    with Path(path).expanduser().open() as handle:
-        for line in handle:
-            record = line[:6]
-            component_id = line[17:20].strip()
-            if line[:4] != "ATOM" and not (record == "HETATM" and component_id == "MSE"):
-                continue
-
-            instance_id = line[21:22]
-            if chains is not None and instance_id not in chains:
-                continue
-            number = int(line[22:26])
-            insertion_code = line[26:27].strip()
-            residue_key = (instance_id, number, insertion_code)
-            if residue_key not in component_id_by_residue:
-                component_id_by_residue[residue_key] = component_id
-                atoms_by_residue[residue_key] = {}
-                residue_keys_by_chain.setdefault(instance_id, []).append(residue_key)
-
-            atom_id = line[12:16].strip()
-            parsed_coordinates = np.array([float(line[start : start + 8]) for start in (30, 38, 46)])
-            residue_atoms = atoms_by_residue[residue_key]
-            if atom_id not in residue_atoms:
-                residue_atoms[atom_id] = (
-                    parsed_coordinates,
-                    line[76:78].strip().title(),
-                )
-
-    if not component_id_by_residue:
-        raise ValueError("ProteinMPNN requires at least one PDB ATOM residue or HETATM MSE residue")
-
-    entities: dict[str, PolymerSequence | Molecule] = {}
-    instances: dict[str, str] = {}
-    sites: list[AtomSite] = []
-    coordinates: list[np.ndarray] = []
-    residue_numbers: dict[ComponentReference, ResidueNumber] = {}
-    for instance_id, residue_keys in residue_keys_by_chain.items():
-        components: list[ChemicalComponent] = []
-        for component_index, residue_key in enumerate(residue_keys):
-            residue_atoms = atoms_by_residue[residue_key]
-            components.append(
-                ChemicalComponent(
-                    component_id=component_id_by_residue[residue_key],
-                    atoms=tuple(
-                        ChemicalAtom(atom_id=atom_id, element=element)
-                        for atom_id, (_coordinates, element) in residue_atoms.items()
-                    ),
-                    bonds=None,
-                )
-            )
-            residue_numbers[(instance_id, component_index)] = ResidueNumber(
-                residue_key[1],
-                residue_key[2],
-            )
-            for atom_id, (atom_coordinates, _element) in residue_atoms.items():
-                sites.append(AtomSite(instance_id, component_index, atom_id))
-                coordinates.append(atom_coordinates)
-        entities[instance_id] = PolymerSequence("protein", tuple(components))
-        instances[instance_id] = instance_id
-
-    return Structure(
-        MolecularSystem(entities, instances),
-        tuple(sites),
-        np.stack(coordinates),
-        np.ones(len(sites), dtype=np.bool_),
-        residue_numbers=residue_numbers,
-    )
 
 
 class ProteinMpnnProcessor:
@@ -158,7 +78,7 @@ class ProteinMpnnProcessor:
         input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
@@ -173,7 +93,7 @@ class ProteinMpnnProcessor:
                 input,
                 chains=None,
                 sequence=sequence,
-                positions=positions,
+                design_positions=design_positions,
                 conditions=conditions,
                 tied_weights=tied_weights,
                 residue_logit_bias=residue_logit_bias,
@@ -184,7 +104,7 @@ class ProteinMpnnProcessor:
         return self.process_structure(
             input,
             sequence=sequence,
-            positions=positions,
+            design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
             residue_logit_bias=residue_logit_bias,
@@ -200,7 +120,7 @@ class ProteinMpnnProcessor:
         *,
         chains: Sequence[str] | None = None,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
@@ -212,7 +132,7 @@ class ProteinMpnnProcessor:
 
         structure = _read_proteinmpnn_pdb(path, chains)
         structure, system = self._resolve_target(structure, sequence)
-        rows = self._lower_pdb_rows(structure, system, positions)
+        rows = self._lower_pdb_rows(structure, system, design_positions)
         return self._finalize(
             structure,
             system,
@@ -230,7 +150,7 @@ class ProteinMpnnProcessor:
         structure: Structure,
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
@@ -242,7 +162,7 @@ class ProteinMpnnProcessor:
         r"""Lower a canonical Structure with the updated LigandMPNN protein/soluble semantics."""
 
         structure, system = self._resolve_target(structure, sequence)
-        rows = self._lower_structure_rows(structure, system, positions, filter_by_occupancy)
+        rows = self._lower_structure_rows(structure, system, design_positions, filter_by_occupancy)
         return self._finalize(
             structure,
             system,
@@ -379,7 +299,7 @@ class ProteinMpnnProcessor:
         self,
         structure: Structure,
         system: MolecularSystem,
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
     ) -> _LoweredRows:
         r"""Build fixed-column rows: designed chains first, numeric gaps, ``100 * c + i`` positions."""
 
@@ -414,10 +334,10 @@ class ProteinMpnnProcessor:
                 coordinates_by_reference[reference] = atom_coordinates[0] if self.config.ca_only else atom_coordinates
                 valid_by_reference[reference] = valid
 
-        if positions is None:
+        if design_positions is None:
             selected_references = {reference for reference, valid in valid_by_reference.items() if valid}
         else:
-            selected_references = set(positions)
+            selected_references = set(design_positions)
             for selected_reference in selected_references:
                 if selected_reference not in valid_by_reference:
                     raise ValueError(f"ProteinMPNN position {selected_reference!r} is not a protein occurrence")
@@ -434,8 +354,8 @@ class ProteinMpnnProcessor:
         row_coordinates: list[np.ndarray] = []
         row_tokens: list[int] = []
         row_valid: list[bool] = []
-        row_residue_indices: list[int] = []
-        row_chain_indices: list[int] = []
+        row_residue_index: list[int] = []
+        row_chain_index: list[int] = []
         row_design: list[bool] = []
         row_references: list[ComponentReference | None] = []
         row_component_ids: list[str | None] = []
@@ -463,8 +383,8 @@ class ProteinMpnnProcessor:
             for row_reference in chain_rows:
                 global_row_index = len(row_references)
                 row_references.append(row_reference)
-                row_residue_indices.append(100 * chain_index + global_row_index)
-                row_chain_indices.append(chain_index)
+                row_residue_index.append(100 * chain_index + global_row_index)
+                row_chain_index.append(chain_index)
                 if row_reference is None:
                     coordinate_shape = (3,) if self.config.ca_only else (4, 3)
                     row_coordinates.append(np.zeros(coordinate_shape, dtype=structure.coordinates.dtype))
@@ -492,8 +412,8 @@ class ProteinMpnnProcessor:
             tuple(row_coordinates),
             tuple(row_tokens),
             tuple(row_valid),
-            tuple(row_residue_indices),
-            tuple(row_chain_indices),
+            tuple(row_residue_index),
+            tuple(row_chain_index),
             tuple(row_design),
             tuple(row_component_ids),
         )
@@ -502,7 +422,7 @@ class ProteinMpnnProcessor:
         self,
         structure: Structure,
         system: MolecularSystem,
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
         filter_by_occupancy: bool,
     ) -> _LoweredRows:
         r"""Build updated rows: observed-CA occurrences in source order, cumulative positions."""
@@ -518,7 +438,7 @@ class ProteinMpnnProcessor:
         row_coordinates: list[np.ndarray] = []
         row_valid: list[bool] = []
         row_component_ids: list[str | None] = []
-        row_chain_indices: list[int] = []
+        row_chain_index: list[int] = []
         row_source_numbers: list[int | None] = []
         chain_label_by_instance: dict[str, int] = {}
         for index, site in enumerate(structure.sites):
@@ -547,16 +467,16 @@ class ProteinMpnnProcessor:
             row_coordinates.append(atom_coordinates[0] if self.config.ca_only else atom_coordinates)
             row_valid.append(valid)
             row_component_ids.append(system.component(reference).component_id)
-            row_chain_indices.append(chain_label_by_instance[site.instance_id])
+            row_chain_index.append(chain_label_by_instance[site.instance_id])
             row_source_numbers.append(
                 None if structure.residue_numbers is None else structure.residue_numbers[reference].number
             )
 
-        row_residue_indices: list[int] = []
+        row_residue_index: list[int] = []
         if structure.residue_numbers is None:
             for row_reference in row_references:
                 assert row_reference is not None
-                row_residue_indices.append(row_reference[1])
+                row_residue_index.append(row_reference[1])
         else:
             duplicate_count = 0
             previous_number: int | None = None
@@ -564,7 +484,7 @@ class ProteinMpnnProcessor:
                 assert source_number is not None
                 if source_number == previous_number:
                     duplicate_count += 1
-                row_residue_indices.append(source_number + duplicate_count)
+                row_residue_index.append(source_number + duplicate_count)
                 previous_number = source_number
 
         row_tokens = [
@@ -577,10 +497,10 @@ class ProteinMpnnProcessor:
         ]
 
         valid_by_reference = dict(zip(row_references, row_valid))
-        if positions is None:
+        if design_positions is None:
             selected_references = {reference for reference, valid in zip(row_references, row_valid) if valid}
         else:
-            selected_references = set(positions)
+            selected_references = set(design_positions)
             for selected_reference in selected_references:
                 if selected_reference not in valid_by_reference:
                     raise ValueError(f"ProteinMPNN position {selected_reference!r} is not a protein occurrence")
@@ -595,8 +515,8 @@ class ProteinMpnnProcessor:
             tuple(row_coordinates),
             tuple(row_tokens),
             tuple(row_valid),
-            tuple(row_residue_indices),
-            tuple(row_chain_indices),
+            tuple(row_residue_index),
+            tuple(row_chain_index),
             tuple(row_design),
             tuple(row_component_ids),
         )
@@ -621,8 +541,8 @@ class ProteinMpnnProcessor:
             row_coordinates,
             row_tokens,
             row_valid,
-            row_residue_indices,
-            row_chain_indices,
+            row_residue_index,
+            row_chain_index,
             row_design,
             row_component_ids,
         ) = rows
@@ -838,22 +758,22 @@ class ProteinMpnnProcessor:
                 device=self.device,
                 dtype=torch.int64,
             ).unsqueeze(0),
-            valid_mask=torch.tensor(
+            residue_mask=torch.tensor(
                 row_valid,
                 device=self.device,
                 dtype=torch.bool,
             ).unsqueeze(0),
-            residue_indices=torch.tensor(
-                row_residue_indices,
+            residue_index=torch.tensor(
+                row_residue_index,
                 device=self.device,
                 dtype=torch.int64,
             ).unsqueeze(0),
-            chain_indices=torch.tensor(
-                row_chain_indices,
+            chain_index=torch.tensor(
+                row_chain_index,
                 device=self.device,
                 dtype=torch.int64,
             ).unsqueeze(0),
-            design_mask=torch.tensor(
+            design_positions=torch.tensor(
                 row_design,
                 device=self.device,
                 dtype=torch.bool,
@@ -872,3 +792,83 @@ class ProteinMpnnProcessor:
             pssm_probabilities=pssm_probability_values,
             pssm_log_odds=pssm_log_odds_values,
         )
+
+
+def _read_proteinmpnn_pdb(
+    path: str | PathLike[str],
+    chains: Sequence[str] | None = None,
+) -> Structure:
+    r"""Read the exact fixed-column PDB slice released with ProteinMPNN."""
+
+    residue_keys_by_chain: dict[str, list[tuple[str, int, str]]] = {}
+    component_id_by_residue: dict[tuple[str, int, str], str] = {}
+    atoms_by_residue: dict[
+        tuple[str, int, str],
+        dict[str, tuple[np.ndarray, str]],
+    ] = {}
+    with Path(path).expanduser().open() as handle:
+        for line in handle:
+            record = line[:6]
+            component_id = line[17:20].strip()
+            if line[:4] != "ATOM" and not (record == "HETATM" and component_id == "MSE"):
+                continue
+
+            instance_id = line[21:22]
+            if chains is not None and instance_id not in chains:
+                continue
+            number = int(line[22:26])
+            insertion_code = line[26:27].strip()
+            residue_key = (instance_id, number, insertion_code)
+            if residue_key not in component_id_by_residue:
+                component_id_by_residue[residue_key] = component_id
+                atoms_by_residue[residue_key] = {}
+                residue_keys_by_chain.setdefault(instance_id, []).append(residue_key)
+
+            atom_id = line[12:16].strip()
+            parsed_coordinates = np.array([float(line[start : start + 8]) for start in (30, 38, 46)])
+            residue_atoms = atoms_by_residue[residue_key]
+            if atom_id not in residue_atoms:
+                residue_atoms[atom_id] = (
+                    parsed_coordinates,
+                    line[76:78].strip().title(),
+                )
+
+    if not component_id_by_residue:
+        raise ValueError("ProteinMPNN requires at least one PDB ATOM residue or HETATM MSE residue")
+
+    entities: dict[str, PolymerSequence | Molecule] = {}
+    instances: dict[str, str] = {}
+    sites: list[AtomSite] = []
+    coordinates: list[np.ndarray] = []
+    residue_numbers: dict[ComponentReference, ResidueNumber] = {}
+    for instance_id, residue_keys in residue_keys_by_chain.items():
+        components: list[ChemicalComponent] = []
+        for component_index, residue_key in enumerate(residue_keys):
+            residue_atoms = atoms_by_residue[residue_key]
+            components.append(
+                ChemicalComponent(
+                    component_id=component_id_by_residue[residue_key],
+                    atoms=tuple(
+                        ChemicalAtom(atom_id=atom_id, element=element)
+                        for atom_id, (_coordinates, element) in residue_atoms.items()
+                    ),
+                    bonds=None,
+                )
+            )
+            residue_numbers[(instance_id, component_index)] = ResidueNumber(
+                residue_key[1],
+                residue_key[2],
+            )
+            for atom_id, (atom_coordinates, _element) in residue_atoms.items():
+                sites.append(AtomSite(instance_id, component_index, atom_id))
+                coordinates.append(atom_coordinates)
+        entities[instance_id] = PolymerSequence("protein", tuple(components))
+        instances[instance_id] = instance_id
+
+    return Structure(
+        MolecularSystem(entities, instances),
+        tuple(sites),
+        np.stack(coordinates),
+        np.ones(len(sites), dtype=np.bool_),
+        residue_numbers=residue_numbers,
+    )

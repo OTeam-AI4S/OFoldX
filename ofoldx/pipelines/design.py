@@ -17,7 +17,7 @@ from ..results import DesignResult
 from ._paired import PairedPipeline
 from .generator import PipelineProcessor, processor_device, resolve_generator
 
-_FeaturesT = TypeVar("_FeaturesT")
+_ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
 _ModelInputT_contra = TypeVar("_ModelInputT_contra", contravariant=True)
 
@@ -44,8 +44,8 @@ class _DesignModel(SaveableModel, Protocol[_ModelInputT_contra]):
 
 
 class DesignPipeline(
-    PairedPipeline[_DesignModel[_FeaturesT], _DesignProcessor[_FeaturesT]],
-    Generic[_FeaturesT],
+    PairedPipeline[_DesignModel[_ModelInputT], _DesignProcessor[_ModelInputT]],
+    Generic[_ModelInputT],
 ):
     r"""Reusable binding of one design Model and its paired Processor."""
 
@@ -61,9 +61,9 @@ class DesignPipeline(
         generator: torch.Generator | None = None,
     ) -> DesignResult:
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(input, msa=msa, templates=templates, conditions=conditions)
+        model_input = self.processor(input, msa=msa, templates=templates, conditions=conditions)
         return self.model.design(
-            features,
+            model_input,
             num_candidates=num_candidates,
             generator=generator,
         )

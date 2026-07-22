@@ -14,7 +14,7 @@ rejected because the checkpoint has only that binary input. It lowers target
 chemistry, the unknown-sequence binder atom
 layout, target distance-template conditioning, and reference conformers to
 `PxDesignInput`. `PxDesignModel.design` decodes every coordinate sample directly to
-a canonical `Structure` in the family-owned `PxDesignResult`; the generated protein has
+a canonical `Structure` in the family-owned `PxDesignDesignResult`; the generated protein has
 truthful `UNK` identity while retaining the released xpb/GLY backbone atom contract.
 
 ## Design suite / repository story
@@ -22,10 +22,10 @@ truthful `UNK` identity while retaining the released xpb/GLY backbone atom contr
 PXDesign is two separable things and OFoldX keeps them separate. The **PXDesign-d
 generator** is a real native Model+Processor with the `pxdesign_v0.1.0.pt` checkpoint; it is
 coordinate-producing, so per the locked §5.3 decision it returns its OWN family Result,
-`PxDesignResult` (a generation-ordered collection of `PxDesignCandidate`s with the frozen
+`PxDesignDesignResult` (a generation-ordered collection of `PxDesignDesignCandidate`s with the frozen
 single-Score `.best`/`.ranked`), rather than the frozen coordinate-free shared
 `DesignResult`. This is the one place the family diverges from the earlier prototype:
-`PxDesignCandidate` is a standalone family-local record (§5.3.1 freezes the shared carrier
+`PxDesignDesignCandidate` is a standalone family-local record (§5.3.1 freezes the shared carrier
 excluding PXDesign; §5.3.3 forbids widening it), not a subclass of the frozen `DesignCandidate`,
 so nothing in the shared record changes. The generator gets the standard model-repository
 entry, and `PxDesignPipeline` (a normal `_PairedPipeline`) is repository-saveable.

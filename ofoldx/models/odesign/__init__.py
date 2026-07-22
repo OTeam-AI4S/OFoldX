@@ -2,11 +2,13 @@ r"""ODesign biomolecular structure-design implementation."""
 
 from __future__ import annotations
 
+from typing import cast
+
 from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ..registry import MODELS, Task
 from .config import (
     ODesignConfig,
-    ODesignConstraintConfig,
+    ODesignConstraintEmbeddingsConfig,
     ODesignDenoiserConfig,
     ODesignPairwiseConfig,
     ODesignProcessorConfig,
@@ -14,13 +16,18 @@ from .config import (
 )
 from .model import (
     ODesignDesignCandidate,
+    ODesignDesignedResidue,
     ODesignDesignResult,
+    ODesignFixedResidue,
     ODesignInput,
     ODesignModel,
     ODesignOutput,
+    ODesignPlacements,
+    ODesignReferenceCoordinates,
+    ODesignResidueSpec,
 )
 from .pipeline import ODesignPipeline
-from .processor import ODesignProcessor
+from .processor import ODesignProcessor, from_design_mask, to_design_mask
 
 # Coordinate generation and child sequence designers require the concrete multi-pair pipeline.
 MODELS.register_model(
@@ -33,6 +40,6 @@ MODELS.register_model(
 PIPELINES.register_pipeline(
     "ofoldx.odesign",
     pipeline=ODesignPipeline,
-    tasks=("design",),
+    tasks=(cast(Task, "design"),),
     repository_loader=ODesignPipeline.from_repository,
 )

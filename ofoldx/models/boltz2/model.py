@@ -20,10 +20,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from typing_extensions import Self
 
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
+from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
@@ -44,10 +44,10 @@ from ...modules.transition import Transition
 from ...modules.trunk.msa import MsaModule, MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateBlock
 from ...modules.trunk.pairformer import PairformerStack
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score, ScoreResult
-from .config import Boltz2AffinityConfig, Boltz2AffinityHeadConfig, Boltz2Config
+from .config import Boltz2AffinityConfig, Boltz2AffinityModuleConfig, Boltz2Config
 
 
-class Boltz2Model(nn.Module):
+class Boltz2Model(Model):
     r"""
     Boltz-2-shaped folding model composed from shared OFoldX modules.
 
@@ -62,33 +62,33 @@ class Boltz2Model(nn.Module):
     """
 
     config_class = Boltz2Config
+    config: Boltz2Config
 
     def __init__(self, config: Boltz2Config | None = None) -> None:
         config = Boltz2Config() if config is None else config
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self._recycling_steps = config.recycling_steps
         single_size, pair_size = config.single_size, config.pair_size
-        embedder = config.input_embedder
+        input_embeddings_config = config.input_embeddings
         trunk = config.trunk
 
-        self.input_embedder = AtomConditionedInputEmbedder(
+        self.input_embeddings = Boltz2InputEmbeddings(
             single_size=single_size,
             atom_hidden_size=config.atom_hidden_size,
             atom_pair_hidden_size=config.atom_pair_hidden_size,
             atom_feature_size=config.atom_feature_size,
-            num_query_atoms=config.diffusion.num_query_atoms,
-            num_key_atoms=config.diffusion.num_key_atoms,
-            num_atom_encoder_blocks=embedder.num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=embedder.num_atom_encoder_attention_heads,
-            vocab_size=embedder.vocab_size,
-            msa_profile_size=embedder.msa_profile_size,
-            num_method_types=embedder.num_method_types,
-            num_molecule_types=embedder.num_molecule_types,
-            add_method_conditioning=embedder.add_method_conditioning,
-            add_modified_flag=embedder.add_modified_flag,
-            add_cyclic_flag=embedder.add_cyclic_flag,
-            add_mol_type_feat=embedder.add_mol_type_feat,
+            num_query_atoms=config.denoiser.num_query_atoms,
+            num_key_atoms=config.denoiser.num_key_atoms,
+            num_atom_encoder_blocks=input_embeddings_config.num_atom_encoder_blocks,
+            num_atom_encoder_attention_heads=input_embeddings_config.num_atom_encoder_attention_heads,
+            vocab_size=input_embeddings_config.vocab_size,
+            msa_profile_size=input_embeddings_config.msa_profile_size,
+            num_method_types=input_embeddings_config.num_method_types,
+            num_molecule_types=input_embeddings_config.num_molecule_types,
+            add_method_conditioning=input_embeddings_config.add_method_conditioning,
+            add_modified_flag=input_embeddings_config.add_modified_flag,
+            add_cyclic_flag=input_embeddings_config.add_cyclic_flag,
+            add_mol_type_feat=input_embeddings_config.add_mol_type_feat,
             operator_backend="auto",
         )
 
@@ -99,7 +99,7 @@ class Boltz2Model(nn.Module):
         self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
         self.token_bond_type_embedding = nn.Embedding(config.num_bond_types, pair_size)
-        self.contact_conditioning = ContactConditioning(
+        self.contact_conditioning = Boltz2ContactConditioning(
             pair_size, cutoff_min=config.conditioning_cutoff_min, cutoff_max=config.conditioning_cutoff_max
         )
 
@@ -111,9 +111,9 @@ class Boltz2Model(nn.Module):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        self.template_embedder: TemplateV2Embedder | None = None
+        self.template_embeddings: Boltz2TemplateV2Embeddings | None = None
         if config.use_templates:
-            self.template_embedder = TemplateV2Embedder(
+            self.template_embeddings = Boltz2TemplateV2Embeddings(
                 pair_size=pair_size,
                 hidden_size=config.template.hidden_size,
                 num_blocks=config.template.num_blocks,
@@ -132,7 +132,7 @@ class Boltz2Model(nn.Module):
             msa_size=trunk.msa_size,
             msa_feature_size=trunk.msa_feature_size,
             num_blocks=trunk.num_msa_blocks,
-            vocab_size=embedder.vocab_size,
+            vocab_size=input_embeddings_config.vocab_size,
             use_paired_feature=trunk.use_paired_feature,
             outer_product_hidden_size=trunk.outer_product_hidden_size,
             msa_dropout=trunk.msa_dropout,
@@ -157,42 +157,42 @@ class Boltz2Model(nn.Module):
             pair_size=pair_size, num_bins=config.num_distogram_bins, symmetrize_before_projection=True
         )
 
-        diffusion = config.diffusion
-        self.diffusion_conditioning = DiffusionConditioning(
+        denoiser_config = config.denoiser
+        self.denoiser_conditioning = Boltz2DenoiserConditioning(
             single_size=single_size,
             pair_size=pair_size,
-            atom_hidden_size=diffusion.atom_hidden_size,
-            atom_pair_hidden_size=diffusion.atom_pair_hidden_size,
+            atom_hidden_size=denoiser_config.atom_hidden_size,
+            atom_pair_hidden_size=denoiser_config.atom_pair_hidden_size,
             atom_feature_size=config.atom_feature_size,
-            num_query_atoms=diffusion.num_query_atoms,
-            num_key_atoms=diffusion.num_key_atoms,
-            num_atom_encoder_blocks=diffusion.num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=diffusion.num_atom_attention_heads,
-            num_atom_decoder_blocks=diffusion.num_atom_decoder_blocks,
-            num_atom_decoder_attention_heads=diffusion.num_atom_attention_heads,
-            num_token_transformer_blocks=diffusion.num_token_transformer_blocks,
-            num_token_transformer_heads=diffusion.num_token_transformer_heads,
-            num_conditioning_transitions=diffusion.num_conditioning_transitions,
+            num_query_atoms=denoiser_config.num_query_atoms,
+            num_key_atoms=denoiser_config.num_key_atoms,
+            num_atom_encoder_blocks=denoiser_config.num_atom_encoder_blocks,
+            num_atom_encoder_attention_heads=denoiser_config.num_atom_attention_heads,
+            num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
+            num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
+            num_token_transformer_blocks=denoiser_config.num_token_transformer_blocks,
+            num_token_transformer_heads=denoiser_config.num_token_transformer_heads,
+            num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
         )
-        score_model = DiffusionScoreModel(
+        denoiser = Boltz2Denoiser(
             single_size=single_size,
-            atom_hidden_size=diffusion.atom_hidden_size,
+            atom_hidden_size=denoiser_config.atom_hidden_size,
             fourier_embedding_size=config.fourier_embedding_size,
-            num_query_atoms=diffusion.num_query_atoms,
-            num_key_atoms=diffusion.num_key_atoms,
-            num_atom_encoder_blocks=diffusion.num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=diffusion.num_atom_attention_heads,
-            num_token_transformer_blocks=diffusion.num_token_transformer_blocks,
-            num_token_transformer_heads=diffusion.num_token_transformer_heads,
-            num_atom_decoder_blocks=diffusion.num_atom_decoder_blocks,
-            num_atom_decoder_attention_heads=diffusion.num_atom_attention_heads,
-            num_conditioning_transitions=diffusion.num_conditioning_transitions,
+            num_query_atoms=denoiser_config.num_query_atoms,
+            num_key_atoms=denoiser_config.num_key_atoms,
+            num_atom_encoder_blocks=denoiser_config.num_atom_encoder_blocks,
+            num_atom_encoder_attention_heads=denoiser_config.num_atom_attention_heads,
+            num_token_transformer_blocks=denoiser_config.num_token_transformer_blocks,
+            num_token_transformer_heads=denoiser_config.num_token_transformer_heads,
+            num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
+            num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
+            num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
             operator_backend="auto",
         )
         sampler = config.sampler
-        self.structure_module = AtomDiffusion(
-            score_model,
-            sigma_data=diffusion.sigma_data,
+        self.coordinate_diffusion = Boltz2CoordinateDiffusion(
+            denoiser,
+            sigma_data=denoiser_config.sigma_data,
             min_noise_level=sampler.min_noise_level,
             max_noise_level=sampler.max_noise_level,
             rho=sampler.rho,
@@ -200,11 +200,11 @@ class Boltz2Model(nn.Module):
             noise_scale=sampler.noise_scale,
             step_scale=sampler.step_scale,
             num_sampling_steps=sampler.num_sampling_steps,
-            alignment_reverse_diff=diffusion.alignment_reverse_diff,
+            alignment_reverse_diff=denoiser_config.alignment_reverse_diff,
         )
 
-        confidence = config.confidence
-        self.confidence_head = ConfidenceHead(
+        confidence = config.confidence_module
+        self.confidence_module = Boltz2ConfidenceModule(
             single_size=single_size,
             pair_size=pair_size,
             num_blocks=confidence.num_pairformer_blocks,
@@ -220,17 +220,14 @@ class Boltz2Model(nn.Module):
             num_pde_bins=confidence.num_pde_bins,
             operator_backend="auto",
         )
-        self.bfactor_head: BFactorHead | None = None
+        self.bfactor_head: Boltz2BFactorHead | None = None
         if config.predict_bfactor:
-            self.bfactor_head = BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
+            self.bfactor_head = Boltz2BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
         self.set_backend("auto")
 
-    def set_backend(self, backend: str) -> Self:
-        r"""Select the operator implementation used by this model."""
+    def _set_backend(self, backend: ModelBackend) -> None:
+        r"""Apply the operator implementation used by this model."""
 
-        if backend not in {"auto", "torch", "oops"}:
-            raise ValueError(f"unknown backend: {backend!r}")
-        self.backend = backend
         attention_backend = "eager" if backend == "torch" else backend
         operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
@@ -250,7 +247,6 @@ class Boltz2Model(nn.Module):
                 ),
             ):
                 module.operator_backend = operator_backend
-        return self
 
     def forward(
         self,
@@ -276,15 +272,16 @@ class Boltz2Model(nn.Module):
             generator: Optional PyTorch random generator for the diffusion noise.
 
         Returns:
-            Structure-prediction output carrying ``denoised_coords``, ``augmented_target``, and ``noise_level``
+            Structure-prediction output carrying ``coordinates``, ``augmented_target_coordinates``, and
+            ``noise_level``
             for the diffusion loss alongside the distogram logits.
 
         """
 
         representations = self._trunk(input, recycling_steps=recycling_steps)
         target_positions = cast(Tensor, input.target_positions)
-        conditioning = self._build_diffusion_conditioning(representations, input)
-        denoised, sigmas, augmented_target = self.structure_module.denoise(
+        conditioning = self._build_denoiser_conditioning(representations, input)
+        denoised_coordinates, sigmas, augmented_target_coordinates = self.coordinate_diffusion.denoise(
             target_positions,
             input.atom_mask,
             multiplicity=num_samples,
@@ -297,10 +294,9 @@ class Boltz2Model(nn.Module):
         )
         batch_size = representations.single.shape[0]
         return Boltz2Output(
-            pred_coords=_unflatten_sample_axis(denoised, batch_size, num_samples),
+            coordinates=_unflatten_sample_axis(denoised_coordinates, batch_size, num_samples),
             distogram_logits=representations.distogram_logits,
-            denoised_coords=_unflatten_sample_axis(denoised, batch_size, num_samples),
-            augmented_target=_unflatten_sample_axis(augmented_target, batch_size, num_samples),
+            augmented_target_coordinates=_unflatten_sample_axis(augmented_target_coordinates, batch_size, num_samples),
             noise_level=sigmas,
         )
 
@@ -396,7 +392,7 @@ class Boltz2Model(nn.Module):
             num_samples=num_samples,
             generator=generator,
         )
-        confidence = self.confidence_head(
+        confidence = self.confidence_module(
             representations.single_inputs,
             single,
             pair,
@@ -418,7 +414,7 @@ class Boltz2Model(nn.Module):
         bfactor = self.bfactor_head(single) if self.bfactor_head is not None else None
         batch_size = single.shape[0]
         return Boltz2Output(
-            pred_coords=_unflatten_sample_axis(sample_coords_flat, batch_size, num_samples),
+            coordinates=_unflatten_sample_axis(sample_coords_flat, batch_size, num_samples),
             distogram_logits=representations.distogram_logits,
             plddt_logits=_unflatten_sample_axis(confidence["plddt_logits"], batch_size, num_samples),
             pae_logits=_unflatten_sample_axis(confidence["pae_logits"], batch_size, num_samples),
@@ -431,7 +427,7 @@ class Boltz2Model(nn.Module):
             ),
         )
 
-    def _trunk(self, input: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2Representations:
+    def _trunk(self, input: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2TrunkState:
         r"""
         Run the recycled folding trunk (template + MSA + Pairformer) and emit the trunk representations.
 
@@ -459,7 +455,7 @@ class Boltz2Model(nn.Module):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
                 if input.template_restype is not None:
-                    pair = pair + cast(TemplateV2Embedder, self.template_embedder)(
+                    pair = pair + cast(Boltz2TemplateV2Embeddings, self.template_embeddings)(
                         pair,
                         residue_type=input.template_restype,
                         frame_rotation=cast(Tensor, input.template_frame_rot),
@@ -486,7 +482,7 @@ class Boltz2Model(nn.Module):
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
-        return _Boltz2Representations(
+        return _Boltz2TrunkState(
             single_inputs=single_inputs,
             single=single,
             pair=pair,
@@ -507,7 +503,7 @@ class Boltz2Model(nn.Module):
             ``relative_position_encoding`` are ``(B, N, N, pair_size)``.
         """
 
-        single_inputs = self.input_embedder(
+        single_inputs = self.input_embeddings(
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
             atom_mask=input.atom_mask,
@@ -546,7 +542,7 @@ class Boltz2Model(nn.Module):
 
     def _sample_coords(
         self,
-        representations: _Boltz2Representations,
+        representations: _Boltz2TrunkState,
         input: Boltz2Input,
         *,
         num_sampling_steps: int | None,
@@ -568,8 +564,8 @@ class Boltz2Model(nn.Module):
             Flattened sampled atom coords ``(B*num_samples, M, 3)``.
         """
 
-        conditioning = self._build_diffusion_conditioning(representations, input)
-        return self.structure_module._sample(
+        conditioning = self._build_denoiser_conditioning(representations, input)
+        return self.coordinate_diffusion._sample(
             input.atom_mask,
             num_sampling_steps=num_sampling_steps,
             multiplicity=num_samples,
@@ -581,9 +577,7 @@ class Boltz2Model(nn.Module):
             token_mask=input.token_mask,
         )
 
-    def _build_diffusion_conditioning(
-        self, representations: _Boltz2Representations, input: Boltz2Input
-    ) -> dict[str, Tensor]:
+    def _build_denoiser_conditioning(self, representations: _Boltz2TrunkState, input: Boltz2Input) -> dict[str, Tensor]:
         r"""
         Precompute the per-call-invariant diffusion conditioning from the trunk representations.
 
@@ -596,10 +590,10 @@ class Boltz2Model(nn.Module):
             input: Typed model input.
 
         Returns:
-            The [`DiffusionConditioning`][ofoldx.models.boltz2.model.DiffusionConditioning] output dict.
+            The [`Boltz2DenoiserConditioning`][ofoldx.models.boltz2.model.Boltz2DenoiserConditioning] output dict.
         """
 
-        return self.diffusion_conditioning(
+        return self.denoiser_conditioning(
             representations.single,
             representations.pair,
             representations.relative_position_encoding,
@@ -626,15 +620,16 @@ class Boltz2AffinityModel(Boltz2Model):
     """
 
     config_class = Boltz2AffinityConfig
+    config: Boltz2AffinityConfig
 
     def __init__(self, config: Boltz2AffinityConfig | None = None) -> None:
         config = Boltz2AffinityConfig() if config is None else config
         super().__init__(config)
-        self.affinity_module1 = self._build_affinity_head(config.affinity1)
-        self.affinity_module2 = self._build_affinity_head(config.affinity2)
+        self.affinity_module1 = self._build_affinity_module(config.affinity_module1)
+        self.affinity_module2 = self._build_affinity_module(config.affinity_module2)
         self.set_backend(self.backend)
 
-    def _build_affinity_head(self, affinity: Boltz2AffinityHeadConfig) -> Boltz2AffinityHead:
+    def _build_affinity_module(self, affinity: Boltz2AffinityModuleConfig) -> Boltz2AffinityModule:
         r"""
         Instantiate one affinity head from an affinity-head sub-config.
 
@@ -645,7 +640,7 @@ class Boltz2AffinityModel(Boltz2Model):
             A configured [`Boltz2AffinityHead`][ofoldx.models.boltz2.model.Boltz2AffinityHead].
         """
 
-        return Boltz2AffinityHead(
+        return Boltz2AffinityModule(
             single_size=self.config.single_size,
             pair_size=self.config.pair_size,
             num_blocks=affinity.num_pairformer_blocks,
@@ -708,7 +703,7 @@ class Boltz2AffinityModel(Boltz2Model):
             generator=generator,
         )
         selected_index = int(raw_scores["selected_sample_index"][0].item())
-        selected_coords = structure_output.pred_coords[0, selected_index]
+        selected_coords = structure_output.coordinates[0, selected_index]
         layout = input.layout
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
@@ -782,7 +777,7 @@ class Boltz2AffinityModel(Boltz2Model):
         self,
         input: Boltz2Input,
         *,
-        pred_coords: Tensor | None = None,
+        coordinates: Tensor | None = None,
         recycling_steps: int | None = None,
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
@@ -795,9 +790,9 @@ class Boltz2AffinityModel(Boltz2Model):
         Args:
             input: Typed Boltz-2 input. ``affinity_token_mask`` may select the ligand; otherwise ligand tokens are
                 inferred from ``molecule_type == 3``.
-            pred_coords: Optional atom coords to score with shape ``(B, S, M, 3)``.
+            coordinates: Optional atom coordinates to score with shape ``(B, S, M, 3)``.
             recycling_steps: Optional trunk recycling passes. Defaults to the config value.
-            num_samples: Number of coords to sample when ``pred_coords`` is absent.
+            num_samples: Number of coordinate sets to sample when ``coordinates`` is absent.
             num_sampling_steps: Optional EDM sampling steps for internally sampled coords.
             molecular_weight_correction: Whether to apply the released ligand-molecular-weight calibration.
             generator: Optional PyTorch random generator for diffusion noise.
@@ -809,7 +804,7 @@ class Boltz2AffinityModel(Boltz2Model):
 
         representations = self._trunk(input, recycling_steps=recycling_steps)
         batch_size = representations.single.shape[0]
-        if pred_coords is None:
+        if coordinates is None:
             sample_coords_flat = self._sample_coords(
                 representations,
                 input,
@@ -817,12 +812,12 @@ class Boltz2AffinityModel(Boltz2Model):
                 num_samples=num_samples,
                 generator=generator,
             )
-            pred_coords = _unflatten_sample_axis(sample_coords_flat, batch_size, num_samples)
+            coordinates = _unflatten_sample_axis(sample_coords_flat, batch_size, num_samples)
         else:
-            num_samples = pred_coords.shape[1]
-            sample_coords_flat = pred_coords.flatten(0, 1)
+            num_samples = coordinates.shape[1]
+            sample_coords_flat = coordinates.flatten(0, 1)
 
-        confidence = self.confidence_head(
+        confidence = self.confidence_module(
             representations.single_inputs,
             representations.single,
             representations.pair,
@@ -843,12 +838,12 @@ class Boltz2AffinityModel(Boltz2Model):
         )
         iptm = _boltz2_ptm_scores(
             confidence["pae_logits"],
-            pred_coords=sample_coords_flat,
+            coordinates=sample_coords_flat,
             input=input,
             multiplicity=num_samples,
         )["iptm"].reshape(batch_size, num_samples)
         selected_sample_index = iptm.argmax(dim=1)
-        selected_coords = pred_coords[torch.arange(batch_size, device=pred_coords.device), selected_sample_index]
+        selected_coords = coordinates[torch.arange(batch_size, device=coordinates.device), selected_sample_index]
         scores = self._score_affinity(
             representations,
             input,
@@ -858,7 +853,7 @@ class Boltz2AffinityModel(Boltz2Model):
         scores["iptm_by_sample"] = iptm
         scores["selected_sample_index"] = selected_sample_index
         structure_prediction = Boltz2Output(
-            pred_coords=pred_coords,
+            coordinates=coordinates,
             distogram_logits=representations.distogram_logits,
             plddt_logits=_unflatten_sample_axis(confidence["plddt_logits"], batch_size, num_samples),
             pae_logits=_unflatten_sample_axis(confidence["pae_logits"], batch_size, num_samples),
@@ -869,9 +864,9 @@ class Boltz2AffinityModel(Boltz2Model):
 
     def _score_affinity(
         self,
-        representations: _Boltz2Representations,
+        representations: _Boltz2TrunkState,
         input: Boltz2Input,
-        pred_coords: Tensor,
+        coordinates: Tensor,
         *,
         affinity_token_mask: Tensor | None = None,
         affinity_mw: Tensor | None = None,
@@ -888,7 +883,7 @@ class Boltz2AffinityModel(Boltz2Model):
             representations: Trunk representations from
                 [`_trunk`][ofoldx.models.boltz2.model.Boltz2Model._trunk].
             input: Typed Boltz-2 input.
-            pred_coords: Atom coords to score with shape ``(B, S, M, 3)``.
+            coordinates: Atom coordinates to score with shape ``(B, S, M, 3)``.
             affinity_token_mask: Optional explicit ligand token mask ``(B, N)``.
             affinity_mw: Optional per-batch molecular weight used by the molecular-weight correction.
             molecular_weight_correction: Whether to apply the released ligand-molecular-weight calibration.
@@ -897,8 +892,8 @@ class Boltz2AffinityModel(Boltz2Model):
             Dict of affinity score tensors keyed by name, each with an explicit sample axis.
         """
 
-        batch_size, multiplicity = pred_coords.shape[:2]
-        coords = pred_coords.flatten(0, 1)
+        batch_size, multiplicity = coordinates.shape[:2]
+        coords = coordinates.flatten(0, 1)
         if affinity_token_mask is None:
             affinity_token_mask = input.affinity_token_mask
         if affinity_token_mask is None:
@@ -914,7 +909,7 @@ class Boltz2AffinityModel(Boltz2Model):
             | ligand_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
         )
         pair = representations.pair * affinity_pair_mask.unsqueeze(-1).to(representations.pair)
-        affinity_single_inputs = self.input_embedder(
+        affinity_single_inputs = self.input_embeddings(
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
             atom_mask=input.atom_mask,
@@ -931,7 +926,7 @@ class Boltz2AffinityModel(Boltz2Model):
         head_kwargs = {
             "single_inputs": affinity_single_inputs,
             "pair": pair,
-            "pred_coords": coords,
+            "coordinates": coords,
             "token_to_rep_atom": input.token_to_rep_atom,
             "token_mask": input.token_mask,
             "ligand_mask": ligand_mask,
@@ -970,226 +965,7 @@ class Boltz2AffinityModel(Boltz2Model):
         return scores
 
 
-class TemplateV2Embedder(nn.Module):
-    r"""
-    Boltz-2 template embedder with on-the-fly distogram / unit-vector featurization.
-
-    Unlike [`TemplateEmbedder`][ofoldx.modules.embedding.template.TemplateEmbedder] (which consumes pre-packed
-    features), this computes the template distogram and per-frame unit vectors inside ``forward`` from raw CA/CB
-    coords and frames, masks pairs by ``visibility_ids`` (same-chain), folds templates into the batch through
-    a shared pair-only pairformer with an outer residual, and aggregates by a template-count-weighted mean.
-
-    Feature order fed to ``template_projection`` is load-bearing: ``[distogram, cb_mask, unit_vector,
-    frame_mask, residue_type_i, residue_type_j]`` (= 2*vocab_size + num_bins + 5 channels).
-
-    Args:
-        pair_size: Width of the trunk pair representation this update is added into.
-        hidden_size: Width of the internal template pair channel.
-        num_blocks: Number of pair-only triangle update blocks in the shared pairformer.
-        vocab_size: Residue-type vocabulary size (one block per side of the pair).
-        num_bins: Number of distogram bins computed from CB distances.
-        min_distance: Lower edge of the distogram binning range, in angstroms.
-        max_distance: Upper edge of the distogram binning range, in angstroms.
-        expansion: FFN expansion factor inside each triangle update block.
-        triangle_attention_hidden_size: Per-head dimension of the triangle attention.
-        num_triangle_attention_heads: Number of triangle attention heads.
-        dropout: Dropout probability inside each triangle update block.
-        operator_backend: Operator backend selector forwarded to the triangle update blocks.
-
-    Examples:
-        >>> from ofoldx.models.boltz2.model import TemplateV2Embedder  # doctest: +SKIP
-        >>> embedder = TemplateV2Embedder(pair_size=128, hidden_size=64).cuda()  # doctest: +SKIP
-        >>> update = embedder(  # doctest: +SKIP
-        ...     pair,
-        ...     residue_type=residue_type,
-        ...     frame_rotation=frame_rotation,
-        ...     frame_translation=frame_translation,
-        ...     frame_mask=frame_mask,
-        ...     cb_coords=cb_coords,
-        ...     ca_coords=ca_coords,
-        ...     cb_mask=cb_mask,
-        ...     visibility_ids=visibility_ids,
-        ...     template_mask=template_mask,
-        ... )
-    """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        hidden_size: int = 64,
-        num_blocks: int = 2,
-        vocab_size: int = 33,
-        num_bins: int = 38,
-        min_distance: float = 3.25,
-        max_distance: float = 50.75,
-        expansion: int = 4,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        dropout: float = 0.25,
-        operator_backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.num_bins = num_bins
-        self.min_distance = min_distance
-        self.max_distance = max_distance
-        template_feature_size = 2 * vocab_size + num_bins + 5
-        self.norm_pair = LayerNorm(pair_size)
-        self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
-        self.blocks = nn.ModuleList(
-            TrianglePairUpdateBlock(
-                pair_size=hidden_size,
-                triangle_multiplication_hidden_size=hidden_size,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
-                expansion=expansion,
-                dropout=dropout,
-                operator_backend=operator_backend,
-            )
-            for _ in range(num_blocks)
-        )
-        self.hidden_norm = LayerNorm(hidden_size)
-        self.activation = nn.ReLU()
-        self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
-
-    def _featurize(
-        self,
-        residue_type: Tensor,
-        frame_rotation: Tensor,
-        frame_translation: Tensor,
-        frame_mask: Tensor,
-        cb_coords: Tensor,
-        ca_coords: Tensor,
-        cb_mask: Tensor,
-        visibility_ids: Tensor,
-    ) -> Tensor:
-        r"""
-        Build the packed per-template pair feature tensor from raw coordinates and frames.
-
-        Computes the CB-distance distogram, the per-frame CA unit vectors, masks pairs to same-chain
-        via ``visibility_ids``, and concatenates the geometry with the broadcast per-side residue
-        types in the load-bearing channel order.
-
-        Args:
-            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
-            frame_rotation: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
-            frame_translation: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
-            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
-            cb_coords: ``[batch, num_templates, N_token, 3]`` CB (or pseudo-CB) coordinates.
-            ca_coords: ``[batch, num_templates, N_token, 3]`` CA coordinates.
-            cb_mask: ``[batch, num_templates, N_token]`` CB validity mask.
-            visibility_ids: ``[batch, num_templates, N_token]`` chain/visibility ids; only same-id
-                pairs keep their geometry.
-
-        Returns:
-            ``[batch, num_templates, N_token, N_token, 2 * vocab_size + num_bins + 5]`` packed features.
-        """
-        num_tokens = residue_type.shape[2]
-        pair_cb_mask = (cb_mask[..., :, None] * cb_mask[..., None, :]).unsqueeze(-1)
-        pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
-        same_chain = (visibility_ids[..., :, None] == visibility_ids[..., None, :]).to(residue_type.dtype)
-
-        cb_distances = torch.cdist(cb_coords, cb_coords)
-        boundaries = torch.linspace(self.min_distance, self.max_distance, self.num_bins - 1, device=cb_distances.device)
-        distogram = (cb_distances[..., None] > boundaries).sum(dim=-1).long()
-        distogram = F.one_hot(distogram, num_classes=self.num_bins).to(residue_type.dtype)
-
-        # Per-frame unit vector of CA_j in frame_i (replicated faithfully, incl. the per-component norm).
-        rotation = frame_rotation.unsqueeze(2).transpose(-1, -2)
-        translation = frame_translation.unsqueeze(2).unsqueeze(-1)
-        targets = ca_coords.unsqueeze(3).unsqueeze(-1)
-        vector = torch.matmul(rotation, targets - translation)
-        norm = torch.norm(vector, dim=-1, keepdim=True)
-        unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
-
-        geometry = torch.cat([distogram, pair_cb_mask, unit_vector, pair_frame_mask], dim=-1)
-        geometry = geometry * same_chain.unsqueeze(-1)
-        residue_i = residue_type[:, :, :, None].expand(-1, -1, -1, num_tokens, -1)
-        residue_j = residue_type[:, :, None, :].expand(-1, -1, num_tokens, -1, -1)
-        return torch.cat([geometry, residue_i, residue_j], dim=-1)
-
-    def forward(
-        self,
-        pair: Tensor,
-        *,
-        residue_type: Tensor,
-        frame_rotation: Tensor,
-        frame_translation: Tensor,
-        frame_mask: Tensor,
-        cb_coords: Tensor,
-        ca_coords: Tensor,
-        cb_mask: Tensor,
-        visibility_ids: Tensor,
-        template_mask: Tensor,
-        pair_mask: Tensor | None = None,
-    ) -> Tensor:
-        r"""
-        Return the template pair update ``u`` (added into the trunk pair representation).
-
-        Templates are folded into the batch dim (``reshape(batch * num_templates, ...)``) and run through the
-        template pairformer in one batched pass, then aggregated by a template-count-weighted mean over the
-        per-template mask.
-
-        Args:
-            pair: ``[batch, N_token, N_token, pair_size]`` trunk pair representation.
-            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
-            frame_rotation: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
-            frame_translation: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
-            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
-            cb_coords: ``[batch, num_templates, N_token, 3]`` CB (or pseudo-CB) coordinates.
-            ca_coords: ``[batch, num_templates, N_token, 3]`` CA coordinates.
-            cb_mask: ``[batch, num_templates, N_token]`` CB validity mask.
-            visibility_ids: ``[batch, num_templates, N_token]`` chain/visibility ids for the same-chain gate.
-            template_mask: ``[batch, num_templates, N_token]`` per-token template validity mask; a template
-                counts as present when any token is valid.
-            pair_mask: Optional ``[batch, N_token, N_token]`` pair validity mask forwarded to the blocks.
-
-        Returns:
-            ``[batch, N_token, N_token, pair_size]`` template pair update to add into ``pair``.
-
-        Examples:
-            >>> embedder = TemplateV2Embedder().cuda()  # doctest: +SKIP
-            >>> update = embedder(pair, residue_type=residue_type, frame_rotation=frame_rotation,
-            ...                   frame_translation=frame_translation, frame_mask=frame_mask,
-            ...                   cb_coords=cb_coords, ca_coords=ca_coords, cb_mask=cb_mask,
-            ...                   visibility_ids=visibility_ids, template_mask=template_mask)  # doctest: +SKIP
-        """
-
-        batch, num_templates = residue_type.shape[:2]
-        present = template_mask.any(dim=2).to(pair.dtype)
-        template_count = present.sum(dim=1).clamp(min=1)
-
-        features = self._featurize(
-            residue_type,
-            frame_rotation,
-            frame_translation,
-            frame_mask,
-            cb_coords,
-            ca_coords,
-            cb_mask,
-            visibility_ids,
-        )
-        projected = self.template_projection(features)
-        template_pair = self.pair_projection(self.norm_pair(pair[:, None])) + projected
-        template_pair = template_pair.reshape(batch * num_templates, *template_pair.shape[2:])
-
-        if pair_mask is not None:
-            pair_mask = pair_mask[:, None].expand(-1, num_templates, -1, -1)
-            pair_mask = pair_mask.reshape(batch * num_templates, *pair_mask.shape[2:])
-
-        stacked = template_pair
-        for block in self.blocks:
-            stacked = block(stacked, pair_mask=pair_mask)
-        template_pair = self.hidden_norm(template_pair + stacked)
-        template_pair = template_pair.reshape(batch, num_templates, *template_pair.shape[1:])
-
-        weight = present[:, :, None, None, None]
-        update = (template_pair * weight).sum(dim=1) / template_count[:, None, None, None].to(pair.dtype)
-        return self.output_projection(self.activation(update))
-
-
-class AtomConditionedInputEmbedder(nn.Module):
+class Boltz2InputEmbeddings(nn.Module):
     r"""
     Compose atom-derived token states with token-level encodings and conditioning embeddings.
 
@@ -1237,7 +1013,7 @@ class AtomConditionedInputEmbedder(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.atom_encoder = AtomEncoder(
+        self.atom_encoder = Boltz2AtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -1248,7 +1024,7 @@ class AtomConditionedInputEmbedder(nn.Module):
             LayerNorm(atom_pair_hidden_size),
             nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
         )
-        self.atom_attention_encoder = AtomAttentionEncoder(
+        self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
             num_query_atoms=num_query_atoms,
@@ -1342,7 +1118,7 @@ class AtomConditionedInputEmbedder(nn.Module):
         return single
 
 
-class AtomEncoder(nn.Module):
+class Boltz2AtomEncoder(nn.Module):
     r"""
     Build atom single states and windowed atom-pair states from reference geometry.
 
@@ -1506,7 +1282,7 @@ class AtomEncoder(nn.Module):
         return atom_query, atom_single, atom_pair
 
 
-class AtomAttentionEncoder(nn.Module):
+class Boltz2AtomAttentionEncoder(nn.Module):
     r"""
     Windowed atom attention encoder and atom-to-token mean pool.
 
@@ -1609,7 +1385,7 @@ class AtomAttentionEncoder(nn.Module):
         return token_repr
 
 
-class AtomAttentionDecoder(nn.Module):
+class Boltz2AtomAttentionDecoder(nn.Module):
     r"""
     Broadcast token activations back to atoms and predict a per-atom position update.
 
@@ -1701,7 +1477,226 @@ CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
 )
 
 
-class ContactConditioning(nn.Module):
+class Boltz2TemplateV2Embeddings(nn.Module):
+    r"""
+    Boltz-2 template embedder with on-the-fly distogram / unit-vector featurization.
+
+    Unlike [`TemplateEmbedder`][ofoldx.modules.embedding.template.TemplateEmbedder] (which consumes pre-packed
+    features), this computes the template distogram and per-frame unit vectors inside ``forward`` from raw CA/CB
+    coords and frames, masks pairs by ``visibility_ids`` (same-chain), folds templates into the batch through
+    a shared pair-only pairformer with an outer residual, and aggregates by a template-count-weighted mean.
+
+    Feature order fed to ``template_projection`` is load-bearing: ``[distogram, cb_mask, unit_vector,
+    frame_mask, residue_type_i, residue_type_j]`` (= 2*vocab_size + num_bins + 5 channels).
+
+    Args:
+        pair_size: Width of the trunk pair representation this update is added into.
+        hidden_size: Width of the internal template pair channel.
+        num_blocks: Number of pair-only triangle update blocks in the shared pairformer.
+        vocab_size: Residue-type vocabulary size (one block per side of the pair).
+        num_bins: Number of distogram bins computed from CB distances.
+        min_distance: Lower edge of the distogram binning range, in angstroms.
+        max_distance: Upper edge of the distogram binning range, in angstroms.
+        expansion: FFN expansion factor inside each triangle update block.
+        triangle_attention_hidden_size: Per-head dimension of the triangle attention.
+        num_triangle_attention_heads: Number of triangle attention heads.
+        dropout: Dropout probability inside each triangle update block.
+        operator_backend: Operator backend selector forwarded to the triangle update blocks.
+
+    Examples:
+        >>> from ofoldx.models.boltz2.model import Boltz2TemplateV2Embeddings  # doctest: +SKIP
+        >>> embedder = Boltz2TemplateV2Embeddings(pair_size=128, hidden_size=64).cuda()  # doctest: +SKIP
+        >>> update = embedder(  # doctest: +SKIP
+        ...     pair,
+        ...     residue_type=residue_type,
+        ...     frame_rotation=frame_rotation,
+        ...     frame_translation=frame_translation,
+        ...     frame_mask=frame_mask,
+        ...     cb_coords=cb_coords,
+        ...     ca_coords=ca_coords,
+        ...     cb_mask=cb_mask,
+        ...     visibility_ids=visibility_ids,
+        ...     template_mask=template_mask,
+        ... )
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        hidden_size: int = 64,
+        num_blocks: int = 2,
+        vocab_size: int = 33,
+        num_bins: int = 38,
+        min_distance: float = 3.25,
+        max_distance: float = 50.75,
+        expansion: int = 4,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_bins = num_bins
+        self.min_distance = min_distance
+        self.max_distance = max_distance
+        template_feature_size = 2 * vocab_size + num_bins + 5
+        self.norm_pair = LayerNorm(pair_size)
+        self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
+        self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
+        self.blocks = nn.ModuleList(
+            TrianglePairUpdateBlock(
+                pair_size=hidden_size,
+                triangle_multiplication_hidden_size=hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                operator_backend=operator_backend,
+            )
+            for _ in range(num_blocks)
+        )
+        self.hidden_norm = LayerNorm(hidden_size)
+        self.activation = nn.ReLU()
+        self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
+
+    def _featurize(
+        self,
+        residue_type: Tensor,
+        frame_rotation: Tensor,
+        frame_translation: Tensor,
+        frame_mask: Tensor,
+        cb_coords: Tensor,
+        ca_coords: Tensor,
+        cb_mask: Tensor,
+        visibility_ids: Tensor,
+    ) -> Tensor:
+        r"""
+        Build the packed per-template pair feature tensor from raw coordinates and frames.
+
+        Computes the CB-distance distogram, the per-frame CA unit vectors, masks pairs to same-chain
+        via ``visibility_ids``, and concatenates the geometry with the broadcast per-side residue
+        types in the load-bearing channel order.
+
+        Args:
+            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
+            frame_rotation: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
+            frame_translation: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
+            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
+            cb_coords: ``[batch, num_templates, N_token, 3]`` CB (or pseudo-CB) coordinates.
+            ca_coords: ``[batch, num_templates, N_token, 3]`` CA coordinates.
+            cb_mask: ``[batch, num_templates, N_token]`` CB validity mask.
+            visibility_ids: ``[batch, num_templates, N_token]`` chain/visibility ids; only same-id
+                pairs keep their geometry.
+
+        Returns:
+            ``[batch, num_templates, N_token, N_token, 2 * vocab_size + num_bins + 5]`` packed features.
+        """
+        num_tokens = residue_type.shape[2]
+        pair_cb_mask = (cb_mask[..., :, None] * cb_mask[..., None, :]).unsqueeze(-1)
+        pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
+        same_chain = (visibility_ids[..., :, None] == visibility_ids[..., None, :]).to(residue_type.dtype)
+
+        cb_distances = torch.cdist(cb_coords, cb_coords)
+        boundaries = torch.linspace(self.min_distance, self.max_distance, self.num_bins - 1, device=cb_distances.device)
+        distogram = (cb_distances[..., None] > boundaries).sum(dim=-1).long()
+        distogram = F.one_hot(distogram, num_classes=self.num_bins).to(residue_type.dtype)
+
+        # Per-frame unit vector of CA_j in frame_i (replicated faithfully, incl. the per-component norm).
+        rotation = frame_rotation.unsqueeze(2).transpose(-1, -2)
+        translation = frame_translation.unsqueeze(2).unsqueeze(-1)
+        targets = ca_coords.unsqueeze(3).unsqueeze(-1)
+        vector = torch.matmul(rotation, targets - translation)
+        norm = torch.norm(vector, dim=-1, keepdim=True)
+        unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
+
+        geometry = torch.cat([distogram, pair_cb_mask, unit_vector, pair_frame_mask], dim=-1)
+        geometry = geometry * same_chain.unsqueeze(-1)
+        residue_i = residue_type[:, :, :, None].expand(-1, -1, -1, num_tokens, -1)
+        residue_j = residue_type[:, :, None, :].expand(-1, -1, num_tokens, -1, -1)
+        return torch.cat([geometry, residue_i, residue_j], dim=-1)
+
+    def forward(
+        self,
+        pair: Tensor,
+        *,
+        residue_type: Tensor,
+        frame_rotation: Tensor,
+        frame_translation: Tensor,
+        frame_mask: Tensor,
+        cb_coords: Tensor,
+        ca_coords: Tensor,
+        cb_mask: Tensor,
+        visibility_ids: Tensor,
+        template_mask: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        r"""
+        Return the template pair update ``u`` (added into the trunk pair representation).
+
+        Templates are folded into the batch dim (``reshape(batch * num_templates, ...)``) and run through the
+        template pairformer in one batched pass, then aggregated by a template-count-weighted mean over the
+        per-template mask.
+
+        Args:
+            pair: ``[batch, N_token, N_token, pair_size]`` trunk pair representation.
+            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
+            frame_rotation: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
+            frame_translation: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
+            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
+            cb_coords: ``[batch, num_templates, N_token, 3]`` CB (or pseudo-CB) coordinates.
+            ca_coords: ``[batch, num_templates, N_token, 3]`` CA coordinates.
+            cb_mask: ``[batch, num_templates, N_token]`` CB validity mask.
+            visibility_ids: ``[batch, num_templates, N_token]`` chain/visibility ids for the same-chain gate.
+            template_mask: ``[batch, num_templates, N_token]`` per-token template validity mask; a template
+                counts as present when any token is valid.
+            pair_mask: Optional ``[batch, N_token, N_token]`` pair validity mask forwarded to the blocks.
+
+        Returns:
+            ``[batch, N_token, N_token, pair_size]`` template pair update to add into ``pair``.
+
+        Examples:
+            >>> embedder = Boltz2TemplateV2Embeddings().cuda()  # doctest: +SKIP
+            >>> update = embedder(pair, residue_type=residue_type, frame_rotation=frame_rotation,
+            ...                   frame_translation=frame_translation, frame_mask=frame_mask,
+            ...                   cb_coords=cb_coords, ca_coords=ca_coords, cb_mask=cb_mask,
+            ...                   visibility_ids=visibility_ids, template_mask=template_mask)  # doctest: +SKIP
+        """
+
+        batch, num_templates = residue_type.shape[:2]
+        present = template_mask.any(dim=2).to(pair.dtype)
+        template_count = present.sum(dim=1).clamp(min=1)
+
+        features = self._featurize(
+            residue_type,
+            frame_rotation,
+            frame_translation,
+            frame_mask,
+            cb_coords,
+            ca_coords,
+            cb_mask,
+            visibility_ids,
+        )
+        projected = self.template_projection(features)
+        template_pair = self.pair_projection(self.norm_pair(pair[:, None])) + projected
+        template_pair = template_pair.reshape(batch * num_templates, *template_pair.shape[2:])
+
+        if pair_mask is not None:
+            pair_mask = pair_mask[:, None].expand(-1, num_templates, -1, -1)
+            pair_mask = pair_mask.reshape(batch * num_templates, *pair_mask.shape[2:])
+
+        stacked = template_pair
+        for block in self.blocks:
+            stacked = block(stacked, pair_mask=pair_mask)
+        template_pair = self.hidden_norm(template_pair + stacked)
+        template_pair = template_pair.reshape(batch, num_templates, *template_pair.shape[1:])
+
+        weight = present[:, :, None, None, None]
+        update = (template_pair * weight).sum(dim=1) / template_count[:, None, None, None].to(pair.dtype)
+        return self.output_projection(self.activation(update))
+
+
+class Boltz2ContactConditioning(nn.Module):
     r"""
     Additive pair bias encoding Boltz-2 pocket and contact constraints.
 
@@ -1765,7 +1760,7 @@ class ContactConditioning(nn.Module):
         )
 
 
-class DiffusionConditioning(nn.Module):
+class Boltz2DenoiserConditioning(nn.Module):
     r"""
     Precompute the diffusion conditioning shared across denoiser calls (Boltz DiffusionConditioning).
 
@@ -1813,7 +1808,7 @@ class DiffusionConditioning(nn.Module):
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
         )
-        self.atom_encoder = AtomEncoder(
+        self.atom_encoder = Boltz2AtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -1823,21 +1818,21 @@ class DiffusionConditioning(nn.Module):
             num_key_atoms=num_key_atoms,
             structure_prediction=True,
         )
-        self.atom_enc_proj_pair = nn.ModuleList(
+        self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
                 LayerNorm(atom_pair_hidden_size),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
-        self.atom_dec_proj_pair = nn.ModuleList(
+        self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
                 LayerNorm(atom_pair_hidden_size),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
-        self.token_trans_proj_pair = nn.ModuleList(
+        self.token_transformer_pair_bias_projections = nn.ModuleList(
             nn.Sequential(LayerNorm(pair_size), nn.Linear(pair_size, num_token_transformer_heads, bias=False))
             for _ in range(num_token_transformer_blocks)
         )
@@ -1891,9 +1886,9 @@ class DiffusionConditioning(nn.Module):
             single_trunk=single_trunk,
             pair_trunk=pair,
         )
-        atom_enc_bias = torch.cat([layer(atom_pair) for layer in self.atom_enc_proj_pair], dim=-1)
-        atom_dec_bias = torch.cat([layer(atom_pair) for layer in self.atom_dec_proj_pair], dim=-1)
-        token_trans_bias = torch.cat([layer(pair) for layer in self.token_trans_proj_pair], dim=-1)
+        atom_enc_bias = torch.cat([layer(atom_pair) for layer in self.atom_encoder_pair_bias_projections], dim=-1)
+        atom_dec_bias = torch.cat([layer(atom_pair) for layer in self.atom_decoder_pair_bias_projections], dim=-1)
+        token_trans_bias = torch.cat([layer(pair) for layer in self.token_transformer_pair_bias_projections], dim=-1)
         return {
             "atom_query": atom_query,
             "atom_conditioning": atom_conditioning,
@@ -1903,7 +1898,7 @@ class DiffusionConditioning(nn.Module):
         }
 
 
-class DiffusionScoreModel(nn.Module):
+class Boltz2Denoiser(nn.Module):
     r"""
     EDM score network: ``(noisy positions, noise level, trunk, conditioning) -> position update``.
 
@@ -1941,12 +1936,12 @@ class DiffusionScoreModel(nn.Module):
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_conditioner = SingleConditioning(
+        self.single_conditioner = Boltz2SingleConditioning(
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_conditioning_transitions=num_conditioning_transitions,
         )
-        self.atom_attention_encoder = AtomAttentionEncoder(
+        self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
             num_query_atoms=num_query_atoms,
@@ -1965,7 +1960,7 @@ class DiffusionScoreModel(nn.Module):
             operator_backend=operator_backend,
         )
         self.token_norm = LayerNorm(hidden)
-        self.atom_attention_decoder = AtomAttentionDecoder(
+        self.atom_attention_decoder = Boltz2AtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
             num_query_atoms=num_query_atoms,
@@ -2045,7 +2040,7 @@ class DiffusionScoreModel(nn.Module):
         )
 
 
-class SingleConditioning(nn.Module):
+class Boltz2SingleConditioning(nn.Module):
     r"""
     Condition the (concatenated trunk+input) single representation on the diffusion noise level.
 
@@ -2103,21 +2098,21 @@ class SingleConditioning(nn.Module):
         )
 
 
-class AtomDiffusion(nn.Module):
+class Boltz2CoordinateDiffusion(nn.Module):
     r"""
-    EDM sampler around a [`DiffusionScoreModel`][ofoldx.models.boltz2.model.DiffusionScoreModel].
+    EDM sampler around a [`Boltz2Denoiser`][ofoldx.models.boltz2.model.Boltz2Denoiser].
 
     Wraps the score model with EDM preconditioning and a Karras noise schedule, and runs reverse diffusion
     with optional in-loop weighted rigid alignment and stochastic churn.
 
     Args:
-        score_model: The denoising score network to precondition and iterate.
+        denoiser: The learned coordinate network to precondition and iterate.
         sigma_data: EDM data standard deviation used for preconditioning and to scale the schedule.
         min_noise_level: Lowest non-zero sigma before the trailing zero.
         max_noise_level: Highest sigma at the start of the schedule.
         rho: Exponent of the Karras noise schedule.
-        churn_rate: Stochastic churn added per step above ``min_churn``.
-        min_churn: Sigma threshold above which churn is applied.
+        churn_rate: Stochastic churn added per step above ``min_churn_noise_level``.
+        min_churn_noise_level: Sigma threshold above which churn is applied.
         noise_scale: Multiplier on the injected churn noise.
         step_scale: Scale on the Euler update step.
         num_sampling_steps: Default number of sampling steps.
@@ -2126,36 +2121,36 @@ class AtomDiffusion(nn.Module):
 
     def __init__(
         self,
-        score_model: DiffusionScoreModel,
+        denoiser: Boltz2Denoiser,
         sigma_data: float = 16.0,
         min_noise_level: float = 1e-4,
         max_noise_level: float = 160.0,
         rho: float = 7.0,
         churn_rate: float = 0.8,
-        min_churn: float = 1.0,
+        min_churn_noise_level: float = 1.0,
         noise_scale: float = 1.003,
         step_scale: float = 1.5,
         num_sampling_steps: int = 200,
         alignment_reverse_diff: bool = True,
-        p_mean: float = -1.2,
-        p_std: float = 1.5,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
     ) -> None:
         super().__init__()
-        self.score_model = score_model
+        self.denoiser = denoiser
         self.sigma_data = sigma_data
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
         self.min_noise_level = min_noise_level
         self.max_noise_level = max_noise_level
         self.rho = rho
         self.churn_rate = churn_rate
-        self.min_churn = min_churn
+        self.min_churn_noise_level = min_churn_noise_level
         self.noise_scale = noise_scale
         self.step_scale = step_scale
         self.num_sampling_steps = num_sampling_steps
         self.alignment_reverse_diff = alignment_reverse_diff
         # EDM log-normal training noise distribution (Karras et al.); used by the training denoise step only.
-        self.p_mean = p_mean
-        self.p_std = p_std
+        self.noise_log_mean = noise_log_mean
+        self.noise_log_std = noise_log_std
 
     def noise_distribution(
         self, batch_size: int, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None = None
@@ -2174,7 +2169,7 @@ class AtomDiffusion(nn.Module):
         """
 
         normal = torch.randn(batch_size, device=device, dtype=dtype, generator=generator)
-        return self.sigma_data * torch.exp(self.p_mean + self.p_std * normal)
+        return self.sigma_data * torch.exp(self.noise_log_mean + self.noise_log_std * normal)
 
     def loss_weight(self, sigma: Tensor) -> Tensor:
         r"""
@@ -2252,7 +2247,7 @@ class AtomDiffusion(nn.Module):
         batch = noised_coords.shape[0]
         sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
         padded = sigma.reshape(batch, 1, 1)
-        update = self.score_model(
+        update = self.denoiser(
             noisy_positions=self.preconditioner.c_in(padded) * noised_coords,
             noise_level=self.preconditioner.c_noise(sigma),
             multiplicity=multiplicity,
@@ -2316,7 +2311,7 @@ class AtomDiffusion(nn.Module):
         expanded_atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
         shape = (*expanded_atom_mask.shape, 3)
         sigmas = self.sample_schedule(num_sampling_steps, device=device)
-        gammas = torch.where(sigmas > self.min_churn, self.churn_rate, 0.0)
+        gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
 
         def randn() -> Tensor:
             r"""Draw standard-normal noise of shape ``(B*multiplicity, M, 3)`` on ``device`` from ``generator``."""
@@ -2366,7 +2361,7 @@ class AtomDiffusion(nn.Module):
         return coords
 
 
-class Boltz2AffinityHead(nn.Module):
+class Boltz2AffinityModule(nn.Module):
     r"""
     Predict scalar binding affinity and a binder-class from trunk features and predicted atom geometry.
 
@@ -2425,14 +2420,14 @@ class Boltz2AffinityHead(nn.Module):
             dropout=dropout,
             operator_backend=operator_backend,
         )
-        self.affinity_heads = Boltz2AffinityHeads(pair_size=pair_size, single_size=single_size)
+        self.affinity_head = Boltz2AffinityHead(pair_size=pair_size, single_size=single_size)
 
     def forward(
         self,
         *,
         single_inputs: Tensor,
         pair: Tensor,
-        pred_coords: Tensor,
+        coordinates: Tensor,
         token_to_rep_atom: Tensor,
         token_mask: Tensor,
         ligand_mask: Tensor,
@@ -2445,7 +2440,7 @@ class Boltz2AffinityHead(nn.Module):
         Args:
             single_inputs: Trunk input single ``(B, N, single_size)``.
             pair: Trunk pair ``(B, N, N, pair_size)``.
-            pred_coords: Predicted atom coords ``(B*multiplicity, M, 3)``.
+            coordinates: Predicted atom coordinates ``(B*multiplicity, M, 3)``.
             token_to_rep_atom: Representative atom index per token ``(B, N)``.
             token_mask: Boolean token validity mask ``(B, N)``.
             ligand_mask: Boolean mask selecting ligand tokens ``(B, N)``.
@@ -2463,9 +2458,9 @@ class Boltz2AffinityHead(nn.Module):
         pair = pair.repeat_interleave(multiplicity, 0)
 
         rep_atom_index = token_to_rep_atom.repeat_interleave(multiplicity, 0).long()
-        representative = pred_coords.gather(
+        representative = coordinates.gather(
             1,
-            rep_atom_index.unsqueeze(-1).expand(-1, -1, pred_coords.shape[-1]),
+            rep_atom_index.unsqueeze(-1).expand(-1, -1, coordinates.shape[-1]),
         )
         distances = torch.cdist(representative, representative)
         distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
@@ -2480,10 +2475,10 @@ class Boltz2AffinityHead(nn.Module):
             | ligand_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
         )
         _, pair = self.pairformer_stack(None, pair, pair_mask=affinity_pair_mask)
-        return self.affinity_heads(pair, affinity_pair_mask)
+        return self.affinity_head(pair, affinity_pair_mask)
 
 
-class Boltz2AffinityHeads(nn.Module):
+class Boltz2AffinityHead(nn.Module):
     r"""
     Project pooled affinity pair features to value and binder-class logits.
 
@@ -2543,7 +2538,7 @@ class Boltz2AffinityHeads(nn.Module):
         }
 
 
-class ConfidenceHead(nn.Module):
+class Boltz2ConfidenceModule(nn.Module):
     r"""
     Score predicted structures with per-token pLDDT / resolved / PAE / PDE confidence logits.
 
@@ -2601,7 +2596,7 @@ class ConfidenceHead(nn.Module):
         self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
         self.token_bond_type_embedding = nn.Embedding(num_bond_types, pair_size)
-        self.contact_conditioning = ContactConditioning(
+        self.contact_conditioning = Boltz2ContactConditioning(
             pair_size, cutoff_min=conditioning_cutoff_min, cutoff_max=conditioning_cutoff_max
         )
 
@@ -2612,7 +2607,7 @@ class ConfidenceHead(nn.Module):
             num_pair_attention_heads=num_pair_attention_heads,
             operator_backend=operator_backend,
         )
-        self.confidence_heads = ConfidenceHeads(
+        self.confidence_head = Boltz2ConfidenceHead(
             single_size, pair_size, num_plddt_bins=num_plddt_bins, num_pae_bins=num_pae_bins, num_pde_bins=num_pde_bins
         )
 
@@ -2621,7 +2616,7 @@ class ConfidenceHead(nn.Module):
         single_inputs: Tensor,
         single: Tensor,
         pair: Tensor,
-        pred_coords: Tensor,
+        coordinates: Tensor,
         *,
         residue_index: Tensor,
         chain_index: Tensor,
@@ -2645,7 +2640,7 @@ class ConfidenceHead(nn.Module):
             single_inputs: Trunk input single ``(B, N, single_size)``.
             single: Trunk refined single ``(B, N, single_size)``.
             pair: Trunk pair ``(B, N, N, pair_size)``.
-            pred_coords: Sampled atom coords ``(B*multiplicity, M, 3)``.
+            coordinates: Sampled atom coordinates ``(B*multiplicity, M, 3)``.
             residue_index, chain_index, entity_index, symmetry_index, token_index:
                 Relative-position features, each ``(B, N)``.
             token_bonds: Token covalent adjacency ``(B, N, N)``.
@@ -2658,7 +2653,8 @@ class ConfidenceHead(nn.Module):
             multiplicity: Number of samples per batch element; trunk tensors are interleaved to ``B*multiplicity``.
 
         Returns:
-            Logit dict from [`ConfidenceHeads`][ofoldx.models.boltz2.model.ConfidenceHeads]: ``pae_logits``,
+            Logit dict from [`Boltz2ConfidenceHead`][ofoldx.models.boltz2.model.Boltz2ConfidenceHead]:
+            ``pae_logits``,
             ``pde_logits``, ``plddt_logits``, ``resolved_logits``.
         """
 
@@ -2694,7 +2690,7 @@ class ConfidenceHead(nn.Module):
         pair = pair.repeat_interleave(multiplicity, 0)
 
         rep_atom_index = token_to_rep_atom.repeat_interleave(multiplicity, 0)
-        representative = pred_coords.gather(1, rep_atom_index.unsqueeze(-1).expand(-1, -1, pred_coords.shape[-1]))
+        representative = coordinates.gather(1, rep_atom_index.unsqueeze(-1).expand(-1, -1, coordinates.shape[-1]))
         distances = torch.cdist(representative, representative)
         distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
         pair = pair + self.distance_embedding(distogram)
@@ -2704,10 +2700,10 @@ class ConfidenceHead(nn.Module):
         single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
         chain_index = chain_index.repeat_interleave(multiplicity, 0)
-        return self.confidence_heads(single, pair, chain_index)
+        return self.confidence_head(single, pair, chain_index)
 
 
-class ConfidenceHeads(nn.Module):
+class Boltz2ConfidenceHead(nn.Module):
     r"""
     Project the confidence single/pair representations to pLDDT / resolved / PAE / PDE logits.
 
@@ -2762,7 +2758,7 @@ class ConfidenceHeads(nn.Module):
         }
 
 
-class BFactorHead(nn.Module):
+class Boltz2BFactorHead(nn.Module):
     r"""
     Predict per-token B-factor logits from the trunk single representation.
 
@@ -2805,7 +2801,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> Fold
     complete_index = {site: index for index, site in enumerate(complete_sites)}
     model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
 
-    coordinates = output.pred_coords[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+    coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
     num_samples = coordinates.shape[0]
     # Each polymer token_site is already a ``ComponentReference`` (``(instance_id, monomer_index)``) and each
     # atomized-ligand token_site is an ``AtomSite`` -- both are valid ``MetricReference`` values, so the token
@@ -2826,7 +2822,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> Fold
     # _fold/_score.
     ptm_scores = _boltz2_ptm_scores(
         cast(Tensor, output.pae_logits).flatten(0, 1),
-        pred_coords=output.pred_coords.flatten(0, 1),
+        coordinates=output.coordinates.flatten(0, 1),
         input=input,
         multiplicity=num_samples,
     )
@@ -2901,7 +2897,7 @@ def _boltz2_expected_angstrom(logits: Tensor) -> Tensor:
 def _boltz2_ptm_scores(
     pae_logits: Tensor,
     *,
-    pred_coords: Tensor,
+    coordinates: Tensor,
     input: Boltz2Input,
     multiplicity: int,
 ) -> dict[str, Tensor]:
@@ -2909,7 +2905,7 @@ def _boltz2_ptm_scores(
 
     token_mask = input.token_mask.repeat_interleave(multiplicity, 0).float()
     frame_mask = _boltz2_predicted_frame_mask(
-        pred_coords,
+        coordinates,
         input=input,
         multiplicity=multiplicity,
     ).float()
@@ -2950,7 +2946,7 @@ def _boltz2_ptm_scores(
 
 
 def _boltz2_predicted_frame_mask(
-    pred_coords: Tensor,
+    coordinates: Tensor,
     *,
     input: Boltz2Input,
     multiplicity: int,
@@ -2960,14 +2956,14 @@ def _boltz2_predicted_frame_mask(
     if input.frame_atom_index is None:
         raise ValueError("Boltz-2 confidence requires token frame atom indices")
     frame_index = input.frame_atom_index.repeat_interleave(multiplicity, 0).to(
-        device=pred_coords.device,
+        device=coordinates.device,
         dtype=torch.long,
     )
-    molecule_type = input.molecule_type.to(device=pred_coords.device)
-    chain_index = input.chain_index.to(device=pred_coords.device)
-    token_mask = input.token_mask.to(device=pred_coords.device, dtype=torch.bool)
-    atom_mask = input.atom_mask.to(device=pred_coords.device, dtype=torch.bool)
-    atom_to_token = input.atom_to_token.to(device=pred_coords.device, dtype=torch.long)
+    molecule_type = input.molecule_type.to(device=coordinates.device)
+    chain_index = input.chain_index.to(device=coordinates.device)
+    token_mask = input.token_mask.to(device=coordinates.device, dtype=torch.bool)
+    atom_mask = input.atom_mask.to(device=coordinates.device, dtype=torch.bool)
+    atom_to_token = input.atom_to_token.to(device=coordinates.device, dtype=torch.long)
     atom_chain = chain_index.gather(1, atom_to_token)
 
     for batch_index in range(input.token_mask.shape[0]):
@@ -2987,13 +2983,13 @@ def _boltz2_predicted_frame_mask(
                 continue
             for sample_index in range(multiplicity):
                 row = batch_index * multiplicity + sample_index
-                distances = torch.cdist(pred_coords[row, chain_atoms], pred_coords[row, chain_atoms])
+                distances = torch.cdist(coordinates[row, chain_atoms], coordinates[row, chain_atoms])
                 nearest = distances.argsort(dim=-1)[:, :3]
                 nearest_atoms = chain_atoms[nearest]
                 frame_index[row, chain_tokens] = nearest_atoms[:, (1, 0, 2)]
 
     flat_index = frame_index.reshape(frame_index.shape[0], -1)
-    frames = pred_coords.gather(1, flat_index.unsqueeze(-1).expand(-1, -1, 3))
+    frames = coordinates.gather(1, flat_index.unsqueeze(-1).expand(-1, -1, 3))
     frames = frames.reshape(*frame_index.shape, 3)
     first = frames[..., 1, :] - frames[..., 0, :]
     second = frames[..., 1, :] - frames[..., 2, :]
@@ -3021,26 +3017,6 @@ def _unflatten_sample_axis(tensor: Tensor, batch_size: int, num_samples: int) ->
     return tensor.reshape(batch_size, num_samples, *tensor.shape[1:])
 
 
-@dataclass
-class _Boltz2Representations:
-    r"""
-    Trunk outputs consumed by the diffusion / confidence heads.
-
-    Attributes:
-        single_inputs: Initial token single representations.
-        single: Final token single representation.
-        pair: Final token pair representation.
-        distogram_logits: Trunk distogram logits.
-        relative_position_encoding: Relative-position pair features.
-    """
-
-    single_inputs: Tensor
-    single: Tensor
-    pair: Tensor
-    distogram_logits: Tensor
-    relative_position_encoding: Tensor
-
-
 # =====================================================================================================
 # Boltz-2 tensor boundary
 #
@@ -3058,38 +3034,6 @@ class Boltz2Layout:
     atom_sites: tuple[AtomSite, ...]
     token_sites: tuple[AtomSite | tuple[str, int], ...]
     affinity_instance_id: str | None = None
-
-
-@dataclass(eq=False)
-class Boltz2Output:
-    r"""Tensor output of one Boltz-2 forward or sampling pass."""
-
-    pred_coords: Tensor
-    distogram_logits: Tensor
-    plddt_logits: Tensor | None = None
-    pae_logits: Tensor | None = None
-    pde_logits: Tensor | None = None
-    resolved_logits: Tensor | None = None
-    bfactor_logits: Tensor | None = None
-    denoised_coords: Tensor | None = None
-    augmented_target: Tensor | None = None
-    noise_level: Tensor | None = None
-
-    @property
-    def plddt(self) -> Tensor:
-        r"""Expected pLDDT on the conventional 0--100 scale.
-
-        The released Boltz-2 confidence head bins pLDDT on the ``0--1`` fraction; the softmax-expected bin
-        value is rescaled by ``100`` to the shared ``0--100`` convention.
-        """
-
-        if self.plddt_logits is None:
-            raise ValueError("Boltz2Output.plddt requires confidence logits")
-        num_bins = self.plddt_logits.shape[-1]
-        centers = (
-            torch.arange(num_bins, device=self.plddt_logits.device, dtype=self.plddt_logits.dtype) + 0.5
-        ) / num_bins
-        return (self.plddt_logits.softmax(dim=-1) * centers).sum(dim=-1) * 100.0
 
 
 @dataclass(kw_only=True)
@@ -3196,3 +3140,54 @@ class Boltz2Input:
     affinity_msa_profile: Tensor | None = None
     affinity_deletion_mean: Tensor | None = None
     layout: Boltz2Layout | None = None
+
+
+@dataclass
+class _Boltz2TrunkState:
+    r"""
+    Trunk outputs consumed by the diffusion / confidence heads.
+
+    Attributes:
+        single_inputs: Initial token single representations.
+        single: Final token single representation.
+        pair: Final token pair representation.
+        distogram_logits: Trunk distogram logits.
+        relative_position_encoding: Relative-position pair features.
+    """
+
+    single_inputs: Tensor
+    single: Tensor
+    pair: Tensor
+    distogram_logits: Tensor
+    relative_position_encoding: Tensor
+
+
+@dataclass(eq=False)
+class Boltz2Output:
+    r"""Tensor output of one Boltz-2 forward or sampling pass."""
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    plddt_logits: Tensor | None = None
+    pae_logits: Tensor | None = None
+    pde_logits: Tensor | None = None
+    resolved_logits: Tensor | None = None
+    bfactor_logits: Tensor | None = None
+    augmented_target_coordinates: Tensor | None = None
+    noise_level: Tensor | None = None
+
+    @property
+    def plddt(self) -> Tensor:
+        r"""Expected pLDDT on the conventional 0--100 scale.
+
+        The released Boltz-2 confidence head bins pLDDT on the ``0--1`` fraction; the softmax-expected bin
+        value is rescaled by ``100`` to the shared ``0--100`` convention.
+        """
+
+        if self.plddt_logits is None:
+            raise ValueError("Boltz2Output.plddt requires confidence logits")
+        num_bins = self.plddt_logits.shape[-1]
+        centers = (
+            torch.arange(num_bins, device=self.plddt_logits.device, dtype=self.plddt_logits.dtype) + 0.5
+        ) / num_bins
+        return (self.plddt_logits.softmax(dim=-1) * centers).sum(dim=-1) * 100.0

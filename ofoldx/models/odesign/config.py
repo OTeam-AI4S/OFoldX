@@ -5,6 +5,17 @@ from __future__ import annotations
 from chanfig import Config
 
 
+class ODesignConstraintEmbeddingsConfig(Config):
+    r"""Observed condition-geometry embedder dimensions."""
+
+    num_blocks: int = 2
+    hidden_size: int = 64
+    num_bins: int = 39
+    min_distance: float = 3.25
+    max_distance: float = 50.75
+    dropout: float = 0.25
+
+
 class ODesignTrunkConfig(Config):
     r"""Pairformer and MSA dimensions that determine the released graph."""
 
@@ -40,17 +51,6 @@ class ODesignPairwiseConfig(Config):
     num_bond_types: int = 2
 
 
-class ODesignConstraintConfig(Config):
-    r"""Observed condition-geometry embedder dimensions."""
-
-    num_blocks: int = 2
-    hidden_size: int = 64
-    num_bins: int = 39
-    min_distance: float = 3.25
-    max_distance: float = 50.75
-    dropout: float = 0.25
-
-
 class ODesignConfig(Config):
     r"""Exact construction parameters for the released ODesign core graph.
 
@@ -63,12 +63,12 @@ class ODesignConfig(Config):
     atom_feature_size: int = 386
     single_size: int = 384
     pair_size: int = 128
+    constraint_embeddings: ODesignConstraintEmbeddingsConfig = ODesignConstraintEmbeddingsConfig()
     relative_position_size: int = 139
-    recycling_steps: int = 10
     trunk: ODesignTrunkConfig = ODesignTrunkConfig()
+    recycling_steps: int = 10
     denoiser: ODesignDenoiserConfig = ODesignDenoiserConfig()
     pairwise: ODesignPairwiseConfig = ODesignPairwiseConfig()
-    constraint: ODesignConstraintConfig = ODesignConstraintConfig()
 
 
 class ODesignProcessorConfig(Config):
@@ -83,8 +83,8 @@ class ODesignProcessorConfig(Config):
     marks every existing (non-generated)
     receptor heavy atom as a hard fixed coordinate (the released ``diffusion`` condition,
     receptor held rigid); ``"flex"`` regenerates receptor coordinates and pins only atoms
-    named by an explicit hard ``ReferenceCoordinates``. This is additive over the
-    per-atom ``ReferenceCoordinates`` path in ``processor.py``.
+    named by an explicit hard ``ODesignReferenceCoordinates``. This is additive over the
+    per-atom ``ODesignReferenceCoordinates`` path in ``processor.py``.
     """
 
     receptor_mode: str = "flex"  # "rigid" | "flex" (str, not Literal: chanfig validates fields via isinstance)

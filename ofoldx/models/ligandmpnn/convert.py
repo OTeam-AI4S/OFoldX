@@ -30,6 +30,67 @@ from .config import LigandMpnnConfig, LigandMpnnProcessorConfig
 from .model import LigandMpnnModel
 
 
+def convert_ligandmpnn_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert a released LigandMPNN checkpoint into a standard Pipeline repository.
+
+    Derives every live architecture fact from the checkpoint, strict-loads the flat Model with
+    ``assign=True`` to preserve the serialized dtype, writes ``num_context_atoms`` to the paired Processor
+    config, and saves the paired concrete [`LigandMpnnPipeline`]
+    [ofoldx.models.ligandmpnn.pipeline.LigandMpnnPipeline] artifact under the exact ``ofoldx.ligandmpnn`` ID.
+
+    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
+    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
+    and nothing is published without an explicit ``repo_id``.
+
+    Args:
+        checkpoint_path: Path to a released ``ligandmpnn_v_*.pt`` sequence checkpoint.
+        output_dir: New repository directory to write.
+        repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
+        token: Optional Hugging Face token authenticating the ``repo_id`` upload.
+        private: Create the ``repo_id`` repository as private when it does not yet exist.
+
+    Examples:
+        >>> convert_ligandmpnn_checkpoint("ligandmpnn_v_32_010_25.pt", "ligandmpnn")  # doctest: +SKIP
+    """
+
+    from .pipeline import LigandMpnnPipeline
+    from .processor import LigandMpnnProcessor
+
+    checkpoint = load_ligandmpnn_checkpoint(checkpoint_path)
+    config = ligandmpnn_config_from_checkpoint(checkpoint)
+    model = LigandMpnnModel(config)
+    model.load_state_dict(
+        convert_ligandmpnn_state_dict(checkpoint["model_state_dict"]),
+        strict=True,
+        assign=True,
+    )
+    processor = LigandMpnnProcessor(ligandmpnn_processor_config_from_checkpoint(checkpoint))
+    LigandMpnnPipeline(model=model, processor=processor).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def load_ligandmpnn_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    *,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    r"""Load one released LigandMPNN checkpoint with PyTorch's restricted loader."""
+
+    return torch.load(checkpoint_path, map_location=map_location, weights_only=True, mmap=True)
+
+
 def convert_ligandmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
     r"""
     Convert an official LigandMPNN sequence checkpoint to native OFoldX tensor names.
@@ -197,22 +258,6 @@ def _convert_decoder_key(key: str, target_prefix: str) -> str:
     return f"{target_prefix}.{layer}.{replacements[suffix]}"
 
 
-def load_ligandmpnn_checkpoint(
-    checkpoint_path: str | PathLike[str],
-    *,
-    map_location: str | torch.device = "cpu",
-) -> dict[str, Any]:
-    r"""Load one released LigandMPNN checkpoint with PyTorch's restricted loader."""
-
-    return torch.load(checkpoint_path, map_location=map_location, weights_only=True, mmap=True)
-
-
-def _layer_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:
-    r"""Count the distinct layer indices under one released ``<prefix>.<i>.*`` group."""
-
-    return len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith(prefix)})
-
-
 def ligandmpnn_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> LigandMpnnConfig:
     r"""Derive the executable LigandMPNN architecture from a released checkpoint.
 
@@ -230,63 +275,18 @@ def ligandmpnn_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> LigandMp
     )
 
 
+def _layer_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:
+    r"""Count the distinct layer indices under one released ``<prefix>.<i>.*`` group."""
+
+    return len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith(prefix)})
+
+
 def ligandmpnn_processor_config_from_checkpoint(
     checkpoint: Mapping[str, Any],
 ) -> LigandMpnnProcessorConfig:
     r"""Read the padded nearest-context extent into the Processor config."""
 
     return LigandMpnnProcessorConfig(num_context_atoms=checkpoint["atom_context_num"])
-
-
-def convert_ligandmpnn_checkpoint(
-    checkpoint_path: str | PathLike[str],
-    output_dir: str | PathLike[str],
-    *,
-    repo_id: str | None = None,
-    token: str | None = None,
-    private: bool = False,
-) -> None:
-    r"""
-    Convert a released LigandMPNN checkpoint into a standard Pipeline repository.
-
-    Derives every live architecture fact from the checkpoint, strict-loads the flat Model with
-    ``assign=True`` to preserve the serialized dtype, writes ``num_context_atoms`` to the paired Processor
-    config, and saves the paired concrete [`LigandMpnnPipeline`]
-    [ofoldx.models.ligandmpnn.pipeline.LigandMpnnPipeline] artifact under the exact ``ofoldx.ligandmpnn`` ID.
-
-    Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
-    uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
-    and nothing is published without an explicit ``repo_id``.
-
-    Args:
-        checkpoint_path: Path to a released ``ligandmpnn_v_*.pt`` sequence checkpoint.
-        output_dir: New repository directory to write.
-        repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
-        token: Optional Hugging Face token authenticating the ``repo_id`` upload.
-        private: Create the ``repo_id`` repository as private when it does not yet exist.
-
-    Examples:
-        >>> convert_ligandmpnn_checkpoint("ligandmpnn_v_32_010_25.pt", "ligandmpnn")  # doctest: +SKIP
-    """
-
-    from .pipeline import LigandMpnnPipeline
-    from .processor import LigandMpnnProcessor
-
-    checkpoint = load_ligandmpnn_checkpoint(checkpoint_path)
-    config = ligandmpnn_config_from_checkpoint(checkpoint)
-    model = LigandMpnnModel(config)
-    model.load_state_dict(
-        convert_ligandmpnn_state_dict(checkpoint["model_state_dict"]),
-        strict=True,
-        assign=True,
-    )
-    processor = LigandMpnnProcessor(ligandmpnn_processor_config_from_checkpoint(checkpoint))
-    LigandMpnnPipeline(model=model, processor=processor).save(
-        output_dir,
-        repo_id=repo_id,
-        token=token,
-        private=private,
-    )
 
 
 def main(argv: list[str] | None = None) -> None:

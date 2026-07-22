@@ -34,9 +34,9 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
         r"""Lower one monomer and fold it with configured representation ensembles."""
 
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(input, msa=msa, templates=templates)
+        model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,
@@ -60,9 +60,9 @@ class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFo
         r"""Lower one assembly and fold it with configured representation ensembles."""
 
         generator = resolve_generator(seed, generator, device=processor_device(self.processor))
-        features = self.processor(input, msa=msa, templates=templates)
+        model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
-            features,
+            model_input,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,

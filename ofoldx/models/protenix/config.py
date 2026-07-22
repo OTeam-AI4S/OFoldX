@@ -28,14 +28,14 @@ class ProtenixConfig(Config):
     pair_size: int = 128
     atom_feature_size: int = 385
     relative_position_size: int = 139
-    distogram: DistogramConfig = DistogramConfig()
-    confidence: ConfidenceConfig = ConfidenceConfig()
-    trunk: TrunkConfig = TrunkConfig()
+    constraints: bool = False
     template: TemplateConfig = TemplateConfig()
+    trunk: TrunkConfig = TrunkConfig()
+    recycling_steps: int = 10
     denoiser: DenoiserConfig = DenoiserConfig()
     sampler: SamplerConfig = SamplerConfig()
-    recycling_steps: int = 10
-    constraints: bool = False
+    distogram: DistogramConfig = DistogramConfig()
+    confidence: ConfidenceConfig = ConfidenceConfig()
 
 
 class ProtenixConstraintConfig(ProtenixConfig):

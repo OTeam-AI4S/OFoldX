@@ -5,19 +5,19 @@ from __future__ import annotations
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import (
-    Boltz1ConfidenceConfig,
+    Boltz1ConfidenceModuleConfig,
     Boltz1Config,
-    Boltz1DiffusionConfig,
-    Boltz1InputEmbedderConfig,
+    Boltz1DenoiserConfig,
+    Boltz1InputEmbeddingsConfig,
     Boltz1SamplerConfig,
     Boltz1TrunkConfig,
 )
 from .model import (
-    Boltz1Embeddings,
     Boltz1Input,
     Boltz1Model,
     Boltz1Output,
     Boltz1Pocket,
+    Boltz1Representations,
 )
 from .pipeline import Boltz1Pipeline
 from .processor import Boltz1Processor

@@ -2,7 +2,7 @@ r"""PXDesign's biological operation boundary.
 
 :class:`PxDesignPipeline` binds the native PXDesign-d generator Model+Processor and owns
 the ``design`` verb over the PXDesign topology argument (``PlacementSpec``) and
-per-residue target label (``Hotspot``), returning :class:`PxDesignResult`. It mirrors
+per-residue target label (``Hotspot``), returning :class:`PxDesignDesignResult`. It mirrors
 :class:`~ofoldx.models.proteinmpnn.pipeline.ProteinMpnnPipeline` and diverges from the shared
 coordinate-free :class:`~ofoldx.pipelines.design.DesignPipeline` (which lowers
 ``AllowedResidueIdentities`` / ``TiedResidueIdentities`` conditions and returns the
@@ -24,7 +24,7 @@ from ...data import PlacementSpec
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline, resolve_generator
-from .model import Hotspot, PxDesignModel, PxDesignResult
+from .model import Hotspot, PxDesignDesignResult, PxDesignModel
 from .processor import PxDesignProcessor
 
 
@@ -42,21 +42,21 @@ class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
         sample_chunk_size: int | None = 10,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> PxDesignResult:
+    ) -> PxDesignDesignResult:
         r"""Generate ranked target--binder backbone candidates for one released target.
 
         The Processor lowers ``input`` plus PXDesign's own ``PlacementSpec`` topology and optional
         ``Hotspot`` label to a :class:`~ofoldx.models.pxdesign.model.PxDesignInput`; the
         Model runs the released EDM sampler and decodes each coordinate sample. The returned
-        :class:`PxDesignResult` carries raw generator backbones whose ``scores`` are empty
+        :class:`PxDesignDesignResult` carries raw generator backbones whose ``scores`` are empty
         (the released sampler emits no per-sample confidence); the suite Pipeline populates
         the evaluation Scores and ranking.
         """
 
-        batch = self.processor(input, placement=placement, conditions=conditions)
-        generator = resolve_generator(seed, generator, device=batch.reference_positions.device)
+        model_input = self.processor(input, placement=placement, conditions=conditions)
+        generator = resolve_generator(seed, generator, device=model_input.reference_positions.device)
         return self.model.design(
-            batch,
+            model_input,
             num_candidates=num_candidates,
             num_sampling_steps=num_sampling_steps,
             sample_chunk_size=sample_chunk_size,

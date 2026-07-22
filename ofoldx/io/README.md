@@ -17,13 +17,12 @@ canonical value; PDB refuses unacknowledged loss.
 - `pdb.py` - generic PDB parsing, CONECT bonds, lossy-field analysis, and writing.
 - `mmcif.py` - generic mmCIF parsing, canonical payload decoding, branched entities,
   `struct_conn` bonds, and writing.
+- `mpnn.py` - the public MPNN-specific fixed-column PDB reading policy.
 - `msa.py` - `read_msa`.
 
 Canonical value serialization is the public `ofoldx.data.codec` boundary. It
 encodes and decodes `MolecularSystem`, `Structure`, MSA evidence, and templates;
 the mmCIF exchange path uses it for embedded canonical payloads.
 
-The released MPNN implementations use the public
-`ofoldx.models.mpnn_pdb.read_mpnn_pdb` parser for their shared model-specific
-input policy. It belongs to the model namespace and is not re-exported from
-`ofoldx.io`.
+The released MPNN implementations use `ofoldx.io.read_mpnn_pdb` when they need
+their shared model-specific PDB policy rather than the generic structure reader.

@@ -10,6 +10,8 @@ from .data.conditions import Contact, Hotspot
 from .data.evidence import MSA, Template
 from .data.molecular import MolecularSystem, PolymerSequence
 from .data.structure import Structure
+from .model import Model, ModelBackend
+from .models import TASKS, Task
 from .pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
 from .results import (
     DesignCandidate,

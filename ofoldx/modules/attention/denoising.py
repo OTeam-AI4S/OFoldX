@@ -21,11 +21,12 @@ class DenoisingTokenEncoder(nn.Module):
     [`AtomSelfAttentionStack`][ofoldx.modules.atom.encoders.AtomSelfAttentionStack] at the token level.
 
     Args:
-        num_blocks: Number of transformer blocks; ``0`` makes the module the identity on the tokens.
+        num_blocks: Number of token-encoder blocks; each contributes one transformer block. ``0`` makes the
+            module the identity on the tokens.
         token_hidden_size: Width of the per-token channel carried through the transformer.
         conditioning_size: Width of the conditioning signal driving the adaptive norm.
         pair_size: Width of the pair representation projected to the attention bias.
-        num_attention_heads: Number of attention heads per block.
+        num_attention_heads: Number of attention heads per transformer block.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
             to the ``sdpa`` reference otherwise.
 
@@ -81,7 +82,7 @@ class DenoisingTokenEncoder(nn.Module):
         r"""
         Norm and project the pair representation into a per-block, per-head bias, then run the transformer.
 
-        Each block ``b`` maps ``pair`` through its own ``pair_norms[b]`` / ``bias_projections[b]`` to
+        Each block ``i`` maps ``pair`` through its own ``pair_norms[i]`` / ``bias_projections[i]`` to
         ``num_attention_heads`` bias logits; these are concatenated over all ``num_blocks`` blocks into
         `[..., N_token, N_token, num_blocks * num_attention_heads]` and sliced one block at a time inside the
         transformer. With zero blocks the module is the identity on ``token_hidden``.

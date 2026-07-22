@@ -32,7 +32,7 @@ from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...io.structure import read_structure
-from .config import RFdiffusionProcessorConfig
+from .config import RfDiffusionProcessorConfig
 
 # RFdiffusion spatial controls are defined with the model. Topology is a separate
 # ``placement`` argument rather than a condition.
@@ -40,19 +40,19 @@ from .model import (
     ATOM14_NAMES,
     MASK_TOKEN,
     NUM2AA,
-    Coordination,
-    Distance,
     ExistingSpan,
     GeneratedSegment,
     Hotspot,
-    PointGroupSymmetry,
-    RadiusOfGyration,
-    ReferenceCoordinates,
-    RFdiffusionInput,
-    RFdiffusionLayout,
-    RFdiffusionPlacements,
-    SecondaryStructure,
-    SubstrateInteraction,
+    RfDiffusionCoordination,
+    RfDiffusionDistance,
+    RfDiffusionInput,
+    RfDiffusionLayout,
+    RfDiffusionPlacements,
+    RfDiffusionPointGroupSymmetry,
+    RfDiffusionRadiusOfGyration,
+    RfDiffusionReferenceCoordinates,
+    RfDiffusionSecondaryStructure,
+    RfDiffusionSubstrateInteraction,
     SymbolicAtomSite,
     SymbolicBond,
     SymbolicResidueSite,
@@ -63,17 +63,17 @@ from .model import (
 )
 
 
-class RFdiffusionProcessor:
+class RfDiffusionProcessor:
     r"""Lower one canonical design problem to RFdiffusion tensors."""
 
     def __init__(
         self,
-        config: RFdiffusionProcessorConfig | None = None,
+        config: RfDiffusionProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        config = RFdiffusionProcessorConfig() if config is None else config
+        config = RfDiffusionProcessorConfig() if config is None else config
         self.config = config
         self.device = torch.device("cpu" if device is None else device)
         self.dtype = torch.float32 if dtype is None else dtype
@@ -95,29 +95,29 @@ class RFdiffusionProcessor:
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None = None,
         *,
-        placement: RFdiffusionPlacements | None = None,
+        placement: RfDiffusionPlacements | None = None,
         templates: Sequence[Template] = (),
         conditions: Sequence[
             AllowedResidueIdentities
             | Hotspot
-            | Coordination
-            | Distance
-            | PointGroupSymmetry
-            | RadiusOfGyration
-            | ReferenceCoordinates
-            | SecondaryStructure
-            | SubstrateInteraction
+            | RfDiffusionCoordination
+            | RfDiffusionDistance
+            | RfDiffusionPointGroupSymmetry
+            | RfDiffusionRadiusOfGyration
+            | RfDiffusionReferenceCoordinates
+            | RfDiffusionSecondaryStructure
+            | RfDiffusionSubstrateInteraction
             | SymbolicBond
         ] = (),
         inpaint_sequence: Sequence[ComponentReference] = (),
         length: tuple[int, int] | None = None,
         timestep: int = 50,
-    ) -> RFdiffusionInput:
+    ) -> RfDiffusionInput:
         r"""Lower base, complex, inpainting, active-site, or fold conditioning.
 
         ``length`` is the RFdiffusion ``ContigMap.length`` topology argument:
         the combined generated-length bounds across all inpaint chains, excluding receptor
-        ``ExistingSpan`` rows. It is stored on :class:`RFdiffusionLayout` so
+        ``ExistingSpan`` rows. It is stored on :class:`RfDiffusionLayout` so
         ``_sample_variable_lengths`` can honor the cross-segment total when drawing
         per-``GeneratedSegment`` lengths.
         """
@@ -142,13 +142,13 @@ class RFdiffusionProcessor:
                 (
                     AllowedResidueIdentities,
                     Hotspot,
-                    Coordination,
-                    Distance,
-                    PointGroupSymmetry,
-                    RadiusOfGyration,
-                    ReferenceCoordinates,
-                    SecondaryStructure,
-                    SubstrateInteraction,
+                    RfDiffusionCoordination,
+                    RfDiffusionDistance,
+                    RfDiffusionPointGroupSymmetry,
+                    RfDiffusionRadiusOfGyration,
+                    RfDiffusionReferenceCoordinates,
+                    RfDiffusionSecondaryStructure,
+                    RfDiffusionSubstrateInteraction,
                     SymbolicBond,
                 ),
             ):
@@ -171,15 +171,15 @@ class RFdiffusionProcessor:
         else:
             structure = None
             system = input
-        if sum(isinstance(condition, PointGroupSymmetry) for condition in condition_values) > 1:
-            raise ValueError("RFdiffusion accepts at most one PointGroupSymmetry condition")
+        if sum(isinstance(condition, RfDiffusionPointGroupSymmetry) for condition in condition_values) > 1:
+            raise ValueError("RFdiffusion accepts at most one RfDiffusionPointGroupSymmetry condition")
         if placement is None and system is not None:
             default_placement: PlacementSpec = {}
             for instance_id, entity_id in system.instances.items():
                 entity = system.entities[entity_id]
                 if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
                     default_placement[instance_id] = {instance_id: ExistingSpan(instance_id, 0, len(entity))}
-            placement = RFdiffusionPlacements(placements=default_placement) if default_placement else None
+            placement = RfDiffusionPlacements(placements=default_placement) if default_placement else None
         if placement is None:
             raise ValueError("RFdiffusion requires a placement when no protein input can define one")
         # Every placement_id must be globally unique across the whole PlacementSpec.
@@ -233,14 +233,14 @@ class RFdiffusionProcessor:
         reference_sites = {
             site
             for condition in condition_values
-            if isinstance(condition, ReferenceCoordinates)
+            if isinstance(condition, RfDiffusionReferenceCoordinates)
             for site in condition.sites
         }
         if any(
             isinstance(system.entities[system.instances[site.instance_id]], Molecule)  # type: ignore[union-attr]
             for site in reference_sites
         ):
-            raise ValueError("RFdiffusion ReferenceCoordinates must identify protein residue atoms")
+            raise ValueError("RFdiffusion RfDiffusionReferenceCoordinates must identify protein residue atoms")
         referenced_residues = {
             (site.instance_id, site.component_index)
             for site in reference_sites
@@ -248,7 +248,7 @@ class RFdiffusionProcessor:
         }
         for instance_id, component_index in referenced_residues:
             if (instance_id, component_index) not in output_index:
-                raise ValueError("ReferenceCoordinates sites must belong to an RFdiffusion output residue")
+                raise ValueError("RfDiffusionReferenceCoordinates sites must belong to an RFdiffusion output residue")
             backbone = {
                 site.atom_id
                 for site in reference_sites
@@ -256,7 +256,7 @@ class RFdiffusionProcessor:
             }
             if not {"N", "CA", "C"} <= backbone:
                 raise ValueError(
-                    "RFdiffusion ReferenceCoordinates works at residue granularity and requires N/CA/C "
+                    "RFdiffusion RfDiffusionReferenceCoordinates works at residue granularity and requires N/CA/C "
                     f"for {instance_id}:{component_index}"
                 )
         fixed_structure = torch.tensor(
@@ -272,14 +272,14 @@ class RFdiffusionProcessor:
         )
         guided_atoms: list[AtomSite | SymbolicAtomSite] = []
         for condition in condition_values:
-            if isinstance(condition, Coordination):
+            if isinstance(condition, RfDiffusionCoordination):
                 for reference in (
                     *condition.side_a,
                     *condition.side_b,
                 ):
                     if isinstance(reference, (AtomSite, SymbolicAtomSite)):
                         guided_atoms.append(reference)
-            elif isinstance(condition, (Distance, SymbolicBond)):
+            elif isinstance(condition, (RfDiffusionDistance, SymbolicBond)):
                 guided_atoms.extend((condition.site_a, condition.site_b))
         structure_index = {} if structure is None else {site: index for index, site in enumerate(structure.sites)}
         for site in guided_atoms:
@@ -319,7 +319,7 @@ class RFdiffusionProcessor:
                 external_guidance.append(atom_site)
         if external_guidance and not bool(fixed_structure.any()):
             raise ValueError(
-                "guidance to atoms outside the RFdiffusion output requires fixed ReferenceCoordinates "
+                "guidance to atoms outside the RFdiffusion output requires fixed RfDiffusionReferenceCoordinates "
                 "to define their coordinate frame"
             )
         fixed_sequence = torch.tensor(
@@ -371,7 +371,7 @@ class RFdiffusionProcessor:
             [isinstance(reference, tuple) and reference in hotspots for reference in output_residues]
         )
         if bool((hotspot & ~fixed_structure).any()):
-            raise ValueError("RFdiffusion hotspot residues must have fixed ReferenceCoordinates")
+            raise ValueError("RFdiffusion hotspot residues must have fixed RfDiffusionReferenceCoordinates")
 
         coords = torch.full((output_length, 14, 3), float("nan"))
         for output_row, reference in enumerate(output_residues):
@@ -394,7 +394,7 @@ class RFdiffusionProcessor:
             coords[output_row, present] = target_coords[target_row, present]
 
         for condition in condition_values:
-            if not isinstance(condition, SubstrateInteraction):
+            if not isinstance(condition, RfDiffusionSubstrateInteraction):
                 continue
             external_atoms: list[AtomSite] = []
             source_system = cast(MolecularSystem, system)
@@ -409,8 +409,8 @@ class RFdiffusionProcessor:
                     external_atoms.append(atom_site)
             if external_atoms and not bool(fixed_structure.any()):
                 raise ValueError(
-                    "SubstrateInteraction with external atoms requires fixed ReferenceCoordinates to "
-                    "define the substrate frame"
+                    "RfDiffusionSubstrateInteraction with external atoms requires fixed "
+                    "RfDiffusionReferenceCoordinates to define the substrate frame"
                 )
 
         secondary_structure, block_adjacency = _fold_features(
@@ -422,7 +422,7 @@ class RFdiffusionProcessor:
         secondary_labels = secondary_structure.argmax(dim=-1)
         label_by_kind = {"helix": 0, "strand": 1, "loop": 2}
         for condition in condition_values:
-            if not isinstance(condition, SecondaryStructure):
+            if not isinstance(condition, RfDiffusionSecondaryStructure):
                 continue
             secondary_rows: list[int] = []
             for secondary_target in condition.targets:
@@ -436,11 +436,11 @@ class RFdiffusionProcessor:
                     secondary_rows.append(output_index[cast(tuple[str, int] | SymbolicResidueSite, secondary_target)])
             row_tensor = torch.tensor(secondary_rows, dtype=torch.int64)
             if bool(fixed_structure[row_tensor].any()):
-                raise ValueError("SecondaryStructure targets must be structure-inpainted, not fixed")
+                raise ValueError("RfDiffusionSecondaryStructure targets must be structure-inpainted, not fixed")
             label = label_by_kind[condition.kind]
             existing = secondary_labels[row_tensor]
             if bool(((existing != 3) & (existing != label)).any()):
-                raise ValueError("SecondaryStructure contradicts template evidence")
+                raise ValueError("RfDiffusionSecondaryStructure contradicts template evidence")
             secondary_labels[row_tensor] = label
         secondary_structure = F.one_hot(secondary_labels, num_classes=4).to(torch.float32)
         residue_indices: list[int] = []
@@ -454,7 +454,7 @@ class RFdiffusionProcessor:
                 previous_instance = instance_id
             residue_indices.append(200 * chain_index + row - chain_start)
         residue_index = torch.tensor(residue_indices, dtype=torch.int64)
-        return RFdiffusionInput(
+        return RfDiffusionInput(
             noisy_coords=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             sequence=F.one_hot(tokens, num_classes=22).to(device=self.device, dtype=self.dtype).unsqueeze(0),
             residue_index=residue_index.to(self.device).unsqueeze(0),
@@ -465,7 +465,7 @@ class RFdiffusionProcessor:
             secondary_structure=secondary_structure.to(device=self.device, dtype=self.dtype).unsqueeze(0),
             block_adjacency=block_adjacency.to(device=self.device, dtype=self.dtype).unsqueeze(0),
             timestep=torch.tensor([timestep], dtype=torch.int64, device=self.device),
-            layout=RFdiffusionLayout(
+            layout=RfDiffusionLayout(
                 system=system,
                 structure=structure,
                 templates=template_values,  # type: ignore[arg-type]
@@ -516,7 +516,7 @@ def _atom14_target(
 
 
 def _resolve_placement(
-    placement: RFdiffusionPlacements,
+    placement: RfDiffusionPlacements,
 ) -> tuple[
     tuple[tuple[str, int] | SymbolicResidueSite, ...],
     tuple[str, ...],
@@ -527,7 +527,7 @@ def _resolve_placement(
     # order and calling `allocate()` once per realized output chain with >=1 occurrence — the
     # canonical `chain_{n}` IDs (uniform and 0-based). A declaration group that
     # realizes to zero residues mints no chain and consumes no index. Identical to the
-    # post-sample re-lowering in `RFdiffusionModel._sample_variable_lengths`. Numerically inert:
+    # post-sample re-lowering in `RfDiffusionModel._sample_variable_lengths`. Numerically inert:
     # `residue_index` is computed from chain boundaries below, not from this id string.
     allocator = InstanceIdAllocator()
     for group in placement.placements.values():
@@ -539,7 +539,7 @@ def _resolve_placement(
                 ]
             else:
                 # Processor lowering is deterministic. Variable lengths are sampled by
-                # RFdiffusionModel.design, where the user RNG is available.
+                # RfDiffusionModel.design, where the user RNG is available.
                 group_references = [SymbolicResidueSite(placement_id, index) for index in range(part.min_length)]
             group_residues.extend(group_references)
         if not group_residues:
@@ -705,7 +705,7 @@ def from_contig_string(
     Returns ``(PlacementSpec, combined_length)``. ``combined_length`` is the RFdiffusion
     ``ContigMap.length`` argument: the combined generated-length bounds ``(Σ min, Σ max)``
     across every generated subcon, excluding ``ExistingSpan`` rows. It is stored on
-    :class:`RFdiffusionLayout.combined_length` and is ``None`` when the string generates
+    :class:`RfDiffusionLayout.combined_length` and is ``None`` when the string generates
     nothing. ``source_instances`` (source chain-letter →
     length) resolves the bare-chain ``A`` form to ``ExistingSpan("A", 0, length)``; explicit
     ``A163-181`` extents are carried literally (the upstream 1-based residue numbering is NOT

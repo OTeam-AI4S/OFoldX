@@ -68,7 +68,7 @@ _RECYCLING_SCOPE_MAP = {
     "prev_msa_first_row_norm": "prev_msa_first_row_norm",
     "prev_pair_norm": "prev_pair_norm",
 }
-_EXTRA_MSA_EMBEDDING_SCOPE_MAP = {
+_EXTRA_MSA_EMBEDDINGS_SCOPE_MAP = {
     "extra_msa_activations": "extra_msa_projection",
     "extra_msa_projection": "extra_msa_projection",
 }
@@ -197,7 +197,7 @@ def convert_official_alphafold2_state_dict(
         target = convert_official_tensor(source_key, tensor)
         if dtype is not None and target.is_floating_point():
             target = target.to(dtype=dtype)
-        expanded = _expand_stacked_block_tensor(source_key, target_key, tensor, target)
+        expanded = _expand_stacked_tensor(source_key, target_key, tensor, target)
         for expanded_key, expanded_tensor in expanded.items():
             if expanded_key in converted:
                 raise ValueError(f"multiple official AF2 tensors map to {expanded_key!r}")
@@ -245,7 +245,7 @@ def normalize_official_param_key(key: str) -> str:
 
     Examples:
         >>> normalize_official_param_key("alphafold/alphafold_iteration/evoformer/preprocess_1d//weights")
-        'input_embedding.preprocess_1d.weight'
+        'input_embeddings.preprocess_1d.weight'
         >>> normalize_official_param_key("alphafold/alphafold_iteration/structure_module/layer_norm//scale")
         'structure_module.layer_norm.weight'
     """
@@ -261,32 +261,44 @@ def normalize_official_param_key(key: str) -> str:
     return ".".join(combined)
 
 
-def _expand_stacked_block_tensor(
+def _expand_stacked_tensor(
     source_key: str,
     target_key: str,
     source_tensor: Tensor,
     converted_tensor: Tensor,
 ) -> dict[str, Tensor]:
-    if not _is_stacked_block_tensor(source_key, target_key, source_tensor):
+    if not _is_stacked_tensor(source_key, target_key, source_tensor):
         return {target_key: converted_tensor}
-    if ".blocks.stacked." in target_key:
+    if ".template_pair_stack.stacked.pair_stack." in target_key:
+        marker = ".template_pair_stack.stacked.pair_stack."
+        replacement = ".template_pair_stack.layers.{index}."
+    elif ".template_embedding_iteration.layers.stacked.pair_stack." in target_key:
+        marker = ".template_embedding_iteration.layers.stacked.pair_stack."
+        replacement = ".template_embedding_iteration.layers.{index}."
+    elif ".blocks.stacked." in target_key:
         marker = ".blocks.stacked."
-        replacement = ".blocks.{block_index}."
-    elif ".template_pair_stack.stacked." in target_key:
-        marker = ".template_pair_stack.stacked."
-        replacement = ".template_pair_stack.blocks.{block_index}."
+        replacement = ".blocks.{index}."
+    elif ".layers.stacked." in target_key:
+        marker = ".layers.stacked."
+        replacement = ".layers.{index}."
     else:
         return {target_key: converted_tensor}
     return {
-        target_key.replace(marker, replacement.format(block_index=block_index)): converted_tensor[
-            block_index
-        ].contiguous()
-        for block_index in range(converted_tensor.shape[0])
+        target_key.replace(marker, replacement.format(index=index)): converted_tensor[index].contiguous()
+        for index in range(converted_tensor.shape[0])
     }
 
 
-def _is_stacked_block_tensor(source_key: str, target_key: str, tensor: Tensor) -> bool:
-    if ".blocks.stacked." not in target_key and ".template_pair_stack.stacked." not in target_key:
+def _is_stacked_tensor(source_key: str, target_key: str, tensor: Tensor) -> bool:
+    if not any(
+        marker in target_key
+        for marker in (
+            ".layers.stacked.",
+            ".blocks.stacked.",
+            ".template_pair_stack.stacked.pair_stack.",
+            ".template_embedding_iteration.layers.stacked.pair_stack.",
+        )
+    ):
         return False
     _, name = _split_official_param_key(source_key)
     if name in {"query_w", "gating_w", "output_w"}:
@@ -329,19 +341,19 @@ def _normalize_scope_parts(parts: list[str]) -> list[str]:
 def _normalize_evoformer_scope(parts: list[str]) -> list[str]:
     if not parts:
         return ["evoformer"]
-    input_embedding_scope = _INPUT_EMBEDDING_SCOPE_MAP.get(parts[0])
-    if input_embedding_scope is not None:
-        return ["input_embedding", input_embedding_scope, *_normalize_stack_scope(parts[1:])]
+    input_embeddings_scope = _INPUT_EMBEDDING_SCOPE_MAP.get(parts[0])
+    if input_embeddings_scope is not None:
+        return ["input_embeddings", input_embeddings_scope, *_normalize_stack_scope(parts[1:])]
     recycling_scope = _RECYCLING_SCOPE_MAP.get(parts[0])
     if recycling_scope is not None:
-        return ["recycling_embedding", recycling_scope, *_normalize_stack_scope(parts[1:])]
-    extra_msa_embedding_scope = _EXTRA_MSA_EMBEDDING_SCOPE_MAP.get(parts[0])
+        return ["recycling_embeddings", recycling_scope, *_normalize_stack_scope(parts[1:])]
+    extra_msa_embedding_scope = _EXTRA_MSA_EMBEDDINGS_SCOPE_MAP.get(parts[0])
     if extra_msa_embedding_scope is not None:
-        return ["extra_msa_embedding", extra_msa_embedding_scope, *_normalize_stack_scope(parts[1:])]
+        return ["extra_msa_embeddings", extra_msa_embedding_scope, *_normalize_stack_scope(parts[1:])]
     if parts[0] == "single_activations":
-        return ["single_activations", *_normalize_stack_scope(parts[1:])]
+        return ["single_projection", *_normalize_stack_scope(parts[1:])]
     if parts[0] in {"template_single_embedding", "template_projection"}:
-        return ["template_msa_embedding", *_normalize_stack_scope(parts)]
+        return ["template_msa_embeddings", *_normalize_stack_scope(parts)]
     if parts[0] == "template_embedding":
         return ["template_embedder", *_normalize_stack_scope(parts[1:])]
     if parts[0] == "evoformer_iteration":
@@ -447,12 +459,24 @@ def _rename_triangle_multiplication_children(normalized: list[str]) -> list[str]
 def _normalize_structure_module_scope(parts: list[str]) -> list[str]:
     normalized: list[str] = []
     for part in parts:
+        if part == "fold_iteration":
+            normalized.append("layer")
+            continue
+        if part == "affine_update":
+            normalized.append("backbone_update")
+            continue
+        if part == "quat_rigid":
+            normalized.append("backbone_update")
+            continue
+        if part == "rigid" and normalized[-1:] == ["backbone_update"]:
+            normalized.append("projection")
+            continue
         if part == "rigid_sidechain":
             normalized.append("sidechain")
             continue
 
         transition_index = _repeated_haiku_index(part, "transition")
-        if transition_index is not None and "fold_iteration" in normalized and "sidechain" not in normalized:
+        if transition_index is not None and "layer" in normalized and "sidechain" not in normalized:
             normalized.extend(("transition", "layers", str(transition_index)))
             continue
 
@@ -463,12 +487,12 @@ def _normalize_structure_module_scope(parts: list[str]) -> list[str]:
 
         resblock1_index = _repeated_haiku_index(part, "resblock1")
         if resblock1_index is not None and "sidechain" in normalized:
-            normalized.extend(("resblocks", str(resblock1_index), "resblock1"))
+            normalized.extend(("layers", str(resblock1_index), "linear1"))
             continue
 
         resblock2_index = _repeated_haiku_index(part, "resblock2")
         if resblock2_index is not None and "sidechain" in normalized:
-            normalized.extend(("resblocks", str(resblock2_index), "resblock2"))
+            normalized.extend(("layers", str(resblock2_index), "linear2"))
             continue
 
         normalized.append(part)

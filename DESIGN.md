@@ -107,6 +107,48 @@ head, decoded output, and checkpoint variant remains required on the concrete
 family surface that actually owns it. Only a confirmed upstream defect may differ,
 and that divergence is recorded in `UPSTREAM_BUGS.md` and parity evidence.
 
+#### 1.2.1 Code organization consistency
+
+Status: frozen — MultiMolecule's model implementation guide and the owner's
+explicit cross-model consistency correction support this bounded source-organization
+contract for the current Tik–Tok cycle.
+
+One semantic concept uses one canonical name across config fields,
+Model/Processor/Pipeline signatures, Model attributes, Results, converters, and
+repository operations. Scientific differences remain distinct; consistency never
+flattens them into one misleading abstraction or term.
+
+Every model package follows the same `config.py`, `model.py`, `processor.py`,
+`pipeline.py`, `convert.py`, and `__init__.py` ownership grammar. An extra file
+requires a concrete scientific or I/O ownership reason, not an upstream source
+layout or local preference.
+
+In a single-file `model.py`, declarations follow MultiMolecule execution order:
+public Model variants; top-level modules; embeddings or input projections;
+encoders or trunks; repeated layers or blocks; lower-level attention, MLP,
+normalization, geometry, and diffusion components; heads; helpers; and typed
+inputs, outputs, and Results last. Sibling families place equivalent large
+substructures in the same relative position and use the same term. Within every
+`__init__`, child modules are assigned in their `forward` execution order.
+
+`Layer` names one atomic transform. `Block` names a repeatable composite unit
+with multiple coupled transforms or residual paths. A repeated unit's class,
+container attribute, and count use the same noun: `Layer/layers/num_layers` or
+`Block/blocks/num_blocks`. Homogeneous repetition alone does not make a
+composite block a layer.
+
+The remaining package files are similarly predictable: `config.py` follows model
+and component construction order; `processor.py` follows input-to-tensor lowering;
+`pipeline.py` follows call-to-Result execution; `convert.py` follows load,
+translate, validate, and save; and `__init__.py` groups public imports and exports
+before registration. Source-only reordering or renaming must preserve state-dict
+key meaning and exact numerical behavior. Conversion alone owns upstream names and
+translates them into canonical OFoldX names. Each model's `convert.py` owns its
+complete source-checkpoint mapping; `models/` contains no cross-model conversion
+script. Format-independent artifact loading and saving may be shared, while
+appropriate repetition of source-specific key and tensor rules keeps each model's
+conversion contract local and readable.
+
 ### 1.3 Think before coding
 
 Now is better than never, although never is better than right now.
@@ -392,10 +434,22 @@ configuration is already named by its concrete config class and is constructed
 directly as `ConcreteProcessor(config, device=..., dtype=...)`; a config-less
 Processor is constructed directly without a positional config. `AutoProcessor`
 does not maintain a second Processor-config-to-class registry merely to spell that
-ordinary constructor indirectly. Model, Processor, and Config above are collective
-terms, not required nominal base classes.
+ordinary constructor indirectly. Processor and Config above are collective terms,
+not required nominal base classes. Every registered Model inherits the minimal
+public `ofoldx.Model` base.
 
-AutoModel(pretrained) returns an eval-mode Model. AutoModel(config) returns a normal fresh nn.Module without changing its training flag. Runtime device and dtype are not config fields.
+`Model.__init__` performs ordinary `nn.Module` initialization once, stores the
+concrete config, and initializes the backend policy. Its default
+`reset_parameters()` delegates to each child Module's native PyTorch initializer;
+an architecture overrides that method when its released initialization differs or
+when it owns parameters directly. The base does not claim a singular device or
+dtype for a potentially mixed or sharded module, and it does not duplicate pair-
+and Pipeline-owned repository writing with a Model-only save API. Placement uses
+`nn.Module.to`; repository writing is specified in Section 7.5.
+
+AutoModel(pretrained) returns an eval-mode Model. AutoModel(config) returns a normal
+fresh Model without changing its training flag. Runtime device and dtype are not
+config fields.
 
 `AutoModel.from_pretrained(pretrained, ...)` and
 `AutoProcessor.from_pretrained(pretrained, ...)` are guarded, repository-only thin
@@ -2204,16 +2258,18 @@ output meaning. No family-wide cardinality or shared-output rule follows from
 registration. Which concrete Models and Processors form repository pairs remains
 a family inventory question rather than a convention to assume.
 
-`Model`, `Processor`, and `ModelConfig` are collective terms. `ProcessorConfig` is
-collective only for Processors with persistent lowering values; a config-less
-Processor does not invent an empty config. None requires a generic nominal base
-class or a hierarchy that hides the concrete signatures.
+`Processor` and `ModelConfig` are collective terms. `ProcessorConfig` is collective
+only for Processors with persistent lowering values; a config-less Processor does
+not invent an empty config. Every registered Model inherits the minimal public
+`ofoldx.Model` lifecycle base, which stores its concrete config and owns backend
+selection without defining or hiding its scientific signature. Processors and
+Configs do not require nominal bases.
 
 Every concrete Model that is constructible through `AutoModel` has the following
 Hub-loadable constructor shape:
 
 ~~~python
-class ConcreteModel(torch.nn.Module):
+class ConcreteModel(ofoldx.Model):
     config_class = ConcreteModelConfig
 
     def __init__(self, config: ConcreteModelConfig | None = None) -> None: ...
@@ -2449,7 +2505,7 @@ the existing public MPNN module rather than to Packer ownership or a rejected
 generic structure reader:
 
 ~~~python
-# ofoldx.models.mpnn_pdb
+# ofoldx.io
 def read_mpnn_pdb(
     path: str | PathLike[str],
     *,
@@ -3341,7 +3397,7 @@ The Structure arm has the deliberately different updated semantics:
   equals the immediately previous integer, never resets at a chain boundary, and
   is added to every subsequent emitted integer.
 
-Composing the shared `ofoldx.models.mpnn_pdb.read_mpnn_pdb(path, chains=...)` selects the
+Composing the shared `ofoldx.io.read_mpnn_pdb(path, chains=...)` selects the
 Structure arm and therefore also selects that reader's first-model, blank/A-altloc,
 gzip, hybrid36, static-chemistry, and retained-occupancy semantics. The two public
 expressions are intentionally not equivalent:
@@ -3695,7 +3751,7 @@ class ProteinMpnnDesignAndPackPipeline:
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]: ...
 ~~~
 
-A path is parsed exactly once with `ofoldx.models.mpnn_pdb.read_mpnn_pdb`; that canonical
+A path is parsed exactly once with `ofoldx.io.read_mpnn_pdb`; that canonical
 `Structure` is the only source given to both stages. The designer stage lowers it
 through `designer.processor.process_structure`, including the explicit
 `filter_by_occupancy` value, physical-CA order, and updated MSE semantics, before
@@ -4417,7 +4473,7 @@ LigandMpnn, without atom context or an interface mask.
 The one root Model owns the released reusable membrane feature Module directly:
 
 ~~~python
-class MembraneMpnnModel(nn.Module):
+class MembraneMpnnModel(ofoldx.Model):
     def encode(
         self,
         input: MembraneMpnnInput,
@@ -4744,7 +4800,7 @@ not enter frequent CI or committed package history.
 
 Shared ownership stops at concrete graph primitives in `ofoldx.modules.mpnn`: the
 gather functions, `MpnnProteinFeatures`, relative-position, feed-forward, message,
-encoder, and decoder Modules; the public MPNN reader lives in `ofoldx.models.mpnn_pdb`
+encoder, and decoder Modules; the public MPNN reader lives in `ofoldx.io`
 and the amino-acid/element/water facts in `ofoldx.data`. `CaProteinMpnnFeatures` remains Protein-owned,
 `LigandMpnnFeatures` remains Ligand-owned, and `MembraneMpnnFeatures` remains
 Membrane-owned and public because its live three-class node projection is a
@@ -4802,7 +4858,7 @@ class GlobalMembraneMpnnDesignAndPackPipeline:
     ) -> tuple[DesignResult, tuple[PackResult, ...]]: ...
 ~~~
 
-The composition parses a path once with `ofoldx.models.mpnn_pdb.read_mpnn_pdb` and gives
+The composition parses a path once with `ofoldx.io.read_mpnn_pdb` and gives
 the resulting `Structure` to both child Pipelines. `transmembrane` remains the
 global designer's biological input; it is not translated to a per-residue label
 mapping or a composition mode. With `repack_everything=False`, the Packer receives
@@ -5780,7 +5836,7 @@ Its complete method signature on the `MODELS` registry is:
 MODELS.register(
     id: str,
     *,
-    model: type[torch.nn.Module],
+    model: type[ofoldx.Model],
     processor: type,
     standard_tasks: Collection[Literal["fold", "design", "score", "pack"]] = (),
 ) -> None
@@ -6549,22 +6605,24 @@ The dispatcher and OOps adapter are implementation details. The first release ha
 
 ### 8.2 Selection
 
-For Models that use dispatched operators, the user may select:
+For every Model, the user may select an operator policy:
 
 - auto: use a compatible optimized implementation, otherwise PyTorch;
 - torch: require the public reference; or
 - oops: require OOps and fail if unavailable.
 
-A Model that uses dispatched operators exposes the following method, with auto as its initial policy:
+Every Model exposes the following method. The base initializes ``auto``; a concrete
+constructor may select a stricter documented initial policy after its operator graph
+is built:
 
 ~~~python
 model.set_backend(name) -> model
 ~~~
 
-A torch-only Model does not add this method for cosmetic symmetry. A task Pipeline
-does not duplicate backend state. Users select the backend on every explicitly
-named Model that uses dispatched operators: `pipe.model` for a standard Pipeline,
-and each named Model such as `pipe.model` and `pipe.structure_model` for a concrete
+A torch-only Model records the same policy but has no dispatched operation to
+reconfigure. A task Pipeline does not duplicate backend state. Users select the
+backend on every explicitly named Model: `pipe.model` for a standard Pipeline, and
+each named Model such as `pipe.model` and `pipe.structure_model` for a concrete
 multi-pair Pipeline.
 
 Auto dispatch inspects only facts needed to select an implementation. It forwards the documented valid tensor arguments without another full validation pass. Invalid-input failure wording and order are not a cross-backend API.

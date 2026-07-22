@@ -56,11 +56,12 @@ no separately released fold task, so the Model does not expose `fold`.
 Observed `Structure` coordinates are geometric evidence, not implicit fixation.
 Partial diffusion starts from them only when the caller passes
 `partial_diffusion_snr`; without that explicit argument sampling starts from full
-noise even when every model atom is observed. Hard `ReferenceCoordinates` pins only
+noise even when every model atom is observed. Hard `ODesignReferenceCoordinates` pins only
 the selected atoms; soft values remain constraint evidence without pinning.
 Missing/generated coordinates cannot be used for partial diffusion.
-Ranged `GeneratedSegment` lengths are sampled once by `design`, from the same
-seed or generator used by diffusion; `ODesignPlacements.chain_lengths` (a family-owned
+Ranged `GeneratedSegment` lengths are realized once by `ODesignProcessor.realize_ranges`
+at the Pipeline boundary, from the same generator subsequently used by diffusion;
+`ODesignPlacements.chain_lengths` (a family-owned
 per-chain length field, not a shared core invariant) can fix a chain's total length
 while distributing that total across ranged segments. All samples in one call share
 the realized topology as in the released inference path.
@@ -88,7 +89,7 @@ rule of "one pair per checkpoint," it publishes as **two repositories over one a
 both name `ofoldx.odesign` and whose `processor.json` differ only in `receptor_mode`. It is
 explicitly **not** two registered architecture pairs. `rigid` auto-pins every existing
 (non-generated, observed) receptor heavy atom; `flex` pins only atoms named by an explicit
-hard `ReferenceCoordinates`.
+hard `ODesignReferenceCoordinates`.
 
 ## OInvFold protein composition and the M×S×K result
 

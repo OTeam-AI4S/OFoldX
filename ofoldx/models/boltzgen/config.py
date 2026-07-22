@@ -5,6 +5,19 @@ from __future__ import annotations
 from chanfig import Config
 
 
+class BoltzGenInputEmbeddingsConfig(Config):
+    r"""Atom/token input-embedder graph parameters."""
+
+    num_atom_encoder_blocks: int = 3
+    num_atom_encoder_attention_heads: int = 4
+    vocab_size: int = 33
+    msa_profile_size: int = 34
+    num_method_types: int = 12
+    num_molecule_types: int = 4
+    add_binding_specification: bool = False
+    add_ss_specification: bool = False
+
+
 class BoltzGenTrunkConfig(Config):
     r"""Pairformer/MSA graph parameters shared by structure-design variants."""
 
@@ -25,19 +38,6 @@ class BoltzGenTrunkConfig(Config):
     msa_dropout: float = 0.15
 
 
-class BoltzGenInputEmbedderConfig(Config):
-    r"""Atom/token input-embedder graph parameters."""
-
-    num_atom_encoder_blocks: int = 3
-    num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33
-    msa_profile_size: int = 34
-    num_method_types: int = 12
-    num_molecule_types: int = 4
-    add_binding_specification: bool = False
-    add_ss_specification: bool = False
-
-
 class BoltzGenTemplateConfig(Config):
     r"""Geometry and block parameters shared by template and token-distance conditioning."""
 
@@ -49,7 +49,7 @@ class BoltzGenTemplateConfig(Config):
     miniformer_blocks: bool = False
 
 
-class BoltzGenDiffusionConfig(Config):
+class BoltzGenDenoiserConfig(Config):
     r"""EDM score-network graph parameters."""
 
     num_token_transformer_blocks: int = 24
@@ -93,7 +93,7 @@ class BoltzGenStructureDesignConfig(Config):
     use_token_distance: bool = True
 
 
-class BoltzGenIFoldModuleConfig(Config):
+class BoltzGenInverseFoldingModuleConfig(Config):
     r"""Inverse-folding atom encoder, graph encoder, and decoder parameters."""
 
     node_size: int = 128
@@ -128,12 +128,12 @@ class BoltzGenConfig(Config):
     conditioning_cutoff_min: float = 4.0
     conditioning_cutoff_max: float = 20.0
 
-    input_embedder: BoltzGenInputEmbedderConfig = BoltzGenInputEmbedderConfig(
+    input_embeddings: BoltzGenInputEmbeddingsConfig = BoltzGenInputEmbeddingsConfig(
         {"add_binding_specification": True, "add_ss_specification": True}
     )
     trunk: BoltzGenTrunkConfig = BoltzGenTrunkConfig()
     template: BoltzGenTemplateConfig = BoltzGenTemplateConfig()
-    diffusion: BoltzGenDiffusionConfig = BoltzGenDiffusionConfig()
+    denoiser: BoltzGenDenoiserConfig = BoltzGenDenoiserConfig()
     sampler: BoltzGenSamplerConfig = BoltzGenSamplerConfig()
     design: BoltzGenStructureDesignConfig = BoltzGenStructureDesignConfig()
 
@@ -157,24 +157,24 @@ class BoltzGenConfig(Config):
         """
 
         config = cls()
-        config.input_embedder.add_binding_specification = False
-        config.input_embedder.add_ss_specification = False
+        config.input_embeddings.add_binding_specification = False
+        config.input_embeddings.add_ss_specification = False
         config.trunk.use_miniformer = True
         config.trunk.msa_miniformer_blocks = True
         config.trunk.num_pairformer_blocks = 12
         config.trunk.num_msa_blocks = 3
         config.template.miniformer_blocks = True
-        config.diffusion.num_token_transformer_blocks = 8
+        config.denoiser.num_token_transformer_blocks = 8
         config.design.use_token_distance = False
         return config
 
 
-class BoltzGenIFoldConfig(Config):
+class BoltzGenInverseFoldingConfig(Config):
     r"""Model config for the distinct BoltzGen inverse-folding architecture."""
 
     single_size: int = 384
     atom_hidden_size: int = 128
     atom_pair_hidden_size: int = 16
     atom_feature_size: int = 388
-    input_embedder: BoltzGenInputEmbedderConfig = BoltzGenInputEmbedderConfig()
-    ifold: BoltzGenIFoldModuleConfig = BoltzGenIFoldModuleConfig()
+    input_embeddings: BoltzGenInputEmbeddingsConfig = BoltzGenInputEmbeddingsConfig()
+    inverse_folding: BoltzGenInverseFoldingModuleConfig = BoltzGenInverseFoldingModuleConfig()

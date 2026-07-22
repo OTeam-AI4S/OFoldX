@@ -20,13 +20,13 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...io import read_mpnn_pdb
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
     virtual_beta_carbon,
 )
-from ..mpnn_pdb import read_mpnn_pdb
 from .config import LigandMpnnProcessorConfig
 from .model import LigandMpnnInput
 
@@ -123,7 +123,7 @@ class LigandMpnnProcessor:
         self,
         input: Structure | str | PathLike[str],
         *,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         logit_bias: Tensor | None = None,
@@ -137,7 +137,7 @@ class LigandMpnnProcessor:
         if isinstance(input, (str, PathLike)):
             return self.process_pdb(
                 input,
-                positions=positions,
+                design_positions=design_positions,
                 conditions=conditions,
                 tied_weights=tied_weights,
                 logit_bias=logit_bias,
@@ -150,7 +150,7 @@ class LigandMpnnProcessor:
             raise TypeError("LigandMPNN requires coordinates; pass a Structure or local PDB/mmCIF path")
         return self.process_structure(
             input,
-            positions=positions,
+            design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
             logit_bias=logit_bias,
@@ -164,7 +164,7 @@ class LigandMpnnProcessor:
         self,
         path: str | PathLike[str],
         *,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         logit_bias: Tensor | None = None,
@@ -182,7 +182,7 @@ class LigandMpnnProcessor:
 
         return self.process_structure(
             read_mpnn_pdb(path),
-            positions=positions,
+            design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
             logit_bias=logit_bias,
@@ -196,7 +196,7 @@ class LigandMpnnProcessor:
         self,
         structure: Structure,
         *,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
         logit_bias: Tensor | None = None,
@@ -226,7 +226,7 @@ class LigandMpnnProcessor:
             system,
             rows,
             observed=observed,
-            positions=positions,
+            design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
             logit_bias=logit_bias,
@@ -251,7 +251,7 @@ class LigandMpnnProcessor:
         row_residue_context_mask: list[np.ndarray] = []
         row_valid: list[bool] = []
         row_component_ids: list[str] = []
-        row_chain_indices: list[int] = []
+        row_chain_index: list[int] = []
         row_source_numbers: list[int | None] = []
         chain_label_by_instance: dict[str, int] = {}
         for index, site in enumerate(structure.sites):
@@ -284,7 +284,7 @@ class LigandMpnnProcessor:
             row_residue_context_mask.append(atom37_mask[_RESIDUE_CONTEXT_START:])
             row_valid.append(valid)
             row_component_ids.append(system.component(reference).component_id)
-            row_chain_indices.append(chain_label_by_instance[site.instance_id])
+            row_chain_index.append(chain_label_by_instance[site.instance_id])
             row_source_numbers.append(
                 None if structure.residue_numbers is None else structure.residue_numbers[reference].number
             )
@@ -294,10 +294,10 @@ class LigandMpnnProcessor:
         if not any(row_valid):
             raise ValueError("LigandMPNN requires at least one residue with complete N/CA/C/O coordinates")
 
-        row_residue_indices: list[int] = []
+        row_residue_index: list[int] = []
         if structure.residue_numbers is None:
             for reference in row_references:
-                row_residue_indices.append(reference[1])
+                row_residue_index.append(reference[1])
         else:
             duplicate_count = 0
             previous_number: int | None = None
@@ -305,7 +305,7 @@ class LigandMpnnProcessor:
                 assert source_number is not None
                 if source_number == previous_number:
                     duplicate_count += 1
-                row_residue_indices.append(source_number + duplicate_count)
+                row_residue_index.append(source_number + duplicate_count)
                 previous_number = source_number
 
         row_tokens = [
@@ -320,8 +320,8 @@ class LigandMpnnProcessor:
             row_residue_context_mask,
             row_tokens,
             row_valid,
-            row_residue_indices,
-            row_chain_indices,
+            row_residue_index,
+            row_chain_index,
             row_component_ids,
         )
 
@@ -359,7 +359,7 @@ class LigandMpnnProcessor:
     def _select_context(
         self,
         backbone: Tensor,
-        valid_mask: Tensor,
+        residue_mask: Tensor,
         context_coordinates: Tensor,
         context_atomic_numbers: Tensor,
         *,
@@ -373,7 +373,7 @@ class LigandMpnnProcessor:
         cb = virtual_beta_carbon(backbone[:, 0], backbone[:, 1], backbone[:, 2])
         context_mask = context_atomic_numbers != 0
         squared_distance = ((cb[:, None] - context_coordinates[None]) ** 2).sum(dim=-1)
-        pair_mask = valid_mask[:, None] & context_mask[None]
+        pair_mask = residue_mask[:, None] & context_mask[None]
         adjusted = squared_distance * pair_mask + (~pair_mask) * 1000.0
         nearest = adjusted.argsort(dim=-1)[:, :num_context_atoms]
         nearest_distance = adjusted.gather(1, nearest)
@@ -397,7 +397,7 @@ class LigandMpnnProcessor:
                 dim=1,
             )
 
-        interface = valid_mask & selected_mask[:, 0] & (nearest_distance[:, 0] < ligand_interface_cutoff**2)
+        interface = residue_mask & selected_mask[:, 0] & (nearest_distance[:, 0] < ligand_interface_cutoff**2)
         if not use_atom_context:
             selected_mask = torch.zeros_like(selected_mask)
         return selected_coordinates, selected_atomic_numbers, selected_mask, interface
@@ -409,7 +409,7 @@ class LigandMpnnProcessor:
         rows: _LoweredRows,
         *,
         observed: np.ndarray,
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
         tied_weights: Mapping[ComponentReference, float] | None,
         logit_bias: Tensor | None,
@@ -426,14 +426,14 @@ class LigandMpnnProcessor:
             row_residue_context_mask,
             row_tokens,
             row_valid,
-            row_residue_indices,
-            row_chain_indices,
+            row_residue_index,
+            row_chain_index,
             row_component_ids,
         ) = rows
         length = len(row_references)
         row_by_reference = {reference: index for index, reference in enumerate(row_references)}
 
-        row_design = self._lower_design(row_references, row_valid, positions)
+        row_design = self._lower_design(row_references, row_valid, design_positions)
         tied_group_id_values, tied_groups, restrictions = self._close_conditions(conditions, row_by_reference, length)
         allowed_token_mask = self._lower_allowed(tied_groups, restrictions, row_design, row_component_ids)
         logit_bias_values = self._lower_logit_bias(
@@ -442,7 +442,7 @@ class LigandMpnnProcessor:
         tied_weight_values = self._lower_tied_weights(tied_weights, row_by_reference, tied_groups)
 
         backbone = torch.as_tensor(np.stack(row_backbone), device=self.device, dtype=self.dtype)
-        valid_mask = torch.tensor(row_valid, device=self.device, dtype=torch.bool)
+        residue_mask = torch.tensor(row_valid, device=self.device, dtype=torch.bool)
         context_coordinates_array, context_atomic_numbers_array = self._lower_context_atoms(structure, system, observed)
         context_coordinates = torch.as_tensor(context_coordinates_array, device=self.device, dtype=self.dtype)
         context_atomic_numbers = torch.as_tensor(context_atomic_numbers_array, device=self.device, dtype=torch.int64)
@@ -453,7 +453,7 @@ class LigandMpnnProcessor:
             interface,
         ) = self._select_context(
             backbone,
-            valid_mask,
+            residue_mask,
             context_coordinates,
             context_atomic_numbers,
             use_atom_context=use_atom_context,
@@ -467,15 +467,15 @@ class LigandMpnnProcessor:
         return LigandMpnnInput(
             backbone_coordinates=backbone.unsqueeze(0),
             sequence_tokens=torch.tensor(row_tokens, device=self.device, dtype=torch.int64).unsqueeze(0),
-            valid_mask=valid_mask.unsqueeze(0),
-            residue_indices=torch.tensor(row_residue_indices, device=self.device, dtype=torch.int64).unsqueeze(0),
-            chain_indices=torch.tensor(row_chain_indices, device=self.device, dtype=torch.int64).unsqueeze(0),
+            residue_mask=residue_mask.unsqueeze(0),
+            residue_index=torch.tensor(row_residue_index, device=self.device, dtype=torch.int64).unsqueeze(0),
+            chain_index=torch.tensor(row_chain_index, device=self.device, dtype=torch.int64).unsqueeze(0),
             context_coordinates=selected_coordinates.unsqueeze(0),
             context_atomic_numbers=selected_atomic_numbers.unsqueeze(0),
             context_mask=selected_mask.unsqueeze(0),
             residue_context_coordinates=residue_context_coordinates.unsqueeze(0),
             residue_context_mask=residue_context_mask.unsqueeze(0),
-            design_mask=torch.tensor(row_design, device=self.device, dtype=torch.bool).unsqueeze(0),
+            design_positions=torch.tensor(row_design, device=self.device, dtype=torch.bool).unsqueeze(0),
             ligand_interface_mask=interface.unsqueeze(0),
             structure=structure,
             component_references=tuple(row_references),
@@ -489,15 +489,15 @@ class LigandMpnnProcessor:
         self,
         row_references: list[ComponentReference],
         row_valid: list[bool],
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
     ) -> list[bool]:
         r"""Resolve the designable rows from the shared ``positions`` selection meaning."""
 
         valid_by_reference = dict(zip(row_references, row_valid))
-        if positions is None:
+        if design_positions is None:
             selected = {reference for reference, valid in zip(row_references, row_valid) if valid}
         else:
-            selected = set(positions)
+            selected = set(design_positions)
             for reference in selected:
                 if reference not in valid_by_reference:
                     raise ValueError(f"LigandMPNN position {reference!r} is not a protein occurrence")

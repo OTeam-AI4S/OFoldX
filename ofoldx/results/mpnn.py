@@ -17,8 +17,8 @@ class MpnnProbabilityResult:
     target: Structure
     component_references: tuple[ComponentReference | None, ...]
     sequence_tokens: Tensor
-    valid_mask: Tensor
-    design_mask: Tensor
+    residue_mask: Tensor
+    design_positions: Tensor
     logits: Tensor
     decoding_ranks: Tensor
 

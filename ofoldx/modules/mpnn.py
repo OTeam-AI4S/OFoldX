@@ -40,13 +40,13 @@ def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_i
 
 def nearest_neighbors(
     coordinates: Tensor,
-    valid_mask: Tensor,
+    residue_mask: Tensor,
     num_neighbors: int,
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor]:
     r"""Return the released masked nearest-neighbor distances and indices."""
 
-    pair_mask = valid_mask[:, :, None] * valid_mask[:, None, :]
+    pair_mask = residue_mask[:, :, None] * residue_mask[:, None, :]
     distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
     distances = pair_mask * distances
     maximum = distances.max(dim=-1, keepdim=True).values
@@ -99,16 +99,40 @@ def decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
     return ranks
 
 
+def tied_groups_from_ids(
+    tied_group_ids: Tensor,
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    r"""Reconstruct per-batch tied member groups from dense causal-unit IDs.
+
+    Every returned group contains more than one residue and lists members in
+    ascending residue order. Untied singleton units are omitted.
+    """
+
+    batches: list[tuple[tuple[int, ...], ...]] = []
+    for row in tied_group_ids.tolist():
+        members_by_id: dict[int, list[int]] = {}
+        for residue_index, group_id in enumerate(row):
+            members_by_id.setdefault(group_id, []).append(residue_index)
+        batches.append(tuple(tuple(members) for members in members_by_id.values() if len(members) > 1))
+    return tuple(batches)
+
+
+def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
+    r"""Return unreduced token negative log likelihoods."""
+
+    return -log_probabilities.gather(-1, sequence_tokens.unsqueeze(-1)).squeeze(-1)
+
+
 def autoregressive_masks(
     decoding_ranks: Tensor,
     neighbor_indices: Tensor,
-    valid_mask: Tensor,
+    residue_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
     r"""Build backward and forward neighbor masks directly from aligned causal ranks."""
 
     neighbor_ranks = gather_nodes(decoding_ranks.unsqueeze(-1), neighbor_indices).squeeze(-1)
     backward = neighbor_ranks < decoding_ranks.unsqueeze(-1)
-    query_mask = valid_mask.unsqueeze(-1).unsqueeze(-1)
+    query_mask = residue_mask.unsqueeze(-1).unsqueeze(-1)
     return (
         query_mask * backward.unsqueeze(-1),
         query_mask * (~backward).unsqueeze(-1),
@@ -259,9 +283,9 @@ class MpnnProteinFeatures(nn.Module):
     def forward(
         self,
         backbone_coordinates: Tensor,
-        valid_mask: Tensor,
-        residue_indices: Tensor,
-        chain_indices: Tensor,
+        residue_mask: Tensor,
+        residue_index: Tensor,
+        chain_index: Tensor,
     ) -> tuple[Tensor, Tensor]:
         r"""Build vectorized atom-pair and directly gathered identity edge features."""
 
@@ -273,7 +297,7 @@ class MpnnProteinFeatures(nn.Module):
         atoms = torch.stack((alpha_carbon, nitrogen, carbon, oxygen, beta_carbon), dim=2)
         neighbor_distances, neighbor_indices = nearest_neighbors(
             alpha_carbon,
-            valid_mask,
+            residue_mask,
             self.num_neighbors,
         )
 
@@ -297,10 +321,10 @@ class MpnnProteinFeatures(nn.Module):
         pair_distances = torch.cat((neighbor_distances.unsqueeze(-1), pair_distances[..., 1:]), dim=-1)
         distance_features = radial_basis(pair_distances, self.num_rbf).flatten(start_dim=-2)
 
-        neighbor_residue_indices = gather_nodes(residue_indices.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        residue_offsets = residue_indices.unsqueeze(-1) - neighbor_residue_indices
-        neighbor_chain_indices = gather_nodes(chain_indices.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        same_chain = (chain_indices.unsqueeze(-1) == neighbor_chain_indices).long()
+        neighbor_residue_index = gather_nodes(residue_index.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        residue_offsets = residue_index.unsqueeze(-1) - neighbor_residue_index
+        neighbor_chain_index = gather_nodes(chain_index.unsqueeze(-1), neighbor_indices).squeeze(-1)
+        same_chain = (chain_index.unsqueeze(-1) == neighbor_chain_index).long()
         position_features = self.relative_position(residue_offsets.long(), same_chain)
         edges = torch.cat((position_features, distance_features), dim=-1)
         return self.edge_norm(self.edge_projection(edges)), neighbor_indices

@@ -39,7 +39,7 @@ tuple, and polymer attachments only for polymer components.
 The CCD is distributed as a Hub **`dataset`** repository, `ofoldx/ccd`, stored as
 Parquet with **one component per row**. The resolver downloads it through the same
 `huggingface_hub.snapshot_download` mechanism used by
-`ofoldx._repository.resolve_repository` for model repositories (here with
+`ofoldx.hub.resolve_repository` for model repositories (here with
 `repo_type="dataset"` and `allow_patterns=["*.parquet"]`).
 
 **Revision = wwPDB snapshot date.** Each dataset revision corresponds to one wwPDB

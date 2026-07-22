@@ -92,7 +92,7 @@ class NaMpnnProcessor:
         input: Structure | str | PathLike[str],
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        positions: Sequence[ComponentReference] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         symmetry_groups: Sequence[Sequence[ComponentReference]] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
@@ -105,11 +105,11 @@ class NaMpnnProcessor:
         structure = self._read(input)
         rows = self._lower_rows(structure)
         if sequence is not None:
-            return self._process_score(structure, rows, sequence=sequence, positions=positions)
+            return self._process_score(structure, rows, sequence=sequence, design_positions=design_positions)
         return self._process_design(
             structure,
             rows,
-            positions=positions,
+            design_positions=design_positions,
             conditions=tuple(conditions),
             symmetry_groups=tuple(tuple(group) for group in symmetry_groups),
             tied_weights=tied_weights,
@@ -180,7 +180,7 @@ class NaMpnnProcessor:
                     source_numbers.append(component_index)
             chain_index += 1
 
-        residue_indices = self._renumber(source_numbers)
+        residue_index = self._renumber(source_numbers)
         rows: list[_Row] = []
         for position, (reference, component_id, polymer_type, chain) in enumerate(raw):
             rows.append(
@@ -189,7 +189,7 @@ class NaMpnnProcessor:
                     component_id,
                     polymer_type,
                     chain,
-                    residue_indices[position],
+                    residue_index[position],
                     coordinates[position],
                     atom_masks[position],
                     valids[position],
@@ -240,8 +240,8 @@ class NaMpnnProcessor:
         structure: Structure,
         rows: list[_Row],
         *,
-        design_mask: list[bool],
-        token_group_ids: list[int],
+        design_positions: list[bool],
+        tied_group_ids: list[int],
         sequence_tokens: list[int],
         tied_weights: Tensor | None,
         residue_logit_bias: Tensor | None,
@@ -254,15 +254,15 @@ class NaMpnnProcessor:
             atom_coordinates=torch.as_tensor(coordinates, device=self.device, dtype=self.dtype).unsqueeze(0),
             atom_mask=self._tensor([list(row[6]) for row in rows], torch.bool),
             sequence_tokens=self._tensor(sequence_tokens, torch.int64),
-            valid_mask=self._tensor([row[7] for row in rows], torch.bool),
-            residue_indices=self._tensor([row[4] for row in rows], torch.int64),
-            chain_indices=self._tensor([row[3] for row in rows], torch.int64),
+            residue_mask=self._tensor([row[7] for row in rows], torch.bool),
+            residue_index=self._tensor([row[4] for row in rows], torch.int64),
+            chain_index=self._tensor([row[3] for row in rows], torch.int64),
             polymer_type_ids=self._tensor([_POLYMER_TYPE_ID[row[2]] if row[7] else 3 for row in rows], torch.int64),
             protein_mask=self._tensor([row[2] == "protein" and row[7] for row in rows], torch.bool),
             dna_mask=self._tensor([row[2] == "dna" and row[7] for row in rows], torch.bool),
             rna_mask=self._tensor([row[2] == "rna" and row[7] for row in rows], torch.bool),
-            design_mask=self._tensor(design_mask, torch.bool),
-            token_group_ids=self._tensor(token_group_ids, torch.int64),
+            design_positions=self._tensor(design_positions, torch.bool),
+            tied_group_ids=self._tensor(tied_group_ids, torch.int64),
             structures=(structure,),
             component_references=(tuple(row[0] for row in rows),),
             polymer_types=(tuple(row[2] for row in rows),),
@@ -282,7 +282,7 @@ class NaMpnnProcessor:
         rows: list[_Row],
         *,
         sequence: str | Mapping[str, str | Sequence[str]],
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
     ) -> NaMpnnInput:
         r"""Lower an explicit observed sequence for autoregressive scoring."""
 
@@ -295,19 +295,19 @@ class NaMpnnProcessor:
             )
             for row in rows
         ]
-        selected = None if positions is None else set(positions)
+        selected = None if design_positions is None else set(design_positions)
         if selected is not None:
             references = {row[0] for row in rows}
             missing = selected - references
             if missing:
                 raise ValueError(f"NA-MPNN positions are not polymer residues: {sorted(missing)!r}")
-        design_mask = [bool(row[7] and (selected is None or row[0] in selected)) for row in rows]
-        token_group_ids = list(range(len(rows)))
+        lowered_design_positions = [bool(row[7] and (selected is None or row[0] in selected)) for row in rows]
+        tied_group_ids = list(range(len(rows)))
         return self._base_input(
             structure,
             rows,
-            design_mask=design_mask,
-            token_group_ids=token_group_ids,
+            design_positions=lowered_design_positions,
+            tied_group_ids=tied_group_ids,
             sequence_tokens=sequence_tokens,
             tied_weights=None,
             residue_logit_bias=None,
@@ -363,7 +363,7 @@ class NaMpnnProcessor:
         structure: Structure,
         rows: list[_Row],
         *,
-        positions: Sequence[ComponentReference] | None,
+        design_positions: Sequence[ComponentReference] | None,
         conditions: tuple[AllowedResidueIdentities | TiedResidueIdentities, ...],
         symmetry_groups: tuple[tuple[ComponentReference, ...], ...],
         tied_weights: Mapping[ComponentReference, float] | None,
@@ -386,12 +386,12 @@ class NaMpnnProcessor:
         ]
 
         bonded = self._bonded_rows(system)
-        selected = None if positions is None else set(positions)
+        selected = None if design_positions is None else set(design_positions)
         if selected is not None:
             for reference in selected:
                 if reference not in index_by_reference:
                     raise ValueError(f"NA-MPNN position {reference!r} is not a polymer residue")
-        design_mask = [
+        lowered_design_positions = [
             bool(row[7] and row[0] not in bonded and (selected is None or row[0] in selected)) for row in rows
         ]
 
@@ -466,7 +466,7 @@ class NaMpnnProcessor:
                     supported = allowed & set(_GENERATED_COMPONENTS[row[2]])
                     if not supported:
                         if row[1] in allowed:
-                            design_mask[index] = False
+                            lowered_design_positions[index] = False
                             continue
                         raise ValueError("NA-MPNN allowed identities contain no residue it can generate")
                     mask = [False] * _VOCAB_SIZE
@@ -474,7 +474,7 @@ class NaMpnnProcessor:
                         mask[self._component_token(component_id, row[2])] = True
                     allowed_token_mask[0, index] = torch.tensor(mask, device=self.device, dtype=torch.bool)
 
-        token_group_ids = self._dense_ids([find(index) for index in range(length)])
+        tied_group_ids = self._dense_ids([find(index) for index in range(length)])
 
         tied_weight_tensor = self._tied_weights_tensor(rows, index_by_reference, groups, tied_weights)
         residue_bias_tensor = self._residue_bias_tensor(index_by_reference, residue_logit_bias)
@@ -483,8 +483,8 @@ class NaMpnnProcessor:
         return self._base_input(
             structure,
             rows,
-            design_mask=design_mask,
-            token_group_ids=token_group_ids,
+            design_positions=lowered_design_positions,
+            tied_group_ids=tied_group_ids,
             sequence_tokens=sequence_tokens,
             tied_weights=tied_weight_tensor,
             residue_logit_bias=residue_bias_tensor,
@@ -567,11 +567,11 @@ class NaMpnnProcessor:
         if matrix.shape != (_VOCAB_SIZE, _VOCAB_SIZE):
             raise ValueError("NA-MPNN pair bias must have shape (33, 33)")
         length = len(rows)
-        residue_indices = torch.tensor([row[4] for row in rows], device=self.device)
-        chain_indices = torch.tensor([row[3] for row in rows], device=self.device)
-        same_chain = (chain_indices[:, None] == chain_indices[None, :]).to(self.dtype)
-        upper = (residue_indices[1:] - residue_indices[:-1] == 1).to(self.dtype)
-        lower = (residue_indices[:-1] - residue_indices[1:] == -1).to(self.dtype)
+        residue_index = torch.tensor([row[4] for row in rows], device=self.device)
+        chain_index = torch.tensor([row[3] for row in rows], device=self.device)
+        same_chain = (chain_index[:, None] == chain_index[None, :]).to(self.dtype)
+        upper = (residue_index[1:] - residue_index[:-1] == 1).to(self.dtype)
+        lower = (residue_index[:-1] - residue_index[1:] == -1).to(self.dtype)
         upper_mask = torch.diag(upper, 1) * same_chain
         lower_mask = torch.diag(lower, -1) * same_chain
         pair = (
