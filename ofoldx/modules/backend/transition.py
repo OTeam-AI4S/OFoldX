@@ -44,7 +44,7 @@ def transition(
         up_weight: ``[intermediate_size, hidden_size]`` bias-free up projection weight.
         down_weight: ``[hidden_size, intermediate_size]`` bias-free down projection weight.
         eps: LayerNorm epsilon.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``[..., hidden_size]`` transformed activations.
@@ -62,7 +62,7 @@ def transition(
         ...     up_weight=torch.randn(6, 4),
         ...     down_weight=torch.randn(4, 6),
         ...     eps=1e-5,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([2, 4])

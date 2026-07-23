@@ -22,13 +22,12 @@ class PairBiasedSelfAttention(nn.Module):
         hidden_size: Width of the single-representation token channel.
         pair_size: Width of the pair-representation channel used to derive the bias.
         num_attention_heads: Number of attention heads.
-        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to ``sdpa`` otherwise.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Examples:
         >>> import torch
         >>> attention = PairBiasedSelfAttention(
-        ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="sdpa"
+        ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="torch"
         ... )
         >>> _ = torch.manual_seed(0)
         >>> hidden = torch.randn(1, 3, 8)
@@ -80,7 +79,7 @@ class PairBiasedSelfAttention(nn.Module):
         Examples:
             >>> import torch
             >>> attention = PairBiasedSelfAttention(
-            ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="sdpa"
+            ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="torch"
             ... )
             >>> _ = torch.manual_seed(0)
             >>> hidden = torch.randn(1, 3, 8)

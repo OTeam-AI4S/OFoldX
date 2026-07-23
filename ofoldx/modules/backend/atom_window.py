@@ -45,7 +45,7 @@ def atom_to_token_mean(
         num_tokens: Number of output tokens.
         atom_mask: Optional ``[..., N_atom]`` valid-atom mask; padded atoms drop from sum and count.
         eps: Denominator floor (``denom.clamp(min=eps)``).
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``[..., N_token, C]`` token features.
@@ -56,7 +56,7 @@ def atom_to_token_mean(
         >>> atom = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
         >>> atom_to_token = torch.tensor([0, 0, 1])
         >>> out = atom_to_token_mean(
-        ...     atom, atom_to_token, num_tokens=2, atom_mask=None, eps=1e-6, operator_backend="eager"
+        ...     atom, atom_to_token, num_tokens=2, atom_mask=None, eps=1e-6, operator_backend="torch"
         ... )
         >>> out.tolist()
         [[2.0, 3.0], [5.0, 6.0]]
@@ -99,7 +99,7 @@ def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_ba
     Args:
         token: ``[..., N_token, C]`` token features.
         atom_to_token: ``[..., N_atom]`` long token index for each atom.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``[..., N_atom, C]`` atom features.
@@ -109,7 +109,7 @@ def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_ba
         >>> from ofoldx.modules.backend.atom_window import token_to_atom_broadcast
         >>> token = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
         >>> atom_to_token = torch.tensor([0, 1, 1])
-        >>> token_to_atom_broadcast(token, atom_to_token, operator_backend="eager").tolist()
+        >>> token_to_atom_broadcast(token, atom_to_token, operator_backend="torch").tolist()
         [[10.0, 11.0], [20.0, 21.0], [20.0, 21.0]]
     """
 
@@ -144,7 +144,7 @@ def token_pair_to_atom_window_gather(
             broadcasted map lets OOps select its Triton gather when supported.
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``[..., N_blocks, n_queries, n_keys, C]`` local atom-pair features.
@@ -155,7 +155,7 @@ def token_pair_to_atom_window_gather(
         >>> token_pair = torch.arange(16).reshape(4, 4, 1).float()
         >>> atom_to_token = torch.tensor([0, 1, 2, 3])
         >>> out = token_pair_to_atom_window_gather(
-        ...     token_pair, atom_to_token, n_queries=2, n_keys=4, operator_backend="eager"
+        ...     token_pair, atom_to_token, n_queries=2, n_keys=4, operator_backend="torch"
         ... )
         >>> out.shape
         torch.Size([2, 2, 4, 1])

@@ -26,7 +26,7 @@ class Transition(nn.Module):
 
     Examples:
         >>> import torch
-        >>> transition = Transition(8, expansion=2, operator_backend="eager")
+        >>> transition = Transition(8, expansion=2, operator_backend="torch")
         >>> transition(torch.randn(2, 3, 8)).shape
         torch.Size([2, 3, 8])
     """

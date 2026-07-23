@@ -12,7 +12,6 @@ from ofoldx.modules.backend import resolve as resolve_module
     [
         lambda: MultiheadAttentionProjection(hidden_size=8, num_attention_heads=3),
         lambda: GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="bogus"),
-        lambda: GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, torch_backend="bogus"),
     ],
 )
 def test_invalid_inputs(build) -> None:
@@ -51,21 +50,22 @@ def test_explicit_head_dim_defines_the_inner_width() -> None:
     assert projection.output_projection.in_features == 12
 
 
-def test_auto_uses_the_fixed_eager_reference_without_changing_state_dict(monkeypatch) -> None:
+@pytest.mark.parametrize("backend", ("auto", "torch"))
+def test_public_torch_paths_use_sdpa_without_changing_state_dict(monkeypatch, backend: str) -> None:
     monkeypatch.setattr(resolve_module, "oops_available", lambda: False)
-    auto = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, torch_backend="eager")
-    eager = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="eager")
-    eager.load_state_dict(auto.state_dict())
+    public = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend=backend)
+    sdpa = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="sdpa")
+    sdpa.load_state_dict(public.state_dict())
 
     query = torch.randn(2, 4, 8)
     bias = torch.randn(2, 2, 4, 4)
     mask = torch.tensor([[True, True, False, True], [True, False, True, True]]).unsqueeze(1).expand(-1, 4, -1)
 
     torch.testing.assert_close(
-        auto(query, biases=(bias,), attention_mask=mask),
-        eager(query, biases=(bias,), attention_mask=mask),
+        public(query, biases=(bias,), attention_mask=mask),
+        sdpa(query, biases=(bias,), attention_mask=mask),
         rtol=0,
         atol=0,
     )
-    assert auto.state_dict().keys() == eager.state_dict().keys()
-    assert all("backend" not in key for key in auto.state_dict())
+    assert public.state_dict().keys() == sdpa.state_dict().keys()
+    assert all("backend" not in key for key in public.state_dict())

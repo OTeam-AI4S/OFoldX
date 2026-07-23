@@ -18,18 +18,11 @@ END
 """
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: altloc selection policy and multi-altloc plural expansion; "
-    "§3.5.1 removed the altloc_ids carrier field (one altloc realization is one Structure)",
-    strict=False,
-)
 def test_pdb_altloc_policy_and_plural_expansion_are_residue_consistent(tmp_path: Path) -> None:
     path = tmp_path / "altloc.pdb"
     path.write_text(_ALTLOC_PDB, encoding="ascii")
 
-    # §3.5.1 removed the altloc_ids carrier field: one altloc realization is one Structure and
-    # altloc identity stays reopened §3.5. Only the residue-consistent plural expansion count and
-    # a consistent per-selection site axis remain observable on the frozen carrier.
+    # One altloc realization is one Structure; plural selection keeps each site axis consistent.
     highest = read_structure(path)
     first = read_structure(path, altloc="first")
     expanded = read_structures(path)
@@ -38,20 +31,13 @@ def test_pdb_altloc_policy_and_plural_expansion_are_residue_consistent(tmp_path:
     assert len(highest.sites) == len(first.sites)
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: the atom_layout site-materialization knob (complete_heavy); "
-    "§3.5.1 removed the atom_layout carrier field and the system.sites() accessor",
-    strict=False,
-)
 def test_complete_heavy_materializes_declared_sites_with_missing_masks(tmp_path: Path) -> None:
     path = tmp_path / "alanine.pdb"
     path.write_text(_ALTLOC_PDB, encoding="ascii")
 
     structure = read_structure(path, atom_layout="complete_heavy")
 
-    # §3.5.1/§3.5.2 removed the atom_layout carrier field and the system.sites() accessor;
-    # heavy-atom realization is a reopened §3.5 read-time element filter. Only the materialized
-    # site axis and its partially-false mask remain observable on the frozen carrier.
+    # The complete-heavy layout materializes declared heavy sites and marks unobserved sites false.
     assert int(structure.coordinate_mask.sum()) == 5
     assert len(structure.sites) > 5
 

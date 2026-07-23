@@ -51,6 +51,16 @@ def test_resolve_config_operator_backend_preserves_auto(monkeypatch) -> None:
     assert backend == "auto"
 
 
+def test_resolve_config_operator_backend_preserves_torch() -> None:
+    backend = resolve_config_operator_backend(
+        "torch",
+        supported=("oops", "sdpa", "eager"),
+        public_default="sdpa",
+    )
+
+    assert backend == "torch"
+
+
 def test_explicit_unsupported_backend_fails() -> None:
     with pytest.raises(ValueError, match="unsupported operator_backend 'sdpa'"):
         resolve_config_operator_backend(
@@ -71,6 +81,17 @@ def test_resolve_tensor_operator_backend_auto_uses_public_default_for_cpu_tensor
     )
 
     assert backend == "eager"
+
+
+def test_resolve_tensor_operator_backend_torch_uses_public_default() -> None:
+    backend = resolve_tensor_operator_backend(
+        "torch",
+        tensors=(torch.ones(1),),
+        supported=("oops", "sdpa", "eager"),
+        public_default="sdpa",
+    )
+
+    assert backend == "sdpa"
 
 
 def test_resolve_tensor_operator_backend_keeps_explicit_oops_for_cpu_tensors(monkeypatch) -> None:

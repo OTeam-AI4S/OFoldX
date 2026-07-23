@@ -26,7 +26,7 @@ class AdaptiveLayerNorm(nn.Module):
 
     Examples:
         >>> import torch
-        >>> norm = AdaptiveLayerNorm(8, 4, operator_backend="eager")
+        >>> norm = AdaptiveLayerNorm(8, 4, operator_backend="torch")
         >>> norm(torch.randn(2, 3, 8), torch.randn(2, 3, 4)).shape
         torch.Size([2, 3, 8])
     """

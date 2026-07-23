@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal
 
 from torch import Tensor, nn
 
@@ -36,13 +35,12 @@ class GatedMultiheadAttention(nn.Module):
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
-        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to ``torch_backend`` otherwise.
+        operator_backend: Backend selector. Public requests are ``"auto"``, ``"torch"``, and ``"oops"``;
+            attention uses SDPA as its canonical PyTorch implementation.
 
     Examples:
         >>> import torch
-        >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="sdpa")
+        >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="torch")
         >>> _ = torch.manual_seed(0)
         >>> hidden = torch.randn(1, 3, 8)
         >>> attention(hidden).shape
@@ -62,15 +60,11 @@ class GatedMultiheadAttention(nn.Module):
         gating: bool = True,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
-        torch_backend: Literal["sdpa", "eager"] = "sdpa",
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        if torch_backend not in {"sdpa", "eager"}:
-            raise ValueError(f"unsupported torch_backend {torch_backend!r}; expected 'eager' or 'sdpa'")
-        self.torch_backend = torch_backend
         self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "sdpa", "eager"), public_default=torch_backend
+            operator_backend, supported=("oops", "sdpa", "eager"), public_default="sdpa"
         )
         self.projection = MultiheadAttentionProjection(
             hidden_size=hidden_size,
@@ -113,7 +107,7 @@ class GatedMultiheadAttention(nn.Module):
 
         Examples:
             >>> import torch
-            >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="sdpa")
+            >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="torch")
             >>> _ = torch.manual_seed(0)
             >>> query = torch.randn(1, 3, 8)
             >>> bias = torch.randn(1, 2, 3, 3)
@@ -129,7 +123,6 @@ class GatedMultiheadAttention(nn.Module):
             attention_mask=attention_mask,
             projection=self.projection,
             operator_backend=self.operator_backend,
-            torch_backend=self.torch_backend,
         )
 
 

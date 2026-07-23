@@ -127,7 +127,6 @@ class RfDiffusionModel(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator backend used by the RFdiffusion SE(3) path."""
 
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
                 module,
@@ -136,7 +135,7 @@ class RfDiffusionModel(Model):
                 | RfDiffusionSe3Attention
                 | RfDiffusionSe3Transformer,
             ):
-                module.operator_backend = operator_backend
+                module.operator_backend = backend
 
     def forward(self, input: RfDiffusionInput) -> RfDiffusionOutput:
         r"""Run one ordinary differentiable denoising pass."""

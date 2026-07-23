@@ -243,16 +243,12 @@ class Boltz1Model(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator implementation used by this model."""
 
-        attention_backend = "eager" if backend == "torch" else backend
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
-            if isinstance(module, GatedMultiheadAttention):
-                module.torch_backend = "eager"
-                module.operator_backend = attention_backend
-            elif isinstance(
+            if isinstance(
                 module,
                 (
                     AdaptiveLayerNorm,
+                    GatedMultiheadAttention,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,
@@ -261,7 +257,7 @@ class Boltz1Model(Model):
                     TokenPairToLocalAtomPairBroadcast,
                 ),
             ):
-                module.operator_backend = operator_backend
+                module.operator_backend = backend
 
     def forward(
         self,

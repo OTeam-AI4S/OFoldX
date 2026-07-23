@@ -10,7 +10,7 @@ owns the q/k/v projection and passes it in.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +36,6 @@ def gated_multihead_attention(
     attention_mask: Tensor | None,
     projection: MultiheadAttentionProjection,
     operator_backend: str,
-    torch_backend: Literal["sdpa", "eager"],
 ) -> Tensor:
     r"""
     Project q/k/v via ``projection``, run attention on ``operator_backend``, and merge heads.
@@ -53,8 +52,8 @@ def gated_multihead_attention(
         attention_mask: Optional boolean mask broadcastable to ``(..., q_tokens, k_tokens)`` or
             ``(..., k_tokens)``; ``False`` positions are masked out.
         projection: The q/k/v (and optional gate/output) projection owned by the calling module.
-        operator_backend: Backend request, one of ``"auto"`` / ``"oops"`` / ``"sdpa"`` / ``"eager"``.
-        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
+        operator_backend: Public backend request (``"auto"`` / ``"torch"`` / ``"oops"``) or a concrete
+            implementation name used by low-level diagnostics.
 
     Returns:
         ``(..., q_tokens, hidden_size)`` attention output with heads merged.
@@ -68,21 +67,19 @@ def gated_multihead_attention(
         >>> out = gated_multihead_attention(
         ...     hidden, None, None,
         ...     biases=None, attention_mask=None,
-        ...     projection=projection, operator_backend="sdpa", torch_backend="sdpa",
+        ...     projection=projection, operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([1, 4, 8])
     """
 
-    if torch_backend not in {"sdpa", "eager"}:
-        raise ValueError(f"unsupported torch_backend {torch_backend!r}; expected 'eager' or 'sdpa'")
     key = query if key is None else key
     value = key if value is None else value
     operator_backend = resolve_tensor_operator_backend(
         operator_backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
         supported=("oops", "sdpa", "eager"),
-        public_default=torch_backend,
+        public_default="sdpa",
     )
     if operator_backend == "eager":
         query_projection, key_projection, value_projection = projection.project_unscaled(query, key, value)
@@ -145,7 +142,6 @@ def projected_attention(
     *,
     attention_mask: Tensor | None,
     operator_backend: str,
-    torch_backend: Literal["sdpa", "eager"],
     scale: float | None = None,
 ) -> Tensor:
     r"""Run attention over already-projected head-major q/k/v tensors.
@@ -156,13 +152,11 @@ def projected_attention(
     here instead of being reimplemented by each Model.
     """
 
-    if torch_backend not in {"sdpa", "eager"}:
-        raise ValueError(f"unsupported torch_backend {torch_backend!r}; expected 'eager' or 'sdpa'")
     resolved = resolve_tensor_operator_backend(
         operator_backend,
         tensors=(query, key, value, attention_mask),
         supported=("oops", "sdpa", "eager"),
-        public_default=torch_backend,
+        public_default="sdpa",
     )
     if resolved == "eager":
         return _eager_attention(
@@ -199,7 +193,6 @@ def triangle_attention(
     *,
     projection: MultiheadAttentionProjection,
     operator_backend: str,
-    torch_backend: Literal["sdpa", "eager"],
 ) -> Tensor:
     r"""
     Row-batched triangle self-attention over the pair representation.
@@ -219,8 +212,8 @@ def triangle_attention(
         triangle_bias: Per-head triangle bias ``(..., 1, heads, cols, cols)`` (row axis broadcast).
         attention_mask: Optional boolean keep-mask ``(..., rows, cols)``; ``False`` keys are excluded.
         projection: The q/k/v/gate/output projection owned by the calling triangle-attention module.
-        operator_backend: Backend request, one of ``"auto"`` / ``"oops"`` / ``"sdpa"`` / ``"eager"``.
-        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
+        operator_backend: Public backend request (``"auto"`` / ``"torch"`` / ``"oops"``) or a concrete
+            implementation name used by low-level diagnostics.
 
     Returns:
         Gated pair update ``(..., rows, cols, pair_size)``.
@@ -230,7 +223,7 @@ def triangle_attention(
         operator_backend,
         tensors=(pair, triangle_bias, attention_mask),
         supported=("oops", "sdpa", "eager"),
-        public_default=torch_backend,
+        public_default="sdpa",
     )
     can_flash = (
         resolved == "oops"
@@ -254,7 +247,6 @@ def triangle_attention(
         attention_mask=None,
         projection=projection,
         operator_backend=operator_backend,
-        torch_backend=torch_backend,
     )
 
 

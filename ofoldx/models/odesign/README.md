@@ -25,96 +25,49 @@ model card.
 
 ## Model Details
 
-ODesign combines an atom encoder, MSA-conditioned recycled Pairformer trunk,
-distance-constraint embedder, EDM coordinate denoiser, distogram head, and
-token-bond head. `forward` evaluates one differentiable denoising step from
-explicit noisy coordinates and a noise level. `sample` runs coordinate
-generation and preserves the pairwise heads.
-
-The released protein operation is a composition under one `design` verb.
-`ODesignModel` generates S seed groups by M diffusion samples, then
-`ODesignPipeline` uses the separately registered ProteinMPNN or LigandMPNN
-pipeline to assign K sequence variants to each backbone. It returns the complete
-M x S x K grid as `ODesignDesignResult`.
-
-Observed coordinates provide geometric context and are not fixed implicitly.
-`partial_diffusion_snr` explicitly starts from observed coordinates. Hard
-`ODesignReferenceCoordinates` conditions pin selected atoms; soft references
-remain constraint evidence.
+ODesign is an all-atom diffusion model for designing biomolecular interactions.
+It combines atom-level chemical features, MSA information, geometric
+constraints, and recycled Pairformer representations before an EDM denoiser
+generates coordinates. Distogram and bond heads provide additional supervision
+over the designed assembly. The released protein workflow assigns sequences to
+generated backbones with ProteinMPNN or LigandMPNN.
 
 ### Variants
 
-The released `odesign_base_prot_flex.pt` and
-`odesign_base_prot_rigid.pt` checkpoints use the same model graph and state
-tree. Their repositories differ through the Processor's `receptor_mode`:
-
-- `flex` regenerates receptor coordinates unless atoms are explicitly pinned.
-- `rigid` fixes observed receptor heavy atoms during sampling.
+- **[oteam/odesign-flex](https://huggingface.co/oteam/odesign-flex)**: Flexible-receptor interaction design.
+- **[oteam/odesign-rigid](https://huggingface.co/oteam/odesign-rigid)**: Rigid-receptor interaction design.
 
 ### Model Specification
 
-| Property            | Value                       |
-| ------------------- | --------------------------- |
-| Architecture        | `ofoldx.odesign`            |
-| Model               | `ODesignModel`              |
-| Processor           | `ODesignProcessor`          |
-| Pipeline            | `ODesignPipeline`           |
-| Task                | `design`                    |
-| Result              | `ODesignDesignResult`       |
-| Backbone variants   | protein flex, protein rigid |
-| Sequence assignment | ProteinMPNN or LigandMPNN   |
+| Pairformer Blocks | MSA Blocks | Single Size | Pair Size | Denoiser Token Blocks | Num Parameters (M) | FLOPs (G) |
+| ----------------- | ---------- | ----------- | --------- | --------------------- | ------------------ | --------- |
+| 48                | 4          | 384         | 128       | 24                    | 355.648            | 1260.502  |
 
-For protein sequence assignment, `temperature` maps to the released inverse
-folding temperature and `num_sequences` maps to top-k. LigandMPNN is selected
-when the generated assembly carries non-protein atom context; otherwise
-ProteinMPNN is used.
+FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
+operations. They are measured for one batch of 128 generated residues (512 atom
+rows), one recycling pass, and one denoising step.
 
 ### Links
 
-- [Official source](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign)
-- [Technical report](https://arxiv.org/abs/2510.22304)
+- **Code**: [ofoldx.models.odesign](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/odesign)
+- **Paper**: [ODesign: A World Model for Biomolecular Interaction Design](https://arxiv.org/abs/2510.22304)
+- **Developed by**: Odin Zhang, Xujun Zhang, Haitao Lin, et al.
+- **Model type**: All-atom, condition-guided biomolecular diffusion model
+- **Original Repository**: [The-Institute-for-AI-Molecular-Design/ODesign](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign)
 
 ## Usage
+
+Install OFoldX:
+
+```bash
+pip install ofoldx
+```
 
 ```python
 import ofoldx
 
-pipe = ofoldx.pipeline("design", model="./odesign-prot-flex", device="cuda")
-result = pipe.design(
-    "target.cif",
-    placement=placement,
-    num_seeds=2,
-    num_backbones=4,
-    num_sequences=3,
-    seed=7,
-)
-candidate = result.candidates[0]
+result = ofoldx.design("target.cif", model="oteam/odesign-flex")
 ```
-
-`placement` is an optional `ODesignPlacements` value describing generated
-segments and per-chain lengths. Conditions may include hotspots, symbolic bonds,
-and reference coordinates. All samples in one invocation share the topology
-realized from ranged segments.
-
-## Checkpoints and Conversion
-
-The composite repository stores the ODesign backbone pair at its root and embeds
-the converted ProteinMPNN and LigandMPNN designer repositories at their fixed
-component paths:
-
-```bash
-python -m ofoldx.models.odesign.convert \
-  odesign_base_prot_flex.pt \
-  ./odesign-prot-flex \
-  --protein-designer ./proteinmpnn \
-  --ligand-designer ./ligandmpnn
-```
-
-The converter infers `flex` or `rigid` from the official filename unless
-`--receptor-mode` is supplied. It translates the upstream state tree, strict
-loads the model, writes the complete composite Pipeline repository, and can
-upload it with `--repo-id oteam/odesign-prot-flex`. `--private` requests a
-private Hub repository.
 
 ## Training Details
 
@@ -140,11 +93,7 @@ than a separate architecture.
 - Existing canonical molecules are supported as structural context.
 - The core model has no per-sample confidence head. Distogram and token-bond
   logits remain raw outputs rather than fabricated ranking scores.
-- Numerical parity applies to the converted checkpoint and evaluated settings;
-  stochastic trajectories additionally depend on the supplied generator.
-
-Confirmed upstream defects and OFoldX behavior are recorded in
-[`UPSTREAM_BUGS.md`](../../../UPSTREAM_BUGS.md).
+- Sampling is stochastic and depends on the supplied seed or generator.
 
 ## Citation
 
@@ -166,6 +115,8 @@ for questions about this implementation or model card.
 
 ## License
 
-- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
-- **Upstream source and released parameters:** Apache-2.0; preserve the
-  upstream copyright and license notices when redistributing checkpoints.
+This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.en.html).
+
+```spdx
+SPDX-License-Identifier: AGPL-3.0-or-later
+```

@@ -1,10 +1,10 @@
 r"""Lock the single seed|generator resolution point at the Pipeline boundary.
 
 Per the OWNER principle the model graph is a pure function of ``(tensors, generator)``: a Pipeline
-accepts ``seed=`` / ``generator=`` / neither, resolves them once, and forwards the same
-``torch.Generator`` (or ``None``) through a stochastic Processor and the Model -- never an integer
-``seed``. These tests drive all four standard Pipelines with a synthetic Model/Processor pair and
-assert both the accepted call shapes and the shared generator identity.
+accepts ``seed=`` / ``generator=`` / neither, resolves them once, and forwards the resulting
+``torch.Generator`` (or ``None``) to the Model -- never an integer ``seed``. Generic task Processors
+are deterministic and do not receive the stream. These tests drive all four standard Pipelines with
+a synthetic Model/Processor pair and assert both sides of that boundary.
 """
 
 from __future__ import annotations
@@ -47,12 +47,11 @@ def test_pipeline_accepts_seed_generator_or_neither(pipeline_class, method, rng,
 
     forwarded = model.received
     assert forwarded["method"] == method
-    processor_generator = pipeline.processor.received["generator"]
+    assert "generator" not in pipeline.processor.received
     if rng == "neither":
         assert forwarded["generator"] is None
     else:
         assert isinstance(forwarded["generator"], torch.Generator)
-    assert processor_generator is forwarded["generator"]
 
 
 @pytest.mark.parametrize(("pipeline_class", "method"), _PIPELINES)

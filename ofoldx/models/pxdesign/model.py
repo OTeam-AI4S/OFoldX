@@ -68,7 +68,6 @@ class PxDesignModel(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the public PyTorch or OOps operator path."""
 
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
             if isinstance(
                 module,
@@ -81,7 +80,7 @@ class PxDesignModel(Model):
                     Transition,
                 ),
             ):
-                module.operator_backend = operator_backend
+                module.operator_backend = backend
 
     def forward(
         self,

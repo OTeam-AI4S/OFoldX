@@ -27,8 +27,7 @@ class DenoisingTokenEncoder(nn.Module):
         conditioning_size: Width of the conditioning signal driving the adaptive norm.
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per transformer block.
-        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to ``sdpa`` otherwise.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Examples:
         >>> import torch
@@ -38,7 +37,7 @@ class DenoisingTokenEncoder(nn.Module):
         ...     conditioning_size=4,
         ...     pair_size=4,
         ...     num_attention_heads=2,
-        ...     operator_backend="sdpa",
+        ...     operator_backend="torch",
         ... )
         >>> _ = torch.manual_seed(0)
         >>> token_hidden = torch.randn(1, 3, 8)
@@ -104,7 +103,7 @@ class DenoisingTokenEncoder(nn.Module):
             ...     conditioning_size=4,
             ...     pair_size=4,
             ...     num_attention_heads=2,
-            ...     operator_backend="sdpa",
+            ...     operator_backend="torch",
             ... )
             >>> _ = torch.manual_seed(0)
             >>> token_hidden = torch.randn(1, 3, 8)

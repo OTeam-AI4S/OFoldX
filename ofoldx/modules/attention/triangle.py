@@ -30,14 +30,14 @@ class TriangleAttention(nn.Module):
         output_bias: Whether the attention output projection carries a learnable bias.
         gate_bias: Whether the output-gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to ``sdpa`` otherwise. A bias-free module on the ``oops`` backend uses the
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``. A bias-free
+            module on the ``oops`` backend uses the
             dedicated OOps-owned ``triangle_attention`` implementation.
 
     Examples:
         >>> import torch
         >>> attention = TriangleAttention(
-        ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="sdpa"
+        ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="torch"
         ... )
         >>> _ = torch.manual_seed(0)
         >>> pair = torch.randn(1, 3, 3, 8)
@@ -92,7 +92,7 @@ class TriangleAttention(nn.Module):
         Examples:
             >>> import torch
             >>> attention = TriangleAttention(
-            ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="sdpa"
+            ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="torch"
             ... )
             >>> _ = torch.manual_seed(0)
             >>> pair = torch.randn(1, 3, 3, 8)
@@ -115,7 +115,6 @@ class TriangleAttention(nn.Module):
             pair_mask,
             projection=self.attention.projection,
             operator_backend=self.attention.operator_backend,
-            torch_backend=self.attention.torch_backend,
         )
 
 
@@ -133,13 +132,12 @@ class TriangleMultiplication(nn.Module):
         hidden_size: Width of the intermediate left/right factors.
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
-        operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to ``eager`` otherwise.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Examples:
         >>> import torch
         >>> update = TriangleMultiplication(
-        ...     pair_size=8, hidden_size=8, outgoing=True, operator_backend="eager"
+        ...     pair_size=8, hidden_size=8, outgoing=True, operator_backend="torch"
         ... )
         >>> _ = torch.manual_seed(0)
         >>> pair = torch.randn(1, 3, 3, 8)
@@ -193,7 +191,7 @@ class TriangleMultiplication(nn.Module):
         Examples:
             >>> import torch
             >>> update = TriangleMultiplication(
-            ...     pair_size=8, hidden_size=8, outgoing=False, operator_backend="eager"
+            ...     pair_size=8, hidden_size=8, outgoing=False, operator_backend="torch"
             ... )
             >>> _ = torch.manual_seed(0)
             >>> pair = torch.randn(1, 3, 3, 8)

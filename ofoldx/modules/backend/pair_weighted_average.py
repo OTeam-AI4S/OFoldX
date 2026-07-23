@@ -58,7 +58,7 @@ def pair_weighted_average(
         head_dim: Width of each attention head.
         norm_msa_eps: Epsilon used by the MSA LayerNorm.
         norm_pair_eps: Epsilon used by the pair LayerNorm.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``(B, S, N, msa_size)`` MSA update, matching the shape of ``msa``.
@@ -86,7 +86,7 @@ def pair_weighted_average(
         ...     head_dim=head_dim,
         ...     norm_msa_eps=1e-5,
         ...     norm_pair_eps=1e-5,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([1, 2, 3, 4])

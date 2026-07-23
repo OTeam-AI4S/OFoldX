@@ -49,7 +49,7 @@ def adaptive_layer_norm(
             weight; the first ``hidden_size`` rows produce the scale, the remainder the shift.
         scale_bias: ``[hidden_size]`` additive bias applied to the scale half before the sigmoid.
         eps: LayerNorm epsilon shared by both norms.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
         ``[..., hidden_size]`` conditioned activations.
@@ -67,7 +67,7 @@ def adaptive_layer_norm(
         ...     projection_weight=torch.randn(16, 4),
         ...     scale_bias=torch.zeros(8),
         ...     eps=1e-5,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([2, 8])

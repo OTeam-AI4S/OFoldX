@@ -21,7 +21,7 @@ def test_evoformer_stack_refines_msa_and_pair_shapes() -> None:
         msa_dropout=0.0,
         pair_dropout=0.0,
         is_extra_msa=False,
-        operator_backend="sdpa",
+        operator_backend="torch",
     ).eval()
 
     msa, pair = stack(
@@ -51,7 +51,7 @@ def test_evoformer_stack_allows_zero_blocks() -> None:
         msa_dropout=0.0,
         pair_dropout=0.0,
         is_extra_msa=False,
-        operator_backend="sdpa",
+        operator_backend="torch",
     )
     msa = torch.randn(1, 2, 3, 8)
     pair = torch.randn(1, 3, 3, 4)
@@ -78,7 +78,7 @@ def test_evoformer_stack_supports_extra_msa_global_attention() -> None:
         msa_dropout=0.0,
         pair_dropout=0.0,
         is_extra_msa=True,
-        operator_backend="sdpa",
+        operator_backend="torch",
     ).eval()
 
     msa, pair = stack(

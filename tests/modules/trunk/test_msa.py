@@ -27,7 +27,7 @@ def test_outer_product_mean(divide_before_projection: bool) -> None:
     output = module(msa, msa_mask=msa_mask)
 
     # expected recomputed from the outer-product-mean definition via F.* builtins (independent contraction)
-    norm = module.norm_msa
+    norm = module.msa_norm
     normalized = F.layer_norm(msa, (msa_size,), norm.weight, norm.bias, norm.eps)
     left = F.linear(normalized, module.left_projection.weight)
     right = F.linear(normalized, module.right_projection.weight)
@@ -62,7 +62,7 @@ def test_pair_weighted_average() -> None:
     output = module(msa, pair, pair_mask=pair_mask)
 
     # expected from the PWA definition with weights derived by hand (uniform over valid j, no softmax replay)
-    normalized = F.layer_norm(msa, (msa_size,), module.norm_msa.weight, module.norm_msa.bias, module.norm_msa.eps)
+    normalized = F.layer_norm(msa, (msa_size,), module.msa_norm.weight, module.msa_norm.bias, module.msa_norm.eps)
     values = F.linear(normalized, module.value_projection.weight).reshape(batch, seqs, residues, heads, head_dim)
     weights = pair_mask[0].to(values.dtype)
     weights = weights / weights.sum(dim=-1, keepdim=True)

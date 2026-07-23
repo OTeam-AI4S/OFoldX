@@ -274,16 +274,12 @@ class BoltzGenModel(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator implementation used by this model."""
 
-        attention_backend = "eager" if backend == "torch" else backend
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
-            if isinstance(module, GatedMultiheadAttention):
-                module.torch_backend = "eager"
-                module.operator_backend = attention_backend
-            elif isinstance(
+            if isinstance(
                 module,
                 (
                     AdaptiveLayerNorm,
+                    GatedMultiheadAttention,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,
@@ -292,7 +288,7 @@ class BoltzGenModel(Model):
                     TokenPairToLocalAtomPairBroadcast,
                 ),
             ):
-                module.operator_backend = operator_backend
+                module.operator_backend = backend
 
     def forward(
         self,
@@ -635,16 +631,12 @@ class BoltzGenInverseFoldingModel(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator implementation used by this model."""
 
-        attention_backend = "eager" if backend == "torch" else backend
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
-            if isinstance(module, GatedMultiheadAttention):
-                module.torch_backend = "eager"
-                module.operator_backend = attention_backend
-            elif isinstance(
+            if isinstance(
                 module,
                 (
                     AdaptiveLayerNorm,
+                    GatedMultiheadAttention,
                     Transition,
                     TriangleMultiplication,
                     MsaPairWeightedAveraging,
@@ -653,7 +645,7 @@ class BoltzGenInverseFoldingModel(Model):
                     TokenPairToLocalAtomPairBroadcast,
                 ),
             ):
-                module.operator_backend = operator_backend
+                module.operator_backend = backend
 
     def forward(
         self,
@@ -808,7 +800,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         add_ss_specification: Whether to add the secondary-structure conditioning.
         num_binding_types: Number of binding-specification ids.
         num_ss_types: Number of secondary-structure ids.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1150,7 +1142,7 @@ class BoltzGenAtomAttentionEncoder(nn.Module):
         num_atom_encoder_blocks: Number of atom-transformer blocks.
         num_atom_encoder_attention_heads: Number of attention heads per block.
         structure_prediction: Whether to inject noisy positions and return diffusion skip states.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1250,7 +1242,7 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
         num_key_atoms: Number of key atoms per attention window.
         num_atom_decoder_blocks: Number of atom-transformer blocks.
         num_atom_decoder_attention_heads: Number of attention heads per block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1332,7 +1324,7 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         distance_gaussian_dim: Number of Gaussian basis functions in the distance encoder.
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1436,7 +1428,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
         miniformer_blocks: Whether the pairformer uses compact Miniformer pair updates.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1694,7 +1686,7 @@ class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
         pair_size: Width of the pair representation channel.
         expansion: Feed-forward expansion factor of the pair transition.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1737,7 +1729,7 @@ class BoltzGenMiniformerBlock(nn.Module):
         num_pair_attention_heads: Number of pair-biased single-attention heads.
         expansion: Feed-forward expansion factor of the transitions.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1792,7 +1784,7 @@ class BoltzGenMiniformerStack(nn.Module):
         pair_size: Width of the pair representation channel.
         num_pair_attention_heads: Number of pair-biased single-attention heads per block.
         dropout: Row-wise dropout probability inside each block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1855,7 +1847,7 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside each block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -1959,7 +1951,7 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside the block.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(
@@ -2249,7 +2241,7 @@ class BoltzGenDenoiser(nn.Module):
         num_atom_decoder_blocks: Number of atom-decoder blocks.
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_conditioning_transitions: Number of transitions in the single conditioner.
-        operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
     """
 
     def __init__(

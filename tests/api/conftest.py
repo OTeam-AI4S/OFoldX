@@ -37,14 +37,15 @@ def _isolate_registries():
         model_registry.MODELS.by_pair,
         pipeline_registry.PIPELINES,
         pipeline_registry.PIPELINES.ids,
+        pipeline_registry.PIPELINES.by_architecture,
     )
     snapshots = [dict(table) for table in tables]
     try:
         yield
     finally:
         for table, snapshot in zip(tables, snapshots):
-            table.clear()
-            table.update(snapshot)
+            dict.clear(table)
+            dict.update(table, snapshot)
 
 
 def _build_tiny_classes():

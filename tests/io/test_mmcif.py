@@ -9,17 +9,7 @@ from ofoldx.io import LossReport, read_structure, write_structure
 from tests.data.test_codec import _heterogeneous_structure
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: the _ofoldx_structure mmCIF exchange payload and source-exact "
-    "round-trip are the reopened §3.5 exchange-writing contract; §3.5.1 explicitly does NOT "
-    "freeze encode_structure/decode_structure or any exchange writer (the codec depends on an "
-    "unfrozen system ordering contract), so this runs ahead of the frozen carrier boundary",
-    strict=False,
-)
 def test_mmcif_semantic_round_trip_preserves_complete_canonical_value(tmp_path: Path) -> None:
-    # NOTE(§3.5.1): encode_structure/decode_structure and this mmCIF exchange writer are NOT
-    # part of the frozen six-field carrier -- §3.5.1 marks the codec as not-yet-frozen (ahead
-    # of the frozen boundary), so this round-trip exercises reopened §3.5 exchange machinery.
     structure = _heterogeneous_structure()
     path = tmp_path / "result.cif"
 
@@ -93,7 +83,7 @@ _struct_conn.pdbx_value_order
 """,
         encoding="utf-8",
     )
-    ligand = ChemicalComponent("LIG", atoms=(ChemicalAtom("C1", "C"),), bonds=frozenset())
+    ligand = ChemicalComponent("LIG", atoms=(ChemicalAtom("C1", "C", formal_charge=0),), bonds=frozenset())
 
     structure = read_structure(path, components={"LIG": ligand})
 

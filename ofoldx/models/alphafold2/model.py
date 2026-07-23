@@ -201,13 +201,12 @@ class AlphaFold2Model(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the public PyTorch or OOps attention path."""
 
-        attention_backend = "sdpa" if backend == "torch" else backend
-        operator_backend = "eager" if backend == "torch" else backend
         for module in self.modules():
-            if isinstance(module, GatedMultiheadAttention):
-                module.operator_backend = attention_backend
-            elif isinstance(module, (AlphaFold2OuterProductMean, AlphaFold2TriangleMultiplication)):
-                module.operator_backend = operator_backend
+            if isinstance(
+                module,
+                (GatedMultiheadAttention, AlphaFold2OuterProductMean, AlphaFold2TriangleMultiplication),
+            ):
+                module.operator_backend = backend
 
     def forward(
         self,

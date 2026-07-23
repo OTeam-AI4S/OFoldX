@@ -129,6 +129,7 @@ _STACK_SCOPE_MAP = {
     "right_gate": ("right_gate",),
     "gating_linear": ("gating_linear",),
     "attention": ("attention", "projection"),
+    "single_template_embedding": ("single_template_embedder",),
 }
 
 

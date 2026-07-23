@@ -53,7 +53,7 @@ def outer_product_mean(
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
         proj_left_bias: Optional left projection bias; ``None`` keeps the projection bias-free.
         proj_right_bias: Optional right projection bias; ``None`` keeps the projection bias-free.
 
@@ -77,7 +77,7 @@ def outer_product_mean(
         ...     norm_eps=1e-5,
         ...     denom_eps=1e-3,
         ...     divide_before_projection=False,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([1, 3, 3, 5])

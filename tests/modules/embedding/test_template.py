@@ -58,7 +58,7 @@ def test_single_template_update_matches_materialized_one_hot():
     )
 
     pair = torch.randn(1, num_tokens, num_tokens, 8)
-    normalized_pair = embedder.norm_pair(pair)
+    normalized_pair = embedder.pair_norm(pair)
 
     output = embedder._single_template_update(normalized_pair, templates=features, template_index=0, pair_mask=None)
 

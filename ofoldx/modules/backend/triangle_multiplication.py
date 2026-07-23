@@ -69,7 +69,7 @@ def triangle_multiplication(
         output_weight: Projection weight mapping back to ``pair_size``.
         output_gate_weight: Gate-projection weight applied to the normalized input.
         eps: LayerNorm epsilon shared by the input and output normalizations.
-        operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
         left_value_bias: Optional left value-projection bias.
         left_gate_bias: Optional left gate-projection bias.
         right_value_bias: Optional right value-projection bias.
@@ -101,7 +101,7 @@ def triangle_multiplication(
         ...     output_weight=torch.randn(pair_size, hidden_size),
         ...     output_gate_weight=torch.randn(pair_size, pair_size),
         ...     eps=1e-5,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> out.shape
         torch.Size([1, 3, 3, 4])

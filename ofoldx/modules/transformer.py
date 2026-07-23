@@ -44,7 +44,7 @@ class ConditionedTransformer(nn.Module):
         ...     num_attention_heads=2,
         ...     hidden_size=8,
         ...     conditioning_size=4,
-        ...     operator_backend="eager",
+        ...     operator_backend="torch",
         ... )
         >>> hidden = torch.randn(1, 5, 8)
         >>> conditioning = torch.randn(1, 5, 4)
@@ -110,7 +110,7 @@ class ConditionedTransformer(nn.Module):
             >>> import torch
             >>> transformer = ConditionedTransformer(
             ...     num_blocks=2, num_attention_heads=2, hidden_size=8,
-            ...     conditioning_size=4, operator_backend="eager",
+            ...     conditioning_size=4, operator_backend="torch",
             ... )
             >>> hidden = torch.randn(1, 5, 8)
             >>> conditioning = torch.randn(1, 5, 4)
@@ -155,7 +155,7 @@ class ConditionedTransformerBlock(nn.Module):
 
     Examples:
         >>> import torch
-        >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="eager")
+        >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="torch")
         >>> hidden = torch.randn(1, 5, 8)
         >>> conditioning = torch.randn(1, 5, 4)
         >>> bias = torch.randn(1, 5, 5, 2)  # per-head bias for this block
@@ -227,7 +227,7 @@ class ConditionedTransformerBlock(nn.Module):
 
         Examples:
             >>> import torch
-            >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="eager")
+            >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="torch")
             >>> hidden = torch.randn(1, 5, 8)
             >>> conditioning = torch.randn(1, 5, 4)
             >>> bias = torch.randn(1, 5, 5, 2)

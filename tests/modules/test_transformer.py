@@ -3,17 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ofoldx.modules.transformer import ConditionedTransformerLayer
+from ofoldx.modules.transformer import ConditionedTransformerBlock
 
 
 @pytest.fixture
-def layer() -> ConditionedTransformerLayer:
+def block() -> ConditionedTransformerBlock:
     torch.manual_seed(0)
-    return ConditionedTransformerLayer(
+    return ConditionedTransformerBlock(
         hidden_size=4,
         conditioning_size=3,
         num_attention_heads=1,
-        operator_backend="sdpa",
+        operator_backend="torch",
         transition="double",
     ).eval()
 
@@ -40,12 +40,12 @@ def layer() -> ConditionedTransformerLayer:
         ),
     ],
 )
-def test_conditioned_transformer_layer_accepts_key_or_pair_masks(
-    layer: ConditionedTransformerLayer,
+def test_conditioned_transformer_block_accepts_key_or_pair_masks(
+    block: ConditionedTransformerBlock,
     mask: torch.Tensor,
 ) -> None:
     with torch.no_grad():
-        output = layer(
+        output = block(
             hidden=torch.randn(2, 4, 4),
             conditioning=torch.randn(2, 4, 3),
             bias=torch.zeros(2, 4, 4, 1),
@@ -56,9 +56,9 @@ def test_conditioned_transformer_layer_accepts_key_or_pair_masks(
     assert torch.isfinite(output).all()
 
 
-def test_conditioned_transformer_layer_rejects_malformed_mask(layer: ConditionedTransformerLayer) -> None:
+def test_conditioned_transformer_block_rejects_malformed_mask(block: ConditionedTransformerBlock) -> None:
     with pytest.raises(ValueError, match="transformer mask"):
-        layer(
+        block(
             hidden=torch.randn(2, 4, 4),
             conditioning=torch.randn(2, 4, 3),
             bias=torch.zeros(2, 4, 4, 1),

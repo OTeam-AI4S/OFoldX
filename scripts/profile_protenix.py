@@ -35,7 +35,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from ofoldx.models.protenix import ProtenixConfig, ProtenixInput, ProtenixModel  # noqa: E402
-from ofoldx.models.protenix.convert import translate_protenix_from_base_state  # noqa: E402
+from ofoldx.models.protenix.convert import translate_protenix_state  # noqa: E402
 
 BENCHMARK_DATA = REPO / "data" / "benchmark"
 DEFAULT_PROTENIX_BASE_CKPT_PATH = BENCHMARK_DATA / "protenix_base_default_v0.5.0.pt"
@@ -671,7 +671,7 @@ def build_workload(
 ) -> nn.Module:
     model = ProtenixModel(ProtenixConfig()).to(device)
     reference_state = load_protenix_base_checkpoint_state(PROTENIX_BASE_CKPT_PATH)
-    state = translate_protenix_from_base_state(model, reference_state)
+    state = translate_protenix_state(model, reference_state)
     result = model.load_state_dict(state, strict=False)
     if result.unexpected_keys or any(not key.startswith("constraint_embedder.") for key in result.missing_keys):
         raise RuntimeError(f"Protenix checkpoint load mismatch: {result}")

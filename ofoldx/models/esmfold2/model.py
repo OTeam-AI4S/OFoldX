@@ -1815,7 +1815,7 @@ class EsmFold2AtomEncoder(nn.Module):
             expanded_atom_to_token,
             num_tokens,
             atom_mask=expanded_atom_mask.bool(),
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         )
 
         return token_features, atom_query, reference_atom_features, intermediates
@@ -1917,7 +1917,7 @@ class EsmFold2AtomDecoder(nn.Module):
         token_to_atom_update = gather_token_to_atom(
             token_to_atom_update,
             expanded_atom_to_token,
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         )
         atom_query = atom_query + token_to_atom_update
 
@@ -2615,7 +2615,7 @@ class EsmFold2TriangleMultiplication(nn.Module):
             visibility = pair_grid.new_ones(pair_grid.shape[:-1])
 
         resolved = resolve_tensor_operator_backend(
-            self.backends.operator,
+            self.backends.backend,
             tensors=(pair_grid, visibility),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2692,7 +2692,7 @@ class EsmFold2OuterProductMean(nn.Module):
 
     def forward(self, m: Tensor, msa_attention_mask: Tensor) -> Tensor:
         resolved = resolve_tensor_operator_backend(
-            self.backends.operator,
+            self.backends.backend,
             tensors=(m, msa_attention_mask),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2769,7 +2769,7 @@ class EsmFold2MsaPairWeightedAveraging(nn.Module):
             [B, L, M, msa_size]
         """
         resolved = resolve_tensor_operator_backend(
-            self.backends.operator,
+            self.backends.backend,
             tensors=(msa, pair, pair_attention_mask),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2835,7 +2835,7 @@ class EsmFold2Transition(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         resolved = resolve_tensor_operator_backend(
-            self.backends.operator,
+            self.backends.backend,
             tensors=(x,),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2997,8 +2997,7 @@ class EsmFold2SpatialAtomAttention(nn.Module):
             key.transpose(1, 2),
             value.transpose(1, 2),
             attention_mask=allowed.unsqueeze(1),
-            operator_backend=self.backends.attention,
-            torch_backend="sdpa",
+            operator_backend=self.backends.backend,
             scale=self.scale,
         ).transpose(1, 2)
         output = output * valid.unsqueeze(-1).unsqueeze(-1)
@@ -3631,7 +3630,7 @@ class EsmFold2ConfidenceHead(nn.Module):
         atom_single = gather_token_to_atom(
             single,
             expanded_atom_to_token,
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         )
         normalized_atom_single = self.plddt_norm(atom_single)
 
@@ -3667,7 +3666,7 @@ class EsmFold2ConfidenceHead(nn.Module):
         iplddt_weight_atoms = gather_token_to_atom(
             iplddt_weight.unsqueeze(-1),
             expanded_atom_to_token,
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         ).squeeze(-1)
         atom_iplddt_weight = atom_mask_float * iplddt_weight_atoms
         complex_iplddt = (plddt_per_atom * atom_iplddt_weight).sum(dim=-1) / (
@@ -3866,7 +3865,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         atom_single = gather_token_to_atom(
             single,
             expanded_atom_to_token,
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         )
         normalized_atom_single = self.plddt_norm(atom_single)
 
@@ -3902,7 +3901,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         iplddt_weight_atoms = gather_token_to_atom(
             iplddt_weight.unsqueeze(-1),
             expanded_atom_to_token,
-            operator_backend=self.backends.operator,
+            operator_backend=self.backends.backend,
         ).squeeze(-1)
         atom_iplddt_weight = atom_mask_float * iplddt_weight_atoms
         complex_iplddt = (plddt_per_atom * atom_iplddt_weight).sum(dim=-1) / (
@@ -3974,14 +3973,12 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
 
 @dataclass
 class EsmFold2BackendSettings:
-    r"""Shared backend selectors owned by one ESMFold2 model graph."""
+    r"""Shared backend request owned by one ESMFold2 model graph."""
 
-    attention: str = "auto"
-    operator: str = "auto"
+    backend: ModelBackend = "auto"
 
     def configure(self, backend: ModelBackend) -> None:
-        self.attention = "sdpa" if backend == "torch" else backend
-        self.operator = "eager" if backend == "torch" else backend
+        self.backend = backend
 
 
 CHAR_VOCAB_SIZE: int = 64

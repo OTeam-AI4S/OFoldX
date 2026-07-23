@@ -65,7 +65,12 @@ def test_registered_pipeline_round_trip_via_marker(tmp_path, tiny_classes):
     class MarkerFoldPipeline(FoldPipeline):
         r"""A concrete, registered Fold pipeline so save() emits a pipeline.json marker."""
 
-    PIPELINES.register_pipeline("test.tiny.fold", pipeline=MarkerFoldPipeline)
+    PIPELINES.register_pipeline(
+        "test.tiny.fold",
+        pipeline=MarkerFoldPipeline,
+        tasks={"fold"},
+        architectures={"test.tiny"},
+    )
     MarkerFoldPipeline(model=model, processor=processor).save(tmp_path)
 
     marker = tmp_path / "pipeline.json"

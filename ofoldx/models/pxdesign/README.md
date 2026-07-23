@@ -11,8 +11,8 @@ pipeline_tag: other
 
 # PxDesign
 
-Native PyTorch implementation of the released PXDesign-d v0.1 backbone
-generator for target-conditioned and de novo protein design.
+Native PyTorch implementation of the PXDesign-d backbone generator for
+target-conditioned and de novo protein design.
 
 ## Disclaimer
 
@@ -22,93 +22,64 @@ write, review, or endorse this implementation or model card.
 
 ## Model Details
 
-PXDesign-d combines a condition embedder, coordinate denoiser, and EDM sampler.
-The processor lowers a canonical target structure, one protein placement, and
-optional hotspot labels. Generated residues retain an explicit unknown sequence
-identity while the model predicts their backbone coordinates.
-
-PXDesign-d is distinct from the larger PXDesign suite. The suite additionally
-composes ProteinMPNN sequence design, AlphaFold 2 initial-guess evaluation,
-optional Protenix evaluation, and PXDesignBench ranking. Those downstream stages
-are not hidden inside the generator model.
+PXDesign-d is an all-atom diffusion model for de novo and target-conditioned
+protein backbone generation. It embeds target geometry, residue identity,
+confidence, and hotspot conditions, then applies token- and atom-level attention
+inside an EDM coordinate denoiser. The generated backbone can subsequently be
+assigned a sequence and evaluated by separate sequence-design and folding
+models.
 
 ### Variants
 
-The released family contains one PXDesign-d v0.1 checkpoint,
-`pxdesign_v0.1.0.pt`.
+- **[oteam/pxdesign](https://huggingface.co/oteam/pxdesign)**: PXDesign-d for de novo and target-conditioned protein backbone generation.
 
 ### Model Specification
 
-| Property               | Value                  |
-| ---------------------- | ---------------------- |
-| Architecture           | `ofoldx.pxdesign`      |
-| Model                  | `PxDesignModel`        |
-| Processor              | `PxDesignProcessor`    |
-| Pipeline               | `PxDesignPipeline`     |
-| Task                   | `design`               |
-| Result                 | `PxDesignDesignResult` |
-| Checkpoint tensors     | 732                    |
-| Default sampling steps | 400                    |
+| Single Size | Pair Size | Token Denoiser Blocks | Atom Encoder Blocks | Atom Decoder Blocks | Num Parameters (M) | FLOPs (G) |
+| ----------- | --------- | --------------------- | ------------------- | ------------------- | ------------------ | --------- |
+| 384         | 128       | 16                    | 4                   | 4                   | 139.011            | 49.888    |
 
-The differentiable `forward` method evaluates one denoising step from explicit
-noisy coordinates and a noise level. `sample` runs the released EDM loop, and
-`design` decodes its coordinate samples into canonical structures.
+FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
+operations. They are measured for one batch of 128 generated residues (513 atom
+rows) and one denoising step.
 
 ### Links
 
-- [Official source](https://github.com/bytedance/PXDesign)
-- [Audited source revision](https://github.com/bytedance/PXDesign/tree/f788441313c84c3074fe9596ac2433f96b15c763)
-- [Official checkpoint](https://pxdesign.tos-cn-beijing.volces.com/release_model/pxdesign_v0.1.0.pt)
+- **Code**: [ofoldx.models.pxdesign](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/pxdesign)
+- **Developed by**: ByteDance Research
+- **Model type**: Target-conditioned all-atom protein backbone diffusion model
+- **Original Repository**: [bytedance/PXDesign](https://github.com/bytedance/PXDesign)
 
 ## Usage
 
-Convert the official checkpoint first, then load the resulting repository through
-the task API:
+Install OFoldX:
+
+```bash
+pip install ofoldx
+```
 
 ```python
 import ofoldx
+from ofoldx.models.pxdesign import from_binder
 
-pipe = ofoldx.pipeline("design", model="./pxdesign-v0.1", device="cuda")
-result = pipe.design(
-    "target.cif",
-    placement=placement,
-    conditions=hotspots,
-    num_candidates=4,
-    seed=7,
+result = ofoldx.design(
+    None,
+    model="oteam/pxdesign",
+    placement=from_binder(100),
 )
-best_structure = result.candidates[0].structure
 ```
-
-`placement` is one canonical `PlacementSpec` containing the generated protein
-segment. `conditions` is a sequence of PXDesign `Hotspot` labels. Passing
-`input=None` selects the released generation-only path.
-
-## Checkpoints and Conversion
-
-```bash
-python -m ofoldx.models.pxdesign.convert \
-  pxdesign_v0.1.0.pt \
-  ./pxdesign-v0.1
-```
-
-Conversion translates every upstream key into the native OFoldX state tree,
-strict-loads the 732 tensors, and writes the Model, Processor, weights, and
-concrete Pipeline marker. `--repo-id oteam/pxdesign-v0.1` additionally uploads
-the converted repository; `--private` requests a private Hub repository.
 
 ## Training Details
 
 ### Training Data
 
-The released PXDesign-d inference source does not provide a complete,
-reproducible training-data specification.
+PXDesign-d is trained on protein structures for unconditional and
+target-conditioned backbone generation.
 
 ### Training Procedure
 
-The released source is inference-only and does not expose a reference training
-objective. OFoldX therefore provides the differentiable denoiser but does not
-invent a PXDesign training loss. Two distogram heads that are commented out in
-the upstream source are not part of the released model graph.
+PXDesign-d uses an EDM coordinate-denoising objective. OFoldX exposes the
+differentiable one-step denoiser for training and fine-tuning.
 
 ## Limitations
 
@@ -122,11 +93,7 @@ the upstream source are not part of the released model graph.
   target-cropping path is not represented as a partial structure.
 - PXDesign-d does not consume MSA evidence. The full suite passes target MSAs to
   downstream folding and filtering models.
-- OFoldX uses a caller-owned `torch.Generator`. Equal integer seeds across the
-  upstream mixed PyTorch/SciPy RNG loop and OFoldX do not imply equal trajectories.
-
-Confirmed upstream defects and OFoldX behavior are recorded in
-[`UPSTREAM_BUGS.md`](../../../UPSTREAM_BUGS.md).
+- Sampling is stochastic unless the caller supplies a seed or generator.
 
 ## Citation
 
@@ -140,8 +107,8 @@ for questions about this implementation or model card.
 
 ## License
 
-- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
-- **Upstream code and weights:** Apache-2.0; see the
-  [PXDesign license](https://github.com/bytedance/PXDesign/blob/main/LICENSE).
-- The released `pxdesign_v0.1.0.pt` checkpoint may be redistributed with the
-  upstream Apache-2.0 notice preserved.
+This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.en.html).
+
+```spdx
+SPDX-License-Identifier: AGPL-3.0-or-later
+```
