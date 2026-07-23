@@ -56,9 +56,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Side-Chain Packing
+### Side-Chain Packing
 
 Use the high-level `pack` API:
 

@@ -55,9 +55,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Backbone Design
+### Backbone Design
 
 Use the high-level `design` API:
 

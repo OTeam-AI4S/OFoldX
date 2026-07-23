@@ -85,25 +85,16 @@ profile = "black"
 
 [tool.mypy]
 ignore_missing_imports = true
-python_version = "3.10"
-# The parity probes under scripts/parity/<model>/ reuse basenames (confidence_parity,
-# forward_parity, ...) across models. Each model directory is a package (its __init__.py),
-# so the modules are model-qualified (boltz1.confidence_parity vs boltz2.confidence_parity).
-# Disable namespace-package discovery so mypy does not ALSO map scripts/parity/*.py under a
-# second "scripts.parity.*" root ("source file found twice").
-namespace_packages = false
+python_version = "3.14"
 
 [tool.pytest]
 ini_options.addopts = "--import-mode=importlib --doctest-modules --cov=ofoldx"
-ini_options.markers = [
-  "lfs: tests that involve large file handling and should be excluded from CI",
-]
 ini_options.testpaths = [ "ofoldx", "tests" ]
 
 [tool.coverage]
 run.branch = true
 run.source = [ "ofoldx" ]
-paths.source = [ "ofoldx", "*/site-packages/ofoldx" ]
+paths.source = [ "ofoldx" ]
 report.fail_under = 60
 report.omit = [ "ofoldx/models/*/convert.py" ]
 report.show_missing = true

@@ -64,9 +64,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Structure Prediction
+### Structure Prediction
 
 Use the high-level `fold` API:
 

@@ -64,9 +64,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Structure Prediction
+### Structure Prediction
 
 Use the high-level `fold` API:
 
@@ -76,7 +74,7 @@ import ofoldx
 output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/esmfold2")
 ```
 
-#### Binder Design
+### Binder Design
 
 Use the high-level `design` API:
 

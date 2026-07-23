@@ -60,9 +60,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Sequence Design
+### Sequence Design
 
 Use the high-level `design` API:
 

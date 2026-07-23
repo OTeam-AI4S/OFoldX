@@ -60,9 +60,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Biomolecular Design
+### Biomolecular Design
 
 Use the high-level `design` API:
 

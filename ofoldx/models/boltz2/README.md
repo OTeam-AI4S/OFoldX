@@ -69,9 +69,7 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Direct Use
-
-#### Structure Prediction
+### Structure Prediction
 
 Use the high-level `fold` API:
 
@@ -81,7 +79,7 @@ import ofoldx
 output = ofoldx.fold("complex.cif", model="oteam/boltz2")
 ```
 
-#### Binding Affinity Prediction
+### Binding Affinity Prediction
 
 Use the high-level `score` API:
 
