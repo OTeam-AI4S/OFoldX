@@ -1,4 +1,4 @@
-r"""Lower a Hub CCD dataset row to a :class:`ChemicalComponent`.
+r"""Lower a Hub CCD dataset row to a [`ChemicalComponent`][].
 
 The dataset stores one component per Parquet row. ``revision`` pins the wwPDB
 snapshot used for resolution.
@@ -67,7 +67,7 @@ def _read_component_row(snapshot: Path, component_id: str) -> dict[str, object] 
 
 
 def _lower_row(row: dict[str, object]) -> ChemicalComponent:
-    r"""Lower one CCD Parquet row to a :class:`ChemicalComponent`."""
+    r"""Lower one CCD Parquet row to a [`ChemicalComponent`][]."""
 
     component_id = _require_str(row, "component_id")
     atom_ids = _require_str_list(row, "atom_ids")

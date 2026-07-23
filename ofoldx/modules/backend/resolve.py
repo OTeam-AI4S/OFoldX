@@ -4,10 +4,11 @@ Public backend requests have one shared meaning:
 
 - ``"auto"``  — OOps when available and suitable, otherwise PyTorch.
 - ``"torch"`` — the operator's canonical PyTorch implementation.
-- ``"oops"``  — the optional OOps implementation.
+- ``"sdpa"``, ``"oops"``, ``"cueq"``, ``"apex"``, and ``"deepspeed"`` — use that
+  provider where it implements the operator and the canonical PyTorch implementation elsewhere.
 
 Low-level numerical diagnostics may also request a concrete implementation such as
-``"sdpa"`` or ``"eager"``. Those are implementation names, not a second public
+``"eager"``. Concrete names are implementation details, not a second public
 configuration axis.
 """
 
@@ -18,6 +19,8 @@ from collections.abc import Iterable
 from torch import Tensor
 
 from ._oops import OOPS_AVAILABLE
+
+PUBLIC_OPERATOR_BACKENDS = frozenset({"auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"})
 
 
 def oops_available() -> bool:
@@ -51,24 +54,26 @@ def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], publ
         A concrete backend name drawn from ``supported`` (or ``public_default``).
 
     Raises:
-        ValueError: If the requested backend is not implemented by this operator.
+        ValueError: If the request is neither a public provider nor a supported concrete implementation.
 
     Examples:
         >>> from ofoldx.modules.backend.resolve import resolve_operator_backend
         >>> resolve_operator_backend("eager", supported=("oops", "eager"), public_default="eager")
         'eager'
-        >>> resolve_operator_backend("nope", supported=("oops", "eager"), public_default="eager")
+        >>> resolve_operator_backend("nope", supported=("oops", "eager"), public_default="eager")  # doctest: +ELLIPSIS
         Traceback (most recent call last):
             ...
-        ValueError: unsupported operator_backend 'nope'; expected one of: auto, eager, oops, torch
+        ValueError: unsupported operator_backend 'nope'; expected one of: ...torch
     """
 
     if requested == "auto":
         return "oops" if "oops" in supported and oops_available() else public_default
     if requested == "torch":
         return public_default
+    if requested in PUBLIC_OPERATOR_BACKENDS and requested not in supported:
+        return public_default
     if requested not in supported:
-        options = ", ".join(sorted({"auto", "torch", *supported}))
+        options = ", ".join(sorted({*PUBLIC_OPERATOR_BACKENDS, *supported}))
         raise ValueError(f"unsupported operator_backend {requested!r}; expected one of: {options}")
     return requested
 
@@ -77,7 +82,7 @@ def resolve_config_operator_backend(requested: str, *, supported: tuple[str, ...
     r"""
     Validate a stored backend setting while preserving public backend requests.
 
-    Runtime dispatchers resolve ``"auto"`` and ``"torch"`` when the operator executes.
+    Runtime dispatchers resolve every public provider for the concrete operator when it executes.
 
     Args:
         requested: The requested public backend or a concrete implementation name.
@@ -93,7 +98,7 @@ def resolve_config_operator_backend(requested: str, *, supported: tuple[str, ...
         'auto'
     """
 
-    if requested in {"auto", "torch"}:
+    if requested in PUBLIC_OPERATOR_BACKENDS:
         return requested
     return resolve_operator_backend(requested, supported=supported, public_default=public_default)
 

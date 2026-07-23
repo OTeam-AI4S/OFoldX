@@ -1,11 +1,11 @@
 r"""The unified config-only Danling Runner for OFoldX Models.
 
 Construction is config-only (DESIGN §10.3): the Runner takes a
-:class:`~ofoldx.runners.config.RunnerConfig` and builds the Model, Processor,
+[`RunnerConfig`][ofoldx.runners.config.RunnerConfig] and builds the Model, Processor,
 datasets, objective, and collate from it, then hands optimizer / scheduler /
 dataloader / checkpoint building to danling. Family Models stay
 inference-and-forward-only; the training loss is produced by the resolved
-objective (see :mod:`ofoldx.runners.objectives`), never by the Model.
+objective (see [`ofoldx.runners.objectives`][]), never by the Model.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ class Runner(dl.Runner):
         return registration.model(typed_config)
 
     def build_datasets(self) -> dict[str, Any]:
-        r"""Build one :class:`~ofoldx.runners.dataset.StructureDataset` per configured split."""
+        r"""Build one [`StructureDataset`][ofoldx.runners.dataset.StructureDataset] per configured split."""
 
         from ..models.registry import MODELS
         from .dataset import StructureDataset

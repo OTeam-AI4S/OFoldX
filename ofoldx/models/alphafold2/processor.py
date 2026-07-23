@@ -197,9 +197,9 @@ def normalize_msa(
 ) -> MSA | None:
     r"""Bind one monomer alignment to the exact target sequence.
 
-    An :class:`MSA` names its entity by ``entity_id``; the Processor resolves that
+    An [`MSA`][] names its entity by ``entity_id``; the Processor resolves that
     entity against ``system`` and verifies the query width. Path inputs are
-    projected to the entity query axis by :func:`io.msa.read_msa`.
+    projected to the entity query axis by [`io.msa.read_msa`][].
     """
 
     if msa is None:
@@ -256,9 +256,9 @@ def select_template_alignment(
     r"""Return the one Template alignment that binds to the single AlphaFold 2 target.
 
     AlphaFold 2 folds one monomer target, so exactly one of a Template's
-    :class:`TemplateAlignment` values may name that target entity and, when it
+    [`TemplateAlignment`][] values may name that target entity and, when it
     pins an instance, that exact target instance. The target-side upper bound is
-    the Processor's job: :class:`TemplateAlignment` holds no target sequence.
+    the Processor's job: [`TemplateAlignment`][] holds no target sequence.
     """
 
     matches = [

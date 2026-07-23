@@ -5,8 +5,8 @@ with optional fold and affinity stages. It runs structure design, inverse foldin
 optional refolding, optional affinity scoring, and result analysis in that order.
 
 The folding and affinity stages depend on structural fold and score protocols
-(:class:`BoltzGenFoldModel` ``.fold(batch) -> FoldResult`` /
-:class:`BoltzGenScoreModel` ``.score(batch) -> ScoreResult``), so any compatible
+([`BoltzGenFoldModel`][] ``.fold(batch) -> FoldResult`` /
+[`BoltzGenScoreModel`][] ``.score(batch) -> ScoreResult``), so any compatible
 implementation can be injected. ``fold`` /
 ``affinity`` and their Processors are **injected optional dependencies** typed against these
 Protocols; BoltzGen does not alter the composed model interfaces.
@@ -355,7 +355,7 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
     r"""The concrete design (generated) residue references the design step marked.
 
     Read off ``design_batch.design_mask`` over ``layout.output_residues``; only concrete
-    :class:`~ofoldx.data.molecular.ComponentReference` rows are returned (a symbolic generated row
+    [`ComponentReference`][ofoldx.data.molecular.ComponentReference] rows are returned (a symbolic generated row
     from a not-yet-materialized assembly is skipped — the decode path always materializes first).
     """
 

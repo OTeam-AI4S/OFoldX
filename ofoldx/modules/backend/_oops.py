@@ -1,20 +1,16 @@
 r"""Guarded access to optional OOps operators.
 
-Without OOps, :class:`LayerNorm` uses PyTorch and named kernels raise only when
-called, allowing public eager paths to remain available.
+Named kernels raise only when called, allowing public PyTorch paths to remain available.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-from torch import nn
-
 OOpsUnsupportedError: type[NotImplementedError]
 
 try:
     import oops as _oops
-    from oops import LayerNorm
     from oops import OOpsUnsupportedError as _ImportedOOpsUnsupportedError
 
     OOpsUnsupportedError = _ImportedOOpsUnsupportedError
@@ -29,14 +25,13 @@ except ModuleNotFoundError as error:
         r"""Raised when an OOps kernel is requested but OOps is unavailable."""
 
     OOpsUnsupportedError = _MissingOOpsUnsupportedError
-    LayerNorm = nn.LayerNorm
 
 
 def oops_kernel(name: str) -> Callable[..., object]:
     r"""
     Return a named OOps kernel or a deferred unavailable-kernel error.
 
-    The unavailable stub raises :class:`OOpsUnsupportedError` when called. ``"auto"``
+    The unavailable stub raises [`OOpsUnsupportedError`][] when called. ``"auto"``
     dispatch excludes OOps when the package is unavailable.
 
     Args:

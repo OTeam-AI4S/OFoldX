@@ -9,7 +9,11 @@ import torch
 
 import ofoldx.modules.backend.resolve as resolve_module
 from ofoldx.modules.backend import _oops
-from ofoldx.modules.backend.resolve import resolve_config_operator_backend, resolve_tensor_operator_backend
+from ofoldx.modules.backend.resolve import (
+    resolve_config_operator_backend,
+    resolve_operator_backend,
+    resolve_tensor_operator_backend,
+)
 
 
 def _execute_oops_import(monkeypatch, missing_name: str):
@@ -62,12 +66,19 @@ def test_resolve_config_operator_backend_preserves_torch() -> None:
 
 
 def test_explicit_unsupported_backend_fails() -> None:
-    with pytest.raises(ValueError, match="unsupported operator_backend 'sdpa'"):
+    with pytest.raises(ValueError, match="unsupported operator_backend 'triton'"):
         resolve_config_operator_backend(
-            "sdpa",
+            "triton",
             supported=("oops", "eager"),
             public_default="eager",
         )
+
+
+@pytest.mark.parametrize("backend", ["sdpa", "oops", "cueq", "apex", "deepspeed"])
+def test_public_provider_uses_canonical_implementation_when_operator_is_not_supported(backend: str) -> None:
+    expected = "oops" if backend == "oops" else "eager"
+
+    assert resolve_operator_backend(backend, supported=("oops", "eager"), public_default="eager") == expected
 
 
 def test_resolve_tensor_operator_backend_auto_uses_public_default_for_cpu_tensors(monkeypatch) -> None:

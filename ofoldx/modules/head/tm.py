@@ -73,10 +73,10 @@ def tm_bin_weights(bin_centers: Tensor, num_tokens: Tensor | float) -> Tensor:
 
 def tm_weight_from_pae(pae_logits: Tensor, num_tokens: Tensor | float, *, bin_centers: Tensor) -> Tensor:
     r"""
-    Full inner kernel: softmax ``pae_logits`` over bins, weight by :func:`tm_bin_weights`, and sum.
+    Full inner kernel: softmax ``pae_logits`` over bins, weight by [`tm_bin_weights`][], and sum.
 
     Uses a plain ``softmax(-1)``. Callers that upcast to float around the softmax or reuse a
-    pre-decoded probability tensor call :func:`tm_bin_weights` directly on their own distribution
+    pre-decoded probability tensor call [`tm_bin_weights`][] directly on their own distribution
     instead of this convenience wrapper.
 
     Args:

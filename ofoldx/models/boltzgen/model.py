@@ -757,7 +757,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         add_ss_specification: Whether to add the secondary-structure conditioning.
         num_binding_types: Number of binding-specification ids.
         num_ss_types: Number of secondary-structure ids.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -793,7 +793,7 @@ class BoltzGenInputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
         )
         self.atom_pair_bias_projection = nn.Sequential(
-            LayerNorm(atom_pair_hidden_size),
+            LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
             nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
         )
         self.atom_attention_encoder = BoltzGenAtomAttentionEncoder(
@@ -1099,7 +1099,7 @@ class BoltzGenAtomAttentionEncoder(nn.Module):
         num_atom_encoder_blocks: Number of atom-transformer blocks.
         num_atom_encoder_attention_heads: Number of attention heads per block.
         structure_prediction: Whether to inject noisy positions and return diffusion skip states.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1199,7 +1199,7 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
         num_key_atoms: Number of key atoms per attention window.
         num_atom_decoder_blocks: Number of atom-transformer blocks.
         num_atom_decoder_attention_heads: Number of attention heads per block.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1225,7 +1225,9 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
             cross_attention_mode=False,
             transition="triple",
         )
-        self.position_update = nn.Sequential(LayerNorm(atom_hidden_size), nn.Linear(atom_hidden_size, 3, bias=False))
+        self.position_update = nn.Sequential(
+            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+        )
 
     def forward(
         self,
@@ -1281,7 +1283,7 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         distance_gaussian_dim: Number of Gaussian basis functions in the distance encoder.
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1303,8 +1305,8 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.pair_norm = nn.LayerNorm(pair_size)
-        self.hidden_norm = nn.LayerNorm(token_distance_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(token_distance_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
         self.distance_feature_projection = nn.Linear(num_bins + 4 * pair_size, token_distance_size, bias=False)
         self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
@@ -1385,7 +1387,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Number of triangle-attention heads.
         miniformer_blocks: Whether the pairformer uses compact Miniformer pair updates.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1408,8 +1410,8 @@ class BoltzGenTemplateEmbedder(nn.Module):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.pair_norm = nn.LayerNorm(pair_size)
-        self.hidden_norm = nn.LayerNorm(template_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(template_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = nn.Linear(2 * vocab_size + num_bins + 5, template_size, bias=False)
         self.output_projection = nn.Linear(template_size, pair_size, bias=False)
@@ -1598,10 +1600,10 @@ class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
 
     def __init__(self, pair_size: int = 128) -> None:
         super().__init__()
-        self.input_norm = nn.LayerNorm(pair_size, eps=1e-5)
+        self.input_norm = LayerNorm(pair_size, eps=1e-5)
         self.input_projection = nn.Linear(pair_size, pair_size, bias=False)
         self.input_gate_projection = nn.Linear(pair_size, pair_size, bias=False)
-        self.output_norm = nn.LayerNorm(pair_size // 2)
+        self.output_norm = LayerNorm(pair_size // 2)
         self.output_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
         self.output_gate_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
 
@@ -1643,7 +1645,7 @@ class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
         pair_size: Width of the pair representation channel.
         expansion: Feed-forward expansion factor of the pair transition.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1686,7 +1688,7 @@ class BoltzGenMiniformerBlock(nn.Module):
         num_pair_attention_heads: Number of pair-biased single-attention heads.
         expansion: Feed-forward expansion factor of the transitions.
         dropout: Row-wise dropout probability on the triangular-update output.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1741,7 +1743,7 @@ class BoltzGenMiniformerStack(nn.Module):
         pair_size: Width of the pair representation channel.
         num_pair_attention_heads: Number of pair-biased single-attention heads per block.
         dropout: Row-wise dropout probability inside each block.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1804,7 +1806,7 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside each block.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -1908,7 +1910,7 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
         expansion: Feed-forward expansion factor inside the block.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -2103,20 +2105,23 @@ class BoltzGenDenoiserConditioning(nn.Module):
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(LayerNorm(pair_size), nn.Linear(pair_size, num_token_transformer_heads, bias=False))
+            nn.Sequential(
+                LayerNorm(pair_size, operator_backend=operator_backend),
+                nn.Linear(pair_size, num_token_transformer_heads, bias=False),
+            )
             for _ in range(num_token_transformer_blocks)
         )
 
@@ -2201,7 +2206,7 @@ class BoltzGenDenoiser(nn.Module):
         num_atom_decoder_blocks: Number of atom-decoder blocks.
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_conditioning_transitions: Number of transitions in the single conditioner.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -2238,7 +2243,9 @@ class BoltzGenDenoiser(nn.Module):
             structure_prediction=True,
             operator_backend=operator_backend,
         )
-        self.single_to_token = nn.Sequential(LayerNorm(hidden), nn.Linear(hidden, hidden, bias=False))
+        self.single_to_token = nn.Sequential(
+            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
+        )
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
@@ -2246,7 +2253,7 @@ class BoltzGenDenoiser(nn.Module):
             conditioning_size=hidden,
             operator_backend=operator_backend,
         )
-        self.token_norm = LayerNorm(hidden)
+        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
         self.atom_attention_decoder = BoltzGenAtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -2354,10 +2361,10 @@ class BoltzGenSingleConditioning(nn.Module):
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(hidden)
+        self.single_norm = LayerNorm(hidden, operator_backend=operator_backend)
         self.single_projection = nn.Linear(hidden, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
             Transition(hidden, expansion=transition_expansion, operator_backend=operator_backend)
@@ -3595,7 +3602,7 @@ class BoltzGenProjectionTransition(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
         super().__init__()
-        self.input_norm = nn.LayerNorm(input_size)
+        self.input_norm = LayerNorm(input_size)
         self.gate_projection = nn.Linear(input_size, hidden_size, bias=False)
         self.value_projection = nn.Linear(input_size, hidden_size, bias=False)
         self.output_projection = nn.Linear(hidden_size, output_size, bias=False)
@@ -3780,7 +3787,7 @@ class BoltzGenInverseFoldingLayout:
 class BoltzGenPlacements:
     r"""One BoltzGen whole-assembly generation-topology request.
 
-    ``placements`` is a :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``placements`` is a [`PlacementSpec`][ofoldx.data.placement.PlacementSpec] mapping
     ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
     unique across the whole mapping and is the sole pre-realization reference target;
     ``__post_init__`` validates this invariant. Unlike ODesign — which declares one group **per output
@@ -3790,7 +3797,7 @@ class BoltzGenPlacements:
 
     Per-chain lengths are drawn at realization from BoltzGen's whole-assembly
     ``total_len`` budget (the shared core carries no total-length field), so a ranged
-    :class:`~ofoldx.data.placement.GeneratedSegment` (``min_length != max_length``) is resolved
+    [`GeneratedSegment`][ofoldx.data.placement.GeneratedSegment] (``min_length != max_length``) is resolved
     against ``total_len`` rather than fixed on the core. ``total_len is None`` realizes every
     generated placement at its ``max_length``.
     """
@@ -3872,7 +3879,7 @@ class BoltzGenContact:
 
     ``side_a`` and ``side_b`` retain order because BoltzGen has directional
     ``pocket>binder`` and ``binder>pocket`` classes. A shared
-    :class:`~ofoldx.data.conditions.Contact` is deliberately not wrapped here: that record is
+    [`Contact`][ofoldx.data.conditions.Contact] is deliberately not wrapped here: that record is
     symmetric, while swapping these sides changes a directional BoltzGen condition.
     """
 
@@ -3886,11 +3893,11 @@ class BoltzGenContact:
 class BoltzGenCovalentBond:
     r"""A requested covalent link → derived ``cyclic_period`` (envelope over ``SymbolicBond``).
 
-    ``bond`` is a shared :class:`~ofoldx.data.bonds.SymbolicBond`; its endpoints
-    may be EXISTING input atoms (:class:`~ofoldx.data.molecular.AtomSite`) or GENERATED atoms
-    (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the placement
+    ``bond`` is a shared [`SymbolicBond`][ofoldx.data.bonds.SymbolicBond]; its endpoints
+    may be EXISTING input atoms ([`AtomSite`][ofoldx.data.molecular.AtomSite]) or GENERATED atoms
+    ([`SymbolicAtomSite`][ofoldx.data.placement.SymbolicAtomSite]) resolved through the placement
     core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
-    :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
+    [`SystemBond`][ofoldx.data.molecular.SystemBond] and injecting it into the lowered system, so the
     head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
     input system already carried. The request declares no additional physical topology; a
     non-terminal link simply surfaces as a token bond. ``intent`` is a BoltzGen-specific hard/soft

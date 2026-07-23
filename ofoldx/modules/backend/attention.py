@@ -1,8 +1,8 @@
 r"""
 Backend dispatch for gated multi-head (pair-bias) attention.
 
-The dispatch owns both implementations' calling conventions in one place: OOps-owned pair-bias
-implementations (including its gated callable) and public PyTorch implementations.
+The dispatcher owns PyTorch, OOps, cuEquivariance, Apex, and DeepSpeed calling
+conventions in one place.
 [`GatedMultiheadAttention`][ofoldx.modules.attention.multihead.GatedMultiheadAttention] stays backend-agnostic — it
 owns the q/k/v projection and passes it in.
 """
@@ -16,6 +16,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ._apex import apex_evoformer_attention, apex_evoformer_attention_supported
+from ._cueq import cueq_triangle_attention
+from ._deepspeed import deepspeed_evoformer_attention
 from ._oops import oops_kernel
 from .resolve import resolve_tensor_operator_backend
 
@@ -40,8 +43,8 @@ def gated_multihead_attention(
     r"""
     Project q/k/v via ``projection``, run attention on ``operator_backend``, and merge heads.
 
-    Dispatches the attention math to OOps-owned pair-bias dispatch (using its gated callable when the
-    projection contract permits) or a pure-PyTorch implementation. ``biases`` are summed into a single additive pair
+    Dispatches attention to the selected provider when that provider implements the
+    concrete tensor contract, otherwise to canonical PyTorch SDPA. ``biases`` are summed into a single additive pair
     bias and ``attention_mask`` becomes a large-negative additive mask; both are broadcast to the attention shape.
 
     Args:
@@ -52,8 +55,7 @@ def gated_multihead_attention(
         attention_mask: Optional boolean mask broadcastable to ``(..., q_tokens, k_tokens)`` or
             ``(..., k_tokens)``; ``False`` positions are masked out.
         projection: The q/k/v (and optional gate/output) projection owned by the calling module.
-        operator_backend: Public backend request (``"auto"`` / ``"torch"`` / ``"oops"``) or a concrete
-            implementation name used by low-level diagnostics.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``(..., q_tokens, hidden_size)`` attention output with heads merged.
@@ -78,10 +80,10 @@ def gated_multihead_attention(
     operator_backend = resolve_tensor_operator_backend(
         operator_backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
-        supported=("oops", "sdpa", "eager"),
+        supported=("oops", "apex", "deepspeed", "sdpa", "eager"),
         public_default="sdpa",
     )
-    if operator_backend == "eager":
+    if operator_backend in {"eager", "apex", "deepspeed"}:
         query_projection, key_projection, value_projection = projection.project_unscaled(query, key, value)
     else:
         query_projection, key_projection, value_projection = projection.project(query, key, value)
@@ -116,19 +118,47 @@ def gated_multihead_attention(
             biases=biases,
             attention_mask=attention_mask,
         )
-    else:
-        attention_biases = _attention_biases(
-            query_projection,
-            key_projection,
-            biases=biases,
-            attention_mask=attention_mask,
-        )
-        output = F.scaled_dot_product_attention(
+    elif operator_backend == "apex":
+        output = _apex_attention(
             query_projection,
             key_projection,
             value_projection,
-            attn_mask=_sum_biases(attention_biases),
-            dropout_p=0.0,
+            biases=biases,
+            attention_mask=attention_mask,
+        )
+        if output is None:
+            output = _sdpa_attention(
+                query_projection,
+                key_projection,
+                value_projection,
+                biases=biases,
+                attention_mask=attention_mask,
+                scale=None,
+            )
+    elif operator_backend == "deepspeed":
+        output = _deepspeed_attention(
+            query_projection,
+            key_projection,
+            value_projection,
+            biases=biases,
+            attention_mask=attention_mask,
+        )
+        if output is None:
+            output = _sdpa_attention(
+                query_projection,
+                key_projection,
+                value_projection,
+                biases=biases,
+                attention_mask=attention_mask,
+                scale=None,
+            )
+    else:
+        output = _sdpa_attention(
+            query_projection,
+            key_projection,
+            value_projection,
+            biases=biases,
+            attention_mask=attention_mask,
             scale=1.0,
         )
     output = output.transpose(-2, -3)
@@ -146,7 +176,7 @@ def projected_attention(
 ) -> Tensor:
     r"""Run attention over already-projected head-major q/k/v tensors.
 
-    This is the projection-free companion to :func:`gated_multihead_attention` for
+    This is the projection-free companion to [`gated_multihead_attention`][] for
     architectures that own nonstandard q/k/v preparation such as QK normalization or
     rotary embeddings. The backend contract and ``auto`` semantics remain centralized
     here instead of being reimplemented by each Model.
@@ -204,7 +234,7 @@ def triangle_attention(
     heads, head_dim)`` q/k/v layout and the row-broadcast ``(..., rows|1, heads, cols, cols)`` bias
     directly instead of flattening the row axis into a generic pair-bias attention. Every other backend
     (``sdpa``/``eager``, or ``oops`` with biased projections) folds the key mask into an
-    additive bias and delegates to :func:`gated_multihead_attention`, equivalent to attending on
+    additive bias and delegates to [`gated_multihead_attention`][], equivalent to attending on
     ``pair`` with ``biases=[mask_bias, triangle_bias]``.
 
     Args:
@@ -212,8 +242,7 @@ def triangle_attention(
         triangle_bias: Per-head triangle bias ``(..., 1, heads, cols, cols)`` (row axis broadcast).
         attention_mask: Optional boolean keep-mask ``(..., rows, cols)``; ``False`` keys are excluded.
         projection: The q/k/v/gate/output projection owned by the calling triangle-attention module.
-        operator_backend: Public backend request (``"auto"`` / ``"torch"`` / ``"oops"``) or a concrete
-            implementation name used by low-level diagnostics.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         Gated pair update ``(..., rows, cols, pair_size)``.
@@ -222,7 +251,7 @@ def triangle_attention(
     resolved = resolve_tensor_operator_backend(
         operator_backend,
         tensors=(pair, triangle_bias, attention_mask),
-        supported=("oops", "sdpa", "eager"),
+        supported=("oops", "cueq", "apex", "deepspeed", "sdpa", "eager"),
         public_default="sdpa",
     )
     can_flash = (
@@ -233,18 +262,15 @@ def triangle_attention(
     )
     if can_flash:
         return _oops_triangle_flash(pair, triangle_bias, attention_mask, projection=projection)
-    biases: list[Tensor] = [triangle_bias]
-    if attention_mask is not None:
-        mask = attention_mask.bool()
-        mask_bias = torch.zeros_like(mask, dtype=pair.dtype)
-        mask_bias = mask_bias.masked_fill(~mask, torch.finfo(pair.dtype).min)
-        biases.insert(0, mask_bias[..., None, None, :])
+    if resolved == "cueq" and pair.is_cuda:
+        return _cueq_triangle_flash(pair, triangle_bias, attention_mask, projection=projection)
+    key_mask = None if attention_mask is None else attention_mask.unsqueeze(-2)
     return gated_multihead_attention(
         pair,
         None,
         None,
-        biases=biases,
-        attention_mask=None,
+        biases=(triangle_bias,),
+        attention_mask=key_mask,
         projection=projection,
         operator_backend=operator_backend,
     )
@@ -284,6 +310,42 @@ def _oops_triangle_flash(
     return projection.merge(cast(Tensor, output), pair)
 
 
+def _cueq_triangle_flash(
+    pair: Tensor,
+    triangle_bias: Tensor,
+    attention_mask: Tensor | None,
+    *,
+    projection: MultiheadAttentionProjection,
+) -> Tensor:
+    r"""Run cuEquivariance triangle attention and apply OFoldX's output gate."""
+
+    prefix_shape = pair.shape[:-3]
+    rows, columns = pair.shape[-3:-1]
+    heads, head_dim = projection.num_attention_heads, projection.head_dim
+    query, key, value = projection.project_unscaled(pair, pair, pair)
+    query = query.reshape(-1, rows, heads, columns, head_dim)
+    key = key.reshape(-1, rows, heads, columns, head_dim)
+    value = value.reshape(-1, rows, heads, columns, head_dim)
+    target_bias_shape = (*prefix_shape, 1, heads, columns, columns)
+    bias = _broadcast_to_attention_shape(triangle_bias, target_bias_shape, tail_dims=4)
+    mask = None
+    if attention_mask is not None:
+        target_mask_shape = (*prefix_shape, rows, columns)
+        mask = _broadcast_to_attention_shape(attention_mask.bool(), target_mask_shape, tail_dims=2)
+        mask = mask.reshape(-1, rows, 1, 1, columns)
+    output = cueq_triangle_attention(
+        query,
+        key,
+        value,
+        bias.reshape(-1, 1, heads, columns, columns),
+        mask,
+        scale=head_dim**-0.5,
+    )
+    output = output.reshape(*prefix_shape, rows, heads, columns, head_dim)
+    output = output.transpose(-2, -3)
+    return projection.merge(output, pair)
+
+
 def _eager_attention(
     query_projection: Tensor,
     key_projection: Tensor,
@@ -318,6 +380,139 @@ def _eager_attention(
         logits = logits + (~mask).to(dtype=torch.float32) * -inf
     attention = logits.softmax(dim=-1)
     return torch.einsum("...hij,...hjd->...hid", attention, value_projection.float()).to(value_projection.dtype)
+
+
+def _sdpa_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    biases: Sequence[Tensor] | None,
+    attention_mask: Tensor | None,
+    scale: float | None,
+) -> Tensor:
+    r"""Run canonical PyTorch scaled-dot-product attention."""
+
+    attention_biases = _attention_biases(
+        query,
+        key,
+        biases=biases,
+        attention_mask=attention_mask,
+    )
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=_sum_biases(attention_biases),
+        dropout_p=0.0,
+        scale=scale,
+    )
+
+
+def _supports_evoformer_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+) -> bool:
+    r"""Return whether q/k/v and mask have the shared Evoformer-kernel contract."""
+
+    if query.dim() != 5 or not query.is_cuda or query.dtype not in {torch.float16, torch.bfloat16}:
+        return False
+    if query.shape != key.shape or key.shape != value.shape:
+        return False
+    if attention_mask is None or attention_mask.dim() <= 3:
+        return True
+    return attention_mask.dim() == 4 and attention_mask.shape[-2] == 1
+
+
+def _evoformer_key_mask(
+    attention_mask: Tensor,
+    query: Tensor,
+) -> Tensor:
+    r"""Broadcast a key-only mask to ``(batch, outer, 1, 1, keys)``."""
+
+    if attention_mask.dim() == 4:
+        attention_mask = attention_mask.squeeze(-2)
+    target_shape = (query.shape[0], query.shape[1], query.shape[-2])
+    mask = _broadcast_to_attention_shape(attention_mask.bool(), target_shape, tail_dims=1)
+    return mask.reshape(query.shape[0], query.shape[1], 1, 1, query.shape[-2])
+
+
+def _evoformer_pair_bias(
+    query: Tensor,
+    key: Tensor,
+    biases: Sequence[Tensor] | None,
+) -> Tensor | None:
+    r"""Broadcast pair biases to the layout shared by Apex and DeepSpeed."""
+
+    if not biases:
+        return None
+    target_shape = (query.shape[0], 1, query.shape[-3], query.shape[-2], key.shape[-2])
+    broadcast_biases = [_broadcast_to_attention_shape(bias, target_shape, tail_dims=3) for bias in biases]
+    return _sum_biases(broadcast_biases)
+
+
+def _apex_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    biases: Sequence[Tensor] | None,
+    attention_mask: Tensor | None,
+) -> Tensor | None:
+    r"""Run Apex OpenFold attention when its scheduler accepts the exact shape."""
+
+    if not _supports_evoformer_attention(query, key, value, attention_mask):
+        return None
+    training = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (query, key, value, *(biases or ())))
+    if not apex_evoformer_attention_supported(query.shape, training=training):
+        return None
+    bias = _evoformer_pair_bias(query, key, biases)
+    if bias is None:
+        bias = query.new_zeros(query.shape[0], 1, query.shape[-3], query.shape[-2], key.shape[-2])
+    mask = None
+    if attention_mask is not None:
+        mask = _evoformer_key_mask(attention_mask, query).to(dtype=query.dtype)
+    return apex_evoformer_attention(
+        query,
+        key,
+        value,
+        mask,
+        bias,
+        training=training,
+    )
+
+
+def _deepspeed_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    biases: Sequence[Tensor] | None,
+    attention_mask: Tensor | None,
+) -> Tensor | None:
+    r"""Run DS4Sci Evoformer attention when its tensor contract is satisfied."""
+
+    if not _supports_evoformer_attention(query, key, value, attention_mask):
+        return None
+    if query.shape[-2] <= 16 or query.shape[-1] > 64:
+        return None
+    pair_bias = _evoformer_pair_bias(query, key, biases)
+    if pair_bias is not None:
+        pair_bias = pair_bias.to(dtype=query.dtype)
+    mask_bias = None
+    if attention_mask is not None:
+        mask = _evoformer_key_mask(attention_mask, query).to(dtype=query.dtype)
+        mask_bias = (mask - 1) * 1e9
+    if pair_bias is None:
+        deepspeed_biases = [] if mask_bias is None else [mask_bias]
+    else:
+        deepspeed_biases = [mask_bias, pair_bias]
+    output = deepspeed_evoformer_attention(
+        query.transpose(-3, -2), key.transpose(-3, -2), value.transpose(-3, -2), deepspeed_biases
+    )
+    return output.transpose(-3, -2)
 
 
 def _oops_attention_pair_bias(
@@ -507,6 +702,10 @@ def _oops_attention_mask(
         attention_mask = attention_mask.squeeze(-3)
     if attention_mask.shape[-2:] == (1, key_length):
         attention_mask = attention_mask.squeeze(-2)
+        target_shape = (*prefix_shape, key_length)
+        return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=1).reshape(
+            flat_prefix_size, key_length
+        )
     if attention_mask.shape[-2:] == (query_length, key_length):
         target_shape = (*prefix_shape, query_length, key_length)
         return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=2).reshape(

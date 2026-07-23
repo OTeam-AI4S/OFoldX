@@ -2,8 +2,8 @@ r"""Project BoltzGen residue design masks to and from placement records.
 
 ``from_design_mask`` collapses a per-residue mask into maximal generated-polymer segments
 and contiguous spans of existing components in a
-:data:`~ofoldx.data.placement.PlacementSpec`. ``to_design_mask`` expands those placements
-through a :data:`~ofoldx.data.placement.PlacementMap` to recover designedness for each
+[`PlacementSpec`][ofoldx.data.placement.PlacementSpec]. ``to_design_mask`` expands those placements
+through a [`PlacementMap`][ofoldx.data.placement.PlacementMap] to recover designedness for each
 realized row. The representation cannot encode generated non-polymers such as de-novo
 ligands, and per-residue pinned identity remains in a separate conditioning record.
 """
@@ -33,7 +33,7 @@ class DesignMaskResidue:
     * a FIXED (source/context) residue — ``designed=False``, ``source=(instance_id, index)`` set.
 
     ``designed=True`` with ``polymer_type=None`` represents a generated non-polymer and is
-    rejected by :func:`from_design_mask` because :class:`PlacementValue` cannot encode it.
+    rejected by [`from_design_mask`][] because [`PlacementValue`][] cannot encode it.
     """
 
     designed: bool
@@ -44,8 +44,8 @@ class DesignMaskResidue:
 def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> PlacementValue:
     r"""Collapse one maximal same-``placement_id`` run of residues into one core value.
 
-    A designed run → one :class:`GeneratedSegment` (one polymer type, exact length); a fixed
-    run → one :class:`ExistingSpan` (one contiguous half-open source interval). Mixing, a
+    A designed run → one [`GeneratedSegment`][] (one polymer type, exact length); a fixed
+    run → one [`ExistingSpan`][] (one contiguous half-open source interval). Mixing, a
     designed non-polymer, or a non-contiguous / multi-instance source run is rejected.
     """
 
@@ -94,22 +94,22 @@ def from_design_mask(
     group_of: Callable[[int], str],
     placement_id_of: Callable[[int], str],
 ) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a :class:`PlacementSpec`.
+    r"""Project a per-output-residue design mask onto a [`PlacementSpec`][].
 
     Args:
-        residues: The per-output-residue mask cells, in output order (see :class:`DesignMaskResidue`).
+        residues: The per-output-residue mask cells, in output order (see [`DesignMaskResidue`][]).
         group_of: Maps a residue index to its declaration group (chain) label — the outer
-            :data:`~ofoldx.data.placement.PlacementSpec` key.
+            [`PlacementSpec`][ofoldx.data.placement.PlacementSpec] key.
         placement_id_of: Maps a residue index to its ``placement_id`` — the globally-unique inner
             key. Consecutive residues sharing one ``placement_id`` form one placement; the
             ``placement_id`` must be contiguous (a value may not reappear after a different one).
 
     Returns:
-        The realized :data:`~ofoldx.data.placement.PlacementSpec`: maximal designed runs →
-        :class:`GeneratedSegment` (exact length), maximal fixed runs → :class:`ExistingSpan`.
+        The realized [`PlacementSpec`][ofoldx.data.placement.PlacementSpec]: maximal designed runs →
+        [`GeneratedSegment`][] (exact length), maximal fixed runs → [`ExistingSpan`][].
         Interleaving is preserved as ordered placements within each group. The projection
-        preserves the information expressible by :class:`GeneratedSegment` and
-        :class:`ExistingSpan`; see the module docstring for its representational limits.
+        preserves the information expressible by [`GeneratedSegment`][] and
+        [`ExistingSpan`][]; see the module docstring for its representational limits.
     """
 
     placement: PlacementSpec = {}
@@ -153,7 +153,7 @@ def to_design_mask(
 
     Walks ``placement`` in declaration order (outer group, then inner placement) and, for
     each placement, emits one row per realized occurrence in ``placement_map``: ``True`` for a
-    :class:`GeneratedSegment` occurrence, ``False`` for an :class:`ExistingSpan` occurrence, with
+    [`GeneratedSegment`][] occurrence, ``False`` for an [`ExistingSpan`][] occurrence, with
     the declaration-group label carried per row. Symmetry/copy expansion (a placement whose
     occurrences span more than one realized instance id) yields one row per occurrence, so the
     result covers the realized rows in ``placement_map`` occurrence order.

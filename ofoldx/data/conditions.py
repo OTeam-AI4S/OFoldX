@@ -1,6 +1,6 @@
 r"""Shared residue identity, hotspot, and contact conditions.
 
-A :class:`Hotspot` is a one-sided label without a distance. A :class:`Contact`
+A [`Hotspot`][] is a one-sided label without a distance. A [`Contact`][]
 is a symmetric two-sided proximity condition with a distance cutoff. Model-specific
 weights and enforcement settings remain in model inputs.
 """

@@ -1,4 +1,4 @@
-r"""Canonical PDB/mmCIF I/O over :mod:`ofoldx.data` domain values."""
+r"""Canonical PDB/mmCIF I/O over [`ofoldx.data`][] domain values."""
 
 from __future__ import annotations
 

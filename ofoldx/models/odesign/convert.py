@@ -176,7 +176,7 @@ def convert_odesign_model(
     dtype: torch.dtype | None = None,
     config: ODesignConfig | None = None,
 ) -> ODesignModel:
-    r"""Strict-load one released ODesign backbone checkpoint into a native :class:`ODesignModel`."""
+    r"""Strict-load one released ODesign backbone checkpoint into a native [`ODesignModel`][]."""
 
     model = ODesignModel(ODesignConfig() if config is None else config)
     if dtype is not None:
@@ -201,7 +201,7 @@ def convert_odesign_checkpoint(
 ) -> None:
     r"""Convert the ODesign backbone checkpoint and write the aggregate composite repository.
 
-    The ODesign protein repository contains a multi-pair :class:`ODesignPipeline`: the ODesign
+    The ODesign protein repository contains a multi-pair [`ODesignPipeline`][]: the ODesign
     backbone pair owns the runnable root, and the OInvFold sequence step uses the
     *separately registered, read-only* ProteinMPNN / LigandMPNN Pipelines bound at the fixed
     ``protein_designer/`` and ``ligand_designer/`` sub-directories. The backbone pair alone keeps

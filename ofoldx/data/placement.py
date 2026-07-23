@@ -1,8 +1,8 @@
 r"""Placement declarations and symbolic references.
 
-A :data:`PlacementSpec` maps declaration groups to globally unique placement IDs.
+A `PlacementSpec` maps declaration groups to globally unique placement IDs.
 References target placement IDs, while groups determine output grouping and order.
-A :data:`PlacementMap` maps each placement to ordered realized component references;
+A `PlacementMap` maps each placement to ordered realized component references;
 symbolic offsets use standard Python indexing, including negative offsets.
 """
 
@@ -19,7 +19,7 @@ class GeneratedSegment:
     r"""One de novo polymer interval to be realized.
 
     ``min_length == max_length`` fixes the length, and ``min_length == 0`` is valid.
-    The containing :data:`PlacementSpec` key supplies its identity.
+    The containing `PlacementSpec` key supplies its identity.
     """
 
     polymer_type: PolymerType
@@ -114,7 +114,7 @@ class InstanceIdAllocator:
 def instance_of(placement: PlacementSpec) -> dict[str, str]:
     r"""Build a ``placement_id -> declaration_group`` index.
 
-    Duplicate placement IDs raise :class:`ValueError`.
+    Duplicate placement IDs raise [`ValueError`][].
     """
 
     index: dict[str, str] = {}
@@ -132,7 +132,7 @@ def instance_of(placement: PlacementSpec) -> dict[str, str]:
 
 
 def validate_placement(placement: PlacementSpec) -> None:
-    r"""Raise when a :data:`PlacementSpec` contains duplicate placement IDs."""
+    r"""Raise when a `PlacementSpec` contains duplicate placement IDs."""
 
     instance_of(placement)
 
@@ -142,7 +142,7 @@ def resolve(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> ComponentReference:
-    r"""Resolve a symbolic site to its realized :data:`ComponentReference`.
+    r"""Resolve a symbolic site to its realized `ComponentReference`.
 
     ``site.offset`` is applied directly to the placement's occurrence tuple.
     """

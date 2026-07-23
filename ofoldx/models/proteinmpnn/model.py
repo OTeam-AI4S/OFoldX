@@ -14,6 +14,7 @@ from ...data.components import get_component
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
+from ...modules.backend import LayerNorm
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     MpnnDecoderBlock,
@@ -1096,7 +1097,7 @@ class CaProteinMpnnFeatures(nn.Module):
         self.num_neighbors = num_neighbors
         self.relative_position = MpnnRelativePositionEncoding(16)
         self.edge_projection = nn.Linear(16 + 9 * 16 + 7, hidden_size, bias=False)
-        self.edge_norm = nn.LayerNorm(hidden_size)
+        self.edge_norm = LayerNorm(hidden_size)
 
     @staticmethod
     def quaternions(rotations: Tensor) -> Tensor:
@@ -1234,7 +1235,7 @@ def smoothed_loss(
 
     Adds ``weight / 21`` to the one-hot target and renormalizes each row before
     the cross entropy, matching ProteinMPNN's label smoothing. At
-    ``weight=0`` this reduces to :func:`nll_loss`. The result has shape
+    ``weight=0`` this reduces to [`nll_loss`][]. The result has shape
     ``sequence_tokens.shape``.
     """
 

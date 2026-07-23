@@ -320,11 +320,11 @@ def save_rfdiffusion_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
-    pairs it with :class:`RfDiffusionProcessor`, and writes ``model.json`` /
+    pairs it with [`RfDiffusionProcessor`][], and writes ``model.json`` /
     ``processor.json`` / safetensors via
     [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair has no
     generic standard task, so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
-    is written to route ``pipeline("design", model=dir)`` to :class:`RfDiffusionPipeline` rather than
+    is written to route ``pipeline("design", model=dir)`` to [`RfDiffusionPipeline`][] rather than
     the generic standard ``design`` route.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker

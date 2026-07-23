@@ -30,7 +30,7 @@ class TriangleAttention(nn.Module):
         output_bias: Whether the attention output projection carries a learnable bias.
         gate_bias: Whether the output-gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``. A bias-free
+        operator_backend: Operator provider; see [ofoldx.modules.backend][]. A bias-free
             module on the ``oops`` backend uses the
             dedicated OOps-owned ``triangle_attention`` implementation.
 
@@ -58,7 +58,7 @@ class TriangleAttention(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         # Ending-node callers may transpose the pair before this update. In that case,
         # ``transpose_bias`` keeps the bias tied to the original pair orientation.
@@ -132,7 +132,7 @@ class TriangleMultiplication(nn.Module):
         hidden_size: Width of the intermediate left/right factors.
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Examples:
         >>> import torch
@@ -158,8 +158,8 @@ class TriangleMultiplication(nn.Module):
         self.operator_backend = resolve_config_operator_backend(
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
-        self.input_norm = LayerNorm(pair_size)
-        self.output_norm = LayerNorm(hidden_size)
+        self.input_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.output_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.left_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(pair_size, hidden_size, bias=False)

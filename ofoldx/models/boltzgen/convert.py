@@ -1132,7 +1132,7 @@ def save_boltzgen_pipeline(
 ) -> None:
     r"""Convert the BoltzGen design + inverse-fold checkpoints and write the composite repository.
 
-    The released BoltzGen design deliverable is a multi-pair :class:`BoltzGenPipeline`:
+    The released BoltzGen design deliverable is a multi-pair [`BoltzGenPipeline`][]:
     the structure-design pair (``ofoldx.boltzgen``, ``standard_tasks=()``) owns the runnable root and
     the inverse-folding pair lives at the fixed ``ifold/`` sub-directory. Neither registered pair
     routes as a lone standard task, so this writes the aggregate repository — both required pairs and

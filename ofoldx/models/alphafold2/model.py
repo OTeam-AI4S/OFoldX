@@ -951,7 +951,7 @@ class AlphaFold2StructureModule(nn.Module):
 class AlphaFold2MultimerStructureModule(nn.Module):
     r"""AF-Multimer structure module.
 
-    Same shells as the monomer :class:`AlphaFold2StructureModule` (single/pair layer norms,
+    Same shells as the monomer [`AlphaFold2StructureModule`][] (single/pair layer norms,
     initial projection, and one shared-weight block run ``num_blocks`` times) but starting
     from an identity rotation-matrix rigid and using the multimer block.
     """
@@ -1117,7 +1117,7 @@ class AlphaFold2TemplateEmbedder(nn.Module):
 class AlphaFold2MultimerTemplateEmbedder(nn.Module):
     r"""AF-Multimer template pair embedder.
 
-    Runs :class:`AlphaFold2MultimerSingleTemplateEmbedder` over every template, averages
+    Runs [`AlphaFold2MultimerSingleTemplateEmbedder`][] over every template, averages
     the per-template pair activations, applies ReLU, and projects to the pair channel.
     Backbone unit vectors are built from atom37 coordinates in the model graph; the
     cross-chain ``multichain_mask`` restricts template features to same-chain residue
@@ -1464,7 +1464,7 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
             dropout=dropout,
             operator_backend=operator_backend,
         )
-        self.output_norm = LayerNorm(template_size)
+        self.output_norm = LayerNorm(template_size, operator_backend=operator_backend)
 
     def forward(self, template_batch: AlphaFold2TemplateBatch, *, pair_mask: Tensor) -> Tensor:
         features, template_pair_mask = self._features(template_batch)
@@ -1550,7 +1550,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         self.unit_vector_z_projection = nn.Linear(1, template_size)
         self.backbone_pair_mask_projection = nn.Linear(1, template_size)
         self.query_pair_projection = nn.Linear(query_size, template_size)
-        self.query_embedding_norm = LayerNorm(query_size)
+        self.query_embedding_norm = LayerNorm(query_size, operator_backend=operator_backend)
         self.template_pair_stack = AlphaFold2TemplatePairStack(
             num_blocks=num_blocks,
             pair_size=template_size,
@@ -1564,7 +1564,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
             # template pair stack; monomer keeps attention first.
             triangle_multiplication_first=True,
         )
-        self.output_norm = LayerNorm(template_size)
+        self.output_norm = LayerNorm(template_size, operator_backend=operator_backend)
 
     def forward(
         self,
@@ -1868,9 +1868,9 @@ class AlphaFold2StructureModuleBlock(nn.Module):
 class AlphaFold2MultimerStructureModuleBlock(nn.Module):
     r"""One shared-weight AF-Multimer structure-module iteration.
 
-    Same block topology as the monomer :class:`AlphaFold2StructureModuleBlock` (IPA + attention layer norm,
+    Same block topology as the monomer [`AlphaFold2StructureModuleBlock`][] (IPA + attention layer norm,
     transition + layer norm, backbone update, side-chain resnet) but with the multimer IPA
-    and the :class:`AlphaFold2MultimerBackboneUpdate` backbone update composed onto a rotation-matrix rigid.
+    and the [`AlphaFold2MultimerBackboneUpdate`][] backbone update composed onto a rotation-matrix rigid.
     """
 
     def __init__(
@@ -2233,7 +2233,7 @@ class AlphaFold2Sidechain(nn.Module):
 class AlphaFold2SidechainBlock(nn.Module):
     r"""
     Two-layer residual block (ReLU pre-activations, zero-initialized final layer) used by
-    :class:`AlphaFold2Sidechain` to refine the side-chain activations.
+    [`AlphaFold2Sidechain`][] to refine the side-chain activations.
     """
 
     def __init__(self, hidden_size: int) -> None:
@@ -2284,7 +2284,7 @@ class Rigid:
         return cls(rotation=rotation, translation=translation)
 
     def to_rigid(self) -> Rigid:
-        # Adapter so :class:`AlphaFold2Sidechain` (which calls ``affine.to_rigid()``) can
+        # Adapter so [`AlphaFold2Sidechain`][] (which calls ``affine.to_rigid()``) can
         # consume a bare rotation-matrix rigid from the multimer structure module.
         return self
 
@@ -3055,7 +3055,7 @@ def torsion_angles_to_frames(residue_type: Tensor, backb_to_global: Rigid, torsi
     r"""Build the 8 global side-chain rigid-group frames from the backbone frame and per-residue torsions.
 
     Rotates each residue type's default rigid groups by the ``(sin, cos)`` torsion angles and chains the
-    dependent chi frames, returning a ``(..., 8)`` :class:`Rigid` in global coordinates.
+    dependent chi frames, returning a ``(..., 8)`` [`Rigid`][] in global coordinates.
     """
 
     default_frames = Rigid.from_tensor4x4(
@@ -3520,7 +3520,7 @@ class AlphaFold2Input:
     **raw alignment pool** and the full-MSA amino-acid profile; the Model draws the
     clustered/extra MSA feature realizations itself, once per configured ensemble
     member and recycle, off its per-sample generator (see
-    :meth:`AlphaFold2Model.fold`). The realized 49- and
+    [`AlphaFold2Model.fold`][]). The realized 49- and
     25-channel tensors are therefore *not* part of the input contract.
 
     Tensor shapes: ``residue_type`` and ``residue_index`` are ``[B, N]``;
@@ -3619,7 +3619,7 @@ class AlphaFold2MultimerInput:
     ``msa_profile [B, N, 22]`` the full-pool per-column frequency). The Model draws
     the clustered/extra realization itself, once per configured ensemble member and
     recycle, off its per-sample generator (see
-    :meth:`AlphaFold2MultimerModel.fold`). ``msa_features`` / ``msa_mask``
+    [`AlphaFold2MultimerModel.fold`][]). ``msa_features`` / ``msa_mask``
     / ``extra_msa_features`` / ``extra_msa_mask`` / ``bert_mask`` / ``true_msa`` are
     internal per-recycle realized slots the Model fills on a shallow per-realization
     input copy; they are ``None`` on Processor output. When a

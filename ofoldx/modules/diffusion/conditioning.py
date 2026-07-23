@@ -39,7 +39,7 @@ class PairwiseConditioning(nn.Module):
     ) -> None:
         super().__init__()
         self.init_projection = nn.Sequential(
-            LayerNorm(pair_size + relative_position_size),
+            LayerNorm(pair_size + relative_position_size, operator_backend=operator_backend),
             nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
         )
         self.transitions = nn.ModuleList(

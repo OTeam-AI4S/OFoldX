@@ -26,6 +26,7 @@ from ...data.components import get_component
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
+from ...modules.backend import LayerNorm
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     MpnnDecoderBlock,
@@ -91,7 +92,7 @@ class LigandMpnnModel(Model):
         )
         self.context_output = nn.Linear(hidden_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(self.config.dropout)
-        self.context_norm = nn.LayerNorm(hidden_size)
+        self.context_norm = LayerNorm(hidden_size)
         self.token_embedding = nn.Embedding(_VOCABULARY, hidden_size)
         self.decoder_blocks = nn.ModuleList(
             MpnnDecoderBlock(hidden_size, hidden_size * 3, dropout=self.config.dropout)
@@ -995,12 +996,12 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
             num_rbf=num_rbf,
         )
         self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
-        self.atom_norm = nn.LayerNorm(hidden_size)
+        self.atom_norm = LayerNorm(hidden_size)
         self.element_projection = nn.Linear(147, 64)
         self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
         self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
-        self.context_edge_norm = nn.LayerNorm(hidden_size)
-        self.context_node_norm = nn.LayerNorm(hidden_size)
+        self.context_edge_norm = LayerNorm(hidden_size)
+        self.context_node_norm = LayerNorm(hidden_size)
         buffer_device = self.element_projection.weight.device
         if buffer_device.type == "meta":
             buffer_device = torch.device("cpu")

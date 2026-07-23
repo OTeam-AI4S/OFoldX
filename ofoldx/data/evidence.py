@@ -20,7 +20,7 @@ class MSA:
     are MSA symbols, not ChemicalComponent IDs, and ambiguity symbols
     (``B Z U J O X`` and nucleic ambiguity) are preserved as-is -- there is no
     alphabet field and no normalization here. The MSA holds no
-    :class:`PolymerSequence`; ``entity_id`` closes over the primary
+    [`PolymerSequence`][]; ``entity_id`` closes over the primary
     ``MolecularSystem`` supplied beside it, and the Processor -- not this value
     -- resolves the entity and verifies query chemistry and width.
     """
@@ -65,10 +65,10 @@ class MSA:
 class MSACollection:
     r"""A raw pre-cleanup, pre-crop paired and unpaired row assembly plan.
 
-    Columns align one-to-one with :attr:`msas` (column ``c`` binds ``msas[c]``).
-    :attr:`row_pairing` is the complete dense plan: cell ``(r, c)`` with a value
+    Columns align one-to-one with `msas` (column ``c`` binds ``msas[c]``).
+    `row_pairing` is the complete dense plan: cell ``(r, c)`` with a value
     ``>= 0`` selects that source row in column ``c``'s pool while ``-1`` supplies
-    a gap. :attr:`row_is_paired` chooses the PAIRED pool of ``msas[c]`` where
+    a gap. `row_is_paired` chooses the PAIRED pool of ``msas[c]`` where
     ``True`` and the UNPAIRED pool where ``False`` (also recording paired feature
     semantics). ``target_instance_ids is None`` broadcasts each column to every
     instance of its entity; a tuple binds columns to exact target instances.
@@ -196,7 +196,7 @@ class TemplateAlignment:
     r"""One target-to-template polymer alignment within a Template.
 
     ``target_entity_id`` names a target entity in the primary
-    ``MolecularSystem``; this value holds no :class:`PolymerSequence`, so the
+    ``MolecularSystem``; this value holds no [`PolymerSequence`][], so the
     target-side upper bound and query chemistry are the Processor's job.
     ``residue_pairs`` are increasing zero-based
     ``(target_component_index, template_component_index)`` pairs.

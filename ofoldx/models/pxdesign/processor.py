@@ -315,8 +315,8 @@ def _canonicalize_modified_polymers(
     transformed residue uses the canonical MET component without losing modeled atoms.
 
     Any *other* modified polymer residue would need the CCD canonical-parent mapping that
-    the package :class:`ChemicalComponent` value does not carry; those are left unchanged
-    here and rejected precisely by the modeled-residue guard in :meth:`PxDesignProcessor.__call__`.
+    the package [`ChemicalComponent`][] value does not carry; those are left unchanged
+    here and rejected precisely by the modeled-residue guard in [`PxDesignProcessor.__call__`][].
     """
 
     system = structure.system if structure is not None else source
@@ -557,13 +557,14 @@ def _hotspots(
 ) -> frozenset[tuple[str, int]]:
     r"""Collect per-token hotspot target residues.
 
-    :class:`~ofoldx.data.Hotspot` is single-sided and distance-free: ``residues``
+    [`Hotspot`][ofoldx.data.Hotspot] is single-sided and distance-free: ``residues``
     name the EXISTING target residues to condition on and the generated partner is implicit
     (the whole binder). Each named residue must be a materialized target
     ``ComponentReference`` — a ``(instance_id, component_index)`` tuple present in the selected,
     tokenized target — so a generated-binder endpoint (a bare ``placement_id`` / a
-    :class:`~ofoldx.data.SymbolicResidueSite` / a :class:`~ofoldx.data.placement.SymbolicAtomSite`) is
-    rejected because PXDesign hotspots its target, not its binder.
+    [`SymbolicResidueSite`][ofoldx.data.SymbolicResidueSite] /
+    [`SymbolicAtomSite`][ofoldx.data.placement.SymbolicAtomSite]) is rejected because PXDesign
+    hotspots its target, not its binder.
     """
 
     hotspots: set[tuple[str, int]] = set()
@@ -696,10 +697,10 @@ def from_binder(
     binder_length: int,
     target: Sequence[TargetChain] = (),
 ) -> PlacementSpec:
-    r"""Project a native target-and-binder problem onto the shared :data:`PlacementSpec`.
+    r"""Project a native target-and-binder problem onto the shared [`PlacementSpec`][].
 
     ``binder_length`` fixes the single generated protein binder (``min == max``). Each
-    ``target`` chain becomes a declaration group of ordered :class:`~ofoldx.data.ExistingSpan`
+    ``target`` chain becomes a declaration group of ordered [`ExistingSpan`][ofoldx.data.ExistingSpan]
     values; the binder is appended as the trailing generated group.
     """
 
@@ -737,11 +738,11 @@ def from_binder(
 
 
 def to_binder(placement: PlacementSpec) -> tuple[int, list[TargetChain]]:
-    r"""Recover ``(binder_length, target chains)`` from a :data:`PlacementSpec`.
+    r"""Recover ``(binder_length, target chains)`` from a [`PlacementSpec`][].
 
     The trailing declaration group must be exactly one fixed-length protein
-    :class:`~ofoldx.data.GeneratedSegment` (the binder); every earlier group must contain
-    only :class:`~ofoldx.data.ExistingSpan` values addressing one source instance.
+    [`GeneratedSegment`][ofoldx.data.GeneratedSegment] (the binder); every earlier group must contain
+    only [`ExistingSpan`][ofoldx.data.ExistingSpan] values addressing one source instance.
     """
 
     validate_placement(placement)

@@ -45,7 +45,7 @@ def atom_to_token_mean(
         num_tokens: Number of output tokens.
         atom_mask: Optional ``[..., N_atom]`` valid-atom mask; padded atoms drop from sum and count.
         eps: Denominator floor (``denom.clamp(min=eps)``).
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., N_token, C]`` token features.
@@ -99,7 +99,7 @@ def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_ba
     Args:
         token: ``[..., N_token, C]`` token features.
         atom_to_token: ``[..., N_atom]`` long token index for each atom.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., N_atom, C]`` atom features.
@@ -144,7 +144,7 @@ def token_pair_to_atom_window_gather(
             broadcasted map lets OOps select its Triton gather when supported.
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., N_blocks, n_queries, n_keys, C]`` local atom-pair features.

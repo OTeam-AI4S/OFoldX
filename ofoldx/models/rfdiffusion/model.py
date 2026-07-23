@@ -52,7 +52,7 @@ from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import symbolic_residue_aliases
 from ...data.structure import Structure
 from ...model import Model
-from ...modules.backend import _oops
+from ...modules.backend import LayerNorm, _oops
 from ...modules.backend.resolve import resolve_tensor_operator_backend
 from ...results import Metric, Score, best
 from .config import RfDiffusionConfig
@@ -836,7 +836,7 @@ class RfDiffusionTemplatePairStack(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.output_norm = nn.LayerNorm(template_size)
+        self.output_norm = LayerNorm(template_size)
 
     def forward(self, template_pair: torch.Tensor, radial_features: torch.Tensor) -> torch.Tensor:
         r"""
@@ -873,10 +873,10 @@ class RfDiffusionRecyclingEmbeddings(nn.Module):
 
     def __init__(self, msa_size: int = 256, pair_size: int = 128, state_size: int = 32) -> None:
         super().__init__()
-        self.state_norm = nn.LayerNorm(state_size)
+        self.state_norm = LayerNorm(state_size)
         self.pair_projection = nn.Linear(36 + state_size * 2, pair_size)
-        self.msa_norm = nn.LayerNorm(msa_size)
-        self.pair_norm = nn.LayerNorm(pair_size)
+        self.msa_norm = LayerNorm(msa_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -1321,9 +1321,9 @@ class RfDiffusionMsaBlock(nn.Module):
         use_global_attn: bool = False,
     ) -> None:
         super().__init__()
-        self.pair_norm = nn.LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.pair_projection = nn.Linear(pair_size + 36, pair_size)
-        self.state_norm = nn.LayerNorm(state_size)
+        self.state_norm = LayerNorm(state_size)
         self.state_projection = nn.Linear(state_size, msa_size)
         self.row_attention = RfDiffusionMsaRowAttentionWithPairBias(
             msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
@@ -1459,7 +1459,7 @@ class RfDiffusionOuterProductMean(nn.Module):
         hidden_size: int = 32,
     ) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.left_projection = nn.Linear(msa_size, hidden_size)
         self.right_projection = nn.Linear(msa_size, hidden_size)
         self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
@@ -1524,15 +1524,15 @@ class RfDiffusionStructureUpdate(nn.Module):
         l0_out_features = se3_config["l0_out_features"]
         num_edge_features = se3_config["num_edge_features"]
 
-        self.msa_norm = nn.LayerNorm(msa_size)
-        self.state_norm = nn.LayerNorm(state_size)
+        self.msa_norm = LayerNorm(msa_size)
+        self.state_norm = LayerNorm(state_size)
         self.node_projection = nn.Linear(msa_size + state_size, l0_in_features)
-        self.node_norm = nn.LayerNorm(l0_in_features)
-        self.pair_norm = nn.LayerNorm(pair_size)
+        self.node_norm = LayerNorm(l0_in_features)
+        self.pair_norm = LayerNorm(pair_size)
         self.pair_projection = nn.Linear(pair_size, num_edge_features)
-        self.pair_edge_norm = nn.LayerNorm(num_edge_features)
+        self.pair_edge_norm = LayerNorm(num_edge_features)
         self.geometry_projection = nn.Linear(num_edge_features + 36 + 1, num_edge_features)
-        self.geometry_norm = nn.LayerNorm(num_edge_features)
+        self.geometry_norm = LayerNorm(num_edge_features)
         self.structure_module = RfDiffusionSe3StructureModule(**se3_config)
         self.torsion_head = RfDiffusionTorsionHead(msa_size=msa_size, state_size=l0_out_features)
         self.reset_parameters()
@@ -1630,7 +1630,7 @@ class RfDiffusionTransition(nn.Module):
 
     def __init__(self, hidden_size: int, expansion: int, dropout: float = 0.1) -> None:
         super().__init__()
-        self.input_norm = nn.LayerNorm(hidden_size)
+        self.input_norm = LayerNorm(hidden_size)
         self.input_projection = nn.Linear(hidden_size, hidden_size * expansion)
         self.dropout = nn.Dropout(dropout)
         self.output_projection = nn.Linear(hidden_size * expansion, hidden_size)
@@ -1787,8 +1787,8 @@ class RfDiffusionMsaRowAttentionWithPairBias(nn.Module):
         self, msa_size: int = 256, pair_size: int = 128, num_attention_heads: int = 8, head_dim: int = 32
     ) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
-        self.pair_norm = nn.LayerNorm(pair_size)
+        self.msa_norm = LayerNorm(msa_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.sequence_weighting = RfDiffusionMsaSequenceWeighting(msa_size, num_attention_heads, head_dim, dropout=0.1)
         self.query_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
         self.key_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
@@ -1859,7 +1859,7 @@ class RfDiffusionMsaColumnAttention(nn.Module):
 
     def __init__(self, msa_size: int = 256, num_attention_heads: int = 8, head_dim: int = 32) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.query_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
         self.key_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
         self.value_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
@@ -1923,7 +1923,7 @@ class RfDiffusionMsaColumnGlobalAttention(nn.Module):
 
     def __init__(self, msa_size: int = 64, num_attention_heads: int = 8, head_dim: int = 8) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.query_projection = nn.Linear(msa_size, num_attention_heads * head_dim, bias=False)
         self.key_projection = nn.Linear(msa_size, head_dim, bias=False)
         self.value_projection = nn.Linear(msa_size, head_dim, bias=False)
@@ -1998,8 +1998,8 @@ class RfDiffusionPairAxialAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.is_row = is_row
-        self.pair_norm = nn.LayerNorm(pair_size)
-        self.bias_norm = nn.LayerNorm(bias_size)
+        self.pair_norm = LayerNorm(pair_size)
+        self.bias_norm = LayerNorm(bias_size)
         self.query_projection = nn.Linear(pair_size, num_attention_heads * head_dim, bias=False)
         self.key_projection = nn.Linear(pair_size, num_attention_heads * head_dim, bias=False)
         self.value_projection = nn.Linear(pair_size, num_attention_heads * head_dim, bias=False)
@@ -2208,10 +2208,10 @@ class RfDiffusionSe3RadialProfile(nn.Module):
         super().__init__()
         modules = [
             nn.Linear(edge_dim, mid_dim),
-            nn.LayerNorm(mid_dim) if use_layer_norm else None,
+            LayerNorm(mid_dim) if use_layer_norm else None,
             nn.ReLU(),
             nn.Linear(mid_dim, mid_dim),
-            nn.LayerNorm(mid_dim) if use_layer_norm else None,
+            LayerNorm(mid_dim) if use_layer_norm else None,
             nn.ReLU(),
             nn.Linear(mid_dim, num_freq * channels_in * channels_out, bias=False),
         ]
@@ -2994,9 +2994,9 @@ class RfDiffusionTorsionHead(nn.Module):
         hidden_size: int = 128,
     ) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.msa_projection = nn.Linear(msa_size, hidden_size)
-        self.state_norm = nn.LayerNorm(state_size)
+        self.state_norm = LayerNorm(state_size)
         self.state_projection = nn.Linear(state_size, hidden_size)
         self.first_transition_input = nn.Linear(hidden_size, hidden_size)
         self.first_transition_output = nn.Linear(hidden_size, hidden_size)
@@ -3175,8 +3175,8 @@ class RfDiffusionExperimentallyResolvedHead(nn.Module):
 
     def __init__(self, msa_size: int, state_size: int) -> None:
         super().__init__()
-        self.msa_norm = nn.LayerNorm(msa_size)
-        self.state_norm = nn.LayerNorm(state_size)
+        self.msa_norm = LayerNorm(msa_size)
+        self.state_norm = LayerNorm(state_size)
         self.projection = nn.Linear(msa_size + state_size, 1)
         self.reset_parameters()
 
@@ -5115,7 +5115,7 @@ def _torch_segment_softmax_csr(logits: Tensor, row_offsets: Tensor) -> Tensor:
     r"""Apply a numerically stable softmax within each CSR segment.
 
     ``logits`` has shape ``[E, ...]`` and uses the same offset contract as
-    :func:`_torch_segment_sum_csr`. Softmax is taken over the edge axis independently
+    [`_torch_segment_sum_csr`][]. Softmax is taken over the edge axis independently
     for every trailing element. Empty segments own no output entries. Finite
     float16/bfloat16 logits use float32 max/subtract/exp/sum accumulation and the
     result is cast back to the input dtype. Non-finite inputs follow ordinary
@@ -5428,9 +5428,9 @@ def materialize_placement_map(
 ) -> tuple[PlacementMap, dict[str, str]]:
     r"""Lift the sampled flat surface into the shared ``placement_map``.
 
-    ``placement`` is the declared :class:`RfDiffusionPlacements` condition; ``output_residues``
+    ``placement`` is the declared [`RfDiffusionPlacements`][] condition; ``output_residues``
     is the post-sample flat identity tuple (each entry a source ``ComponentReference`` for an
-    ``ExistingSpan`` row or a :class:`SymbolicResidueSite` for a generated row);
+    ``ExistingSpan`` row or a [`SymbolicResidueSite`][] for a generated row);
     ``residue_map`` maps each declared output residue to its realized OUTPUT
     ``ComponentReference`` (as built while decoding the Structure). Returns
     ``(placement_map, instance_of)`` where ``instance_of`` is the derived
@@ -8110,7 +8110,7 @@ class RfDiffusionLayout:
     residue or one symbolic residue declared by the input placement.  Chain and
     instance rows are explicit because RFdiffusion's internal residue numbers are
     not canonical identities.  This is the only non-tensor leaf of
-    :class:`RfDiffusionInput` and is deliberately ignored by the denoiser graph.
+    [`RfDiffusionInput`][] and is deliberately ignored by the denoiser graph.
     """
 
     system: MolecularSystem | None

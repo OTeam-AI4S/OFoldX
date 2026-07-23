@@ -164,9 +164,9 @@ def _materialize_assembly(
 ) -> tuple[MolecularSystem, PlacementMap, dict[str, str]]:
     r"""Realize a fully generated placement specification.
 
-    Every value must be a :class:`GeneratedSegment`. Non-empty segments mint one
+    Every value must be a [`GeneratedSegment`][]. Non-empty segments mint one
     ``chain_{n}`` instance in declaration order; zero-length segments map to an
-    empty occurrence tuple. Lengths are resolved by :func:`_resolve_generated_lengths`.
+    empty occurrence tuple. Lengths are resolved by [`_resolve_generated_lengths`][].
     """
 
     instance_of = _placement_instance_of(placements)  # validates global placement_id uniqueness
@@ -231,13 +231,13 @@ def _materialize_extension(
     r"""Extend an existing input system with generated rows.
 
     Existing instances retain their ids, entities, coordinates, and bonds.
-    :class:`ExistingSpan` occurrences address those source rows directly.
-    :class:`GeneratedSegment` values append fresh non-colliding ``chain_{n}``
+    [`ExistingSpan`][] occurrences address those source rows directly.
+    [`GeneratedSegment`][] values append fresh non-colliding ``chain_{n}``
     instances in declaration order.
 
     ``placements is None`` is the ``total_len`` extension: one generated protein chain of length
-    ``total_len`` is appended (see :func:`_default_extension`). A ``total_len`` given alongside an
-    explicit :class:`~ofoldx.models.boltzgen.model.BoltzGenPlacements` constrains
+    ``total_len`` is appended (see [`_default_extension`][]). A ``total_len`` given alongside an
+    explicit [`BoltzGenPlacements`][ofoldx.models.boltzgen.model.BoltzGenPlacements] constrains
     the sum of generated lengths.
 
     Returns the extended system, the realized ``placement_map`` (generated occurrences under minted
@@ -332,13 +332,13 @@ def _materialize_covalent_bonds(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> MolecularSystem:
-    r"""Resolve requested :class:`SymbolicBond` links and inject them into ``system.bonds``.
+    r"""Resolve requested [`SymbolicBond`][] links and inject them into ``system.bonds``.
 
-    Each :class:`~ofoldx.models.boltzgen.model.BoltzGenCovalentBond` wraps a
-    :class:`~ofoldx.data.bonds.SymbolicBond` whose endpoints are lowered to realized
-    :class:`~ofoldx.data.molecular.AtomSite` occurrences (an existing ``AtomSite`` passes through;
-    a generated :class:`~ofoldx.data.placement.SymbolicAtomSite` resolves through
-    ``placement_map`` / ``instance_of``). The realized :class:`~ofoldx.data.molecular.SystemBond`
+    Each [`BoltzGenCovalentBond`][ofoldx.models.boltzgen.model.BoltzGenCovalentBond] wraps a
+    [`SymbolicBond`][ofoldx.data.bonds.SymbolicBond] whose endpoints are lowered to realized
+    [`AtomSite`][ofoldx.data.molecular.AtomSite] occurrences (an existing ``AtomSite`` passes through;
+    a generated [`SymbolicAtomSite`][ofoldx.data.placement.SymbolicAtomSite] resolves through
+    ``placement_map`` / ``instance_of``). The realized [`SystemBond`][ofoldx.data.molecular.SystemBond]
     is added to the system so ``_cyclic_period`` sees it like any input bond; a bond whose
     unordered endpoint set is already present is not duplicated. Endpoint validity is enforced by
     ``MolecularSystem`` construction (each endpoint atom must resolve).
@@ -540,7 +540,7 @@ class BoltzGenProcessor(Processor):
         r"""Lower a realized design system to model tensors and BoltzGen conditioning channels.
 
         ``generated_residues`` contains occurrences created from
-        :class:`~ofoldx.data.placement.GeneratedSegment`; existing spans are context.
+        [`GeneratedSegment`][ofoldx.data.placement.GeneratedSegment]; existing spans are context.
         The set controls GLY-template backbone features and the automatic design mask.
         """
 
@@ -1194,7 +1194,7 @@ def _design_mask(
     r"""Realize the ``[N]`` boolean design mask.
 
     Generated placement residues are designable by default. Explicit
-    :class:`~ofoldx.models.boltzgen.model.BoltzGenDesignMask` records add existing
+    [`BoltzGenDesignMask`][ofoldx.models.boltzgen.model.BoltzGenDesignMask] records add existing
     residues to that set.
     """
 
@@ -1417,7 +1417,7 @@ def _template_channels(
     tokens: list[dict[str, object]],
     token_count: int,
 ) -> dict[str, Tensor] | None:
-    r"""Lower aligned :class:`~ofoldx.data.evidence.Template` evidence into the BoltzGen template tensors.
+    r"""Lower aligned [`Template`][ofoldx.data.evidence.Template] evidence into the BoltzGen template tensors.
 
     Returns ``None`` when no templates are supplied, so the model skips the template embedder.
     Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by

@@ -495,21 +495,21 @@ def from_design_mask(
     group_of: Callable[[int], str],
     placement_id_of: Callable[[int], str],
 ) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a run-length :data:`PlacementSpec`.
+    r"""Project a per-output-residue design mask onto a run-length [`PlacementSpec`][].
 
     ``residues`` is the realized output layout in order; ``group_of(i)`` labels residue ``i``'s
     declaration group (its ODesign output chain) and ``placement_id_of(i)`` its placement.
     Maximal consecutive runs that share one ``(group, placement_id)`` collapse into one
-    placement: a run of :class:`ODesignDesignedResidue` of one ``polymer_type`` becomes
+    placement: a run of [`ODesignDesignedResidue`][] of one ``polymer_type`` becomes
     ``GeneratedSegment(polymer_type, n, n)`` (exact realized length), and a run of
-    :class:`ODesignFixedResidue` drawn contiguously from one source instance becomes the half-open
+    [`ODesignFixedResidue`][] drawn contiguously from one source instance becomes the half-open
     ``ExistingSpan(instance_id, start, stop)``. A run also breaks when ``polymer_type`` changes,
     when the source instance changes, or when ``source_index`` is not the previous ``+ 1`` — so
     interleaving and discontiguous crops are preserved as ordered placements within the group.
 
     Losslessness: lossless over ODesign's polymer surface — the per-residue designed flag,
     each designed residue's ``polymer_type``, and each fixed residue's exact source residue are
-    all recoverable (see :func:`to_design_mask` for the inverse). A designed non-polymer
+    all recoverable (see [`to_design_mask`][] for the inverse). A designed non-polymer
     (ligand ``num_atoms``) residue has no ``PlacementValue`` and is
     rejected here rather than silently dropped. The partition is exhaustive — every input
     residue belongs to exactly one placement, so no realized row is unaddressable.
@@ -603,13 +603,13 @@ def to_design_mask(
     placement: PlacementSpec,
     placement_map: PlacementMap,
 ) -> tuple[list[bool], list[str]]:
-    r"""Project a realized :data:`PlacementSpec` back onto a per-output-residue design mask.
+    r"""Project a realized [`PlacementSpec`][] back onto a per-output-residue design mask.
 
     Returns ``(design_mask, groups)`` over the realized output rows in declared order: a
-    :class:`GeneratedSegment` occurrence (its realized length read from ``placement_map``, so
+    [`GeneratedSegment`][] occurrence (its realized length read from ``placement_map``, so
     ranged ``min != max`` segments resolve to their sampled length) contributes ``True`` rows,
-    an :class:`ExistingSpan` contributes ``stop - start`` ``False`` rows, and each row carries
-    its declaration group (the outer key). This is the exact inverse of :func:`from_design_mask`
+    an [`ExistingSpan`][] contributes ``stop - start`` ``False`` rows, and each row carries
+    its declaration group (the outer key). This is the exact inverse of [`from_design_mask`][]
     over the polymer surface. Coverage is exhaustive: exactly one mask row is emitted per
     realized residue with no gap or overlap; zero-length placements contribute no rows. Thus
     ``design_mask`` and ``groups`` partition the whole realized layout.

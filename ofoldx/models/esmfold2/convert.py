@@ -383,7 +383,7 @@ def _translate_biohub_state_key(name: str) -> str:
         (".diffusion_module.s_to_token.", ".diffusion_module.single_projection."),
         (".attention.adaln.", ".attention.adaptive_norm."),
         (".transition.adaln.", ".transition.adaptive_norm."),
-        (".adaptive_norm.s_scale", ".adaptive_norm.conditioning_scale"),
+        (".adaptive_norm.s_scale", ".adaptive_norm.conditioning_norm.weight"),
         (".adaptive_norm.s_gate.", ".adaptive_norm.gate_projection."),
         (".adaptive_norm.s_shift.", ".adaptive_norm.shift_projection."),
         (".attention.out_gate.", ".attention.output_gate_projection."),
@@ -684,9 +684,9 @@ def save_experimental_esmfold2_checkpoint(
     [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
     ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
     MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
-    :class:`EsmFold2DesignPipeline`, whose save contract persists them under ``esmc/`` and
+    [`EsmFold2DesignPipeline`][], whose save contract persists them under ``esmc/`` and
     writes the ``ofoldx.esmfold2_design`` marker. The resulting repository is self-contained
-    and routes ``pipeline("design", model=dir)`` to :meth:`EsmFold2DesignPipeline.design`.
+    and routes ``pipeline("design", model=dir)`` to [`EsmFold2DesignPipeline.design`][].
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.

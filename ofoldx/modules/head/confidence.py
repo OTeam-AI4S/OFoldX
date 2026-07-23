@@ -94,7 +94,7 @@ class ConfidenceHead(nn.Module):
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
-        self.single_norm = LayerNorm(single_size) if use_single_norm else None
+        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend) if use_single_norm else None
         self.pair_embedder = ConfidencePairEmbedder(
             pair_size=pair_size,
             token_feature_size=token_feature_size,
@@ -295,8 +295,8 @@ class AtomConfidenceProjector(nn.Module):
         super().__init__()
         self.plddt_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_plddt_bins))
         self.resolved_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_resolved_bins))
-        self.plddt_norm = LayerNorm(single_size)
-        self.resolved_norm = LayerNorm(single_size)
+        self.plddt_norm = LayerNorm(single_size, operator_backend=operator_backend)
+        self.resolved_norm = LayerNorm(single_size, operator_backend=operator_backend)
         self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
         self.reset_parameters()
 

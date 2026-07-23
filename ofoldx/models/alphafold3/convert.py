@@ -55,9 +55,9 @@ def convert_alphafold3_checkpoint(
     r"""Strict-load official AF3 parameters and write a standard OFoldX repository.
 
     Converts the DeepMind AlphaFold 3 parameter archive at ``checkpoint_path`` into a
-    native model, pairs it with :class:`AlphaFold3Processor`, and writes a
+    native model, pairs it with [`AlphaFold3Processor`][], and writes a
     routable ``model.json`` / ``processor.json`` / ``pipeline.json`` / safetensors
-    repository to ``output_dir`` through :class:`AlphaFold3Pipeline`.
+    repository to ``output_dir`` through [`AlphaFold3Pipeline`][].
 
     Saving is local-only when ``repo_id`` is omitted.
     """

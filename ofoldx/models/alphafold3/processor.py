@@ -270,7 +270,7 @@ def _resolve_components(system: MolecularSystem, *, revision: str) -> MolecularS
     reference lacking the chemical graph the tokenizer requires (no ``atoms``, or no
     per-atom ``reference_coordinates`` -- the exact facts checked at
     ``_reference_features`` / ``_tokenize``), lowers it to a canonical
-    :class:`~ofoldx.data.molecular.ChemicalComponent` VALUE via the shared
+    [`ChemicalComponent`][ofoldx.data.molecular.ChemicalComponent] VALUE via the shared
     ``ofoldx/ccd`` resolver and embeds that value in place. This covers CCD-code
     ligands, ions, modified residues, and glycan monomers.
 

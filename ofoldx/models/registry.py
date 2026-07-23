@@ -54,9 +54,9 @@ class ModelRegistry(chanfig.Registry):
 
     ``MODELS.register_model(id, model=..., processor=..., processor_config=...,
     standard_tasks=...)`` registers one identity. Lookups resolve by id
-    (:meth:`lookup_model`, lazy-importing the owner of a built-in id), by exact Model
-    config class (:meth:`for_config`), or by exact ``(Model, Processor)`` class pair
-    (:meth:`for_pair`); the config and pair indexes keep those lookups exact rather than
+    ([`lookup_model`][], lazy-importing the owner of a built-in id), by exact Model
+    config class ([`for_config`][]), or by exact ``(Model, Processor)`` class pair
+    ([`for_pair`][]); the config and pair indexes keep those lookups exact rather than
     a linear scan.
     """
 

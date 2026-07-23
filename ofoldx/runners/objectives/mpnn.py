@@ -1,8 +1,8 @@
 r"""The MPNN autoregressive sequence-recovery objective.
 
 Wires ProteinMPNN / LigandMPNN / NA-MPNN's in-repo, unreduced per-token losses
-(:func:`ofoldx.models.proteinmpnn.model.smoothed_loss` /
-:func:`~ofoldx.models.proteinmpnn.model.nll_loss`) into one scalar training loss
+(`ofoldx.models.proteinmpnn.model.smoothed_loss` /
+`ofoldx.models.proteinmpnn.model.nll_loss`) into one scalar training loss
 via the caller-owned masked mean (DESIGN:3613-3620): the model exposes the
 unreduced primitive, the Runner-side objective owns the reduction.
 """

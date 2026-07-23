@@ -937,14 +937,14 @@ class ProtenixConstraintSubstructureBlock(nn.Module):
             dropout=dropout,
         )
         self.attention_output_dropout = nn.Dropout(dropout)
-        self.attention_norm = nn.LayerNorm(hidden_size)
+        self.attention_norm = LayerNorm(hidden_size)
         self.transition = ProtenixConstraintSubstructureTransition(
             hidden_size=hidden_size,
             transition_size=transition_size,
             dropout=dropout,
         )
         self.transition_output_dropout = nn.Dropout(dropout)
-        self.transition_norm = nn.LayerNorm(hidden_size)
+        self.transition_norm = LayerNorm(hidden_size)
 
     def forward(self, hidden: Tensor) -> Tensor:
         r"""Apply self-attention and transition updates with post-norm residuals."""
@@ -1302,12 +1302,12 @@ class _ProtenixTrunkOutput:
 
 # Spatial conditioning records for the Protenix constraint graph.
 #
-# * :class:`ProtenixAtomContact` -> the atom-contact branch. The training and
+# * [`ProtenixAtomContact`][] -> the atom-contact branch. The training and
 #   inference channel orders differ, so channel 0 is the only trained atom-contact channel
 #   and represents the *maximum* distance. The record therefore carries only
 #   ``max_distance``; there is no trained min-distance channel to fill.
-# * :class:`ProtenixTokenContact` -> the token-contact branch, written as ``[0, max]``.
-# * :class:`ProtenixPocket` -> the pocket branch, a directed binder-to-residue fill.
+# * [`ProtenixTokenContact`][] -> the token-contact branch, written as ``[0, max]``.
+# * [`ProtenixPocket`][] -> the pocket branch, a directed binder-to-residue fill.
 
 
 @dataclass(frozen=True)
@@ -1337,10 +1337,10 @@ class ProtenixAtomContact:
 class ProtenixTokenContact:
     r"""Upper-bound token-centre distance, represented as ``[0, max]``.
 
-    Each endpoint is either a residue (:data:`ComponentReference`) or a single
-    :class:`AtomSite`; a mixed atom/residue pair is allowed. Two ``AtomSite`` endpoints
+    Each endpoint is either a residue ([`ComponentReference`][]) or a single
+    [`AtomSite`][]; a mixed atom/residue pair is allowed. Two ``AtomSite`` endpoints
     are rejected: that pair is definitionally the atom channel
-    (use :class:`ProtenixAtomContact`).
+    (use [`ProtenixAtomContact`][]).
     """
 
     endpoint_a: ComponentReference | AtomSite

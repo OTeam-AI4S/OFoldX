@@ -1,9 +1,9 @@
 r"""Config-only training, evaluation, and inference configuration for the Runner.
 
-The :class:`RunnerConfig` extends danling's ``RunnerConfig`` (optimizer,
+The [`RunnerConfig`][] extends danling's ``RunnerConfig`` (optimizer,
 scheduler, dataloader, checkpoint, score sections) with the two things the
-OFoldX Runner adds: which Model to build (:class:`ModelConfig`) and which raw
-structures to train/evaluate/infer on (:class:`DataConfig`). Training provenance
+OFoldX Runner adds: which Model to build ([`ModelConfig`][]) and which raw
+structures to train/evaluate/infer on ([`DataConfig`][]). Training provenance
 lives here on the Runner config and never leaks into the frozen Model or
 Processor config (DESIGN Principle 10; §10.3): a family Model config carries no
 dataset, optimizer, schedule, or objective state.
@@ -57,11 +57,11 @@ class DatasetConfig(chanfig.Config):
 
 
 class DataConfig(chanfig.Config):
-    r"""Split-name -> :class:`DatasetConfig`.
+    r"""Split-name -> [`DatasetConfig`][].
 
     Split names match the danling ``train_splits`` / ``evaluate_splits`` and the
     ``infer`` split (default keys ``train`` / ``validation`` / ``test`` /
-    ``infer``). Each value is coerced to a :class:`DatasetConfig`.
+    ``infer``). Each value is coerced to a [`DatasetConfig`][].
     """
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
@@ -75,15 +75,15 @@ class RunnerConfig(dl.RunnerConfig):
     r"""Top-level OFoldX Runner configuration.
 
     Inherits danling's ``optim`` / ``sched`` / ``dataloader`` / ``ckpt`` / ``score``
-    sections and adds :attr:`model`, :attr:`data`, and :attr:`objective`. Accepts a
+    sections and adds `model`, `data`, and `objective`. Accepts a
     fully constructed instance or any mapping it can be built from (YAML / CLI via
     the inherited ``parse``).
 
     Attributes:
-        runner: Registry key resolved through :data:`ofoldx.runners.registry.RUNNERS`.
+        runner: Registry key resolved through `ofoldx.runners.registry.RUNNERS`.
         training: When ``False``, training splits are ignored (evaluate / infer only).
-        model: The Model to build (see :class:`ModelConfig`).
-        data: Split -> dataset spec (see :class:`DataConfig`).
+        model: The Model to build (see [`ModelConfig`][]).
+        data: Split -> dataset spec (see [`DataConfig`][]).
         objective: Objective key. When ``None`` the Runner derives it from the
             Model architecture (e.g. the MPNN families -> ``"mpnn"``, the diffusion
             families -> ``"diffusion"``).

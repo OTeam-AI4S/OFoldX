@@ -1,8 +1,8 @@
 r"""Coordinate-producing binder-design Pipeline for PXDesign.
 
-:class:`PxDesignPipeline` binds the native PXDesign-d generator Model+Processor and owns
+[`PxDesignPipeline`][] binds the native PXDesign-d generator Model+Processor and owns
 the ``design`` verb over the PXDesign topology argument (``PlacementSpec``) and
-per-residue target label (``Hotspot``), returning :class:`PxDesignDesignResult`.
+per-residue target label (``Hotspot``), returning [`PxDesignDesignResult`][].
 """
 
 from __future__ import annotations

@@ -12,11 +12,12 @@ import torch
 from torch import Tensor
 
 from ._oops import oops_kernel
+from .normalization import layer_norm
 from .resolve import resolve_tensor_operator_backend
 
 _oops_outer_product_mean = oops_kernel("outer_product_mean")
 
-_SUPPORTED = ("oops", "eager")
+_SUPPORTED = ("oops", "apex", "deepspeed", "eager")
 
 
 def outer_product_mean(
@@ -53,7 +54,7 @@ def outer_product_mean(
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
         proj_left_bias: Optional left projection bias; ``None`` keeps the projection bias-free.
         proj_right_bias: Optional right projection bias; ``None`` keeps the projection bias-free.
 
@@ -106,7 +107,7 @@ def outer_product_mean(
             divide_before_projection=divide_before_projection,
         )
 
-    msa = torch.nn.functional.layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps)
+    msa = layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps, operator_backend=backend)
     left = torch.nn.functional.linear(msa, proj_left_weight, proj_left_bias)
     right = torch.nn.functional.linear(msa, proj_right_weight, proj_right_bias)
     if msa_mask is None:

@@ -1,7 +1,7 @@
 r"""Collate a list of per-structure family Inputs into one batched family Input.
 
 Each dataset item is a family Input dataclass whose tensor fields carry a leading
-singleton batch axis (as the Processors emit). The generic :func:`collate`
+singleton batch axis (as the Processors emit). The generic [`collate`][]
 concatenates matching fields along that axis, padding variable-length axes so a
 heterogeneous batch (different sequence / atom counts) becomes one rectangular
 Input.

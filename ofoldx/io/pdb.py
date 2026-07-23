@@ -1,4 +1,4 @@
-r"""Generic PDB codec for canonical :class:`ofoldx.data.Structure` values."""
+r"""Generic PDB codec for canonical [`ofoldx.data.Structure`][] values."""
 
 from __future__ import annotations
 

@@ -380,9 +380,9 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
         )
-        self.single_norm = LayerNorm(single_size, bias=False)
+        self.single_norm = LayerNorm(single_size, bias=False, operator_backend=operator_backend)
         self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, bias=False, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
 
@@ -1072,7 +1072,9 @@ class AtomSelfAttention(nn.Module):
     ) -> None:
         super().__init__()
         # The pair is projected to per-head attention logits independently in each block.
-        self.pair_norms = nn.ModuleList(LayerNorm(pair_size, bias=False) for _ in range(num_blocks))
+        self.pair_norms = nn.ModuleList(
+            LayerNorm(pair_size, bias=False, operator_backend=operator_backend) for _ in range(num_blocks)
+        )
         self.bias_projections = nn.ModuleList(
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
@@ -1198,7 +1200,7 @@ class TokenToAtomDecoder(nn.Module):
             operator_backend=operator_backend,
             cross_attention_key_source=cross_attention_key_source,
         )
-        self.query_norm = LayerNorm(atom_hidden_size, bias=False)
+        self.query_norm = LayerNorm(atom_hidden_size, bias=False, operator_backend=operator_backend)
         self.output_projection = nn.Linear(atom_hidden_size, 3, bias=False)
 
     def forward(

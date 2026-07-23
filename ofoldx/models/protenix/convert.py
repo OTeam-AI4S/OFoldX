@@ -143,14 +143,14 @@ def save_protenix_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
-    auto-selects the default :class:`ProtenixModel` or the constraint
-    :class:`ProtenixConstraintModel` from the checkpoint tensors — pairs it with the matching processor,
+    auto-selects the default [`ProtenixModel`][] or the constraint
+    [`ProtenixConstraintModel`][] from the checkpoint tensors — pairs it with the matching processor,
     and writes a self-contained ``model.json`` / ``processor.json`` / safetensors repository
     via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
 
     The default pair routes through the generic standard ``fold`` route (no marker). The constraint
     pair additionally writes a ``pipeline.json = {"pipeline": "ofoldx.protenix_constraint"}`` marker so
-    ``pipeline("fold", model=dir)`` routes to :class:`ProtenixConstraintPipeline`, whose ``fold``
+    ``pipeline("fold", model=dir)`` routes to [`ProtenixConstraintPipeline`][], whose ``fold``
     accepts and forwards the released ``atom_contacts`` / ``token_contacts`` / ``pocket`` channels that
     the generic ``FoldPipeline`` cannot.
 

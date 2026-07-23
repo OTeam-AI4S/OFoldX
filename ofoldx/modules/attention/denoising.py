@@ -27,7 +27,7 @@ class DenoisingTokenEncoder(nn.Module):
         conditioning_size: Width of the conditioning signal driving the adaptive norm.
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per transformer block.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Examples:
         >>> import torch
@@ -57,7 +57,9 @@ class DenoisingTokenEncoder(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.pair_norms = nn.ModuleList(LayerNorm(pair_size, bias=False) for _ in range(num_blocks))
+        self.pair_norms = nn.ModuleList(
+            LayerNorm(pair_size, bias=False, operator_backend=operator_backend) for _ in range(num_blocks)
+        )
         self.bias_projections = nn.ModuleList(
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )

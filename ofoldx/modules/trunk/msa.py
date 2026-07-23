@@ -866,9 +866,9 @@ class MsaPairWeightedAveraging(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         inner_size = num_attention_heads * head_dim
-        self.msa_norm = LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size, operator_backend=operator_backend)
         self.value_projection = nn.Linear(msa_size, inner_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.gate_projection = nn.Linear(msa_size, inner_size, bias=False)
         self.output_projection = nn.Linear(inner_size, msa_size, bias=False)
@@ -957,7 +957,7 @@ class OuterProductMean(nn.Module):
         )
         self.eps = eps
         self.divide_before_projection = divide_before_projection
-        self.msa_norm = LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size, operator_backend=operator_backend)
         self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)

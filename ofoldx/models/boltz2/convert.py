@@ -864,7 +864,7 @@ def save_boltz2_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_boltz2_checkpoint`][ofoldx.models.boltz2.convert.convert_boltz2_checkpoint], pairs the
-    model with the config-less :class:`Boltz2Processor`, and writes a self-contained ``model.json`` /
+    model with the config-less [`Boltz2Processor`][], and writes a self-contained ``model.json`` /
     safetensors repository via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. This is
     the standard ``fold`` pair (``ofoldx.boltz2``); the Processor carries no config, so no
     ``processor.json`` is written.
@@ -898,11 +898,11 @@ def save_boltz2_affinity_checkpoint(
 ) -> None:
     r"""Convert the Boltz-2 affinity + structure checkpoints and write the composite repository.
 
-    The affinity deliverable is a multi-pair :class:`Boltz2AffinityPipeline`: the affinity
+    The affinity deliverable is a multi-pair [`Boltz2AffinityPipeline`][]: the affinity
     head (``ofoldx.boltz2_affinity``, ``standard_tasks=()``) runs only after a structure/confidence
     pass, so it cannot route as a lone standard pair. This writes the aggregate repository — the
-    affinity pair at the root, the structure/confidence pair (:class:`Boltz2Model` /
-    :class:`Boltz2Processor`) at the fixed ``structure/`` sub-directory, and the one-field
+    affinity pair at the root, the structure/confidence pair ([`Boltz2Model`][] /
+    [`Boltz2Processor`][]) at the fixed ``structure/`` sub-directory, and the one-field
     ``pipeline.json`` marker — via ``Boltz2AffinityPipeline.save`` so ``pipeline(..., model=dir)``
     routes it back through the multi-pair loader.
 

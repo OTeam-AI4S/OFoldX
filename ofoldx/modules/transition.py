@@ -37,7 +37,7 @@ class Transition(nn.Module):
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
         expanded_size = expansion * hidden_size
-        self.input_norm = LayerNorm(hidden_size)
+        self.input_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)

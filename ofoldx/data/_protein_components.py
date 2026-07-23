@@ -1,7 +1,7 @@
 r"""Built-in protein component graphs and reference coordinates.
 
 The data covers the twenty standard amino acids and the wwPDB CCD ``UNK``
-placeholder. Construction and public access live in :mod:`ofoldx.data.components`.
+placeholder. Construction and public access live in [`ofoldx.data.components`][].
 """
 
 from __future__ import annotations

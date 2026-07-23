@@ -3,7 +3,7 @@ r"""Runner and objective registries.
 ``RUNNERS`` resolves the Runner class from ``config.runner`` — the extension point
 where a user registers their own ``Runner`` subclass. ``OBJECTIVES`` maps an
 objective name (``"mpnn"``, ``"diffusion"``) to its loss reducer, and
-:data:`ARCHITECTURE_OBJECTIVES` maps each supported architecture id to its default
+`ARCHITECTURE_OBJECTIVES` maps each supported architecture id to its default
 objective. An architecture with no grounded, in-repo objective is absent from that
 table, so the Runner raises rather than fabricating a loss (DESIGN Principle 13).
 """

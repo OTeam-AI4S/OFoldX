@@ -88,11 +88,11 @@ def save_pxdesign_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
-    it with :class:`PxDesignProcessor`, and writes ``model.json`` / ``processor.json`` /
+    it with [`PxDesignProcessor`][], and writes ``model.json`` / ``processor.json`` /
     safetensors via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair
     has no generic standard task, so a
     ``pipeline.json = {"pipeline": "ofoldx.pxdesign"}`` marker is written to route
-    ``pipeline("design", model=dir)`` to :class:`PxDesignPipeline` — which returns the
+    ``pipeline("design", model=dir)`` to [`PxDesignPipeline`][] — which returns the
     coordinate-producing ``PxDesignDesignResult`` — rather than the generic standard ``design`` route.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker

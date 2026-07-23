@@ -1088,7 +1088,9 @@ class Boltz1AtomAttentionDecoder(nn.Module):
             cross_attention_mode=False,
             transition="triple",
         )
-        self.position_update = nn.Sequential(LayerNorm(atom_hidden_size), nn.Linear(atom_hidden_size, 3, bias=False))
+        self.position_update = nn.Sequential(
+            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+        )
 
     def forward(
         self,
@@ -1193,20 +1195,23 @@ class Boltz1DenoiserConditioning(nn.Module):
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(LayerNorm(pair_size), nn.Linear(pair_size, num_token_transformer_heads, bias=False))
+            nn.Sequential(
+                LayerNorm(pair_size, operator_backend=operator_backend),
+                nn.Linear(pair_size, num_token_transformer_heads, bias=False),
+            )
             for _ in range(num_token_transformer_blocks)
         )
 
@@ -1359,7 +1364,9 @@ class Boltz1Denoiser(nn.Module):
             structure_prediction=True,
             operator_backend=operator_backend,
         )
-        self.single_to_token = nn.Sequential(LayerNorm(hidden), nn.Linear(hidden, hidden, bias=False))
+        self.single_to_token = nn.Sequential(
+            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
+        )
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
@@ -1367,7 +1374,7 @@ class Boltz1Denoiser(nn.Module):
             conditioning_size=hidden,
             operator_backend=operator_backend,
         )
-        self.token_norm = LayerNorm(hidden)
+        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
         self.atom_attention_decoder = Boltz1AtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -1474,10 +1481,10 @@ class Boltz1SingleConditioning(nn.Module):
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(single_size + input_size)
+        self.single_norm = LayerNorm(single_size + input_size, operator_backend=operator_backend)
         self.single_projection = nn.Linear(single_size + input_size, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
             Transition(hidden, expansion=transition_expansion, operator_backend=operator_backend)
@@ -1609,8 +1616,8 @@ class Boltz1AdaptiveLayerNorm(nn.Module):
 
     def __init__(self, hidden_size: int, conditioning_size: int) -> None:
         super().__init__()
-        self.hidden_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, bias=False)
-        self.conditioning_norm = nn.LayerNorm(conditioning_size, bias=False)
+        self.hidden_norm = LayerNorm(hidden_size, elementwise_affine=False, bias=False)
+        self.conditioning_norm = LayerNorm(conditioning_size, bias=False)
         self.gate_projection = nn.Linear(conditioning_size, hidden_size)
         self.shift_projection = nn.Linear(conditioning_size, hidden_size, bias=False)
         self.sigmoid = nn.Sigmoid()
@@ -2271,7 +2278,7 @@ class Boltz1ConfidenceHead(nn.Module):
         self.input_single_projection: nn.Linear | None = None
 
         if use_single_diffusion:
-            self.diffusion_single_norm = LayerNorm(2 * single_size)
+            self.diffusion_single_norm = LayerNorm(2 * single_size, operator_backend=operator_backend)
             self.diffusion_single_projection = nn.Linear(2 * single_size, single_size, bias=False)
 
         self.single_to_pair_row = nn.Linear(input_size, pair_size, bias=False)
@@ -2300,8 +2307,8 @@ class Boltz1ConfidenceHead(nn.Module):
             )
             self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
             self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
-            self.single_recycle_norm = LayerNorm(single_size)
-            self.pair_recycle_norm = LayerNorm(pair_size)
+            self.single_recycle_norm = LayerNorm(single_size, operator_backend=operator_backend)
+            self.pair_recycle_norm = LayerNorm(pair_size, operator_backend=operator_backend)
             self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
             self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
             nn.init.zeros_(self.single_recycle_projection.weight)
@@ -2334,12 +2341,12 @@ class Boltz1ConfidenceHead(nn.Module):
                 dropout=pair_dropout,
                 operator_backend=operator_backend,
             )
-            self.final_single_norm = LayerNorm(single_size)
-            self.final_pair_norm = LayerNorm(pair_size)
+            self.final_single_norm = LayerNorm(single_size, operator_backend=operator_backend)
+            self.final_pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         else:
-            self.input_single_norm = LayerNorm(input_size)
-            self.single_norm = LayerNorm(single_size)
-            self.pair_norm = LayerNorm(pair_size)
+            self.input_single_norm = LayerNorm(input_size, operator_backend=operator_backend)
+            self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
+            self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
             if add_single_input_to_single:
                 self.input_single_projection = nn.Linear(input_size, single_size, bias=False)
             if add_pair_input_to_pair:

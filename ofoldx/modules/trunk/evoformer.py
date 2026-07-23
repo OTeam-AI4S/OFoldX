@@ -326,8 +326,8 @@ class MsaRowAttentionWithPairBias(nn.Module):
         operator_backend: str,
     ) -> None:
         super().__init__()
-        self.query_norm = LayerNorm(msa_size)
-        self.pair_norm = LayerNorm(pair_size)
+        self.query_norm = LayerNorm(msa_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.attention = GatedMultiheadAttention(
             msa_size,
@@ -359,7 +359,7 @@ class MsaColumnAttention(nn.Module):
 
     def __init__(self, *, msa_size: int, num_attention_heads: int, operator_backend: str) -> None:
         super().__init__()
-        self.query_norm = LayerNorm(msa_size)
+        self.query_norm = LayerNorm(msa_size, operator_backend=operator_backend)
         self.attention = GatedMultiheadAttention(
             msa_size,
             num_attention_heads=num_attention_heads,

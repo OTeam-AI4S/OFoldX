@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
-ModelBackend = Literal["auto", "torch", "oops"]
+ModelBackend = Literal["auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"]
 
 
 class Model(nn.Module):
@@ -67,10 +67,10 @@ class Model(nn.Module):
         return torch.get_default_dtype()
 
     def set_backend(self, backend: ModelBackend) -> Self:
-        r"""Select the model's public PyTorch or OOps operator path."""
+        r"""Select one operator provider across the model while preserving PyTorch semantics."""
 
-        if backend not in ("auto", "torch", "oops"):
-            raise ValueError("backend must be exactly one of: auto, torch, oops")
+        if backend not in ("auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"):
+            raise ValueError("backend must be exactly one of: auto, torch, sdpa, oops, cueq, apex, deepspeed")
         self._set_backend(backend)
         self.backend = backend
         return self

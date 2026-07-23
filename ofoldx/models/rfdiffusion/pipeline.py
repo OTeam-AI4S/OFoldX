@@ -1,8 +1,8 @@
 r"""RFdiffusion generation and design pipeline.
 
-``design`` lowers one generation input through :class:`RfDiffusionProcessor`, runs the
-reverse-diffusion sampler via :meth:`RfDiffusionModel.design`, and returns the coordinate-producing
-:class:`~ofoldx.models.rfdiffusion.model.RfDiffusionDesignResult`. A single caller-controlled
+``design`` lowers one generation input through [`RfDiffusionProcessor`][], runs the
+reverse-diffusion sampler via [`RfDiffusionModel.design`][], and returns the coordinate-producing
+[`RfDiffusionDesignResult`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignResult]. A single caller-controlled
 ``seed`` or ``generator`` supplies the random stream for every requested candidate without
 unintended reseeding.
 """

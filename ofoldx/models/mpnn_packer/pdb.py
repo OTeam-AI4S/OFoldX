@@ -1,6 +1,6 @@
 r"""PDB visualization writer for MpnnPacker predictions.
 
-:func:`write_pdb` serializes one complete :class:`~ofoldx.results.PackPrediction`
+[`write_pdb`][] serializes one complete [`PackPrediction`][ofoldx.results.PackPrediction]
 using the packed-structure conventions produced by MpnnPacker. The output is
 intended for visualization rather than general ``Structure`` exchange.
 """

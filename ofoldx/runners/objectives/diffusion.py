@@ -22,7 +22,7 @@ def edm_weight(sigma: Tensor, sigma_data: float) -> Tensor:
 
     This is the standard Karras EDM training weight. It reproduces the diffusion
     families' own helper verbatim — it is numerically identical to Boltz-2's
-    :meth:`ofoldx.models.boltz2.model.AtomDiffusion.loss_weight`, including its
+    `ofoldx.models.boltz2.model.AtomDiffusion.loss_weight`, including its
     ``+ 1e-8`` denominator guard against a zero ``sigma`` — while staying
     family-agnostic so the same reduction serves Boltz1 / Boltz2 / BoltzGen /
     Protenix. It is applied inline (rather than reaching into a Model attribute)

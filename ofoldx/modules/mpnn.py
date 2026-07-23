@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .backend import LayerNorm
+
 
 def gather_edges(edges: Tensor, neighbor_indices: Tensor) -> Tensor:
     r"""Gather each residue's selected neighbors from a dense pair tensor."""
@@ -224,13 +226,13 @@ class MpnnEncoderBlock(nn.Module):
         self.scale = scale
         self.node_message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.node_dropout = nn.Dropout(dropout)
-        self.node_norm = nn.LayerNorm(hidden_size)
+        self.node_norm = LayerNorm(hidden_size)
         self.transition = MpnnFeedForward(hidden_size, hidden_size * 4)
         self.transition_dropout = nn.Dropout(dropout)
-        self.transition_norm = nn.LayerNorm(hidden_size)
+        self.transition_norm = LayerNorm(hidden_size)
         self.edge_message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.edge_dropout = nn.Dropout(dropout)
-        self.edge_norm = nn.LayerNorm(hidden_size)
+        self.edge_norm = LayerNorm(hidden_size)
 
     def forward(
         self,
@@ -288,10 +290,10 @@ class MpnnDecoderBlock(nn.Module):
         self.scale = scale
         self.message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.message_dropout = nn.Dropout(dropout)
-        self.message_norm = nn.LayerNorm(hidden_size)
+        self.message_norm = LayerNorm(hidden_size)
         self.transition = MpnnFeedForward(hidden_size, hidden_size * 4)
         self.transition_dropout = nn.Dropout(dropout)
-        self.transition_norm = nn.LayerNorm(hidden_size)
+        self.transition_norm = LayerNorm(hidden_size)
 
     def forward(
         self,
@@ -350,7 +352,7 @@ class MpnnProteinFeatures(nn.Module):
         self.num_rbf = num_rbf
         self.relative_position = MpnnRelativePositionEncoding(num_positional_embeddings)
         self.edge_projection = nn.Linear(num_positional_embeddings + 25 * num_rbf, edge_size, bias=False)
-        self.edge_norm = nn.LayerNorm(edge_size)
+        self.edge_norm = LayerNorm(edge_size)
 
     def forward(
         self,

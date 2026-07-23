@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .backend import adaptive_layer_norm, resolve_config_operator_backend
+from .backend import LayerNorm, adaptive_layer_norm, resolve_config_operator_backend
 
 
 class AdaptiveLayerNorm(nn.Module):
@@ -36,7 +36,7 @@ class AdaptiveLayerNorm(nn.Module):
         self.operator_backend = resolve_config_operator_backend(
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
-        self.conditioning_norm = nn.LayerNorm(conditioning_size, bias=False)
+        self.conditioning_norm = LayerNorm(conditioning_size, bias=False, operator_backend=operator_backend)
         self.conditioning_projection = nn.Linear(conditioning_size, hidden_size * 2, bias=False)
         self.conditioning_scale_bias = nn.Parameter(torch.zeros(hidden_size))
 

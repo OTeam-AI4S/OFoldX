@@ -30,7 +30,7 @@ from .structure import ResidueNumber, Structure
 
 
 def encode_system(system: MolecularSystem) -> dict[str, object]:
-    r"""Serialize a :class:`MolecularSystem` to a JSON-safe object (inverse of :func:`decode_system`).
+    r"""Serialize a [`MolecularSystem`][] to a JSON-safe object (inverse of [`decode_system`][]).
 
     Entities are emitted in sorted key order and instance declaration order is preserved so the
     round trip ``decode_system(encode_system(system)) == system`` holds.
@@ -54,7 +54,7 @@ def encode_system(system: MolecularSystem) -> dict[str, object]:
 
 
 def decode_system(value: object) -> MolecularSystem:
-    r"""Rebuild a :class:`MolecularSystem` from the object produced by :func:`encode_system` (its inverse)."""
+    r"""Rebuild a [`MolecularSystem`][] from the object produced by [`encode_system`][] (its inverse)."""
     data = _expect_object(value, "MolecularSystem")
     _expect_keys(
         data,
@@ -95,7 +95,7 @@ def encode_structure(
     *,
     array_prefix: str,
 ) -> tuple[dict[str, object], dict[str, NDArray]]:
-    r"""Serialize a :class:`Structure` (inverse of :func:`decode_structure`).
+    r"""Serialize a [`Structure`][] (inverse of [`decode_structure`][]).
 
     Returns a ``(metadata, arrays)`` pair: bulk numeric fields (coordinates, mask, optional occupancy)
     are moved into ``arrays`` under ``array_prefix``-keyed names and referenced by key from the metadata,
@@ -134,7 +134,7 @@ def encode_structure(
 
 
 def decode_structure(value: object, arrays: Mapping[str, NDArray]) -> Structure:
-    r"""Rebuild a :class:`Structure` from :func:`encode_structure`'s metadata and array map (its inverse).
+    r"""Rebuild a [`Structure`][] from [`encode_structure`][]'s metadata and array map (its inverse).
 
     Array references in ``value`` are resolved against ``arrays`` to restore coordinates, mask, and
     optional occupancy.
@@ -520,7 +520,7 @@ def _decode_system_bond(value: object) -> SystemBond:
 
 
 def encode_msa(msa: MSA) -> dict[str, object]:
-    r"""Serialize an :class:`MSA` to a JSON-safe object (inverse of :func:`decode_msa`).
+    r"""Serialize an [`MSA`][] to a JSON-safe object (inverse of [`decode_msa`][]).
 
     Sequence rows are stored verbatim as strings and deletion-count arrays are widened to nested int
     lists, so ``decode_msa(encode_msa(msa)) == msa`` round-trips.
@@ -540,7 +540,7 @@ def encode_msa(msa: MSA) -> dict[str, object]:
 
 
 def decode_msa(value: object) -> MSA:
-    r"""Rebuild an :class:`MSA` from :func:`encode_msa`'s object (its inverse), restoring uint32 deletion arrays."""
+    r"""Rebuild an [`MSA`][] from [`encode_msa`][]'s object (its inverse), restoring uint32 deletion arrays."""
     data = _expect_object(value, "MSA")
     _expect_keys(
         data,
@@ -565,11 +565,11 @@ def decode_msa(value: object) -> MSA:
 
 
 def encode_msa_collection(collection: MSACollection) -> dict[str, object]:
-    r"""Serialize an :class:`MSACollection` to a JSON-safe object (inverse of :func:`decode_msa_collection`).
+    r"""Serialize an [`MSACollection`][] to a JSON-safe object (inverse of [`decode_msa_collection`][]).
 
-    Each member MSA is encoded via :func:`encode_msa` and the dense pairing plan (``row_pairing``,
+    Each member MSA is encoded via [`encode_msa`][] and the dense pairing plan (``row_pairing``,
     ``row_is_paired``) is rendered as nested lists, so the collection round-trips through
-    :func:`decode_msa_collection`.
+    [`decode_msa_collection`][].
     """
     if not isinstance(collection, MSACollection):
         raise TypeError("collection must be an MSACollection")
@@ -586,7 +586,7 @@ def encode_msa_collection(collection: MSACollection) -> dict[str, object]:
 
 
 def decode_msa_collection(value: object) -> MSACollection:
-    r"""Rebuild an :class:`MSACollection` from :func:`encode_msa_collection`'s object (its inverse).
+    r"""Rebuild an [`MSACollection`][] from [`encode_msa_collection`][]'s object (its inverse).
 
     Restores the member MSAs and the int64/bool pairing-plan matrices.
     """
@@ -618,10 +618,10 @@ def encode_template(
     *,
     array_prefix: str,
 ) -> tuple[dict[str, object], dict[str, NDArray]]:
-    r"""Serialize a :class:`Template` (inverse of :func:`decode_template`).
+    r"""Serialize a [`Template`][] (inverse of [`decode_template`][]).
 
-    Returns a ``(metadata, arrays)`` pair: the template :class:`Structure` is encoded via
-    :func:`encode_structure` (its arrays keyed by ``array_prefix``) alongside the alignments, so
+    Returns a ``(metadata, arrays)`` pair: the template [`Structure`][] is encoded via
+    [`encode_structure`][] (its arrays keyed by ``array_prefix``) alongside the alignments, so
     ``decode_template(*encode_template(template, array_prefix=p))`` reconstructs the original.
     """
     if not isinstance(template, Template):
@@ -637,7 +637,7 @@ def encode_template(
 
 
 def decode_template(value: object, arrays: Mapping[str, NDArray]) -> Template:
-    r"""Rebuild a :class:`Template` from :func:`encode_template`'s metadata and array map (its inverse)."""
+    r"""Rebuild a [`Template`][] from [`encode_template`][]'s metadata and array map (its inverse)."""
     data = _expect_object(value, "Template")
     _expect_keys(
         data,

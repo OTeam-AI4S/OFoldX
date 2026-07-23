@@ -149,7 +149,7 @@ def upload_repository(
 ) -> CommitInfo:
     r"""Upload one local model repository to a Hub repo, creating it if absent.
 
-    The upload counterpart to :func:`resolve_hub_repository`: a thin wrapper over
+    The upload counterpart to [`resolve_hub_repository`][]: a thin wrapper over
     ``HfApi.create_repo``/``HfApi.upload_folder`` that pushes a fully written repository
     directory (``model.json``/``processor.json``/``pipeline.json`` and its safetensors) to
     ``repo_id``. Nothing is uploaded unless a caller passes an explicit ``repo_id``;
@@ -157,7 +157,7 @@ def upload_repository(
     credential. No organization, repository, or token is assumed here.
 
     Re-publishing mirrors repository-managed files by default: ``delete_patterns`` applies to
-    repository-managed files (see :data:`MIRROR_REPOSITORY`) onto ``repo_id`` so a re-publish
+    repository-managed files (see `MIRROR_REPOSITORY`) onto ``repo_id`` so a re-publish
     deletes managed remote files that are absent locally (an orphaned ``pipeline.json``, a stale
     ``model.safetensors.index.json``, or old weight shards) instead of leaving them to misroute the
     loader. The mirror is scoped to those managed names, so a remote README / model card that the

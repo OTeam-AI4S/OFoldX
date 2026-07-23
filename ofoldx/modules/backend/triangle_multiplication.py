@@ -11,12 +11,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ._cueq import cueq_triangle_multiplication
 from ._oops import oops_kernel
+from .normalization import layer_norm
 from .resolve import resolve_tensor_operator_backend
 
 _oops_triangle_multiplication = oops_kernel("triangle_multiplication")
 
-_SUPPORTED = ("oops", "eager")
+_SUPPORTED = ("oops", "cueq", "apex", "deepspeed", "eager")
 
 
 def triangle_multiplication(
@@ -69,7 +71,7 @@ def triangle_multiplication(
         output_weight: Projection weight mapping back to ``pair_size``.
         output_gate_weight: Gate-projection weight applied to the normalized input.
         eps: LayerNorm epsilon shared by the input and output normalizations.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
         left_value_bias: Optional left value-projection bias.
         left_gate_bias: Optional left gate-projection bias.
         right_value_bias: Optional right value-projection bias.
@@ -107,6 +109,8 @@ def triangle_multiplication(
         torch.Size([1, 3, 3, 4])
     """
 
+    hidden_size = left_value_weight.shape[0]
+    pair_size = pair.shape[-1]
     backend = resolve_tensor_operator_backend(
         operator_backend,
         tensors=(pair, pair_mask),
@@ -136,9 +140,38 @@ def triangle_multiplication(
             output_gate_bias=output_gate_bias,
             eps=eps,
         )
-    hidden_size = left_value_weight.shape[0]
-    pair_size = pair.shape[-1]
-    normalized = torch.nn.functional.layer_norm(pair, (pair_size,), input_norm_weight, input_norm_bias, eps)
+    if backend == "cueq" and pair.is_cuda and hidden_size == pair_size:
+        input_bias = _concatenate_optional_biases(
+            left_value_bias,
+            right_value_bias,
+            left_value_weight,
+            right_value_weight,
+        )
+        input_gate_bias = _concatenate_optional_biases(
+            left_gate_bias,
+            right_gate_bias,
+            left_gate_weight,
+            right_gate_weight,
+        )
+        return cueq_triangle_multiplication(
+            pair,
+            direction="outgoing" if outgoing else "incoming",
+            mask=pair_mask,
+            input_norm_weight=input_norm_weight,
+            input_norm_bias=input_norm_bias,
+            input_weight=torch.cat((left_value_weight, right_value_weight)),
+            input_bias=input_bias,
+            input_gate_weight=torch.cat((left_gate_weight, right_gate_weight)),
+            input_gate_bias=input_gate_bias,
+            output_norm_weight=output_norm_weight,
+            output_norm_bias=output_norm_bias,
+            output_weight=output_weight,
+            output_bias=output_bias,
+            output_gate_weight=output_gate_weight,
+            output_gate_bias=output_gate_bias,
+            eps=eps,
+        )
+    normalized = layer_norm(pair, (pair_size,), input_norm_weight, input_norm_bias, eps, operator_backend=backend)
     left = torch.nn.functional.linear(normalized, left_value_weight, left_value_bias) * torch.sigmoid(
         torch.nn.functional.linear(normalized, left_gate_weight, left_gate_bias)
     )
@@ -148,9 +181,33 @@ def triangle_multiplication(
     left, right = _mask_triangle_factors(left, right, pair_mask)
     equation = "...ikh,...jkh->...ijh" if outgoing else "...kih,...kjh->...ijh"
     update = torch.einsum(equation, left, right)
-    normed_update = torch.nn.functional.layer_norm(update, (hidden_size,), output_norm_weight, output_norm_bias, eps)
+    normed_update = layer_norm(
+        update,
+        (hidden_size,),
+        output_norm_weight,
+        output_norm_bias,
+        eps,
+        operator_backend=backend,
+    )
     update = torch.nn.functional.linear(normed_update, output_weight, output_bias)
     return update * torch.sigmoid(torch.nn.functional.linear(normalized, output_gate_weight, output_gate_bias))
+
+
+def _concatenate_optional_biases(
+    first: Tensor | None,
+    second: Tensor | None,
+    first_weight: Tensor,
+    second_weight: Tensor,
+) -> Tensor | None:
+    r"""Pack two optional projection biases for cuEquivariance's fused input projection."""
+
+    if first is None and second is None:
+        return None
+    if first is None:
+        first = first_weight.new_zeros(first_weight.shape[0])
+    if second is None:
+        second = second_weight.new_zeros(second_weight.shape[0])
+    return torch.cat((first, second))
 
 
 def _mask_triangle_factors(left: Tensor, right: Tensor, pair_mask: Tensor | None) -> tuple[Tensor, Tensor]:

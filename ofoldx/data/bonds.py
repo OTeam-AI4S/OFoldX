@@ -1,6 +1,6 @@
 r"""Covalent links between existing or generated atoms.
 
-Symbolic bonds resolve generated endpoints through a :data:`PlacementMap`. Endpoint
+Symbolic bonds resolve generated endpoints through a `PlacementMap`. Endpoint
 identity is unordered, while each leaving-atom set remains associated with its site.
 """
 
@@ -38,7 +38,7 @@ class SymbolicBond:
     r"""A covalent bond with existing or symbolic endpoints.
 
     Equality and hashing are unordered over ``(site, leaving_atoms)`` pairs. Bond
-    order, aromaticity, and stereochemistry are preserved by :meth:`resolve`.
+    order, aromaticity, and stereochemistry are preserved by [`resolve`][].
     """
 
     site_a: SymbolicBondSite
@@ -82,7 +82,7 @@ class SymbolicBond:
         placement_map: PlacementMap,
         instance_of: dict[str, str],
     ) -> SystemBond:
-        r"""Resolve both endpoints to a user-origin :class:`SystemBond`."""
+        r"""Resolve both endpoints to a user-origin [`SystemBond`][]."""
 
         return SystemBond(
             site_a=resolve_bond_site(self.site_a, placement_map, instance_of),

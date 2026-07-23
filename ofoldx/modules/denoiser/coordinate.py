@@ -332,16 +332,18 @@ class DenoisingConditioner(nn.Module):
         self.relative_position_embedder = (
             RelativePositionEmbedder(relative_position_size, pair_size) if embed_relative_position else None
         )
-        self.pair_input_norm = LayerNorm(pair_input_size, bias=False)
+        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
         self.pair_transitions = nn.ModuleList(
             Transition(pair_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
         )
 
-        self.single_conditioning_norm = LayerNorm(single_conditioning_size, bias=False)
+        self.single_conditioning_norm = LayerNorm(
+            single_conditioning_size, bias=False, operator_backend=operator_backend
+        )
         self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
         self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
-        self.noise_norm = LayerNorm(noise_embedding_size, bias=False)
+        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, operator_backend=operator_backend)
         self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
         self.single_transitions = nn.ModuleList(
             Transition(single_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
@@ -461,7 +463,7 @@ class DenoisingTokenRefiner(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.single_norm = LayerNorm(single_size, bias=False)
+        self.single_norm = LayerNorm(single_size, bias=False, operator_backend=operator_backend)
         self.single_to_token_projection = nn.Linear(single_size, token_hidden_size, bias=False)
         self.token_encoder = DenoisingTokenEncoder(
             num_blocks=num_blocks,
@@ -471,7 +473,7 @@ class DenoisingTokenRefiner(nn.Module):
             pair_size=pair_size,
             operator_backend=operator_backend,
         )
-        self.token_norm = LayerNorm(token_hidden_size, bias=False)
+        self.token_norm = LayerNorm(token_hidden_size, bias=False, operator_backend=operator_backend)
 
     def forward(
         self,

@@ -241,7 +241,7 @@ class Boltz2Model(Model):
         control ordinary stochastic layers such as dropout. It mirrors the Boltz-2 training diffusion step
         (``DiffusionModule.forward``): sample a per-example noise level, corrupt the (centred) target coords, and
         denoise them through the score model conditioned on the trunk. Multi-step reverse diffusion is the
-        separate inference path exposed by :meth:`fold`.
+        separate inference path exposed by [`fold`][].
 
         Args:
             input: Typed model input; training requires ``input.target_positions``.
@@ -346,7 +346,7 @@ class Boltz2Model(Model):
         the distinct *inference* path (the training path is
         [`forward`][ofoldx.models.boltz2.model.Boltz2Model.forward]); the returned raw
         [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output] is an internal carrier; the public
-        :meth:`fold` method decodes it into ``FoldResult``.
+        [`fold`][] method decodes it into ``FoldResult``.
 
         Args:
             input: Typed model input.
@@ -1001,7 +1001,7 @@ class Boltz2InputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
         )
         self.atom_pair_bias_projection = nn.Sequential(
-            LayerNorm(atom_pair_hidden_size),
+            LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
             nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
         )
         self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
@@ -1405,7 +1405,9 @@ class Boltz2AtomAttentionDecoder(nn.Module):
             cross_attention_mode=False,
             transition="triple",
         )
-        self.position_update = nn.Sequential(LayerNorm(atom_hidden_size), nn.Linear(atom_hidden_size, 3, bias=False))
+        self.position_update = nn.Sequential(
+            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+        )
 
     def forward(
         self,
@@ -1522,7 +1524,7 @@ class Boltz2TemplateEmbedder(nn.Module):
         self.min_distance = min_distance
         self.max_distance = max_distance
         template_feature_size = 2 * vocab_size + num_bins + 5
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1537,7 +1539,7 @@ class Boltz2TemplateEmbedder(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.hidden_norm = LayerNorm(hidden_size)
+        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 
@@ -1815,20 +1817,23 @@ class Boltz2DenoiserConditioning(nn.Module):
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size),
+                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(LayerNorm(pair_size), nn.Linear(pair_size, num_token_transformer_heads, bias=False))
+            nn.Sequential(
+                LayerNorm(pair_size, operator_backend=operator_backend),
+                nn.Linear(pair_size, num_token_transformer_heads, bias=False),
+            )
             for _ in range(num_token_transformer_blocks)
         )
 
@@ -1942,7 +1947,9 @@ class Boltz2Denoiser(nn.Module):
             structure_prediction=True,
             operator_backend=operator_backend,
         )
-        self.single_to_token = nn.Sequential(LayerNorm(hidden), nn.Linear(hidden, hidden, bias=False))
+        self.single_to_token = nn.Sequential(
+            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
+        )
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
@@ -1950,7 +1957,7 @@ class Boltz2Denoiser(nn.Module):
             conditioning_size=hidden,
             operator_backend=operator_backend,
         )
-        self.token_norm = LayerNorm(hidden)
+        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
         self.atom_attention_decoder = Boltz2AtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -2053,10 +2060,10 @@ class Boltz2SingleConditioning(nn.Module):
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(hidden)
+        self.single_norm = LayerNorm(hidden, operator_backend=operator_backend)
         self.single_projection = nn.Linear(hidden, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
             Transition(hidden, expansion=expansion, operator_backend=operator_backend)
@@ -2395,7 +2402,7 @@ class Boltz2AffinityHead(nn.Module):
         nn.init.zeros_(self.dist_bin_pairwise_embed.weight)
         self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
         self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, pair_size, bias=False)
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
@@ -2576,9 +2583,9 @@ class Boltz2ConfidenceHead(nn.Module):
         self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
         self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
 
-        self.input_single_norm = LayerNorm(single_size)
-        self.single_norm = LayerNorm(single_size)
-        self.pair_norm = LayerNorm(pair_size)
+        self.input_single_norm = LayerNorm(single_size, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
         self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
         self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)

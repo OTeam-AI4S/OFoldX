@@ -103,7 +103,7 @@ class TemplateEmbedder(nn.Module):
         template_feature_size = num_distogram_bins + 1 + 2 * vocab_size + 3 + 1
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -121,7 +121,7 @@ class TemplateEmbedder(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
-        self.hidden_norm = LayerNorm(hidden_size)
+        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 

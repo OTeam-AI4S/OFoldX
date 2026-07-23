@@ -529,7 +529,7 @@ class PxDesignDesignResult:
     r"""One generation-ordered collection of ranked, evaluated PXDesign candidates.
 
     This result carries coordinate-bearing PXDesign candidates and therefore
-    does not reuse the coordinate-free shared :class:`~ofoldx.results.DesignResult`.
+    does not reuse the coordinate-free shared [`DesignResult`][ofoldx.results.DesignResult].
 
     Args:
         candidates: Candidates in generation order. Ranking methods retain this order for ties.

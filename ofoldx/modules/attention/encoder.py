@@ -22,7 +22,7 @@ class PairBiasedSelfAttention(nn.Module):
         hidden_size: Width of the single-representation token channel.
         pair_size: Width of the pair-representation channel used to derive the bias.
         num_attention_heads: Number of attention heads.
-        operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
+        operator_backend: Operator provider; see [ofoldx.modules.backend][].
 
     Examples:
         >>> import torch
@@ -44,14 +44,14 @@ class PairBiasedSelfAttention(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.hidden_norm = LayerNorm(hidden_size)
+        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
             query_bias=True,
             operator_backend=operator_backend,
         )
-        self.pair_norm = LayerNorm(pair_size, bias=True)
+        self.pair_norm = LayerNorm(pair_size, bias=True, operator_backend=operator_backend)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
 
     def forward(

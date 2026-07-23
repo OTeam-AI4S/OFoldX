@@ -256,7 +256,7 @@ class AlphaFold3Model(Model):
         r"""Run AlphaFold 3 folding and preserve the diffusion seed group.
 
         One trunk pass is shared by ``num_samples`` diffusion rollouts. The returned
-        :class:`AlphaFold3FoldResult` preserves that group, while :meth:`best`
+        [`AlphaFold3FoldResult`][] preserves that group, while [`best`][]
         ranks predictions across all groups.
 
         ``generator`` drives the rollouts; ``None`` uses the ambient PyTorch RNG.
@@ -311,7 +311,7 @@ class AlphaFold3Model(Model):
         r"""Sample one seed's diffusion rollouts and decode them into one seed group.
 
         Shares one trunk pass across ``num_samples`` rollouts, decodes each sample's
-        :class:`~ofoldx.data.structure.Structure`, and computes pTM, ipTM, PAE/PDE
+        [`Structure`][ofoldx.data.structure.Structure], and computes pTM, ipTM, PAE/PDE
         aggregates, disorder, clashes, and ranking scores.
         """
 
@@ -560,7 +560,7 @@ class AlphaFold3Model(Model):
 
         The third element is ``0.8 * ipTM + 0.2 * pTM``. ``ranking_score`` also
         includes DSSP disorder and clash terms, which require a decoded Structure
-        and are finalized in :meth:`fold`.
+        and are finalized in [`fold`][].
 
         Args:
             output: Structure-prediction output carrying ``pae_logits``.
@@ -1066,7 +1066,7 @@ def alphafold3_confidence_summary(
 
     The third element is ``0.8 * ipTM + 0.2 * pTM``, with pTM substituted for
     NaN ipTM on single-chain systems. The final ranking score additionally includes
-    DSSP disorder and clash terms in :meth:`AlphaFold3Model.fold`.
+    DSSP disorder and clash terms in [`AlphaFold3Model.fold`][].
 
     Args:
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
@@ -1447,7 +1447,7 @@ def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) ->
     r"""Windowed per-residue rASA for one protein chain (AlphaFold-RSA).
 
     Runs the DSSP 4.4.7 solvent-accessibility algorithm over the chain, normalizes each residue's
-    accessible surface area by :data:`MAX_ACCESSIBLE_SURFACE_AREA`, clips to ``1.0``, and
+    accessible surface area by [`MAX_ACCESSIBLE_SURFACE_AREA`][], clips to ``1.0``, and
     averages over a reflect-padded window.
     Raises ``RuntimeError`` when the chain has no complete DSSP residues.
     """
@@ -1664,8 +1664,8 @@ class AlphaFold3Input:
     ``system``, ``atom_sites``, and ``token_sites`` carry the canonical identities
     used to reconstruct the folding result. They are optional so the pure-tensor
     model graph (``forward`` / ``_sample``) can be driven with bare tensors, but the
-    :class:`AlphaFold3Processor` always populates them so :meth:`AlphaFold3Model.fold`
-    can decode coordinates back into a :class:`~ofoldx.data.structure.Structure`.
+    [`AlphaFold3Processor`][] always populates them so [`AlphaFold3Model.fold`][]
+    can decode coordinates back into a [`Structure`][ofoldx.data.structure.Structure].
     """
 
     token_mask: Tensor
@@ -1733,7 +1733,7 @@ class AlphaFold3FoldResult:
     r"""One AlphaFold 3 folding result preserving its per-seed sample groups.
 
     Args:
-        seed_groups: One :class:`AlphaFold3SeedGroup` per seed, in the order the
+        seed_groups: One [`AlphaFold3SeedGroup`][] per seed, in the order the
             seeds were run.
     """
 
@@ -1743,9 +1743,9 @@ class AlphaFold3FoldResult:
         r"""Return the earliest best prediction under one explicit score.
 
         Pools every sample across every seed group and ranks the pool by the named
-        :class:`~ofoldx.results.Score`, using the
+        [`Score`][ofoldx.results.Score], using the
         explicit-direction, identical-unit, identical-scope, NaN-rejecting,
-        infinity-rankable, earliest-tie semantics of :meth:`~ofoldx.results.FoldResult.best`.
+        infinity-rankable, earliest-tie semantics of [`best`][ofoldx.results.FoldResult.best].
 
         Args:
             score: The name of the per-sample score to rank on.

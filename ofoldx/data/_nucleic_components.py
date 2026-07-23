@@ -8,7 +8,7 @@ CCD aromatic flags are represented by OFoldX's canonical aromatic bond order ``1
 one-letter resolution. Their graphs are, respectively, the ``C`` and ``DC`` heavy
 backbone induced subgraphs with ``N1`` renamed to ``N``.
 
-Construction and public access live in :mod:`ofoldx.data.components`.
+Construction and public access live in [`ofoldx.data.components`][].
 """
 
 from __future__ import annotations

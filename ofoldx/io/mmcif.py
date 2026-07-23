@@ -1,4 +1,4 @@
-r"""Generic mmCIF codec for canonical :class:`ofoldx.data.Structure` values."""
+r"""Generic mmCIF codec for canonical [`ofoldx.data.Structure`][] values."""
 
 from __future__ import annotations
 

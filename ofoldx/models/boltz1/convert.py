@@ -832,7 +832,7 @@ def save_boltz1_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_boltz1_checkpoint`][ofoldx.models.boltz1.convert.convert_boltz1_checkpoint], pairs
-    the model with the config-less :class:`Boltz1Processor`, and writes a self-contained
+    the model with the config-less [`Boltz1Processor`][], and writes a self-contained
     ``model.json`` / safetensors repository via
     [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The Processor carries no config,
     so no ``processor.json`` is written.

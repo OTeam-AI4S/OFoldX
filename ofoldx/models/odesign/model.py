@@ -449,7 +449,7 @@ class ODesignConstraintEmbeddings(nn.Module):
         self.min_distance = min_distance
         self.max_distance = max_distance
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.distogram_projection = nn.Linear(num_bins, hidden_size, bias=False)
         self.pairformer_stack = PairformerStack(
             num_blocks=num_blocks,
@@ -458,7 +458,7 @@ class ODesignConstraintEmbeddings(nn.Module):
             dropout=dropout,
             operator_backend=operator_backend,
         )
-        self.hidden_norm = LayerNorm(hidden_size)
+        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 
@@ -582,7 +582,7 @@ class _ODesignTrunkOutput:
 class ODesignPlacements:
     r"""One ODesign generation-topology request over the shared PlacementSpec.
 
-    ``placements`` is the :data:`~ofoldx.data.placement.PlacementSpec` mapping
+    ``placements`` is the [`PlacementSpec`][ofoldx.data.placement.PlacementSpec] mapping
     ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
     unique across the whole mapping and is the SOLE pre-realization reference target
     (validated at construction). Each declaration group is one ODesign output chain and its
@@ -618,7 +618,7 @@ class ODesignDesignedResidue:
     r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
 
     Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
-    one declaration group run-length-collapse into a single :class:`GeneratedSegment`.
+    one declaration group run-length-collapse into a single [`GeneratedSegment`][].
     """
 
     polymer_type: PolymerType
@@ -631,7 +631,7 @@ class ODesignFixedResidue:
 
     ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
     residues drawn contiguously (increasing ``source_index``) from one source instance
-    run-length-collapse into a single half-open :class:`ExistingSpan`.
+    run-length-collapse into a single half-open [`ExistingSpan`][].
     """
 
     instance_id: str
@@ -719,10 +719,10 @@ class ODesignOutput:
 class ODesignDesignCandidate:
     r"""One coordinate-bearing ODesign design sample.
 
-    The decoded :class:`~ofoldx.data.structure.Structure` is the single owner of
+    The decoded [`Structure`][ofoldx.data.structure.Structure] is the single owner of
     molecular identity and coordinates. The core exposes no per-sample
     confidence head, so ``metrics`` is empty today; distogram and token-bond logits
-    stay on :class:`ODesignOutput`.
+    stay on [`ODesignOutput`][].
     """
 
     structure: Structure
@@ -738,7 +738,7 @@ class ODesignDesignResult:
     r"""The ODesign Result for the M×S×K design grid.
 
     ODesign is coordinate-producing, so this result carries its coordinate-bearing candidate
-    shape rather than the coordinate-free :class:`~ofoldx.results.DesignResult`.
+    shape rather than the coordinate-free [`DesignResult`][ofoldx.results.DesignResult].
     ``candidates`` is generation-ordered
     (seed → backbone → sequence); ``num_seeds`` (S), ``num_backbones`` (M, per-seed
     diffusion samples), and ``num_sequences`` (K, OInvFold top-k per backbone) record the
@@ -757,7 +757,7 @@ class ODesignDesignResult:
 
         Applies the shared ranking semantics: explicit ``preferred``
         direction, one identical unit, one identical ``frozenset`` scope, NaN rejection,
-        earliest tie), mirroring :meth:`ofoldx.results.DesignResult.best`. There is no
+        earliest tie), mirroring [`ofoldx.results.DesignResult.best`][]. There is no
         shared ranking abstraction and no default score.
         """
 

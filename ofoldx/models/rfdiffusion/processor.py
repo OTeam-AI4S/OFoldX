@@ -700,7 +700,7 @@ def from_contig_string(
     Returns ``(PlacementSpec, combined_length)``. ``combined_length`` is the RFdiffusion
     ``ContigMap.length`` argument: the combined generated-length bounds ``(Σ min, Σ max)``
     across every generated subcon, excluding ``ExistingSpan`` rows. It is stored on
-    :class:`RfDiffusionLayout.combined_length` and is ``None`` when the string generates
+    [`RfDiffusionLayout.combined_length`][] and is ``None`` when the string generates
     nothing. ``source_instances`` (source chain-letter →
     length) resolves the bare-chain ``A`` form to ``ExistingSpan("A", 0, length)``; explicit
     ``A163-181`` extents are carried literally rather than rebased to zero-based component indices.

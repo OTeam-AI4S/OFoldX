@@ -142,8 +142,8 @@ def save_alphafold2_checkpoint(
     Strict-loads the checkpoint via
     [`convert_alphafold2_checkpoint`][ofoldx.models.alphafold2.convert.convert_alphafold2_checkpoint],
     pairs the resulting model with the processor selected by the checkpoint variant (the monomer/monomer-pTM
-    :class:`AlphaFold2Processor`, or the :class:`AlphaFold2MultimerProcessor` when the selected
-    ``model_*_multimer`` archive yields an :class:`AlphaFold2MultimerModel`), and writes a
+    [`AlphaFold2Processor`][], or the [`AlphaFold2MultimerProcessor`][] when the selected
+    ``model_*_multimer`` archive yields an [`AlphaFold2MultimerModel`][]), and writes a
     self-contained ``model.json`` / ``processor.json`` / safetensors repository via
     [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
 

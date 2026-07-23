@@ -15,6 +15,7 @@ from ...data.molecular import AMINO_ACID_THREE_TO_ONE, AtomSite, ComponentRefere
 from ...data.structure import Structure
 from ...model import Model
 from ...modules import residue_constants as rc
+from ...modules.backend import LayerNorm
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     MpnnDecoderBlock,
@@ -85,7 +86,7 @@ class MpnnPackerModel(Model):
         )
         self.context_output = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.context_dropout = nn.Dropout(config.dropout)
-        self.context_norm = nn.LayerNorm(config.hidden_size)
+        self.context_norm = LayerNorm(config.hidden_size)
         self.decode_edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
         self.sidechain_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
         self.decoder_node_projection = nn.Linear(2 * config.hidden_size, config.hidden_size)
@@ -586,9 +587,9 @@ class MpnnPackerFeatures(nn.Module):
         self.relative_position = MpnnRelativePositionEncoding(num_positional_embeddings)
 
         self.edge_projection = nn.Linear(num_positional_embeddings + num_rbf * 25, edge_size, bias=False)
-        self.edge_norm = nn.LayerNorm(edge_size)
+        self.edge_norm = LayerNorm(edge_size)
         self.node_projection = nn.Linear(len(AMINO_ACID_COMPONENT_IDS) + 1, node_size, bias=False)
-        self.node_norm = nn.LayerNorm(node_size)
+        self.node_norm = LayerNorm(node_size)
 
         self.context_down_projection = nn.Linear(num_rbf + 120, num_rbf)
         self.decode_edge_projection = nn.Linear(
@@ -596,17 +597,17 @@ class MpnnPackerFeatures(nn.Module):
             edge_size,
             bias=False,
         )
-        self.decode_edge_norm = nn.LayerNorm(edge_size)
+        self.decode_edge_norm = LayerNorm(edge_size)
         self.decode_node_projection = nn.Linear(_ATOM14 * num_context_atoms * num_rbf, node_size, bias=False)
-        self.decode_node_norm = nn.LayerNorm(node_size)
+        self.decode_node_norm = LayerNorm(node_size)
 
         self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
-        self.context_node_norm = nn.LayerNorm(node_size)
+        self.context_node_norm = LayerNorm(node_size)
         self.element_projection = nn.Linear(147, 64)
         self.atom_node_projection = nn.Linear(147, node_size, bias=False)
         self.atom_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
-        self.atom_edge_norm = nn.LayerNorm(node_size)
-        self.atom_node_norm = nn.LayerNorm(node_size)
+        self.atom_edge_norm = LayerNorm(node_size)
+        self.atom_node_norm = LayerNorm(node_size)
 
         buffer_device = self.element_projection.weight.device
         if buffer_device.type == "meta":

@@ -213,7 +213,7 @@ class ProtenixProcessor(Processor):
 class ProtenixConstraintProcessor(ProtenixProcessor):
     r"""Lower atom contacts, token contacts, and one pocket into Protenix constraints.
 
-    Its public call adds constraint arguments that :class:`ProtenixProcessor` deliberately
+    Its public call adds constraint arguments that [`ProtenixProcessor`][] deliberately
     omits.
 
     Args:

@@ -16,6 +16,7 @@ from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
+from ...modules.backend import LayerNorm
 from ...modules.mpnn import (
     MpnnDecoderBlock,
     MpnnEncoderBlock,
@@ -877,13 +878,13 @@ class NaMpnnFeatures(nn.Module):
         total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
         self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
         self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
-        self.node_norm = nn.LayerNorm(config.feature_size)
+        self.node_norm = LayerNorm(config.feature_size)
         self.edge_projection = nn.Linear(
             config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
             config.feature_size,
             bias=False,
         )
-        self.edge_norm = nn.LayerNorm(config.feature_size)
+        self.edge_norm = LayerNorm(config.feature_size)
 
     def forward(
         self,
@@ -1024,7 +1025,7 @@ def smoothed_loss(
     Each row's smoothing mass ``weight`` is distributed uniformly over that row's
     own polymer residue-type set (protein 21, DNA 5, RNA 5), and the true column is
     scaled by ``1 - weight`` before the eps is added, matching NA-MPNN's
-    ``loss_smoothed``. At ``weight=0`` this reduces to :func:`nll_loss`. The
+    ``loss_smoothed``. At ``weight=0`` this reduces to [`nll_loss`][]. The
     result has shape ``sequence_tokens.shape``.
     """
 

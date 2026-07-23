@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ofoldx.modules.attention import TriangleAttention
+from ofoldx.modules.attention import TriangleAttention, TriangleMultiplication
 
 
 def test_triangle_bias_couples_rows() -> None:
@@ -21,3 +21,13 @@ def test_triangle_bias_couples_rows() -> None:
     # Row 2's q/k/v are untouched, so the shared bias couples it to row 0 only at query column 0.
     assert not torch.allclose(baseline[0, 2], updated[0, 2], atol=1e-6)
     torch.testing.assert_close(baseline[0, 2, 1:], updated[0, 2, 1:], atol=1e-6, rtol=0)
+
+
+def test_triangle_backend_propagates_to_layer_norms() -> None:
+    attention = TriangleAttention(pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="apex")
+    multiplication = TriangleMultiplication(pair_size=8, hidden_size=8, outgoing=True, operator_backend="deepspeed")
+
+    assert attention.pair_norm.operator_backend == "apex"
+    assert attention.attention.operator_backend == "apex"
+    assert multiplication.input_norm.operator_backend == "deepspeed"
+    assert multiplication.output_norm.operator_backend == "deepspeed"
