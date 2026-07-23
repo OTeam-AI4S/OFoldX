@@ -18,7 +18,7 @@ _PACKER_TOP_LEVEL = {
     "W_v": "node_embedding",
     "W_f": "decode_edge_embedding",
     "W_v_sc": "sidechain_node_embedding",
-    "linear_down": "linear_down",
+    "linear_down": "decoder_node_projection",
     "W_torsions": "torsion_projection",
     "W_c": "residue_context_input",
     "W_e_context": "context_edge_embedding",
@@ -42,35 +42,35 @@ _PACKER_TOP_LEVEL = {
     "features.y_edges": "feature_encoder.atom_edge_projection",
     "features.norm_y_edges": "feature_encoder.atom_edge_norm",
     "features.norm_y_nodes": "feature_encoder.atom_node_norm",
-    "features.positional_embeddings.linear": "feature_encoder.relative_position.linear",
+    "features.positional_embeddings.linear": "feature_encoder.relative_position.projection",
 }
 _PACKER_ENCODER_SUBLAYER = {
     "norm1": "node_norm",
-    "norm2": "feed_forward_norm",
+    "norm2": "transition_norm",
     "norm3": "edge_norm",
-    "W1": "node_message.input",
-    "W2": "node_message.middle",
-    "W3": "node_message.output",
-    "W11": "edge_message.input",
-    "W12": "edge_message.middle",
-    "W13": "edge_message.output",
-    "dense.W_in": "feed_forward.input",
-    "dense.W_out": "feed_forward.output",
+    "W1": "node_message.input_projection",
+    "W2": "node_message.hidden_projection",
+    "W3": "node_message.output_projection",
+    "W11": "edge_message.input_projection",
+    "W12": "edge_message.hidden_projection",
+    "W13": "edge_message.output_projection",
+    "dense.W_in": "transition.input_projection",
+    "dense.W_out": "transition.output_projection",
 }
 _PACKER_DECODER_SUBLAYER = {
     "norm1": "message_norm",
-    "norm2": "feed_forward_norm",
-    "W1": "message.input",
-    "W2": "message.middle",
-    "W3": "message.output",
-    "dense.W_in": "feed_forward.input",
-    "dense.W_out": "feed_forward.output",
+    "norm2": "transition_norm",
+    "W1": "message.input_projection",
+    "W2": "message.hidden_projection",
+    "W3": "message.output_projection",
+    "dense.W_in": "transition.input_projection",
+    "dense.W_out": "transition.output_projection",
 }
-_PACKER_LAYER_GROUPS = {
-    "encoder_layers": ("encoder_layers", _PACKER_ENCODER_SUBLAYER),
-    "decoder_layers": ("decoder_layers", _PACKER_DECODER_SUBLAYER),
-    "context_encoder_layers": ("context_layers", _PACKER_DECODER_SUBLAYER),
-    "y_context_encoder_layers": ("atom_context_layers", _PACKER_DECODER_SUBLAYER),
+_PACKER_BLOCK_GROUPS = {
+    "encoder_layers": ("encoder_blocks", _PACKER_ENCODER_SUBLAYER),
+    "decoder_layers": ("decoder_blocks", _PACKER_DECODER_SUBLAYER),
+    "context_encoder_layers": ("context_blocks", _PACKER_DECODER_SUBLAYER),
+    "y_context_encoder_layers": ("atom_context_blocks", _PACKER_DECODER_SUBLAYER),
 }
 
 
@@ -162,7 +162,7 @@ def _convert_packer_key(key: str) -> str:
         KeyError: If the key matches no known MpnnPacker layer-group or top-level pattern.
     """
 
-    for prefix, (target, sublayer) in _PACKER_LAYER_GROUPS.items():
+    for prefix, (target, sublayer) in _PACKER_BLOCK_GROUPS.items():
         if key.startswith(prefix + "."):
             parts = key.split(".")
             remainder = ".".join(parts[2:])

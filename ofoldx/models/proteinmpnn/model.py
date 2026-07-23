@@ -11,18 +11,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.components import get_component
-from ...data.molecular import (
-    ComponentReference,
-    MolecularSystem,
-    Molecule,
-    PolymerSequence,
-)
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
-    MpnnDecoderLayer,
-    MpnnEncoderLayer,
+    MpnnDecoderBlock,
+    MpnnEncoderBlock,
     MpnnProteinFeatures,
     MpnnRelativePositionEncoding,
     autoregressive_masks,
@@ -56,28 +51,28 @@ class ProteinMpnnModel(Model):
         feature_class = CaProteinMpnnFeatures if self.config.ca_only else MpnnProteinFeatures
         self.feature_encoder = feature_class(self.config.hidden_size, self.config.num_neighbors)
         self.edge_embedding = nn.Linear(self.config.hidden_size, self.config.hidden_size)
-        self.encoder_layers = nn.ModuleList(
-            MpnnEncoderLayer(
+        self.encoder_blocks = nn.ModuleList(
+            MpnnEncoderBlock(
                 self.config.hidden_size,
                 self.config.hidden_size * 2,
                 dropout=self.config.dropout,
             )
-            for _ in range(self.config.num_encoder_layers)
+            for _ in range(self.config.num_encoder_blocks)
         )
         self.token_embedding = nn.Embedding(len(AMINO_ACID_COMPONENT_IDS) + 1, self.config.hidden_size)
-        self.decoder_layers = nn.ModuleList(
-            MpnnDecoderLayer(
+        self.decoder_blocks = nn.ModuleList(
+            MpnnDecoderBlock(
                 self.config.hidden_size,
                 self.config.hidden_size * 3,
                 dropout=self.config.dropout,
             )
-            for _ in range(self.config.num_decoder_layers)
+            for _ in range(self.config.num_decoder_blocks)
         )
         self.output_projection = nn.Linear(self.config.hidden_size, len(AMINO_ACID_COMPONENT_IDS) + 1)
-        self.reset_parameters()
+        self.post_init()
 
-    def reset_parameters(self) -> None:
-        r"""Apply the released Xavier initialization to matrix parameters."""
+    def initialize_parameters(self) -> None:
+        r"""Apply the Xavier initialization to matrix parameters."""
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -237,7 +232,7 @@ class ProteinMpnnModel(Model):
         backbone_noise: float,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the one coordinate encoder shared by every official operation."""
+        r"""Run the one coordinate encoder shared by every operation."""
 
         if backbone_noise:
             backbone_coordinates = backbone_coordinates + backbone_noise * torch.randn(
@@ -261,8 +256,8 @@ class ProteinMpnnModel(Model):
         edge_states = self.edge_embedding(edge_features)
         attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = mask.unsqueeze(-1) * attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(
+        for block in self.encoder_blocks:
+            node_states, edge_states = block(
                 node_states,
                 edge_states,
                 neighbor_indices,
@@ -292,9 +287,9 @@ class ProteinMpnnModel(Model):
             residue_mask.to(dtype=node_states.dtype),
         )
         forward_context = forward_mask * encoder_context
-        for layer in self.decoder_layers:
+        for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
-            node_states = layer(
+            node_states = block(
                 node_states,
                 backward_mask * decoder_context + forward_context,
                 residue_mask.to(dtype=node_states.dtype),
@@ -323,8 +318,8 @@ class ProteinMpnnModel(Model):
         _, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
         forward_context = forward_mask * encoder_context
         states = node_states
-        for layer in self.decoder_layers:
-            states = layer(states, forward_context, mask)
+        for block in self.decoder_blocks:
+            states = block(states, forward_context, mask)
         return self.output_projection(states)
 
     def encode(
@@ -669,7 +664,7 @@ class ProteinMpnnModel(Model):
         pssm_log_odds_threshold: float | None,
         allowed_token_mask: Tensor | None,
     ) -> Tensor:
-        r"""Apply released sampling controls in their original order."""
+        r"""Apply sampling controls in their original order."""
 
         scaled_logits = logits / temperature
         if global_logit_bias is not None:
@@ -764,7 +759,7 @@ class ProteinMpnnModel(Model):
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = forward_mask * encoder_context
-        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        block_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_blocks]
         sequence_tokens = repeated.sequence_tokens.clone()
         log_probabilities = node_states.new_zeros(num_samples, length, vocabulary)
         sampling_probabilities = torch.zeros_like(log_probabilities)
@@ -782,25 +777,25 @@ class ProteinMpnnModel(Model):
             )
             encoder_at_position = forward_context[batch_indices, positions].unsqueeze(1)
             mask_at_position = repeated.residue_mask[batch_indices, positions, None].to(node_states.dtype)
-            for layer_index, layer in enumerate(self.decoder_layers):
+            for block_index, block in enumerate(self.decoder_blocks):
                 decoder_context = cat_neighbors_nodes(
-                    layer_states[layer_index][batch_indices],
+                    block_states[block_index][batch_indices],
                     sequence_edge,
                     neighbor_index,
                 )
-                updated = layer(
-                    layer_states[layer_index][batch_indices, positions].unsqueeze(1),
+                updated = block(
+                    block_states[block_index][batch_indices, positions].unsqueeze(1),
                     backward_mask[batch_indices, positions].unsqueeze(1) * decoder_context + encoder_at_position,
                     mask_at_position,
                 )
-                layer_states[layer_index + 1][batch_indices, positions] = updated[:, 0]
+                block_states[block_index + 1][batch_indices, positions] = updated[:, 0]
 
-            logits = self.output_projection(layer_states[-1][batch_indices, positions])
+            logits = self.output_projection(block_states[-1][batch_indices, positions])
             log_probabilities[batch_indices, positions] = F.log_softmax(logits, dim=-1)
             member_counts = member_mask.sum(dim=-1)
             if repeated.tied_weights is None:
                 # Default coefficient 1/len(G) per member: the equal mean of the
-                # member logits, matching upstream tied decoding with unit betas.
+                # member logits, matching tied decoding with unit betas.
                 combined_logits = torch.segment_reduce(
                     logits,
                     "sum",
@@ -923,7 +918,7 @@ class ProteinMpnnModel(Model):
     @staticmethod
     def _realize_sequence(
         system: MolecularSystem,
-        component_references: tuple[tuple[str, int] | None, ...],
+        component_references: tuple[ComponentReference | None, ...],
         sampled_tokens: Tensor,
         design_positions: Tensor,
     ) -> MolecularSystem:
@@ -938,68 +933,7 @@ class ProteinMpnnModel(Model):
             )
             if reference is not None and selected
         }
-        changed_references = frozenset(
-            reference
-            for reference, replacement in replacements.items()
-            if system.component(reference).component_id != replacement.component_id
-        )
-        realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
-        for instance_id, entity_id in system.instances.items():
-            entity = system.entities[entity_id]
-            if isinstance(entity, PolymerSequence):
-                realized_by_instance[instance_id] = PolymerSequence(
-                    entity.polymer_type,
-                    tuple(
-                        replacements.get((instance_id, index), component)
-                        for index, component in enumerate(entity.components)
-                    ),
-                )
-            else:
-                realized_by_instance[instance_id] = entity
-
-        partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
-            entity_id: [] for entity_id in system.entities
-        }
-        for instance_id, entity_id in system.instances.items():
-            entity = realized_by_instance[instance_id]
-            signature = tuple(component.component_id for component in entity.components)
-            partition = next(
-                (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
-                None,
-            )
-            if partition is None:
-                partitions[entity_id].append((signature, entity, [instance_id]))
-            else:
-                partition[2].append(instance_id)
-
-        used_ids = set(system.entities)
-        new_entities: dict[str, PolymerSequence | Molecule] = {}
-        instance_entities: dict[str, str] = {}
-        for entity_id, original in system.entities.items():
-            values = partitions[entity_id]
-            original_signature = tuple(component.component_id for component in original.components)
-            primary_index = next(
-                (index for index, value in enumerate(values) if value[0] == original_signature),
-                0,
-            )
-            for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
-                signature, entity, instance_ids = values[partition_index]
-                if partition_index == primary_index:
-                    output_id = entity_id
-                else:
-                    suffix = 2
-                    output_id = f"{entity_id}_{suffix}"
-                    while output_id in used_ids:
-                        suffix += 1
-                        output_id = f"{entity_id}_{suffix}"
-                    used_ids.add(output_id)
-                new_entities[output_id] = original if signature == original_signature else entity
-                for instance_id in instance_ids:
-                    instance_entities[instance_id] = output_id
-        new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-        candidate = MolecularSystem(new_entities, new_instances)
-        retained_bonds = system.retain_bonds_after_component_mutation(candidate, changed_references)
-        return MolecularSystem(new_entities, new_instances, retained_bonds)
+        return system.replace_components(replacements)
 
     @torch.inference_mode()
     def design(
@@ -1016,7 +950,23 @@ class ProteinMpnnModel(Model):
         pssm_log_odds_threshold: float | None = None,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnDesignResult:
-        r"""Design complete sequence candidates and retain the native input score."""
+        r"""Design complete sequence candidates and retain each candidate's input score.
+
+        Args:
+            input: One processed protein backbone and its design constraints.
+            num_candidates: Number of sequence candidates to sample.
+            num_decoding_orders: Number of autoregressive orders used to score each candidate.
+            temperature: Positive sampling temperature.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            global_logit_bias: Optional vocabulary-wide additive logit bias.
+            global_omit_token_mask: Optional vocabulary-wide token exclusion mask.
+            pssm_mixture: Weight assigned to the input position-specific scoring matrix.
+            pssm_log_odds_threshold: Optional minimum accepted PSSM log odds.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            Candidates in sampling order with their designed molecular systems and input scores.
+        """
 
         self._require_single_target(input)
         num_candidates = _positive_integer(num_candidates, "num_candidates")
@@ -1131,8 +1081,15 @@ class ProteinMpnnModel(Model):
         return ProteinMpnnDesignResult(candidates=tuple(candidates), input_score=input_score)
 
 
+def _positive_integer(value: int, name: str) -> int:
+    result = operator.index(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 class CaProteinMpnnFeatures(nn.Module):
-    r"""Released Cα-only ProteinMPNN edge feature graph."""
+    r"""Build the Cα-only ProteinMPNN edge feature graph."""
 
     def __init__(self, hidden_size: int, num_neighbors: int) -> None:
         super().__init__()
@@ -1143,7 +1100,7 @@ class CaProteinMpnnFeatures(nn.Module):
 
     @staticmethod
     def quaternions(rotations: Tensor) -> Tensor:
-        r"""Convert rotation matrices to the released quaternion features."""
+        r"""Convert rotation matrices to the quaternion features."""
 
         diagonal = torch.diagonal(rotations, dim1=-2, dim2=-1)
         xx, yy, zz = diagonal.unbind(-1)
@@ -1252,15 +1209,6 @@ class CaProteinMpnnFeatures(nn.Module):
         return self.edge_norm(self.edge_projection(edges)), neighbor_indices
 
 
-def _positive_integer(value: int, name: str) -> int:
-    r"""Normalize one positive index-valued operation count."""
-
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
-
-
 def _pair_radial_basis(
     source_coordinates: Tensor,
     target_coordinates: Tensor,
@@ -1285,7 +1233,7 @@ def smoothed_loss(
     r"""Return the per-token label-smoothed cross entropy of the observed tokens.
 
     Adds ``weight / 21`` to the one-hot target and renormalizes each row before
-    the cross entropy, matching upstream ProteinMPNN's label smoothing. At
+    the cross entropy, matching ProteinMPNN's label smoothing. At
     ``weight=0`` this reduces to :func:`nll_loss`. The result has shape
     ``sequence_tokens.shape``.
     """

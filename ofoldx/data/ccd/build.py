@@ -18,7 +18,7 @@ field extraction below mirrors ``alphafold3/structure/chemical_components.py``
 - ``_chem_comp_atom.type_symbol``             -> ``elements``
 - ``_chem_comp_atom.charge``                  -> ``formal_charges``
 - ``_chem_comp_atom.pdbx_stereo_config``      -> ``stereo`` (per atom; ``N`` -> None)
-- ``_chem_comp_atom.pdbx_model_Cartn_{x,y,z}_ideal`` -> ``ref_coords``
+- ``_chem_comp_atom.pdbx_model_Cartn_{x,y,z}_ideal`` -> ``reference_coordinates``
 - ``_chem_comp_atom.pdbx_leaving_atom_flag``  -> polymer attachment leaving atoms
 - ``_chem_comp_bond.atom_id_1`` / ``atom_id_2`` -> ``bond_atom_a`` / ``bond_atom_b``
 - ``_chem_comp_bond.value_order``             -> ``bond_orders``
@@ -101,7 +101,7 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
     formal_charges = [_to_optional_int(value) for value in _column(block, "_chem_comp_atom.charge", n_atoms)]
     atom_stereo = [_stereo(value) for value in _column(block, "_chem_comp_atom.pdbx_stereo_config", n_atoms)]
     leaving_flags = _column(block, "_chem_comp_atom.pdbx_leaving_atom_flag", n_atoms)
-    ref_coords = _reference_coordinates(block, n_atoms)
+    reference_coordinates = _reference_coordinates(block, n_atoms)
 
     bond_atom_a = list(block.get("_chem_comp_bond.atom_id_1", []))
     bond_atom_b = _required_column(block, "_chem_comp_bond.atom_id_2", len(bond_atom_a))
@@ -142,7 +142,7 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
         "bond_orders": bond_orders,
         "bond_aromatic": bond_aromatic,
         "bond_stereo": bond_stereo,
-        "ref_coords": ref_coords,
+        "reference_coordinates": reference_coordinates,
         "previous_attachment_atom": previous_atom,
         "previous_leaving_atoms": previous_leaving,
         "next_attachment_atom": next_atom,
@@ -237,8 +237,11 @@ def _reference_coordinates(
     zs = _column(block, "_chem_comp_atom.pdbx_model_Cartn_z_ideal", n_atoms)
     coordinates: list[list[float] | None] = []
     for x, y, z in zip(xs, ys, zs):
-        triple = (_to_float(x), _to_float(y), _to_float(z))
-        coordinates.append(None if None in triple else list(triple))  # type: ignore[arg-type]
+        x_value, y_value, z_value = _to_float(x), _to_float(y), _to_float(z)
+        if x_value is None or y_value is None or z_value is None:
+            coordinates.append(None)
+        else:
+            coordinates.append([x_value, y_value, z_value])
     return coordinates
 
 

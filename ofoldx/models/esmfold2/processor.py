@@ -12,18 +12,18 @@ import numpy as np
 import torch
 from multimolecule import ProteinTokenizer
 from multimolecule.io import read_fasta_records
-from typing_extensions import Self
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
+    AMINO_ACID_THREE_TO_ONE,
     AtomSite,
     MolecularSystem,
     Molecule,
     PolymerSequence,
     one_letter_to_component,
-    restype_3to1,
 )
 from ...data.structure import Structure
+from ...processor import Processor
 from ...references import classify_reference
 from .config import EsmFold2ExperimentalProcessorConfig, EsmFold2ProcessorConfig
 from .model import EsmFold2Input, EsmFold2Layout
@@ -73,8 +73,14 @@ _MUTABLE_TOKEN = "#"
 _ANTIBODY_CDR_SCHEME = "chothia"
 
 
-class EsmFold2Processor:
-    r"""Lower complete canonical ESMFold2 inputs without changing their chemistry."""
+class EsmFold2Processor(Processor):
+    r"""Lower complete canonical ESMFold2 inputs without changing their chemistry.
+
+    Args:
+        config: MSA-conditioning options. Defaults to ``EsmFold2ProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -84,22 +90,8 @@ class EsmFold2Processor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = EsmFold2ProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
+        super().__init__(device=device, dtype=dtype)
         self.tokenizer = ProteinTokenizer()
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
 
     def __call__(
         self,
@@ -107,7 +99,16 @@ class EsmFold2Processor:
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
     ) -> EsmFold2Input:
-        r"""Lower one molecular system and optional MSA evidence."""
+        r"""Lower one molecular system and optional MSA evidence.
+
+        Args:
+            input: Inline sequence, FASTA path, one or more polymer sequences, molecular system,
+                or structure topology.
+            msa: Optional MSA value, collection, or alignment path.
+
+        Returns:
+            An ``EsmFold2Input`` with aligned language-model, MSA, atom, and layout values.
+        """
 
         if msa is not None and not self.config.msa_conditioning:
             raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
@@ -132,6 +133,12 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
     records whether the paired checkpoint accepts MSA evidence. The soft residue
     probabilities consumed by the differentiable trunk are assembled by the
     binder-design Pipeline because they depend on the per-step optimisation logits.
+
+    Args:
+        config: Design-time MSA-conditioning options. Defaults to
+            ``EsmFold2ExperimentalProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -214,7 +221,7 @@ def normalize_msa(
     if isinstance(msa, MSA | MSACollection):
         for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
             if entity.polymer_type != "protein":
-                raise ValueError("released ESMFold2 consumes MSA evidence only for protein entities")
+                raise ValueError("ESMFold2 accepts MSA evidence only for protein entities")
         return msa
 
     path = Path(msa).expanduser()
@@ -290,23 +297,23 @@ def prepare_esmfold2_features(
     token_entity_ids: list[str] = []
     token_monomer_indices: list[int | None] = []
     residue_indices: list[int] = []
-    asym_ids: list[int] = []
-    entity_ids: list[int] = []
-    sym_ids: list[int] = []
+    chain_indices: list[int] = []
+    entity_indices: list[int] = []
+    symmetry_indices: list[int] = []
     molecule_types: list[int] = []
     residue_types: list[int] = []
-    reference_space_ids: list[int] = []
+    reference_space_indices: list[int] = []
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
     instance_count_by_entity: dict[str, int] = {}
-    reference_space = 0
+    next_reference_space_index = 0
 
-    for asym_id, (instance_id, entity_key) in enumerate(system.instances.items()):
+    for chain_index, (instance_id, entity_key) in enumerate(system.instances.items()):
         entity = system.entities[entity_key]
-        entity_id = entity_index_by_id.setdefault(entity_key, len(entity_index_by_id) + 1)
-        sym_id = instance_count_by_entity.get(entity_key, 0)
-        instance_count_by_entity[entity_key] = sym_id + 1
+        entity_index = entity_index_by_id.setdefault(entity_key, len(entity_index_by_id) + 1)
+        symmetry_index = instance_count_by_entity.get(entity_key, 0)
+        instance_count_by_entity[entity_key] = symmetry_index + 1
 
         if isinstance(entity, PolymerSequence):
             molecule_type = _MOLECULE_TYPES[entity.polymer_type]
@@ -340,13 +347,13 @@ def prepare_esmfold2_features(
                     token_entity_ids.append(entity_key)
                     token_monomer_indices.append(component_index)
                     residue_indices.append(component_index)
-                    asym_ids.append(asym_id)
-                    entity_ids.append(entity_id)
-                    sym_ids.append(sym_id)
+                    chain_indices.append(chain_index)
+                    entity_indices.append(entity_index)
+                    symmetry_indices.append(symmetry_index)
                     molecule_types.append(molecule_type)
                     residue_types.append(residue_type)
-                    reference_space_ids.extend([reference_space] * len(group))
-                reference_space += 1
+                    reference_space_indices.extend([next_reference_space_index] * len(group))
+                next_reference_space_index += 1
         else:
             sites = tuple(
                 site
@@ -364,13 +371,13 @@ def prepare_esmfold2_features(
                 token_entity_ids.append(entity_key)
                 token_monomer_indices.append(None)
                 residue_indices.append(0)
-                asym_ids.append(asym_id)
-                entity_ids.append(entity_id)
-                sym_ids.append(sym_id)
+                chain_indices.append(chain_index)
+                entity_indices.append(entity_index)
+                symmetry_indices.append(symmetry_index)
                 molecule_types.append(3)
                 residue_types.append(_PROTEIN_UNKNOWN)
-                reference_space_ids.append(reference_space)
-            reference_space += 1
+                reference_space_indices.append(next_reference_space_index)
+            next_reference_space_index += 1
 
     atom_sites = tuple(site for group in token_groups for site in group)
     site_to_atom = {site: index for index, site in enumerate(atom_sites)}
@@ -379,8 +386,10 @@ def prepare_esmfold2_features(
     padded_atom_count = max(32, math.ceil(real_atom_count / 32) * 32)
 
     optional_reference_coordinates = [reference_coordinate(system, site) for site in atom_sites]
-    for space_id in set(reference_space_ids):
-        indices = [index for index, value in enumerate(reference_space_ids) if value == space_id]
+    for current_reference_space_index in set(reference_space_indices):
+        indices = [
+            index for index, value in enumerate(reference_space_indices) if value == current_reference_space_index
+        ]
         if len(indices) > 1 and any(optional_reference_coordinates[index] is None for index in indices):
             raise ValueError(f"ESMFold2 reference conformer is incomplete for {atom_sites[indices[0]].instance_id!r}")
     reference_coordinates: list[tuple[float, float, float]] = []
@@ -413,17 +422,17 @@ def prepare_esmfold2_features(
             )
 
     reference_positions = torch.zeros(padded_atom_count, 3, dtype=torch.float32)
-    ref_element = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_charge = torch.zeros(padded_atom_count, dtype=torch.int8)
-    ref_atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
-    ref_space_uid = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_elements = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count, dtype=torch.int8)
+    reference_atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    reference_space_index = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     reference_positions[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
-    ref_element[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
-    ref_charge[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
-    ref_atom_name_chars[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
-    ref_space_uid[:real_atom_count] = torch.tensor(reference_space_ids, dtype=torch.long)
+    reference_elements[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
+    reference_charges[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
+    reference_atom_name_characters[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
+    reference_space_index[:real_atom_count] = torch.tensor(reference_space_indices, dtype=torch.long)
     atom_mask[:real_atom_count] = True
     atom_to_token[:real_atom_count] = torch.tensor(
         [token_index for token_index, group in enumerate(token_groups) for _ in group],
@@ -443,7 +452,7 @@ def prepare_esmfold2_features(
         token_monomer_indices=token_monomer_indices,
         residue_types=residue_types,
     )
-    esmc_input_ids, esmc_attention_mask, token_to_esmc, token_has_esmc = esmc_tensors(
+    language_model_tokens, language_model_mask, token_to_esmc, token_has_esmc = esmc_tensors(
         system,
         token_instance_ids=token_instance_ids,
         token_monomer_indices=token_monomer_indices,
@@ -454,21 +463,21 @@ def prepare_esmfold2_features(
     features = {
         "token_index": torch.arange(token_count, dtype=torch.long),
         "residue_index": torch.tensor(residue_indices, dtype=torch.long),
-        "chain_index": torch.tensor(asym_ids, dtype=torch.long),
-        "symmetry_index": torch.tensor(sym_ids, dtype=torch.long),
-        "entity_index": torch.tensor(entity_ids, dtype=torch.long),
+        "chain_index": torch.tensor(chain_indices, dtype=torch.long),
+        "symmetry_index": torch.tensor(symmetry_indices, dtype=torch.long),
+        "entity_index": torch.tensor(entity_indices, dtype=torch.long),
         "molecule_type": torch.tensor(molecule_types, dtype=torch.long),
         "residue_type": torch.tensor(residue_types, dtype=torch.long),
         "token_bonds": token_bonds,
         "token_mask": torch.ones(token_count, dtype=torch.bool),
         "reference_positions": reference_positions,
-        "ref_element": ref_element,
-        "ref_charge": ref_charge,
-        "ref_atom_name_chars": ref_atom_name_chars,
-        "ref_space_uid": ref_space_uid,
+        "reference_elements": reference_elements,
+        "reference_charges": reference_charges,
+        "reference_atom_name_characters": reference_atom_name_characters,
+        "reference_space_index": reference_space_index,
         "atom_mask": atom_mask,
         "atom_to_token": atom_to_token,
-        "distogram_atom_idx": torch.tensor(representative_atoms, dtype=torch.long),
+        "distogram_atom_index": torch.tensor(representative_atoms, dtype=torch.long),
         "token_has_esmc": token_has_esmc,
         **msa_features,
     }
@@ -478,8 +487,8 @@ def prepare_esmfold2_features(
     }
     return EsmFold2Input(
         **{name: value.unsqueeze(0) for name, value in placed.items()},
-        esmc_input_ids=esmc_input_ids.to(device=device),
-        esmc_attention_mask=esmc_attention_mask.to(device=device),
+        language_model_tokens=language_model_tokens.to(device=device),
+        language_model_mask=language_model_mask.to(device=device),
         token_to_esmc=token_to_esmc.unsqueeze(0).to(device=device),
         layout=EsmFold2Layout(
             system=system,
@@ -659,28 +668,28 @@ def esmc_tensors(
 
     if proteins:
         max_length = max(len(entity) for _, entity in proteins) + 2
-        input_ids = torch.full(
+        language_model_tokens = torch.full(
             (len(proteins), max_length),
             tokenizer.pad_token_id,
             dtype=torch.long,
         )
-        attention_mask = torch.zeros(len(proteins), max_length, dtype=torch.bool)
+        language_model_mask = torch.zeros(len(proteins), max_length, dtype=torch.bool)
         row_by_instance: dict[str, int] = {}
         for row, (instance_id, entity) in enumerate(proteins):
             row_by_instance[instance_id] = row
-            letters = [restype_3to1.get(component.component_id, "X") for component in entity.components]
-            residue_ids = tokenizer.convert_tokens_to_ids(letters)
-            chain_ids = torch.tensor(
-                [tokenizer.bos_token_id, *residue_ids, tokenizer.eos_token_id],
+            letters = [AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components]
+            residue_tokens = tokenizer.convert_tokens_to_ids(letters)
+            sequence_tokens = torch.tensor(
+                [tokenizer.bos_token_id, *residue_tokens, tokenizer.eos_token_id],
                 dtype=torch.long,
             )
-            input_ids[row, : len(chain_ids)] = chain_ids
-            attention_mask[row, : len(chain_ids)] = True
+            language_model_tokens[row, : len(sequence_tokens)] = sequence_tokens
+            language_model_mask[row, : len(sequence_tokens)] = True
     else:
         max_length = 2
         row_by_instance = {}
-        input_ids = torch.tensor([[tokenizer.bos_token_id, tokenizer.eos_token_id]], dtype=torch.long)
-        attention_mask = torch.ones(1, 2, dtype=torch.bool)
+        language_model_tokens = torch.tensor([[tokenizer.bos_token_id, tokenizer.eos_token_id]], dtype=torch.long)
+        language_model_mask = torch.ones(1, 2, dtype=torch.bool)
 
     token_to_esmc: list[int] = []
     token_has_esmc: list[bool] = []
@@ -695,8 +704,8 @@ def esmc_tensors(
             row_by_instance[instance_id] * max_length + cast(int, monomer_index) + 1 if has_esmc else 0
         )
     return (
-        input_ids,
-        attention_mask,
+        language_model_tokens,
+        language_model_mask,
         torch.tensor(token_to_esmc, dtype=torch.long),
         torch.tensor(token_has_esmc, dtype=torch.bool),
     )

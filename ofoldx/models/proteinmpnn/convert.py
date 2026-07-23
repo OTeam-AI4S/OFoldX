@@ -49,8 +49,8 @@ def convert_proteinmpnn_checkpoint(
     state_dict = checkpoint["model_state_dict"]
     config = ProteinMpnnConfig(
         hidden_size=state_dict["W_s.weight"].shape[1],
-        num_encoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
-        num_decoder_layers=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
+        num_encoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
+        num_decoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
         num_neighbors=checkpoint["num_edges"],
         ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
     )
@@ -74,8 +74,8 @@ def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str
     """
 
     top_level = {
-        "features.embeddings.linear.weight": "feature_encoder.relative_position.linear.weight",
-        "features.embeddings.linear.bias": "feature_encoder.relative_position.linear.bias",
+        "features.embeddings.linear.weight": "feature_encoder.relative_position.projection.weight",
+        "features.embeddings.linear.bias": "feature_encoder.relative_position.projection.bias",
         "features.edge_embedding.weight": "feature_encoder.edge_projection.weight",
         "features.norm_edges.weight": "feature_encoder.edge_norm.weight",
         "features.norm_edges.bias": "feature_encoder.edge_norm.bias",
@@ -88,42 +88,42 @@ def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str
     encoder_sublayers = {
         "norm1.weight": "node_norm.weight",
         "norm1.bias": "node_norm.bias",
-        "norm2.weight": "feed_forward_norm.weight",
-        "norm2.bias": "feed_forward_norm.bias",
+        "norm2.weight": "transition_norm.weight",
+        "norm2.bias": "transition_norm.bias",
         "norm3.weight": "edge_norm.weight",
         "norm3.bias": "edge_norm.bias",
-        "W1.weight": "node_message.input.weight",
-        "W1.bias": "node_message.input.bias",
-        "W2.weight": "node_message.middle.weight",
-        "W2.bias": "node_message.middle.bias",
-        "W3.weight": "node_message.output.weight",
-        "W3.bias": "node_message.output.bias",
-        "W11.weight": "edge_message.input.weight",
-        "W11.bias": "edge_message.input.bias",
-        "W12.weight": "edge_message.middle.weight",
-        "W12.bias": "edge_message.middle.bias",
-        "W13.weight": "edge_message.output.weight",
-        "W13.bias": "edge_message.output.bias",
-        "dense.W_in.weight": "feed_forward.input.weight",
-        "dense.W_in.bias": "feed_forward.input.bias",
-        "dense.W_out.weight": "feed_forward.output.weight",
-        "dense.W_out.bias": "feed_forward.output.bias",
+        "W1.weight": "node_message.input_projection.weight",
+        "W1.bias": "node_message.input_projection.bias",
+        "W2.weight": "node_message.hidden_projection.weight",
+        "W2.bias": "node_message.hidden_projection.bias",
+        "W3.weight": "node_message.output_projection.weight",
+        "W3.bias": "node_message.output_projection.bias",
+        "W11.weight": "edge_message.input_projection.weight",
+        "W11.bias": "edge_message.input_projection.bias",
+        "W12.weight": "edge_message.hidden_projection.weight",
+        "W12.bias": "edge_message.hidden_projection.bias",
+        "W13.weight": "edge_message.output_projection.weight",
+        "W13.bias": "edge_message.output_projection.bias",
+        "dense.W_in.weight": "transition.input_projection.weight",
+        "dense.W_in.bias": "transition.input_projection.bias",
+        "dense.W_out.weight": "transition.output_projection.weight",
+        "dense.W_out.bias": "transition.output_projection.bias",
     }
     decoder_sublayers = {
         "norm1.weight": "message_norm.weight",
         "norm1.bias": "message_norm.bias",
-        "norm2.weight": "feed_forward_norm.weight",
-        "norm2.bias": "feed_forward_norm.bias",
-        "W1.weight": "message.input.weight",
-        "W1.bias": "message.input.bias",
-        "W2.weight": "message.middle.weight",
-        "W2.bias": "message.middle.bias",
-        "W3.weight": "message.output.weight",
-        "W3.bias": "message.output.bias",
-        "dense.W_in.weight": "feed_forward.input.weight",
-        "dense.W_in.bias": "feed_forward.input.bias",
-        "dense.W_out.weight": "feed_forward.output.weight",
-        "dense.W_out.bias": "feed_forward.output.bias",
+        "norm2.weight": "transition_norm.weight",
+        "norm2.bias": "transition_norm.bias",
+        "W1.weight": "message.input_projection.weight",
+        "W1.bias": "message.input_projection.bias",
+        "W2.weight": "message.hidden_projection.weight",
+        "W2.bias": "message.hidden_projection.bias",
+        "W3.weight": "message.output_projection.weight",
+        "W3.bias": "message.output_projection.bias",
+        "dense.W_in.weight": "transition.input_projection.weight",
+        "dense.W_in.bias": "transition.input_projection.bias",
+        "dense.W_out.weight": "transition.output_projection.weight",
+        "dense.W_out.bias": "transition.output_projection.bias",
     }
     dead_ca_parameters = {
         "W_v.weight",
@@ -140,11 +140,11 @@ def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str
         target = top_level.get(key)
         if target is None:
             if key.startswith("encoder_layers."):
-                layer, _, sublayer = key.removeprefix("encoder_layers.").partition(".")
-                target = f"encoder_layers.{layer}.{encoder_sublayers[sublayer]}"
+                block_index, _, sublayer = key.removeprefix("encoder_layers.").partition(".")
+                target = f"encoder_blocks.{block_index}.{encoder_sublayers[sublayer]}"
             elif key.startswith("decoder_layers."):
-                layer, _, sublayer = key.removeprefix("decoder_layers.").partition(".")
-                target = f"decoder_layers.{layer}.{decoder_sublayers[sublayer]}"
+                block_index, _, sublayer = key.removeprefix("decoder_layers.").partition(".")
+                target = f"decoder_blocks.{block_index}.{decoder_sublayers[sublayer]}"
             else:
                 raise KeyError(f"unrecognized ProteinMPNN checkpoint tensor: {key}")
         converted[target] = value

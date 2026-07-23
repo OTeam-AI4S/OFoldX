@@ -272,6 +272,40 @@ def test_component_resolution_rejects_negative_and_out_of_range() -> None:
         system.component(("missing", 0))
 
 
+def test_replace_components_splits_divergent_entities_and_retains_resolvable_bonds() -> None:
+    protein = PolymerSequence("protein", (_residue("R0", side_chain="SG"), _residue("R1")))
+    ligand = _ligand()
+    removed = SystemBond(AtomSite("chain_a", 0, "SG"), AtomSite("ligand", 0, "C1"))
+    retained = SystemBond(AtomSite("chain_b", 0, "SG"), AtomSite("ligand", 0, "O1"))
+    system = MolecularSystem(
+        {"protein": protein, "ligand": ligand},
+        {"chain_a": "protein", "chain_b": "protein", "ligand": "ligand"},
+        frozenset({removed, retained}),
+    )
+
+    replaced = system.replace_components({("chain_a", 0): _residue("NEW")})
+
+    assert replaced.instances == {
+        "chain_a": "protein_2",
+        "chain_b": "protein",
+        "ligand": "ligand",
+    }
+    assert replaced.entities["protein"] is protein
+    assert replaced.component(("chain_a", 0)).component_id == "NEW"
+    assert replaced.component(("chain_b", 0)).component_id == "R0"
+    assert replaced.bonds == frozenset({retained})
+
+    shared = system.replace_components(
+        {
+            ("chain_a", 0): _residue("NEW"),
+            ("chain_b", 0): _residue("NEW"),
+        }
+    )
+    assert shared.instances["chain_a"] == shared.instances["chain_b"] == "protein"
+    assert "protein_2" not in shared.entities
+    assert system.replace_components({}) is system
+
+
 # --------------------------------------------------------------------------- #
 # §3.4.2 (FROZEN) paired-adjacency retained-atom predicate                     #
 # --------------------------------------------------------------------------- #

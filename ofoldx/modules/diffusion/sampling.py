@@ -32,7 +32,7 @@ class CoordinateDenoiseContext:
     [`CoordinateDenoisingInput`][ofoldx.modules.diffusion.types.CoordinateDenoisingInput]. The convenience
     properties read leading batch shape, device, dtype, and atom count off ``token_embedding`` / ``atom_to_token``.
 
-    Attributes:
+    Args:
         atom_features: Per-atom input features.
         atom_to_token: Token index for each atom.
         reference_positions: Centered reference-conformer atom coords.
@@ -141,23 +141,6 @@ class CoordinateDenoiseContext:
 
         Returns:
             The floating dtype of the conditioning tensors.
-
-        Examples:
-            >>> import torch
-            >>> context = CoordinateDenoiseContext(
-            ...     atom_features=torch.zeros(1, 3, 8),
-            ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
-            ...     reference_positions=torch.zeros(1, 3, 3),
-            ...     reference_charges=torch.zeros(1, 3),
-            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     token_embedding=torch.zeros(1, 2, 4),
-            ...     single=torch.zeros(1, 2, 4),
-            ...     pair=torch.zeros(1, 2, 2, 4),
-            ...     relative_features=None,  # type: ignore[arg-type]
-            ... )
-            >>> context.dtype
-            torch.float32
         """
 
         return self.token_embedding.dtype
@@ -169,23 +152,6 @@ class CoordinateDenoiseContext:
 
         Returns:
             The atom count ``N_atom``.
-
-        Examples:
-            >>> import torch
-            >>> context = CoordinateDenoiseContext(
-            ...     atom_features=torch.zeros(1, 3, 8),
-            ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
-            ...     reference_positions=torch.zeros(1, 3, 3),
-            ...     reference_charges=torch.zeros(1, 3),
-            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     token_embedding=torch.zeros(1, 2, 4),
-            ...     single=torch.zeros(1, 2, 4),
-            ...     pair=torch.zeros(1, 2, 2, 4),
-            ...     relative_features=None,  # type: ignore[arg-type]
-            ... )
-            >>> context.num_atoms
-            3
         """
 
         return self.atom_to_token.size(-1)
@@ -204,24 +170,6 @@ class CoordinateDenoiseContext:
         Returns:
             A [`CoordinateDenoisingInput`][ofoldx.modules.diffusion.types.CoordinateDenoisingInput] carrying the
             static conditioning plus this step's ``noisy_coords`` and ``noise_level``.
-
-        Examples:
-            >>> import torch
-            >>> context = CoordinateDenoiseContext(
-            ...     atom_features=torch.zeros(1, 3, 8),
-            ...     atom_to_token=torch.zeros(1, 3, dtype=torch.long),
-            ...     reference_positions=torch.zeros(1, 3, 3),
-            ...     reference_charges=torch.zeros(1, 3),
-            ...     reference_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     atom_mask=torch.ones(1, 3, dtype=torch.bool),
-            ...     token_embedding=torch.zeros(1, 2, 4),
-            ...     single=torch.zeros(1, 2, 4),
-            ...     pair=torch.zeros(1, 2, 2, 4),
-            ...     relative_features=None,  # type: ignore[arg-type]
-            ... )
-            >>> inputs = context.to_denoising_input(torch.zeros(1, 1, 3, 3), torch.zeros(1, 1))
-            >>> tuple(inputs.noisy_coords.shape)
-            (1, 1, 3, 3)
         """
 
         return CoordinateDenoisingInput(

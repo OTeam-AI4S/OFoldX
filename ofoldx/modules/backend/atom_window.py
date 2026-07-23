@@ -5,8 +5,8 @@ Three closely related index-driven operators move features between the atom axis
 ``atom_to_token_mean`` (masked segmented mean of atom features onto tokens), ``token_to_atom_broadcast``
 (gather each atom's token row), and ``token_pair_to_atom_window_gather`` (gather token-pair features into
 atom-local pair windows). Each dispatcher owns the OOps call and a pure-torch eager
-reference numerically equivalent to the OOps-owned implementation. Modules pass normalized inputs plus their requested
-``operator_backend`` and never branch on the backend themselves.
+implementation with the same tensor contract. Modules pass normalized inputs plus
+their requested ``operator_backend`` and never branch on the backend themselves.
 """
 
 from __future__ import annotations
@@ -76,8 +76,8 @@ def atom_to_token_mean(
             atom_mask=atom_mask,
             eps=eps,
         )
-    # Eager reference mirrors oops._atom_to_token_mean_index: masked scatter-add of values into token slots,
-    # divided by the masked per-token count floored at eps (empty tokens stay zero).
+    # Scatter-add values into token slots, then divide by the masked per-token count floored at eps.
+    # Empty tokens stay zero.
     index = atom_to_token
     values = atom if atom_mask is None else atom * atom_mask.to(dtype=atom.dtype).unsqueeze(-1)
     scatter_index = index.unsqueeze(-1).expand(*index.shape, atom.shape[-1])
@@ -121,8 +121,7 @@ def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_ba
     )
     if backend == "oops":
         return _oops_token_to_atom_broadcast(token, atom_to_token)
-    # Eager reference mirrors oops._token_to_atom_broadcast_index (batched branch): gather the token row for
-    # every atom along the token axis.
+    # Gather the token row for every atom along the token axis.
     gather_idx = atom_to_token.unsqueeze(-1).expand(*atom_to_token.shape, token.shape[-1])
     return token.gather(-2, gather_idx)
 
@@ -176,9 +175,8 @@ def token_pair_to_atom_window_gather(
             n_keys=n_keys,
             num_valid_atoms=num_valid_atoms,
         )
-    # Eager reference mirrors oops._token_pair_to_atom_window_gather_torch: build the per-window query/key token
-    # indices (zero-padded past the atom range, or clamped/shifted inwards when num_valid_atoms is set) and
-    # gather token_pair[..., query, key, :].
+    # Build per-window query/key token indices (zero-padded past the atom range, or clamped and shifted
+    # inward when num_valid_atoms is set), then gather token_pair[..., query, key, :].
     query_indices, key_indices = _local_indices(atom_to_token, n_queries, n_keys, num_valid_atoms)
     prefix = tuple(token_pair.shape[:-3])
     blocks = query_indices.shape[-2]
@@ -201,8 +199,8 @@ def _local_indices(
 
     Splits the atoms into ``ceil(N_atom / n_queries)`` blocks and, for each block, records the token
     index of every query atom and of the ``n_keys`` atoms in the key window. With ``num_valid_atoms`` unset
-    the key window is the fixed centered window, zero-padded past the atom range (matching the OOps implementation).
-    With ``num_valid_atoms`` given (and ``>= n_keys``) the DeepMind AF3 clamped/shifted window is used, so
+    the key window is fixed and centered, with zeros beyond the atom range. With ``num_valid_atoms`` given
+    (and ``>= n_keys``), the window is clamped and shifted inward so
     every key is a real atom and the pair-bias windows match the attention key gather.
 
     Args:

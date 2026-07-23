@@ -15,14 +15,12 @@ def key_window_starts(
     num_windows: int, num_query_atoms: int, num_key_atoms: int, num_valid_atoms: int, device: torch.device
 ) -> Tensor:
     r"""
-    Per-window start offset of the DeepMind AF3 clamped/shifted key neighbourhood.
+    Return per-window start offsets for clamped key neighborhoods.
 
     Each key window is centred on its query window (``num_query_atoms`` wide) and reaches
     ``(num_key_atoms - num_query_atoms) / 2`` atoms to either side, then is **shifted inwards** so it
-    lies fully inside the ``[0, num_valid_atoms)`` real-atom range (upstream
-    ``AtomCrossAtt.compute_features``: ``if left < 0: shift right`` / ``elif right > num_atoms-1: shift left``).
-    Boundary windows therefore keep a full ``num_key_atoms`` of *real* keys instead of padding, which is what
-    the released model attends over. Requires ``num_valid_atoms >= num_key_atoms``.
+    lies fully inside the ``[0, num_valid_atoms)`` real-atom range. Boundary windows therefore keep a full
+    ``num_key_atoms`` of real keys instead of padding. Requires ``num_valid_atoms >= num_key_atoms``.
 
     Args:
         num_windows: Number of query windows.
@@ -47,8 +45,8 @@ def gather_key_windows(
 
     With ``num_valid_atoms`` unset (or below ``num_key_atoms``) the fixed zero-padded window is used:
     a strided ``unfold`` view (O(N), no matmul) equivalent to a one-hot indexing-matrix einsum, with slots
-    past the atom range read as zero. With ``num_valid_atoms`` given (and ``>= num_key_atoms``) the DeepMind
-    AF3 **clamped/shifted** window is used instead: boundary windows are slid inwards so every key is a real
+    past the atom range read as zero. With ``num_valid_atoms`` given (and ``>= num_key_atoms``), a
+    **clamped/shifted** window is used instead: boundary windows are slid inwards so every key is a real
     atom (see [`key_window_starts`][ofoldx.modules.atom.window.key_window_starts]).
 
     Args:
@@ -87,7 +85,7 @@ class LocalAtomWindowInfo:
     Records how the atom axis was padded to fill whole windows and which query/key positions are
     real, so downstream attention can mask out the padded slots without re-deriving them.
 
-    Attributes:
+    Args:
         attention_mask: `[..., N_window, num_query_atoms, num_key_atoms]` boolean mask; ``True``
             where both the query and key atom of a window slot are real (not padding).
         query_padding: Number of padded query atoms appended to reach a whole number of windows.
@@ -114,7 +112,7 @@ class LocalAtomWindows:
     r"""
     Query and key windows carved from a single atom-axis tensor, plus their padding metadata.
 
-    Attributes:
+    Args:
         query: `[..., N_window, num_query_atoms, C]` non-overlapping query windows.
         key: `[..., N_window, num_key_atoms, C]` overlapping key neighbourhoods, one per query window.
         info: Padding and mask metadata for the windows.
@@ -137,7 +135,7 @@ class LocalAtomGeometry:
     r"""
     Windowed atom-pair geometry (displacements and same-space mask) for atom attention blocks.
 
-    Attributes:
+    Args:
         distance_vectors: `[..., N_window, num_query_atoms, num_key_atoms, 3]` canonical
             query-minus-key displacement vectors.
         distance_mask: `[..., N_window, num_query_atoms, num_key_atoms, 1]` mask that is one where
@@ -192,7 +190,7 @@ class LocalAtomGeometryBuilder(nn.Module):
         Args:
             reference_positions: ``[..., N_atom, 3]`` reference coords.
             reference_space_id: ``[..., N_atom]`` reference-space ids.
-            num_valid_atoms: Number of real atoms; enables the DeepMind clamped key window (see
+            num_valid_atoms: Number of real atoms; enables the clamped key window (see
                 [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]).
 
         Returns:
@@ -263,7 +261,7 @@ class LocalAtomWindowing(nn.Module):
         Args:
             tensor: ``[..., N_atom, C]`` atom-axis tensor.
             num_valid_atoms: Number of real atoms (contiguous at the front). When given (and
-                ``>= num_key_atoms``) the DeepMind AF3 clamped/shifted key window is used, so boundary
+                ``>= num_key_atoms``), a clamped/shifted key window is used, so boundary
                 windows carry a full ``num_key_atoms`` of real keys; otherwise the fixed zero-padded window
                 is used. See [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows].
 

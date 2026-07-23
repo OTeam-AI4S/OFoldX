@@ -1,14 +1,10 @@
 r"""Task-specific ESMFold2 folding and binder-design Pipelines.
 
-``EsmFold2Pipeline`` binds the released Model/Processor pair and exposes only ``fold``.
+``EsmFold2Pipeline`` binds the folding Model/Processor pair and exposes ``fold``.
 ``EsmFold2DesignPipeline`` binds the experimental recurrent graph and exposes only
 ``design``; its repository also owns the ESMC masked-LM child used by the objective.
 The design implementation performs gradient descent on per-position soft-sequence logits,
-then discretely refolds each candidate into an ``EsmFold2DesignResult``. Upstream provenance:
-``biohub_esm/cookbook/tutorials/binder_design.py`` (Algorithm 11 gradient-guided sequence
-optimisation L828, Algorithm 12 contact losses L260, Algorithm 13 globularity L323,
-Algorithm 14 ESMC pseudo-perplexity sequence regulariser L715, Algorithm 15 distogram ipTM
-proxy L423, binder prompt ``'#'`` mutable positions L110).
+then discretely refolds each candidate into an ``EsmFold2DesignResult``.
 """
 
 from __future__ import annotations
@@ -27,11 +23,11 @@ import torch
 import torch.nn.functional as F
 from typing_extensions import Self
 
-from ...hub import load_json_object, resolve_repository, upload_repository
 from ...artifacts import save_model
 from ...data.evidence import MSA, MSACollection
-from ...data.molecular import MolecularSystem, PolymerSequence, restype_3to1
+from ...data.molecular import AMINO_ACID_THREE_TO_ONE, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...hub import load_json_object, resolve_repository, upload_repository
 from ...pipelines import PIPELINES, PairedPipeline, resolve_generator
 from ...references import classify_reference
 from ...results import FoldResult, Metric, PairMetric, Score
@@ -46,8 +42,9 @@ from .model import (
 from .processor import EsmFold2ExperimentalProcessor, EsmFold2Processor, antibody_cdr_indices
 
 # 20-dim design amino-acid space, ordered ALA..VAL (residue-type ids 2..21 minus 2), the
-# offset the experimental trunk one-hot uses; ``F.pad(design, (2, 11))`` lifts it to the
-# 33-class ``residue_type`` space (2 leading pad/gap slots, 11 trailing nucleic slots).
+# offset used by the experimental trunk's residue-type features. ``F.pad(design, (2, 11))``
+# lifts it to the 33-class ``residue_type`` space (2 leading pad/gap slots, 11 trailing
+# nucleic slots).
 _AA3_ORDER = (
     "ALA",
     "ARG",
@@ -70,33 +67,27 @@ _AA3_ORDER = (
     "TYR",
     "VAL",
 )
-_AA1_TO_IDX = {restype_3to1[three]: index for index, three in enumerate(_AA3_ORDER)}
-_IDX_TO_AA1 = {index: restype_3to1[three] for index, three in enumerate(_AA3_ORDER)}
+_AMINO_ACID_TO_INDEX = {AMINO_ACID_THREE_TO_ONE[three]: index for index, three in enumerate(_AA3_ORDER)}
+_INDEX_TO_AMINO_ACID = {index: AMINO_ACID_THREE_TO_ONE[three] for index, three in enumerate(_AA3_ORDER)}
 _AA_DIMS = 20
-_CYS_IDX = _AA1_TO_IDX["C"]
+_CYSTEINE_INDEX = _AMINO_ACID_TO_INDEX["C"]
 _MUTABLE_TOKEN = "#"
 
-# Algorithm 11 optimisation constants (binder_design.py L91-L96).
+# Binder-design optimization constants.
 _LOSS_WEIGHTS = {"intra_contact": 0.5, "inter_contact": 0.5, "glob": 0.2}
 _LEARNING_RATE = 0.1
 _TEMPERATURE_MIN = 1e-2
 
-# Algorithm 14 ESMC pseudo-perplexity sequence-regulariser mask sampling constants
-# (binder_design.py L96-L98, L764). The gradient weight blending this masked-LM sequence prior
-# into the structure objective is not here: it is the fixed released hyperparameter
-# ``EsmFold2ExperimentalConfig.language_model_weight`` (0.15 general binder / 0.05 antibody
-# framework), read by ``design`` at construction, never selected at runtime.
+# ESMC pseudo-perplexity regularizer mask-sampling constants. The gradient weight blending
+# this masked-LM prior into the structure objective is stored in
+# ``EsmFold2ExperimentalConfig.language_model_weight`` and is not selected per call.
 _ESMC_MASK_FRACTION = 0.15
 _LM_MASK_PASSES = 4
 _LM_LOSS_CHUNK = 128
 
 
 class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
-    r"""Run released ESMFold2 structure prediction.
-
-    Marker id ``"ofoldx.esmfold2"`` and task ``"fold"``. Repository persistence,
-    placement, and the exact Model-Processor pairing come from ``PairedPipeline``.
-    """
+    r"""Bind the ESMFold2 Model and Processor for structure prediction."""
 
     def fold(
         self,
@@ -118,11 +109,40 @@ class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
         step_scale: float | None = None,
         denoising_early_exit_rmsd: float | None = None,
     ) -> FoldResult:
-        r"""Lower one folding input and run released ESMFold2 folding into a ``FoldResult``.
+        r"""Fold one canonical input with ESMFold2.
 
-        Forwards every effective released inference control to ``EsmFold2Model.fold``; the
-        Fast variant rejects ``msa`` at the paired Processor boundary. ``Structure`` inputs
-        contribute their canonical molecular system; observed coordinates are not features.
+        Args:
+            input: Sequence text or FASTA path, one or more ``PolymerSequence`` values, a
+                ``MolecularSystem``, or a ``Structure``. Structure coordinates are not used.
+            msa: Optional MSA evidence. Single-sequence Fast checkpoints reject this argument.
+            num_samples: Number of diffusion samples and returned predictions.
+            seed: Optional integer seed, mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator, mutually exclusive with ``seed``.
+            recycling_steps: Trunk refinement loops. ``None`` uses the model's configured value.
+            num_sampling_steps: Karras diffusion schedule steps. ``None`` uses the model's
+                configured value.
+            language_model_mask_probability: Probability of masking each non-special ESMC token.
+                ``None`` uses the model's configured value.
+            language_model_dropout: Per-loop ESMC pair-feature dropout override. ``None`` uses
+                the model's configured behavior; ``0`` disables dropout.
+            msa_max_depth: Maximum MSA depth when inference subsampling is enabled. ``None`` keeps
+                all rows.
+            msa_column_mask_rate: Probability of masking a column from non-query MSA rows.
+            msa_subsample_at_inference: Whether to resample MSA rows up to ``msa_max_depth`` in
+                each recycling loop.
+            max_inference_sigma: Maximum inference sigma used to truncate the sampling schedule.
+                ``None`` keeps the full configured schedule.
+            noise_scale: Per-call sampler noise-scale override. ``None`` uses the configured value.
+            step_scale: Per-call sampler step-scale override. ``None`` uses the configured value.
+            denoising_early_exit_rmsd: Optional aligned-RMSD convergence threshold for ending
+                denoising early.
+
+        Returns:
+            A ``FoldResult`` containing one canonical prediction per diffusion sample.
+
+        Notes:
+            MSA column masking is sampled once per call, while row subsampling is resampled in
+            each recycling loop. Sigma truncation and RMSD convergence can reduce denoising work.
         """
 
         batch = self.processor(input, msa=msa)
@@ -146,12 +166,7 @@ class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
 
 
 class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2ExperimentalProcessor]):
-    r"""Run experimental ESMFold2 binder design with its persisted ESMC child.
-
-    Marker id ``"ofoldx.esmfold2_design"`` and task ``"design"``. The root pair is
-    architecture ``"ofoldx.esmfold2_experimental"``; ``esmc/`` stores the exact
-    MultiMolecule masked-LM model and tokenizer used by the design objective.
-    """
+    r"""Run ESMFold2 binder design with its persisted ESMC masked-LM child."""
 
     @classmethod
     def from_repository(
@@ -163,7 +178,18 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Restore the experimental head and its ESMC masked-LM child."""
+        r"""Load the design Pipeline and its ESMC masked-LM child.
+
+        Args:
+            repository: Local directory or Hub repository id.
+            revision: Optional Hub revision.
+            token: Optional Hub authentication token.
+            device: Device for the loaded Models and Processor.
+            dtype: Floating-point dtype for loaded Models and Processor.
+
+        Returns:
+            An ``EsmFold2DesignPipeline`` with the masked-LM child attached.
+        """
 
         from multimolecule import AutoTokenizer, ProteinTokenizer
         from transformers import AutoModelForMaskedLM
@@ -200,7 +226,16 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         private: bool = False,
         commit_message: str | None = None,
     ) -> None:
-        r"""Persist the experimental root pair, ESMC child, tokenizer, and marker."""
+        r"""Save the design pair, ESMC child, tokenizer, and pipeline metadata.
+
+        Args:
+            directory: Local repository directory.
+            max_shard_size: Maximum size of each model-weight shard.
+            repo_id: Optional Hub repository receiving the saved directory.
+            token: Optional Hub authentication token.
+            private: Whether a newly created Hub repository is private.
+            commit_message: Optional Hub commit message.
+        """
 
         from huggingface_hub import save_torch_state_dict
 
@@ -262,35 +297,29 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> EsmFold2DesignResult:
-        r"""Design binders against one target and refold each into an ``EsmFold2DesignResult``.
+        r"""Design and refold binder candidates against one single-chain protein target.
 
-        Runs Algorithm 11: gradient descent on per-position soft-sequence logits through the
-        experimental recurrent graph under a cosine temperature schedule. ``binder_prompt``
-        fixes amino acids at positions and marks mutable positions with ``'#'``
-        (``binder_design.py`` L110); ``None`` makes every position mutable. Cysteines are
-        excluded from the mutable search when ``remove_cysteines`` is set. Each candidate's
-        best-scoring sequence (Algorithm 15 distogram-ipTM proxy) is discretely refolded with
-        the experimental confidence head; the candidate owns the complete folded
-        ``target|binder`` complex, whose binder length is fixed by ``binder_length`` per call
-        but varies across calls — the coordinate-producing, variable-length property carried
-        by ``EsmFold2DesignResult``.
+        Args:
+            target: One-letter sequence, FASTA path, ``Structure``, or ``MolecularSystem``
+                resolving to one protein chain.
+            binder_length: Number of residues in each designed binder.
+            binder_prompt: Optional prompt of length ``binder_length``. One-letter amino acids
+                fix positions and ``'#'`` marks mutable positions; ``None`` makes every position
+                mutable. ``antibody_cdr_prompt`` can construct a CDR-only prompt.
+            num_candidates: Number of independently optimized and refolded candidates.
+            num_optimization_steps: Gradient optimization steps per candidate.
+            remove_cysteines: Whether to exclude cysteine from mutable positions.
+            seed: Optional integer seed, mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator, mutually exclusive with ``seed``.
 
-        When the bound model carries an attached ESMC masked-LM head (``load_esmc`` given an
-        ``EsmCForMaskedLM``), the released ESMC pseudo-perplexity sequence regulariser
-        (Algorithm 14) is added to the structure objective at the fixed released gradient
-        weight ``EsmFold2ExperimentalConfig.language_model_weight`` (a construction-time
-        hyperparameter, read here, never selected at runtime). A nonzero weight therefore
-        requires an attached masked-LM head; the algorithm never silently drops that term.
+        Returns:
+            An ``EsmFold2DesignResult`` containing the generation-ordered folded candidates.
 
-        The design is mode-agnostic: it optimises exactly the mutable ``'#'`` positions of
-        ``binder_prompt`` (the design mask) and never inspects what kind of binder it is. A
-        de-novo single-chain binder (every position mutable) and a CDR-only antibody Fv
-        (framework fixed, CDR loops mutable) are the same call — they differ only in the
-        input-level design mask and in the ``language_model_weight`` the bound model was
-        constructed with (``0.15`` general binder, ``0.05`` antibody framework). Build an
-        antibody CDR mask from a full Fv with
-        [`antibody_cdr_prompt`][ofoldx.models.esmfold2.processor.antibody_cdr_prompt] and pass
-        it as ``binder_prompt``.
+        Notes:
+            Optimization updates soft residue logits at mutable positions, retains each
+            candidate's best distogram-ipTM proxy, and refolds the resulting discrete sequence.
+            The optional masked-LM gradient uses the Model's ``language_model_weight``; a nonzero
+            weight requires an attached masked-LM head.
         """
 
         if binder_length <= 0:
@@ -304,14 +333,13 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             raise ValueError("binder_prompt length must equal binder_length")
 
         model = self.model
-        # The Algorithm 14 sequence-prior weight is the fixed released hyperparameter carried by
-        # the construction-time config (0.15 general binder / 0.05 antibody framework); design
-        # reads it and never selects it from the input's nature.
+        # The sequence-prior weight is fixed by the Model configuration rather than inferred from
+        # the target or prompt.
         language_model_weight = model.config.language_model_weight
         if language_model_weight != 0 and model.esmc_lm_head is None:
             raise RuntimeError("binder design with a nonzero language_model_weight requires an EsmCForMaskedLM")
         processor = self.processor
-        base_generator = resolve_generator(seed, generator, device=model.z_init_1.weight.device)
+        base_generator = resolve_generator(seed, generator, device=model.left_pair_projection.weight.device)
         with _frozen_eval(model):
             return self._run_design(
                 model=model,
@@ -340,12 +368,12 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         language_model_weight: float,
         generator: torch.Generator | None,
     ) -> EsmFold2DesignResult:
-        device = model.z_init_1.weight.device
+        device = model.left_pair_projection.weight.device
 
         target_sequence = _target_one_letter(target)
         target_length = len(target_sequence)
         target_batch = processor(PolymerSequence.from_one_letter(target_sequence))
-        target_soft = F.one_hot(target_batch.residue_type.long(), num_classes=33).float().to(device)
+        target_residue_type_features = F.one_hot(target_batch.residue_type.long(), num_classes=33).float().to(device)
 
         candidates: list[EsmFold2DesignCandidate] = []
         for _ in range(num_candidates):
@@ -360,14 +388,14 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
                 optimizer.zero_grad()
                 design = F.softmax(logits / temperature, dim=-1)
-                binder_sequence = "".join(_IDX_TO_AA1[int(i)] for i in design.argmax(dim=-1)[0])
+                binder_sequence = "".join(_INDEX_TO_AMINO_ACID[int(i)] for i in design.argmax(dim=-1)[0])
                 batch = processor(
                     [
                         PolymerSequence.from_one_letter(target_sequence),
                         PolymerSequence.from_one_letter(binder_sequence),
                     ]
                 )
-                residue_type_probabilities = torch.cat([target_soft, F.pad(design, (2, 11))], dim=1)
+                residue_type_probabilities = torch.cat([target_residue_type_features, F.pad(design, (2, 11))], dim=1)
 
                 output = model.forward(
                     batch,
@@ -383,10 +411,8 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
                 structure_grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
                 combined_grad = _normalized_gradient(structure_grad, gradient_mask)
 
-                # Algorithm 14 ESMC pseudo-perplexity sequence regulariser: added to the
-                # structure objective whenever a masked-LM head is attached (the released
-                # configuration). Each gradient is length-normalised over the mutable
-                # positions before the weighted sum, matching binder_design.py L948-L950.
+                # Add the ESMC pseudo-perplexity regularizer whenever a masked-LM head is attached.
+                # Each gradient is length-normalized over mutable positions before summation.
                 if model.esmc_lm_head is not None:
                     design_lm = F.softmax(logits / temperature, dim=-1)
                     score_mask = gradient_mask.sum(dim=-1) > 0
@@ -446,12 +472,12 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             if symbol == _MUTABLE_TOKEN:
                 logits[:, i, :] = noise[:, i, :]
                 if remove_cysteines:
-                    logits[:, i, _CYS_IDX] = -1e6
-                    mask[:, i, _CYS_IDX] = 0.0
+                    logits[:, i, _CYSTEINE_INDEX] = -1e6
+                    mask[:, i, _CYSTEINE_INDEX] = 0.0
             else:
-                if symbol not in _AA1_TO_IDX:
+                if symbol not in _AMINO_ACID_TO_INDEX:
                     raise ValueError(f"binder_prompt symbol {symbol!r} is not a standard amino acid or '#'")
-                logits[:, i, _AA1_TO_IDX[symbol]] = 10.0
+                logits[:, i, _AMINO_ACID_TO_INDEX[symbol]] = 10.0
                 mask[:, i, :] = 0.0
         return logits.requires_grad_(True), mask
 
@@ -514,7 +540,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
         layout = input.layout
         atom_count = len(layout.atom_sites)
-        raw_coordinates = output["sample_atom_coords"][0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+        raw_coordinates = output["coordinates"][0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
@@ -559,7 +585,7 @@ def _target_one_letter(target: str | PathLike[str] | Structure | MolecularSystem
         proteins = [entity for entity in entities if entity.polymer_type == "protein"]
         if len(proteins) != 1:
             raise NotImplementedError("ESMFold2 design targets one single-chain protein target")
-        return "".join(restype_3to1[component.component_id] for component in proteins[0].components)
+        return "".join(AMINO_ACID_THREE_TO_ONE[component.component_id] for component in proteins[0].components)
 
     classified = classify_reference(cast(str | PathLike[str], target))
     if isinstance(classified, Path):
@@ -573,43 +599,47 @@ def _target_one_letter(target: str | PathLike[str] | Structure | MolecularSystem
 
 
 @cache
-def _lm_aa_layout() -> tuple[int, int, tuple[int, ...]]:
+def _language_model_amino_acid_layout() -> tuple[int, int, tuple[int, ...]]:
     r"""Locate the 20 standard amino acids in the MultiMolecule ESMC vocabulary.
 
-    Returns ``(aa_lo, aa_hi, permutation)`` where ``aa_lo:aa_hi`` is the contiguous vocab
-    block holding the 20 standard amino acids and ``permutation[ft_idx]`` is the column of
-    the folding-trunk amino acid ``ft_idx`` (``_AA3_ORDER`` order) inside that block. This is
-    the folding-trunk-to-LM vocabulary permutation of Algorithm 14
-    (``_folding_trunk_to_lm_aa_vocab_matrix``), derived from the ESMC tokenizer rather than
-    hard-coded — the released reference targets the BioHub ESMC alphabet (amino acids at
-    ids 4:24) whereas MultiMolecule ESMC places them at ids 6:26.
+    Returns ``(amino_acid_start, amino_acid_stop, permutation)`` where the returned range is the
+    contiguous vocabulary block holding the 20 standard amino acids and
+    ``permutation[folding_trunk_index]`` is the column of the folding-trunk amino acid
+    ``folding_trunk_index`` (``_AA3_ORDER`` order) inside that block. The permutation is derived
+    from the tokenizer rather than assuming fixed vocabulary ids.
     """
 
     from multimolecule import ProteinTokenizer
 
     vocabulary = ProteinTokenizer().get_vocab()
-    amino_acid_ids = {amino_acid: vocabulary[amino_acid] for amino_acid in _IDX_TO_AA1.values()}
-    aa_lo = min(amino_acid_ids.values())
-    aa_hi = max(amino_acid_ids.values()) + 1
-    if aa_hi - aa_lo != _AA_DIMS:
+    amino_acid_token_indices = {amino_acid: vocabulary[amino_acid] for amino_acid in _INDEX_TO_AMINO_ACID.values()}
+    amino_acid_start = min(amino_acid_token_indices.values())
+    amino_acid_stop = max(amino_acid_token_indices.values()) + 1
+    if amino_acid_stop - amino_acid_start != _AA_DIMS:
         raise ValueError("ESMC standard amino-acid vocabulary ids are not contiguous")
-    lm_order = [amino_acid for amino_acid, _ in sorted(amino_acid_ids.items(), key=lambda item: item[1])]
-    permutation = tuple(lm_order.index(_IDX_TO_AA1[index]) for index in range(_AA_DIMS))
-    return aa_lo, aa_hi, permutation
+    language_model_order = [
+        amino_acid
+        for amino_acid, _ in sorted(
+            amino_acid_token_indices.items(),
+            key=lambda item: item[1],
+        )
+    ]
+    permutation = tuple(language_model_order.index(_INDEX_TO_AMINO_ACID[index]) for index in range(_AA_DIMS))
+    return amino_acid_start, amino_acid_stop, permutation
 
 
-def _folding_trunk_to_lm_aa_matrix(device: torch.device) -> torch.Tensor:
+def _folding_trunk_to_language_model_amino_acid_matrix(device: torch.device) -> torch.Tensor:
     r"""``[20, 20]`` permutation from folding-trunk amino-acid order to ESMC LM order."""
 
-    _, _, permutation = _lm_aa_layout()
+    _, _, permutation = _language_model_amino_acid_layout()
     matrix = torch.zeros(_AA_DIMS, _AA_DIMS, device=device)
-    for ft_index, lm_index in enumerate(permutation):
-        matrix[ft_index, lm_index] = 1.0
+    for folding_trunk_index, language_model_index in enumerate(permutation):
+        matrix[folding_trunk_index, language_model_index] = 1.0
     return matrix
 
 
-def _one_hot_from_probs(probs: torch.Tensor) -> torch.Tensor:
-    return F.one_hot(torch.argmax(probs, dim=-1), num_classes=probs.size(-1)).to(probs.dtype)
+def _hard_categorical_probabilities(probabilities: torch.Tensor) -> torch.Tensor:
+    return F.one_hot(torch.argmax(probabilities, dim=-1), num_classes=probabilities.size(-1)).to(probabilities.dtype)
 
 
 def _straight_through(discrete: torch.Tensor, continuous: torch.Tensor) -> torch.Tensor:
@@ -628,15 +658,15 @@ def _esmc_pseudo_perplexity_nll(
     mask_fraction: float = _ESMC_MASK_FRACTION,
     chunk_size: int = _LM_LOSS_CHUNK,
 ) -> torch.Tensor:
-    r"""Algorithm 14 — approximate ESMC pseudo-perplexity NLL of a soft designed sequence.
+    r"""Approximate ESMC pseudo-perplexity NLL of a soft designed sequence.
 
     ``design`` is ``[B, L, 20]`` soft amino-acid probabilities in folding-trunk order (the
     binder's per-position softmax). ``score_mask`` is ``[B, L]`` marking the mutable
-    positions eligible for masking. Builds a differentiable one-hot ESMC input (with a
+    positions eligible for masking. Builds a differentiable categorical ESMC input (with a
     straight-through discretisation), samples ``n_passes`` random ``mask_fraction`` masks over
     the mutable positions, and returns the per-sample mean masked-token NLL of the designed
     distribution under the frozen ESMC masked-LM head. Gradient flows back to ``design``
-    through the frozen trunk, giving the released sequence-naturalness prior.
+    through the frozen trunk, giving a differentiable sequence-naturalness prior.
     """
 
     device = design.device
@@ -647,17 +677,28 @@ def _esmc_pseudo_perplexity_nll(
     esmc_config = model.config.esmc
     vocabulary_size = esmc_config.vocab_size
     embed_dtype = esmc.get_input_embeddings().weight.dtype
-    aa_lo, aa_hi, _ = _lm_aa_layout()
-    folding_trunk_to_lm = _folding_trunk_to_lm_aa_matrix(device)
+    amino_acid_start, amino_acid_stop, _ = _language_model_amino_acid_layout()
+    folding_trunk_to_language_model = _folding_trunk_to_language_model_amino_acid_matrix(device)
 
     batch_size, binder_length = design.shape[0], design.shape[1]
-    target_esm = design @ folding_trunk_to_lm
-    input_esm = _straight_through(_one_hot_from_probs(target_esm), target_esm)
+    target_language_model_probabilities = design @ folding_trunk_to_language_model
+    input_language_model_probabilities = _straight_through(
+        _hard_categorical_probabilities(target_language_model_probabilities),
+        target_language_model_probabilities,
+    )
 
-    input_onehot = torch.zeros(batch_size, binder_length + 2, vocabulary_size, dtype=embed_dtype, device=device)
-    input_onehot[:, 0, esmc_config.bos_token_id] = 1
-    input_onehot[:, -1, esmc_config.eos_token_id] = 1
-    input_onehot[:, 1:-1, aa_lo:aa_hi] = input_esm.to(embed_dtype)
+    input_token_probabilities = torch.zeros(
+        batch_size,
+        binder_length + 2,
+        vocabulary_size,
+        dtype=embed_dtype,
+        device=device,
+    )
+    input_token_probabilities[:, 0, esmc_config.bos_token_id] = 1
+    input_token_probabilities[:, -1, esmc_config.eos_token_id] = 1
+    input_token_probabilities[:, 1:-1, amino_acid_start:amino_acid_stop] = input_language_model_probabilities.to(
+        embed_dtype
+    )
 
     if score_mask.ndim == 1:
         score_mask = score_mask.unsqueeze(0).expand(batch_size, -1)
@@ -682,19 +723,28 @@ def _esmc_pseudo_perplexity_nll(
         masked_offsets = random_scores.topk(num_masked, dim=-1, largest=False).indices
         pass_masks = torch.zeros((n_passes, binder_length), dtype=torch.bool, device=device)
         pass_masks[torch.arange(n_passes, device=device)[:, None], position_indices[masked_offsets]] = True
-        masked = input_onehot[sample : sample + 1].repeat(n_passes, 1, 1)
+        masked = input_token_probabilities[sample : sample + 1].repeat(n_passes, 1, 1)
         mask_rows, mask_cols = pass_masks.nonzero(as_tuple=True)
         masked[mask_rows, mask_cols + 1] = mask_token
         all_masked_rows.append(masked)
         all_pass_masks.append(pass_masks)
 
     masked_sequences = torch.cat(all_masked_rows, dim=0)
-    attention_mask = torch.ones(masked_sequences.shape[0], masked_sequences.shape[1], device=device)
+    language_model_mask = torch.ones(
+        masked_sequences.shape[0],
+        masked_sequences.shape[1],
+        device=device,
+    )
     logit_chunks: list[torch.Tensor] = []
     for start in range(0, masked_sequences.shape[0], chunk_size):
         chunk = masked_sequences[start : start + chunk_size]
         logit_chunks.append(
-            compute_esmc_masked_lm_logits(esmc, lm_head, chunk, attention_mask[start : start + chunk_size])
+            compute_esmc_masked_lm_logits(
+                esmc,
+                lm_head,
+                chunk,
+                language_model_mask[start : start + chunk_size],
+            )
         )
     logits = torch.cat(logit_chunks, dim=0)
 
@@ -702,8 +752,12 @@ def _esmc_pseudo_perplexity_nll(
     for sample, pass_masks in enumerate(all_pass_masks):
         start = sample * n_passes
         stop = start + n_passes
-        target_weights = target_esm[sample]
-        log_probs = logits[start:stop].log_softmax(dim=-1)[:, 1:-1, aa_lo:aa_hi]
+        target_weights = target_language_model_probabilities[sample]
+        log_probs = logits[start:stop].log_softmax(dim=-1)[
+            :,
+            1:-1,
+            amino_acid_start:amino_acid_stop,
+        ]
         nlls = -(log_probs * target_weights.to(log_probs.dtype).unsqueeze(0)).sum(dim=-1)
         losses.append(nlls[pass_masks].mean())
     return torch.stack(losses, dim=0)
@@ -748,7 +802,7 @@ def _contact_loss(
     chain_mask: torch.Tensor,
     binder_mask: torch.Tensor,
 ) -> torch.Tensor:
-    r"""Algorithm 12 contact losses — entropy contact with a sequence-separation constraint."""
+    r"""Compute entropy contact loss with a sequence-separation constraint."""
 
     con_loss = _binned_entropy(distogram_logits, bin_distance, cutoff)
     position = torch.arange(distogram_logits.shape[1], device=distogram_logits.device)
@@ -812,7 +866,7 @@ def _binding_confidence_entropy(dgram: torch.Tensor, bin_distance: torch.Tensor,
 
 
 def _distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, binder_length: int) -> float:
-    r"""Algorithm 15 — entropy-of-binding proxy for target|binder ipTM (binder at suffix)."""
+    r"""Return an entropy-of-binding proxy for target-binder ipTM."""
 
     if distogram_logits.ndim == 4:
         distogram_logits = distogram_logits[0]
@@ -827,13 +881,12 @@ def _distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, bi
 
 
 def cdr_distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int, binder_sequence: str) -> float:
-    r"""Algorithm 15 CDR restriction — entropy-of-binding ipTM proxy over the CDR rows only.
+    r"""Return the entropy-of-binding ipTM proxy over CDR rows only.
 
     A structure-derived antibody score: it restricts the binder→target binding-confidence
     entropy of a designed ``target|Fv`` distogram to the Chothia CDR rows of ``binder_sequence``
     (abnumber annotation), the paratope loops that contact the antigen chain (rows
     ``0:target_length``). Returns the same ``[0, 1]`` confidence as ``_distogram_iptm_proxy``.
-    Provenance: binder_design.py L461-L468.
     """
 
     if distogram_logits.ndim == 4:
@@ -851,7 +904,7 @@ def cdr_distogram_iptm_proxy(distogram_logits: torch.Tensor, target_length: int,
 
 
 def _normalized_gradient(grad: torch.Tensor, gradient_mask: torch.Tensor) -> torch.Tensor:
-    r"""Per-sample length-normalised gradient over the mutable positions (binder_design.py L815)."""
+    r"""Return a per-sample length-normalized gradient over mutable positions."""
 
     masked_grad = grad * gradient_mask
     index_has_grad = torch.square(masked_grad).sum(-1) > 0

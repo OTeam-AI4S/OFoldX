@@ -32,6 +32,9 @@ repos:
     rev: v2.1.0
     hooks:
       - id: mypy
+        files: ofoldx
+        pass_filenames: false
+        args: [ofoldx]
         additional_dependencies:
           - types-PyYaml
   - repo: https://github.com/codespell-project/codespell
@@ -43,6 +46,7 @@ repos:
     rev: v4.0.0-alpha.8
     hooks:
       - id: prettier
+        require_serial: true
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
@@ -59,6 +63,7 @@ repos:
       - id: check-xml
       - id: check-toml
       - id: check-yaml
+        exclude: ^docs/mkdocs\.yml$
       - id: debug-statements
       - id: end-of-file-fixer
       - id: fix-byte-order-marker

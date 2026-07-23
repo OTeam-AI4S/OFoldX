@@ -13,18 +13,12 @@ from torch import Tensor, nn
 
 from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import (
-    ChemicalComponent,
-    ComponentReference,
-    MolecularSystem,
-    Molecule,
-    PolymerSequence,
-)
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.mpnn import (
-    MpnnDecoderLayer,
-    MpnnEncoderLayer,
+    MpnnDecoderBlock,
+    MpnnEncoderBlock,
     MpnnRelativePositionEncoding,
     autoregressive_masks,
     cat_neighbors_nodes,
@@ -102,7 +96,7 @@ INVALID_GENERATION_TOKEN_IDS = (
     MIXED_POLYMER_TOKEN_BY_COMPONENT["PAD"],
 )
 # Contiguous generatable token columns per polymer type. RNA shares the DNA columns
-# in the released shared-token mode and owns tokens 26..29 in separate-token mode.
+# in the shared-token mode and owns tokens 26..29 in separate-token mode.
 PROTEIN_GENERATABLE_TOKEN_IDS = tuple(range(0, 20))
 DNA_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
 RNA_SHARED_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
@@ -123,20 +117,20 @@ class NaMpnnModel(Model):
         self.feature_encoder = NaMpnnFeatures(self.config)
         self.node_embedding = nn.Linear(self.config.feature_size, self.config.hidden_size)
         self.edge_embedding = nn.Linear(self.config.feature_size, self.config.hidden_size)
-        self.encoder_layers = nn.ModuleList(
-            MpnnEncoderLayer(self.config.hidden_size, self.config.hidden_size * 2, dropout=self.config.dropout)
-            for _ in range(self.config.num_encoder_layers)
+        self.encoder_blocks = nn.ModuleList(
+            MpnnEncoderBlock(self.config.hidden_size, self.config.hidden_size * 2, dropout=self.config.dropout)
+            for _ in range(self.config.num_encoder_blocks)
         )
         self.token_embedding = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
-        self.decoder_layers = nn.ModuleList(
-            MpnnDecoderLayer(self.config.hidden_size, self.config.hidden_size * 3, dropout=self.config.dropout)
-            for _ in range(self.config.num_decoder_layers)
+        self.decoder_blocks = nn.ModuleList(
+            MpnnDecoderBlock(self.config.hidden_size, self.config.hidden_size * 3, dropout=self.config.dropout)
+            for _ in range(self.config.num_decoder_blocks)
         )
         self.output_projection = nn.Linear(self.config.hidden_size, self.config.vocab_size)
-        self.reset_parameters()
+        self.post_init()
 
-    def reset_parameters(self) -> None:
-        r"""Apply the released Xavier-uniform matrix initialization."""
+    def initialize_parameters(self) -> None:
+        r"""Apply the Xavier-uniform matrix initialization."""
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -173,7 +167,7 @@ class NaMpnnModel(Model):
             residue_mask=repeat(input.residue_mask),
             residue_index=repeat(input.residue_index),
             chain_index=repeat(input.chain_index),
-            polymer_type_ids=repeat(input.polymer_type_ids),
+            polymer_type_index=repeat(input.polymer_type_index),
             protein_mask=repeat(input.protein_mask),
             dna_mask=repeat(input.dna_mask),
             rna_mask=repeat(input.rna_mask),
@@ -243,7 +237,7 @@ class NaMpnnModel(Model):
     ) -> Tensor:
         r"""Draw one causal ranking shared across the sampling evaluation axis.
 
-        The released sampler decodes one biological structure many times with an
+        The sampler decodes one biological structure many times with an
         order shared across the draw axis so tied members stay simultaneous; only
         the multinomial draw differs per sample. Members of a unit share its rank
         and generated units sort after every fixed unit.
@@ -267,7 +261,7 @@ class NaMpnnModel(Model):
         polymer_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the one coordinate encoder shared by every official operation."""
+        r"""Run the one coordinate encoder shared by every operation."""
 
         coordinates = input.atom_coordinates
         protein_noise, dna_noise, rna_noise = polymer_noise
@@ -290,7 +284,7 @@ class NaMpnnModel(Model):
             input.residue_mask,
             input.residue_index,
             input.chain_index,
-            input.polymer_type_ids,
+            input.polymer_type_index,
             input.protein_mask,
             input.dna_mask,
             input.rna_mask,
@@ -300,8 +294,8 @@ class NaMpnnModel(Model):
         mask = input.residue_mask.to(dtype=node_states.dtype)
         attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = mask.unsqueeze(-1) * attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(node_states, edge_states, neighbor_indices, mask, attend_mask)
+        for block in self.encoder_blocks:
+            node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         return node_states, edge_states, neighbor_indices
 
     def _decode_logits(
@@ -326,9 +320,9 @@ class NaMpnnModel(Model):
         )
         forward_context = forward_mask * encoder_context
         mask = residue_mask.to(node_states.dtype)
-        for layer in self.decoder_layers:
+        for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
-            node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+            node_states = block(node_states, backward_mask * decoder_context + forward_context, mask)
         return self.output_projection(node_states)
 
     def _decode_unconditional_logits(
@@ -345,8 +339,8 @@ class NaMpnnModel(Model):
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = mask[:, :, None, None] * encoder_context
         states = node_states
-        for layer in self.decoder_layers:
-            states = layer(states, forward_context, mask)
+        for block in self.decoder_blocks:
+            states = block(states, forward_context, mask)
         return self.output_projection(states)
 
     def encode(
@@ -380,7 +374,7 @@ class NaMpnnModel(Model):
         r"""Return the single teacher-forced differentiable sequence-conditioned pass.
 
         ``decode_protein_first`` and the three polymer coordinate noises are the
-        released training-only augmentation; inference operations never expose
+        training-only augmentation; inference operations never expose
         them. The returned ranks are the exact causal order used.
         """
 
@@ -407,7 +401,7 @@ class NaMpnnModel(Model):
         decode_protein_first: bool,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw the released noised training decode order, protein-first when asked."""
+        r"""Draw the noised training decode order, protein-first when asked."""
 
         device = input.residue_mask.device
         decode_mask = (input.residue_mask & input.design_positions).to(torch.float32)
@@ -529,7 +523,7 @@ class NaMpnnModel(Model):
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = forward_mask * encoder_context
-        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        block_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_blocks]
 
         sequence_tokens = torch.full((num_samples, length), PAD_TOKEN, dtype=torch.long, device=device)
         log_probabilities = node_states.new_zeros(num_samples, length, vocabulary)
@@ -552,7 +546,7 @@ class NaMpnnModel(Model):
                     edge_states,
                     neighbor_indices,
                     token_states,
-                    layer_states,
+                    block_states,
                     backward_mask,
                     forward_context,
                     repeated.residue_mask,
@@ -573,7 +567,7 @@ class NaMpnnModel(Model):
             if global_logit_bias is not None:
                 total = total + global_logit_bias
             # Hard support intersects the combined logit last, before temperature and
-            # the one group draw, matching the released -1e8 pre-softmax masking; a
+            # the one group draw, matching the -1e8 pre-softmax masking; a
             # post-softmax intersection underflows to all-zero support when the top
             # logit is a disallowed token at low temperature.
             total = total.masked_fill(~group_support, float("-inf"))
@@ -621,7 +615,7 @@ class NaMpnnModel(Model):
         edge_states: Tensor,
         neighbor_indices: Tensor,
         token_states: Tensor,
-        layer_states: list[Tensor],
+        block_states: list[Tensor],
         backward_mask: Tensor,
         forward_context: Tensor,
         residue_mask: Tensor,
@@ -634,12 +628,12 @@ class NaMpnnModel(Model):
         forward_slice = forward_context[:, position : position + 1]
         backward_slice = backward_mask[:, position : position + 1]
         mask_slice = residue_mask[:, position : position + 1].to(dtype=token_states.dtype)
-        for layer_index, layer in enumerate(self.decoder_layers):
-            decoder_context = cat_neighbors_nodes(layer_states[layer_index], sequence_edge, neighbor_slice)
-            node_slice = layer_states[layer_index][:, position : position + 1]
-            updated = layer(node_slice, backward_slice * decoder_context + forward_slice, mask_slice)
-            layer_states[layer_index + 1][:, position : position + 1] = updated
-        return self.output_projection(layer_states[-1][:, position])
+        for block_index, block in enumerate(self.decoder_blocks):
+            decoder_context = cat_neighbors_nodes(block_states[block_index], sequence_edge, neighbor_slice)
+            node_slice = block_states[block_index][:, position : position + 1]
+            updated = block(node_slice, backward_slice * decoder_context + forward_slice, mask_slice)
+            block_states[block_index + 1][:, position : position + 1] = updated
+        return self.output_projection(block_states[-1][:, position])
 
     @staticmethod
     def _pair_contribution(
@@ -681,6 +675,29 @@ class NaMpnnModel(Model):
     # ------------------------------------------------------------------
     # Realized design and specificity operations.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _realize_sequence(
+        system: MolecularSystem,
+        component_references: tuple[ComponentReference | None, ...],
+        polymer_types: tuple[str, ...],
+        sampled_tokens: list[int],
+        design_positions: list[bool],
+    ) -> MolecularSystem:
+        r"""Realize one candidate while preserving entity and bond identity."""
+
+        replacements = {
+            reference: get_component(_component_from_token(int(token), polymer_type))
+            for reference, polymer_type, token, selected in zip(
+                component_references,
+                polymer_types,
+                sampled_tokens,
+                design_positions,
+            )
+            if reference is not None and selected
+        }
+        return system.replace_components(replacements)
+
     @torch.inference_mode()
     def design(
         self,
@@ -726,7 +743,7 @@ class NaMpnnModel(Model):
         host_recovery = recovery.detach().cpu().tolist()
         candidates: list[DesignCandidate] = []
         for index in range(num_candidates):
-            system = _realize_system(
+            system = self._realize_sequence(
                 input.structures[0].system,
                 references,
                 polymer_types,
@@ -773,7 +790,7 @@ class NaMpnnModel(Model):
             residue_mask=input.residue_mask,
             residue_index=input.residue_index,
             chain_index=input.chain_index,
-            polymer_type_ids=input.polymer_type_ids,
+            polymer_type_index=input.polymer_type_index,
             protein_mask=input.protein_mask,
             dna_mask=input.dna_mask,
             rna_mask=input.rna_mask,
@@ -835,6 +852,13 @@ class NaMpnnModel(Model):
         return ScoreResult(target=input.structures[0], scores={}, metrics=metrics)
 
 
+def _positive_integer(value: int, name: str) -> int:
+    result = operator.index(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 class NaMpnnFeatures(nn.Module):
     r"""Geometric feature encoder for unified protein/nucleic-acid polymer graphs."""
 
@@ -844,12 +868,12 @@ class NaMpnnFeatures(nn.Module):
         self.num_rbf = config.num_rbf
         self.num_polymer_types = config.num_polymer_types
         self.include_predicted_na_n = config.include_predicted_na_n
-        self.n_idx = MIXED_POLYMER_ATOM_TO_INDEX["N"]
-        self.ca_idx = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
-        self.c_idx = MIXED_POLYMER_ATOM_TO_INDEX["C"]
-        self.o4prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
-        self.c1prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
-        self.c2prime_idx = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
+        self.nitrogen_index = MIXED_POLYMER_ATOM_TO_INDEX["N"]
+        self.alpha_carbon_index = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
+        self.carbonyl_carbon_index = MIXED_POLYMER_ATOM_TO_INDEX["C"]
+        self.oxygen_4_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
+        self.carbon_1_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
+        self.carbon_2_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
         total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
         self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
         self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
@@ -868,7 +892,7 @@ class NaMpnnFeatures(nn.Module):
         residue_mask: Tensor,
         residue_index: Tensor,
         chain_index: Tensor,
-        polymer_type_ids: Tensor,
+        polymer_type_index: Tensor,
         protein_mask: Tensor,
         dna_mask: Tensor,
         rna_mask: Tensor,
@@ -882,24 +906,32 @@ class NaMpnnFeatures(nn.Module):
         dna = dna_mask.to(dtype=dtype)
         rna = rna_mask.to(dtype=dtype)
 
-        ca = atom_coordinates[:, :, self.ca_idx]
-        n_atom = atom_coordinates[:, :, self.n_idx]
-        c_atom = atom_coordinates[:, :, self.c_idx]
-        beta_carbon = virtual_beta_carbon(n_atom, ca, c_atom)
-        reference = atom_coordinates[:, :, self.c1prime_idx]
+        alpha_carbon = atom_coordinates[:, :, self.alpha_carbon_index]
+        nitrogen = atom_coordinates[:, :, self.nitrogen_index]
+        carbonyl_carbon = atom_coordinates[:, :, self.carbonyl_carbon_index]
+        beta_carbon = virtual_beta_carbon(nitrogen, alpha_carbon, carbonyl_carbon)
+        reference = atom_coordinates[:, :, self.carbon_1_prime_index]
         augmented_coordinates = [atom_coordinates, beta_carbon[:, :, None, :]]
         augmented_mask = [atom_mask, protein[:, :, None]]
         if self.include_predicted_na_n:
-            o4prime = atom_coordinates[:, :, self.o4prime_idx]
-            c1prime = atom_coordinates[:, :, self.c1prime_idx]
-            c2prime = atom_coordinates[:, :, self.c2prime_idx]
-            na_n = _virtual_na_n(o4prime, c1prime, c2prime)
-            augmented_coordinates.append(na_n[:, :, None, :])
+            oxygen_4_prime = atom_coordinates[:, :, self.oxygen_4_prime_index]
+            carbon_1_prime = atom_coordinates[:, :, self.carbon_1_prime_index]
+            carbon_2_prime = atom_coordinates[:, :, self.carbon_2_prime_index]
+            predicted_nitrogen = _virtual_na_n(
+                oxygen_4_prime,
+                carbon_1_prime,
+                carbon_2_prime,
+            )
+            augmented_coordinates.append(predicted_nitrogen[:, :, None, :])
             augmented_mask.append((dna + rna).clamp(max=1.0)[:, :, None])
         all_coordinates = torch.cat(augmented_coordinates, dim=-2)
         all_mask = torch.cat(augmented_mask, dim=-1)
 
-        neighbor_indices = nearest_neighbors(ca + reference, valid, self.num_neighbors)[1]
+        neighbor_indices = nearest_neighbors(
+            alpha_carbon + reference,
+            valid,
+            self.num_neighbors,
+        )[1]
         pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
         residue_offset = residue_index[:, :, None] - residue_index[:, None, :]
         residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]
@@ -908,7 +940,10 @@ class NaMpnnFeatures(nn.Module):
         position_features = self.relative_position(residue_offset.long(), same_chain)
         edge_features = self.edge_norm(self.edge_projection(torch.cat((position_features, pair_rbf), dim=-1)))
 
-        polymer_one_hot = F.one_hot(polymer_type_ids, num_classes=self.num_polymer_types).to(dtype=dtype)
+        polymer_one_hot = F.one_hot(
+            polymer_type_index,
+            num_classes=self.num_polymer_types,
+        ).to(dtype=dtype)
         node_features = self.node_norm(self.node_projection(polymer_one_hot))
         return node_features, edge_features, neighbor_indices
 
@@ -938,15 +973,6 @@ def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tens
     return rbf.reshape(coordinates.shape[0], coordinates.shape[1], neighbor_indices.shape[-1], -1)
 
 
-def _positive_integer(value: int, name: str) -> int:
-    r"""Normalize one positive index-valued operation count."""
-
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
-
-
 def _component_from_token(token: int, polymer_type: str) -> str:
     r"""Realize one sampled token as a canonical component under its polymer type."""
 
@@ -965,108 +991,22 @@ def _component_from_token(token: int, polymer_type: str) -> str:
     raise RuntimeError(f"NA-MPNN sampled non-RNA token {token} for an RNA residue")
 
 
-def _realize_system(
-    system: MolecularSystem,
-    component_references: tuple[ComponentReference | None, ...],
-    polymer_types: tuple[str, ...],
-    sampled_tokens: list[int],
-    design_rows: list[bool],
-) -> MolecularSystem:
-    r"""Realize one candidate, partitioning divergent copies into distinct entities.
-
-    Copies within one original entity that realize different sequences are split
-    into distinct output entities; original entities are never merged, and
-    divergent shared instances never raise. Every ``ComponentReference`` and every
-    still-realizable bond is preserved.
-    """
-
-    replacements: dict[ComponentReference, ChemicalComponent] = {}
-    for reference, polymer, token, selected in zip(component_references, polymer_types, sampled_tokens, design_rows):
-        if reference is None or not selected:
-            continue
-        replacements[reference] = get_component(_component_from_token(int(token), polymer))
-    changed_references = frozenset(
-        reference
-        for reference, replacement in replacements.items()
-        if system.component(reference).component_id != replacement.component_id
-    )
-
-    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            realized_by_instance[instance_id] = PolymerSequence(
-                entity.polymer_type,
-                tuple(
-                    replacements.get((instance_id, index), component)
-                    for index, component in enumerate(entity.components)
-                ),
-            )
-        else:
-            realized_by_instance[instance_id] = entity
-
-    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
-        entity_id: [] for entity_id in system.entities
-    }
-    for instance_id, entity_id in system.instances.items():
-        entity = realized_by_instance[instance_id]
-        signature = tuple(component.component_id for component in entity.components)
-        partition = next(
-            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
-            None,
-        )
-        if partition is None:
-            partitions[entity_id].append((signature, entity, [instance_id]))
-        else:
-            partition[2].append(instance_id)
-
-    used_ids = set(system.entities)
-    new_entities: dict[str, PolymerSequence | Molecule] = {}
-    instance_entities: dict[str, str] = {}
-    for entity_id, original in system.entities.items():
-        values = partitions[entity_id]
-        original_signature = tuple(component.component_id for component in original.components)
-        primary_index = next(
-            (index for index, value in enumerate(values) if value[0] == original_signature),
-            0,
-        )
-        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
-            signature, entity, instance_ids = values[partition_index]
-            if partition_index == primary_index:
-                output_id = entity_id
-            else:
-                suffix = 2
-                output_id = f"{entity_id}_{suffix}"
-                while output_id in used_ids:
-                    suffix += 1
-                    output_id = f"{entity_id}_{suffix}"
-                used_ids.add(output_id)
-            new_entities[output_id] = original if signature == original_signature else entity
-            for instance_id in instance_ids:
-                instance_entities[instance_id] = output_id
-    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-
-    candidate = MolecularSystem(new_entities, new_instances)
-    retained_bonds = system.retain_bonds_after_component_mutation(candidate, changed_references)
-    return MolecularSystem(new_entities, new_instances, retained_bonds)
-
-
 # Differentiable training objectives published by NA-MPNN.
 #
-# The released NA-MPNN training surface owns two ordinary per-token losses over the
+# The NA-MPNN training surface owns two ordinary per-token losses over the
 # 33-class protein/DNA/RNA vocabulary. Both consume ``[B, L]`` sequence tokens and
 # ``[B, L, 33]`` vocabulary log probabilities and return the unreduced per-row loss
 # with shape ``sequence_tokens.shape``. The polymer-specific label smoothing
-# distributes its mass only over each row's own polymer restype set. Masked mean,
+# distributes its mass only over each row's own polymer residue-type set. Masked mean,
 # accuracy, PPM injection, and the training command's fixed token aggregate belong
 # to a later Runner and are deliberately excluded here.
 
-# Contiguous vocabulary spans of the released 33-token alphabet. Protein occupies
+# Contiguous vocabulary spans of the 33-token alphabet. Protein occupies
 # tokens 0..20 (twenty amino acids plus UNK), DNA tokens 21..25 (DA/DC/DG/DT/DX),
 # and RNA tokens 26..30 (A/C/G/U/RX); MAS and PAD are never smoothing targets.
-_PROTEIN_RESTYPE_SPAN = (0, 21)
-_DNA_RESTYPE_SPAN = (21, 26)
-_RNA_RESTYPE_SPAN = (26, 31)
+_PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
+_DNA_RESIDUE_TYPE_SPAN = (21, 26)
+_RNA_RESIDUE_TYPE_SPAN = (26, 31)
 _POLYMER_PROTEIN = 0
 _POLYMER_DNA = 1
 _POLYMER_RNA = 2
@@ -1075,15 +1015,15 @@ _POLYMER_RNA = 2
 def smoothed_loss(
     sequence_tokens: Tensor,
     log_probabilities: Tensor,
-    polymer_type_ids: Tensor,
+    polymer_type_index: Tensor,
     *,
     weight: float = 0.1,
 ) -> Tensor:
     r"""Return the per-token polymer-specific label-smoothed cross entropy.
 
     Each row's smoothing mass ``weight`` is distributed uniformly over that row's
-    own polymer restype set (protein 21, DNA 5, RNA 5), and the true column is
-    scaled by ``1 - weight`` before the eps is added, matching upstream NA-MPNN's
+    own polymer residue-type set (protein 21, DNA 5, RNA 5), and the true column is
+    scaled by ``1 - weight`` before the eps is added, matching NA-MPNN's
     ``loss_smoothed``. At ``weight=0`` this reduces to :func:`nll_loss`. The
     result has shape ``sequence_tokens.shape``.
     """
@@ -1098,20 +1038,24 @@ def smoothed_loss(
         mask[span[0] : span[1]] = 1.0
         return mask
 
-    protein_set = span_mask(_PROTEIN_RESTYPE_SPAN)
-    dna_set = span_mask(_DNA_RESTYPE_SPAN)
-    rna_set = span_mask(_RNA_RESTYPE_SPAN)
-    restype_mask = protein_set + dna_set + rna_set
+    protein_set = span_mask(_PROTEIN_RESIDUE_TYPE_SPAN)
+    dna_set = span_mask(_DNA_RESIDUE_TYPE_SPAN)
+    rna_set = span_mask(_RNA_RESIDUE_TYPE_SPAN)
+    residue_type_mask = protein_set + dna_set + rna_set
 
-    target = target * torch.where(restype_mask.bool(), 1.0 - weight, torch.ones((), device=device, dtype=dtype))
+    target = target * torch.where(
+        residue_type_mask.bool(),
+        1.0 - weight,
+        torch.ones((), device=device, dtype=dtype),
+    )
 
-    protein_rows = (polymer_type_ids == _POLYMER_PROTEIN).to(dtype).unsqueeze(-1)
-    dna_rows = (polymer_type_ids == _POLYMER_DNA).to(dtype).unsqueeze(-1)
-    rna_rows = (polymer_type_ids == _POLYMER_RNA).to(dtype).unsqueeze(-1)
+    protein_rows = (polymer_type_index == _POLYMER_PROTEIN).to(dtype).unsqueeze(-1)
+    dna_rows = (polymer_type_index == _POLYMER_DNA).to(dtype).unsqueeze(-1)
+    rna_rows = (polymer_type_index == _POLYMER_RNA).to(dtype).unsqueeze(-1)
     eps = (
-        protein_rows * protein_set * (weight / (_PROTEIN_RESTYPE_SPAN[1] - _PROTEIN_RESTYPE_SPAN[0]))
-        + dna_rows * dna_set * (weight / (_DNA_RESTYPE_SPAN[1] - _DNA_RESTYPE_SPAN[0]))
-        + rna_rows * rna_set * (weight / (_RNA_RESTYPE_SPAN[1] - _RNA_RESTYPE_SPAN[0]))
+        protein_rows * protein_set * (weight / (_PROTEIN_RESIDUE_TYPE_SPAN[1] - _PROTEIN_RESIDUE_TYPE_SPAN[0]))
+        + dna_rows * dna_set * (weight / (_DNA_RESIDUE_TYPE_SPAN[1] - _DNA_RESIDUE_TYPE_SPAN[0]))
+        + rna_rows * rna_set * (weight / (_RNA_RESIDUE_TYPE_SPAN[1] - _RNA_RESIDUE_TYPE_SPAN[0]))
     )
     target = target + eps
     return -(target * log_probabilities).sum(dim=-1)
@@ -1141,7 +1085,7 @@ class NaMpnnInput:
     residue_mask: Tensor
     residue_index: Tensor
     chain_index: Tensor
-    polymer_type_ids: Tensor
+    polymer_type_index: Tensor
     protein_mask: Tensor
     dna_mask: Tensor
     rna_mask: Tensor

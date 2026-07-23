@@ -9,7 +9,6 @@ from os import PathLike
 import numpy as np
 import torch
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
@@ -27,6 +26,7 @@ from ...modules.mpnn import (
     AMINO_ACID_UNKNOWN_TOKEN,
     virtual_beta_carbon,
 )
+from ...processor import Processor
 from .config import LigandMpnnProcessorConfig
 from .model import LigandMpnnInput
 
@@ -88,8 +88,14 @@ _LoweredRows = tuple[
 ]
 
 
-class LigandMpnnProcessor:
-    r"""Lower one canonical protein/context Structure to the released LigandMPNN tensors."""
+class LigandMpnnProcessor(Processor):
+    r"""Lower one canonical protein/context structure to LigandMPNN tensors.
+
+    Args:
+        config: LigandMPNN context options. Defaults to ``LigandMpnnProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -103,21 +109,7 @@ class LigandMpnnProcessor:
         if num_context_atoms < 1:
             raise ValueError("num_context_atoms must be a positive integer")
         self.config = config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -126,13 +118,34 @@ class LigandMpnnProcessor:
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Select the arm from the expression: a path reads first, then one lowering runs."""
+        r"""Lower a PDB path or canonical ``Structure`` to ``LigandMpnnInput``.
+
+        Args:
+            input: Coordinate-bearing canonical ``Structure`` or local PDB path.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with complete backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
+            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+
+        Returns:
+            A single-example ``LigandMpnnInput`` carrying aligned tensors, source structure, and
+            component references.
+
+        Notes:
+            PDB paths are parsed first and then use the same observed-CA row mapping as canonical
+            ``Structure`` inputs.
+        """
 
         if isinstance(input, (str, PathLike)):
             return self.process_pdb(
@@ -140,7 +153,7 @@ class LigandMpnnProcessor:
                 design_positions=design_positions,
                 conditions=conditions,
                 tied_weights=tied_weights,
-                logit_bias=logit_bias,
+                global_logit_bias=global_logit_bias,
                 residue_logit_bias=residue_logit_bias,
                 use_atom_context=use_atom_context,
                 ligand_interface_cutoff=ligand_interface_cutoff,
@@ -153,7 +166,7 @@ class LigandMpnnProcessor:
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=global_logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
@@ -167,17 +180,32 @@ class LigandMpnnProcessor:
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Lower a PDB path exactly as ``processor(read_mpnn_pdb(path), ...)``.
+        r"""Read and lower a PDB path to ``LigandMpnnInput``.
 
-        Chain filtering stays on the shared reader's ``chains`` argument rather than a
-        path-only Processor option; a caller needing it invokes ``read_mpnn_pdb`` directly
-        and passes the resulting Structure.
+        Args:
+            path: Local PDB path parsed by ``read_mpnn_pdb``.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with complete backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
+            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+
+        Returns:
+            A single-example ``LigandMpnnInput`` lowered from the parsed PDB structure.
+
+        Notes:
+            Protein rows and nearest-context axes are identical to ``process_structure`` because
+            this method delegates after parsing.
         """
 
         return self.process_structure(
@@ -185,7 +213,7 @@ class LigandMpnnProcessor:
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=global_logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
@@ -199,13 +227,34 @@ class LigandMpnnProcessor:
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Lower one canonical Structure to the released protein/context tensors."""
+        r"""Lower a canonical ``Structure`` to ``LigandMpnnInput``.
+
+        Args:
+            structure: Coordinate-bearing protein and context structure.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with complete backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
+            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+
+        Returns:
+            A single-example ``LigandMpnnInput`` lowered from the canonical structure.
+
+        Notes:
+            Protein rows follow observed CA sites in ``structure.sites`` order, and
+            ``component_references`` uses the same axis. Each row's context axis contains its
+            nearest nonwater, nonprotein heavy atoms, padded to ``config.num_context_atoms``.
+        """
 
         if not isinstance(structure, Structure):
             raise TypeError("LigandMpnnProcessor.process_structure requires a Structure")
@@ -229,7 +278,7 @@ class LigandMpnnProcessor:
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=global_logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=cutoff,
@@ -269,7 +318,7 @@ class LigandMpnnProcessor:
             for atom_index, atom_id in enumerate(_ATOM37):
                 if atom_id == "OXT":
                     # OXT remains empty so atom37[_RESIDUE_CONTEXT_START:] retains
-                    # the released 32-slot residue-context layout.
+                    # the 32-slot residue-context layout.
                     continue
                 position = coordinate_index.get(AtomSite(site.instance_id, site.component_index, atom_id))
                 if position is not None and bool(observed[position]):
@@ -412,7 +461,7 @@ class LigandMpnnProcessor:
         design_positions: Sequence[ComponentReference] | None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
         tied_weights: Mapping[ComponentReference, float] | None,
-        logit_bias: Tensor | None,
+        global_logit_bias: Tensor | None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
         use_atom_context: bool,
         ligand_interface_cutoff: float,
@@ -436,8 +485,12 @@ class LigandMpnnProcessor:
         row_design = self._lower_design(row_references, row_valid, design_positions)
         tied_group_id_values, tied_groups, restrictions = self._close_conditions(conditions, row_by_reference, length)
         allowed_token_mask = self._lower_allowed(tied_groups, restrictions, row_design, row_component_ids)
-        logit_bias_values = self._lower_logit_bias(
-            logit_bias, residue_logit_bias, row_by_reference, length, tied_groups
+        residue_logit_bias_values = self._lower_logit_bias(
+            global_logit_bias,
+            residue_logit_bias,
+            row_by_reference,
+            length,
+            tied_groups,
         )
         tied_weight_values = self._lower_tied_weights(tied_weights, row_by_reference, tied_groups)
 
@@ -482,7 +535,7 @@ class LigandMpnnProcessor:
             tied_group_ids=torch.tensor(tied_group_id_values, device=self.device, dtype=torch.int64).unsqueeze(0),
             tied_weights=tied_weight_values,
             allowed_token_mask=allowed_token_mask,
-            logit_bias=logit_bias_values,
+            residue_logit_bias=residue_logit_bias_values,
         )
 
     def _lower_design(
@@ -630,7 +683,7 @@ class LigandMpnnProcessor:
 
     def _lower_logit_bias(
         self,
-        logit_bias: Tensor | None,
+        global_logit_bias: Tensor | None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
         row_by_reference: Mapping[ComponentReference, int],
         length: int,
@@ -643,13 +696,13 @@ class LigandMpnnProcessor:
         across a tied group after sparse defaults.
         """
 
-        if logit_bias is None and not residue_logit_bias:
+        if global_logit_bias is None and not residue_logit_bias:
             return None
         bias_values = torch.zeros(1, length, _VOCABULARY, device=self.device, dtype=self.dtype)
-        if logit_bias is not None:
-            converted = logit_bias.to(device=self.device, dtype=self.dtype)
+        if global_logit_bias is not None:
+            converted = global_logit_bias.to(device=self.device, dtype=self.dtype)
             if converted.shape != (_GENERATED_IDENTITIES,):
-                raise ValueError(f"LigandMPNN logit_bias must have shape ({_GENERATED_IDENTITIES},)")
+                raise ValueError(f"LigandMPNN global_logit_bias must have shape ({_GENERATED_IDENTITIES},)")
             bias_values[0, :, :_GENERATED_IDENTITIES] = converted
         if residue_logit_bias:
             for reference, value in residue_logit_bias.items():

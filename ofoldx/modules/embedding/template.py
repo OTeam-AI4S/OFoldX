@@ -26,7 +26,7 @@ class TemplateFeatures:
     be moved between devices/dtypes together and passed through the embedder as one argument. All
     tensors carry a leading ``num_templates`` axis (``[..., num_templates, ...]``).
 
-    Attributes:
+    Args:
         distogram: ``[..., num_templates, N_token, N_token, num_distogram_bins]`` template pair distogram
             features.
         pseudo_beta_mask: ``[..., num_templates, N_token, N_token]`` template pseudo-beta validity mask.
@@ -62,10 +62,10 @@ class TemplateEmbedder(nn.Module):
         num_distogram_bins: Number of distogram bins in the packed template features.
         triangle_attention_hidden_size: Per-head width of template triangle attention.
         num_triangle_attention_heads: Number of template triangle-attention heads.
-        expansion: FFN expansion factor inside each triangle update block.
+        expansion: Transition expansion factor inside each triangle update block.
         dropout: Dropout probability inside each triangle update block.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to the triangle update blocks.
 
     Examples:
@@ -103,7 +103,7 @@ class TemplateEmbedder(nn.Module):
         template_feature_size = num_distogram_bins + 1 + 2 * vocab_size + 3 + 1
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
-        self.norm_pair = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -168,7 +168,7 @@ class TemplateEmbedder(nn.Module):
         if self.num_blocks == 0 or templates.distogram.shape[-4] == 0:
             return pair.new_zeros(pair.shape)
 
-        normalized_pair = self.norm_pair(pair)
+        normalized_pair = self.pair_norm(pair)
         template_updates = []
         for template_index in range(templates.distogram.shape[-4]):
             template_pair = self._single_template_update(

@@ -272,10 +272,15 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
             raise ValueError(f"PDB atom-name rewrite collides within residue {residue_key!r}: {atom_name!r}")
         used_names.add(atom_name)
         altloc_id = ""
-        coordinate = tuple(float(value) for value in structure.coordinates[site_index])
+        x, y, z = structure.coordinates[site_index]
+        coordinate = (float(x), float(y), float(z))
         if any(not np.isfinite(value) or value < -999.999 or value > 9999.999 for value in coordinate):
             raise ValueError("PDB coordinate field range was exceeded")
-        rounded_coordinate = tuple(round(value, 3) for value in coordinate)
+        rounded_coordinate = (
+            round(coordinate[0], 3),
+            round(coordinate[1], 3),
+            round(coordinate[2], 3),
+        )
         if not np.array_equal(np.asarray(rounded_coordinate, dtype=np.float32), structure.coordinates[site_index]):
             rewritten.add("structure.coordinates")
         if structure.occupancy is None or np.isnan(structure.occupancy[site_index]):
@@ -304,7 +309,7 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
                 chain_id=chain_by_instance[site.instance_id],
                 residue_id=residue_id,
                 insertion_code=insertion_code,
-                coordinates=rounded_coordinate,  # type: ignore[arg-type]
+                coordinates=rounded_coordinate,
                 occupancy=round(occupancy, 2),
                 b_factor=round(b_factor, 2),
                 element=chemical_atom.element,

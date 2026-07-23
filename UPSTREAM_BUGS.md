@@ -54,10 +54,10 @@ entered through SMILES or CCD.
 The behavior is reproducible with RDKit:
 
 | SMILES | Upstream SMILES-path value | Molecular weight after sanitization |
-| --- | ---: | ---: |
-| `CC` | 24.022 | 30.070 |
-| `CCC` | 36.033 | 44.097 |
-| `CCO` | 40.021 | 46.069 |
+| ------ | -------------------------: | ----------------------------------: |
+| `CC`   |                     24.022 |                              30.070 |
+| `CCC`  |                     36.033 |                              44.097 |
+| `CCO`  |                     40.021 |                              46.069 |
 
 The incorrect value survives the pickle round-trip used by the upstream molecule
 cache. Updating the property cache or sanitizing the molecule restores the expected
@@ -1765,17 +1765,17 @@ configurations `@AL1` and `@AL2`; see the
 
 In RDKit 2025.09.3, both of these valid inputs parse successfully:
 
-~~~text
+```text
 FC=[C@AL1]=C(Cl)Br
 FC=[C@AL2]=C(Cl)Br
-~~~
+```
 
 For both inputs, every atom has `CHI_UNSPECIFIED`, every bond has `STEREONONE`, and
 isomeric serialization returns the same achiral string:
 
-~~~text
+```text
 FC=C=C(Cl)Br
-~~~
+```
 
 The shorthand allene forms using `@` and `@@` are lost in the same way. The parser
 raises no error or warning that the declared stereochemical distinction has been
@@ -2092,9 +2092,9 @@ does not claim upstream acknowledgement.
 
 Both implementations compute the mean sequence negative log-likelihood as
 
-~~~python
+```python
 sum(loss_per_residue * mask) / (sum(mask) + 1e-8)
-~~~
+```
 
 and publish `exp(-mean_loss)` as confidence. See LigandMPNN
 [`get_score`](https://github.com/dauparas/LigandMPNN/blob/26ec57ac976ade5379920dbd43c7f97a91cf82de/data_utils.py#L219-L233)
@@ -2509,7 +2509,7 @@ This classification does not claim upstream acknowledgement.
 ### Behavior
 
 `compare_chirality` documents its returned Boolean as indicating that a ligand's
-chirality *mismatches* the reference. The implementation stores `_chiral_match(...)`
+chirality _mismatches_ the reference. The implementation stores `_chiral_match(...)`
 directly, whose Boolean is true only when every compared centre matches. Its local
 mapping is correspondingly named `chiral_match_by_chain_id`. See
 [`compare_chirality`](https://github.com/google-deepmind/alphafold3/blob/7b197fe859790fc3e04d03ea70dd0b9ba48881c9/src/alphafold3/model/scoring/chirality.py#L149-L199).
@@ -3307,6 +3307,7 @@ scientifically false name.
 Only the ligand-aware route publishes `ligand_interface_confidence` with its exact
 component scope. Protein, soluble, and membrane routes publish overall designed
 sequence confidence once; no duplicate alias is retained.
+
 ## NA-MPNN's NA-only mode designs protein rows in mixed chains
 
 **Upstream:** `baker-laboratory/NA-MPNN`

@@ -6,7 +6,20 @@ from chanfig import Config
 
 
 class RfDiffusionSe3Config(Config):
-    r"""Architecture of one released SE(3)-Transformer stack."""
+    r"""Configure one SE(3)-Transformer stack.
+
+    Args:
+        num_blocks: Number of SE(3)-Transformer blocks.
+        num_channels: Number of channels per irreducible representation.
+        num_degrees: Number of representation degrees.
+        num_attention_heads: Number of equivariant attention heads.
+        div: Divisor used to size intermediate equivariant channels.
+        l0_in_features: Number of scalar input features.
+        l0_out_features: Number of scalar output features.
+        l1_in_features: Number of vector input features.
+        l1_out_features: Number of vector output features.
+        num_edge_features: Width of edge features.
+    """
 
     num_blocks: int = 1
     num_channels: int = 32
@@ -21,7 +34,27 @@ class RfDiffusionSe3Config(Config):
 
 
 class RfDiffusionDenoiserConfig(Config):
-    r"""RoseTTAFold denoiser dimensions stored in official checkpoints."""
+    r"""Configure the RoseTTAFold denoiser architecture.
+
+    Args:
+        vocab_size: Number of sequence token types.
+        num_extra_blocks: Number of extra-MSA blocks.
+        num_main_blocks: Number of main RoseTTAFold blocks.
+        num_refinement_blocks: Number of structural refinement blocks.
+        msa_size: Width of the clustered MSA representation.
+        full_msa_size: Width of the full-MSA representation.
+        pair_size: Width of the pair representation.
+        template_size: Width of template representations.
+        num_msa_attention_heads: Number of MSA attention heads.
+        num_pair_attention_heads: Number of pair attention heads.
+        num_template_attention_heads: Number of template attention heads.
+        hidden_size: Width of projected structure features.
+        template_hidden_size: Width of projected template features.
+        dropout: Dropout probability in denoiser blocks.
+        trunk_se3: SE(3)-Transformer used in the main trunk.
+        refinement_se3: Wider SE(3)-Transformer used for structural refinement.
+        freeze_track_motif: Whether motif residues remain fixed in the structure track.
+    """
 
     vocab_size: int = 21
     num_extra_blocks: int = 4
@@ -49,7 +82,21 @@ class RfDiffusionDenoiserConfig(Config):
 
 
 class RfDiffusionDiffuserConfig(Config):
-    r"""Forward-diffusion process the checkpoint was trained against."""
+    r"""Configure the RFdiffusion forward-diffusion process.
+
+    Args:
+        num_timesteps: Number of discrete diffusion timesteps.
+        beta_initial: Initial translation variance.
+        beta_final: Final translation variance.
+        schedule_type: Translation variance schedule.
+        rotation_diffuser: Rotational diffusion formulation.
+        coordinate_scale: Scale applied to Cartesian coordinates.
+        rotation_schedule_type: Rotation variance schedule.
+        min_rotation_beta: Minimum rotation beta.
+        max_rotation_beta: Maximum rotation beta.
+        min_rotation_sigma: Minimum rotation noise scale.
+        max_rotation_sigma: Maximum rotation noise scale.
+    """
 
     num_timesteps: int = 50
     beta_initial: float = 1e-2
@@ -65,21 +112,30 @@ class RfDiffusionDiffuserConfig(Config):
 
 
 class RfDiffusionPreprocessConfig(Config):
-    r"""Checkpoint-dependent input feature schema."""
+    r"""Configure the denoiser input feature schema.
+
+    Args:
+        sidechain_input: Whether to include general sidechain coordinates.
+        motif_sidechain_input: Whether to include motif sidechain coordinates.
+        template_single_feature_size: Width of per-token template features.
+        template_pair_feature_size: Width of pairwise template features.
+        structure_self_conditioning: Whether preprocessing exposes self-conditioned structure features.
+    """
 
     sidechain_input: bool = False
     motif_sidechain_input: bool = True
-    template_1d_size: int = 22
-    template_2d_size: int = 44
+    template_single_feature_size: int = 22
+    template_pair_feature_size: int = 44
     structure_self_conditioning: bool = False
 
 
 class RfDiffusionConfig(Config):
-    r"""Exact persistent configuration of one RFdiffusion denoiser.
+    r"""Configure one persistent RFdiffusion denoiser architecture.
 
-    Sampling steps, noise scales, symmetry, conditions, paths, placement, logging,
-    backend selection, and training-loop controls are deliberately absent.  They
-    are execution inputs, not checkpoint architecture.
+    Args:
+        denoiser: RoseTTAFold denoiser architecture.
+        diffuser: Forward-diffusion process.
+        preprocess: Denoiser input feature schema.
     """
 
     denoiser: RfDiffusionDenoiserConfig = RfDiffusionDenoiserConfig()
@@ -93,13 +149,13 @@ class RfDiffusionConfig(Config):
     def validate(self) -> None:
         super().validate()
         if self.diffuser.schedule_type != "linear":
-            raise ValueError("RFdiffusion supports the released linear translation schedule")
+            raise ValueError("RFdiffusion supports the linear translation schedule")
         if self.diffuser.rotation_diffuser != "igso3":
-            raise ValueError("RFdiffusion supports the released IGSO(3) rotation diffuser")
-        if self.preprocess.template_1d_size not in (22, 24, 28):
-            raise ValueError("preprocess.template_1d_size must be 22, 24, or 28")
-        if self.preprocess.template_2d_size not in (44, 47):
-            raise ValueError("preprocess.template_2d_size must be 44 or 47")
+            raise ValueError("RFdiffusion supports the IGSO(3) rotation diffuser")
+        if self.preprocess.template_single_feature_size not in (22, 24, 28):
+            raise ValueError("preprocess.template_single_feature_size must be 22, 24, or 28")
+        if self.preprocess.template_pair_feature_size not in (44, 47):
+            raise ValueError("preprocess.template_pair_feature_size must be 44 or 47")
 
 
 class RfDiffusionProcessorConfig(Config):

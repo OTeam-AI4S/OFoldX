@@ -8,6 +8,9 @@ from typing import Any, TypeAlias
 
 import torch
 
+from ..data.evidence import MSA, MSACollection, Template
+from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
+from ..data.structure import Structure
 from ..hub import (
     PROCESSOR_METADATA,
     hydrate_weights,
@@ -18,9 +21,6 @@ from ..hub import (
     resolve_hub_repository,
     resolve_repository,
 )
-from ..data.evidence import MSA, MSACollection, Template
-from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
-from ..data.structure import Structure
 from ..models.registry import Task
 from ..pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
 from ..pipelines.registry import PIPELINES, PipelineRegistration
@@ -127,6 +127,7 @@ def pipeline(
         device=device,
         dtype=dtype,
     )
+    loaded_processor.to(device=loaded_model.device, dtype=loaded_model.dtype)
 
     return selected_pipeline_class(model=loaded_model, processor=loaded_processor)
 

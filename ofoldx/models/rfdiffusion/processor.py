@@ -11,7 +11,6 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from typing_extensions import Self
 
 # AllowedResidueIdentities is shared by sequence-design pipelines.
 from ...data.conditions import AllowedResidueIdentities
@@ -29,9 +28,10 @@ from ...data.placement import (
     PlacementValue,
 )
 from ...data.placement import instance_of as derive_instance_of
-from ...data.placement import validate_placement
+from ...data.placement import symbolic_residue_aliases, validate_placement
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .config import RfDiffusionProcessorConfig
 
 # RFdiffusion spatial controls are defined with the model. Topology is a separate
@@ -58,13 +58,19 @@ from .model import (
     SymbolicResidueSite,
     residue_token,
     rfdiffusion_secondary_structure,
-    symbolic_residue_aliases,
     terminal_cyclization_instance,
 )
 
 
-class RfDiffusionProcessor:
-    r"""Lower one canonical design problem to RFdiffusion tensors."""
+class RfDiffusionProcessor(Processor):
+    r"""Lower one canonical design problem to RFdiffusion tensors.
+
+    Args:
+        config: Diffusion preprocessing options. Defaults to
+            ``RfDiffusionProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -75,21 +81,7 @@ class RfDiffusionProcessor:
     ) -> None:
         config = RfDiffusionProcessorConfig() if config is None else config
         self.config = config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -115,11 +107,17 @@ class RfDiffusionProcessor:
     ) -> RfDiffusionInput:
         r"""Lower base, complex, inpainting, active-site, or fold conditioning.
 
-        ``length`` is the RFdiffusion ``ContigMap.length`` topology argument:
-        the combined generated-length bounds across all inpaint chains, excluding receptor
-        ``ExistingSpan`` rows. It is stored on :class:`RfDiffusionLayout` so
-        ``_sample_variable_lengths`` can honor the cross-segment total when drawing
-        per-``GeneratedSegment`` lengths.
+        Args:
+            input: Optional context system, structure, or local structure path.
+            placement: Output topology containing existing spans and generated protein segments.
+            templates: Up to one fold-conditioning template.
+            conditions: Sequence, hotspot, geometry, symmetry, and interaction conditions.
+            inpaint_sequence: Existing residue occurrences whose identities are masked.
+            length: Inclusive bounds for total generated length across all generated segments.
+            timestep: Positive diffusion timestep stored on the lowered input.
+
+        Returns:
+            An ``RfDiffusionInput`` with aligned target, output, template, and condition axes.
         """
 
         if length is not None:
@@ -161,9 +159,7 @@ class RfDiffusionProcessor:
                     )
                 component_id = next(iter(condition.component_ids))
                 if component_id not in NUM2AA[:MASK_TOKEN]:
-                    raise ValueError(
-                        "RFdiffusion AllowedResidueIdentities must name one residue in its released alphabet"
-                    )
+                    raise ValueError("RFdiffusion AllowedResidueIdentities must name one residue in its alphabet")
 
         if isinstance(input, Structure):
             structure = input
@@ -236,16 +232,15 @@ class RfDiffusionProcessor:
             if isinstance(condition, RfDiffusionReferenceCoordinates)
             for site in condition.sites
         }
+        if reference_sites and system is None:
+            raise ValueError("RfDiffusionReferenceCoordinates requires a molecular input system")
+        reference_system = cast(MolecularSystem, system)
         if any(
-            isinstance(system.entities[system.instances[site.instance_id]], Molecule)  # type: ignore[union-attr]
+            isinstance(reference_system.entities[reference_system.instances[site.instance_id]], Molecule)
             for site in reference_sites
         ):
             raise ValueError("RFdiffusion RfDiffusionReferenceCoordinates must identify protein residue atoms")
-        referenced_residues = {
-            (site.instance_id, site.component_index)
-            for site in reference_sites
-            if not isinstance(system.entities[system.instances[site.instance_id]], Molecule)  # type: ignore[union-attr]
-        }
+        referenced_residues = {(site.instance_id, site.component_index) for site in reference_sites}
         for instance_id, component_index in referenced_residues:
             if (instance_id, component_index) not in output_index:
                 raise ValueError("RfDiffusionReferenceCoordinates sites must belong to an RFdiffusion output residue")
@@ -362,7 +357,7 @@ class RfDiffusionProcessor:
             # ``Hotspot`` is single-sided and distance-free: its
             # ``residues`` name the EXISTING target residues to condition on and the generated binder
             # partner is implicit (the whole design). RFdiffusion realizes them as the per-token
-            # ``hotspot_mask``; the released ppi head reads no cutoff, so ``Hotspot`` carries none.
+            # ``hotspot_mask``; the interaction head consumes no distance cutoff.
             for hotspot_reference in condition.residues:
                 if not isinstance(hotspot_reference, tuple) or hotspot_reference not in output_index:
                     raise ValueError("RFdiffusion hotspot residues must be existing residues in the output placement")
@@ -468,7 +463,7 @@ class RfDiffusionProcessor:
             layout=RfDiffusionLayout(
                 system=system,
                 structure=structure,
-                templates=template_values,  # type: ignore[arg-type]
+                templates=template_values,
                 placement=placement,
                 conditions=condition_values,
                 output_residues=output_residues,
@@ -708,9 +703,9 @@ def from_contig_string(
     :class:`RfDiffusionLayout.combined_length` and is ``None`` when the string generates
     nothing. ``source_instances`` (source chain-letter →
     length) resolves the bare-chain ``A`` form to ``ExistingSpan("A", 0, length)``; explicit
-    ``A163-181`` extents are carried literally (the upstream 1-based residue numbering is NOT
-    re-based to the core's 0-based index). Lossless into ``(PlacementSpec, combined_length)``
-    (the precise ``ref_idx/hal_idx`` permutation, when needed, projects to ordered length-1
+    ``A163-181`` extents are carried literally rather than rebased to zero-based component indices.
+    Lossless into ``(PlacementSpec, combined_length)``
+    (the precise reference/output permutation, when needed, projects to ordered length-1
     spans).
     """
 
@@ -745,11 +740,11 @@ def from_contig_string(
                         start, stop = int(bounds[0]), int(bounds[1])
                     else:
                         raise ValueError(f"malformed existing subcon {sub!r}")
-                    stop += 1  # inclusive upstream bound -> half-open core stop
+                    stop += 1  # inclusive bound -> half-open stop
                 if start < 0 or stop < start:
                     raise ValueError(f"malformed existing subcon {sub!r}")
-                # NB: RFdiffusion ``contig`` residue numbers are the upstream (often 1-based) PDB
-                # numbers and are carried literally into the ExistingSpan
+                # RFdiffusion ``contig`` residue numbers are external PDB labels and are carried
+                # literally into the ExistingSpan
                 # ``A163-181 -> ExistingSpan("A", 163, 182)``), so no upper-bound check against
                 # source length is applied — the numbering base is not the core's 0-based index.
                 group[placement_id] = ExistingSpan(instance_id, start, stop)

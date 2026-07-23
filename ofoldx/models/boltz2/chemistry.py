@@ -1,4 +1,4 @@
-r"""Released raw-SMILES chemistry for Boltz-2 affinity prediction."""
+r"""Raw-SMILES chemistry for Boltz-2 affinity prediction."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def standardize_boltz2_affinity_smiles(
 
     molecule = Chem.MolFromSmiles(smiles, sanitize=False)
     if exclude_flag(molecule, includeRDKitSanitization=False):
-        raise ValueError("the affinity SMILES is excluded by the released ChEMBL standardization path")
+        raise ValueError("the affinity SMILES is excluded by ChEMBL standardization")
     molecule = rdMolStandardize.LargestFragmentChooser().choose(molecule)
     molecule = standardize_mol(molecule)
     standardized_smiles = Chem.MolToSmiles(molecule)

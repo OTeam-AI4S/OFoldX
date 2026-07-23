@@ -2,8 +2,9 @@ r"""
 Backend dispatch for gated multi-head (pair-bias) attention.
 
 The dispatch owns both implementations' calling conventions in one place: OOps-owned pair-bias
-implementations (including its gated callable) and the public PyTorch references.
-[`GatedMultiheadAttention`][] stays backend-agnostic — it owns the q/k/v projection and passes it in.
+implementations (including its gated callable) and public PyTorch implementations.
+[`GatedMultiheadAttention`][ofoldx.modules.attention.multihead.GatedMultiheadAttention] stays backend-agnostic — it
+owns the q/k/v projection and passes it in.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def gated_multihead_attention(
     Project q/k/v via ``projection``, run attention on ``operator_backend``, and merge heads.
 
     Dispatches the attention math to OOps-owned pair-bias dispatch (using its gated callable when the
-    projection contract permits) or a pure-PyTorch reference. ``biases`` are summed into a single additive pair
+    projection contract permits) or a pure-PyTorch implementation. ``biases`` are summed into a single additive pair
     bias and ``attention_mask`` becomes a large-negative additive mask; both are broadcast to the attention shape.
 
     Args:
@@ -53,7 +54,7 @@ def gated_multihead_attention(
             ``(..., k_tokens)``; ``False`` positions are masked out.
         projection: The q/k/v (and optional gate/output) projection owned by the calling module.
         operator_backend: Backend request, one of ``"auto"`` / ``"oops"`` / ``"sdpa"`` / ``"eager"``.
-        torch_backend: Fixed PyTorch reference used when ``operator_backend="auto"`` cannot use OOps.
+        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
 
     Returns:
         ``(..., q_tokens, hidden_size)`` attention output with heads merged.
@@ -205,12 +206,12 @@ def triangle_attention(
 
     Projects the (already layer-normed) ``pair`` into per-row attention heads and attends along the
     key/column axis with the pre-computed per-head ``triangle_bias``. When the resolved backend is
-    ``oops`` and the projection is bias-free (the AlphaFold 3 / Boltz / Protenix / ODesign lineage),
+    ``oops`` and the output and gate projections are bias-free,
     the dedicated OOps-owned ``triangle_attention`` implementation is used, which consumes the ``(..., rows, cols,
     heads, head_dim)`` q/k/v layout and the row-broadcast ``(..., rows|1, heads, cols, cols)`` bias
     directly instead of flattening the row axis into a generic pair-bias attention. Every other backend
-    (``sdpa``/``eager``, or ``oops`` with a biased AlphaFold 2 projection) folds the key mask into an
-    additive bias and delegates to :func:`gated_multihead_attention` — byte-identical to attending on
+    (``sdpa``/``eager``, or ``oops`` with biased projections) folds the key mask into an
+    additive bias and delegates to :func:`gated_multihead_attention`, equivalent to attending on
     ``pair`` with ``biases=[mask_bias, triangle_bias]``.
 
     Args:
@@ -219,7 +220,7 @@ def triangle_attention(
         attention_mask: Optional boolean keep-mask ``(..., rows, cols)``; ``False`` keys are excluded.
         projection: The q/k/v/gate/output projection owned by the calling triangle-attention module.
         operator_backend: Backend request, one of ``"auto"`` / ``"oops"`` / ``"sdpa"`` / ``"eager"``.
-        torch_backend: Fixed PyTorch reference used when ``operator_backend="auto"`` cannot use OOps.
+        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
 
     Returns:
         Gated pair update ``(..., rows, cols, pair_size)``.
@@ -302,11 +303,11 @@ def _eager_attention(
     scale: float | None = None,
 ) -> Tensor:
     r"""
-    Pure PyTorch attention path matching Boltz's reference ``AttentionPairBias`` numerics.
+    Pure PyTorch attention with explicit float32 logits and softmax.
 
     Unlike SDPA, this path explicitly performs the attention logits and softmax in float32 and uses the
-    same ``-1e6`` additive mask convention as the Boltz implementation. It is selected only by an explicit
-    ``operator_backend="eager"`` request.
+    ``-1e6`` additive mask convention. It is selected only by an explicit ``operator_backend="eager"``
+    request.
     """
 
     head_dim = query_projection.shape[-1]

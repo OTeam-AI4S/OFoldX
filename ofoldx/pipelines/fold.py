@@ -13,8 +13,8 @@ from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import MolecularSystem, PolymerSequence
 from ..data.structure import Structure
 from ..results import FoldResult
-from ._paired import PairedPipeline
-from .generator import PipelineProcessor, processor_device, resolve_generator
+from .generator import PipelineProcessor, resolve_generator
+from .paired import PairedPipeline
 
 _ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
@@ -57,7 +57,25 @@ class FoldPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> FoldResult:
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        r"""Fold one biological input with the paired Processor and Model.
+
+        Args:
+            input: Sequence, molecular system, structure, or path to process.
+            msa: Optional multiple-sequence-alignment evidence.
+            templates: Template evidence to process with ``input``.
+            num_samples: Positive number of folding samples to generate.
+            seed: Optional integer seed used to create the operation generator; mutually exclusive
+                with ``generator``.
+            generator: Optional caller-supplied random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``FoldResult`` containing generation-ordered folding predictions.
+
+        Raises:
+            ValueError: If both ``seed`` and ``generator`` are supplied.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
             model_input,

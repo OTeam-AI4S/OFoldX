@@ -3,7 +3,7 @@ EDM preconditioning (Karras et al.).
 
 The ``c_skip`` / ``c_out`` / ``c_in`` / ``c_noise`` reweighting that keeps a diffusion denoiser's input and target
 unit-variance across noise levels. Pure functions of the noise level ``sigma`` and ``sigma_data`` — no learned
-parameters and no checkpoint state.
+parameters or persistent state.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ class EdmPreconditioner(nn.Module):
 
     Implements the ``c_skip`` / ``c_out`` / ``c_in`` / ``c_noise`` reweighting of Karras et al. that keeps the
     denoiser's input and target unit-variance across noise levels. The module holds no learned parameters and no
-    checkpoint state; every method is a closed-form function of the noise level ``sigma`` and ``sigma_data``.
+    persistent state; every method is a closed-form function of the noise level ``sigma`` and ``sigma_data``.
 
     Args:
         sigma_data: Data noise scale used by EDM preconditioning.

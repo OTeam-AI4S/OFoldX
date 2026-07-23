@@ -16,6 +16,7 @@ import torch
 from torch import Tensor, nn
 
 from ...artifacts import save_model
+from ...processor import Processor
 
 if TYPE_CHECKING:
     from .model import ProtenixModel
@@ -164,7 +165,7 @@ def save_protenix_checkpoint(
     model = convert_protenix_checkpoint(Path(checkpoint_path).expanduser(), dtype=dtype)
     destination = Path(output_dir).expanduser()
     if isinstance(model, ProtenixConstraintModel):
-        processor: object = ProtenixConstraintProcessor()
+        processor: Processor = ProtenixConstraintProcessor()
     else:
         processor = ProtenixProcessor()
     save_model(destination, model=model, processor=processor)
@@ -209,7 +210,44 @@ def main(argv: list[str] | None = None) -> None:
 
 def _protenix_reference_key(model_key: str) -> _ReferenceKey:
     if model_key.startswith("constraint_embeddings."):
-        return "constraint_embedder." + model_key.removeprefix("constraint_embeddings.")
+        relative_key = model_key.removeprefix("constraint_embeddings.")
+        transformer_match = re.fullmatch(
+            r"substructure_embeddings\.transformer\.blocks\.(\d+)\.(.+)",
+            relative_key,
+        )
+        if transformer_match is not None:
+            block_index, suffix = transformer_match.groups()
+            source_suffix = {
+                "attention.query_projection.weight": "self_attn.in_proj_weight",
+                "attention.query_projection.bias": "self_attn.in_proj_bias",
+                "attention.key_projection.weight": "self_attn.in_proj_weight",
+                "attention.key_projection.bias": "self_attn.in_proj_bias",
+                "attention.value_projection.weight": "self_attn.in_proj_weight",
+                "attention.value_projection.bias": "self_attn.in_proj_bias",
+                "attention.output_projection.weight": "self_attn.out_proj.weight",
+                "attention.output_projection.bias": "self_attn.out_proj.bias",
+                "attention_norm.weight": "norm1.weight",
+                "attention_norm.bias": "norm1.bias",
+                "transition.input_projection.weight": "linear1.weight",
+                "transition.input_projection.bias": "linear1.bias",
+                "transition.output_projection.weight": "linear2.weight",
+                "transition.output_projection.bias": "linear2.bias",
+                "transition_norm.weight": "norm2.weight",
+                "transition_norm.bias": "norm2.bias",
+            }[suffix]
+            return "constraint_embedder.substructure_z_embedder.transformer.layers." f"{block_index}.{source_suffix}"
+
+        key = "constraint_embedder." + relative_key
+        key = _replace_many(
+            key,
+            {
+                ".pocket_projection.": ".pocket_z_embedder.",
+                ".token_contact_projection.": ".contact_z_embedder.",
+                ".atom_contact_projection.": ".contact_atom_z_embedder.",
+                ".substructure_embeddings.": ".substructure_z_embedder.",
+            },
+        )
+        return key.replace(".input_projection.", ".input_proj.").replace(".output_projection.", ".output_proj.")
     return _reference_key(model_key)
 
 
@@ -246,6 +284,16 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
             return torch.cat(reference_value, dim=0)
         raise RuntimeError(f"unexpected multi-tensor reference mapping for {model_key}")
 
+    if model_key.startswith("constraint_embeddings.substructure_embeddings.transformer.blocks."):
+        projection_index = {
+            ".attention.query_projection.": 0,
+            ".attention.key_projection.": 1,
+            ".attention.value_projection.": 2,
+        }
+        for projection, index in projection_index.items():
+            if projection in model_key:
+                return reference_value.chunk(3, dim=0)[index]
+
     if model_key.endswith(".noise_embedding.projection.weight") and reference_value.dim() == 1:
         return reference_value.unsqueeze(-1)
     return reference_value
@@ -281,6 +329,7 @@ def _replace_top_level(key: str) -> str:
         "single_recycle_projection": "linear_no_bias_s",
         "pair_recycle_norm": "layernorm_z_cycle",
         "single_recycle_norm": "layernorm_s",
+        "distogram_head.projection": "distogram_head.linear",
         "input_embeddings.atom_encoder": "input_embedder.atom_attention_encoder",
         "msa_trunk": "msa_module",
         "coordinate_denoiser": "diffusion_module",
@@ -297,7 +346,7 @@ def _replace_template_key(key: str) -> str:
     return _replace_many(
         key,
         {
-            ".norm_pair.": ".layernorm_z.",
+            ".pair_norm.": ".layernorm_z.",
             ".pair_projection.": ".linear_no_bias_z.",
             ".template_projection.": ".linear_no_bias_a.",
             ".hidden_norm.": ".layernorm_v.",
@@ -349,16 +398,16 @@ def _replace_denoiser_key(key: str) -> str:
             ".diffusion_conditioning.relpe.output_projection.": ".diffusion_conditioning.relpe.linear_no_bias.",
             ".conditioner.pair_input_norm.": ".diffusion_conditioning.layernorm_z.",
             ".conditioner.pair_projection.": ".diffusion_conditioning.linear_no_bias_z.",
-            ".conditioner.pair_feed_forward_1.": ".diffusion_conditioning.transition_z1.",
-            ".conditioner.pair_feed_forward_2.": ".diffusion_conditioning.transition_z2.",
+            ".conditioner.pair_transitions.0.": ".diffusion_conditioning.transition_z1.",
+            ".conditioner.pair_transitions.1.": ".diffusion_conditioning.transition_z2.",
             ".conditioner.single_conditioning_norm.": ".diffusion_conditioning.layernorm_s.",
             ".conditioner.single_conditioning_projection.": ".diffusion_conditioning.linear_no_bias_s.",
             ".conditioner.noise_embedding.projection.weight": ".diffusion_conditioning.fourier_embedding.w",
             ".conditioner.noise_embedding.projection.bias": ".diffusion_conditioning.fourier_embedding.b",
             ".conditioner.noise_norm.": ".diffusion_conditioning.layernorm_n.",
             ".conditioner.noise_projection.": ".diffusion_conditioning.linear_no_bias_n.",
-            ".conditioner.single_feed_forward_1.": ".diffusion_conditioning.transition_s1.",
-            ".conditioner.single_feed_forward_2.": ".diffusion_conditioning.transition_s2.",
+            ".conditioner.single_transitions.0.": ".diffusion_conditioning.transition_s1.",
+            ".conditioner.single_transitions.1.": ".diffusion_conditioning.transition_s2.",
             ".atom_encoder.": ".atom_attention_encoder.",
             ".token_refiner.single_norm.": ".layernorm_s.",
             ".token_refiner.single_to_token_projection.": ".linear_no_bias_s.",
@@ -370,14 +419,14 @@ def _replace_denoiser_key(key: str) -> str:
 
 
 def _replace_atom_stack_key(key: str) -> str:
-    if ".atom_attention_stack." not in key:
+    if ".atom_self_attention." not in key:
         return key
     block = r".atom_transformer.diffusion_transformer.blocks.\1"
-    target_block = r"\.atom_attention_stack\.atom_attention\.transformer\.blocks\.(\d+)\."
+    target_block = r"\.atom_self_attention\.atom_attention\.transformer\.blocks\.(\d+)\."
     rules = [
-        (r"\.atom_attention_stack\.pair_norms\.(\d+)\.", block + r".attention_pair_bias.layernorm_z."),
+        (r"\.atom_self_attention\.pair_norms\.(\d+)\.", block + r".attention_pair_bias.layernorm_z."),
         (
-            r"\.atom_attention_stack\.bias_projections\.(\d+)\.",
+            r"\.atom_self_attention\.bias_projections\.(\d+)\.",
             block + r".attention_pair_bias.linear_nobias_z.",
         ),
         (target_block + r"transition\.", block + r".conditioned_transition_block."),
@@ -406,12 +455,12 @@ def _replace_atom_key(key: str) -> str:
             ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
             ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
             ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
-            ".atom_attention_stack.": ".atom_transformer.diffusion_transformer.",
+            ".atom_self_attention.": ".atom_transformer.diffusion_transformer.",
             ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
             ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",
             ".single_norm.": ".layernorm_s.",
             ".single_to_atom_projection.": ".linear_no_bias_s.",
-            ".atom_attention_encoder.norm_pair.": ".atom_attention_encoder.layernorm_z.",
+            ".atom_attention_encoder.pair_norm.": ".atom_attention_encoder.layernorm_z.",
             ".pair_projection.": ".linear_no_bias_z.",
             ".noisy_position_projection.": ".linear_no_bias_r.",
             ".atom_attention_decoder.output_projection.": ".atom_attention_decoder.linear_no_bias_out.",
@@ -428,13 +477,11 @@ def _replace_pairformer_key(key: str) -> str:
             ".triangle_multiplication_incoming.": ".tri_mul_in.",
             ".triangle_attention_starting_node.": ".tri_att_start.",
             ".triangle_attention_ending_node.": ".tri_att_end.",
-            ".pair_feed_forward.": ".pair_transition.",
             ".pair_attention.": ".attention_pair_bias.",
-            ".single_feed_forward.": ".single_transition.",
-            ".tri_mul_out.norm_input.": ".tri_mul_out.layer_norm_in.",
-            ".tri_mul_in.norm_input.": ".tri_mul_in.layer_norm_in.",
-            ".tri_mul_out.norm_output.": ".tri_mul_out.layer_norm_out.",
-            ".tri_mul_in.norm_output.": ".tri_mul_in.layer_norm_out.",
+            ".tri_mul_out.input_norm.": ".tri_mul_out.layer_norm_in.",
+            ".tri_mul_in.input_norm.": ".tri_mul_in.layer_norm_in.",
+            ".tri_mul_out.output_norm.": ".tri_mul_out.layer_norm_out.",
+            ".tri_mul_in.output_norm.": ".tri_mul_in.layer_norm_out.",
             ".tri_mul_out.left_projection.": ".tri_mul_out.linear_a_p.",
             ".tri_mul_in.left_projection.": ".tri_mul_in.linear_a_p.",
             ".tri_mul_out.left_gate_projection.": ".tri_mul_out.linear_a_g.",
@@ -447,8 +494,8 @@ def _replace_pairformer_key(key: str) -> str:
             ".tri_mul_in.output_projection.": ".tri_mul_in.linear_z.",
             ".tri_mul_out.gate_projection.": ".tri_mul_out.linear_g.",
             ".tri_mul_in.gate_projection.": ".tri_mul_in.linear_g.",
-            ".tri_att_start.norm_pair.": ".tri_att_start.layer_norm.",
-            ".tri_att_end.norm_pair.": ".tri_att_end.layer_norm.",
+            ".tri_att_start.pair_norm.": ".tri_att_start.layer_norm.",
+            ".tri_att_end.pair_norm.": ".tri_att_end.layer_norm.",
             ".tri_att_start.bias_projection.": ".tri_att_start.linear.",
             ".tri_att_end.bias_projection.": ".tri_att_end.linear.",
             ".tri_att_start.attention.projection.": ".tri_att_start.mha.",
@@ -465,7 +512,7 @@ def _replace_attention_key(key: str) -> str:
             ".hidden_norm.": ".layernorm_a.",
             ".atom_norm.": ".layernorm_a.",
             ".key_value_norm.": ".layernorm_kv.",
-            ".attention_pair_bias.norm_pair.": ".attention_pair_bias.layernorm_z.",
+            ".attention_pair_bias.pair_norm.": ".attention_pair_bias.layernorm_z.",
             ".attention_pair_bias.bias_projection.": ".attention_pair_bias.linear_nobias_z.",
             ".attention_pair_bias.conditioning_gate_projection.": ".attention_pair_bias.linear_a_last.",
         },
@@ -483,18 +530,18 @@ def _replace_attention_projection_key(key: str) -> str:
             "msa_module.msa_projection.": "msa_module.linear_no_bias_m.",
             "msa_module.token_projection.": "msa_module.linear_no_bias_s.",
             ".outer_product_mean.": ".outer_product_mean_msa.",
-            ".outer_product_mean_msa.norm_msa.": ".outer_product_mean_msa.layer_norm.",
+            ".outer_product_mean_msa.msa_norm.": ".outer_product_mean_msa.layer_norm.",
             ".outer_product_mean_msa.left_projection.": ".outer_product_mean_msa.linear_1.",
             ".outer_product_mean_msa.right_projection.": ".outer_product_mean_msa.linear_2.",
             ".outer_product_mean_msa.output_projection.": ".outer_product_mean_msa.linear_out.",
-            ".msa_pair_weighted_averaging.norm_msa.": ".msa_pair_weighted_averaging.layernorm_m.",
+            ".msa_pair_weighted_averaging.msa_norm.": ".msa_pair_weighted_averaging.layernorm_m.",
             ".msa_pair_weighted_averaging.value_projection.": ".msa_pair_weighted_averaging.linear_no_bias_mv.",
-            ".msa_pair_weighted_averaging.norm_pair.": ".msa_pair_weighted_averaging.layernorm_z.",
+            ".msa_pair_weighted_averaging.pair_norm.": ".msa_pair_weighted_averaging.layernorm_z.",
             ".msa_pair_weighted_averaging.pair_projection.": ".msa_pair_weighted_averaging.linear_no_bias_z.",
             ".msa_pair_weighted_averaging.gate_projection.": ".msa_pair_weighted_averaging.linear_no_bias_mg.",
             ".msa_pair_weighted_averaging.output_projection.": ".msa_pair_weighted_averaging.linear_no_bias_out.",
-            ".msa_stack.feed_forward.": ".msa_stack.transition_m.",
-            ".pair_stack.feed_forward.": ".pair_stack.pair_transition.",
+            ".msa_stack.transition.": ".msa_stack.transition_m.",
+            ".pair_stack.transition.": ".pair_stack.pair_transition.",
             ".attention.projection.query_projection.": ".attention.linear_q.",
             ".attention.projection.key_projection.": ".attention.linear_k.",
             ".attention.projection.value_projection.": ".attention.linear_v.",
@@ -514,9 +561,8 @@ def _replace_transition_key(key: str) -> str:
     return _replace_many(
         key,
         {
-            ".norm_input.": ".layernorm1.",
+            ".input_norm.": ".layernorm1.",
             ".conditioned_norm.": ".adaln.",
-            ".feed_forward.": ".conditioned_transition_block.",
             ".conditioned_transition_block.gate_projection.": ".conditioned_transition_block.linear_nobias_a1.",
             ".conditioned_transition_block.value_projection.": ".conditioned_transition_block.linear_nobias_a2.",
             ".conditioned_transition_block.output_projection.": ".conditioned_transition_block.linear_nobias_b.",

@@ -12,8 +12,8 @@ from ..artifacts import SaveableModel
 from ..data.molecular import ComponentReference
 from ..data.structure import Structure
 from ..results import PackResult
-from ._paired import PairedPipeline
-from .generator import PipelineProcessor, processor_device, resolve_generator
+from .generator import PipelineProcessor, resolve_generator
+from .paired import PairedPipeline
 
 _ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
@@ -56,7 +56,26 @@ class PackPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        r"""Pack protein side chains with the paired Processor and Model.
+
+        Args:
+            input: Structure or path to process.
+            sequence: Optional target protein sequence, supplied directly for one protein instance
+                or keyed by instance.
+            pack_positions: Optional component positions to pack.
+            num_samples: Positive number of side-chain packing samples to generate.
+            seed: Optional integer seed used to create the operation generator; mutually exclusive
+                with ``generator``.
+            generator: Optional caller-supplied random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``PackResult`` containing generation-ordered side-chain packing predictions.
+
+        Raises:
+            ValueError: If both ``seed`` and ``generator`` are supplied.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input, sequence=sequence, pack_positions=pack_positions)
         return self.model.pack(
             model_input,

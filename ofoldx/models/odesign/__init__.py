@@ -2,10 +2,8 @@ r"""ODesign biomolecular structure-design implementation."""
 
 from __future__ import annotations
 
-from typing import cast
-
 from ...pipelines.registry import PIPELINES
-from ..registry import MODELS, Task
+from ..registry import MODELS
 from .config import (
     ODesignConfig,
     ODesignConstraintEmbeddingsConfig,
@@ -40,6 +38,6 @@ MODELS.register_model(
 PIPELINES.register_pipeline(
     "ofoldx.odesign",
     pipeline=ODesignPipeline,
-    tasks=(cast(Task, "design"),),
+    tasks=("design",),
     repository_loader=ODesignPipeline.from_repository,
 )

@@ -9,12 +9,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .config import NaMpnnProcessorConfig
 from .model import (
     DNA_GENERATABLE_TOKEN_IDS,
@@ -45,22 +45,28 @@ _SHARED_NUCLEIC_TOKENS = {
     "G": MIXED_POLYMER_TOKEN_BY_COMPONENT["DG"],
     "U": MIXED_POLYMER_TOKEN_BY_COMPONENT["DT"],
 }
-_POLYMER_TYPE_ID = {"protein": 0, "dna": 1, "rna": 2}
+_POLYMER_TYPE_INDEX = {"protein": 0, "dna": 1, "rna": 2}
 
 # One aligned lowered residue row.
 _Row = tuple[ComponentReference, str, str, int, int, np.ndarray, tuple[bool, ...], bool]
 
 
-class NaMpnnProcessor:
-    r"""Lower one protein/DNA/RNA Structure into the released 16-atom layout.
+class NaMpnnProcessor(Processor):
+    r"""Lower one protein/DNA/RNA structure into the NA-MPNN 16-atom layout.
 
     The Processor has two arms selected by the expression: a ``sequence`` override
     lowers the score arm over an explicit observed sequence, while the default
     design/probability arm lowers conditions, token symmetry, and the aligned
     bias tensors. Both arms derive residue indices from ``Structure.residue_numbers``
-    with the released running-count renumber, type polymers from the canonical
+    with a running-count renumber, type polymers from the canonical
     component, and demote incomplete or unoccupied residues to an invalid unknown
     token.
+
+    Args:
+        config: NA-MPNN token and nucleic-acid options. Defaults to
+            ``NaMpnnProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -71,21 +77,7 @@ class NaMpnnProcessor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = NaMpnnProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -100,7 +92,24 @@ class NaMpnnProcessor:
         pair_bias: Tensor | None = None,
         global_omit_tokens: Sequence[str] = (),
     ) -> NaMpnnInput:
-        r"""Select the score arm on a sequence override, otherwise the design arm."""
+        r"""Lower one mixed-polymer structure for scoring, design, or probabilities.
+
+        Args:
+            input: Canonical structure or local structure path.
+            sequence: Optional replacement sequence selecting the scoring arm. A bare string
+                requires one polymer instance; a mapping addresses instances explicitly.
+            design_positions: Residue occurrences to evaluate or design. ``None`` selects every
+                valid, eligible residue.
+            conditions: Allowed-identity and tied-identity conditions.
+            symmetry_groups: Residue groups sharing one decoding position.
+            tied_weights: Optional sampling coefficient for each tied residue.
+            residue_logit_bias: Per-residue bias vectors over the NA-MPNN vocabulary.
+            pair_bias: Optional pairwise bias tensor aligned to the lowered residue rows.
+            global_omit_tokens: One-letter residue tokens excluded from generation.
+
+        Returns:
+            A single-example ``NaMpnnInput`` with aligned structure, residue, and condition axes.
+        """
 
         structure = self._read(input)
         rows = self._lower_rows(structure)
@@ -203,7 +212,7 @@ class NaMpnnProcessor:
 
     @staticmethod
     def _renumber(source_numbers: Sequence[int]) -> list[int]:
-        r"""Apply the released running-count renumber for repeats and insertion codes."""
+        r"""Apply running-count renumbering for repeats and insertion codes."""
 
         renumbered: list[int] = []
         count = 0
@@ -257,7 +266,10 @@ class NaMpnnProcessor:
             residue_mask=self._tensor([row[7] for row in rows], torch.bool),
             residue_index=self._tensor([row[4] for row in rows], torch.int64),
             chain_index=self._tensor([row[3] for row in rows], torch.int64),
-            polymer_type_ids=self._tensor([_POLYMER_TYPE_ID[row[2]] if row[7] else 3 for row in rows], torch.int64),
+            polymer_type_index=self._tensor(
+                [_POLYMER_TYPE_INDEX[row[2]] if row[7] else 3 for row in rows],
+                torch.int64,
+            ),
             protein_mask=self._tensor([row[2] == "protein" and row[7] for row in rows], torch.bool),
             dna_mask=self._tensor([row[2] == "dna" and row[7] for row in rows], torch.bool),
             rna_mask=self._tensor([row[2] == "rna" and row[7] for row in rows], torch.bool),

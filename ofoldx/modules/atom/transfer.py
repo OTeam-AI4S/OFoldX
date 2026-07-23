@@ -71,9 +71,9 @@ def dense_mean_to_tokens(
     r"""
     Mean-pool atoms to tokens through a dense one-hot matrix.
 
-    This mirrors the Boltz reference implementation, which forms a dense atom-to-token one-hot matrix,
-    normalizes it by per-token counts plus ``1e-6``, then applies ``torch.bmm``. The dense path is slower than
-    scatter pooling but gives the same floating-point reduction order as the reference diffusion models.
+    Forms a dense atom-to-token one-hot matrix, normalizes it by per-token counts plus
+    ``count_eps``, and applies ``torch.bmm``. This path provides a deterministic dense
+    reduction order distinct from scatter pooling.
     """
 
     prefix = tuple(atom_hidden.shape[:-2])
@@ -237,8 +237,8 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
         Args:
             token_pair: ``[..., N_token, N_token, C]`` token-pair features.
             atom_to_token: ``[..., N_atom]`` token index for each atom.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window so the
-                pair-bias windows line up with the attention key gather. Unset keeps the fixed padded window.
+            num_valid_atoms: Number of real atoms; enables clamped key windows so pair-bias windows align
+                with attention key gathering. Unset keeps the fixed padded window.
 
         Returns:
             ``[..., N_window, num_query_atoms, num_key_atoms, C]`` local atom-pair features.

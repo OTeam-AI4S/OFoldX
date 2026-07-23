@@ -1,4 +1,4 @@
-r"""OFoldX's biological operation boundary for released Boltz-1 folding."""
+r"""Boltz-1 folding Pipeline."""
 
 from __future__ import annotations
 
@@ -10,14 +10,14 @@ import torch
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
-from ...pipelines import PairedPipeline, processor_device, resolve_generator
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import FoldResult
 from .model import Boltz1Model, Boltz1Pocket
 from .processor import Boltz1Processor
 
 
 class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
-    r"""Bind one Boltz-1 Model-Processor pair for the released folding operation.
+    r"""Bind one Boltz-1 Model and Processor for folding.
 
     Runs one Processor call followed by one ``Boltz1Model.fold`` invocation, exposing
     Boltz-1 pocket conditioning and Boltz-1x steering controls. The decoded output is the
@@ -38,9 +38,26 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
     ) -> FoldResult:
-        r"""Lower one folding input and run released Boltz-1 folding into a canonical ``FoldResult``."""
+        r"""Lower one molecular input and run Boltz-1 folding.
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        Args:
+            input: Canonical molecular system, structure, or local structure path.
+            msa: Optional MSA value, collection, or alignment path.
+            pocket: Optional binder and pocket-residue specification.
+            num_samples: Number of structure predictions to generate.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+            num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            use_potentials: Whether to apply configured physical-potential guidance.
+            steering_args: Optional potential-guidance controls.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         batch = self.processor(input, msa=msa, pocket=pocket, generator=generator)
         return self.model.fold(
             batch,

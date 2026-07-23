@@ -8,8 +8,7 @@ sequences conditioned on backbone geometry and nearby ligand/context atoms. The 
 the model-local [`LigandMpnnOutput`][ofoldx.models.ligandmpnn.model.LigandMpnnOutput] and
 [`LigandMpnnSamplingOutput`][ofoldx.models.ligandmpnn.model.LigandMpnnSamplingOutput]. The four probability
 operations return the shared [`MpnnProbabilityResult`][ofoldx.results.MpnnProbabilityResult], and ``design``
-returns the shared [`DesignResult`][ofoldx.results.DesignResult]. The released feature Module is attached
-directly to the Model, with no ``LigandMpnnBackbone`` checkpoint prefix.
+returns the shared [`DesignResult`][ofoldx.results.DesignResult].
 """
 
 from __future__ import annotations
@@ -24,18 +23,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.components import get_component
-from ...data.molecular import (
-    ComponentReference,
-    MolecularSystem,
-    Molecule,
-    PolymerSequence,
-)
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
-    MpnnDecoderLayer,
-    MpnnEncoderLayer,
+    MpnnDecoderBlock,
+    MpnnEncoderBlock,
     MpnnProteinFeatures,
     autoregressive_masks,
     cat_neighbors_nodes,
@@ -59,7 +53,7 @@ class LigandMpnnModel(Model):
     Message-passing model that designs protein sequences for a protein-ligand complex.
 
     ``forward`` is the ordinary differentiable sequence-conditioned teacher-forced graph. ``sample`` and
-    the four probability operations expose the released tensor protocols through model-local output records,
+    the four probability operations expose the tensor protocols through model-local output records,
     and ``design`` returns self-contained canonical candidates. ``coordinate_noise``,
     ``use_sidechain_context``, and the stochastic controls are per-operation arguments rather than
     persistent configuration.
@@ -82,32 +76,32 @@ class LigandMpnnModel(Model):
         self.feature_encoder = LigandMpnnFeatures(hidden_size, self.config.num_neighbors)
         self.edge_embedding = nn.Linear(hidden_size, hidden_size)
         self.atom_context_embedding = nn.Linear(hidden_size, hidden_size)
-        self.encoder_layers = nn.ModuleList(
-            MpnnEncoderLayer(hidden_size, hidden_size * 2, dropout=self.config.dropout)
-            for _ in range(self.config.num_encoder_layers)
+        self.encoder_blocks = nn.ModuleList(
+            MpnnEncoderBlock(hidden_size, hidden_size * 2, dropout=self.config.dropout)
+            for _ in range(self.config.num_encoder_blocks)
         )
         self.residue_context_input = nn.Linear(hidden_size, hidden_size)
         self.atom_node_embedding = nn.Linear(hidden_size, hidden_size)
         self.atom_edge_embedding = nn.Linear(hidden_size, hidden_size)
-        self.atom_context_layers = nn.ModuleList(
-            MpnnDecoderLayer(hidden_size, hidden_size, dropout=self.config.dropout) for _ in range(2)
+        self.atom_context_blocks = nn.ModuleList(
+            MpnnDecoderBlock(hidden_size, hidden_size, dropout=self.config.dropout) for _ in range(2)
         )
-        self.context_layers = nn.ModuleList(
-            MpnnDecoderLayer(hidden_size, hidden_size * 2, dropout=self.config.dropout) for _ in range(2)
+        self.context_blocks = nn.ModuleList(
+            MpnnDecoderBlock(hidden_size, hidden_size * 2, dropout=self.config.dropout) for _ in range(2)
         )
         self.context_output = nn.Linear(hidden_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(self.config.dropout)
         self.context_norm = nn.LayerNorm(hidden_size)
         self.token_embedding = nn.Embedding(_VOCABULARY, hidden_size)
-        self.decoder_layers = nn.ModuleList(
-            MpnnDecoderLayer(hidden_size, hidden_size * 3, dropout=self.config.dropout)
-            for _ in range(self.config.num_decoder_layers)
+        self.decoder_blocks = nn.ModuleList(
+            MpnnDecoderBlock(hidden_size, hidden_size * 3, dropout=self.config.dropout)
+            for _ in range(self.config.num_decoder_blocks)
         )
         self.output_projection = nn.Linear(hidden_size, _VOCABULARY)
-        self.reset_parameters()
+        self.post_init()
 
-    def reset_parameters(self) -> None:
-        r"""Apply the released Xavier-uniform initialization to every matrix parameter."""
+    def initialize_parameters(self) -> None:
+        r"""Apply the Xavier-uniform initialization to every matrix parameter."""
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -162,7 +156,7 @@ class LigandMpnnModel(Model):
             tied_group_ids=repeat(input.tied_group_ids),
             tied_weights=repeat(input.tied_weights),
             allowed_token_mask=repeat(input.allowed_token_mask),
-            logit_bias=repeat(input.logit_bias),
+            residue_logit_bias=repeat(input.residue_logit_bias),
         )
 
     def _probability_result(
@@ -191,7 +185,7 @@ class LigandMpnnModel(Model):
         design_positions: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw the released fixed-first decoding orders directly from aligned masks.
+        r"""Draw the fixed-first decoding orders directly from aligned masks.
 
         Fixed rows receive a near-zero weight and therefore decode before every designed row; each row
         of the returned ``[B, L]`` permutation is an independent order.
@@ -221,7 +215,7 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the coordinate/context encoder shared by every official operation.
+        r"""Run the coordinate/context encoder shared by every operation.
 
         Coordinate noise perturbs the backbone coordinates and the already selected nonprotein context
         coordinates before residue-neighbor and atom-context features; fixed side-chain coordinates are
@@ -262,15 +256,15 @@ class LigandMpnnModel(Model):
         atom_context = self.atom_context_embedding(atom_features)
         attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = mask.unsqueeze(-1) * attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(node_states, edge_states, neighbor_indices, mask, attend_mask)
+        for block in self.encoder_blocks:
+            node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         residue_context = self.residue_context_input(node_states)
         atom_pair_mask = atom_mask[:, :, :, None] * atom_mask[:, :, None, :]
         atom_nodes = self.atom_node_embedding(atom_nodes)
         atom_edges = self.atom_edge_embedding(atom_edges)
-        for layer_index, layer in enumerate(self.context_layers):
-            atom_nodes = self.atom_context_layers[layer_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
-            residue_context = layer(residue_context, torch.cat((atom_context, atom_nodes), dim=-1), mask, atom_mask)
+        for block_index, block in enumerate(self.context_blocks):
+            atom_nodes = self.atom_context_blocks[block_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
+            residue_context = block(residue_context, torch.cat((atom_context, atom_nodes), dim=-1), mask, atom_mask)
         node_states = node_states + self.context_norm(self.dropout(self.context_output(residue_context)))
         return node_states, edge_states, neighbor_indices
 
@@ -292,9 +286,9 @@ class LigandMpnnModel(Model):
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         backward_mask, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
         forward_context = forward_mask * encoder_context
-        for layer in self.decoder_layers:
+        for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
-            node_states = layer(node_states, backward_mask * decoder_context + forward_context, mask)
+            node_states = block(node_states, backward_mask * decoder_context + forward_context, mask)
         return self.output_projection(node_states)
 
     def _decode_sequence_free_logits(
@@ -314,8 +308,8 @@ class LigandMpnnModel(Model):
         _, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
         forward_context = forward_mask * encoder_context
         states = node_states
-        for layer in self.decoder_layers:
-            states = layer(states, forward_context, mask)
+        for block in self.decoder_blocks:
+            states = block(states, forward_context, mask)
         return self.output_projection(states)
 
     # -- public operations -----------------------------------------------------------------------
@@ -550,7 +544,7 @@ class LigandMpnnModel(Model):
     def _sampling_bias(input: LigandMpnnInput) -> Tensor:
         r"""Return the aligned soft logit bias."""
 
-        if input.logit_bias is None:
+        if input.residue_logit_bias is None:
             bias = torch.zeros(
                 input.sequence_tokens.shape[0],
                 input.sequence_tokens.shape[1],
@@ -559,7 +553,7 @@ class LigandMpnnModel(Model):
                 dtype=input.backbone_coordinates.dtype,
             )
         else:
-            bias = input.logit_bias
+            bias = input.residue_logit_bias
         return bias
 
     @staticmethod
@@ -589,7 +583,7 @@ class LigandMpnnModel(Model):
         decoding_ranks: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> LigandMpnnSamplingOutput:
-        r"""Run the complete released autoregressive tensor sampler."""
+        r"""Run the complete autoregressive tensor sampler."""
 
         self._require_single_target(input)
         num_samples = _positive_integer(num_samples, "num_samples")
@@ -678,7 +672,7 @@ class LigandMpnnModel(Model):
         device = sequence_true.device
         sampled = _GENERATABLE * torch.ones(num_samples, length, dtype=torch.long, device=device)
         token_states = torch.zeros_like(node_states)
-        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        block_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_blocks]
         probabilities = node_states.new_zeros(num_samples, length, _GENERATABLE)
         log_probs_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
         logits_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
@@ -722,24 +716,24 @@ class LigandMpnnModel(Model):
                 1,
                 residue[:, None, None, None].repeat(1, 1, backward_mask.shape[-2], backward_mask.shape[-1]),
             )
-            for layer_index, layer in enumerate(self.decoder_layers):
-                decoder_context = cat_neighbors_nodes(layer_states[layer_index], edge_token_t, neighbor_idx_t)
+            for block_index, block in enumerate(self.decoder_blocks):
+                decoder_context = cat_neighbors_nodes(block_states[block_index], edge_token_t, neighbor_idx_t)
                 node_t = torch.gather(
-                    layer_states[layer_index],
+                    block_states[block_index],
                     1,
-                    residue[:, None, None].repeat(1, 1, layer_states[layer_index].shape[-1]),
+                    residue[:, None, None].repeat(1, 1, block_states[block_index].shape[-1]),
                 )
-                updated = layer(node_t, backward_t * decoder_context + forward_t, mask_t)
-                layer_states[layer_index + 1].scatter_(
+                updated = block(node_t, backward_t * decoder_context + forward_t, mask_t)
+                block_states[block_index + 1].scatter_(
                     1,
                     residue[:, None, None].repeat(1, 1, node_states.shape[-1]),
                     updated,
                 )
 
             final_t = torch.gather(
-                layer_states[-1],
+                block_states[-1],
                 1,
-                residue[:, None, None].repeat(1, 1, layer_states[-1].shape[-1]),
+                residue[:, None, None].repeat(1, 1, block_states[-1].shape[-1]),
             )[:, 0]
             logits = self.output_projection(final_t)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -804,7 +798,7 @@ class LigandMpnnModel(Model):
         device = sequence_true.device
         sampled = _GENERATABLE * torch.ones(num_samples, length, dtype=torch.long, device=device)
         token_states = torch.zeros_like(node_states)
-        layer_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_layers]
+        block_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_blocks]
         probabilities = node_states.new_zeros(num_samples, length, _GENERATABLE)
         log_probs_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
         logits_out = node_states.new_zeros(num_samples, length, _VOCABULARY)
@@ -829,12 +823,12 @@ class LigandMpnnModel(Model):
                 neighbor_idx_t = neighbor_indices[:, residue : residue + 1]
                 edge_token_t = cat_neighbors_nodes(token_states, edge_t, neighbor_idx_t)
                 forward_t = forward_context[:, residue : residue + 1]
-                for layer_index, layer in enumerate(self.decoder_layers):
-                    decoder_context = cat_neighbors_nodes(layer_states[layer_index], edge_token_t, neighbor_idx_t)
-                    node_t = layer_states[layer_index][:, residue : residue + 1]
+                for block_index, block in enumerate(self.decoder_blocks):
+                    decoder_context = cat_neighbors_nodes(block_states[block_index], edge_token_t, neighbor_idx_t)
+                    node_t = block_states[block_index][:, residue : residue + 1]
                     context_t = backward_mask[:, residue : residue + 1] * decoder_context + forward_t
-                    layer_states[layer_index + 1][:, residue : residue + 1] = layer(node_t, context_t, mask_t[:, None])
-                logits = self.output_projection(layer_states[-1][:, residue])
+                    block_states[block_index + 1][:, residue : residue + 1] = block(node_t, context_t, mask_t[:, None])
+                logits = self.output_projection(block_states[-1][:, residue])
                 log_probs = F.log_softmax(logits, dim=-1)
                 log_probs_out[:, residue] = chain_mask_t[:, None] * log_probs
                 logits_out[:, residue] = chain_mask_t[:, None] * logits
@@ -859,6 +853,22 @@ class LigandMpnnModel(Model):
         }
 
     # -- design ----------------------------------------------------------------------------------
+
+    @staticmethod
+    def _realize_sequence(
+        system: MolecularSystem,
+        component_references: tuple[ComponentReference | None, ...],
+        sampled_tokens: list[int],
+        design_positions: list[bool],
+    ) -> MolecularSystem:
+        r"""Realize one candidate while preserving entity and bond identity."""
+
+        replacements = {
+            reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
+            for reference, token, selected in zip(component_references, sampled_tokens, design_positions)
+            if reference is not None and selected
+        }
+        return system.replace_components(replacements)
 
     @torch.inference_mode()
     def design(
@@ -917,7 +927,7 @@ class LigandMpnnModel(Model):
 
         candidates = tuple(
             DesignCandidate(
-                system=_realize_designed_system(
+                system=self._realize_sequence(
                     input.structure.system,
                     references,
                     host_sequence_tokens[index],
@@ -944,6 +954,13 @@ class LigandMpnnModel(Model):
             for index in range(num_candidates)
         )
         return DesignResult(candidates=candidates)
+
+
+def _positive_integer(value: int, name: str) -> int:
+    result = operator.index(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
 
 
 class LigandMpnnFeatures(MpnnProteinFeatures):
@@ -1188,15 +1205,6 @@ def _local_angle_features(
     )
 
 
-def _positive_integer(value: int, name: str) -> int:
-    r"""Normalize one positive index-valued operation count."""
-
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
-
-
 def _decode_groups(decode_order: Tensor, tied_groups: list[list[int]]) -> list[list[int]]:
     r"""Order tied groups by the first time any member appears in the decode order."""
 
@@ -1227,91 +1235,6 @@ def _collapse_tied_order(
     )
 
 
-def _realize_designed_system(
-    system: MolecularSystem,
-    component_references: tuple[ComponentReference | None, ...],
-    sampled_tokens: list[int],
-    design_positions: list[bool],
-) -> MolecularSystem:
-    r"""Realize one candidate while preserving entity, instance, and bond identity.
-
-    Designed protein occurrences take their sampled generatable identity; every untouched entity,
-    instance, and resolvable stored bond is preserved. Changed copies of a shared entity partition by
-    their complete output component-ID sequence as ProteinMpnn does, and entities from
-    different originals never merge.
-    """
-
-    replacements = {
-        reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
-        for reference, token, selected in zip(component_references, sampled_tokens, design_positions)
-        if reference is not None and selected
-    }
-    changed_references = frozenset(
-        reference
-        for reference, replacement in replacements.items()
-        if system.component(reference).component_id != replacement.component_id
-    )
-    realized_by_instance: dict[str, PolymerSequence | Molecule] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            realized_by_instance[instance_id] = PolymerSequence(
-                entity.polymer_type,
-                tuple(
-                    replacements.get((instance_id, index), component)
-                    for index, component in enumerate(entity.components)
-                ),
-            )
-        else:
-            realized_by_instance[instance_id] = entity
-
-    # Partition chemically equivalent copies within each original entity by complete output sequence;
-    # instance keys remain unchanged and entities from different originals never merge.
-    partitions: dict[str, list[tuple[tuple[str, ...], PolymerSequence | Molecule, list[str]]]] = {
-        entity_id: [] for entity_id in system.entities
-    }
-    for instance_id, entity_id in system.instances.items():
-        entity = realized_by_instance[instance_id]
-        signature = tuple(component.component_id for component in entity.components)
-        partition = next(
-            (candidate for candidate in partitions[entity_id] if candidate[0] == signature),
-            None,
-        )
-        if partition is None:
-            partitions[entity_id].append((signature, entity, [instance_id]))
-        else:
-            partition[2].append(instance_id)
-
-    used_ids = set(system.entities)
-    new_entities: dict[str, PolymerSequence | Molecule] = {}
-    instance_entities: dict[str, str] = {}
-    for entity_id, original in system.entities.items():
-        values = partitions[entity_id]
-        original_signature = tuple(component.component_id for component in original.components)
-        primary_index = next(
-            (index for index, value in enumerate(values) if value[0] == original_signature),
-            0,
-        )
-        for partition_index in (primary_index, *(index for index in range(len(values)) if index != primary_index)):
-            signature, entity, instance_ids = values[partition_index]
-            if partition_index == primary_index:
-                output_id = entity_id
-            else:
-                suffix = 2
-                output_id = f"{entity_id}_{suffix}"
-                while output_id in used_ids:
-                    suffix += 1
-                    output_id = f"{entity_id}_{suffix}"
-                used_ids.add(output_id)
-            new_entities[output_id] = original if signature == original_signature else entity
-            for instance_id in instance_ids:
-                instance_entities[instance_id] = output_id
-    new_instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-    candidate = MolecularSystem(new_entities, new_instances)
-    retained_bonds = system.retain_bonds_after_component_mutation(candidate, changed_references)
-    return MolecularSystem(new_entities, new_instances, retained_bonds)
-
-
 # ---------------------------------------------------------------------------
 # LigandMPNN typed inputs and outputs.
 # ---------------------------------------------------------------------------
@@ -1324,7 +1247,7 @@ class LigandMpnnInput:
     The Processor emits one Structure per input, so the tensor batch size is one.
     ``backbone_coordinates`` is ``[1, L, 4, 3]`` in N/CA/C/O order. The
     ``context_*`` tensors are ``[1, L, A, ...]`` for the padded nearest-context
-    extent ``A``. The ``residue_context_*`` tensors are the released ``[1, L, 32]``
+    extent ``A``. The ``residue_context_*`` tensors are the ``[1, L, 32]``
     side-chain slots at atom37 indices ``5:37`` (CG through OXT, deliberately
     excluding CB), which the Model consumes directly instead of a redundant full
     atom37 array. ``tied_group_ids`` is aligned ``long [1, L]`` dense causal-unit
@@ -1351,7 +1274,7 @@ class LigandMpnnInput:
     tied_group_ids: Tensor
     tied_weights: Tensor | None = None
     allowed_token_mask: Tensor | None = None
-    logit_bias: Tensor | None = None
+    residue_logit_bias: Tensor | None = None
 
 
 @dataclass(eq=False)

@@ -31,11 +31,11 @@ class ModelConfig(chanfig.Config):
     path the architecture and config come from the repository.
     """
 
-    name: str | None = None
+    name: str = ""
     pretrained: str | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.name = None
+        self.name = ""
         self.pretrained = None
         super().__init__(*args, **kwargs)
 
@@ -79,7 +79,7 @@ class RunnerConfig(dl.RunnerConfig):
     fully constructed instance or any mapping it can be built from (YAML / CLI via
     the inherited ``parse``).
 
-    Args:
+    Attributes:
         runner: Registry key resolved through :data:`ofoldx.runners.registry.RUNNERS`.
         training: When ``False``, training splits are ignored (evaluate / infer only).
         model: The Model to build (see :class:`ModelConfig`).

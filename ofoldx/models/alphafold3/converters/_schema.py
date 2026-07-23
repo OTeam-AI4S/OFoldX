@@ -22,7 +22,7 @@ from dataclasses import dataclass
 class AF3Node:
     r"""One resolved OFoldX-AF3 model key.
 
-    Attributes:
+    Args:
         section: The top-level submodule the key belongs to (e.g. ``"pairformer"``, ``"atom_encoder"``).
         context: A within-section discriminator (e.g. the pairformer stack that hosts the block, or the
             ``"input"`` / ``"diffusion"`` atom-encoder instance). Empty when the section has a single context.

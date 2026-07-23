@@ -3,9 +3,9 @@ r"""Generic mmCIF codec for canonical :class:`ofoldx.data.Structure` values."""
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import Protocol, cast
 
 import numpy as np
 
@@ -24,8 +24,28 @@ from .records import (
     unique_identifier,
 )
 
-if TYPE_CHECKING:
-    from biotite.structure.io.pdbx import CIFFile
+
+class _CifColumn(Protocol):
+    def as_array(self) -> Iterable[object]: ...
+
+
+class _CifCategory(Protocol):
+    row_count: int
+
+    def __contains__(self, name: object) -> bool: ...
+
+    def __getitem__(self, name: str) -> _CifColumn: ...
+
+
+class _CifBlock(Protocol):
+    def __contains__(self, name: object) -> bool: ...
+
+    def __getitem__(self, name: str) -> _CifCategory: ...
+
+
+class _CifFile(Protocol):
+    block: _CifBlock
+
 
 _CIF_BOND_ORDERS = {
     "sing": (1.0, False),
@@ -39,7 +59,9 @@ _CIF_BOND_ORDERS = {
 def _expect_object(value: object, owner: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"{owner} must be an object")
-    return value  # type: ignore[return-value]
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{owner} keys must be strings")
+    return cast(dict[str, object], value)
 
 
 def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> ParsedStructure:
@@ -175,7 +197,7 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     row_sites = tuple(row.canonical_site for row in rows)
     if any(site is None for site in row_sites) or row_sites != structure.sites:
         raise ValueError("canonical mmCIF atom_site identity does not match _ofoldx_structure payload")
-    cif_file = cast("CIFFile", parsed.mmcif_file)
+    cif_file = cast(_CifFile, parsed.mmcif_file)
     formal_charges = _cif_column(cif_file.block["atom_site"], "pdbx_formal_charge")
     for row, site in zip(rows, structure.sites):
         atom = structure.system.atom(site)
@@ -186,10 +208,10 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     return structure
 
 
-def _cif_column(category: object, name: str) -> tuple[str | None, ...]:
-    if name not in category:  # type: ignore[operator]
-        return (None,) * category.row_count  # type: ignore[attr-defined]
-    return tuple(present_string(value) for value in category[name].as_array())  # type: ignore[index]
+def _cif_column(category: _CifCategory, name: str) -> tuple[str | None, ...]:
+    if name not in category:
+        return (None,) * category.row_count
+    return tuple(present_string(value) for value in category[name].as_array())
 
 
 def _cif_bond_order(value: str | None) -> tuple[float, bool]:
@@ -247,7 +269,7 @@ def read_mmcif_branch_entities(
     cif_file = parsed.mmcif_file
     if cif_file is None:
         return {}, {}
-    block = cif_file.block  # type: ignore[attr-defined]
+    block = cast(_CifFile, cif_file).block
     if "pdbx_entity_branch_list" not in block:
         return {}, {}
 
@@ -352,7 +374,7 @@ def read_mmcif_branch_entities(
     component_indices: dict[tuple[object, ...], int] = {}
     if "pdbx_branch_scheme" in block:
         scheme = block["pdbx_branch_scheme"]
-        asym_ids = _cif_column(scheme, "asym_id")
+        label_asym_ids = _cif_column(scheme, "asym_id")
         scheme_entities = _cif_column(scheme, "entity_id")
         monomer_ids = _cif_column(scheme, "mon_id")
         scheme_numbers = _cif_column(scheme, "num")
@@ -363,7 +385,7 @@ def read_mmcif_branch_entities(
         auth_monomer_ids = _cif_column(scheme, "auth_mon_id")
         auth_sequence_numbers = _cif_column(scheme, "auth_seq_num")
         for values in zip(
-            asym_ids,
+            label_asym_ids,
             scheme_entities,
             monomer_ids,
             scheme_numbers,
@@ -375,7 +397,7 @@ def read_mmcif_branch_entities(
             auth_sequence_numbers,
         ):
             (
-                asym_id,
+                label_asym_id,
                 entity_id,
                 monomer_id,
                 number,
@@ -404,7 +426,7 @@ def read_mmcif_branch_entities(
             for source_monomer_id in source_monomer_ids:
                 for source_asym_id, source_sequence_number in source_positions:
                     key = (
-                        asym_id,
+                        label_asym_id,
                         entity_id,
                         source_monomer_id,
                         source_asym_id,
@@ -427,7 +449,7 @@ def read_mmcif_bonds(
     cif_file = parsed.mmcif_file
     if cif_file is None:
         return ()
-    block = cif_file.block  # type: ignore[attr-defined]
+    block = cast(_CifFile, cif_file).block
     if "struct_conn" not in block:
         return ()
     category = block["struct_conn"]

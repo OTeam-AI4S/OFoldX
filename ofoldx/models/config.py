@@ -6,31 +6,17 @@ from chanfig import Config
 
 
 class DistogramConfig(Config):
-    r"""
-    Distogram head configuration.
-
-    The distogram head reads the pair representation and predicts, per residue pair, a categorical
-    distribution over binned inter-residue distances.
+    r"""Configure a head that predicts binned inter-residue distances from pair representations.
 
     Attributes:
         num_bins: Number of distance bins the head predicts over.
-
-    Examples:
-        >>> config = DistogramConfig()
-        >>> config.num_bins
-        64
     """
 
     num_bins: int = 64
 
 
 class ConfidenceConfig(Config):
-    r"""
-    Confidence head configuration.
-
-    Groups every knob of the confidence trunk: the pLDDT / PAE / PDE / resolved bin counts, the
-    distogram-derived distance grid, and the Pairformer stack that refines the single and pair
-    representations before the per-metric projections.
+    r"""Configure confidence metrics and the Pairformer trunk that predicts them.
 
     Attributes:
         num_plddt_bins: Number of pLDDT confidence bins.
@@ -49,11 +35,6 @@ class ConfidenceConfig(Config):
         num_triangle_attention_heads: Number of triangle-attention heads.
         expansion: Feed-forward expansion factor inside the Pairformer transition.
         pairformer_dropout: Dropout probability applied inside the confidence Pairformer.
-
-    Examples:
-        >>> config = ConfidenceConfig()
-        >>> config.num_pae_bins
-        64
     """
 
     num_plddt_bins: int = 50
@@ -75,22 +56,13 @@ class ConfidenceConfig(Config):
 
 
 class TrunkConfig(Config):
-    r"""
-    Representation trunk configuration.
-
-    Configures the main Pairformer trunk that jointly refines the single, pair, and MSA
-    representations, including the per-axis dropout rates used during training.
+    r"""Configure the Pairformer trunk that refines single, pair, and MSA representations.
 
     Attributes:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
         pairformer_dropout: Dropout probability applied inside each Pairformer block.
         msa_dropout: Dropout probability applied along the MSA path.
         pair_dropout: Dropout probability applied along the pair path.
-
-    Examples:
-        >>> config = TrunkConfig()
-        >>> config.num_pairformer_blocks
-        48
     """
 
     num_pairformer_blocks: int = 48
@@ -100,11 +72,7 @@ class TrunkConfig(Config):
 
 
 class TemplateConfig(Config):
-    r"""
-    Template embedding configuration.
-
-    Controls the optional template stack that embeds structural templates into the pair
-    representation. A ``num_blocks`` of ``0`` disables template embedding entirely.
+    r"""Configure the optional stack that embeds structural templates into pair representations.
 
     Attributes:
         hidden_size: Width of the template pair embedding.
@@ -115,13 +83,6 @@ class TemplateConfig(Config):
         num_triangle_attention_heads: Number of template triangle-attention heads.
         expansion: Feed-forward expansion factor inside the template transition.
         dropout: Dropout probability applied inside the template stack.
-
-    Examples:
-        >>> config = TemplateConfig()
-        >>> config.hidden_size
-        64
-        >>> config.num_blocks
-        0
     """
 
     hidden_size: int = 64
@@ -135,12 +96,7 @@ class TemplateConfig(Config):
 
 
 class DenoiserConfig(Config):
-    r"""
-    Coordinate denoiser configuration.
-
-    Configures the diffusion denoiser: the atom encoder / decoder that map between per-atom and
-    per-token representations, the token-level transformer trunk, and the local-attention window
-    sizes used by the atom stacks.
+    r"""Configure the atom and token stacks of the diffusion coordinate denoiser.
 
     Attributes:
         num_token_encoder_blocks: Number of token-level transformer blocks in the denoiser trunk.
@@ -155,13 +111,6 @@ class DenoiserConfig(Config):
         num_atom_decoder_attention_heads: Number of attention heads in the atom decoder.
         num_query_atoms: Local-attention query window size for the atom stacks.
         num_key_atoms: Local-attention key window size for the atom stacks.
-
-    Examples:
-        >>> config = DenoiserConfig()
-        >>> config.token_hidden_size
-        768
-        >>> config.sigma_data
-        16.0
     """
 
     num_token_encoder_blocks: int = 24
@@ -179,11 +128,7 @@ class DenoiserConfig(Config):
 
 
 class SamplerConfig(Config):
-    r"""
-    Coordinate sampler configuration.
-
-    Controls the EDM reverse-diffusion loop used at inference: the solver, the number of sampling
-    steps, the churn (noise re-injection) schedule, and the log-uniform noise-level grid bounds.
+    r"""Configure the solver and noise schedule for EDM reverse diffusion.
 
     Attributes:
         solver: Name of the ODE/SDE solver driving the reverse diffusion (e.g. ``"euler"``).
@@ -196,13 +141,6 @@ class SamplerConfig(Config):
         max_noise_level: Upper bound of the noise-level grid.
         min_noise_level: Lower bound of the noise-level grid.
         rho: Exponent shaping the noise-level grid spacing.
-
-    Examples:
-        >>> config = SamplerConfig()
-        >>> config.solver
-        'euler'
-        >>> config.num_sampling_steps
-        200
     """
 
     solver: str = "euler"

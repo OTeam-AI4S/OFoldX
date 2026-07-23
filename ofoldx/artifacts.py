@@ -10,11 +10,13 @@ from typing import Protocol, cast
 
 import torch
 
+from .model import Model
 from .models.registry import MODELS
+from .processor import Processor
 
 
 class SaveableModel(Protocol):
-    r"""Model capabilities required by the repository writer and paired Pipelines."""
+    r"""Structural model surface used only to compose task-specific Protocols."""
 
     @property
     def config(self) -> Mapping[str, object]: ...
@@ -47,8 +49,8 @@ def _config_json(config: Mapping[str, object], *, architecture: str | None = Non
 def save_model(
     directory: str | PathLike[str],
     *,
-    model: SaveableModel,
-    processor: object,
+    model: Model,
+    processor: Processor,
     max_shard_size: int | str = "5GB",
     repo_id: str | None = None,
     token: str | None = None,

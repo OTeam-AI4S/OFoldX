@@ -2,11 +2,9 @@ r"""LigandMPNN protein-sequence design implementation."""
 
 from __future__ import annotations
 
-from typing import cast
-
 from ...modules.mpnn import tied_groups_from_ids
 from ...pipelines.registry import PIPELINES
-from ..registry import MODELS, Task
+from ..registry import MODELS
 from .config import LigandMpnnConfig, LigandMpnnProcessorConfig
 from .model import (
     LigandMpnnFeatures,
@@ -29,6 +27,6 @@ MODELS.register_model(
 PIPELINES.register_pipeline(
     "ofoldx.ligandmpnn",
     pipeline=LigandMpnnPipeline,
-    tasks=cast(tuple[Task], ("design",)),
+    tasks=("design",),
     architectures=("ofoldx.ligandmpnn",),
 )

@@ -1,27 +1,9 @@
 r"""ODesign design-and-assign composition.
 
-The released ODesign protein deliverable is a two-stage composition under the single
-``design`` verb: the ODesign core generates backbone coordinates (S seeds × M diffusion
-samples), and the OInvFold sequence step assigns sequences to each backbone (K top-k
-variants). Upstream the OInvFold sequence module for the protein modality *is* the released
-ProteinMPNN / LigandMPNN network (``mpnn_model_type`` dual-model dispatch,
-``infer_runner.py:84-91``), so this Pipeline **composes the already-registered
-``ofoldx/proteinmpnn`` and ``ofoldx/ligandmpnn`` Pipelines read-only** rather than
-re-vendoring the sequence network. The result is the M×S×K :class:`ODesignDesignResult`.
-
-Sampling controls for the protein modality:
-  * ``temperature`` (upstream ``invfold_temp``) → the MPNN sampler temperature;
-  * ``num_sequences`` = top-k (upstream ``invfold_topk``) → MPNN ``num_candidates``;
-  * ``use_beam`` is **inert for protein** and MUST NOT be a functional protein knob — the
-    released ``proteinmpnn_inference`` ignores it (``proteinmpnn/inference.py`` ``_ = use_beam``).
-    Beam decoding exists only on non-protein OInvFold checkpoints (``oinvfold_*.ckpt``,
-    gRNAde), which are not included here and expose a different call type.
-    This Pipeline accepts ``use_beam`` and ignores it, exactly as the released protein path does.
-
-The protein vertical follows upstream ``parse_invfold`` at the composition boundary: each
-generated protein chain is sampled independently against the whole assembly, candidates are
-score-sorted per chain before rank-wise merging, and assigned identities are written back into
-the coordinate-bearing Structure while fixed motif/receptor positions remain unchanged.
+The Pipeline generates backbone coordinates over seed and diffusion-sample axes, then assigns
+ProteinMPNN or LigandMPNN sequence variants to each generated protein chain. Variants are ranked
+per chain, merged by rank, and written into coordinate-bearing structures while fixed context
+positions remain unchanged.
 """
 
 from __future__ import annotations
@@ -33,9 +15,9 @@ from typing import Literal
 
 import numpy as np
 import torch
-from typing_extensions import Self
 
 from ...data.bonds import SymbolicBond
+from ...data.components import get_component
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence, is_water_component
 from ...data.structure import Structure
 from ...modules.mpnn import (
@@ -47,7 +29,6 @@ from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import Score
 from ..ligandmpnn import LigandMpnnPipeline
 from ..proteinmpnn import ProteinMpnnPipeline
-from ..proteinmpnn.model import ProteinMpnnModel
 from .model import (
     Hotspot,
     ODesignDesignCandidate,
@@ -63,9 +44,8 @@ from .processor import ODesignProcessor
 def _has_atom_context(system: MolecularSystem) -> bool:
     r"""Report whether the backbone system carries non-protein (ligand / nucleic) context.
 
-    Protein atoms and water are excluded exactly as in upstream ``parse_invfold``. Any other
-    heavy atom selects LigandMPNN globally for every designed protein chain; its processor then
-    applies the released strict 8 Å interface mask per residue.
+    Protein atoms and water are excluded. Any other heavy atom selects LigandMPNN for every
+    designed protein chain; its Processor applies the per-residue interface mask.
     """
 
     for entity in system.entities.values():
@@ -80,17 +60,16 @@ def _has_atom_context(system: MolecularSystem) -> bool:
 
 
 def _odesign_scores(scores: dict[str, Score], *, used_ligand: bool) -> dict[str, Score]:
-    r"""Map the released MPNN per-sequence Scores to the ODesign score table.
+    r"""Map MPNN per-sequence scores to the ODesign score table.
 
-    The OInvFold protein module uses the ProteinMPNN / LigandMPNN network, so the
-    per-sequence Scores preserve its semantics (raw ``log_softmax``, not
-    the tempered sampling distribution). ProteinMPNN emits ``designed_sequence_nll``
+    ProteinMPNN and LigandMPNN per-sequence scores preserve raw ``log_softmax`` semantics rather
+    than the tempered sampling distribution. ProteinMPNN emits ``designed_sequence_nll``
     (nat/residue) while LigandMPNN emits ``designed_sequence_confidence`` = ``exp(-nll)``;
     each is the exact inverse of the other, so both branches populate the same four keys with
     identical units / ``preferred`` / scope. ``ligand_interface_confidence`` is present only
     when the LigandMPNN atom-context model was used (its scope is the LigandMPNN interface
     subset ``I``); empty-scope and NaN behavior is carried through unchanged from the
-    source Score (LigandMPNN already emits ``scope=frozenset()`` + ``NaN`` for a chain with no
+    input score (LigandMPNN emits ``scope=frozenset()`` + ``NaN`` for a chain with no
     ligand interface).
     """
 
@@ -159,7 +138,7 @@ def _generated_protein_chains(input: ODesignInput) -> tuple[tuple[ComponentRefer
 
 
 def _decoding_ranks(priorities: torch.Tensor, design_mask: torch.Tensor) -> torch.Tensor:
-    r"""Lower upstream ProteinMPNN ``randn`` priorities to explicit causal ranks."""
+    r"""Lower ProteinMPNN random priorities to explicit causal ranks."""
 
     order = torch.argsort((design_mask.to(priorities.dtype) + 0.0001) * priorities.abs(), dim=-1)
     ranks = torch.empty_like(order)
@@ -180,7 +159,7 @@ def _protein_sequence_variants(
     temperature: float,
     generator: torch.Generator | None,
 ) -> tuple[tuple[dict[ComponentReference, int], dict[str, Score]], ...]:
-    r"""Run upstream-equivalent ProteinMPNN sampling for one target chain."""
+    r"""Run ProteinMPNN sampling for one target chain."""
 
     model_input = designer.processor(structure, design_positions=positions)
     device = model_input.backbone_coordinates.device
@@ -264,7 +243,7 @@ def _ligand_sequence_variants(
     temperature: float,
     generator: torch.Generator | None,
 ) -> tuple[tuple[dict[ComponentReference, int], dict[str, Score]], ...]:
-    r"""Run LigandMPNN for one target chain and reproduce upstream score sorting."""
+    r"""Run LigandMPNN for one target chain and sort variants by confidence."""
 
     result = designer.design(
         structure,
@@ -335,14 +314,6 @@ def _combine_chain_scores(chain_scores: Sequence[dict[str, Score]]) -> dict[str,
     return result
 
 
-def _realize_sequence_system(system: MolecularSystem, replacements: dict[ComponentReference, int]) -> MolecularSystem:
-    r"""Apply all chain assignments through ProteinMPNN's canonical entity-splitting rule."""
-
-    references = tuple(replacements)
-    tokens = torch.tensor(tuple(replacements.values()), dtype=torch.int64)
-    return ProteinMpnnModel._realize_sequence(system, references, tokens, torch.ones_like(tokens, dtype=torch.bool))
-
-
 def _structure_with_system(structure: Structure, system: MolecularSystem) -> Structure:
     r"""Retain the generated backbone coordinates while replacing residue identities."""
 
@@ -365,24 +336,22 @@ def _structure_with_system(structure: Structure, system: MolecularSystem) -> Str
 
 
 class ODesignPipeline(CompositePipeline):
-    r"""Compose the ODesign backbone designer with the OInvFold (MPNN) sequence step.
+    r"""Compose the ODesign backbone designer with MPNN sequence assignment.
 
-    ODesign generates backbones over
-    S seeds × M diffusion samples, and each backbone is assigned K sequence variants by the
-    read-only ProteinMPNN / LigandMPNN Pipelines. It mirrors the ``ProteinMpnnDesignAndPack``
-    composition structure — a coordinating object holding child Pipelines with a shared
-    :meth:`to` — rather than the single-pair ``PairedPipeline``, because the sequence network
-    is loaded as a separately registered Model-Processor pair, never re-vendored.
+    ODesign generates backbones over S seeds and M diffusion samples. Each backbone receives K
+    ranked sequence variants from the ProteinMPNN or LigandMPNN Pipeline.
 
-    This is a multi-pair Pipeline (see ``_PAIR_LAYOUT`` below), registered so repositories route
-    through the composite loader. De-novo ligand and nucleic-acid generation remains outside the
-    polymer-only placement representation.
+    Args:
+        model: ODesign backbone Model.
+        processor: Processor paired with ``model``.
+        protein_designer: ProteinMPNN Pipeline used without atom context.
+        ligand_designer: LigandMPNN Pipeline used when atom context is present.
     """
 
-    # The ODesign backbone pair owns the runnable root, and the two read-only OInvFold sequence
+    # The ODesign backbone pair owns the root, and the two sequence
     # designers live at fixed subdirectories. Each designer is a
     # single-pair child Pipeline, so its reloaded pair is wrapped back into its Pipeline class.
-    _PAIR_LAYOUT = (
+    pair_layout = (
         CompositePair("", "model", "processor"),
         CompositePair("protein_designer", "protein_designer", None, wrap=ProteinMpnnPipeline),
         CompositePair("ligand_designer", "ligand_designer", None, wrap=LigandMpnnPipeline),
@@ -400,19 +369,6 @@ class ODesignPipeline(CompositePipeline):
         self.processor = processor
         self.protein_designer = protein_designer
         self.ligand_designer = ligand_designer
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Place the ODesign pair and both sequence Pipelines on one device / dtype."""
-
-        self.model.to(device=device, dtype=dtype)
-        self.processor.to(device=device, dtype=dtype)
-        self.protein_designer.to(device=device, dtype=dtype)
-        self.ligand_designer.to(device=device, dtype=dtype)
-        return self
 
     def design(
         self,
@@ -432,20 +388,35 @@ class ODesignPipeline(CompositePipeline):
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
     ) -> ODesignDesignResult:
-        r"""Generate the released M×S×K backbone-and-sequence design grid.
+        r"""Generate the ODesign backbone-and-sequence grid.
 
-        ``num_candidates`` is the standard OFoldX design-count entry (what
-        :func:`ofoldx.design` forwards). ODesign natively splits generation over three axes —
-        ``num_seeds`` (S) × ``num_backbones`` (M diffusion samples) × ``num_sequences`` (K
-        top-k sequence variants). ``num_candidates`` maps onto the primary backbone-generation
-        axis: when given it sets ``num_backbones`` (each generated backbone is one design), so
-        with the default S=1, K=1 the pipeline returns exactly ``num_candidates`` candidates. It
-        takes precedence over an explicit ``num_backbones``; the 3-axis knobs remain available
-        for the richer native grid.
+        Args:
+            input: Optional target or context system, structure, or structure path.
+            placement: Optional topology of existing spans and generated polymer segments.
+            num_candidates: Standard OFoldX design count, mapped to ``num_backbones`` when set.
+            num_seeds: Number of generation seeds to draw when ``seeds`` is not supplied.
+            num_backbones: Number of diffusion backbones generated for each seed.
+            num_sequences: Number of ranked inverse-folding variants assigned to each backbone.
+            temperature: ProteinMPNN or LigandMPNN sequence-sampling temperature.
+            seeds: Optional explicit generation seeds; their count replaces ``num_seeds``.
+            seed: Optional integer seed used to draw generation seeds.
+            generator: Optional PyTorch random generator used to draw generation seeds.
+            receptor_mode: Optional receptor treatment, ``"rigid"`` or ``"flex"``.
+            conditions: Hotspot, covalent-bond, and reference-coordinate conditions.
+            num_sampling_steps: Number of coordinate-diffusion sampling steps per backbone.
+            partial_diffusion_snr: Optional signal-to-noise ratio for partial diffusion from
+                observed coordinates.
+
+        Returns:
+            An ``ODesignDesignResult`` containing the coordinate-bearing design grid.
+
+        Notes:
+            The candidate axes are seed (S), backbone (M), then sequence (K), and candidates are
+            ordered S -> M -> K. ``num_candidates`` replaces M when supplied; explicit ``seeds``
+            replace S. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
+        generator = resolve_generator(seed, generator)
         if num_candidates is not None:
             # Standard single-axis entry: map the OFoldX design count onto the primary
             # backbone-generation axis (see the method docstring).
@@ -453,7 +424,7 @@ class ODesignPipeline(CompositePipeline):
         if num_seeds <= 0 or num_backbones <= 0 or num_sequences <= 0:
             raise ValueError("num_seeds, num_backbones, and num_sequences must be positive")
 
-        seed_list = self._resolve_seeds(num_seeds, seeds, seed, generator)
+        seed_list = self._resolve_seeds(num_seeds, seeds, generator)
 
         model_input = self._build_batch(input, placement, conditions, receptor_mode)
         candidates: list[ODesignDesignCandidate] = []
@@ -505,7 +476,12 @@ class ODesignPipeline(CompositePipeline):
                         for variants in chain_variants
                         for reference, token in variants[sequence_index][0].items()
                     }
-                    system = _realize_sequence_system(structure.system, replacements)
+                    system = structure.system.replace_components(
+                        {
+                            reference: get_component(AMINO_ACID_COMPONENT_IDS[token])
+                            for reference, token in replacements.items()
+                        }
+                    )
                     assigned_structure = _structure_with_system(structure, system)
                     candidates.append(
                         ODesignDesignCandidate(
@@ -527,7 +503,6 @@ class ODesignPipeline(CompositePipeline):
         self,
         num_seeds: int,
         seeds: Sequence[int] | None,
-        seed: int | None,
         generator: torch.Generator | None,
     ) -> tuple[int, ...]:
         r"""Fix the S seed list (explicit ``configs.seeds`` or drawn from one base stream)."""
@@ -537,8 +512,6 @@ class ODesignPipeline(CompositePipeline):
             if not seed_list:
                 raise ValueError("seeds must not be empty")
             return seed_list
-        if generator is None and seed is not None:
-            generator = torch.Generator().manual_seed(seed)
         device = None if generator is None else generator.device
         drawn = torch.randint(
             1,

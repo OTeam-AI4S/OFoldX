@@ -24,6 +24,7 @@ class ConditionedTransformer(nn.Module):
 
     The pair bias is computed once and packed as ``num_blocks * heads`` channels on the last axis;
     the stack hands each block its own per-head slice, so no per-block bias projection is needed.
+
     Args:
         num_blocks: Number of transformer blocks.
         num_attention_heads: Number of attention heads per block.
@@ -32,7 +33,10 @@ class ConditionedTransformer(nn.Module):
         operator_backend: Which operator backend the attention runs; see
             [ofoldx.modules.backend][].
         cross_attention_mode: Whether each block adds a second adaptive norm on the key/value path.
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
         transition: Which conditioned transition each block uses, ``"triple"`` or ``"double"``.
+
     Examples:
         >>> import torch
         >>> transformer = ConditionedTransformer(
@@ -62,6 +66,7 @@ class ConditionedTransformer(nn.Module):
     ) -> None:
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
+        self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             ConditionedTransformerBlock(
                 hidden_size,
@@ -130,9 +135,8 @@ class ConditionedTransformerBlock(nn.Module):
     selects the windowed key set for local atom attention; when ``None`` the block self-attends
     over the full token/atom axis. ``cross_attention_mode`` adds a second adaptive norm on the
     key/value path. ``cross_attention_key_source`` selects whether that norm consumes the raw hidden
-    (DeepMind AF3) or the already query-normalized activation (Protenix and descendants). ``transition``
-    selects either the triple-product
-    [ConditionedTransitionBlock][ofoldx.modules.transformer.ConditionedTransitionBlock] or the
+    or the already query-normalized activation. ``transition`` selects either the
+    [TripleProductConditionedTransition][ofoldx.modules.transformer.TripleProductConditionedTransition] or the
     double-product [ConditionedTransition][ofoldx.modules.transition.ConditionedTransition].
 
     Args:
@@ -142,6 +146,8 @@ class ConditionedTransformerBlock(nn.Module):
         operator_backend: Which operator backend the attention runs; see
             [ofoldx.modules.backend][].
         cross_attention_mode: Whether to add a second adaptive norm on the key/value path.
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
         transition: Which conditioned transition to use, ``"triple"`` or ``"double"``.
 
     Raises:
@@ -183,7 +189,7 @@ class ConditionedTransformerBlock(nn.Module):
         )
         self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
         if transition == "triple":
-            self.transition: nn.Module = ConditionedTransitionBlock(hidden_size, conditioning_size)
+            self.transition: nn.Module = TripleProductConditionedTransition(hidden_size, conditioning_size)
         elif transition == "double":
             self.transition = ConditionedTransition(hidden_size, conditioning_size, expansion=2)
         else:
@@ -229,10 +235,9 @@ class ConditionedTransformerBlock(nn.Module):
             torch.Size([1, 5, 8])
         """
         normalized = self.conditioned_norm(hidden, conditioning)
-        # Cross-attention adaptive-norms the key/value path independently. The canonical convention
-        # (DeepMind AF3 ``cross_attention``) norms the *raw* hidden -- ``x_q = adaLN(act, cond_q)``,
-        # ``x_k = adaLN(gather(act), cond_k)`` -- so the key path is a norm of the raw hidden, chosen by
-        # Applying the norm per atom before ``to_keys`` gathers each key with its own conditioning.
+        # Cross-attention normalizes the key/value path independently. Normalizing before ``to_keys``
+        # lets every gathered key use its own conditioning; ``cross_attention_key_source`` selects
+        # whether that normalization starts from the raw or query-normalized hidden state.
         if self.cross_attention_mode:
             key_source = normalized if self.cross_attention_key_source == "normalized" else hidden
             key_base = self.key_value_norm(key_source, conditioning)
@@ -263,14 +268,13 @@ class ConditionedTransformerBlock(nn.Module):
         return hidden + self.transition(hidden, conditioning)
 
 
-class ConditionedTransitionBlock(nn.Module):
+class TripleProductConditionedTransition(nn.Module):
     r"""
     Conditioning-gated SwiGLU transition whose activation is multiplied by a third expansion branch.
 
     Unlike the double-product
     [ConditionedTransition][ofoldx.modules.transition.ConditionedTransition], the SwiGLU
-    activation is multiplied by a third ``expand_projection`` branch, and the gate/value terms
-    share a single fused projection whose output layout the checkpoint converters rely on.
+    activation is multiplied by a third ``expand_projection`` branch.
 
     Args:
         hidden_size: Input and output hidden width.
@@ -279,10 +283,10 @@ class ConditionedTransitionBlock(nn.Module):
 
     Examples:
         >>> import torch
-        >>> block = ConditionedTransitionBlock(8, 4, expansion=2)
+        >>> transition = TripleProductConditionedTransition(8, 4, expansion=2)
         >>> hidden = torch.randn(2, 3, 8)
         >>> conditioning = torch.randn(2, 3, 4)
-        >>> block(hidden, conditioning).shape
+        >>> transition(hidden, conditioning).shape
         torch.Size([2, 3, 8])
     """
 
@@ -290,7 +294,8 @@ class ConditionedTransitionBlock(nn.Module):
         super().__init__()
         inner_size = hidden_size * expansion
         self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
-        self.gate_value_projection = nn.Linear(hidden_size, inner_size * 2, bias=False)
+        self.gate_projection = nn.Linear(hidden_size, inner_size, bias=False)
+        self.value_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.expand_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.output_projection = nn.Linear(inner_size, hidden_size, bias=False)
         self.conditioning_gate_projection = nn.Linear(conditioning_size, hidden_size)
@@ -301,10 +306,9 @@ class ConditionedTransitionBlock(nn.Module):
         r"""
         Triple-product SwiGLU transition with a conditioning-gated output.
 
-        The input is conditioned-normed, then the fused projection splits into ``value`` and
-        ``gate`` of width ``inner_size``; the activation ``silu(gate) * value`` is further
-        multiplied by the ``expand_projection`` branch, projected back to ``hidden_size``, and
-        scaled by a sigmoid gate projected from ``conditioning``.
+        The input is conditioned-normed, then ``silu(gate) * value`` is multiplied by the
+        ``expand_projection`` branch, projected back to ``hidden_size``, and scaled by a sigmoid
+        gate projected from ``conditioning``.
 
         Args:
             hidden: `[..., hidden_size]` input activations.
@@ -315,15 +319,15 @@ class ConditionedTransitionBlock(nn.Module):
 
         Examples:
             >>> import torch
-            >>> block = ConditionedTransitionBlock(8, 4, expansion=2)
+            >>> transition = TripleProductConditionedTransition(8, 4, expansion=2)
             >>> hidden = torch.randn(1, 5, 8)
             >>> conditioning = torch.randn(1, 5, 4)
-            >>> block(hidden, conditioning).shape
+            >>> transition(hidden, conditioning).shape
             torch.Size([1, 5, 8])
         """
         normalized = self.conditioned_norm(hidden, conditioning)
-        # Gate/value order follows the fused projection layout expected by the checkpoint converters.
-        value, gate = self.gate_value_projection(normalized).chunk(2, dim=-1)
+        gate = self.gate_projection(normalized)
+        value = self.value_projection(normalized)
         activated = (self.silu(gate) * value) * self.expand_projection(normalized)
         conditioning_gate = self.sigmoid(self.conditioning_gate_projection(conditioning))
         return conditioning_gate * self.output_projection(activated)

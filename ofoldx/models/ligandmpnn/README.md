@@ -10,158 +10,186 @@ library_name: ofoldx
 pipeline_tag: other
 ---
 
-# LigandMpnn
+# LigandMPNN
 
-LigandMpnn designs protein sequences from a fixed backbone and nearby
-non-protein atomic context. This is an unofficial OFoldX reimplementation of
-[LigandMPNN](https://doi.org/10.1038/s41592-025-02626-1). The upstream authors did
-not create, review, or endorse this implementation or model card.
+LigandMPNN designs protein sequences on a fixed backbone using nearby
+non-protein atoms as structural context.
 
-## Qualification
+## Disclaimer
 
-The sequence architecture has a canonical `LigandMpnnProcessor`, a differentiable
-`LigandMpnnModel.forward` returning the shared `MpnnOutput`, one standard
-autoregressive `design` path, all four released autoregressive/single-residue
-probability workflows returning the shared `MpnnProbabilityResult`, and a
-complete tensor `sample` output carrying probabilities, log probabilities, and the
-actual decoding order. `design` accepts direct per-residue `tied_weights` rather
-than forcing one symmetry weighting policy. It also has strict in-memory checkpoint
-conversion into a standard repository. It is registered as `ofoldx.ligandmpnn`
-for `design`.
+This is an unofficial OFoldX implementation of
+[LigandMPNN](https://github.com/dauparas/LigandMPNN). The upstream authors did
+not write, review, or endorse this implementation, conversion, or model card.
 
-The upstream project also distributes an independently loaded side-chain Packer.
-It accepts sequences from every official designer type and therefore belongs to the
-separate OFoldX `MpnnPacker` family, not to the LigandMpnn Model. The complete
-released design-to-pack composition remains part of the upstream surface audit.
-The audited upstream repository is inference-only; reproducing unpublished training
-choices is not a Model Hub requirement.
+## Model Details
 
-The maintained
-[`scripts/parity/ligandmpnn.py`](../../../scripts/parity/ligandmpnn.py)
-comparison reads the official source from `~/reference` and checkpoints from
-`~/weights`; generated reports remain local.
+The `ofoldx.ligandmpnn` architecture pairs
+`LigandMpnnModel` with `LigandMpnnProcessor`.
+`LigandMpnnPipeline` exposes autoregressive `design` and the
+four released probability workflows:
+`autoregressive_probabilities`,
+`sequence_free_autoregressive_probabilities`,
+`conditional_probabilities`, and
+`unconditional_probabilities`.
 
-## Inputs and outputs
+The Model exposes `encode`, differentiable `forward`, and
+`sample`. `forward` returns `LigandMpnnOutput`;
+`sample` returns `LigandMpnnSamplingOutput`. Both retain the
+effective decoding ranks. Probability workflows return
+`MpnnProbabilityResult`, while `design` returns
+`DesignResult`. Direct per-residue `tied_weights` preserve
+the released weighted-symmetry control.
 
-`LigandMpnnProcessor` accepts a canonical `Structure` or a local PDB/mmCIF path.
-It preserves full molecular identity while lowering protein N/CA/C/O coordinates,
-observed atom37 coordinates, residue and chain indices, and the nearest 25
-non-protein heavy atoms. Declared water molecules are excluded. Hard
-`AllowedResidueIdentities` and `TiedResidueIdentities` conditions are supported.
+The upstream side-chain packer is independently loaded and accepts sequences
+from every official designer type. OFoldX therefore implements it as the
+separate MPNN Packer family.
+`LigandMpnnDesignAndPackPipeline` owns the concrete design-to-pack
+composition.
 
-`design(...)` implements the released autoregressive sampler and returns the shared
-`DesignResult`. Each candidate carries a complete coordinate-free `MolecularSystem`
-that retains ligands and topology, realizes tied sequences, records aligned condition
-outcomes and score mappings, and carries sampling diagnostics and provenance.
+### Variants
 
-The four probability operations `autoregressive_probabilities`,
-`sequence_free_autoregressive_probabilities`, `conditional_probabilities`, and
-`unconditional_probabilities` each return the shared `MpnnProbabilityResult`. Over
-`num_decoding_orders` evaluations they retain the raw per-position `logits` and the
-effective decoding ranks and expose `log_probabilities`, `probabilities`,
-`mean_probabilities`, and `probability_standard_deviation`. The released command
-saves those raw aligned distributions, their mean, and population standard deviation
-rather than an aggregate NLL, so LigandMpnn publishes no scalar `score`/`ScoreResult`
-path.
+| Family member | Released checkpoint         | Role            |
+| ------------- | --------------------------- | --------------- |
+| LigandMPNN    | `ligandmpnn_v_32_005_25.pt` | sequence design |
+| LigandMPNN    | `ligandmpnn_v_32_010_25.pt` | sequence design |
+| LigandMPNN    | `ligandmpnn_v_32_020_25.pt` | sequence design |
+| LigandMPNN    | `ligandmpnn_v_32_030_25.pt` | sequence design |
+
+The four checkpoints share one executable architecture and differ by the
+Gaussian coordinate-noise level used during upstream training. That label is
+weight provenance, not a runtime Model configuration field. The
+`ligandmpnn_sc_v_32_002_16.pt` side-chain checkpoint belongs to
+MPNN Packer, not LigandMPNN.
+
+### Model Specification
+
+| Property            | Value                              |
+| ------------------- | ---------------------------------- |
+| Architecture        | `ofoldx.ligandmpnn`                |
+| Model               | `LigandMpnnModel`                  |
+| Processor           | `LigandMpnnProcessor`              |
+| Pipeline            | `LigandMpnnPipeline`               |
+| Task                | `design`                           |
+| Design result       | `DesignResult`                     |
+| Probability result  | `MpnnProbabilityResult`            |
+| Hidden size         | 128                                |
+| Encoder blocks      | 3 (`num_encoder_blocks`)           |
+| Atom-context blocks | 2 (`atom_context_blocks`)          |
+| Context blocks      | 2 (`context_blocks`)               |
+| Decoder blocks      | 3 (`num_decoder_blocks`)           |
+| Neighbors           | 32 (`num_neighbors`)               |
+| Context atoms       | nearest 25 non-protein heavy atoms |
+
+The Processor accepts a canonical `Structure` or a local PDB path.
+Load mmCIF through the canonical structure reader and pass the resulting
+`Structure`. It preserves complete molecular identity while lowering
+protein N/CA/C/O coordinates, observed residue atom context, residue and chain
+indices, and nearby non-protein heavy atoms. Declared water molecules are
+excluded. `use_atom_context`, `ligand_interface_cutoff`, and
+`filter_by_occupancy` are per-call controls.
+
+Hard `AllowedResidueIdentities` and
+`TiedResidueIdentities` conditions, global and per-residue logit bias,
+weighted ties, coordinate noise, and optional side-chain context are supported.
+Each design candidate carries a complete coordinate-free
+`MolecularSystem` and the scores
+`designed_sequence_confidence`,
+`ligand_interface_confidence`, and
+`sequence_recovery`.
+
+Each probability workflow retains logits and exact decoding ranks over every
+requested evaluation and exposes log probabilities, probabilities, their mean,
+and population standard deviation. The released workflow publishes these
+aligned distributions rather than an aggregate sequence NLL, so LigandMPNN has
+no scalar `score` or `ScoreResult` operation.
+
+### Links
+
+- [Official source](https://github.com/dauparas/LigandMPNN)
+- [Audited source revision](https://github.com/dauparas/LigandMPNN/tree/26ec57ac976ade5379920dbd43c7f97a91cf82de)
+- [Official checkpoint host](https://files.ipd.uw.edu/pub/ligandmpnn)
+- [LigandMPNN paper](https://doi.org/10.1038/s41592-025-02626-1)
 
 ## Usage
 
 ```python
-from ofoldx import pipeline
-from ofoldx.models.ligandmpnn.convert import convert_ligandmpnn_checkpoint
+from ofoldx import AutoModel, AutoProcessor, pipeline
 
-convert_ligandmpnn_checkpoint(
-    "ligandmpnn_v_32_010_25.pt",
-    "ligandmpnn",
+repository = "./ligandmpnn-v_32_010_25"
+designer = pipeline("design", model=repository, device="cuda")
+
+result = designer.design(
+    "target.pdb",
+    num_candidates=4,
+    use_atom_context=True,
+    ligand_interface_cutoff=8.0,
+    seed=7,
+)
+probabilities = designer.autoregressive_probabilities(
+    "target.pdb",
+    num_decoding_orders=8,
+    seed=7,
 )
 
-design_pipeline = pipeline("design", model="ligandmpnn", device="cuda")
-
-candidates = design_pipeline.design("target.cif", num_candidates=4, seed=7)
-probabilities = design_pipeline.autoregressive_probabilities(
-    "target.cif", num_decoding_orders=8, seed=7
-)
-```
-
-The ordinary tensor path remains available and differentiable:
-
-```python
-from ofoldx import AutoModel, AutoProcessor
-
-model = AutoModel("ligandmpnn", device="cuda")
-processor = AutoProcessor("ligandmpnn", device="cuda")
-batch = processor("target.cif")
+model = AutoModel(repository, device="cuda")
+processor = AutoProcessor(repository, device="cuda")
+batch = processor("target.pdb")
 output = model(batch)
-output.logits.square().mean().backward()
-
 sampled = model.sample(batch, num_samples=4)
-conditional = model.conditional_probabilities(batch, num_decoding_orders=8)
-autoregressive = model.autoregressive_probabilities(batch, num_decoding_orders=8)
 ```
 
-That example demonstrates gradient flow; it is not presented as the unpublished
-official training objective. Training orchestration is outside the current Model Hub
-gate.
+The direct tensor path is differentiable. Direct stochastic Model operations
+accept a caller-owned `torch.Generator`; Pipeline operations also
+accept `seed`.
 
-## Real-checkpoint parity
+## Checkpoints and Conversion
 
-The maintained script compares all four released sequence checkpoints, canonical
-Processor, and public APIs with the inspected official source. Its
-comparison surface includes:
+Convert one acquired sequence checkpoint:
 
-- backbone, sequence, masks, ligand coordinates/types/masks, interface identity,
-  relative residue offsets, and same-chain features;
-- teacher-forced forward log probabilities;
-- autoregressive and target-specific log probabilities, both with sequence context
-  and with backbone context only;
-- four-order sequence and ligand-interface scoring;
-- full autoregressive design tokens, sampling probabilities, per-step log
-  probabilities, and actual decoding order.
-- atom context enabled and disabled, side-chain context, and non-uniform tied
-  weights.
+```bash
+python -m ofoldx.models.ligandmpnn.convert \
+  ligandmpnn_v_32_010_25.pt \
+  ./ligandmpnn-v_32_010_25
+```
 
-Real-weight parity runs outside frequent CI. Frequent tests use tiny self-contained
-fixtures to cover shared Hub, Result, Condition, and standard-Pipeline invariants;
-family-specific qualification lives in the maintained parity scripts above.
+The converter uses restricted PyTorch loading, derives the hidden size, block
+counts, neighbor count, and Processor context extent, maps every checkpoint
+tensor, and strict-loads the native Model. It writes `model.json`,
+`processor.json`, safetensors weights, and the concrete
+`pipeline.json` marker. `--repo-id` optionally uploads the
+repository, and `--private` requests a private Hub repository.
 
-## Side-chain packing composition
+The side-chain checkpoint is converted with the separate
+`ofoldx.models.mpnn_packer.convert` module.
 
-The released workflow can pass LigandMpnn designs to the independent
-`ligandmpnn_sc_v_32_002_16.pt` Packer, but that checkpoint is not part of the
-LigandMpnn Model graph. Its implementation and direct packing API live with
-`ofoldx.models.mpnn_packer`; a concrete composition owns the designer × pack
-cardinality and transfer of selected sequences.
+## Training Details
 
-[`scripts/parity/mpnn_packer.py`](../../../scripts/parity/mpnn_packer.py)
-compares all 215 converted tensors, the default context-enabled Processor lowering,
-public encode/decode/forward, all eight sampling fields, and canonical `PackResult`
-realization against the released checkpoint. The script lists its intentionally
-uncovered diagnostic cases explicitly; repository round-trip evidence is maintained
-separately and is not attributed to that comparison.
+### Training Data
 
-## Upstream provenance
+The inspected upstream repository is inference-oriented and does not publish a
+complete reproducible training-data manifest for the four released sequence
+checkpoints.
 
-- Official repository: [dauparas/LigandMPNN](https://github.com/dauparas/LigandMPNN)
-- Audited source revision: `26ec57ac976ade5379920dbd43c7f97a91cf82de`
-- Official checkpoint host: `https://files.ipd.uw.edu/pub/ligandmpnn`
-- Validated sequence checkpoints: `ligandmpnn_v_32_{005,010,020,030}_25.pt`
-- Validated packer checkpoint: `ligandmpnn_sc_v_32_002_16.pt`
+### Training Procedure
 
-The audited revision records the source inspected for this behavior inventory. It
-does not pin an OFoldX dependency or constrain which checkout a parity run may use.
+The four checkpoint suffixes record distinct Gaussian coordinate-noise levels
+used during upstream training. The released inference source does not publish a
+complete reference training objective and procedure. OFoldX preserves a
+differentiable teacher-forced `forward` path but does not present a
+gradient-flow example as the unpublished official objective. Training
+orchestration belongs to the unified OFoldX Runner.
 
-The sequence checkpoints use the same executable architecture and differ by the
-Gaussian coordinate-noise level used during upstream training. That value is weight
-provenance, not a runtime Model configuration field.
+## Limitations
 
-## Provenance, terms, and redistribution
-
-OFoldX's Python implementation and documentation are licensed under
-`AGPL-3.0-or-later`. The audited upstream LigandMPNN code and released checkpoint
-files are distributed under the upstream
-[MIT License](https://github.com/dauparas/LigandMPNN/blob/26ec57ac976ade5379920dbd43c7f97a91cf82de/LICENSE).
-Converted weights are not relicensed as AGPL; preserve the upstream notice and
-recheck the exact source revision before redistribution.
+- LigandMPNN designs protein sequence on a fixed backbone with atomic context.
+  It does not generate backbones or pack side chains.
+- Side-chain packing belongs to MPNN Packer, and combined design-to-pack
+  cardinality belongs to the concrete composition.
+- LigandMPNN intentionally exposes aligned probability distributions rather
+  than a scalar `ScoreResult`.
+- Released-weight comparison tooling covers an earlier LigandMPNN surface.
+  Real-weight parity is not established for the current Model, Processor,
+  Pipeline, conversion, and design-to-pack composition.
 
 ## Citation
 
@@ -175,25 +203,17 @@ recheck the exact source revision before redistribution.
 }
 ```
 
-## Limitations & intentional upstream divergences
+## Contact
 
-- LigandMpnn designs sequence on a fixed backbone with atomic context. It does not
-  generate backbones or pack side chains; the independent packer is the separate
-  `MpnnPacker` family.
-- The four released sequence checkpoints share one executable architecture and differ
-  only by the training coordinate-noise level; that value is weight provenance, not a
-  runtime config field.
-- The released command saves raw aligned distributions, their mean, and population
-  standard deviation rather than a scalar NLL, so LigandMpnn intentionally publishes
-  no `ScoreResult` path.
-- A parity run applies only to the checkpoints and settings supplied to the script.
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card.
 
-## Licensing & redistribution
+## License
 
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code & weights:** MIT
-  ([LigandMPNN LICENSE](https://github.com/dauparas/LigandMPNN/blob/26ec57ac976ade5379920dbd43c7f97a91cf82de/LICENSE),
-  Copyright (c) 2024 Justas Dauparas).
-- **Redistribution status: GREEN.** The four `ligandmpnn_v_32_*_25` checkpoints are
-  permissively licensed and freely redistributable with the upstream MIT notice
-  preserved.
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Upstream source and checkpoints:** MIT under the
+  [LigandMPNN license](https://github.com/dauparas/LigandMPNN/blob/26ec57ac976ade5379920dbd43c7f97a91cf82de/LICENSE),
+  Copyright (c) 2024 Justas Dauparas.
+- The four sequence checkpoints and the separate side-chain checkpoint may be
+  redistributed with the upstream MIT notice preserved. Converted weights are
+  not relicensed by OFoldX.

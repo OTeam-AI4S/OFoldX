@@ -3,24 +3,44 @@ r"""Convert official RFdiffusion checkpoints to native OFoldX Models."""
 from __future__ import annotations
 
 import argparse
+import pickle
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
 from typing import cast
 
 import chanfig
+import numpy as np
 import torch
 from torch import Tensor
 
 from ...artifacts import save_model
 from .config import RfDiffusionConfig
-from .model import RfDiffusionModel, rfdiffusion_schedule
+from .model import RfDiffusionModel
 
 _DTYPES = {
     "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str, np.ndarray]:
+    r"""Load the released IGSO(3) lookup table from an original or safe converted source."""
+
+    if source is None:
+        raise ValueError(
+            "the IGSO(3) schedule source is required: pass the original RFdiffusion .pkl cache "
+            "or an .npz archive via schedule_source (the convert CLI's --schedule-source)"
+        )
+    path = Path(source)
+    if path.suffix == ".pkl":
+        with path.open("rb") as handle:
+            values = pickle.load(handle)
+        return {name: np.asarray(array) for name, array in values.items()}
+    with np.load(path, allow_pickle=False) as values:
+        return {name: values[name] for name in values.files}
+
 
 _DENOISER_RENAMES = {
     "n_extra_block": "num_extra_blocks",
@@ -56,15 +76,15 @@ _DIFFUSER_RENAMES = {
 _PREPROCESS_RENAMES = {
     "sidechain_input": "sidechain_input",
     "motif_sidechain_input": "motif_sidechain_input",
-    "d_t1d": "template_1d_size",
-    "d_t2d": "template_2d_size",
+    "d_t1d": "template_single_feature_size",
+    "d_t2d": "template_pair_feature_size",
     "str_self_cond": "structure_self_conditioning",
 }
 
 _DENOISER_ROOT_RENAMES = {
     "latent_emb": "msa_embeddings",
     "full_emb": "extra_msa_embeddings",
-    "templ_emb": "template_embeddings",
+    "templ_emb": "template_embedder",
     "recycle": "recycling_embeddings",
     "simulator": "trunk",
     "c6d_pred": "pairwise_geometry_head",
@@ -82,13 +102,13 @@ _DENOISER_STRUCTURE_RENAMES = (
     ("msa_embeddings.emb.", "msa_embeddings.input_projection."),
     ("extra_msa_embeddings.emb_q.", "extra_msa_embeddings.query_embedding."),
     ("extra_msa_embeddings.emb.", "extra_msa_embeddings.input_projection."),
-    ("template_embeddings.templ_stack.block.", "template_embeddings.template_pair_stack.blocks."),
-    ("template_embeddings.templ_stack.", "template_embeddings.template_pair_stack."),
-    ("template_embeddings.emb_t1d.", "template_embeddings.single_input_projection."),
-    ("template_embeddings.proj_t1d.", "template_embeddings.single_output_projection."),
-    ("template_embeddings.attn_tor.", "template_embeddings.state_attention."),
-    ("template_embeddings.attn.", "template_embeddings.pair_attention."),
-    ("template_embeddings.emb.", "template_embeddings.pair_projection."),
+    ("template_embedder.templ_stack.block.", "template_embedder.template_pair_stack.blocks."),
+    ("template_embedder.templ_stack.", "template_embedder.template_pair_stack."),
+    ("template_embedder.emb_t1d.", "template_embedder.single_input_projection."),
+    ("template_embedder.proj_t1d.", "template_embedder.single_output_projection."),
+    ("template_embedder.attn_tor.", "template_embedder.state_attention."),
+    ("template_embedder.attn.", "template_embedder.pair_attention."),
+    ("template_embedder.emb.", "template_embedder.pair_projection."),
     ("recycling_embeddings.proj_dist.", "recycling_embeddings.pair_projection."),
     ("trunk.proj_state2.", "trunk.state_output_projection."),
     ("trunk.proj_state.", "trunk.state_input_projection."),
@@ -109,6 +129,7 @@ _DENOISER_STRUCTURE_RENAMES = (
 )
 
 _DENOISER_LEAF_RENAMES = (
+    (".template_pair_stack.norm.", ".template_pair_stack.output_norm."),
     (".norm_msa.", ".msa_norm."),
     (".norm_pair.", ".pair_norm."),
     (".norm_state.", ".state_norm."),

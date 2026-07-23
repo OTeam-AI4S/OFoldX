@@ -1,11 +1,4 @@
-r"""
-AlphaFold 2 style Evoformer blocks.
-
-This module owns OFoldX's canonical Evoformer implementation. The block order and
-parameter-bearing submodule boundaries follow the official AlphaFold 2
-``EvoformerIteration`` closely enough for the architecture-specific converter to
-load AF2 checkpoints directly.
-"""
+r"""AlphaFold 2 Evoformer representation refinement."""
 
 from __future__ import annotations
 
@@ -20,8 +13,27 @@ from .msa import OuterProductMean
 
 
 class EvoformerStack(nn.Module):
-    r"""
-    Stack of official-order AlphaFold 2 Evoformer iterations.
+    r"""Refine MSA and pair representations through homogeneous Evoformer blocks.
+
+    MSA states use ``[..., sequences, residues, msa_size]`` and pair states use
+    ``[..., residues, residues, pair_size]``. Each block preserves both layouts.
+
+    Args:
+        num_blocks: Number of homogeneous Evoformer blocks.
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the pair representation.
+        outer_product_hidden_size: Hidden width of the outer-product mean.
+        outer_product_first: Whether pair projection precedes the MSA-track block.
+        num_msa_attention_heads: Number of MSA attention heads.
+        triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        msa_transition_expansion: Expansion factor of the MSA transition.
+        pair_transition_expansion: Expansion factor of the pair transition.
+        msa_dropout: Row-wise dropout probability on MSA residuals.
+        pair_dropout: Row-wise dropout probability on pair residuals.
+        is_extra_msa: Whether to use global rather than ordinary MSA-column attention.
+        operator_backend: Operator backend used by attention and pair updates.
     """
 
     def __init__(
@@ -44,6 +56,7 @@ class EvoformerStack(nn.Module):
         operator_backend: str,
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             [
                 EvoformerBlock(
@@ -74,6 +87,8 @@ class EvoformerStack(nn.Module):
         msa_mask: Tensor | None = None,
         pair_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        r"""Run every block and return refined MSA and pair representations."""
+
         if not self.blocks:
             return msa, pair
         if msa_mask is None:
@@ -86,8 +101,26 @@ class EvoformerStack(nn.Module):
 
 
 class EvoformerBlock(nn.Module):
-    r"""
-    One AF2 Evoformer iteration in official module order.
+    r"""Own one ordered Evoformer update of the MSA and pair tracks.
+
+    The block places outer-product mean before or after the MSA-track block, then
+    applies the pair-track block. Its children own their respective residual order.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the pair representation.
+        outer_product_hidden_size: Hidden width of the outer-product mean.
+        outer_product_first: Whether pair projection precedes the MSA-track block.
+        num_msa_attention_heads: Number of MSA attention heads.
+        triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        msa_transition_expansion: Expansion factor of the MSA transition.
+        pair_transition_expansion: Expansion factor of the pair transition.
+        msa_dropout: Row-wise dropout probability on MSA residuals.
+        pair_dropout: Row-wise dropout probability on pair residuals.
+        is_extra_msa: Whether to use global MSA-column attention.
+        operator_backend: Operator backend used by attention and pair updates.
     """
 
     def __init__(
@@ -116,7 +149,7 @@ class EvoformerBlock(nn.Module):
             hidden_size=outer_product_hidden_size,
             operator_backend=operator_backend,
         )
-        self.msa_stack = MsaStack(
+        self.msa_block = EvoformerMsaBlock(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
@@ -125,7 +158,7 @@ class EvoformerBlock(nn.Module):
             is_extra_msa=is_extra_msa,
             operator_backend=operator_backend,
         )
-        self.pair_stack = PairStack(
+        self.pair_block = EvoformerPairBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
             triangle_attention_hidden_size=triangle_attention_hidden_size,
@@ -136,18 +169,28 @@ class EvoformerBlock(nn.Module):
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        r"""Apply the ordered MSA, outer-product, and pair updates."""
+
         if self.outer_product_first:
             pair = pair + self.outer_product_mean(msa, msa_mask)
-        msa = self.msa_stack(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         if not self.outer_product_first:
             pair = pair + self.outer_product_mean(msa, msa_mask)
-        pair = self.pair_stack(pair, pair_mask=pair_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
         return msa, pair
 
 
-class MsaStack(nn.Module):
-    r"""
-    AF2 MSA update stack for main-MSA or extra-MSA Evoformer blocks.
+class EvoformerMsaBlock(nn.Module):
+    r"""MSA-track block owning row, column, and transition residuals.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the pair representation used as row-attention bias.
+        num_attention_heads: Number of MSA attention heads.
+        transition_expansion: Expansion factor of the MSA transition.
+        dropout: Row-wise dropout probability on row-attention updates.
+        is_extra_msa: Whether column attention uses a global query over MSA rows.
+        operator_backend: Operator backend used by MSA attention.
     """
 
     def __init__(
@@ -181,10 +224,12 @@ class MsaStack(nn.Module):
                 operator_backend=operator_backend,
             )
             self.msa_column_global_attention = None
-        self.feed_forward = EvoformerTransition(msa_size, expansion=transition_expansion)
+        self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
+        r"""Apply row attention, column attention, and transition residuals in order."""
+
         msa = msa + self.rowwise_dropout(
             self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask),
         )
@@ -192,12 +237,20 @@ class MsaStack(nn.Module):
             msa = msa + self.msa_column_attention(msa, msa_mask=msa_mask)
         if self.msa_column_global_attention is not None:
             msa = msa + self.msa_column_global_attention(msa, msa_mask=msa_mask)
-        return msa + self.feed_forward(msa, msa_mask)
+        return msa + self.transition(msa, msa_mask)
 
 
-class PairStack(nn.Module):
-    r"""
-    AF2 pair update stack: triangle multiplication, triangle attention, transition.
+class EvoformerPairBlock(nn.Module):
+    r"""Pair-track block owning triangle and transition residuals.
+
+    Args:
+        pair_size: Width of the pair representation.
+        triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        transition_expansion: Expansion factor of the pair transition.
+        dropout: Row-wise dropout probability on pair updates.
+        operator_backend: Operator backend used by triangle operations.
     """
 
     def __init__(
@@ -236,10 +289,12 @@ class PairStack(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             operator_backend=operator_backend,
         )
-        self.feed_forward = EvoformerTransition(pair_size, expansion=transition_expansion)
+        self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
+        r"""Apply outgoing, incoming, starting, ending, and transition residuals."""
+
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
@@ -249,12 +304,17 @@ class PairStack(nn.Module):
         pair = pair + self.rowwise_dropout(
             self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2),
         )
-        return pair + self.feed_forward(pair, pair_mask)
+        return pair + self.transition(pair, pair_mask)
 
 
 class MsaRowAttentionWithPairBias(nn.Module):
-    r"""
-    AF2 MSA row attention with per-head pair bias.
+    r"""Attend over residues within each MSA row using pair-derived head biases.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the pair representation.
+        num_attention_heads: Number of row-attention heads.
+        operator_backend: Operator backend used by gated attention.
     """
 
     def __init__(
@@ -267,8 +327,8 @@ class MsaRowAttentionWithPairBias(nn.Module):
     ) -> None:
         super().__init__()
         self.query_norm = LayerNorm(msa_size)
-        self.feat_2d_norm = LayerNorm(pair_size)
-        self.feat_2d_weights = nn.Linear(pair_size, num_attention_heads, bias=False)
+        self.pair_norm = LayerNorm(pair_size)
+        self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.attention = GatedMultiheadAttention(
             msa_size,
             num_attention_heads=num_attention_heads,
@@ -280,15 +340,21 @@ class MsaRowAttentionWithPairBias(nn.Module):
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor) -> Tensor:
+        r"""Return an additive MSA row-attention update."""
+
         msa = self.query_norm(msa)
-        pair = self.feat_2d_norm(pair)
-        pair_bias = self.feat_2d_weights(pair).movedim(-1, -3).unsqueeze(-4)
+        pair = self.pair_norm(pair)
+        pair_bias = self.pair_bias_projection(pair).movedim(-1, -3).unsqueeze(-4)
         return self.attention(msa, biases=(pair_bias,), attention_mask=msa_mask.unsqueeze(-2).bool())
 
 
 class MsaColumnAttention(nn.Module):
-    r"""
-    AF2 main-MSA column attention.
+    r"""Attend over MSA rows independently at each residue position.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        num_attention_heads: Number of column-attention heads.
+        operator_backend: Operator backend used by gated attention.
     """
 
     def __init__(self, *, msa_size: int, num_attention_heads: int, operator_backend: str) -> None:
@@ -305,6 +371,8 @@ class MsaColumnAttention(nn.Module):
         )
 
     def forward(self, msa: Tensor, *, msa_mask: Tensor) -> Tensor:
+        r"""Return an additive MSA column-attention update."""
+
         msa = msa.transpose(-3, -2)
         msa_mask = msa_mask.transpose(-2, -1)
         output = self.attention(self.query_norm(msa), attention_mask=msa_mask.unsqueeze(-2).bool())
@@ -312,8 +380,11 @@ class MsaColumnAttention(nn.Module):
 
 
 class MsaColumnGlobalAttention(nn.Module):
-    r"""
-    AF2 extra-MSA column global attention.
+    r"""Attend over MSA rows from one mask-weighted global query per residue.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        num_attention_heads: Number of global-attention heads.
     """
 
     def __init__(self, *, msa_size: int, num_attention_heads: int) -> None:
@@ -328,6 +399,8 @@ class MsaColumnGlobalAttention(nn.Module):
         )
 
     def forward(self, msa: Tensor, *, msa_mask: Tensor) -> Tensor:
+        r"""Return an additive global column-attention update."""
+
         msa = msa.transpose(-3, -2)
         msa_mask = msa_mask.transpose(-2, -1)
         output = self.attention(self.query_norm(msa), msa_mask.unsqueeze(-1))
@@ -335,8 +408,12 @@ class MsaColumnGlobalAttention(nn.Module):
 
 
 class GlobalAttention(nn.Module):
-    r"""
-    AF2 global attention used by the extra-MSA stack.
+    r"""Apply mask-weighted global-query attention along an input axis.
+
+    Args:
+        hidden_size: Width of input and output states.
+        num_attention_heads: Number of global-query heads.
+        head_dim: Width of each attention head.
     """
 
     def __init__(self, *, hidden_size: int, num_attention_heads: int, head_dim: int) -> None:
@@ -348,12 +425,18 @@ class GlobalAttention(nn.Module):
         )
 
     def forward(self, query: Tensor, mask: Tensor) -> Tensor:
+        r"""Project a mask-weighted global query and return gated attended values."""
+
         return self.projection(query, mask)
 
 
 class GlobalAttentionProjection(nn.Module):
-    r"""
-    Parameter-bearing AF2 global attention projection.
+    r"""Own the query, key, value, gate, and output projections for global attention.
+
+    Args:
+        hidden_size: Width of input and output states.
+        num_attention_heads: Number of global-query heads.
+        head_dim: Width of each attention head.
     """
 
     def __init__(self, *, hidden_size: int, num_attention_heads: int, head_dim: int) -> None:
@@ -369,6 +452,8 @@ class GlobalAttentionProjection(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, query: Tensor, mask: Tensor) -> Tensor:
+        r"""Attend from the mask-weighted mean query and gate the broadcast result."""
+
         mask = mask.to(dtype=query.dtype)
         mask_count = mask.sum(dim=-2).clamp(min=1.0)
         query_avg = (query * mask).sum(dim=-2) / mask_count
@@ -386,18 +471,23 @@ class GlobalAttentionProjection(nn.Module):
 
 
 class EvoformerTransition(nn.Module):
-    r"""
-    AF2 transition module.
+    r"""Pre-normalized two-projection ReLU transition returning an update.
+
+    Args:
+        hidden_size: Width of input and output representations.
+        expansion: Intermediate-width multiplier.
     """
 
     def __init__(self, hidden_size: int, *, expansion: int) -> None:
         super().__init__()
-        self.input_layer_norm = LayerNorm(hidden_size)
-        self.transition1 = nn.Linear(hidden_size, hidden_size * expansion)
-        self.transition2 = nn.Linear(hidden_size * expansion, hidden_size)
+        self.input_norm = LayerNorm(hidden_size)
+        self.input_projection = nn.Linear(hidden_size, hidden_size * expansion)
+        self.output_projection = nn.Linear(hidden_size * expansion, hidden_size)
 
     def forward(self, hidden: Tensor, mask: Tensor | None = None) -> Tensor:
-        output = self.transition2(F.relu(self.transition1(self.input_layer_norm(hidden))))
+        r"""Return a masked additive transition update."""
+
+        output = self.output_projection(F.relu(self.input_projection(self.input_norm(hidden))))
         if mask is None:
             return output
         return output * mask.unsqueeze(-1).to(dtype=output.dtype)
@@ -405,13 +495,17 @@ class EvoformerTransition(nn.Module):
 
 class AlphaFold2OuterProductMean(OuterProductMean):
     r"""
-    AF2 outer-product mean.
+    AlphaFold 2 outer-product mean with biased left and right MSA projections.
 
-    AlphaFold 2 variant of the shared bias-free
-    [`OuterProductMean`][ofoldx.modules.trunk.msa.OuterProductMean]: the left/right MSA
-    projections carry a learned bias (all AF3-lineage checkpoints leave them bias-free). Everything
-    else — pre-LayerNorm, divide-after-projection (``count + eps``) normalisation and the affine output
-    projection — is inherited unchanged from the shared module. OOps owns the biased implementation.
+    It uses pre-normalization, divides by ``count + eps`` after projection, and
+    returns an additive pair update.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the returned pair update.
+        hidden_size: Width of each projected MSA factor.
+        eps: Epsilon added to the valid-sequence count.
+        operator_backend: Operator backend used by the outer-product contraction.
     """
 
     def __init__(
@@ -437,22 +531,18 @@ class AlphaFold2OuterProductMean(OuterProductMean):
 
 class AlphaFold2TriangleMultiplication(TriangleMultiplication):
     r"""
-    AlphaFold 2 triangle multiplicative update.
+    AlphaFold 2 triangle multiplication with biased value, gate, and output projections.
 
-    AlphaFold 2 variant of the shared bias-free
-    [`TriangleMultiplication`][ofoldx.modules.attention.triangle.TriangleMultiplication]: all six
-    projections (left/right value, left/right gate, output, and the input gate) carry a learned bias,
-    where every AF3-lineage checkpoint leaves them bias-free. Everything else — the
-    canonical incoming/outgoing contraction ``"...kih,...kjh->...ijh"`` / ``"...ikh,...jkh->...ijh"``
-    (left owns row ``i``, right owns column ``j``), the input/output LayerNorms and the gated output
-    projection — is inherited unchanged from the shared module, whose ``forward`` already forwards
-    each projection's ``.bias`` to the selected backend. OOps owns the biased implementation.
+    The outgoing and incoming contractions are ``"...ikh,...jkh->...ijh"`` and
+    ``"...kih,...kjh->...ijh"``, respectively. The left operand owns output row
+    ``i``, the right operand owns output column ``j``, and the method returns
+    an additive pair update.
 
-    Because the shared module fixes the operand order (left→``i``, right→``j``) for both directions,
-    the AlphaFold 2 *incoming* converter must load DeepMind/OpenFold ``left_projection``/``left_gate``
-    into this module's **right** slot and ``right_projection``/``right_gate`` into the **left** slot
-    (value and gate move together). The outgoing converter loads raw. See
-    ``ofoldx/models/alphafold2/converters``.
+    Args:
+        pair_size: Width of the pair representation.
+        hidden_size: Width of projected multiplicative factors.
+        outgoing: Whether to contract outgoing rather than incoming edges.
+        operator_backend: Operator backend used by the triangle contraction.
     """
 
     def __init__(
@@ -479,17 +569,17 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
 
 class AlphaFold2TriangleAttention(TriangleAttention):
     r"""
-    AlphaFold 2 triangle self-attention update.
+    AlphaFold 2 triangle self-attention with biased output and gate projections.
 
-    AlphaFold 2 variant of the shared bias-free
-    [`TriangleAttention`][ofoldx.modules.attention.triangle.TriangleAttention]: the attention output
-    projection and the output gate carry a learned bias (``gate_bias_init=1.0`` opens the gate near
-    init), where every AF3-lineage checkpoint leaves them bias-free. The biased gate/output keep the
-    module on the generic backend route rather than the OOps-owned bias-free ``triangle_attention`` callable; the
-    attention core still dispatches to whatever ``operator_backend`` resolves to, applying the gate and
-    output bias in the (backend-agnostic) head merge. ``transpose_bias`` stays ``False`` — the OpenFold
-    convention, matching DeepMind's own AlphaFold 2 ending node — and the row/column direction is set by
-    the caller orienting ``pair``; this module always preserves the orientation it receives.
+    A gate bias of ``1.0`` opens the output gate near initialization. The caller
+    selects starting- or ending-node attention by orienting ``pair``; this module
+    preserves the orientation it receives.
+
+    Args:
+        pair_size: Width of the pair representation.
+        head_dim: Width of each triangle-attention head.
+        num_attention_heads: Number of triangle-attention heads.
+        operator_backend: Operator backend used by attention.
     """
 
     def __init__(self, *, pair_size: int, head_dim: int, num_attention_heads: int, operator_backend: str) -> None:

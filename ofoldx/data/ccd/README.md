@@ -7,7 +7,7 @@ resolver. It is the boundary-time counterpart to
 - `get_component` is **audited-only** and does **zero I/O** (Principle 7). It
   returns one of the package-audited standard components (the 31 audited IDs) and
   never guesses a chemical graph from a residue name.
-- `resolve_ccd_component` is the tool for the *other* job: a family that folds
+- `resolve_ccd_component` is the tool for the _other_ job: a family that folds
   arbitrary CCD-code ligands calls it **once, at its importer / Processor
   boundary**, to fetch the wwPDB CCD snapshot and lower one component into a
   canonical `ChemicalComponent` VALUE. The family then embeds those values in its
@@ -50,25 +50,25 @@ CCD snapshot; passing that date as `revision` fixes exact provenance.
 Each row is one component. List-valued columns for atoms are all aligned to
 `atom_ids`; list-valued bond columns are all aligned to `bond_atom_a`.
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `component_id` | `str` | wwPDB CCD code (row key). |
-| `chem_type` | `str` | `protein` / `rna` / `dna` / `dna_rna_hybrid` / `non-polymer`. Determines whether polymer attachments apply. |
-| `atom_ids` | `list[str]` | Component-local atom IDs, in canonical order. |
-| `elements` | `list[str]` | Element symbol per atom. |
-| `formal_charges` | `list[int \| None]` | Formal charge per atom; `None` when the CCD source is unspecified. |
-| `aromatic` | `list[bool \| None]` | Aromatic flag per atom; `None` when incident bond aromaticity is unspecified. |
-| `stereo` | `list[str \| None]` | Per-atom stereo config (`R`/`S`/…), `None` when unspecified. |
-| `bond_atom_a` | `list[str]` | First endpoint atom ID per bond. |
-| `bond_atom_b` | `list[str]` | Second endpoint atom ID per bond. |
-| `bond_orders` | `list[float \| None]` | Bond order per bond (`1.0`, `1.5` aromatic, `2.0`, `3.0`); `None` when unspecified. |
-| `bond_aromatic` | `list[bool \| None]` | Aromatic flag per bond; `None` when unspecified. |
-| `bond_stereo` | `list[str \| None]` | Per-bond stereo config, `None` when unspecified. |
-| `ref_coords` | `list[[float,float,float] \| None]` | Ideal reference coordinate per atom (aligned to `atom_ids`); `None` where absent. |
-| `previous_attachment_atom` | `str \| None` | Polymer previous-link anchor atom (e.g. protein `N`, nucleic `P`). |
-| `previous_leaving_atoms` | `list[str]` | Atoms removed on forming the previous link. |
-| `next_attachment_atom` | `str \| None` | Polymer next-link anchor atom (e.g. protein `C`, nucleic `O3'`). |
-| `next_leaving_atoms` | `list[str]` | Atoms removed on forming the next link. |
+| Column                     | Type                                | Meaning                                                                                                     |
+| -------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `component_id`             | `str`                               | wwPDB CCD code (row key).                                                                                   |
+| `chem_type`                | `str`                               | `protein` / `rna` / `dna` / `dna_rna_hybrid` / `non-polymer`. Determines whether polymer attachments apply. |
+| `atom_ids`                 | `list[str]`                         | Component-local atom IDs, in canonical order.                                                               |
+| `elements`                 | `list[str]`                         | Element symbol per atom.                                                                                    |
+| `formal_charges`           | `list[int \| None]`                 | Formal charge per atom; `None` when the CCD source is unspecified.                                          |
+| `aromatic`                 | `list[bool \| None]`                | Aromatic flag per atom; `None` when incident bond aromaticity is unspecified.                               |
+| `stereo`                   | `list[str \| None]`                 | Per-atom stereo config (`R`/`S`/…), `None` when unspecified.                                                |
+| `bond_atom_a`              | `list[str]`                         | First endpoint atom ID per bond.                                                                            |
+| `bond_atom_b`              | `list[str]`                         | Second endpoint atom ID per bond.                                                                           |
+| `bond_orders`              | `list[float \| None]`               | Bond order per bond (`1.0`, `1.5` aromatic, `2.0`, `3.0`); `None` when unspecified.                         |
+| `bond_aromatic`            | `list[bool \| None]`                | Aromatic flag per bond; `None` when unspecified.                                                            |
+| `bond_stereo`              | `list[str \| None]`                 | Per-bond stereo config, `None` when unspecified.                                                            |
+| `reference_coordinates`    | `list[[float,float,float] \| None]` | Ideal reference coordinate per atom (aligned to `atom_ids`); `None` where absent.                           |
+| `previous_attachment_atom` | `str \| None`                       | Polymer previous-link anchor atom (e.g. protein `N`, nucleic `P`).                                          |
+| `previous_leaving_atoms`   | `list[str]`                         | Atoms removed on forming the previous link.                                                                 |
+| `next_attachment_atom`     | `str \| None`                       | Polymer next-link anchor atom (e.g. protein `C`, nucleic `O3'`).                                            |
+| `next_leaving_atoms`       | `list[str]`                         | Atoms removed on forming the next link.                                                                     |
 
 For `non-polymer` components the attachment columns are `None` / empty and the
 resolver omits polymer attachments.

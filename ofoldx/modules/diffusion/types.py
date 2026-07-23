@@ -21,7 +21,7 @@ class CoordinateDenoisingInput:
     ``noise_level``. Instances are built by
     [`CoordinateDenoiseContext.to_denoising_input`][ofoldx.modules.diffusion.sampling.CoordinateDenoiseContext].
 
-    Attributes:
+    Args:
         atom_features: Per-atom input features.
         atom_to_token: Token index for each atom.
         token_embedding: Token embedding before trunk updates.

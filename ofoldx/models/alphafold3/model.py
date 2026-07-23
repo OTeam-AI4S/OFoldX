@@ -9,7 +9,6 @@ the ordinary differentiable denoising graph; full sampling stays internal until 
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -18,11 +17,11 @@ import torch
 from torch import Tensor, nn
 
 from ...data.molecular import (
+    AMINO_ACID_THREE_TO_ONE,
     AtomSite,
     ComponentReference,
     MolecularSystem,
     PolymerSequence,
-    restype_3to1,
 )
 from ...data.structure import Structure
 from ...model import Model, ModelBackend
@@ -56,7 +55,7 @@ from ...modules.head import ConfidenceHead, DistogramHead, expected_plddt, tm_bi
 from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
-from ...results import FoldPrediction, Metric, PairMetric, Score
+from ...results import FoldPrediction, Metric, PairMetric, Score, best
 from .config import AlphaFold3Config
 
 
@@ -177,17 +176,16 @@ class AlphaFold3Model(Model):
             single_max_abs=config.confidence.single_max_abs,
             # AlphaFold 3 confidence flags: no extra single LayerNorm, no raw-distance projection channel,
             # and PDE symmetrizes the projected LOGITS (DeepMind ``left + swapaxes(left, -2, -3)``). The
-            # distance-bin buffers are non-persistent (absent from the checkpoint).
+            # Distance-bin buffers are derived and therefore non-persistent.
             use_single_norm=False,
             use_distance_projection=False,
             symmetrize_pde_before_projection=False,
             persistent_distance_bins=False,
         )
-        self.reset_parameters()
         # Atom cross-attention adaptively normalizes queries and keys from the raw hidden state.
-        self.set_backend("auto")
+        self.post_init()
 
-    def reset_parameters(self) -> None:
+    def initialize_parameters(self) -> None:
         r"""
         Zero-initialize the recycling and PAE/PDE projection weights after construction.
 
@@ -197,7 +195,7 @@ class AlphaFold3Model(Model):
         Examples:
             >>> from ofoldx.models.alphafold3 import AlphaFold3Config, AlphaFold3Model  # doctest: +SKIP
             >>> model = AlphaFold3Model(AlphaFold3Config())  # doctest: +SKIP
-            >>> model.reset_parameters()  # doctest: +SKIP
+            >>> model.initialize_parameters()  # doctest: +SKIP
         """
 
         nn.init.zeros_(self.pair_recycle_projection.weight)
@@ -376,10 +374,10 @@ class AlphaFold3Model(Model):
         # Chain-level confidence summaries operate on decoded per-sample arrays.
         full_pae = pae.numpy()
         full_pde = pde.numpy()
-        asym_ids = input.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
+        chain_indices = input.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
         frame_mask = input.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
         instance_ids = tuple(input.system.instances.keys())
-        unique_chain = np.unique(asym_ids)
+        unique_chain = np.unique(chain_indices)
         chain_axis = tuple(instance_ids[int(index)] for index in unique_chain)
         multi_chain = unique_chain.shape[0] > 1
 
@@ -388,14 +386,14 @@ class AlphaFold3Model(Model):
         tm_interface = tm_adjusted_pae(
             pae_logits,
             pair_mask=torch.from_numpy(frame_pair_mask).unsqueeze(0).expand(pae_logits.shape[0], -1, -1),
-            asym_id=torch.from_numpy(asym_ids).unsqueeze(0).expand(pae_logits.shape[0], -1),
+            chain_index=torch.from_numpy(chain_indices).unsqueeze(0).expand(pae_logits.shape[0], -1),
             interface=True,
         ).numpy()
 
-        chain_pair_pde_mean, chain_pair_pde_min = _chain_pair_pde(full_pde, asym_ids)
-        _, chain_pair_pae_min, _ = _chain_pair_pae(full_pae, asym_ids, mask=pae_single_mask)
-        pde_ichain, pde_xchain, pde_full_chain = _pde_single(asym_ids, full_pde, contact_probability)
-        chain_metrics = _pae_metrics(asym_ids, full_pae, pae_single_mask, contact_probability, tm_interface)
+        chain_pair_pde_mean, chain_pair_pde_min = _chain_pair_pde(full_pde, chain_indices)
+        _, chain_pair_pae_min, _ = _chain_pair_pae(full_pae, chain_indices, mask=pae_single_mask)
+        pde_ichain, pde_xchain, pde_full_chain = _pde_single(chain_indices, full_pde, contact_probability)
+        chain_metrics = _pae_metrics(chain_indices, full_pae, pae_single_mask, contact_probability, tm_interface)
         ranking_confidence_pae = _rank_metric(
             full_pae,
             contact_probability * frame_mask[:, None].astype(float),
@@ -529,7 +527,7 @@ class AlphaFold3Model(Model):
             atom_token_index=input.atom_token_index,
         )
         with torch.autocast(device_type=pair.device.type, enabled=False):
-            distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.linear.weight.dtype))
+            distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.projection.weight.dtype))
         return AlphaFold3Output(
             coordinates=coordinates,
             distogram_logits=distogram_logits,
@@ -612,14 +610,14 @@ class AlphaFold3Model(Model):
         frame_mask = input.token_mask.to(torch.bool)
         # Broadcast token-axis fields across the per-sample logit axis so the summary is per-sample.
         sample_axes = output.pae_logits.dim() - 3
-        asym_id = input.chain_index
-        for _ in range(sample_axes - asym_id.dim() + 1):
-            asym_id = asym_id.unsqueeze(1)
+        chain_index = input.chain_index
+        for _ in range(sample_axes - chain_index.dim() + 1):
+            chain_index = chain_index.unsqueeze(1)
             frame_mask = frame_mask.unsqueeze(1)
         return alphafold3_confidence_summary(
             output.pae_logits,
             frame_mask=frame_mask.expand(*output.pae_logits.shape[:-3], num_tokens),
-            asym_id=asym_id.expand(*output.pae_logits.shape[:-3], num_tokens),
+            chain_index=chain_index.expand(*output.pae_logits.shape[:-3], num_tokens),
             max_error_bin=max_error_bin,
         )
 
@@ -990,7 +988,7 @@ def tm_adjusted_pae(
     pae_logits: Tensor,
     *,
     pair_mask: Tensor,
-    asym_id: Tensor,
+    chain_index: Tensor,
     interface: bool,
     max_error_bin: float = 31.0,
 ) -> Tensor:
@@ -1005,7 +1003,7 @@ def tm_adjusted_pae(
     Args:
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
         pair_mask: ``[..., N_token, N_token]`` boolean mask of valid frame pairs.
-        asym_id: ``[..., N_token]`` chain (asym) id per token.
+        chain_index: ``[..., N_token]`` chain index per token.
         interface: If ``True``, use the interface token count for ``d0``; else the global count.
         max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
 
@@ -1018,8 +1016,8 @@ def tm_adjusted_pae(
         >>> logits = torch.randn(1, 3, 3, 4)
         >>> mask = torch.ones(1, 3, dtype=torch.bool)
         >>> pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-        >>> asym_id = torch.tensor([[0, 0, 1]])
-        >>> tm_adjusted_pae(logits, pair_mask=pair_mask, asym_id=asym_id, interface=False).shape
+        >>> chain_index = torch.tensor([[0, 0, 1]])
+        >>> tm_adjusted_pae(logits, pair_mask=pair_mask, chain_index=chain_index, interface=False).shape
         torch.Size([1, 3, 3])
     """
 
@@ -1028,7 +1026,7 @@ def tm_adjusted_pae(
     probs = torch.softmax(pae_logits.float(), dim=-1).to(pae_logits.dtype)
     pair_mask = pair_mask.to(pae_logits.dtype)
 
-    same_chain = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)
+    same_chain = chain_index.unsqueeze(-1) == chain_index.unsqueeze(-2)
     if interface:
         num_chain_tokens = (same_chain.to(pae_logits.dtype) * pair_mask).sum(dim=-1)
         num_tokens = num_chain_tokens.unsqueeze(-1) + num_chain_tokens.unsqueeze(-2)
@@ -1043,7 +1041,7 @@ def tm_adjusted_pae(
 
 
 def alphafold3_predicted_tm_score(
-    adjusted_pae: Tensor, *, pair_mask: Tensor, asym_id: Tensor, interface: bool
+    adjusted_pae: Tensor, *, pair_mask: Tensor, chain_index: Tensor, interface: bool
 ) -> Tensor:
     r"""
     Reduce a TM-adjusted PAE matrix to a scalar pTM or ipTM.
@@ -1055,7 +1053,7 @@ def alphafold3_predicted_tm_score(
     Args:
         adjusted_pae: ``[..., N_token, N_token]`` TM-adjusted PAE.
         pair_mask: ``[..., N_token, N_token]`` boolean mask of valid frame pairs.
-        asym_id: ``[..., N_token]`` chain id per token.
+        chain_index: ``[..., N_token]`` chain index per token.
         interface: If ``True``, compute ipTM over cross-chain pairs; else pTM over all pairs.
 
     Returns:
@@ -1067,14 +1065,16 @@ def alphafold3_predicted_tm_score(
         >>> adjusted = torch.rand(1, 3, 3)
         >>> mask = torch.ones(1, 3, dtype=torch.bool)
         >>> pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-        >>> asym_id = torch.tensor([[0, 0, 1]])
-        >>> alphafold3_predicted_tm_score(adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False).shape
+        >>> chain_index = torch.tensor([[0, 0, 1]])
+        >>> alphafold3_predicted_tm_score(
+        ...     adjusted, pair_mask=pair_mask, chain_index=chain_index, interface=False
+        ... ).shape
         torch.Size([1])
     """
 
     mask = pair_mask.to(adjusted_pae.dtype)
     if interface:
-        mask = mask * (asym_id.unsqueeze(-1) != asym_id.unsqueeze(-2)).to(adjusted_pae.dtype)
+        mask = mask * (chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2)).to(adjusted_pae.dtype)
     normed = mask / (torch.finfo(mask.dtype).tiny + mask.sum(dim=-1, keepdim=True))
     per_alignment = (adjusted_pae * normed).sum(dim=-1)
     score = per_alignment.max(dim=-1).values
@@ -1086,7 +1086,7 @@ def alphafold3_confidence_summary(
     pae_logits: Tensor,
     *,
     frame_mask: Tensor,
-    asym_id: Tensor,
+    chain_index: Tensor,
     max_error_bin: float = 31.0,
 ) -> tuple[Tensor, Tensor, Tensor]:
     r"""
@@ -1099,7 +1099,7 @@ def alphafold3_confidence_summary(
     Args:
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
         frame_mask: ``[..., N_token]`` boolean mask of tokens with a valid frame.
-        asym_id: ``[..., N_token]`` chain (asym) id per token.
+        chain_index: ``[..., N_token]`` chain index per token.
         max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
 
     Returns:
@@ -1110,9 +1110,9 @@ def alphafold3_confidence_summary(
         >>> _ = torch.manual_seed(0)
         >>> logits = torch.randn(1, 3, 3, 4)
         >>> frame_mask = torch.ones(1, 3, dtype=torch.bool)
-        >>> asym_id = torch.tensor([[0, 0, 1]])
+        >>> chain_index = torch.tensor([[0, 0, 1]])
         >>> ptm, iptm, ptm_iptm_average = alphafold3_confidence_summary(
-        ...     logits, frame_mask=frame_mask, asym_id=asym_id
+        ...     logits, frame_mask=frame_mask, chain_index=chain_index
         ... )
         >>> ptm.shape
         torch.Size([1])
@@ -1123,13 +1123,15 @@ def alphafold3_confidence_summary(
     frame_mask = frame_mask.to(torch.bool)
     pair_mask = frame_mask.unsqueeze(-1) & frame_mask.unsqueeze(-2)
     global_adjusted = tm_adjusted_pae(
-        pae_logits, pair_mask=pair_mask, asym_id=asym_id, interface=False, max_error_bin=max_error_bin
+        pae_logits, pair_mask=pair_mask, chain_index=chain_index, interface=False, max_error_bin=max_error_bin
     )
     interface_adjusted = tm_adjusted_pae(
-        pae_logits, pair_mask=pair_mask, asym_id=asym_id, interface=True, max_error_bin=max_error_bin
+        pae_logits, pair_mask=pair_mask, chain_index=chain_index, interface=True, max_error_bin=max_error_bin
     )
-    ptm = alphafold3_predicted_tm_score(global_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=False)
-    iptm = alphafold3_predicted_tm_score(interface_adjusted, pair_mask=pair_mask, asym_id=asym_id, interface=True)
+    ptm = alphafold3_predicted_tm_score(global_adjusted, pair_mask=pair_mask, chain_index=chain_index, interface=False)
+    iptm = alphafold3_predicted_tm_score(
+        interface_adjusted, pair_mask=pair_mask, chain_index=chain_index, interface=True
+    )
     ptm_iptm_average = torch.where(torch.isnan(iptm), ptm, _IPTM_WEIGHT * iptm + (1.0 - _IPTM_WEIGHT) * ptm)
     return ptm, iptm, ptm_iptm_average
 
@@ -1154,37 +1156,37 @@ def _weighted_nanmean(value: np.ndarray, mask: np.ndarray, axis: int) -> np.ndar
         return np.nanmean(value * mask_with_nan, axis=axis) / np.nanmean(mask_with_nan, axis=axis)
 
 
-def _chain_pair_pde(full_pde: np.ndarray, asym_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _chain_pair_pde(full_pde: np.ndarray, chain_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     r"""Compute per-chain-pair mean and minimum predicted distance error."""
 
-    unique = np.unique(asym_ids)
+    unique = np.unique(chain_indices)
     num_chains = len(unique)
     num_samples = full_pde.shape[0]
     mean = np.zeros((num_samples, num_chains, num_chains))
     minimum = np.zeros((num_samples, num_chains, num_chains))
-    for first, asym_first in enumerate(unique):
-        subset = full_pde[:, asym_ids == asym_first, :]
-        for second, asym_second in enumerate(unique):
-            block = subset[:, :, asym_ids == asym_second]
+    for first, chain_first in enumerate(unique):
+        subset = full_pde[:, chain_indices == chain_first, :]
+        for second, chain_second in enumerate(unique):
+            block = subset[:, :, chain_indices == chain_second]
             mean[:, first, second] = np.mean(block, axis=(1, 2))
             minimum[:, first, second] = np.min(block, axis=(1, 2))
     return mean, minimum
 
 
 def _pde_single(
-    asym_ids: np.ndarray, full_pde: np.ndarray, contact_probs: np.ndarray
+    chain_indices: np.ndarray, full_pde: np.ndarray, contact_probs: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     r"""Compute contact-weighted intra-chain, cross-chain, and per-token PDE."""
 
-    unique = np.unique(asym_ids)
+    unique = np.unique(chain_indices)
     num_chains = len(unique)
     num_samples = full_pde.shape[0]
-    asym = asym_ids[None]
+    chain_indices_row = chain_indices[None]
     contact = contact_probs[None]
     ichain = np.zeros((num_samples, num_chains))
     xchain = np.zeros((num_samples, num_chains))
-    for index, asym_id in enumerate(unique):
-        mine = asym == asym_id
+    for index, chain_index in enumerate(unique):
+        mine = chain_indices_row == chain_index
         intra = mine[:, :, None] * mine[:, None, :] * contact
         cross = mine[:, :, None] * (~mine[:, None, :]) * contact
         ichain[:, index] = _weighted_mean(intra, full_pde, axis=(-2, -1))
@@ -1195,7 +1197,7 @@ def _pde_single(
 
 def _chain_pair_pae(
     full_pae: np.ndarray,
-    asym_ids: np.ndarray,
+    chain_indices: np.ndarray,
     *,
     mask: np.ndarray,
     contact_probs: np.ndarray | None = None,
@@ -1204,19 +1206,19 @@ def _chain_pair_pae(
 
     if contact_probs is None:
         contact_probs = np.ones(full_pae.shape[1:], dtype=float)
-    unique = np.unique(asym_ids)
+    unique = np.unique(chain_indices)
     num_chains = len(unique)
     num_samples = full_pae.shape[0]
     mean = np.zeros((num_samples, num_chains, num_chains))
     minimum = np.zeros((num_samples, num_chains, num_chains))
-    for first, asym_first in enumerate(unique):
-        subset = full_pae[:, asym_ids == asym_first, :]
-        subset_mask = mask[asym_ids == asym_first, :]
-        subset_contact = contact_probs[asym_ids == asym_first, :]
-        for second, asym_second in enumerate(unique):
-            block = subset[:, :, asym_ids == asym_second]
-            block_mask = subset_mask[:, asym_ids == asym_second]
-            block_contact = subset_contact[:, asym_ids == asym_second]
+    for first, chain_first in enumerate(unique):
+        subset = full_pae[:, chain_indices == chain_first, :]
+        subset_mask = mask[chain_indices == chain_first, :]
+        subset_contact = contact_probs[chain_indices == chain_first, :]
+        for second, chain_second in enumerate(unique):
+            block = subset[:, :, chain_indices == chain_second]
+            block_mask = subset_mask[:, chain_indices == chain_second]
+            block_contact = subset_contact[:, chain_indices == chain_second]
             (kept,) = np.where(block_mask.flatten() > 0)
             flat_block = block.reshape(num_samples, -1)
             flat_contact = block_contact.flatten()
@@ -1230,12 +1232,12 @@ def _chain_pair_pae(
 
 
 def _predicted_tm_score_np(
-    tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, asym_id: np.ndarray, interface: bool
+    tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, chain_index: np.ndarray, interface: bool
 ) -> float:
     r"""Compute scalar pTM or ipTM for one sample."""
 
     if interface:
-        pair_mask = pair_mask * (asym_id[:, None] != asym_id[None, :])
+        pair_mask = pair_mask * (chain_index[:, None] != chain_index[None, :])
     if pair_mask.sum() == 0:
         return float("nan")
     normed = pair_mask / (np.finfo(tm_adjusted_pae.dtype).tiny + np.sum(pair_mask, axis=-1, keepdims=True))
@@ -1243,21 +1245,21 @@ def _predicted_tm_score_np(
     return float(per_alignment.max())
 
 
-def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, asym_id: np.ndarray) -> np.ndarray:
+def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, chain_index: np.ndarray) -> np.ndarray:
     r"""Compute the per-chain-pair ipTM matrix for one sample."""
 
-    unique = list(np.unique(asym_id))
+    unique = list(np.unique(chain_index))
     num_chains = len(unique)
     pairwise = np.zeros((num_chains, num_chains))
     for first, chain_first in enumerate(unique):
-        first_mask = asym_id == chain_first
+        first_mask = chain_index == chain_first
         for offset, chain_second in enumerate(unique[first:]):
-            second_mask = asym_id == chain_second
+            second_mask = chain_index == chain_second
             selected = first_mask | second_mask
             (indices,) = np.where(selected)
             is_interface = chain_first != chain_second
             grid = np.ix_(indices, indices)
-            value = _predicted_tm_score_np(tm_adjusted_pae[grid], pair_mask[grid], asym_id[selected], is_interface)
+            value = _predicted_tm_score_np(tm_adjusted_pae[grid], pair_mask[grid], chain_index[selected], is_interface)
             pairwise[first, first + offset] = value
             pairwise[first + offset, first] = value
     return pairwise
@@ -1279,7 +1281,7 @@ def _reduce_chain_pair(chain_pair: np.ndarray, *, agg_over_col: bool) -> tuple[n
 
 
 def _pae_metrics(
-    asym_ids: np.ndarray,
+    chain_indices: np.ndarray,
     full_pae: np.ndarray,
     mask: np.ndarray,
     contact_probs: np.ndarray,
@@ -1287,10 +1289,10 @@ def _pae_metrics(
 ) -> dict[str, np.ndarray]:
     r"""Compute per-chain ipTM/PAE aggregates and the chain-pair ipTM matrix."""
 
-    chain_pair_contact_weighted, _, _ = _chain_pair_pae(full_pae, asym_ids, mask=mask, contact_probs=contact_probs)
+    chain_pair_contact_weighted, _, _ = _chain_pair_pae(full_pae, chain_indices, mask=mask, contact_probs=contact_probs)
     chain_pair_iptm = np.stack(
         [
-            _chain_pairwise_iptm(tm_adjusted_pae=sample_tm, asym_id=asym_ids, pair_mask=mask)
+            _chain_pairwise_iptm(tm_adjusted_pae=sample_tm, chain_index=chain_indices, pair_mask=mask)
             for sample_tm in tm_adjusted_pae_interface
         ],
         axis=0,
@@ -1404,7 +1406,7 @@ def fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RAS
 
     rasa: list[float] = []
     sequence_rasa: dict[str, np.ndarray] = {}
-    for instance_id in _protein_chain_ids(structure):
+    for instance_id in _protein_instance_ids(structure):
         chain_sequence = _chain_sequence(structure, instance_id)
         cached = sequence_rasa.get(chain_sequence)
         if cached is not None:
@@ -1443,7 +1445,7 @@ def alphafold3_has_clash(
         ``True`` if at least one polymer chain overlaps another.
     """
 
-    coordinates, residue_ids, chain_ids = _polymer_atoms(structure)
+    coordinates, residue_indices, instance_ids = _polymer_atoms(structure)
     if coordinates.shape[0] == 0:
         return False
 
@@ -1451,14 +1453,14 @@ def alphafold3_has_clash(
     per_atom_has_clash = np.zeros(coordinates.shape[0], dtype=bool)
     for atom_index, clashing in enumerate(neighbors):
         for other in clashing:
-            if abs(int(residue_ids[atom_index]) - int(residue_ids[other])) > 1 or (
-                chain_ids[atom_index] != chain_ids[other]
+            if abs(int(residue_indices[atom_index]) - int(residue_indices[other])) > 1 or (
+                instance_ids[atom_index] != instance_ids[other]
             ):
                 per_atom_has_clash[atom_index] = True
                 break
 
-    for chain_id in np.unique(chain_ids):
-        mask = chain_ids == chain_id
+    for instance_id in np.unique(instance_ids):
+        mask = instance_ids == instance_id
         num_atoms = int(np.sum(mask))
         if num_atoms == 0:
             continue
@@ -1618,32 +1620,32 @@ def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[
     return rows
 
 
-def _protein_chain_ids(structure: Structure) -> list[str]:
+def _protein_instance_ids(structure: Structure) -> list[str]:
     r"""Instance ids of protein polymer chains, in system order."""
 
     system = structure.system
-    chain_ids: list[str] = []
+    instance_ids: list[str] = []
     for instance_id, entity_id in system.instances.items():
         entity = system.entities[entity_id]
         if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            chain_ids.append(instance_id)
-    return chain_ids
+            instance_ids.append(instance_id)
+    return instance_ids
 
 
 def _chain_sequence(structure: Structure, instance_id: str) -> str:
     r"""Return the protein sequence used by the cross-chain rASA cache."""
 
     entity = structure.system.entities[structure.system.instances[instance_id]]
-    return "".join(restype_3to1.get(component.component_id, "X") for component in entity.components)
+    return "".join(AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components)
 
 
 def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Observed polymer (protein / RNA / DNA) atom coords, residue ids, and chain ids."""
+    r"""Observed polymer atom coordinates, component indices, and instance IDs."""
 
     system = structure.system
     coordinates: list[np.ndarray] = []
-    residue_ids: list[int] = []
-    chain_ids: list[str] = []
+    residue_indices: list[int] = []
+    instance_ids: list[str] = []
     for index, site in enumerate(structure.sites):
         if not bool(structure.coordinate_mask[index]):
             continue
@@ -1651,14 +1653,14 @@ def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.nda
         if not isinstance(entity, PolymerSequence) or entity.polymer_type not in _POLYMER_TYPES:
             continue
         coordinates.append(np.asarray(structure.coordinates[index], dtype=np.float64))
-        residue_ids.append(site.component_index)
-        chain_ids.append(site.instance_id)
+        residue_indices.append(site.component_index)
+        instance_ids.append(site.instance_id)
     if not coordinates:
         return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=object)
     return (
         np.stack(coordinates, axis=0),
-        np.asarray(residue_ids, dtype=np.int64),
-        np.asarray(chain_ids, dtype=object),
+        np.asarray(residue_indices, dtype=np.int64),
+        np.asarray(instance_ids, dtype=object),
     )
 
 
@@ -1744,7 +1746,7 @@ class AlphaFold3Output:
 class AlphaFold3SeedGroup:
     r"""One diffusion seed and its generation-ordered samples.
 
-    Attributes:
+    Args:
         seed: The integer diffusion seed shared by every sample, when one was supplied.
         predictions: Generation-ordered samples drawn for this seed; tuple
             position is the sample identity within the group.
@@ -1758,7 +1760,7 @@ class AlphaFold3SeedGroup:
 class AlphaFold3FoldResult:
     r"""One AlphaFold 3 folding result preserving its per-seed sample groups.
 
-    Attributes:
+    Args:
         seed_groups: One :class:`AlphaFold3SeedGroup` per seed, in the order the
             seeds were run.
     """
@@ -1785,16 +1787,4 @@ class AlphaFold3FoldResult:
         """
 
         predictions = tuple(prediction for group in self.seed_groups for prediction in group.predictions)
-        scores = tuple(prediction.scores[score] for prediction in predictions)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(predictions, key=lambda prediction: prediction.scores[score].value)
-        return min(predictions, key=lambda prediction: prediction.scores[score].value)
+        return best(predictions, score)

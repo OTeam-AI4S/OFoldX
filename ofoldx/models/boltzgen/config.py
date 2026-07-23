@@ -6,7 +6,18 @@ from chanfig import Config
 
 
 class BoltzGenInputEmbeddingsConfig(Config):
-    r"""Atom/token input-embedder graph parameters."""
+    r"""Configure BoltzGen atom and token input embeddings.
+
+    Args:
+        num_atom_encoder_blocks: Number of atom encoder blocks.
+        num_atom_encoder_attention_heads: Number of atom encoder attention heads.
+        vocab_size: Number of token types.
+        msa_profile_size: Width of MSA profile features.
+        num_method_types: Number of experimental-method categories.
+        num_molecule_types: Number of molecule-type categories.
+        add_binding_specification: Whether to embed binding-site specifications.
+        add_ss_specification: Whether to embed secondary-structure specifications.
+    """
 
     num_atom_encoder_blocks: int = 3
     num_atom_encoder_attention_heads: int = 4
@@ -19,7 +30,25 @@ class BoltzGenInputEmbeddingsConfig(Config):
 
 
 class BoltzGenTrunkConfig(Config):
-    r"""Pairformer/MSA graph parameters shared by structure-design variants."""
+    r"""Configure the Pairformer and MSA trunk shared by BoltzGen structure-design variants.
+
+    Args:
+        num_pairformer_blocks: Number of pair trunk blocks.
+        num_pair_attention_heads: Number of pair-biased attention heads.
+        num_msa_blocks: Number of MSA blocks.
+        msa_size: Width of MSA representations.
+        msa_feature_size: Width of raw MSA features.
+        msa_head_dim: Per-head width of MSA attention.
+        num_msa_attention_heads: Number of MSA attention heads.
+        outer_product_hidden_size: Hidden width of the outer-product-mean projection.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        use_paired_feature: Whether to consume paired-MSA features.
+        use_miniformer: Whether to replace the full pair trunk with Miniformer blocks.
+        msa_miniformer_blocks: Whether the MSA trunk uses Miniformer pair updates.
+        dropout: Dropout probability along the pair trunk.
+        msa_dropout: Dropout probability inside the MSA trunk.
+    """
 
     num_pairformer_blocks: int = 64
     num_pair_attention_heads: int = 16
@@ -39,7 +68,16 @@ class BoltzGenTrunkConfig(Config):
 
 
 class BoltzGenTemplateConfig(Config):
-    r"""Geometry and block parameters shared by template and token-distance conditioning."""
+    r"""Configure geometry shared by template and token-distance conditioning.
+
+    Args:
+        num_distogram_bins: Number of distance bins.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        min_distance: Lower distance bound, in angstroms.
+        max_distance: Upper distance bound, in angstroms.
+        miniformer_blocks: Whether to use Miniformer template pair updates.
+    """
 
     num_distogram_bins: int = 38
     triangle_attention_hidden_size: int = 32
@@ -50,7 +88,22 @@ class BoltzGenTemplateConfig(Config):
 
 
 class BoltzGenDenoiserConfig(Config):
-    r"""EDM score-network graph parameters."""
+    r"""Configure the BoltzGen EDM score network.
+
+    Args:
+        num_token_transformer_blocks: Number of token transformer blocks.
+        num_token_transformer_heads: Number of token transformer attention heads.
+        num_atom_encoder_blocks: Number of atom encoder blocks.
+        num_atom_decoder_blocks: Number of atom decoder blocks.
+        num_atom_attention_heads: Number of atom attention heads.
+        atom_hidden_size: Width of atom single features.
+        atom_pair_hidden_size: Width of atom pair features.
+        num_query_atoms: Query-window size for local atom attention.
+        num_key_atoms: Key-window size for local atom attention.
+        num_conditioning_transitions: Number of transitions in each diffusion conditioner.
+        sigma_data: Data noise scale used by EDM preconditioning.
+        alignment_reverse_diff: Whether to rigid-align each reverse-diffusion step.
+    """
 
     num_token_transformer_blocks: int = 24
     num_token_transformer_heads: int = 16
@@ -67,7 +120,21 @@ class BoltzGenDenoiserConfig(Config):
 
 
 class BoltzGenSamplerConfig(Config):
-    r"""Released reverse-diffusion schedule and solver parameters."""
+    r"""Configure the BoltzGen reverse-diffusion schedule.
+
+    Args:
+        num_sampling_steps: Number of reverse-diffusion steps.
+        sampling_schedule: Name of the noise schedule.
+        rho: Exponent shaping noise-level spacing.
+        max_noise_level: Highest noise level in the schedule.
+        min_noise_level: Lowest non-zero noise level in the schedule.
+        step_scale: Multiplier on each denoising step.
+        noise_scale: Multiplier on churn-injected noise.
+        churn_rate: Stochastic churn added during sampling.
+        time_dilation: Dilation factor applied inside the configured schedule interval.
+        time_dilation_start: Start of the time-dilation interval.
+        time_dilation_end: End of the time-dilation interval.
+    """
 
     num_sampling_steps: int = 200
     sampling_schedule: str = "dilated"
@@ -83,24 +150,50 @@ class BoltzGenSamplerConfig(Config):
 
 
 class BoltzGenStructureDesignConfig(Config):
-    r"""Structure-design-only template and token-distance graph parameters."""
+    r"""Configure structure-design template and token-distance modules.
+
+    Args:
+        template_size: Width of structure-design template features.
+        num_template_blocks: Number of structure-design template blocks.
+        token_distance_size: Width of token-distance features.
+        num_token_distance_blocks: Number of token-distance blocks.
+        distance_gaussian_dim: Number of Gaussian distance features.
+        use_token_distance: Whether to build token-distance conditioning.
+    """
 
     template_size: int = 64
-    template_blocks: int = 2
+    num_template_blocks: int = 2
     token_distance_size: int = 64
-    token_distance_blocks: int = 2
+    num_token_distance_blocks: int = 2
     distance_gaussian_dim: int = 32
     use_token_distance: bool = True
 
 
 class BoltzGenInverseFoldingModuleConfig(Config):
-    r"""Inverse-folding atom encoder, graph encoder, and decoder parameters."""
+    r"""Configure the BoltzGen inverse-folding atom encoder and residue graph.
+
+    Args:
+        node_size: Width of projected node features.
+        edge_size: Width of projected edge features.
+        hidden_size: Width of graph hidden states.
+        num_encoder_blocks: Number of graph encoder blocks.
+        num_decoder_blocks: Number of sequence decoder blocks.
+        num_attention_heads: Number of graph attention heads.
+        num_neighbors: Number of nearest neighbors in each residue graph.
+        num_atom_encoder_blocks: Number of atom encoder blocks.
+        num_atom_encoder_attention_heads: Number of atom encoder attention heads.
+        num_query_atoms: Query-window size for local atom attention.
+        num_key_atoms: Key-window size for local atom attention.
+        dropout: Dropout probability in graph blocks.
+        softmax_dropout: Probability of masking attention logits before destination-wise softmax.
+        inverse_fold_noise: Training-time coordinate-noise standard deviation.
+    """
 
     node_size: int = 128
     edge_size: int = 128
     hidden_size: int = 128
-    num_encoder_layers: int = 6
-    num_decoder_layers: int = 3
+    num_encoder_blocks: int = 6
+    num_decoder_blocks: int = 3
     num_attention_heads: int = 4
     num_neighbors: int = 30
     num_atom_encoder_blocks: int = 1
@@ -113,7 +206,28 @@ class BoltzGenInverseFoldingModuleConfig(Config):
 
 
 class BoltzGenConfig(Config):
-    r"""Model config for the parameterized BoltzGen structure-design architecture."""
+    r"""Configure the parameterized BoltzGen structure-design architecture.
+
+    Args:
+        single_size: Width of the token representation.
+        pair_size: Width of the pair representation.
+        atom_hidden_size: Width of atom single features in the input embedder.
+        atom_pair_hidden_size: Width of atom pair features in the input embedder.
+        atom_feature_size: Width of raw atom features.
+        num_distogram_bins: Number of distogram output bins.
+        fourier_embedding_size: Width of diffusion-noise Fourier features.
+        relative_position_size: Width of relative-position features.
+        num_bond_types: Number of token bond types.
+        recycling_steps: Number of trunk recycling passes.
+        conditioning_cutoff_min: Lower contact-conditioning cutoff, in angstroms.
+        conditioning_cutoff_max: Upper contact-conditioning cutoff, in angstroms.
+        input_embeddings: Input embedder with binding and secondary-structure conditioning enabled.
+        trunk: Pairformer and MSA trunk configuration.
+        template: Shared template and token-distance geometry configuration.
+        denoiser: EDM score-network configuration.
+        sampler: Reverse-diffusion schedule configuration.
+        design: Structure-design modules, including token-distance conditioning.
+    """
 
     single_size: int = 384
     pair_size: int = 128
@@ -139,11 +253,9 @@ class BoltzGenConfig(Config):
 
     @classmethod
     def structuretrained_small(cls) -> BoltzGenConfig:
-        r"""Config for the reduced ``boltzgen1_structuretrained_small`` structure-design checkpoint.
+        r"""Return the reduced BoltzGen structure-design configuration.
 
-        The released small artifact is the same dim-for-dim BoltzGen structure-design contract as
-        ``boltzgen1_diverse`` (single/pair/atom widths, atom features, EDM schedule all identical) but a
-        *shallower* realization, and it predates the design-conditioning + token-distance additions:
+        This variant preserves the single, pair, atom, and EDM dimensions while using a shallower graph:
 
         - Miniformer trunk (compact triangular pair updates) instead of the full Pairformer/MSA stack.
         - ``12`` Miniformer pairformer blocks (vs ``64``) and ``3`` MSA blocks (vs ``4``).
@@ -152,8 +264,11 @@ class BoltzGenConfig(Config):
         - No token-distance conditioning module.
         - No binding-specification / design-mask / secondary-structure input conditioning.
 
-        Every one of these is an existing config knob, so the small model loads into the unchanged
-        ``BoltzGenModel`` graph; no contract change is required.
+        Every difference is represented by an existing configuration field, so both variants use the same
+        ``BoltzGenModel`` graph.
+
+        Returns:
+            Reduced structure-design configuration.
         """
 
         config = cls()
@@ -170,7 +285,16 @@ class BoltzGenConfig(Config):
 
 
 class BoltzGenInverseFoldingConfig(Config):
-    r"""Model config for the distinct BoltzGen inverse-folding architecture."""
+    r"""Configure the distinct BoltzGen inverse-folding architecture.
+
+    Args:
+        single_size: Width of the token representation.
+        atom_hidden_size: Width of atom single features.
+        atom_pair_hidden_size: Width of atom pair features.
+        atom_feature_size: Width of raw atom features.
+        input_embeddings: Atom and token input embedding configuration.
+        inverse_folding: Inverse-folding atom encoder and residue graph configuration.
+    """
 
     single_size: int = 384
     atom_hidden_size: int = 128

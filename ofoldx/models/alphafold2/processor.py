@@ -10,23 +10,27 @@ import torch
 import torch.nn.functional as F
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
 from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...modules import residue_constants
+from ...processor import Processor
 from ...references import classify_reference
 from .config import AlphaFold2ProcessorConfig
 from .model import AlphaFold2Input, AlphaFold2Layout
 
-RESTYPE_INDEX_BY_COMPONENT = {
-    residue_constants.restype_1to3[letter]: index for index, letter in enumerate(residue_constants.restypes)
+RESIDUE_TYPE_INDEX_BY_COMPONENT = {
+    residue_constants.AMINO_ACID_ONE_TO_THREE[letter]: index
+    for index, letter in enumerate(residue_constants.AMINO_ACID_ONE_LETTER_CODES)
 }
-RESTYPE_INDEX_BY_COMPONENT["UNK"] = residue_constants.restype_num
+RESIDUE_TYPE_INDEX_BY_COMPONENT["UNK"] = residue_constants.NUM_AMINO_ACID_TYPES
 _COMPONENT_BY_SYMBOL = {
-    **{letter: residue_constants.restype_1to3[letter] for letter in residue_constants.restypes},
+    **{
+        letter: residue_constants.AMINO_ACID_ONE_TO_THREE[letter]
+        for letter in residue_constants.AMINO_ACID_ONE_LETTER_CODES
+    },
     "B": "ASP",
     "J": "UNK",
     "O": "UNK",
@@ -34,14 +38,14 @@ _COMPONENT_BY_SYMBOL = {
     "X": "UNK",
     "Z": "GLU",
 }
-UNKNOWN_RESTYPE_INDEX = residue_constants.restype_num
-GAP_RESTYPE_INDEX = residue_constants.restype_num + 1
+UNKNOWN_RESIDUE_TYPE_INDEX = residue_constants.NUM_AMINO_ACID_TYPES
+GAP_RESIDUE_TYPE_INDEX = residue_constants.NUM_AMINO_ACID_TYPES + 1
 # MSA cells use uppercase one-letter symbols or ``-``. Ambiguous and uncommon
 # symbols follow the HHblits mapping: B->D, U->C, Z->E, J/O/X->UNK.
-RESTYPE_INDEX_BY_SYMBOL = {
-    symbol: RESTYPE_INDEX_BY_COMPONENT[component_id] for symbol, component_id in _COMPONENT_BY_SYMBOL.items()
+RESIDUE_TYPE_INDEX_BY_SYMBOL = {
+    symbol: RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for symbol, component_id in _COMPONENT_BY_SYMBOL.items()
 }
-RESTYPE_INDEX_BY_SYMBOL["-"] = GAP_RESTYPE_INDEX
+RESIDUE_TYPE_INDEX_BY_SYMBOL["-"] = GAP_RESIDUE_TYPE_INDEX
 _CHI_PI_PERIODIC = (
     (0.0, 0.0, 0.0, 0.0),
     (0.0, 0.0, 0.0, 0.0),
@@ -67,8 +71,15 @@ _CHI_PI_PERIODIC = (
 )
 
 
-class AlphaFold2Processor:
-    r"""Build monomer AlphaFold 2 input features."""
+class AlphaFold2Processor(Processor):
+    r"""Build monomer AlphaFold 2 input features.
+
+    Args:
+        config: Feature limits and preprocessing options. Defaults to
+            ``AlphaFold2ProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -78,21 +89,7 @@ class AlphaFold2Processor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = AlphaFold2ProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -101,7 +98,17 @@ class AlphaFold2Processor:
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold2Input:
-        r"""Lower one protein monomer and its explicit evidence."""
+        r"""Lower one protein monomer and its explicit evidence.
+
+        Args:
+            input: Inline sequence, FASTA path, protein sequence, molecular system, or structure
+                topology containing exactly one protein instance.
+            msa: Optional monomer MSA value or alignment path.
+            templates: Template structures with explicit target alignments.
+
+        Returns:
+            An ``AlphaFold2Input`` with aligned target, MSA, template, and layout values.
+        """
 
         if isinstance(input, str | PathLike):
             classified = classify_reference(input)
@@ -142,7 +149,7 @@ class AlphaFold2Processor:
 def molecular_system(
     input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
 ) -> MolecularSystem:
-    r"""Construct the one-polymer convenience input accepted by monomer AF2."""
+    r"""Construct the one-polymer convenience input accepted by monomer AlphaFold 2."""
 
     if isinstance(input, str | PathLike):
         classified = classify_reference(input)
@@ -178,7 +185,7 @@ def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
         raise ValueError("AlphaFold 2 monomer requires a protein PolymerSequence")
     for component in entity.components:
         component_id = component.component_id
-        if component_id not in RESTYPE_INDEX_BY_COMPONENT:
+        if component_id not in RESIDUE_TYPE_INDEX_BY_COMPONENT:
             raise ValueError(f"AlphaFold 2 monomer does not support protein component {component_id!r}")
     return entity, instance_id
 
@@ -221,7 +228,7 @@ def normalize_templates(
     target_instance_id: str,
     max_templates: int,
 ) -> tuple[Template, ...]:
-    r"""Bind explicit canonical template alignments to the AF2 target."""
+    r"""Bind explicit canonical template alignments to the AlphaFold 2 target."""
 
     if len(templates) > max_templates:
         raise ValueError(f"AlphaFold 2 accepts at most {max_templates} templates")
@@ -246,7 +253,7 @@ def select_template_alignment(
     target_entity_id: str,
     target_instance_id: str,
 ) -> TemplateAlignment:
-    r"""Return the one Template alignment that binds to the single AF2 target.
+    r"""Return the one Template alignment that binds to the single AlphaFold 2 target.
 
     AlphaFold 2 folds one monomer target, so exactly one of a Template's
     :class:`TemplateAlignment` values may name that target entity and, when it
@@ -280,7 +287,7 @@ def prepare_alphafold2_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> AlphaFold2Input:
-    r"""Build the monomer AF2 raw MSA pool, profile, and semantic axes.
+    r"""Build the monomer AlphaFold 2 raw MSA pool, profile, and semantic axes.
 
     The stochastic ``sample_msa`` / ``make_masked_msa`` / clustering / crop draw is
     the Model's job (once per recycle, off its per-sample generator), so this
@@ -289,13 +296,13 @@ def prepare_alphafold2_features(
     profile.
     """
 
-    aatype = torch.tensor(
-        [RESTYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
+    residue_type = torch.tensor(
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
     )
-    target_feat = torch.cat(
+    token_features = torch.cat(
         [
             torch.zeros(len(target), 1),
-            F.one_hot(aatype, num_classes=residue_constants.restype_num + 1),
+            F.one_hot(residue_type, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
         ],
         dim=-1,
     ).to(torch.float32)
@@ -307,25 +314,25 @@ def prepare_alphafold2_features(
         target_instance_id=instance_id,
     )
     floating = {
-        "target_feat": target_feat,
-        "token_mask": torch.ones(len(target)),
+        "token_features": token_features,
+        "sequence_mask": torch.ones(len(target)),
         "msa_deletions": msa_deletions,
         "msa_profile": msa_profile,
     }
     names = (
         "template_mask",
         "template_all_atom_positions",
-        "template_all_atom_masks",
+        "template_all_atom_mask",
         "template_torsion_angles_sin_cos",
-        "template_alt_torsion_angles_sin_cos",
+        "template_alternative_torsion_angles_sin_cos",
         "template_torsion_angles_mask",
     )
     for name, value in zip(names, template_values[1:], strict=True):
         floating[name] = value
     placed = {name: value.to(device=device, dtype=dtype).unsqueeze(0) for name, value in floating.items()}
-    template_aatype = template_values[0]
+    template_residue_type = template_values[0]
     return AlphaFold2Input(
-        aatype=aatype.to(device=device).unsqueeze(0),
+        residue_type=residue_type.to(device=device).unsqueeze(0),
         residue_index=torch.arange(len(target), device=device).unsqueeze(0),
         msa_tokens=msa_tokens.to(device=device).unsqueeze(0),
         layout=AlphaFold2Layout(
@@ -334,7 +341,7 @@ def prepare_alphafold2_features(
             msa=msa,
             templates=templates,
         ),
-        template_aatype=template_aatype.to(device=device).unsqueeze(0),
+        template_residue_type=template_residue_type.to(device=device).unsqueeze(0),
         **placed,
     )
 
@@ -345,14 +352,14 @@ def msa_pool_features(
 ) -> tuple[Tensor, Tensor, Tensor]:
     r"""Lower the raw query-projected alignment pool and its HHblits profile.
 
-    Returns ``msa_tokens [M, N]`` (long restype ids, row 0 is the query),
+    Returns ``msa_tokens [M, N]`` (long residue-type indices, row 0 is the query),
     ``msa_deletions [M, N]`` (float per-cell insertion counts), and
     ``msa_profile [N, 22]`` -- the mean of ``one_hot(tokens, 22)`` over the
     whole pool, computed before sampling or masking.
     """
 
     query = torch.tensor(
-        [RESTYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
     )
     if msa is None:
         tokens = query.unsqueeze(0)
@@ -362,7 +369,7 @@ def msa_pool_features(
         # addresses ``target.components[i]``. Deletions are per-cell insertion counts.
         tokens = torch.tensor(
             [
-                [RESTYPE_INDEX_BY_SYMBOL.get(symbol, UNKNOWN_RESTYPE_INDEX) for symbol in row]
+                [RESIDUE_TYPE_INDEX_BY_SYMBOL.get(symbol, UNKNOWN_RESIDUE_TYPE_INDEX) for symbol in row]
                 for row in msa.unpaired_sequences
             ],
             dtype=torch.long,
@@ -392,7 +399,7 @@ def template_features(
             torch.zeros(1, target_length, 7, 2),
             torch.zeros(1, target_length, 7),
         )
-    template_types: list[Tensor] = []
+    template_residue_types: list[Tensor] = []
     template_positions: list[Tensor] = []
     template_masks: list[Tensor] = []
     for template in templates:
@@ -408,12 +415,12 @@ def template_features(
         if not isinstance(template_entity, PolymerSequence) or template_entity.polymer_type != "protein":
             raise ValueError("AlphaFold 2 templates must align a protein instance")
         sites = {site: index for index, site in enumerate(structure.sites)}
-        aatype = torch.full((target_length,), GAP_RESTYPE_INDEX, dtype=torch.long)
+        residue_type = torch.full((target_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
         positions = torch.zeros(target_length, residue_constants.atom_type_num, 3)
         masks = torch.zeros(target_length, residue_constants.atom_type_num)
         for target_index, template_index in alignment.residue_pairs:
             component_id = template_entity.components[template_index].component_id
-            aatype[target_index] = RESTYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESTYPE_INDEX)
+            residue_type[target_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
             for atom_name, atom_index in residue_constants.atom_order.items():
                 site = AtomSite(alignment.template_instance_id, template_index, atom_name)
                 coordinate_index = sites.get(site)
@@ -421,30 +428,30 @@ def template_features(
                     continue
                 positions[target_index, atom_index] = torch.from_numpy(structure.coordinates[coordinate_index].copy())
                 masks[target_index, atom_index] = 1.0
-        template_types.append(aatype)
+        template_residue_types.append(residue_type)
         template_positions.append(positions)
         template_masks.append(masks)
-    aatype = torch.stack(template_types)
+    residue_type = torch.stack(template_residue_types)
     positions = torch.stack(template_positions)
     masks = torch.stack(template_masks)
-    torsion, alternate_torsion, torsion_mask = atom37_to_torsion_angles(
-        aatype,
+    torsion, alternative_torsion, torsion_mask = atom37_to_torsion_angles(
+        residue_type,
         positions,
         masks,
     )
     return (
-        aatype,
+        residue_type,
         torch.ones(len(templates)),
         positions,
         masks,
         torsion,
-        alternate_torsion,
+        alternative_torsion,
         torsion_mask,
     )
 
 
 def atom37_to_torsion_angles(
-    aatype: Tensor,
+    residue_type: Tensor,
     positions: Tensor,
     atom_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -459,22 +466,24 @@ def atom37_to_torsion_angles(
     phi_mask = previous_mask[..., 2] * atom_mask[..., :3].prod(dim=-1)
     psi_mask = atom_mask[..., :3].prod(dim=-1) * atom_mask[..., 4]
 
-    chi_indices = torch.zeros(21, 4, 4, dtype=torch.long, device=aatype.device)
-    for restype_index, letter in enumerate(residue_constants.restypes):
+    chi_indices = torch.zeros(21, 4, 4, dtype=torch.long, device=residue_type.device)
+    for residue_type_index, letter in enumerate(residue_constants.AMINO_ACID_ONE_LETTER_CODES):
         for chi_index, atom_names in enumerate(
-            residue_constants.chi_angles_atoms[residue_constants.restype_1to3[letter]]
+            residue_constants.chi_angles_atoms[residue_constants.AMINO_ACID_ONE_TO_THREE[letter]]
         ):
-            chi_indices[restype_index, chi_index] = torch.tensor(
+            chi_indices[residue_type_index, chi_index] = torch.tensor(
                 [residue_constants.atom_order[name] for name in atom_names],
-                device=aatype.device,
+                device=residue_type.device,
             )
-    selected_indices = chi_indices[aatype.clamp(max=20)]
+    selected_indices = chi_indices[residue_type.clamp(max=20)]
     expanded = selected_indices.unsqueeze(-1).expand(*selected_indices.shape, 3)
     chi_positions = positions.unsqueeze(-3).expand(*positions.shape[:-2], 4, *positions.shape[-2:]).gather(-2, expanded)
     chi_atom_mask = (
         atom_mask.unsqueeze(-2).expand(*atom_mask.shape[:-1], 4, atom_mask.shape[-1]).gather(-1, selected_indices)
     )
-    chi_exists = atom_mask.new_tensor((*residue_constants.chi_angles_mask, (0.0, 0.0, 0.0, 0.0)))[aatype.clamp(max=20)]
+    chi_exists = atom_mask.new_tensor((*residue_constants.chi_angles_mask, (0.0, 0.0, 0.0, 0.0)))[
+        residue_type.clamp(max=20)
+    ]
     chi_mask = chi_atom_mask.prod(dim=-1) * chi_exists
     torsion_atoms = torch.cat(
         [pre_omega.unsqueeze(-3), phi.unsqueeze(-3), psi.unsqueeze(-3), chi_positions],
@@ -506,6 +515,6 @@ def atom37_to_torsion_angles(
     angle_norm = torch.sqrt(sine.square() + cosine.square() + 1e-8)
     angles = torch.stack((sine / angle_norm, cosine / angle_norm), dim=-1)
     angles = angles * angles.new_tensor((1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0))[..., None]
-    periodic = angles.new_tensor(_CHI_PI_PERIODIC)[aatype.clamp(max=20)]
+    periodic = angles.new_tensor(_CHI_PI_PERIODIC)[residue_type.clamp(max=20)]
     mirror = torch.cat([torch.ones_like(periodic[..., :3]), 1.0 - 2.0 * periodic], dim=-1)
     return angles, angles * mirror.unsqueeze(-1), torsion_mask

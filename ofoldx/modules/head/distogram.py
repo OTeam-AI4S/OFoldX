@@ -19,6 +19,7 @@ class DistogramHead(nn.Module):
         pair_size: Pair representation width.
         num_bins: Number of distance bins.
         symmetrize_before_projection: Whether to symmetrize pair features before the output projection.
+        bias: Whether the output projection carries a learnable bias.
     """
 
     def __init__(
@@ -29,7 +30,7 @@ class DistogramHead(nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
-        self.linear = nn.Linear(pair_size, num_bins, bias=bias)
+        self.projection = nn.Linear(pair_size, num_bins, bias=bias)
         self.symmetrize_before_projection = symmetrize_before_projection
 
     def forward(self, pair: Tensor) -> Tensor:
@@ -53,6 +54,6 @@ class DistogramHead(nn.Module):
         """
 
         if self.symmetrize_before_projection:
-            return self.linear(pair + pair.transpose(-2, -3))
-        logits = self.linear(pair)
+            return self.projection(pair + pair.transpose(-2, -3))
+        logits = self.projection(pair)
         return logits + logits.transpose(-2, -3)

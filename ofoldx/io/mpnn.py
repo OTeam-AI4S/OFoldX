@@ -62,7 +62,7 @@ def read_mpnn_pdb(
     *,
     chains: Sequence[str] | None = None,
 ) -> Structure:
-    r"""Read one PDB through the input policy shared by the released MPNN implementations."""
+    r"""Read one PDB through the input policy shared by OFoldX MPNN models."""
 
     source = Path(path).expanduser()
     if source.suffix == ".gz":

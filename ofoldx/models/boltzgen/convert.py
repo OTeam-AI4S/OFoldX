@@ -3,7 +3,7 @@ Checkpoint converter: BoltzGen inverse-folding checkpoint -> OFoldX clean names.
 
 Routes the three top-level prefixes of ``boltzgen1_ifold.ckpt`` (input_embedder / inverse_folding_encoder /
 structure_module) to the matching OFoldX modules. The input embedder reuses the Boltz-2 atom converters;
-the encoder/decoder GNN layers use the clean MLP/transition names. Unmapped keys raise, and the resulting
+the encoder/decoder GNN blocks use the clean MLP/transition names. Unmapped keys raise, and the resulting
 state dictionary is suitable for strict loading.
 """
 
@@ -47,6 +47,18 @@ def compile_rules(pairs: Iterable[tuple[str, str | None]]) -> list[Rule]:
     return [(re.compile(pattern), replacement) for pattern, replacement in pairs]
 
 
+def _unpack_triple_product_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+    marker = ".gate_value_projection."
+    if marker not in key:
+        return [(key, tensor)]
+    prefix, suffix = key.rsplit(marker, 1)
+    value, gate = tensor.chunk(2, dim=0)
+    return [
+        (f"{prefix}.value_projection.{suffix}", value),
+        (f"{prefix}.gate_projection.{suffix}", gate),
+    ]
+
+
 CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
     [
         (r"^transition\.adaln\.s_norm\.", "transition.conditioned_norm.conditioning_norm."),
@@ -70,7 +82,7 @@ CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
 )
 
 
-DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "linear.")])
+DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "projection.")])
 
 
 BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "projection.")])
@@ -93,7 +105,7 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
 
 def transition_index_rules() -> list[tuple[str, str | None]]:
     return [
-        (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.norm_input."),
+        (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.input_norm."),
         (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
         (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.value_projection."),
         (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.output_projection."),
@@ -206,7 +218,7 @@ CONTACT_CONDITIONING_RULES: list[Rule] = compile_rules(
 
 def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.layer_norm\.", f"{clean}.norm_pair."),
+        (rf"^{boltz}\.layer_norm\.", f"{clean}.pair_norm."),
         (rf"^{boltz}\.linear\.", f"{clean}.bias_projection."),
         (rf"^{boltz}\.mha\.linear_q\.", f"{clean}.attention.projection.query_projection."),
         (rf"^{boltz}\.mha\.linear_k\.", f"{clean}.attention.projection.key_projection."),
@@ -218,7 +230,7 @@ def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | No
 
 def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.norm\.", f"{clean}.norm_input."),
+        (rf"^{boltz}\.norm\.", f"{clean}.input_norm."),
         (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
         (rf"^{boltz}\.fc2\.", f"{clean}.value_projection."),
         (rf"^{boltz}\.fc3\.", f"{clean}.output_projection."),
@@ -227,8 +239,8 @@ def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
 
 def triangle_multiplication_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.norm_in\.", f"{clean}.norm_input."),
-        (rf"^{boltz}\.norm_out\.", f"{clean}.norm_output."),
+        (rf"^{boltz}\.norm_in\.", f"{clean}.input_norm."),
+        (rf"^{boltz}\.norm_out\.", f"{clean}.output_norm."),
         (rf"^{boltz}\.p_out\.", f"{clean}.output_projection."),
         (rf"^{boltz}\.g_out\.", f"{clean}.gate_projection."),
     ]
@@ -243,14 +255,14 @@ PAIRFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_v\.", "pair_attention.attention.projection.value_projection."),
         (r"^attention\.proj_g\.", "pair_attention.attention.projection.gate_projection."),
         (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
-        (r"^attention\.proj_z\.0\.", "pair_attention.norm_pair."),
+        (r"^attention\.proj_z\.0\.", "pair_attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
         *triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_s", "single_feed_forward"),
-        *transition_rules("transition_z", "pair_feed_forward"),
+        *transition_rules("transition_s", "single_transition"),
+        *transition_rules("transition_z", "pair_transition"),
     ]
 )
 
@@ -304,7 +316,7 @@ PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_z", "feed_forward"),
+        *transition_rules("transition_z", "transition"),
     ]
 )
 
@@ -323,7 +335,7 @@ MSA_DIRECT_TRIANGLE_RULES: list[Rule] = compile_rules(
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("z_transition", "feed_forward"),
+        *transition_rules("z_transition", "transition"),
     ]
 )
 
@@ -338,8 +350,8 @@ def convert_msa_direct_triangle(key: str, tensor: Tensor) -> list[tuple[str, Ten
 
 MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
     [
-        (r"^norm_m\.", "norm_msa."),
-        (r"^norm_z\.", "norm_pair."),
+        (r"^norm_m\.", "msa_norm."),
+        (r"^norm_z\.", "pair_norm."),
         (r"^proj_m\.", "value_projection."),
         (r"^proj_g\.", "gate_projection."),
         (r"^proj_z\.", "pair_projection."),
@@ -350,7 +362,7 @@ MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
 
 MSA_TRANSITION_RULES = compile_rules(
     [
-        (r"^norm\.", "norm_input."),
+        (r"^norm\.", "input_norm."),
         (r"^fc1\.", "gate_projection."),
         (r"^fc2\.", "value_projection."),
         (r"^fc3\.", "output_projection."),
@@ -360,7 +372,7 @@ MSA_TRANSITION_RULES = compile_rules(
 
 OUTER_PRODUCT_MEAN_RULES = compile_rules(
     [
-        (r"^norm\.", "norm_msa."),
+        (r"^norm\.", "msa_norm."),
         (r"^proj_a\.", "left_projection."),
         (r"^proj_b\.", "right_projection."),
         (r"^proj_o\.", "output_projection."),
@@ -400,7 +412,7 @@ def _convert_standard_msa_module(key: str, tensor: Tensor) -> list[tuple[str, Te
         return [(key.replace("msa_proj.", "msa_projection.", 1), tensor)]
     if key.startswith("layers."):
         index, _, remainder = key[len("layers.") :].partition(".")
-        return [(f"layers.{index}.{new_key}", value) for new_key, value in convert_msa_layer(remainder, tensor)]
+        return [(f"blocks.{index}.{new_key}", value) for new_key, value in convert_msa_layer(remainder, tensor)]
     raise KeyError(f"unmapped MSA module key: {key}")
 
 
@@ -454,20 +466,35 @@ MINIFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_v\.", "attention.attention.projection.value_projection."),
         (r"^attention\.proj_g\.", "attention.attention.projection.gate_projection."),
         (r"^attention\.proj_o\.", "attention.attention.projection.output_projection."),
-        (r"^attention\.proj_z\.0\.", "attention.norm_pair."),
+        (r"^attention\.proj_z\.0\.", "attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "attention.bias_projection."),
-        *transition_rules("transition_s", "transition_single"),
-        *transition_rules("transition_z", "transition_pair"),
+        *transition_rules("transition_s", "single_transition"),
+        *transition_rules("transition_z", "pair_transition"),
     ]
 )
+
+
+def _convert_miniformer_triangle_key(key: str) -> str | None:
+    if not key.startswith("triangular."):
+        return None
+    converted = "triangle_multiplication." + key.removeprefix("triangular.")
+    for source, target in {
+        ".norm_in.": ".input_norm.",
+        ".p_in.": ".input_projection.",
+        ".g_in.": ".input_gate_projection.",
+        ".norm_out.": ".output_norm.",
+        ".p_out.": ".output_projection.",
+        ".g_out.": ".output_gate_projection.",
+    }.items():
+        converted = converted.replace(source, target)
+    return converted
 
 
 def convert_miniformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     r"""
     Tensor-aware converter for one compact Miniformer layer.
 
-    Passes ``triangular.*`` keys through unchanged (the compact triangular update keeps upstream names); otherwise
-    applies the Miniformer rename rules.
+    Maps the compact triangle multiplication and applies the remaining Miniformer rename rules.
 
     Args:
         key: Checkpoint key relative to the layer root.
@@ -477,20 +504,21 @@ def convert_miniformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor
         List of ``(new_key, tensor)`` pairs (empty when the key is dropped).
     """
 
-    if key.startswith("triangular."):
-        return [(key, tensor)]
+    triangle_key = _convert_miniformer_triangle_key(key)
+    if triangle_key is not None:
+        return [(triangle_key, tensor)]
     new_key = convert_keys(key, MINIFORMER_LAYER_RULES)
     return [] if new_key is None else [(new_key, tensor)]
 
 
-MINIFORMER_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules([*transition_rules("transition_z", "transition_pair")])
+MINIFORMER_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules([*transition_rules("transition_z", "pair_transition")])
 
 
 def convert_miniformer_pair_only_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     r"""
     Tensor-aware converter for one compact pair-only Miniformer layer.
 
-    Passes ``triangular.*`` keys through unchanged; otherwise applies the compact pair-only rename rules.
+    Maps the compact triangle multiplication and applies the remaining pair-only rename rules.
 
     Args:
         key: Checkpoint key relative to the layer root.
@@ -500,8 +528,9 @@ def convert_miniformer_pair_only_layer(key: str, tensor: Tensor) -> list[tuple[s
         List of ``(new_key, tensor)`` pairs (empty when the key is dropped).
     """
 
-    if key.startswith("triangular."):
-        return [(key, tensor)]
+    triangle_key = _convert_miniformer_triangle_key(key)
+    if triangle_key is not None:
+        return [(triangle_key, tensor)]
     new_key = convert_keys(key, MINIFORMER_PAIR_ONLY_LAYER_RULES)
     return [] if new_key is None else [(new_key, tensor)]
 
@@ -597,7 +626,7 @@ def convert_msa_module(
         return [(key.replace("msa_proj.", "msa_projection.", 1), tensor)]
     if key.startswith("layers."):
         index, _, remainder = key[len("layers.") :].partition(".")
-        return [(f"layers.{index}.{nk}", nv) for nk, nv in convert_miniformer_msa_layer(remainder, tensor)]
+        return [(f"blocks.{index}.{nk}", nv) for nk, nv in convert_miniformer_msa_layer(remainder, tensor)]
     raise KeyError(f"unmapped MSA module key: {key}")
 
 
@@ -630,7 +659,7 @@ def convert_trunk_key(
         return [("contact_conditioning." + new, tensor)] if new is not None else []
     if key.startswith("msa_module."):
         inner = convert_msa_module(key[len("msa_module.") :], tensor, miniformer_blocks=miniformer_msa)
-        return [(f"msa_module.{new_key}", new_value) for new_key, new_value in inner]
+        return [(f"msa_trunk.{new_key}", new_value) for new_key, new_value in inner]
     if key.startswith(("pairformer_stack.layers.", "pairformer_module.layers.")):
         prefix = (
             "pairformer_stack.layers." if key.startswith("pairformer_stack.layers.") else "pairformer_module.layers."
@@ -732,7 +761,7 @@ def convert_encoder(key: str) -> str:
     """
     if key.startswith("encoder_layers."):
         index, suffix = key[len("encoder_layers.") :].split(".", 1)
-        return f"layers.{index}.{_convert_gnn_layer(suffix)}"
+        return f"blocks.{index}.{_convert_gnn_layer(suffix)}"
     head = key.split(".")[0]
     return ENCODER_TOP.get(head, head) + key[len(head) :]
 
@@ -749,13 +778,13 @@ def convert_decoder(key: str) -> str:
     """
     if key.startswith("decoder_layers."):
         index, suffix = key[len("decoder_layers.") :].split(".", 1)
-        return f"layers.{index}.{_convert_gnn_layer(suffix)}"
+        return f"blocks.{index}.{_convert_gnn_layer(suffix)}"
     head = key.split(".")[0]
     return DECODER_TOP.get(head, head) + key[len(head) :]
 
 
 TOKEN_DISTANCE_TOP = {
-    "z_norm": "norm_pair",
+    "z_norm": "pair_norm",
     "v_norm": "hidden_norm",
     "z_proj": "pair_projection",
     "a_proj": "distance_feature_projection",
@@ -764,15 +793,16 @@ TOKEN_DISTANCE_TOP = {
 
 TOKEN_DISTANCE_ENCODER = {
     "distance_gaussian_smearing": "distance_smearing",
-    "distance_token_bias_trans.fc1": "distance_token_bias_trans.gate_projection",
-    "distance_token_bias_trans.fc2": "distance_token_bias_trans.value_projection",
-    "distance_token_bias_trans.fc3": "distance_token_bias_trans.output_projection",
+    "distance_token_bias_trans.norm": "distance_transition.input_norm",
+    "distance_token_bias_trans.fc1": "distance_transition.gate_projection",
+    "distance_token_bias_trans.fc2": "distance_transition.value_projection",
+    "distance_token_bias_trans.fc3": "distance_transition.output_projection",
 }
 
 
 def convert_token_distance(state: dict) -> dict:
     r"""
-    Convert a ``token_distance_module.*`` checkpoint subset onto ``BoltzGenTokenDistanceModule``.
+    Convert a ``token_distance_module.*`` checkpoint subset onto ``BoltzGenTokenDistanceEmbedder``.
 
     The pair-only pairformer layers are split tensor-aware; the distance encoder and top-level projections use the
     local rename maps.
@@ -788,7 +818,7 @@ def convert_token_distance(state: dict) -> dict:
         if key.startswith("pairformer.layers."):
             index, suffix = key[len("pairformer.layers.") :].split(".", 1)
             for new_suffix, new_value in convert_pair_only_layer(suffix, value):
-                out[f"pairformer.{index}.{new_suffix}"] = new_value
+                out[f"blocks.{index}.{new_suffix}"] = new_value
         elif key.startswith("token_distance_encoder."):
             inner = key[len("token_distance_encoder.") :]
             for ref, clean in TOKEN_DISTANCE_ENCODER.items():
@@ -804,7 +834,7 @@ def convert_token_distance(state: dict) -> dict:
 
 def convert_template(state: dict, *, miniformer_blocks: bool = False) -> dict:
     r"""
-    Convert a ``template_module.*`` checkpoint subset onto ``BoltzGenTemplateModule``.
+    Convert a ``template_module.*`` checkpoint subset onto ``BoltzGenTemplateEmbedder``.
 
     The pair-only pairformer layers are split tensor-aware (Miniformer variant when ``miniformer_blocks`` is set);
     the top-level projections use the local rename map.
@@ -823,7 +853,7 @@ def convert_template(state: dict, *, miniformer_blocks: bool = False) -> dict:
             index, suffix = key[len("pairformer.layers.") :].split(".", 1)
             converter = convert_miniformer_pair_only_layer if miniformer_blocks else convert_pair_only_layer
             for new_suffix, new_value in converter(suffix, value):
-                out[f"pairformer.{index}.{new_suffix}"] = new_value
+                out[f"blocks.{index}.{new_suffix}"] = new_value
         else:
             head = key.split(".")[0]
             out[rename.get(head, head) + key[len(head) :]] = value
@@ -876,7 +906,8 @@ def convert_inverse_folding(state: Mapping[str, torch.Tensor]) -> dict[str, torc
             if is_tied_output_projection(key):
                 continue
             raise KeyError(f"unmapped inverse-folding checkpoint key: {key}")
-        out[new_key] = value
+        for unpacked_key, unpacked_value in _unpack_triple_product_projection(new_key, value):
+            out[unpacked_key] = unpacked_value
     _pack_conditioned_adaptive_norms(out)
     return out
 
@@ -914,10 +945,13 @@ def convert_structure_design(state: Mapping[str, torch.Tensor]) -> dict[str, tor
     )
 
     # Modules the boltz2 trunk converter doesn't cover (or covers as v2): route to the BoltzGen converters.
-    out = {f"token_distance_module.{k}": v for k, v in convert_token_distance(_sub("token_distance_module")).items()}
+    out = {
+        f"token_distance_embedder.{key}": value
+        for key, value in convert_token_distance(_sub("token_distance_module")).items()
+    }
     out.update(
         {
-            f"template_module.{k}": v
+            f"template_embedder.{k}": v
             for k, v in convert_template(_sub("template_module"), miniformer_blocks=miniformer_template).items()
         }
     )
@@ -930,7 +964,8 @@ def convert_structure_design(state: Mapping[str, torch.Tensor]) -> dict[str, tor
                 if is_tied_output_projection(key):
                     continue
                 raise KeyError(f"unmapped structure-design checkpoint key: {key}")
-            out["input_embeddings." + inner] = value
+            for new_key, new_value in _unpack_triple_product_projection("input_embeddings." + inner, value):
+                out[new_key] = new_value
         else:
             # BoltzGen wraps the diffusion token transformer in an outer ModuleList (token_layers=1):
             # token_transformer_layers.0.layers.<i> == boltz2's flat token_transformer.layers.<i>.
@@ -950,8 +985,9 @@ def convert_structure_design(state: Mapping[str, torch.Tensor]) -> dict[str, tor
                 if is_tied_output_projection(source_key):
                     continue
                 raise KeyError(f"unmapped structure-design checkpoint key: {source_key}")
-            for new_key, new_value in converted:
-                out[new_key] = new_value
+            for packed_key, packed_value in converted:
+                for new_key, new_value in _unpack_triple_product_projection(packed_key, packed_value):
+                    out[new_key] = new_value
     _pack_conditioned_adaptive_norms(out)
     return out
 
@@ -1001,13 +1037,13 @@ def boltzgen_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> BoltzGenCo
     config.trunk.msa_dropout = msa_args["msa_dropout"]
 
     config.design.template_size = template_args["template_dim"]
-    config.design.template_blocks = template_args["template_blocks"]
+    config.design.num_template_blocks = template_args["template_blocks"]
     config.template.miniformer_blocks = template_args.get("miniformer_blocks", False)
     config.design.use_token_distance = any(key.startswith("token_distance_module.") for key in state)
     if config.design.use_token_distance:
         token_distance_args: Mapping[str, Any] = hyperparameters["token_distance_args"]
         config.design.token_distance_size = token_distance_args["token_distance_dim"]
-        config.design.token_distance_blocks = token_distance_args["token_distance_blocks"]
+        config.design.num_token_distance_blocks = token_distance_args["token_distance_blocks"]
         config.design.distance_gaussian_dim = token_distance_args["distance_gaussian_dim"]
 
     config.denoiser.num_token_transformer_blocks = score_model_args["token_transformer_depth"]

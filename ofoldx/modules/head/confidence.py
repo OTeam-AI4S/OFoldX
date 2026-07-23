@@ -1,23 +1,10 @@
 r"""
-Shared confidence head for the AlphaFold 3 and Protenix implementations.
+Confidence prediction from trunk representations and sampled coordinates.
 
-Predicts pLDDT, PAE, PDE, and resolved logits from the trunk single/pair states and the predicted
-coordinates. AlphaFold 3 and Protenix share this parameterized head; the real architectural
-differences between the two implementations are exposed as constructor flags rather than duplicated code
-(mirroring the shared :class:`~ofoldx.modules.head.distogram.DistogramHead` precedent):
-
-- ``single_max_abs`` -- clamp on the trunk single before scoring (AlphaFold 3 ``None`` / unclamped,
-  Protenix ``512``).
-- ``use_single_norm`` -- Protenix applies one extra ``LayerNorm`` to the single before the sample
-  loop (upstream ``input_strunk_ln``); AlphaFold 3 does not.
-- ``use_distance_projection`` -- Protenix adds a raw-distance projection channel in the pair
-  embedder; AlphaFold 3 does not.
-- ``symmetrize_pde_before_projection`` -- Protenix symmetrizes the pair *state* before the PDE
-  norm/projection (upstream ``pde_ln(z + z.transpose(-2, -3))``); AlphaFold 3 symmetrizes the
-  projected *logits* (``left + swapaxes(left, -2, -3)``). ``LayerNorm`` is non-linear, so the two
-  are distinct functions.
-- ``persistent_distance_bins`` -- whether the distance-bin buffers appear in ``state_dict``
-  (Protenix persistent, AlphaFold 3 non-persistent).
+The shared head predicts pLDDT, PAE, PDE, and resolved logits. Constructor flags
+select optional single-state clipping and normalization, raw-distance projection,
+PDE symmetrization order, and persistent distance bins without changing the public
+tensor contract.
 """
 
 from __future__ import annotations
@@ -67,13 +54,13 @@ class ConfidenceHead(nn.Module):
         expansion: Feed-forward expansion factor in the Pairformer transitions.
         dropout: Pairformer dropout probability.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair.
         single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
-        use_single_norm: Whether to apply a ``LayerNorm`` to the single before the sample loop (Protenix).
-        use_distance_projection: Whether the pair embedder adds a raw-distance projection channel (Protenix).
+        use_single_norm: Whether to apply a ``LayerNorm`` to the single before the sample loop.
+        use_distance_projection: Whether the pair embedder adds a raw-distance projection channel.
         symmetrize_pde_before_projection: Whether the PDE projector symmetrizes the pair state before the
-            norm/projection (Protenix) instead of symmetrizing the projected logits (AlphaFold 3).
-        persistent_distance_bins: Whether the distance-bin buffers are stored in ``state_dict`` (Protenix).
+            norm/projection instead of symmetrizing the projected logits.
+        persistent_distance_bins: Whether the distance-bin buffers are stored in ``state_dict``.
     """
 
     def __init__(
@@ -358,15 +345,13 @@ class PairConfidenceProjector(nn.Module):
     r"""
     Project the pair representation to PAE and (symmetrized) PDE logits.
 
-    PAE is projected from the normalized pair state. The PDE symmetrization convention differs between
-    the AlphaFold 3 and Protenix implementations and is selected by ``symmetrize_before_projection``:
+    PAE is projected from the normalized pair state. ``symmetrize_before_projection`` selects between
+    two PDE symmetrization orders:
 
-    - ``False`` (AlphaFold 3): symmetrize the projected distance-error *logits* --
-      ``left = pde_projection(pde_norm(pair)); pde = left + left.transpose(-2, -3)`` -- matching DeepMind
-      (``confidence_head.py``: ``left + swapaxes(left, -2, -3)``).
-    - ``True`` (Protenix): symmetrize the pair *state* before the norm/projection --
-      ``pde = pde_projection(pde_norm(pair + pair.transpose(-2, -3)))`` -- matching Protenix
-      (``confidence.py``: ``pde_ln(z + z.transpose(-2, -3))``).
+    - ``False``: symmetrize the projected distance-error *logits*:
+      ``left = pde_projection(pde_norm(pair)); pde = left + left.transpose(-2, -3)``.
+    - ``True``: symmetrize the pair *state* before normalization and projection:
+      ``pde = pde_projection(pde_norm(pair + pair.transpose(-2, -3)))``.
 
     Because ``LayerNorm`` is non-linear, the two conventions are distinct functions.
 
@@ -375,7 +360,7 @@ class PairConfidenceProjector(nn.Module):
         num_pae_bins: Number of predicted-aligned-error bins.
         num_pde_bins: Number of predicted-distance-error bins.
         symmetrize_before_projection: Whether to symmetrize the pair state before the PDE norm/projection
-            (Protenix) instead of symmetrizing the projected logits (AlphaFold 3).
+            instead of symmetrizing the projected logits.
     """
 
     def __init__(
@@ -410,11 +395,8 @@ class PairConfidenceProjector(nn.Module):
         if self.symmetrize_before_projection:
             pde_logits = self.pde_projection(self.pde_norm(pde_pair + pde_pair.transpose(-2, -3)))
         else:
-            # DeepMind symmetrizes the distance-error LOGITS, not the pair state: it projects the raw
-            # (unsymmetrized) pair through ``LayerNorm`` + ``left_half_distance_logits`` and only then
-            # adds the transpose (``confidence_head.py``: ``left + swapaxes(left, -2, -3)``).  Because
-            # ``LayerNorm`` is non-linear, symmetrizing the pair *before* the norm/projection is a
-            # different function and diverges from the checkpoint; symmetrize after.
+            # Project the unsymmetrized pair, then add the transposed logits. Because LayerNorm is
+            # non-linear, symmetrizing the pair before normalization would be a different function.
             left_distance_logits = self.pde_projection(self.pde_norm(pde_pair))
             pde_logits = left_distance_logits + left_distance_logits.transpose(-2, -3)
         return pae_logits, pde_logits

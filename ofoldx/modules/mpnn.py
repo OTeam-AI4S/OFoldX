@@ -1,10 +1,9 @@
 r"""
-Concrete graph primitives shared by the released MPNN implementations.
+Graph message passing and feature construction shared by MPNN models.
 
-This module owns the exact message-passing blocks, feature graphs, and helper
-functions reused by more than one released MPNN implementation.
-Concrete Models, Inputs, Configs, samplers, Pipelines, and model-specific feature
-graphs remain with their implementations.
+This module owns reusable message-passing blocks, feature graphs, and tensor
+operations. Model inputs, outputs, sampling, and model-specific feature graphs
+remain with their model families.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ def nearest_neighbors(
     num_neighbors: int,
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor]:
-    r"""Return the released masked nearest-neighbor distances and indices."""
+    r"""Return masked nearest-neighbor distances and indices."""
 
     pair_mask = residue_mask[:, :, None] * residue_mask[:, None, :]
     distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
@@ -140,54 +139,85 @@ def autoregressive_masks(
 
 
 class MpnnMessage(nn.Module):
-    r"""Three-layer GELU network used to compute neighbor messages."""
+    r"""Compute neighbor messages with a three-projection GELU network.
+
+    Args:
+        input_size: Width of the assembled neighbor context.
+        hidden_size: Width of hidden messages and the returned update.
+    """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
-        self.input = nn.Linear(input_size, hidden_size)
-        self.middle = nn.Linear(hidden_size, hidden_size)
-        self.output = nn.Linear(hidden_size, hidden_size)
+        self.input_projection = nn.Linear(input_size, hidden_size)
+        self.hidden_projection = nn.Linear(hidden_size, hidden_size)
+        self.output_projection = nn.Linear(hidden_size, hidden_size)
         self.activation = nn.GELU()
 
     def forward(self, x: Tensor) -> Tensor:
         r"""Apply the message network to an aligned context tensor."""
 
-        return self.output(self.activation(self.middle(self.activation(self.input(x)))))
+        hidden = self.activation(self.input_projection(x))
+        hidden = self.activation(self.hidden_projection(hidden))
+        return self.output_projection(hidden)
 
 
 class MpnnFeedForward(nn.Module):
-    r"""Position-wise two-layer GELU feed-forward block."""
+    r"""Position-wise projection, GELU activation, and output projection.
+
+    Residual addition, dropout, and normalization belong to the containing block.
+
+    Args:
+        hidden_size: Width of input and output states.
+        intermediate_size: Width of the activated intermediate state.
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
-        self.input = nn.Linear(hidden_size, intermediate_size)
-        self.output = nn.Linear(intermediate_size, hidden_size)
+        self.input_projection = nn.Linear(hidden_size, intermediate_size)
+        self.output_projection = nn.Linear(intermediate_size, hidden_size)
         self.activation = nn.GELU()
 
     def forward(self, x: Tensor) -> Tensor:
-        r"""Apply the feed-forward block."""
+        r"""Apply the feed-forward computation."""
 
-        return self.output(self.activation(self.input(x)))
+        return self.output_projection(self.activation(self.input_projection(x)))
 
 
 class MpnnRelativePositionEncoding(nn.Module):
-    r"""Embed signed residue offsets with one distinct inter-chain bucket."""
+    r"""Embed signed residue offsets with one distinct inter-chain bucket.
+
+    Args:
+        num_embeddings: Width of the returned relative-position features.
+        max_relative_feature: Largest signed within-chain offset represented separately.
+    """
 
     def __init__(self, num_embeddings: int, max_relative_feature: int = 32) -> None:
         super().__init__()
         self.max_relative_feature = max_relative_feature
-        self.linear = nn.Linear(2 * max_relative_feature + 2, num_embeddings)
+        self.projection = nn.Linear(2 * max_relative_feature + 2, num_embeddings)
 
     def forward(self, offset: Tensor, same_chain: Tensor) -> Tensor:
         r"""Project bucketed residue offsets to edge-position features."""
 
         clipped = torch.clamp(offset + self.max_relative_feature, 0, 2 * self.max_relative_feature)
         bucket = clipped * same_chain + (1 - same_chain) * (2 * self.max_relative_feature + 1)
-        return self.linear(F.one_hot(bucket, 2 * self.max_relative_feature + 2).to(dtype=self.linear.weight.dtype))
+        features = F.one_hot(bucket, 2 * self.max_relative_feature + 2).to(dtype=self.projection.weight.dtype)
+        return self.projection(features)
 
 
-class MpnnEncoderLayer(nn.Module):
-    r"""One neighbor-message node, feed-forward, and edge update."""
+class MpnnEncoderBlock(nn.Module):
+    r"""Apply one node-message, transition, and edge-message update.
+
+    The block owns residual order, dropout, and post-normalization. Its
+    [`MpnnFeedForward`][ofoldx.modules.mpnn.MpnnFeedForward] member computes only
+    the transition update.
+
+    Args:
+        hidden_size: Width of node, edge, and message states.
+        edge_input_size: Width of gathered neighbor context before the source node is appended.
+        dropout: Dropout probability on each residual update.
+        scale: Divisor applied to the summed neighbor messages.
+    """
 
     def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
         super().__init__()
@@ -195,9 +225,9 @@ class MpnnEncoderLayer(nn.Module):
         self.node_message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.node_dropout = nn.Dropout(dropout)
         self.node_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = MpnnFeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
+        self.transition = MpnnFeedForward(hidden_size, hidden_size * 4)
+        self.transition_dropout = nn.Dropout(dropout)
+        self.transition_norm = nn.LayerNorm(hidden_size)
         self.edge_message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.edge_dropout = nn.Dropout(dropout)
         self.edge_norm = nn.LayerNorm(hidden_size)
@@ -210,7 +240,18 @@ class MpnnEncoderLayer(nn.Module):
         node_mask: Tensor | None,
         attend_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
-        r"""Update aligned node and edge states from one message-passing round."""
+        r"""Update aligned node and edge states from one message-passing round.
+
+        Args:
+            node_states: Node states ``[batch, residues, hidden_size]``.
+            edge_states: Neighbor-aligned edge states ``[batch, residues, neighbors, hidden_size]``.
+            neighbor_indices: Source indices ``[batch, residues, neighbors]`` for each neighbor slot.
+            node_mask: Optional valid-node mask ``[batch, residues]``.
+            attend_mask: Optional valid-neighbor mask ``[batch, residues, neighbors]``.
+
+        Returns:
+            Updated node and edge states with the same shapes as their inputs.
+        """
 
         neighbor_states = cat_neighbors_nodes(node_states, edge_states, neighbor_indices)
         source_states = node_states.unsqueeze(-2).expand(-1, -1, neighbor_states.shape[-2], -1)
@@ -218,7 +259,7 @@ class MpnnEncoderLayer(nn.Module):
         if attend_mask is not None:
             node_message = node_message * attend_mask.unsqueeze(-1)
         node_states = self.node_norm(node_states + self.node_dropout(node_message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
+        node_states = self.transition_norm(node_states + self.transition_dropout(self.transition(node_states)))
         if node_mask is not None:
             node_states = node_states * node_mask.unsqueeze(-1)
 
@@ -229,8 +270,18 @@ class MpnnEncoderLayer(nn.Module):
         return node_states, edge_states
 
 
-class MpnnDecoderLayer(nn.Module):
-    r"""One masked neighbor-message node update followed by feed-forward."""
+class MpnnDecoderBlock(nn.Module):
+    r"""Apply one masked neighbor-message update followed by a transition.
+
+    The block owns both residual paths, dropout, and post-normalization; the
+    feed-forward module held as ``transition`` only computes its additive update.
+
+    Args:
+        hidden_size: Width of node states and messages.
+        edge_input_size: Width of caller-assembled neighbor context.
+        dropout: Dropout probability on each residual update.
+        scale: Divisor applied to the summed neighbor messages.
+    """
 
     def __init__(self, hidden_size: int, edge_input_size: int, *, dropout: float, scale: float = 30.0) -> None:
         super().__init__()
@@ -238,9 +289,9 @@ class MpnnDecoderLayer(nn.Module):
         self.message = MpnnMessage(hidden_size + edge_input_size, hidden_size)
         self.message_dropout = nn.Dropout(dropout)
         self.message_norm = nn.LayerNorm(hidden_size)
-        self.feed_forward = MpnnFeedForward(hidden_size, hidden_size * 4)
-        self.feed_forward_dropout = nn.Dropout(dropout)
-        self.feed_forward_norm = nn.LayerNorm(hidden_size)
+        self.transition = MpnnFeedForward(hidden_size, hidden_size * 4)
+        self.transition_dropout = nn.Dropout(dropout)
+        self.transition_norm = nn.LayerNorm(hidden_size)
 
     def forward(
         self,
@@ -249,21 +300,42 @@ class MpnnDecoderLayer(nn.Module):
         node_mask: Tensor | None = None,
         attend_mask: Tensor | None = None,
     ) -> Tensor:
-        r"""Update node states from caller-assembled neighbor context."""
+        r"""Update node states from caller-assembled neighbor context.
+
+        Args:
+            node_states: Node states ``[..., residues, hidden_size]``.
+            edge_context: Neighbor context ``[..., residues, neighbors, edge_input_size]``.
+            node_mask: Optional valid-node mask ``[..., residues]``.
+            attend_mask: Optional valid-neighbor mask ``[..., residues, neighbors]``.
+
+        Returns:
+            Updated node states with the same shape as ``node_states``.
+        """
 
         source_states = node_states.unsqueeze(-2).expand(*node_states.shape[:-1], edge_context.shape[-2], -1)
         message = self.message(torch.cat((source_states, edge_context), dim=-1))
         if attend_mask is not None:
             message = message * attend_mask.unsqueeze(-1)
         node_states = self.message_norm(node_states + self.message_dropout(message.sum(dim=-2) / self.scale))
-        node_states = self.feed_forward_norm(node_states + self.feed_forward_dropout(self.feed_forward(node_states)))
+        node_states = self.transition_norm(node_states + self.transition_dropout(self.transition(node_states)))
         if node_mask is not None:
             node_states = node_states * node_mask.unsqueeze(-1)
         return node_states
 
 
 class MpnnProteinFeatures(nn.Module):
-    r"""The shared 25-pair full-protein edge graph used by MPNN designers."""
+    r"""Build a 25-distance full-backbone edge graph for MPNN designers.
+
+    Each residue selects nearest neighbors by Cα distance. The edge representation
+    combines relative residue position with radial-basis features for 25 ordered
+    atom-pair distances over N, Cα, C, O, and virtual Cβ coordinates.
+
+    Args:
+        edge_size: Width of returned edge features.
+        num_neighbors: Maximum number of neighbors selected per residue.
+        num_positional_embeddings: Width of relative-position features.
+        num_rbf: Number of radial-basis bins per atom-pair distance.
+    """
 
     def __init__(
         self,
@@ -287,7 +359,18 @@ class MpnnProteinFeatures(nn.Module):
         residue_index: Tensor,
         chain_index: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        r"""Build vectorized atom-pair and directly gathered identity edge features."""
+        r"""Build neighbor-aligned geometric and relative-position edge features.
+
+        Args:
+            backbone_coordinates: Backbone coordinates ``[batch, residues, 4, 3]`` in N, Cα, C, O order.
+            residue_mask: Valid-residue mask ``[batch, residues]``.
+            residue_index: Residue indices ``[batch, residues]`` used for signed offsets.
+            chain_index: Chain indices ``[batch, residues]`` used to separate inter-chain offsets.
+
+        Returns:
+            Edge features ``[batch, residues, neighbors, edge_size]`` and their residue indices
+            ``[batch, residues, neighbors]``.
+        """
 
         nitrogen = backbone_coordinates[:, :, 0]
         alpha_carbon = backbone_coordinates[:, :, 1]

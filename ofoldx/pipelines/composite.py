@@ -1,6 +1,6 @@
 r"""Persistence for pipelines owning multiple model-processor pairs.
 
-``_PAIR_LAYOUT`` assigns one pair to the repository root and additional pairs to fixed
+``pair_layout`` assigns one pair to the repository root and additional pairs to fixed
 subdirectories. Only the root carries ``pipeline.json``.
 """
 
@@ -12,10 +12,12 @@ from typing import NamedTuple, cast
 
 import chanfig
 import torch
-from torch import nn
+from typing_extensions import Self
 
-from ..hub import ResolvedRepository, load_model, load_processor, resolve_repository
 from ..artifacts import save_model
+from ..hub import ResolvedRepository, load_model, load_processor, resolve_repository
+from ..model import Model
+from ..processor import Processor
 from .registry import PIPELINES
 
 
@@ -48,23 +50,47 @@ def _pair_directory(root: Path, subdirectory: str) -> Path:
 class CompositePipeline:
     r"""Base class for pipelines with a fixed multi-pair repository layout."""
 
-    _PAIR_LAYOUT: tuple[CompositePair, ...]
+    pair_layout: tuple[CompositePair, ...]
 
-    def _composite_pair_source(self, pair: CompositePair) -> tuple[nn.Module, object] | None:
+    def _composite_pair_source(self, pair: CompositePair) -> tuple[Model, Processor] | None:
         r"""Return the ``(model, processor)`` a layout slot serializes, or ``None`` when absent."""
 
         bound = getattr(self, pair.model_attribute)
         if pair.wrap is not None:
             if bound is None:
                 return None
-            return bound.model, bound.processor
-        processor = getattr(self, cast(str, pair.processor_attribute))
+            return cast(Model, bound.model), cast(Processor, bound.processor)
+        processor = cast(Processor | None, getattr(self, cast(str, pair.processor_attribute)))
         if (bound is None) != (processor is None):
             location = pair.subdirectory or "root"
             raise ValueError(f"{location} model and processor must either both be present or both be absent")
         if bound is None:
             return None
-        return bound, processor
+        return cast(Model, bound), cast(Processor, processor)
+
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""Move every bound Model and Processor to one device and dtype.
+
+        Args:
+            device: Destination device. ``None`` preserves each component's current device.
+            dtype: Destination floating-point dtype. ``None`` preserves each component's dtype.
+
+        Returns:
+            This pipeline after in-place placement.
+        """
+
+        for pair in self.pair_layout:
+            source = self._composite_pair_source(pair)
+            if source is None:
+                continue
+            model, processor = source
+            model.to(device=device, dtype=dtype)
+            processor.to(device=device, dtype=dtype)
+        return self
 
     def save(
         self,
@@ -76,7 +102,16 @@ class CompositePipeline:
         private: bool = False,
         commit_message: str | None = None,
     ) -> None:
-        r"""Save every pair, write the root marker, and optionally upload the repository."""
+        r"""Save every pair, write the root marker, and optionally upload the repository.
+
+        Args:
+            directory: Local repository directory.
+            max_shard_size: Maximum size of each model-weight shard.
+            repo_id: Optional Hub repository receiving the saved directory.
+            token: Optional Hub authentication token.
+            private: Whether a newly created Hub repository is private.
+            commit_message: Optional Hub commit message.
+        """
 
         pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is None:
@@ -86,8 +121,8 @@ class CompositePipeline:
 
         # Resolve every slot's source first so a missing required pair aborts the save
         # before the destination is mutated.
-        plan: list[tuple[CompositePair, Path, tuple[nn.Module, object] | None]] = []
-        for pair in self._PAIR_LAYOUT:
+        plan: list[tuple[CompositePair, Path, tuple[Model, Processor] | None]] = []
+        for pair in self.pair_layout:
             pair_directory = _pair_directory(destination, pair.subdirectory)
             source = self._composite_pair_source(pair)
             if source is None and pair.required:
@@ -140,23 +175,37 @@ class CompositePipeline:
         token: str | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ):
+    ) -> Self:
         r"""Load every pair from one resolved repository snapshot.
 
         Missing optional pairs are skipped; missing required pairs raise ``ValueError``.
+
+        Args:
+            directory: Local directory or Hub repository id.
+            revision: Optional Hub revision.
+            token: Optional Hub authentication token.
+            device: Device for loaded Models and Processors.
+            dtype: Floating-point dtype for loaded Models and Processors.
+
+        Returns:
+            A pipeline assembled from the repository's declared pairs.
         """
 
         resolved = resolve_repository(directory, revision=revision, token=token)
         arguments: dict[str, object] = {}
-        for pair in cls._PAIR_LAYOUT:
+        for pair in cls.pair_layout:
             subrepository = ResolvedRepository(_pair_directory(resolved.path, pair.subdirectory))
             if not (subrepository.path / "model.json").exists():
                 if pair.required:
                     location = pair.subdirectory or "root"
                     raise ValueError(f"repository is missing the {location} pair required by {cls.__name__}")
                 continue
-            processor = load_processor(subrepository, device=device, dtype=dtype)
             model = load_model(subrepository, device=device, dtype=dtype)
+            processor = load_processor(
+                subrepository,
+                device=model.device,
+                dtype=model.dtype,
+            )
             if pair.wrap is not None:
                 arguments[pair.model_attribute] = pair.wrap(model=model, processor=processor)
             else:

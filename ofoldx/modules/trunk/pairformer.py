@@ -34,10 +34,10 @@ class PairformerStack(nn.Module):
         triangle_attention_hidden_size: Per-head width of each triangle-attention update.
         num_triangle_attention_heads: Number of heads in triangle attention.
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
-        expansion: Feed-forward expansion factor of every transition.
+        expansion: Expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -69,6 +69,7 @@ class PairformerStack(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.single_size = single_size
         self.blocks = nn.ModuleList(
             [
@@ -147,7 +148,7 @@ class PairformerBlock(nn.Module):
         expansion: Feed-forward expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -203,9 +204,9 @@ class PairformerBlock(nn.Module):
             operator_backend=operator_backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.pair_feed_forward = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.pair_transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
         self.pair_attention: PairBiasedSelfAttention | None
-        self.single_feed_forward: Transition | None
+        self.single_transition: Transition | None
         if single_size > 0:
             self.pair_attention = PairBiasedSelfAttention(
                 hidden_size=single_size,
@@ -213,10 +214,10 @@ class PairformerBlock(nn.Module):
                 num_attention_heads=num_pair_attention_heads,
                 operator_backend=operator_backend,
             )
-            self.single_feed_forward = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+            self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
         else:
             self.pair_attention = None
-            self.single_feed_forward = None
+            self.single_transition = None
 
     def forward(
         self, single: Tensor | None, pair: Tensor, pair_mask: Tensor | None = None
@@ -261,8 +262,8 @@ class PairformerBlock(nn.Module):
                 -2,
             ),
         )
-        pair = pair + self.pair_feed_forward(pair)
-        if self.pair_attention is not None and self.single_feed_forward is not None:
+        pair = pair + self.pair_transition(pair)
+        if self.pair_attention is not None and self.single_transition is not None:
             single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
-            single = single + self.single_feed_forward(single)
+            single = single + self.single_transition(single)
         return single, pair

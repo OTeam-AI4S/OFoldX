@@ -151,13 +151,13 @@ def _extract_reference_state(checkpoint_or_state_dict: Mapping[str, Any]) -> dic
 
 
 def _pxdesign_reference_key(model_key: str) -> _ReferenceKey:
-    if model_key.startswith("condition_embeddings.input_map."):
+    if model_key.startswith("condition_embeddings.input_projection."):
         return "design_condition_embedder.input_embedder.input_map." + model_key.removeprefix(
-            "condition_embeddings.input_map."
+            "condition_embeddings.input_projection."
         )
-    if model_key.startswith("condition_embeddings.template_embeddings.embedding."):
+    if model_key.startswith("condition_embeddings.template_embedder.embedding."):
         return "design_condition_embedder.condition_template_embedder.embedder." + model_key.removeprefix(
-            "condition_embeddings.template_embeddings.embedding."
+            "condition_embeddings.template_embedder.embedding."
         )
     if model_key.startswith("condition_embeddings.atom_encoder."):
         reference_key = _reference_key(
@@ -270,16 +270,16 @@ def _replace_denoiser_key(key: str) -> str:
             ".diffusion_conditioning.relpe.output_projection.": ".diffusion_conditioning.relpe.linear_no_bias.",
             ".conditioner.pair_input_norm.": ".diffusion_conditioning.layernorm_z.",
             ".conditioner.pair_projection.": ".diffusion_conditioning.linear_no_bias_z.",
-            ".conditioner.pair_feed_forward_1.": ".diffusion_conditioning.transition_z1.",
-            ".conditioner.pair_feed_forward_2.": ".diffusion_conditioning.transition_z2.",
+            ".conditioner.pair_transitions.0.": ".diffusion_conditioning.transition_z1.",
+            ".conditioner.pair_transitions.1.": ".diffusion_conditioning.transition_z2.",
             ".conditioner.single_conditioning_norm.": ".diffusion_conditioning.layernorm_s.",
             ".conditioner.single_conditioning_projection.": ".diffusion_conditioning.linear_no_bias_s.",
             ".conditioner.noise_embedding.projection.weight": ".diffusion_conditioning.fourier_embedding.w",
             ".conditioner.noise_embedding.projection.bias": ".diffusion_conditioning.fourier_embedding.b",
             ".conditioner.noise_norm.": ".diffusion_conditioning.layernorm_n.",
             ".conditioner.noise_projection.": ".diffusion_conditioning.linear_no_bias_n.",
-            ".conditioner.single_feed_forward_1.": ".diffusion_conditioning.transition_s1.",
-            ".conditioner.single_feed_forward_2.": ".diffusion_conditioning.transition_s2.",
+            ".conditioner.single_transitions.0.": ".diffusion_conditioning.transition_s1.",
+            ".conditioner.single_transitions.1.": ".diffusion_conditioning.transition_s2.",
             ".atom_encoder.": ".atom_attention_encoder.",
             ".token_refiner.single_norm.": ".layernorm_s.",
             ".token_refiner.single_to_token_projection.": ".linear_no_bias_s.",
@@ -291,14 +291,14 @@ def _replace_denoiser_key(key: str) -> str:
 
 
 def _replace_atom_stack_key(key: str) -> str:
-    if ".atom_attention_stack." not in key:
+    if ".atom_self_attention." not in key:
         return key
     block = r".atom_transformer.diffusion_transformer.blocks.\1"
-    source_block = r"\.atom_attention_stack\.atom_attention\.transformer\.blocks\.(\d+)\."
+    source_block = r"\.atom_self_attention\.atom_attention\.transformer\.blocks\.(\d+)\."
     rules = [
-        (r"\.atom_attention_stack\.pair_norms\.(\d+)\.", block + r".attention_pair_bias.layernorm_z."),
+        (r"\.atom_self_attention\.pair_norms\.(\d+)\.", block + r".attention_pair_bias.layernorm_z."),
         (
-            r"\.atom_attention_stack\.bias_projections\.(\d+)\.",
+            r"\.atom_self_attention\.bias_projections\.(\d+)\.",
             block + r".attention_pair_bias.linear_nobias_z.",
         ),
         (source_block + r"transition\.", block + r".conditioned_transition_block."),
@@ -327,12 +327,12 @@ def _replace_atom_key(key: str) -> str:
             ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
             ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
             ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
-            ".atom_attention_stack.": ".atom_transformer.diffusion_transformer.",
+            ".atom_self_attention.": ".atom_transformer.diffusion_transformer.",
             ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
             ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",
             ".single_norm.": ".layernorm_s.",
             ".single_to_atom_projection.": ".linear_no_bias_s.",
-            ".atom_attention_encoder.norm_pair.": ".atom_attention_encoder.layernorm_z.",
+            ".atom_attention_encoder.pair_norm.": ".atom_attention_encoder.layernorm_z.",
             ".pair_projection.": ".linear_no_bias_z.",
             ".noisy_position_projection.": ".linear_no_bias_r.",
             ".atom_attention_decoder.output_projection.": ".atom_attention_decoder.linear_no_bias_out.",
@@ -349,7 +349,7 @@ def _replace_attention_key(key: str) -> str:
             ".hidden_norm.": ".layernorm_a.",
             ".atom_norm.": ".layernorm_a.",
             ".key_value_norm.": ".layernorm_kv.",
-            ".attention_pair_bias.norm_pair.": ".attention_pair_bias.layernorm_z.",
+            ".attention_pair_bias.pair_norm.": ".attention_pair_bias.layernorm_z.",
             ".attention_pair_bias.bias_projection.": ".attention_pair_bias.linear_nobias_z.",
             ".attention_pair_bias.conditioning_gate_projection.": ".attention_pair_bias.linear_a_last.",
         },
@@ -383,9 +383,8 @@ def _replace_transition_key(key: str) -> str:
     return _replace_many(
         key,
         {
-            ".norm_input.": ".layernorm1.",
+            ".input_norm.": ".layernorm1.",
             ".conditioned_norm.": ".adaln.",
-            ".feed_forward.": ".conditioned_transition_block.",
             ".conditioned_transition_block.gate_projection.": ".conditioned_transition_block.linear_nobias_a1.",
             ".conditioned_transition_block.value_projection.": ".conditioned_transition_block.linear_nobias_a2.",
             ".conditioned_transition_block.output_projection.": ".conditioned_transition_block.linear_nobias_b.",

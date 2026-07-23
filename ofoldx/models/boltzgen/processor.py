@@ -17,7 +17,6 @@ import numpy as np
 import torch
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.components import get_component
 from ...data.conditions import Endpoint
@@ -33,11 +32,10 @@ from ...data.placement import (
     SymbolicResidueSite,
 )
 from ...data.placement import instance_of as _placement_instance_of
-from ...data.placement import (
-    resolve,
-)
+from ...data.placement import resolve
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .model import (
     CANONICAL_TOKENS,
     NUM_CANONICAL_TOKENS,
@@ -45,9 +43,9 @@ from .model import (
     BoltzGenContact,
     BoltzGenCovalentBond,
     BoltzGenDesignMask,
+    BoltzGenInput,
     BoltzGenInverseFoldingInput,
     BoltzGenInverseFoldingLayout,
-    BoltzGenInput,
     BoltzGenLayout,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
@@ -426,7 +424,7 @@ def _generated_reference_coordinates(
     return coordinates
 
 
-class BoltzGenProcessor:
+class BoltzGenProcessor(Processor):
     r"""Lower one BoltzGen structure-design request to ``BoltzGenInput``.
 
     Supports whole-assembly topology (``total_len``) and spatial conditioning
@@ -434,20 +432,14 @@ class BoltzGenProcessor:
     conditioning channels the trunk always consumes (contact conditioning, token
     distance, binding/design/secondary-structure ids) are written for every token so
     the graph receives a complete set of conditioning inputs.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(self, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -466,10 +458,10 @@ class BoltzGenProcessor:
             input: Optional target/context system, structure, or path. ``None`` means a
                 fully-generated whole-assembly determined by the ``BoltzGenPlacements`` topology
                 and the whole-assembly ``total_len`` budget.
+            placement: Optional whole-assembly generation topology.
             total_len: Whole-assembly token budget. When
                 ``input`` is ``None`` it drives per-placement length realization; otherwise it
                 extends the input system by one generated protein chain of length ``total_len``.
-            placement: Optional whole-assembly generation topology.
             conditions: BoltzGen conditioning records.
             msa: Optional MSA evidence for the input polymer chains.
             templates: Optional template evidence (structure-design template channel).
@@ -557,8 +549,8 @@ class BoltzGenProcessor:
         token_count = len(tokens)
         (
             atom_features,
-            ref_pos,
-            ref_space,
+            reference_positions,
+            reference_space_id,
             atom_mask,
             atom_to_token,
             atom_token_index,
@@ -598,7 +590,7 @@ class BoltzGenProcessor:
             [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
         )
 
-        # token_to_bb4_atoms (N, CA, C, O), used by the gated token-distance module.
+        # token_to_bb4_atoms (N, CA, C, O), used by the token-distance embedder.
         token_to_bb4 = torch.stack(
             [
                 torch.tensor(
@@ -631,7 +623,7 @@ class BoltzGenProcessor:
         # atom reference-space ids remain per-residue.
         structure_group = _structure_group_ids(conditions, token_index_by_residue, token_count, design_mask)
         token_distance_mask = _token_distance_mask(structure_group)
-        # ``None`` leaves template fields unset so the trunk skips the template module.
+        # ``None`` leaves template fields unset so the trunk skips the template embedder.
         template_values = _template_channels(templates, tokens, token_count)
 
         tensor_values: dict[str, Tensor] = {
@@ -644,8 +636,8 @@ class BoltzGenProcessor:
             "atom_features": atom_features,
             "atom_to_token": atom_to_token,
             "atom_mask": atom_mask,
-            "reference_positions": ref_pos,
-            "reference_space_id": ref_space,
+            "reference_positions": reference_positions,
+            "reference_space_id": reference_space_id,
             "representative_atom_mask": representative_atom_mask,
             "atom_token_index": atom_token_index,
             "token_to_rep_atom": token_to_rep_atom,
@@ -692,27 +684,21 @@ class BoltzGenProcessor:
         return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
 
 
-class BoltzGenInverseFoldingProcessor:
+class BoltzGenInverseFoldingProcessor(Processor):
     r"""Lower one fixed backbone and its inverse-fold constraints to ``BoltzGenInverseFoldingInput``.
 
     Supported constraints are ``design`` positions (``design_mask``), per-residue
     amino-acid constraints (``aa_constraints`` → ``aa_constraint_mask``), and symmetric
     groups (``symmetry`` → ``symmetric_group``). These lower directly to the BoltzGen
-    inverse-fold input vocabulary; RFdiffusion's ``inpaint_sequence`` is not used.
+    inverse-fold input vocabulary.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(self, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -723,7 +709,18 @@ class BoltzGenInverseFoldingProcessor:
         symmetry: Sequence[Sequence[ComponentReference]] = (),
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
     ) -> BoltzGenInverseFoldingInput:
-        r"""Validate and lower one fixed backbone to inverse-fold input."""
+        r"""Validate and lower one fixed backbone to inverse-fold input.
+
+        Args:
+            input: Canonical fixed-backbone structure or local structure path.
+            design: Residue occurrences whose identities may change.
+            aa_constraints: Per-residue amino-acid constraints.
+            symmetry: Residue groups sharing one sequence identity.
+            msa: Optional MSA value, collection, or alignment path.
+
+        Returns:
+            A ``BoltzGenInverseFoldingInput`` with aligned backbone, design, and constraint axes.
+        """
 
         if isinstance(input, str | PathLike):
             input = read_structure(Path(input).expanduser())
@@ -760,8 +757,8 @@ class BoltzGenInverseFoldingProcessor:
         token_count = len(tokens)
         (
             atom_features,
-            ref_pos,
-            ref_space,
+            reference_positions,
+            reference_space_id,
             atom_mask,
             atom_to_token,
             atom_token_index,
@@ -815,8 +812,8 @@ class BoltzGenInverseFoldingProcessor:
             "atom_features": atom_features,
             "atom_to_token": atom_to_token,
             "atom_mask": atom_mask,
-            "reference_positions": ref_pos,
-            "reference_space_id": ref_space,
+            "reference_positions": reference_positions,
+            "reference_space_id": reference_space_id,
             "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
             "msa_profile": msa_values["msa_profile"],
             "deletion_mean": msa_values["deletion_mean"],
@@ -848,7 +845,9 @@ class BoltzGenInverseFoldingProcessor:
             output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
         )
-        return BoltzGenInverseFoldingInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
+        return BoltzGenInverseFoldingInput(
+            **{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout
+        )
 
 
 # Shared BoltzGen featurization helpers.
@@ -982,8 +981,8 @@ def _build_atom_features(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict[AtomSite, int]]:
     r"""Build the 388-wide BoltzGen/Boltz-2 atom reference feature vector and index maps.
 
-    The 388-wide layout is ``[ref_pos(3), charge(1), element(128), atom_name_chars(4x64)]``
-    with no atom-pad-mask channel, unlike Boltz-1's 389-wide layout.
+    The 388-wide layout contains positions (3), charge (1), element (128), and
+    atom-name characters (4x64), with no atom-mask channel.
 
     ``generated_residues`` selects protein placeholders whose backbone atoms use
     GLY-template coordinates. An empty set uses component reference coordinates.
@@ -1035,20 +1034,20 @@ def _build_atom_features(
     )
     center_coords = raw_coords[center_atom_indices]
 
-    ref_pos = torch.zeros(padded_atom_count, 3)
-    ref_pos[:atom_count] = torch.tensor(reference_coordinates)
-    ref_space = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_space[:atom_count] = torch.tensor(reference_space_ids)
+    reference_positions = torch.zeros(padded_atom_count, 3)
+    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
     _augment_reference_positions(
-        ref_pos[:atom_count],
-        ref_space[:atom_count],
+        reference_positions[:atom_count],
+        reference_space_id[:atom_count],
         resolved_atoms,
         generator=generator,
     )
 
     atomic_number = torch.zeros(padded_atom_count, dtype=torch.long)
-    charge = torch.zeros(padded_atom_count)
-    atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count)
+    atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
@@ -1057,8 +1056,8 @@ def _build_atom_features(
     for atom_index, (site, atom_name) in enumerate(zip(atom_sites, atom_names)):
         atom = system.atom(site)
         atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
-        charge[atom_index] = atom.formal_charge
-        atom_name_chars[atom_index] = torch.tensor(
+        reference_charges[atom_index] = atom.formal_charge
+        atom_name_characters[atom_index] = torch.tensor(
             [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
         )
         atom_mask[atom_index] = True
@@ -1068,17 +1067,17 @@ def _build_atom_features(
 
     atom_features = torch.cat(
         (
-            ref_pos,
-            charge.unsqueeze(-1),
+            reference_positions,
+            reference_charges.unsqueeze(-1),
             torch.nn.functional.one_hot(atomic_number, 128).float(),
-            torch.nn.functional.one_hot(atom_name_chars, 64).reshape(padded_atom_count, 256).float(),
+            torch.nn.functional.one_hot(atom_name_characters, 64).reshape(padded_atom_count, 256).float(),
         ),
         dim=-1,
     )
     return (
         atom_features,
-        ref_pos,
-        ref_space,
+        reference_positions,
+        reference_space_id,
         atom_mask,
         atom_to_token,
         atom_token_index,
@@ -1420,11 +1419,12 @@ def _template_channels(
 ) -> dict[str, Tensor] | None:
     r"""Lower aligned :class:`~ofoldx.data.evidence.Template` evidence into the BoltzGen template tensors.
 
-    Returns ``None`` when no templates are supplied, so the model skips the template module.
-    Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by ``BoltzGenTemplateModule``:
+    Returns ``None`` when no templates are supplied, so the model skips the template embedder.
+    Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by
+    ``BoltzGenTemplateEmbedder``:
     residue-type one-hot
     (``num_tokens == 33``), ``compute_frame`` backbone frame (protein, all of N/CA/C resolved),
-    CB (``disto``) coords + mask, CA (``center``) coords, ``template_mask`` / ``visibility_ids`` set
+    beta-carbon positions and mask, alpha-carbon positions, template mask, and visibility groups
     where the template covers a token, zeros everywhere else.
     """
 
@@ -1442,15 +1442,15 @@ def _template_channels(
         entity_residue.setdefault((cast(str, token["entity_id"]), monomer_index), []).append(token_index)
 
     tdim = len(templates)
-    restype_ids = torch.zeros(tdim, token_count, dtype=torch.long)
-    frame_rot = torch.zeros(tdim, token_count, 3, 3)
-    frame_t = torch.zeros(tdim, token_count, 3)
-    cb_coords = torch.zeros(tdim, token_count, 3)
-    ca_coords = torch.zeros(tdim, token_count, 3)
-    cb_mask = torch.zeros(tdim, token_count)
+    residue_type_ids = torch.zeros(tdim, token_count, dtype=torch.long)
+    frame_rotations = torch.zeros(tdim, token_count, 3, 3)
+    frame_translations = torch.zeros(tdim, token_count, 3)
+    beta_carbon_positions = torch.zeros(tdim, token_count, 3)
+    alpha_carbon_positions = torch.zeros(tdim, token_count, 3)
+    beta_carbon_mask = torch.zeros(tdim, token_count)
     frame_mask = torch.zeros(tdim, token_count)
     template_mask = torch.zeros(tdim, token_count)
-    visibility_ids = torch.zeros(tdim, token_count)
+    visibility_index = torch.zeros(tdim, token_count)
 
     for template_index, template in enumerate(templates):
         coordinates = {
@@ -1498,42 +1498,42 @@ def _template_channels(
                         np.asarray(carbon, dtype=np.float32),
                     )
 
-                restype = _residue_type(component_id, polymer_type)
+                residue_type = _residue_type(component_id, polymer_type)
                 for target_token in targets:
-                    restype_ids[template_index, target_token] = restype
+                    residue_type_ids[template_index, target_token] = residue_type
                     if center_coord is not None:
-                        ca_coords[template_index, target_token] = torch.from_numpy(
+                        alpha_carbon_positions[template_index, target_token] = torch.from_numpy(
                             np.asarray(center_coord, dtype=np.float32)
                         )
                     if disto_coord is not None:
-                        cb_coords[template_index, target_token] = torch.from_numpy(
+                        beta_carbon_positions[template_index, target_token] = torch.from_numpy(
                             np.asarray(disto_coord, dtype=np.float32)
                         )
-                    cb_mask[template_index, target_token] = 1.0 if disto_present else 0.0
+                    beta_carbon_mask[template_index, target_token] = 1.0 if disto_present else 0.0
                     if has_frame:
-                        frame_rot[template_index, target_token] = torch.from_numpy(
+                        frame_rotations[template_index, target_token] = torch.from_numpy(
                             np.asarray(rotation, dtype=np.float32)
                         )
-                        frame_t[template_index, target_token] = torch.from_numpy(
+                        frame_translations[template_index, target_token] = torch.from_numpy(
                             np.asarray(translation, dtype=np.float32)
                         )
                         frame_mask[template_index, target_token] = 1.0
                     template_mask[template_index, target_token] = 1.0
-                    visibility_ids[template_index, target_token] = 1.0
+                    visibility_index[template_index, target_token] = 1.0
 
         if not bool(template_mask[template_index].any()):
             raise ValueError(f"BoltzGen template {template_index} does not cover any lowered target token")
 
     return {
-        "template_restype": torch.nn.functional.one_hot(restype_ids, 33),
-        "template_frame_rot": frame_rot,
-        "template_frame_t": frame_t,
-        "template_cb": cb_coords,
-        "template_ca": ca_coords,
-        "template_mask_cb": cb_mask,
-        "template_mask_frame": frame_mask,
+        "template_residue_type": torch.nn.functional.one_hot(residue_type_ids, 33),
+        "template_frame_rotations": frame_rotations,
+        "template_frame_translations": frame_translations,
+        "template_beta_carbon_positions": beta_carbon_positions,
+        "template_alpha_carbon_positions": alpha_carbon_positions,
+        "template_beta_carbon_mask": beta_carbon_mask,
+        "template_frame_mask": frame_mask,
         "template_mask": template_mask,
-        "visibility_ids": visibility_ids,
+        "template_visibility_index": visibility_index,
     }
 
 

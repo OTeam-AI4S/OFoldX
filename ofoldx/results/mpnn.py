@@ -12,7 +12,18 @@ from ..data.structure import Structure
 
 @dataclass(eq=False)
 class MpnnProbabilityResult:
-    r"""Repeated aligned probability output for one structure-conditioned MPNN call."""
+    r"""Repeated aligned probability output for one structure-conditioned MPNN call.
+
+    Args:
+        target: Canonical structure used for conditioning.
+        component_references: Residue references aligned to the sequence axis. ``None`` marks a
+            padded or unresolved row.
+        sequence_tokens: Input token ids with shape ``[residues]``.
+        residue_mask: Valid-residue mask with shape ``[residues]``.
+        design_positions: Designed-position mask with shape ``[residues]``.
+        logits: Vocabulary logits with shape ``[evaluations, residues, vocabulary]``.
+        decoding_ranks: Autoregressive ranks with shape ``[evaluations, residues]``.
+    """
 
     target: Structure
     component_references: tuple[ComponentReference | None, ...]

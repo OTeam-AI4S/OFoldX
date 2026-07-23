@@ -1,4 +1,4 @@
-r"""Native implementation of the released PxDesign v0.1 model graph."""
+r"""PxDesign coordinate-design model graph."""
 
 from __future__ import annotations
 
@@ -27,12 +27,12 @@ from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.geometry import uniform_random_rotation
 from ...modules.transition import Transition
-from ...results import Metric, Score
+from ...results import Metric, Score, best
 from .config import PxDesignConfig
 
 
 class PxDesignModel(Model):
-    r"""PxDesign's released condition embedder and coordinate-diffusion model."""
+    r"""PxDesign's condition embedder and coordinate-diffusion model."""
 
     config_class = PxDesignConfig
     config: PxDesignConfig
@@ -63,7 +63,7 @@ class PxDesignModel(Model):
             cross_attention_key_source="normalized",
         )
         self.coordinate_sampler = PxDesignSampler(config)
-        self.set_backend("auto")
+        self.post_init()
 
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the public PyTorch or OOps operator path."""
@@ -112,7 +112,7 @@ class PxDesignModel(Model):
         sample_chunk_size: int | None = 10,
         generator: torch.Generator | None = None,
     ) -> PxDesignOutput:
-        r"""Run the released PxDesign EDM sampler and return raw model coordinates."""
+        r"""Run the PxDesign EDM sampler and return raw model coordinates."""
 
         input = _augment_reference_conformers(input, generator)
         token_embedding, single, pair, relative_features = self.encode_condition(input)
@@ -166,7 +166,7 @@ class PxDesignModel(Model):
         # PxDesign is coordinate-producing, so each backbone sample is carried by a
         # PxDesignDesignCandidate containing the decoded Structure and collected in a
         # PxDesignDesignResult. The coordinate-free shared DesignResult cannot represent this output.
-        # The released sampler decodes no per-sample score or metric (its plddt input is
+        # The sampler decodes no per-sample score or metric (its plddt input is
         # zeros and it has no confidence head), so scores/metrics stay empty.
         return PxDesignDesignResult(candidates=candidates)
 
@@ -174,7 +174,7 @@ class PxDesignModel(Model):
         self,
         input: PxDesignInput,
     ) -> tuple[Tensor, Tensor, Tensor, RelativePositionBuckets]:
-        r"""Compute the released token, zero-single, pair, and relative conditioning."""
+        r"""Compute the token, zero-single, pair, and relative conditioning."""
 
         token_embedding, pair = self.condition_embeddings(input)
         single = token_embedding.new_zeros(*token_embedding.shape[:-1], self.config.single_size)
@@ -218,7 +218,7 @@ class PxDesignModel(Model):
 
 
 class PxDesignConditionEmbeddings(nn.Module):
-    r"""Released PxDesign atom, token, and conditional-template embedder."""
+    r"""Embed PxDesign atom, token, and conditional-template features."""
 
     def __init__(self, config: PxDesignConfig) -> None:
         super().__init__()
@@ -241,15 +241,15 @@ class PxDesignConditionEmbeddings(nn.Module):
             + embedder.hotspot_size
             + 2 * embedder.add_feature_size
         )
-        self.input_map = nn.Linear(input_size, config.token_feature_size)
-        self.template_embeddings = PxDesignConditionalTemplateEmbeddings(
+        self.input_projection = nn.Linear(input_size, config.token_feature_size)
+        self.template_embedder = PxDesignConditionalTemplateEmbedder(
             num_template_bins=config.num_template_bins,
             pair_size=config.pair_size,
         )
         self.add_feature_size = embedder.add_feature_size
 
     def forward(self, input: PxDesignInput) -> tuple[Tensor, Tensor]:
-        r"""Return the released token and conditional-template pair embeddings."""
+        r"""Return the token and conditional-template pair embeddings."""
 
         local_geometry = self.atom_encoder.build_local_geometry(
             input.reference_positions,
@@ -262,18 +262,22 @@ class PxDesignConditionEmbeddings(nn.Module):
             reference_mask=input.reference_mask,
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
-            num_tokens=input.restype.shape[-2],
+            num_tokens=input.residue_type.shape[-2],
             local_geometry=local_geometry,
         )
         add_feature = F.one_hot(
-            torch.zeros(input.restype.shape[:-1], device=input.restype.device, dtype=torch.long),
+            torch.zeros(
+                input.residue_type.shape[:-1],
+                device=input.residue_type.device,
+                dtype=torch.long,
+            ),
             num_classes=self.add_feature_size,
         ).to(dtype=atom_output.token_hidden.dtype)
-        token_embedding = self.input_map(
+        token_embedding = self.input_projection(
             torch.cat(
                 (
                     atom_output.token_hidden,
-                    input.restype.to(atom_output.token_hidden),
+                    input.residue_type.to(atom_output.token_hidden),
                     input.plddt.to(atom_output.token_hidden),
                     input.hotspot.to(atom_output.token_hidden),
                     add_feature,
@@ -282,26 +286,29 @@ class PxDesignConditionEmbeddings(nn.Module):
                 dim=-1,
             )
         )
-        pair = self.template_embeddings(input.conditional_templ, input.conditional_templ_mask)
+        pair = self.template_embedder(
+            input.template_distance_bins,
+            input.template_pair_mask,
+        )
         return token_embedding, pair.to(token_embedding)
 
 
-class PxDesignConditionalTemplateEmbeddings(nn.Module):
-    r"""Embed released conditional-template distance-bin IDs."""
+class PxDesignConditionalTemplateEmbedder(nn.Module):
+    r"""Embed conditional-template distance-bin IDs."""
 
     def __init__(self, *, num_template_bins: int = 64, pair_size: int = 128) -> None:
         super().__init__()
         self.embedding = nn.Embedding(num_template_bins + 1, pair_size)
 
-    def forward(self, conditional_templ: Tensor, conditional_templ_mask: Tensor) -> Tensor:
-        r"""Use ID zero for unconditioned pairs and IDs 1--64 for released bins."""
+    def forward(self, template_distance_bins: Tensor, template_pair_mask: Tensor) -> Tensor:
+        r"""Use ID zero for unconditioned pairs and IDs 1--64 for bins."""
 
-        embedding_ids = conditional_templ_mask.to(dtype=torch.long) * (conditional_templ.to(dtype=torch.long) + 1)
+        embedding_ids = template_pair_mask.to(dtype=torch.long) * (template_distance_bins.to(dtype=torch.long) + 1)
         return self.embedding(embedding_ids)
 
 
 class PxDesignSampler(nn.Module):
-    r"""The released PxDesign EDM predictor-corrector sampling loop."""
+    r"""The PxDesign EDM predictor-corrector sampling loop."""
 
     def __init__(self, config: PxDesignConfig) -> None:
         super().__init__()
@@ -433,7 +440,7 @@ def _augment_reference_conformers(
     input: PxDesignInput,
     generator: torch.Generator | None,
 ) -> PxDesignInput:
-    r"""Apply the released independent per-residue reference augmentation."""
+    r"""Apply the independent per-residue reference augmentation."""
 
     positions = input.reference_positions.clone()
     flat_positions = positions.reshape(-1, positions.shape[-2], 3)
@@ -479,7 +486,7 @@ def _augment_reference_conformers(
 
 @dataclass(frozen=True)
 class PxDesignLayout:
-    r"""Canonical identities needed to decode the released coordinate samples."""
+    r"""Canonical identities needed to decode the coordinate samples."""
 
     system: MolecularSystem
     sites: tuple[AtomSite, ...]
@@ -490,9 +497,9 @@ class PxDesignLayout:
 
 @dataclass(kw_only=True)
 class PxDesignInput:
-    r"""Tensors consumed by the released PxDesign condition and diffusion graph.
+    r"""Tensors consumed by the PxDesign condition and diffusion graph.
 
-    ``restype`` is the released 36-channel one-hot representation. ``plddt`` and
+    ``residue_type`` is the 36-channel one-hot representation. ``plddt`` and
     ``hotspot`` are explicit ``[..., N_token, 1]`` tensors; callers represent an
     absent condition with zeros rather than changing the input schema.
     """
@@ -509,11 +516,11 @@ class PxDesignInput:
     reference_space_id: Tensor
     reference_mask: Tensor
     reference_charges: Tensor
-    restype: Tensor
+    residue_type: Tensor
     plddt: Tensor
     hotspot: Tensor
-    conditional_templ: Tensor
-    conditional_templ_mask: Tensor
+    template_distance_bins: Tensor
+    template_pair_mask: Tensor
     layout: PxDesignLayout
 
 
@@ -526,34 +533,15 @@ class PxDesignOutput:
 
 @dataclass(eq=False)
 class PxDesignDesignCandidate:
-    r"""One ranked, evaluated PXDesign target--binder backbone design sample.
+    r"""One coordinate-bearing target-binder backbone candidate.
 
-    PXDesign is coordinate-producing, so this candidate is a standalone record,
-    not a subclass of the coordinate-free :class:`~ofoldx.results.DesignCandidate`. It mirrors the
-    sibling coordinate-producing
-    :class:`~ofoldx.models.rfdiffusion.model.RFdiffusionDesignCandidate`: each candidate owns
-    the decoded backbone :class:`~ofoldx.data.structure.Structure` (which owns its
-    ``MolecularSystem`` via ``Structure.system``), so no separate ``system`` field is carried.
-    These coordinate-bearing candidates are collected by :class:`PxDesignDesignResult`, not
-    the shared coordinate-free ``DesignResult``.
-
-    Fields:
-
-    - ``structure`` — the decoded backbone Structure (truthful ``UNK`` binder identity,
-      GLY/xpb backbone atom contract). Present for every generator sample.
-    - ``scores`` — evaluation Scores: AF2-IG / Protenix confidence, RMSD, geometry,
-      success flags, and the ranking ``rank`` / ``bucket`` / ``pass_*`` Scores stamped by the
-      suite. Empty for raw generator output.
-    - ``metrics`` — per-residue evaluation metrics (e.g. AF2 pLDDT). Currently empty for raw
-      generator output: the released sampler emits only coordinates (its ``plddt``
-      conditioning input is zeros and there is no confidence head), so no per-sample
-      scientific metric is decoded from the generator itself.
-    - ``sequence`` — the ProteinMPNN-assigned binder sequence per instance once the suite
-      sequencing stage has run; ``None`` for a raw generator backbone whose binder is a
-      truthful ``UNK`` placeholder with no assigned sequence.
-
-    ``chosen_struct_type`` / ``chosen_struct_path`` provenance from the suite selection are
-    carried as plain attributes when the suite sets them, not as Scores.
+    Args:
+        structure: Decoded backbone structure. Unassigned binder residues retain their unknown
+            component identity.
+        scores: Candidate-level scalar scores, empty before evaluation.
+        metrics: Site- or pair-level metrics, empty before evaluation.
+        sequence: ProteinMPNN-assigned sequences keyed by instance, or ``None`` before sequence
+            design.
     """
 
     structure: Structure
@@ -569,12 +557,8 @@ class PxDesignDesignResult:
     This result carries coordinate-bearing PXDesign candidates and therefore
     does not reuse the coordinate-free shared :class:`~ofoldx.results.DesignResult`.
 
-    ``.best`` and ``.ranked`` apply the single-Score validation from
-    results/values.py:95-110 (single unit, single scope, consistent ``preferred``,
-    NaN-reject). ``ranked("af2_ipae")`` (preview) / ``ranked("ptx_iptm")`` (extended)
-    reproduce the released within-bucket tie ordering; the full released two-tier
-    bucket+fusion selection is performed by the suite Pipeline, which stamps
-    ``bucket`` / ``rank`` / ``pass_*`` Scores that this carrier only needs to order over.
+    Args:
+        candidates: Candidates in generation order. Ranking methods retain this order for ties.
     """
 
     candidates: tuple[PxDesignDesignCandidate, ...]
@@ -597,16 +581,13 @@ class PxDesignDesignResult:
     def best(self, score: str) -> PxDesignDesignCandidate:
         r"""Return the earliest best candidate under one explicit score."""
 
-        scores = self._validated_scores(score)
-        if {value.preferred for value in scores} == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return best(self.candidates, score)
 
     def ranked(self, score: str) -> tuple[PxDesignDesignCandidate, ...]:
         r"""Return the candidates ordered best-first under one explicit score.
 
         The ordering is stable, so candidates that tie on ``score`` keep their generation
-        order — reproducing the released within-bucket tie ordering.
+        order — reproducing the within-bucket tie ordering.
         """
 
         scores = self._validated_scores(score)

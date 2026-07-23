@@ -3,8 +3,9 @@ r"""Canonical scientific results returned by OFoldX tasks."""
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, TypeAlias
+from typing import Literal, Protocol, TypeAlias, TypeVar
 
 import numpy as np
 
@@ -16,7 +17,18 @@ MetricReference: TypeAlias = str | ComponentReference | AtomSite
 
 @dataclass(eq=False)
 class Score:
-    r"""One named scalar value and the canonical subtarget it describes."""
+    r"""One named scalar value and the canonical subtarget it describes.
+
+    Args:
+        value: Scalar score value.
+        unit: Physical or statistical unit, or ``None`` for a dimensionless score.
+        preferred: Direction used to rank comparable results, or ``None`` when the score is not
+            rankable.
+        scope: Canonical components or atoms summarized by the score. ``None`` denotes the whole
+            result.
+        evaluations: Optional raw values whose aggregate is reported by ``value``. Their leading
+            axis preserves evaluation order.
+    """
 
     value: float
     unit: str | None = None
@@ -25,9 +37,60 @@ class Score:
     evaluations: np.ndarray | None = None
 
 
+class Scored(Protocol):
+    r"""Public structural contract for a result item carrying named scores."""
+
+    @property
+    def scores(self) -> Mapping[str, Score]:
+        r"""Return scores keyed by their stable scientific names."""
+
+        ...
+
+
+_ScoredT = TypeVar("_ScoredT", bound=Scored)
+
+
+def best(values: Sequence[_ScoredT], score: str) -> _ScoredT:
+    r"""Return the earliest best item under one explicit, comparable score.
+
+    Args:
+        values: Candidate values in tie-breaking order.
+        score: Score name present on every candidate.
+
+    Returns:
+        The highest- or lowest-valued candidate according to ``Score.preferred``. Ties preserve
+        the order in ``values``.
+
+    Raises:
+        ValueError: If direction, unit, or scope differs between candidates, or a value is NaN.
+    """
+
+    scores = tuple(value.scores[score] for value in values)
+    directions = {value.preferred for value in scores}
+    if directions not in ({"higher"}, {"lower"}):
+        raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
+    if len({value.unit for value in scores}) != 1:
+        raise ValueError(f"score {score!r} must use one identical unit")
+    if len({value.scope for value in scores}) != 1:
+        raise ValueError(f"score {score!r} must use one identical scope")
+    if any(math.isnan(value.value) for value in scores):
+        raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
+
+    def score_value(value: _ScoredT) -> float:
+        return value.scores[score].value
+
+    return max(values, key=score_value) if directions == {"higher"} else min(values, key=score_value)
+
+
 @dataclass(eq=False)
 class Metric:
-    r"""One numerical value aligned to one canonical axis."""
+    r"""One numerical value aligned to one canonical axis.
+
+    Args:
+        values: Numerical values whose leading axis corresponds to ``axis``.
+        axis: Canonical component or atom reference for each leading-axis value.
+        unit: Physical or statistical unit, or ``None`` for dimensionless values.
+    """
 
     values: np.ndarray
     axis: tuple[MetricReference, ...]
@@ -36,7 +99,15 @@ class Metric:
 
 @dataclass(eq=False)
 class PairMetric:
-    r"""One numerical value aligned to two canonical axes."""
+    r"""One numerical value aligned to two canonical axes.
+
+    Args:
+        values: Numerical matrix whose first two axes correspond to ``row_axis`` and
+            ``column_axis``.
+        row_axis: Canonical component or atom references for matrix rows.
+        column_axis: Canonical component or atom references for matrix columns.
+        unit: Physical or statistical unit, or ``None`` for dimensionless values.
+    """
 
     values: np.ndarray
     row_axis: tuple[MetricReference, ...]
@@ -46,7 +117,14 @@ class PairMetric:
 
 @dataclass(eq=False)
 class FoldPrediction:
-    r"""One folding prediction and its aligned scientific values."""
+    r"""One folding prediction and its aligned scientific values.
+
+    Args:
+        structure: Predicted canonical structure.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+        pair_metrics: Two-axis metrics keyed by stable scientific names.
+    """
 
     structure: Structure
     scores: dict[str, Score] = field(default_factory=dict)
@@ -56,31 +134,35 @@ class FoldPrediction:
 
 @dataclass(eq=False)
 class FoldResult:
-    r"""One generation-ordered collection of folding predictions."""
+    r"""One generation-ordered collection of folding predictions.
+
+    Args:
+        predictions: Predictions in generation order.
+    """
 
     predictions: tuple[FoldPrediction, ...]
 
     def best(self, score: str) -> FoldPrediction:
-        r"""Return the earliest best prediction under one explicit score."""
+        r"""Return the earliest best prediction under one explicit score.
 
-        values = tuple(prediction.scores[score] for prediction in self.predictions)
-        directions = {value.preferred for value in values}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in values}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in values}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in values):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.predictions, key=lambda prediction: prediction.scores[score].value)
-        return min(self.predictions, key=lambda prediction: prediction.scores[score].value)
+        Args:
+            score: Comparable score name present on every prediction.
+
+        Returns:
+            The best prediction, with generation order breaking ties.
+        """
+
+        return best(self.predictions, score)
 
 
 @dataclass(eq=False)
 class DesignCandidate:
-    r"""One coordinate-free fixed-length design and its scientific values."""
+    r"""One coordinate-free fixed-length design and its scientific values.
+
+    Args:
+        system: Designed canonical molecular system.
+        scores: Scalar scores keyed by stable scientific names.
+    """
 
     system: MolecularSystem
     scores: dict[str, Score] = field(default_factory=dict)
@@ -88,31 +170,36 @@ class DesignCandidate:
 
 @dataclass(eq=False)
 class DesignResult:
-    r"""One generation-ordered collection of fixed-length designs."""
+    r"""One generation-ordered collection of fixed-length designs.
+
+    Args:
+        candidates: Designed systems in generation order.
+    """
 
     candidates: tuple[DesignCandidate, ...]
 
     def best(self, score: str) -> DesignCandidate:
-        r"""Return the earliest best candidate under one explicit score."""
+        r"""Return the earliest best candidate under one explicit score.
 
-        values = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in values}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in values}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in values}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in values):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
+        """
+
+        return best(self.candidates, score)
 
 
 @dataclass(eq=False)
 class ScoreResult:
-    r"""One coordinate-conditioned target and its scientific values."""
+    r"""One coordinate-conditioned target and its scientific values.
+
+    Args:
+        target: Canonical structure that was scored.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+    """
 
     target: Structure
     scores: dict[str, Score] = field(default_factory=dict)
@@ -121,7 +208,12 @@ class ScoreResult:
 
 @dataclass(eq=False)
 class PackPrediction:
-    r"""One packed structure and the metrics produced for that sample."""
+    r"""One packed structure and the metrics produced for that sample.
+
+    Args:
+        structure: Canonical structure with packed side-chain coordinates.
+        metrics: One-axis metrics keyed by stable scientific names.
+    """
 
     structure: Structure
     metrics: dict[str, Metric] = field(default_factory=dict)
@@ -129,6 +221,10 @@ class PackPrediction:
 
 @dataclass(eq=False)
 class PackResult:
-    r"""One generation-ordered collection of side-chain packing predictions."""
+    r"""One generation-ordered collection of side-chain packing predictions.
+
+    Args:
+        predictions: Packed structures in sampling order.
+    """
 
     predictions: tuple[PackPrediction, ...]

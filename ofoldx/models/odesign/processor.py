@@ -13,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
@@ -49,6 +48,7 @@ from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .config import ODesignProcessorConfig
 from .model import (
     ODesignDesignedResidue,
@@ -63,7 +63,7 @@ from .model import (
 _CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
 
 
-_RESTYPE_INDEX: dict[str, int] = {
+_RESIDUE_TYPE_INDEX: dict[str, int] = {
     "ALA": 0,
     "ARG": 1,
     "ASN": 2,
@@ -101,7 +101,7 @@ _RESTYPE_INDEX: dict[str, int] = {
     "-L": 34,
 }
 
-_STANDARD_POLYMER_COMPONENTS: frozenset[str] = frozenset(_RESTYPE_INDEX) - {
+_STANDARD_POLYMER_COMPONENTS: frozenset[str] = frozenset(_RESIDUE_TYPE_INDEX) - {
     "-",
     "-P",
     "-N",
@@ -109,21 +109,20 @@ _STANDARD_POLYMER_COMPONENTS: frozenset[str] = frozenset(_RESTYPE_INDEX) - {
 }
 
 
-# The released ODesign generation surface realizes a de-novo polymer GeneratedSegment as a run
+# ODesign realizes a de-novo polymer GeneratedSegment as a run
 # of placeholder components of the segment's polymer type (protein -> UNK, rna -> N, dna -> DN).
-# There is NO honest de-novo *ligand* realization: the released path emits placeholder ``-L`` atom
-# rows with fake bonds and binary NONE/ANY bond-type logits, not a real chemical graph. A generated
+# De-novo ligand placeholders do not define a real chemical graph. A generated
 # ligand segment therefore has no entry here and is rejected at the realization boundary below:
 # a de-novo molecule has no PlacementValue. Existing or fixed ligand context is unaffected.
 _GENERATED_COMPONENT_ID = {"protein": "UNK", "rna": "N", "dna": "DN"}
 
 # MSA cells are uppercase one-letter symbols or the ``-`` gap, not ChemicalComponent IDs.
 # Standard symbols resolve to residue tokens, gaps to the gap token, and ambiguity symbols to ``UNK``.
-_MSA_UNKNOWN = _RESTYPE_INDEX["UNK"]
-_MSA_GAP = _RESTYPE_INDEX["-"]
+_MSA_UNKNOWN = _RESIDUE_TYPE_INDEX["UNK"]
+_MSA_GAP = _RESIDUE_TYPE_INDEX["-"]
 _MSA_SYMBOL_TOKENS = {
     "protein": {
-        symbol: _RESTYPE_INDEX[component_id]
+        symbol: _RESIDUE_TYPE_INDEX[component_id]
         for symbol, component_id in {
             "A": "ALA",
             "R": "ARG",
@@ -147,13 +146,19 @@ _MSA_SYMBOL_TOKENS = {
             "V": "VAL",
         }.items()
     },
-    "rna": {symbol: _RESTYPE_INDEX[symbol] for symbol in ("A", "G", "C", "U", "N")},
-    "dna": {symbol: _RESTYPE_INDEX["D" + symbol] for symbol in ("A", "G", "C", "T", "N")},
+    "rna": {symbol: _RESIDUE_TYPE_INDEX[symbol] for symbol in ("A", "G", "C", "U", "N")},
+    "dna": {symbol: _RESIDUE_TYPE_INDEX["D" + symbol] for symbol in ("A", "G", "C", "T", "N")},
 }
 
 
-class ODesignProcessor:
-    r"""Lower canonical systems, evidence, and supported Conditions to ODesignInput."""
+class ODesignProcessor(Processor):
+    r"""Lower canonical systems, evidence, and supported conditions to ``ODesignInput``.
+
+    Args:
+        config: ODesign preprocessing options. Defaults to ``ODesignProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -164,21 +169,7 @@ class ODesignProcessor:
     ) -> None:
         config = ODesignProcessorConfig() if config is None else config
         self.config = config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime tensor placement and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def realize_ranges(
         self,
@@ -186,7 +177,15 @@ class ODesignProcessor:
         *,
         generator: torch.Generator | None = None,
     ) -> ODesignInput:
-        r"""Resolve variable placement lengths into one fixed tensor layout."""
+        r"""Resolve variable placement lengths into one fixed tensor layout.
+
+        Args:
+            input: Lowered design input with unresolved placement ranges.
+            generator: Optional RNG used to sample variable lengths.
+
+        Returns:
+            An ``ODesignInput`` with one realized fixed-length layout.
+        """
 
         return _realize_ranges(input, generator)
 
@@ -199,7 +198,18 @@ class ODesignProcessor:
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
         receptor_mode: str | None = None,
     ) -> ODesignInput:
-        r"""Validate and lower one unbatched canonical ODesign example."""
+        r"""Validate and lower one unbatched canonical ODesign example.
+
+        Args:
+            input: Optional context system, structure, or local structure path.
+            placement: Optional output topology containing existing spans and generated segments.
+            msa: Optional MSA value, collection, or alignment path.
+            conditions: Hotspot, symbolic-bond, and reference-coordinate conditions.
+            receptor_mode: Optional receptor annotation carried by the model layout.
+
+        Returns:
+            An ``ODesignInput`` with aligned token, atom, condition, and placement values.
+        """
 
         condition_values = tuple(conditions)
         for condition in condition_values:
@@ -279,9 +289,7 @@ class ODesignProcessor:
             if component.component_id not in _STANDARD_POLYMER_COMPONENTS
         }
         if unsupported_components:
-            raise ValueError(
-                "released ODesign has no residue token for components " f"{sorted(unsupported_components)!r}"
-            )
+            raise ValueError("ODesign has no residue token for components " f"{sorted(unsupported_components)!r}")
         msa_value = _normalize_msa(msa, system)
 
         if not sites:
@@ -402,14 +410,14 @@ class ODesignProcessor:
         token_features = torch.zeros(len(token_sites), 453, dtype=torch.float32)
         for token_index, (residue, entity) in enumerate(zip(token_residues, token_entities)):
             if residue is None:
-                restype = "-L"
+                residue_type = "-L"
             elif residue in generated_residues:
-                restype = "-P" if cast(PolymerSequence, entity).polymer_type == "protein" else "-N"
+                residue_type = "-P" if cast(PolymerSequence, entity).polymer_type == "protein" else "-N"
             else:
                 sequence = cast(PolymerSequence, system.entities[system.instances[residue[0]]])
-                restype = sequence.components[residue[1]].component_id
-            restype_index = _RESTYPE_INDEX.get(restype, 20)
-            token_features[token_index, 384 + restype_index] = 1.0
+                residue_type = sequence.components[residue[1]].component_id
+            residue_type_index = _RESIDUE_TYPE_INDEX.get(residue_type, 20)
+            token_features[token_index, 384 + residue_type_index] = 1.0
             token_features[token_index, 419 : 419 + 32] = profile[token_index]
             token_features[token_index, 451] = deletion_mean[token_index]
             token_features[token_index, 452] = float(hotspot[token_index])
@@ -639,7 +647,7 @@ def _normalize_input(input):
 
 
 def _sites_with_reference_coordinates(system: MolecularSystem) -> tuple[AtomSite, ...]:
-    r"""Select released model atoms; canonical-only terminal atoms stay unresolved in Results."""
+    r"""Select model atoms while leaving canonical-only terminal atoms unresolved."""
 
     sites = []
     for site, atom in system.iter_atoms():
@@ -933,11 +941,11 @@ def _materialize_cyclic_links(
 
         site_a, site_b = endpoints
         if site_a.instance_id != site_b.instance_id:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
+            raise ValueError("ODesign supports only head-to-tail cyclic polymer links")
         instance_id = site_a.instance_id
         entity = system.entities[system.instances[instance_id]]
         if not isinstance(entity, PolymerSequence):
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
+            raise ValueError("ODesign supports only head-to-tail cyclic polymer links")
         previous = entity.components[0].previous_attachment
         following = entity.components[-1].next_attachment
         if previous is None or following is None:
@@ -950,7 +958,7 @@ def _materialize_cyclic_links(
         )
         endpoint_set = frozenset((site_a, site_b))
         if endpoint_set != expected:
-            raise ValueError("released ODesign supports only head-to-tail cyclic polymer links")
+            raise ValueError("ODesign supports only head-to-tail cyclic polymer links")
 
         existing_bonds = tuple(
             candidate for candidate in bonds if frozenset((candidate.site_a, candidate.site_b)) == endpoint_set
@@ -1401,7 +1409,7 @@ def _normalize_msa(
     from multimolecule.io import read_fasta_records
 
     entity_id, entity = polymers[0]
-    # The released path reads a plain aligned FASTA (row 0 is the ungapped query) and carries no
+    # A plain aligned FASTA uses row 0 as the ungapped query and carries no
     # insertion state, so every row becomes a query-width one-letter symbol string and both pools'
     # deletion counts stay zero. Column ``i`` binds to ``entity.components[i]`` positionally.
     rows = tuple(_aligned_symbols(record.sequence) for record in read_fasta_records(path))
@@ -1533,7 +1541,13 @@ def _reference_sites(
     return tuple(sites)
 
 
-def _msa_features(msa, system, token_residues, token_entities, generated_residues):
+def _msa_features(
+    msa: MSA | MSACollection | None,
+    system: MolecularSystem,
+    token_residues: Sequence[tuple[str, int] | None],
+    token_entities: Sequence[PolymerSequence | Molecule],
+    generated_residues: set[tuple[str, int]],
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     token_count = len(token_residues)
     profile = torch.zeros(token_count, 32)
     deletion_mean = torch.zeros(token_count)
@@ -1545,7 +1559,7 @@ def _msa_features(msa, system, token_residues, token_entities, generated_residue
                 if residue is None or residue in generated_residues
                 else token_entities[index].components[residue[1]].component_id
             )
-            token = min(_RESTYPE_INDEX.get(component, 20), 31)
+            token = min(_RESIDUE_TYPE_INDEX.get(component, 20), 31)
             profile[index, token] = 1.0
             row[index] = token
         features = torch.cat(

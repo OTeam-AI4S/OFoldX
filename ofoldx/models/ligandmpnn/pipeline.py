@@ -1,4 +1,4 @@
-r"""OFoldX's biological operation boundary for released LigandMPNN computations."""
+r"""LigandMPNN sequence design and probability Pipelines."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
-    r"""Bind one LigandMpnn Model-Processor pair for biological operations."""
+    r"""Bind one LigandMPNN Model and Processor for biological operations."""
 
     def design(
         self,
@@ -33,7 +33,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
@@ -45,14 +45,40 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design sequences over selected positions with ligand and residue context."""
+        r"""Design LigandMPNN sequences with ligand and residue context.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with complete backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
+            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_candidates: Number of complete sequence candidates to sample.
+            temperature: Positive autoregressive sampling temperature.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used as context.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            A ``DesignResult`` containing the sampled sequence candidates.
+
+        Notes:
+            Candidates follow sampling order. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(
             input,
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=global_logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
@@ -82,7 +108,29 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+        r"""Compute sequence-conditioned LigandMPNN autoregressive probabilities.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences treated as designable. ``None`` selects every
+                valid protein occurrence.
+            conditions: Tied-identity conditions applied to decoding order.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_decoding_orders: Number of independent decoding orders to evaluate.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used as context.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with sequence-conditioned logits and decoding ranks.
+
+        Notes:
+            The leading tensor axis enumerates decoding orders, and the residue axis follows
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(
             input,
@@ -114,7 +162,29 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return order-dependent sequence-free autoregressive probabilities."""
+        r"""Compute sequence-free LigandMPNN autoregressive probabilities.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences treated as designable. ``None`` selects every
+                valid protein occurrence.
+            conditions: Tied-identity conditions applied to decoding order.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_decoding_orders: Number of independent decoding orders to evaluate.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used as context.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with sequence-free logits and decoding ranks.
+
+        Notes:
+            The leading tensor axis enumerates decoding orders, and the residue axis follows
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(
             input,
@@ -145,7 +215,29 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-last conditional probabilities for every row."""
+        r"""Compute target-last conditional probabilities for every residue row.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences marked as designable in the returned carrier.
+                ``None`` selects every valid protein occurrence.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_decoding_orders: Number of independent base decoding orders to evaluate.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used as context.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with each target decoded after all other residues.
+
+        Notes:
+            ``logits`` use decoding-order, target-residue, and vocabulary axes;
+            ``decoding_ranks`` add a final residue-order axis. Residue axes follow
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(
             input,
@@ -175,7 +267,29 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-first sequence-free probabilities for every row."""
+        r"""Compute target-first unconditional probabilities for every residue row.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences marked as designable in the returned carrier.
+                ``None`` selects every valid protein occurrence.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_decoding_orders: Number of independent base decoding orders to evaluate.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used as context.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with each target decoded before all other residues.
+
+        Notes:
+            ``logits`` use decoding-order, target-residue, and vocabulary axes;
+            ``decoding_ranks`` add a final residue-order axis. Residue axes follow
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(
             input,
@@ -194,12 +308,16 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
 
 
 class LigandMpnnDesignAndPackPipeline:
-    r"""Compose the LigandMpnn designer with the MpnnPacker over one source.
+    r"""Compose the LigandMPNN designer with MPNN Packer over one source.
 
-    The released combined command designs sequences with ligand and residue context
-    and then packs each design. Both stages read one canonical ``Structure`` parsed
+    The Pipeline designs sequences with ligand and residue context and then packs each design.
+    Both stages read one canonical ``Structure`` parsed
     exactly once, keep three genuinely distinct context controls, and share a single
     random stream advanced design-first then pack-major across every candidate.
+
+    Args:
+        designer: LigandMPNN sequence-design Pipeline.
+        packer: MPNN Packer Pipeline applied to each designed sequence.
     """
 
     def __init__(
@@ -229,7 +347,7 @@ class LigandMpnnDesignAndPackPipeline:
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
@@ -246,7 +364,40 @@ class LigandMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[DesignResult, tuple[PackResult, ...]]:
-        r"""Design sequences on one canonical Structure and pack each candidate."""
+        r"""Design LigandMPNN sequences and pack every resulting candidate.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path, parsed once for both stages.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with complete backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
+            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
+            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible during design.
+            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_candidates: Number of complete sequence candidates to sample.
+            temperature: Positive autoregressive sampling temperature.
+            coordinate_noise: Standard deviation of noise applied to backbone and atom-context
+                coordinates during design.
+            use_sidechain_context: Whether fixed protein side-chain atoms are used during design.
+            use_packing_atom_context: Whether the packing stage uses nonprotein atom context.
+            repack_everything: Whether to pack every eligible residue instead of only designed
+                positions.
+            num_packs_per_candidate: Number of packed structures generated per sequence candidate.
+            num_denoising_steps: Number of side-chain denoising steps per packed structure.
+            num_torsion_samples: Number of torsion proposals evaluated per denoising step.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator advanced through design before packing.
+
+        Returns:
+            A pair containing the ``DesignResult`` and one ``PackResult`` per sequence candidate.
+
+        Notes:
+            The ``PackResult`` tuple follows candidate order, and each result's predictions follow
+            packing-sample order. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.designer.processor.process_structure(
@@ -254,7 +405,7 @@ class LigandMpnnDesignAndPackPipeline:
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=global_logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,

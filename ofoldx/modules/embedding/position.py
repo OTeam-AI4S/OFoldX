@@ -27,7 +27,7 @@ class RelativePositionBuckets:
     instead of materialising the dense ``(..., N, N, input_size)`` one-hot. This carries the buckets, the one-hot
     block widths needed to slice that weight, and the activation dtype for the gathered output.
 
-    Attributes:
+    Args:
         residue_bucket: Relative residue-distance bucket ids.
         token_bucket: Relative token-distance bucket ids.
         same_entity: Boolean bucket indicating whether token pairs share an entity.
@@ -89,7 +89,7 @@ class RelativePositionEmbedder(nn.Module):
 
         Args:
             buckets: Relative-position bucket container produced by
-                [`generate_relative_position_features`][ofoldx.modules.embedding.position.generate_relative_position_features].
+                ``generate_relative_position_features``.
 
         Returns:
             ``[..., N_token, N_token, pair_size]`` relative-position encoding, cast to ``buckets.dtype``.
@@ -151,8 +151,8 @@ def generate_relative_position_features(
     key axis matches the per-pair period for every pair that counts.
 
     ``chain_gate`` selects which pairs keep their real ``chain_offset`` bucket (the rest get the out-of-range
-    sentinel): ``"same_entity"`` (default) keeps same-entity pairs, ``"not_same_chain"`` (the Boltz-1 variant)
-    keeps cross-chain pairs instead.
+    sentinel): ``"same_entity"`` keeps same-entity pairs, while ``"not_same_chain"`` keeps cross-chain
+    pairs instead.
 
     Args:
         residue_index: ``[..., N_token]`` residue indices.

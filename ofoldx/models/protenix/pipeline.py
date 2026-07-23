@@ -1,8 +1,7 @@
-r"""Protenix's biological operation boundary for constraint-conditioned folding.
+r"""Protenix folding Pipelines.
 
-The default and constraint checkpoints each publish a concrete Pipeline so recycling and
-diffusion sampling controls are not erased by the common fold surface. The constraint
-Pipeline additionally forwards the released atom-contact, token-contact, and pocket inputs.
+The default and constraint variants expose separate task boundaries. The constraint
+Pipeline additionally accepts atom contacts, token contacts, and pocket inputs.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import torch
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines import PairedPipeline, processor_device, resolve_generator
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import FoldResult
 from .model import (
     ProtenixAtomContact,
@@ -28,7 +27,7 @@ from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
 
 class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
-    r"""Bind the default Protenix v0.5 Model and Processor."""
+    r"""Bind the default Protenix Model and Processor."""
 
     def fold(
         self,
@@ -42,9 +41,25 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one input and run released Protenix folding."""
+        r"""Lower one assembly and run Protenix folding.
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        Args:
+            input: Inline sequence, FASTA or structure path, polymer sequence collection,
+                molecular system, or structure topology.
+            msa: Optional MSA value, collection, or alignment path.
+            templates: Reserved template evidence; this architecture requires an empty sequence.
+            num_samples: Number of structure predictions. ``None`` uses the Model configuration.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+            num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(
             input,
             msa=msa,
@@ -78,15 +93,29 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one input plus its v0.5.3 constraints and run released Protenix constraint folding.
+        r"""Lower one assembly and run constraint-conditioned Protenix folding.
 
-        Forwards the released ``atom_contacts`` / ``token_contacts`` / ``pocket`` constraint channels
-        to :meth:`ProtenixConstraintProcessor.__call__`, then runs
-        :meth:`ProtenixConstraintModel.fold`. ``seed`` / ``generator`` resolve one stream which is
-        passed directly through the stochastic Processor and Model; ``msa`` / ``templates`` are forwarded.
+        Args:
+            input: Inline sequence, FASTA or structure path, polymer sequence collection,
+                molecular system, or structure topology.
+            atom_contacts: Upper-bound constraints between exact atom pairs.
+            token_contacts: Upper-bound constraints between token-level endpoints.
+            pocket: Optional directed binder-to-residue pocket constraint.
+            msa: Optional MSA value, collection, or alignment path.
+            templates: Reserved template evidence; this architecture requires an empty sequence.
+            num_samples: Number of structure predictions. ``None`` uses the Model configuration.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional RNG shared by preprocessing and folding; mutually exclusive with
+                ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+            num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
         """
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(
             input,
             atom_contacts=atom_contacts,

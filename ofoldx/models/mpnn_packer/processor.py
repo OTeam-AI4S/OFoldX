@@ -1,4 +1,4 @@
-r"""Canonical Structure lowering for MpnnPacker."""
+r"""Canonical structure lowering for MPNN Packer."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from os import PathLike
 
 import numpy as np
 import torch
-from typing_extensions import Self
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
 from ...data.components import get_component
@@ -28,12 +27,20 @@ from ...modules.mpnn import (
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
+from ...processor import Processor
 from .config import MpnnPackerProcessorConfig
 from .model import MpnnPackerInput
 
 
-class MpnnPackerProcessor:
-    r"""Lower one canonical Structure to the released MpnnPacker."""
+class MpnnPackerProcessor(Processor):
+    r"""Lower one canonical structure for MPNN Packer.
+
+    Args:
+        config: Side-chain packing context options. Defaults to
+            ``MpnnPackerProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -43,21 +50,7 @@ class MpnnPackerProcessor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = MpnnPackerProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -68,7 +61,20 @@ class MpnnPackerProcessor:
         use_atom_context: bool = True,
         filter_by_occupancy: bool = True,
     ) -> MpnnPackerInput:
-        r"""Lower fixed identity, selected residues, coordinates, and nearest-atom context."""
+        r"""Lower fixed identities, selected residues, coordinates, and atom context.
+
+        Args:
+            input: Canonical structure or local structure path.
+            sequence: Optional replacement protein sequence. A bare string requires one protein
+                instance; a mapping addresses instances explicitly.
+            pack_positions: Residue occurrences to repack. ``None`` selects every eligible
+                protein residue.
+            use_atom_context: Whether nonprotein heavy atoms are visible to the packer.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+
+        Returns:
+            A single-example ``MpnnPackerInput`` with aligned atom14, context, and layout values.
+        """
 
         structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         system = structure.system
@@ -173,7 +179,7 @@ class MpnnPackerProcessor:
                         target_atoms = {atom.atom_id: atom for atom in target.atoms}
                         atom_ids: list[str] = []
                         seen_atom_ids: set[str] = set()
-                        for atom_id in rc.restype_name_to_atom14_names.get(target.component_id, ()):
+                        for atom_id in rc.AMINO_ACID_ATOM14_NAMES.get(target.component_id, ()):
                             if atom_id and atom_id not in seen_atom_ids:
                                 atom_ids.append(atom_id)
                                 seen_atom_ids.add(atom_id)
@@ -235,7 +241,7 @@ class MpnnPackerProcessor:
                 declared_atom_ids = {atom.atom_id for atom in component.atoms}
                 missing_atom_ids = tuple(
                     atom_id
-                    for atom_id in rc.restype_name_to_atom14_names[component.component_id]
+                    for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component.component_id]
                     if atom_id and atom_id not in declared_atom_ids
                 )
                 if not missing_atom_ids:
@@ -320,7 +326,7 @@ class MpnnPackerProcessor:
                 unresolved_expected_atoms.append(())
                 continue
             unresolved: list[str] = []
-            for atom_id in rc.restype_name_to_atom14_names[component_id]:
+            for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component_id]:
                 if not atom_id:
                     continue
                 try:

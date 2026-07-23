@@ -5,7 +5,7 @@ from __future__ import annotations
 from ...pipelines.registry import PIPELINES
 from ..registry import MODELS
 from .config import (
-    Boltz1ConfidenceModuleConfig,
+    Boltz1ConfidenceConfig,
     Boltz1Config,
     Boltz1DenoiserConfig,
     Boltz1InputEmbeddingsConfig,

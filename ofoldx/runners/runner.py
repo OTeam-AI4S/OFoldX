@@ -20,6 +20,7 @@ from danling.runners.utils import RunnerMode
 from torch import Tensor
 
 from ..model import Model
+from ..processor import Processor
 from .collate import collate
 from .config import RunnerConfig
 from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
@@ -84,10 +85,11 @@ class Runner(dl.Runner):
         from .dataset import StructureDataset
 
         model_config = self.config.model
+        processor: Processor
         if model_config.pretrained:
             from ..auto import AutoProcessor
 
-            processor = AutoProcessor(model_config.pretrained)
+            processor = AutoProcessor.from_pretrained(model_config.pretrained)
         else:
             processor = MODELS.lookup_model(model_config.name).processor()
         datasets: dict[str, Any] = {}

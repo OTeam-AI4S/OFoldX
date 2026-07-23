@@ -10,7 +10,7 @@ import torch
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
-from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, processor_device, resolve_generator
+from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
 from ...results import FoldPrediction, FoldResult, Metric, Score
 from .model import Boltz2AffinityModel, Boltz2Model
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
@@ -30,9 +30,23 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one input and run Boltz-2 folding."""
+        r"""Lower one molecular input and run Boltz-2 folding.
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        Args:
+            input: Canonical molecular system, structure, or local structure path.
+            msa: Optional MSA value, collection, or alignment path.
+            num_samples: Number of structure predictions to generate.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+            num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         features = self.processor(input, msa=msa, generator=generator)
         return self.model.fold(
             features,
@@ -54,6 +68,12 @@ class Boltz2AffinityPipeline(CompositePipeline):
 
     The result preserves the confidence-sorted folding predictions alongside the
     affinity target, scores, and metrics.
+
+    Args:
+        model: Affinity-scoring Model.
+        processor: Processor paired with ``model``.
+        structure_model: Structure-prediction Model used by the first stage.
+        structure_processor: Processor paired with ``structure_model``.
     """
 
     model: Boltz2AffinityModel
@@ -63,7 +83,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
 
     # The affinity pass owns the repository root; the structure/confidence pair is stored in
     # the fixed ``structure/`` subdirectory.
-    _PAIR_LAYOUT = (
+    pair_layout = (
         CompositePair("", "model", "processor"),
         CompositePair("structure", "structure_model", "structure_processor"),
     )
@@ -109,10 +129,14 @@ class Boltz2AffinityPipeline(CompositePipeline):
             seed: Optional integer seed shared by both passes; mutually exclusive with
                 ``generator``.
             generator: Optional RNG shared across both passes; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``Boltz2AffinityResult`` containing confidence-sorted structure predictions and
+            affinity outputs for the selected structure.
         """
 
         # Reference augmentation and both model passes advance one RNG stream.
-        generator = resolve_generator(seed, generator, device=processor_device(self.structure_processor))
+        generator = resolve_generator(seed, generator, device=self.structure_processor.device)
 
         # The structure and affinity passes use independent sampling counts.
         fold_batch = self.structure_processor(input, msa=msa, generator=generator)
@@ -158,6 +182,12 @@ class Boltz2AffinityResult:
 
     Contains the selected second-pass ``target``, confidence-sorted first-pass
     ``structure_predictions``, and affinity scores and metrics.
+
+    Args:
+        target: Structure selected for affinity scoring.
+        structure_predictions: First-stage predictions in descending confidence order.
+        scores: Scalar affinity scores keyed by stable scientific names.
+        metrics: Affinity metrics keyed by stable scientific names.
     """
 
     target: Structure

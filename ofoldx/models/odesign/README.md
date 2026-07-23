@@ -1,162 +1,152 @@
 ---
-license: apache-2.0
-library_name: ofoldx
-pipeline_tag: protein-folding
+language:
+  - protein
 tags:
-  - protein-design
-  - biomolecular-structure
-  - diffusion
+  - Biology
+  - Protein Design
+  - Biomolecular Structure
+  - Diffusion
+license: agpl-3.0
+library_name: ofoldx
+pipeline_tag: other
 ---
 
 # ODesign
 
-OFoldX implementation of the released ODesign core model from the ODesign team.
-ODesign is an all-atom generative world model for biomolecular interaction design,
-using an atom encoder, MSA-conditioned recycling Pairformer trunk, distance-constraint
-embedder, EDM coordinate denoiser, distogram head, and token-bond head.
+Native PyTorch implementation of the ODesign all-atom biomolecular interaction
+design model and its released protein sequence-assignment composition.
 
-The implementation is staged but is not a registered or published OFoldX
-architecture yet. Truthful canonical representation of the released de-novo ligand
-mode remains a quality-gate blocker, described below. The available protein-flex and
-protein-rigid archives have both passed exact key/shape translation and strict state
-loading locally; the ligand-rigid and nucleic-acid-rigid archives still require the
-same manual checkpoint proof because those two multi-gigabyte files are not present
-in the validation environment.
+## Disclaimer
 
-The single `ODesignModel` owns the `design` task and precise expert tensor methods:
+This is an unofficial OFoldX implementation of
+[ODesign](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign).
+The upstream authors did not write, review, or endorse this implementation or
+model card.
+
+## Model Details
+
+ODesign combines an atom encoder, MSA-conditioned recycled Pairformer trunk,
+distance-constraint embedder, EDM coordinate denoiser, distogram head, and
+token-bond head. `forward` evaluates one differentiable denoising step from
+explicit noisy coordinates and a noise level. `sample` runs coordinate
+generation and preserves the pairwise heads.
+
+The released protein operation is a composition under one `design` verb.
+`ODesignModel` generates S seed groups by M diffusion samples, then
+`ODesignPipeline` uses the separately registered ProteinMPNN or LigandMPNN
+pipeline to assign K sequence variants to each backbone. It returns the complete
+M x S x K grid as `ODesignDesignResult`.
+
+Observed coordinates provide geometric context and are not fixed implicitly.
+`partial_diffusion_snr` explicitly starts from observed coordinates. Hard
+`ODesignReferenceCoordinates` conditions pin selected atoms; soft references
+remain constraint evidence.
+
+### Variants
+
+The released `odesign_base_prot_flex.pt` and
+`odesign_base_prot_rigid.pt` checkpoints use the same model graph and state
+tree. Their repositories differ through the Processor's `receptor_mode`:
+
+- `flex` regenerates receptor coordinates unless atoms are explicitly pinned.
+- `rigid` fixes observed receptor heavy atoms during sampling.
+
+### Model Specification
+
+| Property            | Value                       |
+| ------------------- | --------------------------- |
+| Architecture        | `ofoldx.odesign`            |
+| Model               | `ODesignModel`              |
+| Processor           | `ODesignProcessor`          |
+| Pipeline            | `ODesignPipeline`           |
+| Task                | `design`                    |
+| Result              | `ODesignDesignResult`       |
+| Backbone variants   | protein flex, protein rigid |
+| Sequence assignment | ProteinMPNN or LigandMPNN   |
+
+For protein sequence assignment, `temperature` maps to the released inverse
+folding temperature and `num_sequences` maps to top-k. LigandMPNN is selected
+when the generated assembly carries non-protein atom context; otherwise
+ProteinMPNN is used.
+
+### Links
+
+- [Official source](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign)
+- [Technical report](https://arxiv.org/abs/2510.22304)
+
+## Usage
 
 ```python
-import torch
+import ofoldx
 
-from ofoldx.models.odesign import ODesignConfig, ODesignModel, ODesignProcessor
-
-processor = ODesignProcessor(device="cuda", dtype=torch.bfloat16)
-model = ODesignModel(ODesignConfig()).to(device="cuda", dtype=torch.bfloat16)
-
-batch = processor(structure, conditions=conditions)
-tensor_output = model(
-    batch,
-    noisy_coordinates=noisy_coordinates,
-    noise_level=noise_level,
-)                                 # differentiable one-step ODesignOutput
-designed = model.design(batch)     # ODesignDesignResult of backbone Structure candidates
-sampled = model.sample(batch)      # expert ODesignOutput, including pairwise heads
+pipe = ofoldx.pipeline("design", model="./odesign-prot-flex", device="cuda")
+result = pipe.design(
+    "target.cif",
+    placement=placement,
+    num_seeds=2,
+    num_backbones=4,
+    num_sequences=3,
+    seed=7,
+)
+candidate = result.candidates[0]
 ```
 
-`forward` is the released one-step denoising primitive: the caller supplies the
-noisy coordinates and their EDM noise level, and it returns only tensors computed by
-the released core graph—denoised coordinates, distogram logits, and token-bond
-logits. It does not invent a training target or silently reinterpret observed input
-coordinates as synthetic noise. `sample` preserves the same pairwise heads while
-running the released multi-seed coordinate sampler; `design` decodes its coordinates
-into canonical Results. Rigid and flexible receptor checkpoints are weight and
-conditioning variants of this same graph, not separate architectures. ODesign has
-no separately released fold task, so the Model does not expose `fold`.
+`placement` is an optional `ODesignPlacements` value describing generated
+segments and per-chain lengths. Conditions may include hotspots, symbolic bonds,
+and reference coordinates. All samples in one invocation share the topology
+realized from ranged segments.
 
-Observed `Structure` coordinates are geometric evidence, not implicit fixation.
-Partial diffusion starts from them only when the caller passes
-`partial_diffusion_snr`; without that explicit argument sampling starts from full
-noise even when every model atom is observed. Hard `ODesignReferenceCoordinates` pins only
-the selected atoms; soft values remain constraint evidence without pinning.
-Missing/generated coordinates cannot be used for partial diffusion.
-Ranged `GeneratedSegment` lengths are realized once by `ODesignProcessor.realize_ranges`
-at the Pipeline boundary, from the same generator subsequently used by diffusion;
-`ODesignPlacements.chain_lengths` (a family-owned
-per-chain length field, not a shared core invariant) can fix a chain's total length
-while distributing that total across ranged segments. All samples in one call share
-the realized topology as in the released inference path.
+## Checkpoints and Conversion
 
-`model.set_backend(...)` accepts exactly `"auto"`, `"torch"`, or `"oops"`.
-Explicit OOps selection fails when it cannot run; Results record the concrete backend
-selected for that call.
+The composite repository stores the ODesign backbone pair at its root and embeds
+the converted ProteinMPNN and LigandMPNN designer repositories at their fixed
+component paths:
 
-ODesign core design is coordinate/structure generation. The separate upstream
-OInvFold sequence-assignment checkpoints are not silently bundled into this model
-identity.
-
-## Flex and rigid: one architecture, two repositories
-
-The two released protein checkpoints `odesign_base_prot_flex.pt` and
-`odesign_base_prot_rigid.pt` are the **same graph with the same state-dict contract**;
-their upstream training configs differ only in whether the receptor atoms are supplied
-as fixed EDM diffusion conditions (rigid) or regenerated (flex). This is realized entirely
-by whether the Processor marks existing receptor atoms into `fixed_coordinate_mask`, which
-the sampler already consumes. Because there is no signature or type difference, this is
-**one `ODesignModel` + one `ODesignProcessor`**, distinguished by a single Processor config
-value `receptor_mode: Literal["rigid", "flex"]` (default `"flex"`). Under the registration
-rule of "one pair per checkpoint," it publishes as **two repositories over one architecture**
-— `ofoldx/odesign-base-prot-flex` and `ofoldx/odesign-base-prot-rigid`, whose `model.json`
-both name `ofoldx.odesign` and whose `processor.json` differ only in `receptor_mode`. It is
-explicitly **not** two registered architecture pairs. `rigid` auto-pins every existing
-(non-generated, observed) receptor heavy atom; `flex` pins only atoms named by an explicit
-hard `ODesignReferenceCoordinates`.
-
-## OInvFold protein composition and the M×S×K result
-
-The full released protein deliverable is a two-stage composition under the single `design`
-verb, exposed by `ODesignPipeline`: the ODesign core generates backbones over **S** seeds ×
-**M** diffusion samples, and each backbone is assigned **K** top-k sequence variants by the
-OInvFold sequence step. For the protein modality the OInvFold sequence module *is* the
-released ProteinMPNN / LigandMPNN network, so `ODesignPipeline` **composes the already
-registered `ofoldx/proteinmpnn` and `ofoldx/ligandmpnn` Pipelines read-only** (never
-re-vendored), dispatching to LigandMPNN when the backbone carries ligand/nucleic atom
-context and to ProteinMPNN otherwise. The sampling knobs map directly: `temperature`
-(upstream `invfold_temp`) and `num_sequences` = top-k (upstream `invfold_topk`). **Beam
-decoding is inert for the protein path** — the released protein sequence inference ignores
-`use_beam`, so it is accepted and ignored here and never exposed as a functional protein
-knob; beam exists only on the non-protein OInvFold checkpoints, which are owner-gated.
-
-The composition returns the family-owned `ODesignDesignResult` — the released
-`M×S×K` grid of `ODesignDesignCandidate`s, each tagged with integer `seed_index` /
-`backbone_index` / `sequence_index` provenance and carrying its backbone `Structure` plus the
-assigned-sequence `MolecularSystem`. `ODesignDesignResult` is a concrete **family Result**:
-ODesign is coordinate-producing, so it owns its own carrier rather than widening the frozen
-coordinate-free shared `DesignResult`. Its `best(score)` reproduces the frozen ranking
-contract exactly (explicit direction, one identical unit / scope, NaN rejection, earliest
-tie). Per-sequence Scores reuse the frozen ProteinMPNN / LigandMPNN semantics:
-`designed_sequence_nll` (nat/residue, lower), `designed_sequence_confidence` (higher),
-`sequence_recovery` (higher), and — only when the LigandMPNN atom-context model was used —
-`ligand_interface_confidence` (higher). No backbone-geometry Score is fabricated: the
-released core exposes no per-sample confidence head, and the distogram / token-bond logits
-stay raw on `ODesignOutput`.
-
-## Owner-gated blockers
-
-Beyond the de-novo ligand mode above, the following remain owner-gated and are **not**
-shipped as public contracts: the §3.7 placement core is now frozen (owner verdicts
-ratified 2026-07-18) and the family consumes it from `ofoldx.data.placement` via the family-owned
-`ODesignPlacements` condition (which re-homes the family per-chain `chain_lengths`); the hotspot split
-(`ODesignHotspot(residues)` — which admits ligand components — is recorded as the target but
-the running two-sided `Contact` hotspot lowering is retained); de-novo nucleic-acid generation
-and the non-protein OInvFold beam paths; and the `SymbolicBond` / `DesiredCovalentLink` cyclic
-closure. The `M×S×K` `ODesignDesignResult` is itself a candidate family carrier pending the
-§5.3 coordinate-bearing design sub-freeze.
-
-An existing canonical `Molecule` can be used as structural context. The released
-de-novo ligand CLI path cannot yet be exposed as a generated `Molecule`: it
-creates `-L` atom rows with unknown element/reference identity and sequential fake
-single bonds, predicts only binary `NONE`/`ANY` bond logits, and never reconstructs
-or sanitizes a chemical graph. Treating those placeholders as canonical chemistry
-would be false. ODesign therefore remains unregistered until this mode has a truthful
-canonical implementation; the other released modes do not lower that gate.
-
-## Conversion
-
-`ofoldx.models.odesign.convert.convert_odesign_checkpoint` strictly translates a
-released checkpoint into the standard paired OFoldX repository format once the
-architecture passes its remaining gate and is registered:
-
-```text
-model.json
-processor.json
-model.safetensors
-README.md
+```bash
+python -m ofoldx.models.odesign.convert \
+  odesign_base_prot_flex.pt \
+  ./odesign-prot-flex \
+  --protein-designer ./proteinmpnn \
+  --ligand-designer ./ligandmpnn
 ```
 
-## Upstream
+The converter infers `flex` or `rigid` from the official filename unless
+`--receptor-mode` is supplied. It translates the upstream state tree, strict
+loads the model, writes the complete composite Pipeline repository, and can
+upload it with `--repo-id oteam/odesign-prot-flex`. `--private` requests a
+private Hub repository.
 
-- [ODesign source repository](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign)
-- [Technical report](https://arxiv.org/abs/2510.22304)
+## Training Details
+
+### Training Data
+
+Refer to the [ODesign technical report](https://arxiv.org/abs/2510.22304) for the
+upstream training corpus and data construction.
+
+### Training Procedure
+
+OFoldX preserves the released inference graph and exposes the differentiable
+one-step denoiser. It does not add an OFoldX-specific training objective to the
+model. Rigid and flexible receptor behavior is a conditioning difference rather
+than a separate architecture.
+
+## Limitations
+
+- The released de novo ligand CLI creates atoms without sufficient element,
+  reference-component, and sanitized bond identity to construct a truthful
+  canonical molecule. That generation mode is not exposed.
+- De novo nucleic-acid generation and non-protein OInvFold beam decoding are not
+  included in this protein composition.
+- Existing canonical molecules are supported as structural context.
+- The core model has no per-sample confidence head. Distogram and token-bond
+  logits remain raw outputs rather than fabricated ranking scores.
+- Numerical parity applies to the converted checkpoint and evaluated settings;
+  stochastic trajectories additionally depend on the supplied generator.
+
+Confirmed upstream defects and OFoldX behavior are recorded in
+[`UPSTREAM_BUGS.md`](../../../UPSTREAM_BUGS.md).
+
+## Citation
 
 ```bibtex
 @misc{zhang2025odesign,
@@ -169,25 +159,13 @@ README.md
 }
 ```
 
-The upstream ODesign source code and released model parameters are licensed under
-Apache-2.0. OFoldX library code remains governed by the OFoldX project license.
+## Contact
 
-## Limitations & intentional upstream divergences
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card.
 
-- ODesign is **owner-gated and unregistered**: the de-novo ligand CLI path emits `-L`
-  atom rows with unknown element/reference identity and placeholder single bonds and
-  does not reconstruct a sanitized chemical graph, so it cannot yet be exposed as a
-  truthful canonical `Molecule`. De-novo nucleic-acid generation, non-protein OInvFold
-  beam paths, and cyclic-closure bonds remain owner-gated.
-- The flex and rigid variants share one architecture across two repositories.
-- A parity run applies only to the checkpoint and settings supplied to the script.
+## License
 
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code & weights:** Apache-2.0
-  ([ODesign LICENSE](https://github.com/odesign-team/ODesign/blob/main/LICENSE),
-  Copyright 2024 ODesign Team).
-- **Redistribution status: GREEN by license** (Apache-2.0, `odesign_base_prot_flex`
-  and `odesign_base_prot_rigid` redistributable with notice). Publication is blocked
-  by the owner-gated qualification above, not by the license.
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Upstream source and released parameters:** Apache-2.0; preserve the
+  upstream copyright and license notices when redistributing checkpoints.

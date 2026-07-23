@@ -11,19 +11,18 @@ import numpy as np
 import torch
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .model import Boltz1Input, Boltz1Layout, Boltz1Pocket
 
 if TYPE_CHECKING:
     from rdkit.Chem.rdchem import Mol
 
-# Boltz-1 pocket one-hot classes (config ``pocket_feature_size == 4``); mirrors upstream
-# ``const.py`` ``pocket_contact_info`` labels: UNSPECIFIED, UNSELECTED, POCKET, BINDER.
+# Boltz-1 pocket one-hot classes: UNSPECIFIED, UNSELECTED, POCKET, and BINDER.
 _POCKET_UNSPECIFIED = 0
 _POCKET_UNSELECTED = 1
 _POCKET_POCKET = 2
@@ -117,7 +116,7 @@ def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
     return _DNA_MSA_RESTYPE.get(symbol, _UNKNOWN_RESIDUE_TYPES["dna"])
 
 
-class Boltz1Processor:
+class Boltz1Processor(Processor):
     r"""Lower one canonical molecular system to ``Boltz1Input``.
 
     Produces residue-token geometry, the 33-token
@@ -127,6 +126,10 @@ class Boltz1Processor:
     consumed by the confidence-ranking head. The optional Boltz-1x
     physical-potential constraint surface is left empty; the model materializes
     empty steering features from the absent fields.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -135,21 +138,7 @@ class Boltz1Processor:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -161,8 +150,14 @@ class Boltz1Processor:
     ) -> Boltz1Input:
         r"""Lower one folding input, its optional MSA evidence, and an optional pocket to ``Boltz1Input``.
 
-        ``generator`` drives reference-conformer augmentation; ``None`` uses the
-        ambient PyTorch RNG.
+        Args:
+            input: Canonical molecular system, structure, or local structure path.
+            msa: Optional MSA value, collection, or alignment path.
+            pocket: Optional binder and pocket-residue specification.
+            generator: Optional RNG for reference-conformer augmentation.
+
+        Returns:
+            A ``Boltz1Input`` with aligned token, atom, MSA, pocket, and layout values.
         """
 
         if isinstance(input, str | PathLike):
@@ -323,15 +318,20 @@ def _prepare_boltz1_features(
                 resolved[atom_index] = True
                 target_positions[atom_index] = torch.from_numpy(structure.coordinates[source_index].copy())
 
-    ref_pos = torch.zeros(padded_atom_count, 3)
-    ref_pos[:atom_count] = torch.tensor(reference_coordinates)
-    ref_space = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_space[:atom_count] = torch.tensor(reference_space_ids)
-    _augment_reference_positions(ref_pos[:atom_count], ref_space[:atom_count], resolved, generator=generator)
+    reference_positions = torch.zeros(padded_atom_count, 3)
+    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
+    _augment_reference_positions(
+        reference_positions[:atom_count],
+        reference_space_id[:atom_count],
+        resolved,
+        generator=generator,
+    )
 
     atomic_number = torch.zeros(padded_atom_count, dtype=torch.long)
-    charge = torch.zeros(padded_atom_count)
-    atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count)
+    atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
@@ -342,8 +342,8 @@ def _prepare_boltz1_features(
     for atom_index, (site, atom_name) in enumerate(zip(atom_sites, atom_names)):
         atom = system.atom(site)
         atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
-        charge[atom_index] = atom.formal_charge
-        atom_name_chars[atom_index] = torch.tensor(
+        reference_charges[atom_index] = atom.formal_charge
+        atom_name_characters[atom_index] = torch.tensor(
             [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
         )
         atom_mask[atom_index] = True
@@ -351,16 +351,16 @@ def _prepare_boltz1_features(
         atom_to_token[atom_index] = token_index
         atom_token_index[atom_index] = cast(tuple[AtomSite, ...], tokens[token_index]["atom_sites"]).index(site)
 
-    # Boltz-1 reference-atom feature vector (389): [ref_pos(3), charge(1), atom_pad_mask(1), element(128),
-    # atom_name_chars(4x64=256)]. The atom-pad-mask channel at index 4 is the sole difference from Boltz-2's
-    # 388-wide vector; the model splices nothing, so the Processor emits the full 389 here.
+    # Boltz-1 reference-atom features contain positions (3), charge (1), mask (1),
+    # element (128), and atom-name characters (4x64=256). The mask channel at index 4
+    # is the sole difference from Boltz-2's 388-wide vector.
     atom_features = torch.cat(
         (
-            ref_pos,
-            charge.unsqueeze(-1),
+            reference_positions,
+            reference_charges.unsqueeze(-1),
             atom_mask.unsqueeze(-1).float(),
             torch.nn.functional.one_hot(atomic_number, 128).float(),
-            torch.nn.functional.one_hot(atom_name_chars, 64).reshape(padded_atom_count, 256).float(),
+            torch.nn.functional.one_hot(atom_name_characters, 64).reshape(padded_atom_count, 256).float(),
         ),
         dim=-1,
     )
@@ -404,8 +404,8 @@ def _prepare_boltz1_features(
         "atom_features": atom_features,
         "atom_to_token": atom_to_token,
         "atom_mask": atom_mask,
-        "reference_positions": ref_pos,
-        "reference_space_id": ref_space,
+        "reference_positions": reference_positions,
+        "reference_space_id": reference_space_id,
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,

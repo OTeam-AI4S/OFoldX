@@ -2,7 +2,7 @@ r"""
 Atom-to-token encoders and the token-to-atom decoder.
 
 The atom encoder/decoder web contains the conditioning builder, the dense/local atom-pair encoder, the windowed
-self-attention stack, and the encoders/decoder that move atom states to/from token states. Each piece delegates the
+self-attention module, and the encoders/decoder that move atom states to/from token states. Each piece delegates the
 heavy attention to the shared [`PackedAtomAttention`][ofoldx.modules.atom.encoders.PackedAtomAttention] and the
 shared pair arithmetic to [`encode_atom_pair`][ofoldx.modules.atom.pair_encoding.encode_atom_pair].
 """
@@ -35,7 +35,7 @@ class AtomToTokenEncoderBase(nn.Module):
     r"""
     Shared machinery for the atom-to-token encoders (reference and coordinate paths).
 
-    Holds the atom conditioner, the atom-pair encoder, the atom self-attention stack, and the token
+    Holds the atom conditioner, the atom-pair encoder, the atom self-attention module, and the token
     projection, and exposes the pieces of the encode-then-aggregate pipeline that both concrete encoders
     reuse: [`build_local_geometry`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase.build_local_geometry]
     to precompute the windowed geometry and
@@ -51,8 +51,10 @@ class AtomToTokenEncoderBase(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         atom_feature_size: Width of the raw reference atom-feature vector.
-        operator_backend: Backend selector passed down to the attention stack (``"auto"`` picks the
+        operator_backend: Backend selector passed down to atom self-attention (``"auto"`` picks the
             OOps-owned implementation when available, else the public implementation).
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
 
     Examples:
         >>> import torch
@@ -91,7 +93,7 @@ class AtomToTokenEncoderBase(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
-        self.atom_attention_stack = AtomSelfAttentionStack(
+        self.atom_self_attention = AtomSelfAttention(
             atom_hidden_size=atom_hidden_size,
             conditioning_size=atom_hidden_size,
             pair_size=atom_pair_hidden_size,
@@ -118,7 +120,7 @@ class AtomToTokenEncoderBase(nn.Module):
         Args:
             reference_positions: `[..., N_atom, 3]` reference coordinates.
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window
+            num_valid_atoms: Number of real atoms; enables the clamped/shifted key window
                 (see [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]). Left unset by the
                 non-diffusion input-embedder path, which keeps the fixed zero-padded window.
 
@@ -160,7 +162,7 @@ class AtomToTokenEncoderBase(nn.Module):
         downstream coordinate decoder.
 
         Args:
-            atom_query: `[..., N_atom, atom_hidden_size]` per-atom query states from the attention stack.
+            atom_query: `[..., N_atom, atom_hidden_size]` per-atom query states from atom self-attention.
             atom_to_token: `[..., N_atom]` integer index mapping each atom to its token.
             num_tokens: Number of tokens to scatter into (size of the output token axis).
             atom_mask: Optional `[..., N_atom]` validity mask; absent atoms are excluded from the mean.
@@ -240,7 +242,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
         Encode reference atom features plus geometry into token hidden states.
 
         Builds per-atom conditioning, encodes the atom-pair representation (dense when ``local_geometry`` is
-        ``None``, else local-window), runs the self-attention stack, then projects and mask-means atoms into
+        ``None``, else local-window), runs atom self-attention, then projects and mask-means atoms into
         ``num_tokens`` tokens.
 
         Args:
@@ -292,7 +294,7 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
             local_geometry=local_geometry,
         )
         attention_layout = "dense" if local_geometry is None else "local"
-        atom_query = self.atom_attention_stack(
+        atom_query = self.atom_self_attention(
             atom_conditioning,
             atom_conditioning,
             atom_pair,
@@ -329,7 +331,9 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         atom_feature_size: Width of the raw reference atom-feature vector.
-        operator_backend: Backend selector passed down to the attention stack.
+        operator_backend: Backend selector passed down to atom self-attention.
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
 
     Examples:
         >>> import torch
@@ -377,7 +381,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         )
         self.single_norm = LayerNorm(single_size, bias=False)
         self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
-        self.norm_pair = LayerNorm(pair_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, bias=False)
         self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
 
@@ -450,9 +454,8 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             reference_charges=reference_charges,
             reference_mask=reference_mask,
         )
-        # The clamped/shifted key window (DeepMind AF3) is selected by the valid-atom count carried on the
-        # precomputed geometry; the pair broadcast and the attention key gather must use the same count so
-        # their key panes stay aligned. ``None`` (dense layout or fixed geometry) keeps the padded window.
+        # The valid-atom count selects clamped key windows. Pair broadcast and attention gathering share
+        # that count so their key panes stay aligned; ``None`` keeps the fixed padded layout.
         num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
         atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
         atom_pair = self._build_atom_pair(
@@ -464,7 +467,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         )
         atom_query = atom_conditioning + self.noisy_position_projection(noisy_coords)
         attention_layout = "dense" if local_geometry is None else "local"
-        atom_query = self.atom_attention_stack(
+        atom_query = self.atom_self_attention(
             atom_query,
             atom_conditioning,
             atom_pair,
@@ -522,7 +525,7 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             The atom-pair representation: dense `[..., N_atom, N_atom, atom_pair_hidden_size]`, or local
             `[..., N_window, num_query_atoms, num_key_atoms, atom_pair_hidden_size]`.
         """
-        pair = self.pair_projection(self.norm_pair(pair))
+        pair = self.pair_projection(self.pair_norm(pair))
         if local_geometry is None:
             pair = self.token_pair_to_atom_pair_broadcast(pair, atom_to_token)
             return self.atom_pair_encoder(
@@ -541,7 +544,7 @@ class AtomConditioner(nn.Module):
     Build per-atom conditioning states from reference position, charge, and feature inputs.
 
     Projects each reference input to the atom hidden width and sums them, giving the shared per-atom
-    conditioning consumed by the atom-pair encoder and the attention stack.
+    conditioning consumed by the atom-pair encoder and atom self-attention.
 
     Args:
         atom_feature_size: Width of the raw reference atom-feature vector.
@@ -676,7 +679,7 @@ class AtomPairEncoder(nn.Module):
         Args:
             reference_positions: `[..., N_atom, 3]` reference coordinates.
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window.
+            num_valid_atoms: Number of real atoms; enables the clamped/shifted key window.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] to pass to
@@ -869,6 +872,8 @@ class PackedAtomAttention(nn.Module):
         num_key_atoms: Number of key atoms gathered around each query window.
         operator_backend: Backend selector for the transformer's attention/transition implementations.
         cross_attention_mode: Whether the transformer runs in cross-attention mode (query/key panes differ).
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
         transition: Transition-block kind used inside each transformer block.
 
     Examples:
@@ -933,7 +938,7 @@ class PackedAtomAttention(nn.Module):
                 `[..., N_window, num_query_atoms, num_key_atoms, depth * heads]`.
             atom_mask: Optional `[..., N_atom]` attention mask; defaults to all-valid.
             attention_layout: Either ``"dense"`` (global) or ``"local"`` (windowed).
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather so the
+            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather so the
                 windowed key panes match the pair-bias windows. Unset keeps the fixed zero-padded gather.
 
         Returns:
@@ -1022,9 +1027,9 @@ class PackedAtomAttention(nn.Module):
         return output.reshape(*prefix, num_atoms, output.shape[-1])
 
 
-class AtomSelfAttentionStack(nn.Module):
+class AtomSelfAttention(nn.Module):
     r"""
-    Stack of atom self-attention blocks over a projected pair bias.
+    Atom self-attention with a separately projected pair bias for each repeated block.
 
     Supports both a ``"dense"`` layout (global attention over all atoms) and a ``"local"`` layout (windowed
     local attention), selected per forward. The per-block pair-bias projection lives here; the packed attention
@@ -1039,14 +1044,16 @@ class AtomSelfAttentionStack(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         operator_backend: Backend selector for the underlying attention/transition implementations.
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
 
     Examples:
         >>> import torch
-        >>> stack = AtomSelfAttentionStack(
+        >>> attention = AtomSelfAttention(
         ...     atom_hidden_size=8, conditioning_size=8, pair_size=4, num_blocks=1,
         ...     num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
         ... )
-        >>> len(stack.bias_projections)
+        >>> len(attention.bias_projections)
         1
     """
 
@@ -1091,7 +1098,7 @@ class AtomSelfAttentionStack(nn.Module):
         num_valid_atoms: int | None = None,
     ) -> Tensor:
         r"""
-        Project the ``pair`` to a packed per-block bias and run the atom self-attention stack.
+        Project ``pair`` to a packed per-block bias and run atom self-attention.
 
         Args:
             atom_hidden: `[..., N_atom, atom_hidden_size]` atom query states driving the blocks.
@@ -1100,7 +1107,7 @@ class AtomSelfAttentionStack(nn.Module):
                 per block into per-head bias logits.
             atom_mask: Optional `[..., N_atom]` attention mask.
             attention_layout: Either ``"dense"`` or ``"local"`` execution.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather.
+            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather.
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
@@ -1108,11 +1115,11 @@ class AtomSelfAttentionStack(nn.Module):
         Examples:
             >>> import torch
             >>> _ = torch.manual_seed(0)
-            >>> stack = AtomSelfAttentionStack(
+            >>> attention = AtomSelfAttention(
             ...     atom_hidden_size=8, conditioning_size=8, pair_size=4, num_blocks=1,
             ...     num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
             ... )
-            >>> out = stack(
+            >>> out = attention(
             ...     torch.randn(1, 4, 8), torch.randn(1, 4, 8), torch.randn(1, 4, 4, 4),
             ...     attention_layout="dense",
             ... )
@@ -1150,7 +1157,9 @@ class TokenToAtomDecoder(nn.Module):
         num_attention_heads: Number of attention heads per block.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        operator_backend: Backend selector passed down to the attention stack.
+        operator_backend: Backend selector passed down to atom self-attention.
+        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
+            or the query-normalized state.
 
     Examples:
         >>> import torch
@@ -1177,7 +1186,7 @@ class TokenToAtomDecoder(nn.Module):
         super().__init__()
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
         self.token_to_atom_broadcast = TokenToAtomBroadcast()
-        self.atom_attention_stack = AtomSelfAttentionStack(
+        self.atom_self_attention = AtomSelfAttention(
             atom_hidden_size=atom_hidden_size,
             conditioning_size=atom_hidden_size,
             pair_size=atom_pair_hidden_size,
@@ -1206,7 +1215,7 @@ class TokenToAtomDecoder(nn.Module):
         Decode token hidden states into per-atom coordinate updates.
 
         Projects ``token_hidden`` to atom width, broadcasts it onto the encoder ``atom_query`` via
-        ``atom_to_token``, runs the atom self-attention stack (reusing ``atom_context``'s pair/conditioning,
+        ``atom_to_token``, runs atom self-attention (reusing ``atom_context``'s pair/conditioning,
         dense or local per ``attention_layout``), and projects to a coordinate delta per atom.
 
         Args:
@@ -1217,7 +1226,7 @@ class TokenToAtomDecoder(nn.Module):
                 pair representation and conditioning to reuse.
             atom_mask: Optional `[..., N_atom]` attention mask.
             attention_layout: Either ``"dense"`` or ``"local"`` execution.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key gather so the
+            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather so the
                 decoder attends over the same key panes the encoder built the reused pair bias for.
 
         Returns:
@@ -1243,7 +1252,7 @@ class TokenToAtomDecoder(nn.Module):
         """
 
         atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
-        atom_query = self.atom_attention_stack(
+        atom_query = self.atom_self_attention(
             atom_query,
             conditioning=atom_context.conditioning,
             pair=atom_context.pair,

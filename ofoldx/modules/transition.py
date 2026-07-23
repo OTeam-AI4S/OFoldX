@@ -1,6 +1,4 @@
-r"""
-Transition blocks and the companion row-wise dropout used in trunk/atom blocks.
-"""
+r"""Transition update branches and row-wise dropout for trunk and atom blocks."""
 
 from __future__ import annotations
 
@@ -13,12 +11,13 @@ from .backend import transition as dispatch_transition
 
 class Transition(nn.Module):
     r"""
-    Position-wise SwiGLU transition block.
+    Pre-normalized position-wise SwiGLU transition.
 
     Layer-norms the input, then applies a gated linear unit: the SiLU-activated ``gate_projection``
     modulates the ``value_projection`` before ``output_projection`` maps back to ``hidden_size``.
     The computation is dispatched through
-    [ofoldx.modules.backend][], which selects the OOps-owned implementation or an eager reference.
+    [ofoldx.modules.backend][], which selects the OOps-owned or eager implementation.
+    It returns an update; the containing block owns the residual addition.
 
     Args:
         hidden_size: Input and output hidden width.
@@ -38,36 +37,30 @@ class Transition(nn.Module):
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
         expanded_size = expansion * hidden_size
-        self.norm_input = LayerNorm(hidden_size)
+        self.input_norm = LayerNorm(hidden_size)
         self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)
 
     def forward(self, hidden: Tensor) -> Tensor:
         r"""
-        Normalize, gate, and project the input through the transition block.
+        Normalize, gate, and project one transition update.
 
         Args:
             hidden: `[..., hidden_size]` input activations.
 
         Returns:
             Transition output with the same shape as ``hidden``.
-
-        Examples:
-            >>> import torch
-            >>> transition = Transition(8, expansion=2, operator_backend="eager")
-            >>> transition(torch.randn(1, 4, 8)).shape
-            torch.Size([1, 4, 8])
         """
 
         return dispatch_transition(
             hidden,
-            norm_weight=self.norm_input.weight,
-            norm_bias=self.norm_input.bias,
+            norm_weight=self.input_norm.weight,
+            norm_bias=self.input_norm.bias,
             gate_weight=self.gate_projection.weight,
             up_weight=self.value_projection.weight,
             down_weight=self.output_projection.weight,
-            eps=self.norm_input.eps,
+            eps=self.input_norm.eps,
             operator_backend=self.operator_backend,
         )
 
@@ -105,13 +98,6 @@ class RowwiseDropout(nn.Module):
         Returns:
             Tensor with a dropout mask shared across the row dimension during training, or
             ``hidden`` unchanged in eval mode or when ``probability`` is ``0``.
-
-        Examples:
-            >>> import torch
-            >>> dropout = RowwiseDropout(0.5).eval()
-            >>> hidden = torch.randn(2, 3, 4, 5)
-            >>> torch.equal(dropout(hidden), hidden)
-            True
         """
 
         # Dropout is an identity in eval (and at p=0); short-circuit so we neither waste work nor
@@ -131,6 +117,7 @@ class ConditionedTransition(nn.Module):
     Like [Transition][ofoldx.modules.transition.Transition], but the input norm is an adaptive
     (conditioned) layer norm and the SwiGLU output is scaled by a sigmoid gate projected from the
     conditioning tensor, letting the conditioning both shift the normalization and gate the update.
+    It returns an update; the containing block owns the residual addition.
 
     Args:
         hidden_size: Input and output hidden width.
@@ -173,14 +160,6 @@ class ConditionedTransition(nn.Module):
 
         Returns:
             Conditioned transition output with the same shape as ``hidden``.
-
-        Examples:
-            >>> import torch
-            >>> transition = ConditionedTransition(8, 4, expansion=2)
-            >>> hidden = torch.randn(1, 5, 8)
-            >>> conditioning = torch.randn(1, 5, 4)
-            >>> transition(hidden, conditioning).shape
-            torch.Size([1, 5, 8])
         """
 
         hidden = self.conditioned_norm(hidden, conditioning)

@@ -137,6 +137,20 @@ container attribute, and count use the same noun: `Layer/layers/num_layers` or
 `Block/blocks/num_blocks`. Homogeneous repetition alone does not make a
 composite block a layer.
 
+`Stack` names only a homogeneous repetition container and owns `blocks` and
+`num_blocks`; it does not own a second scientific role. `Transformer`, `Encoder`,
+`Decoder`, and `Trunk` name heterogeneous architectural roles and may contain
+blocks without being renamed to a stack. `Subblock` is not a source-level concept.
+
+Within a residual Transformer-style block, `Attention` and `Transition` name the
+two semantic update branches. `FeedForward` names only the projection,
+activation, and projection computation inside a transition; folding trunks use
+the established term `Transition` rather than parallel `Mlp`, `MLP`, `Ffn`, or
+`FFN` spellings. The block owns branch ordering and outer residual paths. A
+normalization, gate, dropout, or residual remains at the exact mathematical owner
+required by the released architecture; naming consistency never relocates an
+operation or changes an equation.
+
 The remaining package files are similarly predictable: `config.py` follows model
 and component construction order; `processor.py` follows input-to-tensor lowering;
 `pipeline.py` follows call-to-Result execution; `convert.py` follows load,
@@ -218,12 +232,12 @@ The public API introduces no parallel molecular representation or generic orches
 
 OFoldX exposes exactly four top-level task functions:
 
-~~~python
+```python
 ofoldx.fold(...)
 ofoldx.design(...)
 ofoldx.score(...)
 ofoldx.pack(...)
-~~~
+```
 
 The same verbs name Model task methods and task-Pipeline methods. Predict, generate, sample, repack, structure_prediction, binding_affinity, and side_chain_packing are not parallel routing names. A family may expose precisely named expert methods for released computations that do not form another cross-family task.
 
@@ -233,7 +247,7 @@ A heterogeneous input is an explicit MolecularSystem. A tuple that mixes sequenc
 
 The common signatures are:
 
-~~~python
+```python
 def fold(
     input: str | PathLike[str] | PolymerSequence | MolecularSystem | Structure,
     *, model: str | PathLike[str], revision: str | None = None,
@@ -273,7 +287,7 @@ def pack(
     positions: Sequence[ComponentReference] | None = None, num_samples: int = 1,
     seed: int | None = None, generator: torch.Generator | None = None,
 ) -> Any: ...
-~~~
+```
 
 The `Any` return annotation is confined to these dynamically dispatched one-shot
 functions. The selected standard Pipeline returns the shared task Result. A
@@ -366,7 +380,7 @@ callable still requires two completed verticals.
 
 The task-first factory is:
 
-~~~python
+```python
 def pipeline(
     task: Literal["fold", "design", "score", "pack"],
     *, model: str | PathLike[str],
@@ -374,7 +388,7 @@ def pipeline(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Any: ...
-~~~
+```
 
 Both task and model are required. The model reference selects a repository whose
 root is a runnable Model–Processor pair; task selects the biological verb. The
@@ -392,11 +406,11 @@ artifact with the Processor's ordinary constructor dtype.
 
 These forms are deliberately invalid:
 
-~~~python
+```python
 ofoldx.pipeline("ofoldx/rfdiffusion")
 ofoldx.pipeline(model="ofoldx/rfdiffusion")
 ofoldx.pipeline("design", model=loaded_model)
-~~~
+```
 
 Loaded live objects use the explicit constructors in Section 6.
 
@@ -410,7 +424,7 @@ construction or family publication.
 
 OFoldX owns construction, architecture dispatch, loading, and Model/Processor pairing:
 
-~~~python
+```python
 AutoModel(
     pretrained: str | PathLike[str], *, revision: str | None = None,
     token: str | None = None, device: torch.device | str | None = None,
@@ -425,7 +439,7 @@ AutoProcessor(
     token: str | None = None, device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> ConcreteProcessor
-~~~
+```
 
 String or PathLike means a repository. A typed config means fresh construction and
 selects its concrete Model class by exact registered config-class identity. Bare
@@ -434,18 +448,21 @@ configuration is already named by its concrete config class and is constructed
 directly as `ConcreteProcessor(config, device=..., dtype=...)`; a config-less
 Processor is constructed directly without a positional config. `AutoProcessor`
 does not maintain a second Processor-config-to-class registry merely to spell that
-ordinary constructor indirectly. Processor and Config above are collective terms,
-not required nominal base classes. Every registered Model inherits the minimal
+ordinary constructor indirectly. Config above remains a collective term. Every
+concrete Processor inherits the minimal public `ofoldx.Processor` base, which owns
+only runtime device/dtype placement; every registered Model inherits the minimal
 public `ofoldx.Model` base.
 
 `Model.__init__` performs ordinary `nn.Module` initialization once, stores the
-concrete config, and initializes the backend policy. Its default
-`reset_parameters()` delegates to each child Module's native PyTorch initializer;
-an architecture overrides that method when its released initialization differs or
-when it owns parameters directly. The base does not claim a singular device or
-dtype for a potentially mixed or sharded module, and it does not duplicate pair-
-and Pipeline-owned repository writing with a Model-only save API. Placement uses
-`nn.Module.to`; repository writing is specified in Section 7.5.
+concrete config, and initializes the requested backend policy to `"auto"`. A
+concrete constructor builds its complete graph and then calls `post_init()`, which
+invokes the overridable `initialize_parameters()` hook before applying the initial
+backend. The default hook is intentionally empty because ordinary PyTorch child
+Modules initialize themselves during construction; an architecture overrides it
+only for additional released initialization rules. The base does not claim a
+singular device or dtype for a potentially mixed or sharded module, and it does not
+duplicate pair- and Pipeline-owned repository writing with a Model-only save API.
+Placement uses `nn.Module.to`; repository writing is specified in Section 7.5.
 
 AutoModel(pretrained) returns an eval-mode Model. AutoModel(config) returns a normal
 fresh Model without changing its training flag. Runtime device and dtype are not
@@ -467,10 +484,10 @@ audit.
 Classification exists only at genuinely overloaded boundaries. It has one public
 function and no `Reference` class or parallel value hierarchy:
 
-~~~python
+```python
 # ofoldx.references
 def classify_reference(reference: str | PathLike[str]) -> str | Path: ...
-~~~
+```
 
 A PathLike, an existing string path, or a string with an explicit local spelling is
 returned as an expanded `Path`. Explicit local spellings include POSIX absolute and
@@ -504,7 +521,7 @@ intent, while family call signatures and repository-loading details remain open.
 
 Repeated biological inference loads once:
 
-~~~python
+```python
 pipe = ofoldx.pipeline(
     "fold",
     model="ofoldx/alphafold3",
@@ -512,17 +529,17 @@ pipe = ofoldx.pipeline(
     dtype=torch.bfloat16,
 )
 result = pipe.fold("target.cif", num_samples=4, seed=7)
-~~~
+```
 
 Direct paired use loads the objects explicitly:
 
-~~~python
+```python
 model = AutoModel("ofoldx/alphafold3", device="cuda")
 processor = AutoProcessor("ofoldx/alphafold3", device="cuda")
 
 inputs = processor(structure)
 result = model.fold(inputs)
-~~~
+```
 
 The Processor return is the concrete static and biological input for that Model.
 Each concrete Model documents its own explicit raw `forward` signature; the raw
@@ -552,10 +569,10 @@ second public structure object.
 
 Canonical references are flat:
 
-~~~python
+```python
 ComponentReference = tuple[str, int]
 AtomSite(instance_id: str, component_index: int, atom_id: str)
-~~~
+```
 
 `ComponentReference` is `(instance_id, component_index)`. Resolution reads the
 instance's entity ID from `system.instances`, then the ordinary molecular value
@@ -598,7 +615,7 @@ only the smaller partial-observation slice already consumed by released families
 
 The current minimum chemical values are:
 
-~~~python
+```python
 ChemicalAtom(
     atom_id: str,
     element: str,
@@ -630,7 +647,7 @@ ChemicalComponent(
     next_attachment: PolymerAttachment | None = None,
     reference_coordinates: tuple[tuple[float, float, float] | None, ...] | None = None,
 )
-~~~
+```
 
 `ChemicalComponent` has no polymer-membership field. Chain context belongs to the
 containing `PolymerSequence`; any family-specific row classification, including
@@ -735,7 +752,7 @@ table (when a source declaration is absent, an importer may still fall back to
 format-local, component-ID-keyed inference — AF3 `guess_polymer_type`, OFoldX
 `io/structure.py:_component_polymer_type`; §3.5.2):
 
-~~~python
+```python
 PolymerType = Literal["protein", "rna", "dna", "dna_rna_hybrid", "pna"]   # 5 members; "pna" independent — recognized+lowered-differently by released parsers; no shipped from_one_letter path, but explicit ChemicalComponents still construct it
 
 @dataclass(frozen=True)
@@ -763,14 +780,14 @@ class Molecule:
     bonds: frozenset[MoleculeBond] = frozenset()
     @staticmethod
     def from_smiles(smiles: str, *, atom_ids: tuple[str, ...] | None = None) -> Molecule: ...
-~~~
+```
 
 The ordered tuples hold exact `ChemicalComponent` occurrences, not component IDs that
 require a separate lookup table. Repeated components are ordinary repeated values, and
 occurrence index disambiguates them. A D-polypeptide remains `polymer_type="protein"`;
 handedness belongs to exact component stereochemistry, not a second polymer kind. The
 candidate `PolymerType` retains an independent `"pna"` (a confirmed-correct 5th member):
-PNA is recognized and lowered *differently* by the released *parsing* pipelines (AF3 →
+PNA is recognized and lowered _differently_ by the released _parsing_ pipelines (AF3 →
 peptide/protein via `mmcif_names.py`; Protenix → nucleic via `constants.py`), so folding
 it into another polymer kind would erase a real canonical distinction. `"pna"` is
 nonetheless **not constructible via the shipped `from_one_letter` convenience** — there is
@@ -780,7 +797,7 @@ still carry a PNA occurrence. So its `from_one_letter` producer and concrete per
 lowering stay reopened.
 
 **Entity ID is not a field.** Neither value carries an `entity_id`. An entity ID is
-exclusively the *key* of `MolecularSystem.entities` and the corresponding *value* of
+exclusively the _key_ of `MolecularSystem.entities` and the corresponding _value_ of
 `MolecularSystem.instances` (§3.1, §3.4.1). A bare value carries no identity; whoever
 inserts it chooses its key (default `"A"`, §3.1). `EntityInstance` remains absent because
 the two strings it would wrap are already the key and value of the instance mapping.
@@ -809,7 +826,7 @@ connectivity is `ChemicalBond` edges built by the private RDKit importer — it 
 only bridges two occurrences. Ordinary RDKit failures fail.
 
 `MoleculeBond` carries the same numeric `order` (float, default `1.0`), `aromatic`, and
-stereo facts as `ChemicalBond`, across two *distinct* occurrences in one `Molecule`.
+stereo facts as `ChemicalBond`, across two _distinct_ occurrences in one `Molecule`.
 `Molecule.__post_init__` validates endpoint resolution, differing occurrences, no
 self-loops, and no duplicate physical edges; constructing a `MoleculeBond` adds a pure
 edge and never edits or removes atoms. `ChemicalBond` owns topology inside one component;
@@ -820,11 +837,11 @@ edge and never edits or removes atoms. `ChemicalBond` owns topology inside one c
 ID, `_encode_entity(entity)` serializes only the entity's own fields and must not emit
 `entity_id` or `monomers`:
 
-~~~
+```
 PolymerSequence -> {"kind":"polymer_sequence", "polymer_type": …, "components": [_encode_component(c) …]}
 Molecule        -> {"kind":"molecule", "components": [_encode_component(c) …],
                     "bonds": [_encode_molecule_bond(b) for b in sorted(entity.bonds, key=_molecule_bond_key)]}
-~~~
+```
 
 `_decode_entity(value)` reconstructs with no `entity_id` argument; the required-key sets
 are `{"kind","polymer_type","components"}` and `{"kind","components","bonds"}`. The entity
@@ -884,13 +901,13 @@ partitions remain reopened.
 An assembly stores ordinary molecular entity definitions and an insertion-ordered
 mapping from stable instance IDs to those definitions:
 
-~~~python
+```python
 MolecularSystem(
     entities: dict[str, PolymerSequence | Molecule],
     instances: dict[str, str],  # instance_id -> entity_id
     bonds: frozenset[SystemBond] = frozenset(),
 )
-~~~
+```
 
 At construction, every instance resolves to one entity and every stored entity has
 at least one instance. Equivalently,
@@ -912,7 +929,7 @@ normalizer, or automatic rescan.
 
 The bounded direct component surface is:
 
-~~~python
+```python
 ComponentReference = tuple[str, int]
 
 @dataclass(frozen=True)
@@ -922,7 +939,7 @@ class AtomSite:
     atom_id: str
 
 system.component(reference: ComponentReference) -> ChemicalComponent
-~~~
+```
 
 An `AtomSite` uses ordinary generated equality and hashing over all three fields;
 it does not sort, normalize case, or rewrite identifiers. It identifies an atom in
@@ -974,10 +991,10 @@ This rule applies only to default linear `PolymerSequence` adjacency. It does no
 apply to `Molecule`, and a stored `SystemBond` does not activate an attachment or
 remove a leaving atom.
 
-~~~python
+```python
 system.atom(site: AtomSite) -> ChemicalAtom
 system.iter_atoms() -> Iterator[tuple[AtomSite, ChemicalAtom]]
-~~~
+```
 
 `atom()` resolves a declared atom that survives this one retained-atom predicate.
 `iter_atoms()` follows instance insertion order, component order, and atom
@@ -1009,11 +1026,11 @@ below).
 `SystemBond` is one resolved edge between exact `AtomSite` endpoints. Its origin is one
 of the five members:
 
-~~~python
+```python
 BondOrigin = Literal[
     "component", "molecule", "polymer_rule", "source", "user",
 ]
-~~~
+```
 
 These map exactly to the sources `iter_bonds()` can emit: the three intrinsic classes
 (`component`, `molecule`, `polymer_rule`) and the stored assembly overlays (`source`,
@@ -1033,9 +1050,9 @@ non-mutating accessor added to committed `molecular.py`, parallel to `iter_atoms
 non-deduplicated stream, not a completed graph (cross-layer duplicate-edge dedup and
 intrinsic-stereo lifting stay reopened, per the Status above):
 
-~~~python
+```python
 def iter_bonds(self) -> Iterator[SystemBond]: ...
-~~~
+```
 
 It yields a `SystemBond` for each of four edge classes:
 
@@ -1111,7 +1128,7 @@ The single remaining open sub-point is not an I/O question. It is the codec's
 system-ordering/persistence facet — whether `MolecularSystem.instances` serializes as an
 ordered `(instance_id, entity_id)` entry array rather than a plain JSON object whose keys
 the exchange writer's recursive `json.dumps(..., sort_keys=True)` reorders (§3.4.1, "Open
-questions"). That facet governs only instance *declaration order* carried through the
+questions"). That facet governs only instance _declaration order_ carried through the
 `_ofoldx_structure` payload, not the read/exchange-write/`LossReport` surface frozen in
 §3.5.3. Git history preserves the discarded proposal.
 
@@ -1127,7 +1144,7 @@ are now frozen as well: the structure-payload JSON shape and the mmCIF numbering
 selection are settled in §3.5.3, and parsing, exchange-identity writing,
 altloc/model/assembly materialization, lossy-write reporting, and the importer's
 source-category derivation are frozen there too. The one facet that stays open is the
-codec's *system-ordering* persistence — the `MolecularSystem.instances` ordered-entry-array
+codec's _system-ordering_ persistence — the `MolecularSystem.instances` ordered-entry-array
 shape owned by §3.4.1 — which fixes instance declaration order but changes neither this
 carrier nor the §3.5.3 read/write/`LossReport` surface (see "Frozen by §3.5.3; one facet
 stays open" below).
@@ -1136,7 +1153,7 @@ A Structure is one coordinate realization of one already-materialized
 MolecularSystem. The one bounded source fact required by released MPNN families is
 an instance-local residue number:
 
-~~~python
+```python
 @dataclass(frozen=True)
 class ResidueNumber:
     number: int
@@ -1159,7 +1176,7 @@ class Structure:
         occupancy: NDArray | None = None,
         residue_numbers: dict[ComponentReference, ResidueNumber] | None = None,
     ) -> None: ...
-~~~
+```
 
 `sites` is the complete and only row axis of the three arrays. Its order is
 caller-owned and need not equal system traversal order. Every site is unique and
@@ -1222,14 +1239,14 @@ sufficient when fixed tensor alignment is useful.
 
 `sites` and `coordinate_mask` already state materialization, so the following are
 explicitly removed and must not be reintroduced as a `Structure` field without a proven
-released-family *input* consumer:
+released-family _input_ consumer:
 
-| Removed | Rationale |
-|---|---|
-| `atom_layout` | `sites` + `coordinate_mask` already state materialization; a mask-false row and an omitted row have no distinct canonical meaning. The `observed`/`complete_heavy`/`complete_all` knob is an I/O element-filter choice, not a carrier fact. |
-| `b_factor` | No audited family consumes a B-factor **input**. AF3/Boltz/Protenix use the B column only as an *export encoding* for predicted confidence; ModelCIF owns separate QA categories. Confidence stays a Result Score or Metric — it is not a canonical B-factor merely because a PDB or mmCIF exporter encodes it in that column. |
-| `altloc_ids` | One source altloc realization becomes one Structure; altloc materialization belongs to the §3.5.3 I/O reader (`read_structure` selects one residue-consistent altloc; `read_structures` expands the combinations), not the coordinate carrier. |
-| `source_identities: tuple[SourceAtomIdentity, ...]` **and the `SourceAtomIdentity` class** | The broad per-atom label/auth asym/seq/comp/atom/group bag is rejected. The one independently evidenced source fact is instance-local residue numbering, now carried by `residue_numbers`; `ComponentReference` already names the instance. |
+| Removed                                                                                    | Rationale                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `atom_layout`                                                                              | `sites` + `coordinate_mask` already state materialization; a mask-false row and an omitted row have no distinct canonical meaning. The `observed`/`complete_heavy`/`complete_all` knob is an I/O element-filter choice, not a carrier fact.                                                                                    |
+| `b_factor`                                                                                 | No audited family consumes a B-factor **input**. AF3/Boltz/Protenix use the B column only as an _export encoding_ for predicted confidence; ModelCIF owns separate QA categories. Confidence stays a Result Score or Metric — it is not a canonical B-factor merely because a PDB or mmCIF exporter encodes it in that column. |
+| `altloc_ids`                                                                               | One source altloc realization becomes one Structure; altloc materialization belongs to the §3.5.3 I/O reader (`read_structure` selects one residue-consistent altloc; `read_structures` expands the combinations), not the coordinate carrier.                                                                                 |
+| `source_identities: tuple[SourceAtomIdentity, ...]` **and the `SourceAtomIdentity` class** | The broad per-atom label/auth asym/seq/comp/atom/group bag is rejected. The one independently evidenced source fact is instance-local residue numbering, now carried by `residue_numbers`; `ComponentReference` already names the instance.                                                                                    |
 
 One source file may contain several models, altloc realizations, or assemblies.
 Materializing those values and retaining exchange identities belong to the §3.5.3
@@ -1265,9 +1282,9 @@ Heavy-atom realization is an inline element filter, not an API. There is no
 materialization. A consumer wanting a hydrogen-free axis filters inline over
 `iter_atoms()`:
 
-~~~python
+```python
 heavy_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
-~~~
+```
 
 `iter_atoms()` already applies the §3.4.2 retained-atom predicate, so this also excludes
 hidden leaving atoms; the consumer adds only the tests it needs (`element != "H"` plus
@@ -1277,13 +1294,13 @@ complete-heavy, or complete-all traversal.
 Polymer classification on import is producer/source-driven, not chemistry-driven.
 `ChemicalComponent` carries no polymer-membership fact (§3.2), and the package exposes no
 reusable component- or module-level polymer-classification helper.
-`PolymerSequence.polymer_type` is a fact *declared by the producer* that constructs the
+`PolymerSequence.polymer_type` is a fact _declared by the producer_ that constructs the
 sequence; the primary import path takes it from the producer's own source declaration,
 not from the chemistry of its component occurrences. When that declaration is absent, an
 importer may fall back to a format-local, component-ID-keyed heuristic (AF3
 `guess_polymer_type`; OFoldX `io/structure.py:_component_polymer_type`). The frozen
 boundary is only that `ChemicalComponent` carries no polymer-membership fact and no
-*public* classifier is exposed — never that a component ID is unusable inside an
+_public_ classifier is exposed — never that a component ID is unusable inside an
 importer. The codec serializes `PolymerSequence.polymer_type` but emits and requires
 no `ChemicalComponent.polymer_types` key.
 
@@ -1433,7 +1450,7 @@ MSA, MSACollection, and Template are ordinary evidence records supplied beside t
 primary input. Their explicit entity and instance IDs close over that primary
 `MolecularSystem`; they do not retain Python object identity or query a registry:
 
-~~~python
+```python
 MSA(
     entity_id: str,
     unpaired_sequences: tuple[str, ...],
@@ -1457,7 +1474,7 @@ Template(
     structure: Structure,
     alignments: tuple[TemplateAlignment, ...],
 )
-~~~
+```
 
 An MSA is bound to one entity ID in the primary `MolecularSystem`. It retains the
 complete unpaired and paired source pools separately, including rows not selected
@@ -1508,9 +1525,9 @@ Search is a separate acquisition operation. Source database, taxonomy, search se
 
 The candidate ordinary file boundary is:
 
-~~~python
+```python
 read_msa(path, *, entity_id: str) -> MSA
-~~~
+```
 
 It uses MultiMolecule sequence-file records and produces an unpaired pool plus a
 query-only paired pool. A separate acquisition/pairing operation may supply paired
@@ -1591,7 +1608,7 @@ is shared and unchanged.
 A PlacementSpec is an ordered mapping from a declaration-group label to an ordered mapping
 from a placement identity to one placement value:
 
-~~~python
+```python
 PolymerType        = Literal["protein", "rna", "dna", "dna_rna_hybrid"]
 ComponentReference = tuple[str, int]        # (realized_instance_id, component_index); UNCHANGED
 
@@ -1612,7 +1629,7 @@ PlacementValue = GeneratedSegment | ExistingSpan
 
 PlacementSpec = dict[str, dict[str, PlacementValue]]
 #         declaration_group -> placement_id (globally unique) -> value
-~~~
+```
 
 **Identity.** A placement's identity is its caller-chosen `placement_id`, the inner
 mapping key, which is **globally unique across the whole PlacementSpec** and validated as
@@ -1631,7 +1648,7 @@ ODesign's ligand `num_atoms` remains a family argument and does not justify a sh
 names only `(placement_id, offset)`; `placement_id` is globally unique so the
 reference resolves without the outer key:
 
-~~~python
+```python
 @dataclass(frozen=True)
 class SymbolicResidueSite:
     placement_id: str          # the globally-unique inner key; resolves WITHOUT the outer group
@@ -1641,7 +1658,7 @@ class SymbolicResidueSite:
 class SymbolicAtomSite:
     residue: SymbolicResidueSite
     atom_id: str
-~~~
+```
 
 This is a **rename** of today's 2-field `(segment_id, offset)`, not a widening; the
 `segment_id → placement_id` rename keeps the arity, so every family reference site
@@ -1665,10 +1682,10 @@ forbidden.
 **Output surface.** Declaration order is semantic and is never recovered by sorting
 ids. After realization a result exposes:
 
-~~~python
+```python
 placement_map: dict[str, dict[str, tuple[ComponentReference, ...]]]
 #              declaration_group -> placement_id -> realized OUTPUT occurrences, in order
-~~~
+```
 
 The outer and inner mappings preserve the declared group and placement order. Every
 declared placement appears, including a zero-length placement whose value is an empty
@@ -1744,7 +1761,7 @@ these two biological values. This subsection freezes only their public records;
 each concrete Processor owns reference resolution, family alphabet support, and
 lowering.
 
-~~~python
+```python
 @dataclass(frozen=True)
 class AllowedResidueIdentities:
     positions: tuple[ComponentReference, ...]
@@ -1753,7 +1770,7 @@ class AllowedResidueIdentities:
 @dataclass(frozen=True)
 class TiedResidueIdentities:
     groups: tuple[tuple[ComponentReference, ...], ...]
-~~~
+```
 
 These are plain immutable records with no `intent`, `weight`, tolerance,
 satisfaction method, `__post_init__`, or generic validator. `positions` remains the
@@ -1827,9 +1844,9 @@ bounded Processor argument. This subsection freezes neither partial-diffusion
 sequence provision, structure inpainting, secondary-structure specification, nor
 the complete PlacementSpec contract.
 
-~~~python
+```python
 inpaint_sequence: Sequence[ComponentReference] = ()
-~~~
+```
 
 Each reference names one existing protein component occurrence in the primary
 input whose identity is hidden from the denoiser. Existing-span identities remain
@@ -1887,7 +1904,7 @@ be frozen; neither a generic context bag nor a PreparedInput is implied.
 #### 3.7.4 Frozen constraint layer — SymbolicBond, Hotspot, Contact
 
 Status: **FROZEN** — owner verdicts D1–D3 ratified 2026-07-19. This subsection
-freezes the *input-side* constraint records that ride on top of the frozen
+freezes the _input-side_ constraint records that ride on top of the frozen
 placement core (`#### Placement core`) and the exact covalent surface
 (`ofoldx.data.molecular`): the pre-realization covalent link `SymbolicBond`
 (`ofoldx.data.bonds`) and the target-conditioning pair `Hotspot` / `Contact`
@@ -1903,7 +1920,7 @@ the placement freeze's uniqueness and `resolve()` invariants carry the constrain
 for free. Two endpoint granularities are shared, both pure re-uses of the placement
 vocabulary:
 
-~~~python
+```python
 # atom-granularity endpoint (ofoldx.data.bonds; re-exported as AtomEndpoint in conditions)
 #   AtomSite       — an EXISTING realized atom; its (instance_id, component_index) IS a ComponentReference
 #   SymbolicAtomSite — a GENERATED atom over the frozen 2-field SymbolicResidueSite(placement_id, offset)
@@ -1916,7 +1933,7 @@ ResidueEndpoint: TypeAlias = ComponentReference | str | SymbolicResidueSite
 #   SymbolicResidueSite  — one GENERATED residue (placement_id, offset)
 AtomEndpoint: TypeAlias = AtomSite | SymbolicAtomSite      # == SymbolicBondSite, for atom-reaching families
 Endpoint:     TypeAlias = ResidueEndpoint | AtomEndpoint
-~~~
+```
 
 The resolution chain is closed by the placement freeze:
 `SymbolicAtomSite → SymbolicResidueSite → resolve() → ComponentReference → AtomSite`.
@@ -1924,7 +1941,7 @@ The resolution chain is closed by the placement freeze:
 **D1 / D2 — `SymbolicBond` (frozen `ofoldx.data.bonds`).** A covalent link declared
 BEFORE realization, whose endpoints may be generated atoms.
 
-~~~python
+```python
 @dataclass(frozen=True)
 class SymbolicBond:
     site_a: SymbolicBondSite
@@ -1934,7 +1951,7 @@ class SymbolicBond:
     stereo: str | None = None
     leaving_a: frozenset[str] = frozenset()   # atom_ids deleted from site_a on bond formation
     leaving_b: frozenset[str] = frozenset()   # atom_ids deleted from site_b
-~~~
+```
 
 - **D2 — physical identity is the UNORDERED endpoint set** (`endpoints` → the
   `frozenset` of both endpoints), mirroring `SystemBond` (whose identity is enforced
@@ -1960,7 +1977,7 @@ class SymbolicBond:
 **D3 — `Hotspot` and `Contact` are two orthogonal records, not one toggle** (frozen
 `ofoldx.data.conditions`).
 
-~~~python
+```python
 @dataclass(frozen=True)
 class Hotspot:
     residues: tuple[Endpoint, ...]            # per-residue target label; NO distance; single-sided
@@ -1971,7 +1988,7 @@ class Contact:
     side_b: tuple[Endpoint, ...]
     cutoff_angstrom: float                    # identity IS the distance; symmetric in side_a/side_b
     tolerance_angstrom: float = 0.0
-~~~
+```
 
 - **`Hotspot` is a first-class distance-free label**, not a degenerate `Contact`. The
   generated partner is implicit (the whole design). All four families already own the
@@ -1985,7 +2002,7 @@ class Contact:
   is symmetric: swapping `side_a` / `side_b` names the same physical contact.
 - **Family-owned, kept OFF the frozen core:** `weight` (px/od), directional `kind`
   (BoltzGen `pocket>binder` / `binder>pocket`), the negative `not_binding` label
-  (BoltzGen), the allowed cutoff/threshold *values* and their enforcement, hard/soft
+  (BoltzGen), the allowed cutoff/threshold _values_ and their enforcement, hard/soft
   `intent`, and the lowering itself. A family that needs any of these wraps the frozen
   record in its own condition envelope.
 
@@ -2001,12 +2018,12 @@ inherits the §3.7.3 "mask/constrain all realized placements" behavior rather th
 contradicting it.
 
 **Do not unify (load-bearing).** This freeze constrains only the INPUT spec. It is
-NOT license to unify the *output-side* confidence metrics: the per-lineage
+NOT license to unify the _output-side_ confidence metrics: the per-lineage
 `has_clash`, the pTM-with-`d0` variants, and the family post-generation
 verifications (ODesign's §B hard-distance check that reads `Contact.cutoff_angstrom` /
 `tolerance_angstrom`; BoltzGen's N×N `contact_conditioning` classes) stay per-lineage
 faithful to each upstream and remain distinct. The constraint layer freezes the shared
-*question* ("the input asks for these residues to be within `cutoff`"); each family's
+_question_ ("the input asks for these residues to be within `cutoff`"); each family's
 metric independently answers "did my output satisfy it, by my faithful definition."
 A shared `Contact.cutoff_angstrom` is one input field with three faithful family
 lowerings (px hard-pins 8 Å, od §B verifier, bg threshold matrix), not evidence the
@@ -2037,7 +2054,7 @@ parser mode, generic option, or lowest-common-denominator support mask.
 
 The candidate public surface retained from the previous Tik is:
 
-~~~python
+```python
 PolymerType = Literal["protein", "rna", "dna", "dna_rna_hybrid"]
 ComponentReference = tuple[str, int]
 
@@ -2057,12 +2074,12 @@ Structure(
     occupancy=None,
     residue_numbers=None,
 )
-~~~
+```
 
 Only the following chemical-leaf fields remain candidates in this slice because
 its resolution and MPNN consumers use them directly:
 
-~~~python
+```python
 ChemicalAtom.atom_id: str
 ChemicalAtom.element: str
 PolymerAttachment.atom_id: str
@@ -2078,7 +2095,7 @@ MoleculeBond.atom_b: str
 SystemBond.site_a: AtomSite
 SystemBond.site_b: AtomSite
 SystemBond.stereo_sites: tuple[AtomSite, AtomSite] | None
-~~~
+```
 
 `ChemicalComponent.polymer_types` does not exist: polymer membership belongs to a
 `PolymerSequence` occurrence. `PolymerAttachment` carries neither `order` nor
@@ -2141,9 +2158,9 @@ For the shared ProteinMPNN/LigandMPNN lowering in this cycle, coordinate validit
 and design selection are separate Processor facts. Their Processors accept the
 ordinary family argument:
 
-~~~python
+```python
 positions: Sequence[ComponentReference] | None = None
-~~~
+```
 
 Validity belongs to the concrete Processor/Model pair; selection is user intent.
 For example, the released full-backbone ProteinMPNN path requires finite N/CA/C/O,
@@ -2262,18 +2279,19 @@ a family inventory question rather than a convention to assume.
 only for Processors with persistent lowering values; a config-less Processor does
 not invent an empty config. Every registered Model inherits the minimal public
 `ofoldx.Model` lifecycle base, which stores its concrete config and owns backend
-selection without defining or hiding its scientific signature. Processors and
-Configs do not require nominal bases.
+selection without defining or hiding its scientific signature. Every concrete
+Processor inherits `ofoldx.Processor` for runtime device/dtype placement; concrete
+Processor call signatures and Config types remain family-owned.
 
 Every concrete Model that is constructible through `AutoModel` has the following
 Hub-loadable constructor shape:
 
-~~~python
+```python
 class ConcreteModel(ofoldx.Model):
     config_class = ConcreteModelConfig
 
     def __init__(self, config: ConcreteModelConfig | None = None) -> None: ...
-~~~
+```
 
 `config=None` means the concrete default config.
 
@@ -2352,9 +2370,9 @@ container. The Processor does not construct a canonical Result.
 Concrete Processors accept runtime device and dtype requests at construction and
 support ordinary mutable placement through:
 
-~~~python
+```python
 processor.to(device=..., dtype=...) -> processor
-~~~
+```
 
 Tensor outputs are produced on the requested device. Device and runtime dtype are
 not `ProcessorConfig` fields, and placement is not inferred by scanning Model
@@ -2504,18 +2522,18 @@ parse route also feeds LigandMpnn and the membrane MPNN variants, so it belongs 
 the existing public MPNN module rather than to Packer ownership or a rejected
 generic structure reader:
 
-~~~python
+```python
 # ofoldx.io
 def read_mpnn_pdb(
     path: str | PathLike[str],
     *,
     chains: Sequence[str] | None = None,
 ) -> Structure: ...
-~~~
+```
 
 The Processor accepts the common input union and delegates only its path branch:
 
-~~~python
+```python
 def __call__(
     self,
     input: Structure | str | PathLike[str],
@@ -2525,7 +2543,7 @@ def __call__(
     use_atom_context: bool = True,
     filter_by_occupancy: bool = True,
 ) -> MpnnPackerInput: ...
-~~~
+```
 
 `processor(path, ...)` is exactly `processor(read_mpnn_pdb(path), ...)`; no path-only
 payload survives canonical construction. The reader interprets plain PDB text and
@@ -2758,7 +2776,7 @@ therefore a call argument, not `ProcessorConfig` state.
 `MpnnPackerInput` directly owns the tensors and decode associations needed by
 the Model:
 
-~~~python
+```python
 @dataclass(eq=False)
 class MpnnPackerInput:
     backbone_coordinates: Tensor
@@ -2774,7 +2792,7 @@ class MpnnPackerInput:
     pack_mask: Tensor
     structure: Structure
     component_references: tuple[ComponentReference, ...]
-~~~
+```
 
 `structure` is the canonical target-identity Structure after the explicit
 partition above.
@@ -2788,7 +2806,7 @@ than treating arbitrary absolute integers as scientific values.
 
 The public tensor operations are:
 
-~~~python
+```python
 def encode(
     self,
     input: MpnnPackerInput,
@@ -2834,7 +2852,7 @@ def pack(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> PackResult: ...
-~~~
+```
 
 `encode` and `decode` are public in the released Model and remain public here.
 The explicit coordinates on `encode` are not redundant with
@@ -2888,7 +2906,7 @@ standalone `pack` continues to default to one result.
 
 The raw outputs retain the values needed by direct scientific callers:
 
-~~~python
+```python
 @dataclass(eq=False)
 class MpnnPackerOutput:
     mean: Tensor
@@ -2905,7 +2923,7 @@ class MpnnPackerSamplingOutput:
     concentration: Tensor
     mix_logits: Tensor
     input_chi_sin_cos: Tensor
-~~~
+```
 
 These dataclasses name related tensors; they retain ordinary positional or keyword
 construction and ordinary dataclass representations. `eq=False` is the one
@@ -2934,13 +2952,13 @@ round-trip contract.
 The public family writer is symmetric with `read_pdb` and consumes one complete
 task output:
 
-~~~python
+```python
 # ofoldx.models.mpnn_packer.pdb, reexported by ofoldx.models.mpnn_packer
 def write_pdb(
     prediction: PackPrediction,
     path: str | PathLike[str],
 ) -> None: ...
-~~~
+```
 
 One prediction maps to one file. A caller with several samples loops over
 `result.predictions` and chooses each path explicitly. The writer does not accept a
@@ -2991,7 +3009,7 @@ Because the released call controls exceed the common pack signature, its reposit
 uses `MpnnPackerPipeline`. The root pair is still exactly the packer Model
 and Processor:
 
-~~~python
+```python
 def pack(
     self,
     input: Structure | str | PathLike[str],
@@ -3006,7 +3024,7 @@ def pack(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> PackResult: ...
-~~~
+```
 
 `repack_everything` is not a second standalone selection mechanism. A composed
 design-to-pack Pipeline may translate its concrete designer selection to
@@ -3027,7 +3045,7 @@ composition base, protocol, mode, factory, or manifest.
 The Packer Pipeline nevertheless owns the one biological batch operation proven by
 all five routes:
 
-~~~python
+```python
 def pack_sequences(
     self,
     input: Structure | str | PathLike[str],
@@ -3042,7 +3060,7 @@ def pack_sequences(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[PackResult, ...]: ...
-~~~
+```
 
 This is one source Structure, one selected-position set, and an ordered set of
 target protein sequences. The path branch parses once. Each target is lowered by
@@ -3075,7 +3093,7 @@ different coordinate-feature graph. They share one scientific Model–Processor
 pair. Solubility and training provenance are learned weights, not runtime modes;
 CA-only is an architecture and lowering fact:
 
-~~~python
+```python
 class ProteinMpnnConfig(Config):
     hidden_size: int = 128
     num_encoder_layers: int = 3
@@ -3086,7 +3104,7 @@ class ProteinMpnnConfig(Config):
 
 class ProteinMpnnProcessorConfig(Config):
     ca_only: bool = False
-~~~
+```
 
 The released graph has only one usable width. Its nominal node, edge, and hidden
 dimensions fail when unequal. OFoldX therefore has no false `edge_feature_size`
@@ -3104,7 +3122,7 @@ wrapper. Protein, Ligand, and Membrane also have two exactly identical raw tenso
 outputs, so those three real consumers use one concrete shared spelling in
 `ofoldx.modules.mpnn` rather than six family aliases:
 
-~~~python
+```python
 @dataclass(eq=False)
 class ProteinMpnnInput:
     backbone_coordinates: Tensor
@@ -3142,7 +3160,7 @@ class MpnnSamplingOutput:
     log_probabilities: Tensor
     sampling_probabilities: Tensor
     decoding_ranks: Tensor
-~~~
+```
 
 These are concrete MPNN tensor records, not bases or a generic output framework.
 The raw output meaning is identical across the three graphs. Sampling vocabulary
@@ -3188,7 +3206,7 @@ The public expression selects the arm; no provenance bit or runtime reader mode 
 stored. Their real path-specific controls live on explicit methods rather than a
 sentinel or an argument that is inert for half of a union.
 
-~~~python
+```python
 def __call__(
     self,
     input: Structure | str | PathLike[str],
@@ -3238,7 +3256,7 @@ def process_pdb(
     pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
     pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
 ) -> ProteinMpnnInput: ...
-~~~
+```
 
 `__call__(path)` delegates to `process_pdb(path, chains=None)` and
 `__call__(structure)` delegates to
@@ -3254,7 +3272,7 @@ wrapper or Protein-specific `read_pdb`.
 The one-pair concrete Pipeline owns design, the original scalar score protocol,
 and four distinct probability computations:
 
-~~~python
+```python
 class ProteinMpnnPipeline:
     def __init__(
         self,
@@ -3345,7 +3363,7 @@ class ProteinMpnnPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult: ...
-~~~
+```
 
 Each method lowers once and calls one matching Model operation once. `sequence`
 belongs only to alternate-sequence scalar scoring. `positions` selects generated
@@ -3402,9 +3420,9 @@ Structure arm and therefore also selects that reader's first-model, blank/A-altl
 gzip, hybrid36, static-chemistry, and retained-occupancy semantics. The two public
 expressions are intentionally not equivalent:
 
-~~~python
+```python
 processor(path) != processor(read_mpnn_pdb(path))
-~~~
+```
 
 Validity and selection remain independent. `positions=None` selects all valid
 protein occurrences, an empty sequence selects none, duplicates are idempotent,
@@ -3422,7 +3440,7 @@ in Model input or Results.
 
 The public Model surface is:
 
-~~~python
+```python
 def encode(
     self,
     input: ProteinMpnnInput,
@@ -3525,7 +3543,7 @@ def design(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> ProteinMpnnDesignResult: ...
-~~~
+```
 
 Each operation that encodes coordinates exposes `backbone_noise`; it is an
 inference operation control in Å, not checkpoint training metadata. Nonzero noise
@@ -3636,11 +3654,11 @@ all-infinity tensor merely to represent no evidence.
 
 ProteinMpnn uniquely returns its native input sequence score with a design:
 
-~~~python
+```python
 @dataclass(eq=False)
 class ProteinMpnnDesignResult(DesignResult):
     input_score: ScoreResult
-~~~
+```
 
 `score` returns only `designed_sequence_nll` and `global_sequence_nll`, each with
 ordered decoding-order values in `Score.evaluations`, explicit canonical scope,
@@ -3664,7 +3682,7 @@ Only ProteinMPNN's inspected training surface proves objective ownership. It
 publishes two ordinary differentiable functions in
 `ofoldx.models.proteinmpnn.objectives`:
 
-~~~python
+```python
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor: ...
 
 def smoothed_loss(
@@ -3673,7 +3691,7 @@ def smoothed_loss(
     *,
     weight: float = 0.1,
 ) -> Tensor: ...
-~~~
+```
 
 Both return the unreduced per-row loss with shape `sequence_tokens.shape`.
 `smoothed_loss` adds `weight / 21` to the one-hot target and renormalizes each row
@@ -3704,7 +3722,7 @@ operation in Section 4.6, candidate × pack cardinality, selected-only/full
 repacking, and exact RNG order support this one explicit live composition. Soluble
 weights change the assembled designer artifact, not the composition class.
 
-~~~python
+```python
 class ProteinMpnnDesignAndPackPipeline:
     def __init__(
         self,
@@ -3749,7 +3767,7 @@ class ProteinMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]: ...
-~~~
+```
 
 A path is parsed exactly once with `ofoldx.io.read_mpnn_pdb`; that canonical
 `Structure` is the only source given to both stages. The designer stage lowers it
@@ -3760,10 +3778,10 @@ invoking the matching Model design operation. It intentionally does not call
 numeric-gap, designed-chain-first path arm. The following expressions are therefore
 not interchangeable:
 
-~~~python
+```python
 ProteinMpnnDesignAndPackPipeline(...).design(path)
 ProteinMpnnPipeline(...).design(path)
-~~~
+```
 
 The first expression is the released shared-parser composition route; the second
 is the standalone original Protein route. This is observable scientific lowering,
@@ -3804,7 +3822,7 @@ dependency or behavior pin.
 The four checkpoints were trained at four coordinate-noise levels, but that label
 does not change the executable graph. They share one pair:
 
-~~~python
+```python
 class LigandMpnnConfig(Config):
     hidden_size: int = 128
     num_encoder_layers: int = 3
@@ -3814,7 +3832,7 @@ class LigandMpnnConfig(Config):
 
 class LigandMpnnProcessorConfig(Config):
     num_context_atoms: int = 25
-~~~
+```
 
 The released graph has one usable node/edge/hidden width. Its nominal independent
 width arguments fail when unequal, so OFoldX retains one `hidden_size` rather than
@@ -3834,7 +3852,7 @@ Fixed side-chain coordinates are not perturbed.
 The direct input is an ordinary aligned tensor record. Raw forward and sampling
 return the shared `MpnnOutput` and `MpnnSamplingOutput` frozen in Section 4.7:
 
-~~~python
+```python
 @dataclass(eq=False)
 class LigandMpnnInput:
     backbone_coordinates: Tensor
@@ -3855,7 +3873,7 @@ class LigandMpnnInput:
     tied_weights: Tensor | None = None
     allowed_token_mask: Tensor | None = None
     logit_bias: Tensor | None = None
-~~~
+```
 
 The canonical Processor operation owns one Structure, so its tensor batch is one.
 `backbone_coordinates` is `[1, L, 4, 3]` in N/CA/C/O order. Context tensors are
@@ -3900,7 +3918,7 @@ The root Model owns the released feature Module directly; a
 
 The Processor consumes only inputs used by this pair:
 
-~~~python
+```python
 def __call__(
     self,
     input: Structure | str | PathLike[str],
@@ -3916,7 +3934,7 @@ def __call__(
     ligand_interface_cutoff: float = 8.0,
     filter_by_occupancy: bool = True,
 ) -> LigandMpnnInput: ...
-~~~
+```
 
 There is no alternate-sequence argument: the released LigandMPNN scoring command
 scores the input sequence only. There are no MSA, template, MolecularSystem,
@@ -3973,7 +3991,7 @@ contradictions. No topology pre-scan or satisfaction report is added.
 
 The public Model operations are:
 
-~~~python
+```python
 def encode(
     self,
     input: LigandMpnnInput,
@@ -4064,7 +4082,7 @@ def design(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> DesignResult: ...
-~~~
+```
 
 LigandMpnn exposes four named probability computations.
 `autoregressive_probabilities` is native-sequence-conditioned autoregressive
@@ -4131,7 +4149,7 @@ as frozen for ProteinMpnn; entities from different originals never merge.
 
 The one-pair concrete Pipeline exposes only the released biological operations:
 
-~~~python
+```python
 class LigandMpnnPipeline:
     def __init__(
         self,
@@ -4219,7 +4237,7 @@ class LigandMpnnPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult: ...
-~~~
+```
 
 Each Pipeline method processes once and invokes one matching Model task method.
 `ligand_interface_cutoff` belongs only to design, whose Result publishes an
@@ -4256,7 +4274,7 @@ generic workflow, shared composition base, or designer mode.
 
 The composition holds the two already assembled public child Pipelines:
 
-~~~python
+```python
 class LigandMpnnDesignAndPackPipeline:
     def __init__(
         self,
@@ -4297,7 +4315,7 @@ class LigandMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[DesignResult, tuple[PackResult, ...]]: ...
-~~~
+```
 
 The constructor accepts child Pipelines rather than four loose Models/Processors or
 a component mapping. Selecting this class already selects design plus packing, so
@@ -4361,7 +4379,7 @@ different tensor values. State shape cannot determine their biological subtype.
 
 Both artifacts execute one graph:
 
-~~~python
+```python
 class MembraneMpnnConfig(Config):
     hidden_size: int = 128
     num_encoder_layers: int = 3
@@ -4384,7 +4402,7 @@ class MembraneMpnnInput:
     tied_weights: Tensor | None = None
     allowed_token_mask: Tensor | None = None
     logit_bias: Tensor | None = None
-~~~
+```
 
 Raw forward and sampling return the shared `MpnnOutput` and
 `MpnnSamplingOutput`; membrane labels change the input graph, not the output
@@ -4403,7 +4421,7 @@ aligned `[1, L]`; `None` selects coefficient one.
 
 The distinct scientific signatures require two Processors:
 
-~~~python
+```python
 class GlobalMembraneMpnnProcessor:
     def __init__(
         self,
@@ -4452,7 +4470,7 @@ class PerResidueMembraneMpnnProcessor:
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         filter_by_occupancy: bool = True,
     ) -> MembraneMpnnInput: ...
-~~~
+```
 
 Neither Processor declares `config_class` or exposes an empty `.config`; there is
 no persistent lowering axis. Concrete fresh construction uses the ordinary
@@ -4472,7 +4490,7 @@ LigandMpnn, without atom context or an interface mask.
 
 The one root Model owns the released reusable membrane feature Module directly:
 
-~~~python
+```python
 class MembraneMpnnModel(ofoldx.Model):
     def encode(
         self,
@@ -4556,7 +4574,7 @@ class MembraneMpnnModel(ofoldx.Model):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult: ...
-~~~
+```
 
 Every operation is the corresponding LigandMPNN updated algorithm without atom or
 side-chain context. `forward` is one differentiable sequence-conditioned
@@ -4577,7 +4595,7 @@ anchor exact identity, and tied members have equal ranks.
 The two Pipelines expose the same operations while retaining their distinct label
 arguments. Their exact signatures are:
 
-~~~python
+```python
 class GlobalMembraneMpnnPipeline:
     def __init__(
         self,
@@ -4756,7 +4774,7 @@ class PerResidueMembraneMpnnPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult: ...
-~~~
+```
 
 The repeated spelling reflects two concrete biological APIs, not a shared Pipeline
 base or runtime request object. Tensor-level rank arguments remain on direct Model
@@ -4775,7 +4793,7 @@ serialized dtype, translates every tensor, and strict-loads with `assign=True`.
 Because global and per-residue state schemas are indistinguishable, the public
 entry points in `ofoldx.models.membranempnn.convert` are explicitly:
 
-~~~python
+```python
 def convert_global_membrane_mpnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
@@ -4785,7 +4803,7 @@ def convert_per_residue_membrane_mpnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
 ) -> None: ...
-~~~
+```
 
 Neither guesses from a path, filename, or tensor shape. They save the matching
 concrete Pipeline marker and expose no dtype-conversion argument. The
@@ -4817,7 +4835,7 @@ its whole-structure Boolean, Section 4.6's batch Packer handoff, selected-only/f
 repacking, candidate × pack association, and exact RNG order support this explicit
 live composition.
 
-~~~python
+```python
 class GlobalMembraneMpnnDesignAndPackPipeline:
     def __init__(
         self,
@@ -4856,7 +4874,7 @@ class GlobalMembraneMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[DesignResult, tuple[PackResult, ...]]: ...
-~~~
+```
 
 The composition parses a path once with `ofoldx.io.read_mpnn_pdb` and gives
 the resulting `Structure` to both child Pipelines. `transmembrane` remains the
@@ -4879,7 +4897,7 @@ combined-command route, its component-aligned three-class labels, Section 4.6's
 batch Packer handoff, selected-only/full repacking, candidate × pack association,
 and exact RNG order support this distinct explicit live composition.
 
-~~~python
+```python
 class PerResidueMembraneMpnnDesignAndPackPipeline:
     def __init__(
         self,
@@ -4921,7 +4939,7 @@ class PerResidueMembraneMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[DesignResult, tuple[PackResult, ...]]: ...
-~~~
+```
 
 The path, selected-position, target-sequence, candidate association, generator,
 placement, and live-only ownership semantics are exactly those in Section 4.9.1.
@@ -5034,15 +5052,15 @@ Protocol.
 
 One metric reference names one level of canonical identity:
 
-~~~python
+```python
 MetricReference = str | ComponentReference | AtomSite
-~~~
+```
 
 A string is an exact instance_id. ComponentReference is an (instance_id, component_index) pair for either a PolymerSequence monomer or a Molecule component occurrence. AtomSite is an exact atom. This instance → component → atom hierarchy is sufficient for atom, residue, ligand-token, chain, and chain-pair outputs; there is no InstanceSite or generic axis descriptor.
 
 The shared scientific values are:
 
-~~~python
+```python
 @dataclass(eq=False)
 class Score:
     value: float
@@ -5063,7 +5081,7 @@ class PairMetric:
     row_axis: tuple[MetricReference, ...]
     column_axis: tuple[MetricReference, ...]
     unit: str | None = None
-~~~
+```
 
 Score is one named scalar scientific value. scope=None means the whole containing
 target; a frozenset names the exact unordered canonical subtarget to which the
@@ -5112,7 +5130,7 @@ Status: frozen — this bounded flat result is supported by AF2, ESMFold2, and
 Protenix single-invocation outputs. AF3 multi-seed grouping and family-composite
 folding remain reopened.
 
-~~~python
+```python
 @dataclass(eq=False)
 class FoldPrediction:
     structure: Structure
@@ -5123,7 +5141,7 @@ class FoldPrediction:
 @dataclass(eq=False)
 class FoldResult:
     predictions: tuple[FoldPrediction, ...]
-~~~
+```
 
 Predictions belong to one seed or other common family sampling context and are
 generation ordered; tuple position is sample identity. Each prediction owns the
@@ -5164,7 +5182,7 @@ design operation.
 
 The values needed by this bounded cycle are:
 
-~~~python
+```python
 @dataclass(eq=False)
 class DesignCandidate:
     system: MolecularSystem
@@ -5173,7 +5191,7 @@ class DesignCandidate:
 @dataclass(eq=False)
 class DesignResult:
     candidates: tuple[DesignCandidate, ...]
-~~~
+```
 
 ProteinMPNN, LigandMPNN, and NA-MPNN publish sequence design without predicted
 coordinates. Each generation-ordered candidate therefore owns a complete
@@ -5211,11 +5229,11 @@ invocation. ProteinMpnn preserves them without changing candidate RNG or
 recomputing a later score call. Its family-specific Result is an ordinary
 constructible dataclass:
 
-~~~python
+```python
 @dataclass(eq=False)
 class ProteinMpnnDesignResult(DesignResult):
     input_score: ScoreResult
-~~~
+```
 
 That `ScoreResult.target` is the exact conditioning Structure, so every scope owns
 its geometry without adding input fields to the shared `DesignResult`.
@@ -5305,13 +5323,13 @@ excluded: their vocabulary and decoding-order axes remain concrete typed tensor
 outputs rather than scalar `ScoreResult` values. No audited consumer of this
 carrier currently returns a canonical pair matrix or a coordinate-free target.
 
-~~~python
+```python
 @dataclass(eq=False)
 class ScoreResult:
     target: Structure
     scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
-~~~
+```
 
 Target is the Structure on which the returned scores were evaluated. This Result
 carrier does not itself prove the still-reopened Structure/site-decoding contract.
@@ -5342,7 +5360,7 @@ released repeated tensor outputs support one concrete carrier with four real
 Model consumers, the fourth being the NaMpnn `score` and
 `unconditional_probabilities` operations frozen in Section 4.10:
 
-~~~python
+```python
 @dataclass(eq=False)
 class MpnnProbabilityResult:
     target: Structure
@@ -5364,7 +5382,7 @@ class MpnnProbabilityResult:
 
     @property
     def probability_standard_deviation(self) -> Tensor: ...
-~~~
+```
 
 This constructible carrier is defined in `ofoldx.results` and used directly by
 `ProteinMpnnModel`, `LigandMpnnModel`, `MembraneMpnnModel`, and `NaMpnnModel`. It
@@ -5413,14 +5431,14 @@ Boltz-2 affinity is the concrete counterexample to treating score as a scalar he
 over the input. Its complete released operation has one additional decoded output,
 so its concrete Pipeline returns the only necessary family Result here:
 
-~~~python
+```python
 @dataclass(eq=False)
 class Boltz2AffinityResult:
     target: Structure
     structure_predictions: tuple[FoldPrediction, ...]
     scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
-~~~
+```
 
 The target, scores, and metrics remain directly accessible; they are not nested in
 another ScoreResult. The additional tuple
@@ -5429,14 +5447,14 @@ descending released confidence score, not generation order.
 
 For one first-stage call, the released ranking is exactly:
 
-~~~python
+```python
 interface_score = (
     iptm
     if not torch.allclose(iptm, torch.zeros_like(iptm))
     else ptm
 )
 confidence_score = (4 * complex_plddt + interface_score) / 5
-~~~
+```
 
 The all-zero iPTM decision is made once over the complete call tensor. It is not a
 per-sample fallback: if any iPTM entry makes that tensor nonzero, every sample is
@@ -5486,7 +5504,7 @@ grouping is a domain invariant, so one real consumer is sufficient to justify th
 shared carrier. A future packer uses it only when the carrier represents its
 complete decoded output without loss; the routing word alone does not force it.
 
-~~~python
+```python
 @dataclass(eq=False)
 class PackPrediction:
     structure: Structure
@@ -5495,7 +5513,7 @@ class PackPrediction:
 @dataclass(eq=False)
 class PackResult:
     predictions: tuple[PackPrediction, ...]
-~~~
+```
 
 Each prediction binds one stochastic packed Structure to the decoded metrics
 produced for that exact sample. Its Structure contains the explicit target sequence
@@ -5558,18 +5576,18 @@ forward more than once; it is still one Model task invocation. A standard Pipeli
 does not compose pairs, repeat task invocations, or select among invocation Results.
 Its complete route is:
 
-~~~text
+```text
 biological input -> Processor -> concrete Model input -> Model task method -> Result
-~~~
+```
 
 Its four direct-construction classes are:
 
-~~~python
+```python
 FoldPipeline(*, model, processor)
 DesignPipeline(*, model, processor)
 ScorePipeline(*, model, processor)
 PackPipeline(*, model, processor)
-~~~
+```
 
 Direct construction binds the supplied live objects as public model and processor
 attributes. It does not change Model training state, redispatch through architecture
@@ -5654,7 +5672,7 @@ concrete biological call boundary; it is not a standalone composition manifest.
 
 Boltz2AffinityPipeline is the concrete example that requires two ordinary pairs:
 
-~~~python
+```python
 Boltz2AffinityPipeline(
     *,
     model=affinity_model,
@@ -5662,7 +5680,7 @@ Boltz2AffinityPipeline(
     structure_model=structure_confidence_model,
     structure_processor=structure_confidence_processor,
 )
-~~~
+```
 
 The root pair is the affinity pass. The structure/ repository directory holds the
 structure/confidence pair. The Pipeline first runs the structure/confidence pair,
@@ -5821,18 +5839,18 @@ registry contract.
 
 Model registration is normal explicit Python:
 
-~~~python
+```python
 MODELS.register(
     "ofoldx.alphafold3",
     model=AlphaFold3Model,
     processor=AlphaFold3Processor,
     standard_tasks=(),
 )
-~~~
+```
 
 Its complete method signature on the `MODELS` registry is:
 
-~~~python
+```python
 MODELS.register(
     id: str,
     *,
@@ -5840,7 +5858,7 @@ MODELS.register(
     processor: type,
     standard_tasks: Collection[Literal["fold", "design", "score", "pack"]] = (),
 ) -> None
-~~~
+```
 
 `id` is any nonempty string and is unique by exact string equality. Registration
 does not normalize it or impose a naming regex. `standard_tasks` is converted to a
@@ -5879,18 +5897,18 @@ evidence for this subsection.
 
 Concrete registration is normal explicit Python:
 
-~~~python
+```python
 PIPELINES.register(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
 )
-~~~
+```
 
 Its complete method signature on the `PIPELINES` registry is:
 
-~~~python
+```python
 PIPELINES.register(id: str, *, pipeline: type) -> None
-~~~
+```
 
 The ID is an exact nonempty string. ID and exact class are each unique; the reverse
 class-to-ID index gives a concrete writer one unambiguous marker value. Registration
@@ -5898,9 +5916,9 @@ does not require a generic Pipeline base and does not inspect task methods,
 signatures, annotations, components, subdirectories, or repository layout. It
 stores no task set. At task-first routing time, support means only:
 
-~~~python
+```python
 callable(getattr(pipeline_class, task, None))
-~~~
+```
 
 An inherited ordinary public method counts; instance-only dynamic `__getattr__`
 does not hide a task contract from the class. A methodless registered class is not a
@@ -5943,12 +5961,12 @@ subsection; the pair format and one-field marker are unchanged there.
 
 Every serializable repository has one runnable root Model–Processor pair:
 
-~~~text
+```text
 model-repository/
 ├── model.json
 ├── processor.json        # only when the Processor has persistent config
 └── model.safetensors
-~~~
+```
 
 Runnable describes the complete scientific pair and its explicit placement surface;
 it is not a promise that every user-cast artifact runs with omitted placement. The
@@ -5989,9 +6007,9 @@ config, generic pair validator, compatibility matrix, or hidden synchronization.
 A repository that publishes a concrete Pipeline adds exactly one optional root
 file whose complete JSON object is:
 
-~~~json
+```json
 { "pipeline": "ofoldx.boltz2_affinity" }
-~~~
+```
 
 `pipeline.json` is a marker for the registered concrete call boundary, not a
 manifest or task record. It identifies the complete class; its public methods state
@@ -6011,7 +6029,7 @@ convenient component.
 
 For `Boltz2AffinityPipeline` the layout is:
 
-~~~text
+```text
 model-repository/
 ├── model.json
 ├── processor.json
@@ -6021,7 +6039,7 @@ model-repository/
     ├── model.json
     ├── processor.json
     └── model.safetensors
-~~~
+```
 
 The root pair is the affinity pass and `structure/` is the structure/confidence
 pair. That meaning belongs to the registered class. `pipeline.json` contains no
@@ -6109,7 +6127,7 @@ construction.
 A repository-owned concrete Pipeline that requires only its runnable root pair has
 the ordinary live constructor:
 
-~~~python
+```python
 class FamilyPipeline:
     def __init__(
         self,
@@ -6117,7 +6135,7 @@ class FamilyPipeline:
         model: FamilyModel,
         processor: FamilyProcessor,
     ) -> None: ...
-~~~
+```
 
 The supplied objects remain available as public `model` and `processor` attributes.
 Construction does not redispatch them, change Model state, infer a repository, or
@@ -6151,7 +6169,7 @@ component list, source state, or second manifest.
 Status: frozen — the multi-pair pair-layout, writer, snapshot loader, and factory
 routing below are proven by three materially different verticals
 (`Boltz2AffinityPipeline`, `ODesignPipeline`, `BoltzGenPipeline`). This freezes only
-repository construction and routing; multi-pair *placement* stays reopened in Section
+repository construction and routing; multi-pair _placement_ stays reopened in Section
 6.3, and complete family checkpoint publication stays reopened in Sections 7.5/7.6.
 
 A concrete Pipeline whose live constructor binds more than one Model–Processor pair
@@ -6218,13 +6236,13 @@ framework alias protocol.
 
 The paired Model+Processor repository writer is:
 
-~~~python
+```python
 ofoldx.artifacts.save_model(
     directory,
     model=model,
     processor=processor,
 )
-~~~
+```
 
 `save_model` requires one exact registered Model–Processor class pair. It writes
 `model.json` and, only for a configful Processor, `processor.json` as specified in
@@ -6240,9 +6258,9 @@ dict.
 
 Every Pipeline with a serialized root owner has the symmetric writer:
 
-~~~python
+```python
 pipeline.save(directory)
-~~~
+```
 
 Before writing any ordinary pair, `save_model` removes an existing
 `pipeline.json` at that pair root. A standard task Pipeline delegates its save to
@@ -6331,11 +6349,11 @@ may import only the literal built-in owner on a miss, as specified in Section 7.
 
 A registered root pair has one of these direct Processor construction contracts:
 
-~~~python
+```python
 model_class(model_config)
 processor_class(processor_config, *, device=None, dtype=None)
 processor_class(*, device=None, dtype=None)  # config-less
-~~~
+```
 
 Config-based `AutoModel` dispatches by exact config class. Fresh Model construction
 calls `model_class(config)`, applies ordinary `.to(...)` only when requested, and
@@ -6414,7 +6432,7 @@ must establish its own assign semantics before that family publishes.
 
 The exact materialization path is:
 
-~~~python
+```python
 with torch.device("meta"):
     model = model_class(config)
 
@@ -6425,7 +6443,7 @@ del state_dict
 if device is not None or dtype is not None:
     model.to(device=device, dtype=dtype)
 model.eval()
-~~~
+```
 
 The meta context ends before loading state. The call above is one ordinary public
 `Model.load_state_dict` call, so native subclass and pre/post-hook semantics remain
@@ -6496,10 +6514,12 @@ override, lazy forward mutation,
 materializer, loader scan, family flag, or persistent duplicate. State-dict keys
 and converted checkpoints remain unchanged.
 
-MultiMolecule's ESMC rotary buffer uses its owner's existing lazy first-forward
-construction and needs no OFoldX action. An explicit whole-Model dtype request is
-obeyed; OFoldX does not preserve hidden FP32 exceptions on behalf of an experienced
-caller.
+MultiMolecule's ESMC rotary owner reconstructs its non-persistent inverse-frequency
+buffer when a meta-built module is materialized and rebuilds cached frequencies on
+the requested device and dtype. OFoldX therefore keeps repository construction on
+meta and delegates this constant's lifecycle to its owning Module. An explicit
+whole-Model dtype request is obeyed; neither library preserves hidden FP32
+exceptions on behalf of an experienced caller.
 
 #### Writing and a standard task Pipeline
 
@@ -6611,13 +6631,13 @@ For every Model, the user may select an operator policy:
 - torch: require the public reference; or
 - oops: require OOps and fail if unavailable.
 
-Every Model exposes the following method. The base initializes ``auto``; a concrete
+Every Model exposes the following method. The base initializes `auto`; a concrete
 constructor may select a stricter documented initial policy after its operator graph
 is built:
 
-~~~python
+```python
 model.set_backend(name) -> model
-~~~
+```
 
 A torch-only Model records the same policy but has no dispatched operation to
 reconfigure. A task Pipeline does not duplicate backend state. Users select the
@@ -6631,13 +6651,13 @@ Auto dispatch inspects only facts needed to select an implementation. It forward
 
 The ordinary order is:
 
-~~~text
+```text
 load
   -> select backend
   -> place Model and Processor
   -> compile where useful
   -> execute
-~~~
+```
 
 Backend lookup resolves outside or during tracing so the captured graph contains a stable callable or registered operator. PyTorch guards and recompilation retain their normal meaning. OFoldX does not inspect or mutate private compiler fields.
 
@@ -6739,6 +6759,23 @@ eventual complete evidence includes:
 - upstream code and weight terms; and
 - citations.
 
+Family READMEs use one model-card order: front matter and title; Disclaimer;
+Model Details, with Variants, Model Specification, and Links; Usage; Checkpoints
+and Conversion; Training Details, with Training Data and Training Procedure;
+Limitations; Citation; Contact; and License. A section may state that upstream did
+not publish a fact, but it is not silently omitted or moved to a family-specific
+location. Parity status may be summarized for users; commands, local paths,
+publication gates, and diagnostic mechanics remain beside untracked parity scripts.
+
+Docstrings are level-sensitive rather than mechanically uniform. Public Models,
+Processors, Pipelines, configs, Results, and unusual scientific Modules document
+their behavior and arguments in signature order. Tensor operations document the
+non-obvious axes, masks, coordinate frames, units, equivariance, conditioning,
+recycling, and randomness they own. Sections appear only when needed, in the order
+`Args`, `Returns`, `Raises`, `Notes`, and `Examples`. Ordinary internal
+composition and self-explanatory `forward` methods use a concise summary instead
+of repeating type annotations or narrating implementation.
+
 UPSTREAM_BUGS.md records confirmed upstream defects and OFoldX's chosen correct behavior. Parity operational details live beside scripts/parity. Backlogs and progress belong in issues, not this normative document.
 
 ### 10.2 Direct pre-release migration
@@ -6748,7 +6785,7 @@ replaces incorrect prototype contracts directly. It does not preserve them throu
 aliases, fallback branches, duplicate registries, shadow modules, or files whose
 only purpose is old behavior.
 
-Migration is complete only when production imports and docs use the new contract. Dead prototype code is deleted rather than renamed out of sight. Public imports are expressed by actual module locations and reexports; source files do not maintain a second public-surface list through __all__.
+Migration is complete only when production imports and docs use the new contract. Dead prototype code is deleted rather than renamed out of sight. Public imports are expressed by actual module locations and reexports; source files do not maintain a second public-surface list through **all**.
 
 Private files, helpers, and dataclasses are not default organization tools. A helper
 needs a concrete invariant or current consumer that ordinary inline Python cannot

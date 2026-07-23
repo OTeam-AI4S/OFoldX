@@ -1,9 +1,4 @@
-r"""
-Boltz-1 configuration.
-
-    Defaults follow the released ``boltz1_conf.ckpt`` inference entry point: 48 Pairformer blocks,
-    a 4-block MSA module, 8-head diffusion token transformer, and the Boltz-1 EDM sampling schedule.
-"""
+r"""Boltz-1 architecture and inference configuration."""
 
 from __future__ import annotations
 
@@ -11,38 +6,27 @@ from chanfig import Config
 
 
 class Boltz1InputEmbeddingsConfig(Config):
-    r"""
-    Input-embedder knobs for Boltz-1: the atom-attention encoder and its token-level feature widths.
+    r"""Configure the Boltz-1 atom-attention input embedder and token feature widths.
 
-    Attributes:
+    Args:
         num_atom_encoder_blocks: Number of atom-attention encoder blocks.
         num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
         vocab_size: Residue-type vocabulary size feeding the one-hot residue feature.
         pocket_feature_size: Width of the token-level pocket one-hot conditioning feature.
-        no_atom_encoder: When ``True``, skip the atom encoder and emit zeroed token-from-atom states.
-
-    Examples:
-        >>> config = Boltz1InputEmbeddingsConfig()
-        >>> config.num_atom_encoder_blocks
-        3
+        use_atom_encoder: Whether to encode atom features into token states.
     """
 
     num_atom_encoder_blocks: int = 3
     num_atom_encoder_attention_heads: int = 4
     vocab_size: int = 33
     pocket_feature_size: int = 4
-    no_atom_encoder: bool = False
+    use_atom_encoder: bool = True
 
 
 class Boltz1TrunkConfig(Config):
-    r"""
-    Representation-trunk knobs for Boltz-1: the Pairformer stack and the optional MSA module.
+    r"""Configure the Boltz-1 Pairformer trunk and optional MSA trunk.
 
-    The two head counts are distinct: ``num_msa_attention_heads`` sizes the MSA pair-weighted-averaging,
-    while ``num_triangle_attention_heads`` governs the triangle attention shared by the trunk Pairformer and
-    the MSA pairformer-no-seq layer.
-
-    Attributes:
+    Args:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
         num_pair_attention_heads: Head count for the single-track pair-biased attention.
         num_msa_blocks: Number of MSA-module blocks.
@@ -55,12 +39,7 @@ class Boltz1TrunkConfig(Config):
         num_triangle_attention_heads: Head count for the triangle attention.
         use_paired_feature: Whether the MSA carries the cross-chain pairing feature.
         dropout: Dropout applied to the Pairformer pair track.
-        msa_dropout: Dropout applied inside the MSA module.
-
-    Examples:
-        >>> config = Boltz1TrunkConfig()
-        >>> config.num_pairformer_blocks
-        48
+        msa_dropout: Dropout applied inside the MSA trunk.
     """
 
     num_pairformer_blocks: int = 48
@@ -79,10 +58,9 @@ class Boltz1TrunkConfig(Config):
 
 
 class Boltz1DenoiserConfig(Config):
-    r"""
-    EDM denoising-module knobs for Boltz-1: the token transformer, atom encoder/decoder, and score-model widths.
+    r"""Configure the Boltz-1 EDM token transformer and atom encoder-decoder.
 
-    Attributes:
+    Args:
         num_token_transformer_blocks: Number of conditioned token-transformer blocks in the score model.
         num_token_transformer_heads: Head count for the token transformer.
         num_atom_encoder_blocks: Number of atom-attention encoder blocks in the denoiser.
@@ -92,14 +70,9 @@ class Boltz1DenoiserConfig(Config):
         atom_pair_hidden_size: Width of the windowed atom-pair representation.
         num_query_atoms: Query-window size for the local atom attention.
         num_key_atoms: Key-window size for the local atom attention.
-        num_conditioning_transitions: Number of transition blocks in each diffusion-conditioning stack.
+        num_conditioning_transitions: Number of transitions in each diffusion conditioner.
         sigma_data: EDM data-scale hyperparameter used by the preconditioner and noise schedule.
         alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step to the denoised coords.
-
-    Examples:
-        >>> config = Boltz1DenoiserConfig()
-        >>> config.num_token_transformer_blocks
-        24
     """
 
     num_token_transformer_blocks: int = 24
@@ -117,10 +90,9 @@ class Boltz1DenoiserConfig(Config):
 
 
 class Boltz1SamplerConfig(Config):
-    r"""
-    Reverse-diffusion sampler parameters for the Boltz-1 EDM schedule.
+    r"""Configure the Boltz-1 EDM reverse-diffusion schedule.
 
-    Attributes:
+    Args:
         num_sampling_steps: Number of reverse-diffusion steps.
         rho: Karras schedule power controlling the sigma spacing.
         max_noise_level: Highest noise level (start of the schedule), in ``sigma_data`` units.
@@ -129,11 +101,6 @@ class Boltz1SamplerConfig(Config):
         min_churn_noise_level: Noise level below which churn is disabled.
         noise_scale: Multiplier on the churn-injected noise.
         step_scale: Multiplier on the Euler update step.
-
-    Examples:
-        >>> config = Boltz1SamplerConfig()
-        >>> config.num_sampling_steps
-        200
     """
 
     num_sampling_steps: int = 200
@@ -146,19 +113,15 @@ class Boltz1SamplerConfig(Config):
     step_scale: float = 1.0
 
 
-class Boltz1ConfidenceModuleConfig(Config):
-    r"""
-    Boltz-1 confidence module and ranking configuration.
+class Boltz1ConfidenceConfig(Config):
+    r"""Configure the Boltz-1 confidence head and combined ranking score.
 
-    The released ``boltz1_conf.ckpt`` uses the trunk-imitating confidence module, computes PAE/pTM metrics
-    (``alpha_pae > 0`` in upstream Boltz), and conditions on the final diffusion token representation.
-
-    Attributes:
+    Args:
         enabled: Whether to build and run the confidence/ranking head at all.
-        imitate_trunk: Whether the confidence module re-runs a full trunk-like stack (vs. reusing trunk outputs).
+        imitate_trunk: Whether the confidence head re-runs a full trunk-like stack instead of reusing trunk outputs.
         compute_pae: Whether to emit PAE logits and pTM/ipTM ranking metrics.
-        num_pairformer_blocks: Number of Pairformer blocks inside the confidence module.
-        num_pair_attention_heads: Head count for the confidence-module pair-biased attention.
+        num_pairformer_blocks: Number of Pairformer blocks inside the confidence head.
+        num_pair_attention_heads: Head count for the confidence-head pair-biased attention.
         num_distogram_bins: Number of bins for the confidence distance embedding.
         max_distance: Upper distance bound (Angstrom) for the confidence distogram binning.
         num_plddt_bins: Number of pLDDT output bins.
@@ -170,11 +133,6 @@ class Boltz1ConfidenceModuleConfig(Config):
         use_single_diffusion: Whether to condition on the accumulated final diffusion token representation.
         ranking_plddt_weight: Weight on complex pLDDT when forming the combined ranking score.
         ranking_ptm_weight: Weight on pTM/ipTM when forming the combined ranking score.
-
-    Examples:
-        >>> config = Boltz1ConfidenceModuleConfig()
-        >>> config.enabled
-        True
     """
 
     enabled: bool = True
@@ -196,14 +154,9 @@ class Boltz1ConfidenceModuleConfig(Config):
 
 
 class Boltz1Config(Config):
-    r"""
-    Top-level configuration for the Boltz-1 structure-prediction model.
+    r"""Configure the Boltz-1 structure-prediction architecture and inference schedule.
 
-    Instantiating with the defaults reproduces the public Boltz-1 inference entry point. The nested sub-configs
-    hold the input-embeddings, trunk, denoiser, sampler, and confidence-module values; the top-level fields
-    below set the shared representation widths and the recycling/distogram parameters.
-
-    Attributes:
+    Args:
         single_size: Width of the single (token) representation.
         pair_size: Width of the pair representation.
         atom_hidden_size: Width of the atom single representation.
@@ -213,17 +166,12 @@ class Boltz1Config(Config):
         fourier_embedding_size: Width of the frozen Fourier noise embedding.
         relative_position_size: Width of the relative-position feature fed to the position embedder.
         recycling_steps: Total number of trunk passes.
-        no_msa: When ``True``, build the model without the MSA module.
+        use_msa: Whether to build and run the MSA trunk.
         input_embeddings: Nested input-embeddings configuration.
         trunk: Nested representation-trunk configuration.
         denoiser: Nested EDM denoiser configuration.
         sampler: Nested reverse-diffusion sampler configuration.
-        confidence_module: Nested confidence/ranking module configuration.
-
-    Examples:
-        >>> config = Boltz1Config()
-        >>> from ofoldx.models.boltz1.model import Boltz1Model
-        >>> model = Boltz1Model(config)  # doctest: +SKIP
+        confidence: Nested confidence/ranking module configuration.
     """
 
     single_size: int = 384
@@ -235,10 +183,10 @@ class Boltz1Config(Config):
     fourier_embedding_size: int = 256
     relative_position_size: int = 139
     recycling_steps: int = 4
-    no_msa: bool = False
+    use_msa: bool = True
 
     input_embeddings: Boltz1InputEmbeddingsConfig = Boltz1InputEmbeddingsConfig()
     trunk: Boltz1TrunkConfig = Boltz1TrunkConfig()
     denoiser: Boltz1DenoiserConfig = Boltz1DenoiserConfig()
     sampler: Boltz1SamplerConfig = Boltz1SamplerConfig()
-    confidence_module: Boltz1ConfidenceModuleConfig = Boltz1ConfidenceModuleConfig()
+    confidence: Boltz1ConfidenceConfig = Boltz1ConfidenceConfig()

@@ -1,4 +1,4 @@
-r"""The released ODesign core graph and its canonical task methods."""
+r"""The ODesign core graph and its canonical task methods."""
 
 from __future__ import annotations
 
@@ -28,9 +28,7 @@ from ...data.placement import (
     SymbolicResidueSite,
 )
 from ...data.placement import resolve as _resolve_site
-from ...data.placement import (
-    validate_placement,
-)
+from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...model import Model, ModelBackend
 from ...modules.adaptive_norm import AdaptiveLayerNorm
@@ -55,12 +53,12 @@ from ...modules.head import DistogramHead
 from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
-from ...results import Metric, Score
+from ...results import Metric, Score, best
 from .config import ODesignConfig
 
 
 class ODesignModel(Model):
-    r"""Released all-atom ODesign coordinate-design model."""
+    r"""All-atom ODesign coordinate-design model."""
 
     config_class = ODesignConfig
     config: ODesignConfig
@@ -135,10 +133,10 @@ class ODesignModel(Model):
         )
         nn.init.zeros_(self.pair_recycle_projection.weight)
         nn.init.zeros_(self.single_recycle_projection.weight)
-        nn.init.zeros_(self.distogram_head.linear.weight)
-        if self.distogram_head.linear.bias is not None:
-            nn.init.zeros_(self.distogram_head.linear.bias)
-        self.set_backend("auto")
+        nn.init.zeros_(self.distogram_head.projection.weight)
+        if self.distogram_head.projection.bias is not None:
+            nn.init.zeros_(self.distogram_head.projection.bias)
+        self.post_init()
 
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the public PyTorch or OOps operator path."""
@@ -276,7 +274,7 @@ class ODesignModel(Model):
         partial_diffusion_snr: float | None = None,
         generator: torch.Generator | None = None,
     ) -> ODesignOutput:
-        r"""Run the released multi-seed sampler without discarding its pairwise heads."""
+        r"""Run the multi-seed sampler without discarding its pairwise heads."""
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
@@ -730,7 +728,7 @@ class ODesignInput:
 
 @dataclass
 class ODesignOutput:
-    r"""The three predictions computed by the released core graph.
+    r"""The three predictions computed by the core graph.
 
     A one-step forward returns coordinates ``[B, S, A, 3]``, distogram logits
     ``[B, T, T, 64]``, and token-bond logits ``[B, T, T, 2]``. Sampling adds a
@@ -747,7 +745,7 @@ class ODesignDesignCandidate:
     r"""One coordinate-bearing ODesign design sample.
 
     The decoded :class:`~ofoldx.data.structure.Structure` is the single owner of
-    molecular identity and coordinates. The released core exposes no per-sample
+    molecular identity and coordinates. The core exposes no per-sample
     confidence head, so ``metrics`` is empty today; distogram and token-bond logits
     stay on :class:`ODesignOutput`.
     """
@@ -762,14 +760,14 @@ class ODesignDesignCandidate:
 
 @dataclass(eq=False)
 class ODesignDesignResult:
-    r"""The ODesign Result for the released M×S×K design grid.
+    r"""The ODesign Result for the M×S×K design grid.
 
     ODesign is coordinate-producing, so this result carries its coordinate-bearing candidate
     shape rather than the coordinate-free :class:`~ofoldx.results.DesignResult`.
     ``candidates`` is generation-ordered
     (seed → backbone → sequence); ``num_seeds`` (S), ``num_backbones`` (M, per-seed
     diffusion samples), and ``num_sequences`` (K, OInvFold top-k per backbone) record the
-    released loop structure. The ``K`` sequence variants of a given ``(seed, backbone)``
+    loop structure. The ``K`` sequence variants of a given ``(seed, backbone)``
     share one backbone coordinate set. A backbone-only ``design`` call sets
     ``num_sequences=0``.
     """
@@ -788,16 +786,4 @@ class ODesignDesignResult:
         shared ranking abstraction and no default score.
         """
 
-        scores = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return best(self.candidates, score)

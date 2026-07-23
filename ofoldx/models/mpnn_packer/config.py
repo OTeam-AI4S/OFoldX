@@ -1,4 +1,4 @@
-r"""Configuration for the released MpnnPacker."""
+r"""Configuration for MPNN Packer."""
 
 from __future__ import annotations
 
@@ -6,12 +6,28 @@ from chanfig import Config
 
 
 class MpnnPackerConfig(Config):
-    r"""Architecture values for the released ``ligandmpnn_sc`` checkpoint."""
+    r"""Configure the MPNN Packer architecture.
+
+    Args:
+        hidden_size: Width of graph hidden states.
+        edge_size: Width of projected edge features.
+        num_encoder_blocks: Number of graph encoder blocks.
+        num_decoder_blocks: Number of autoregressive decoder blocks.
+        num_rbf: Number of radial-basis bins for distance features.
+        num_neighbors: Number of nearest neighbors in each residue graph.
+        num_context_atoms: Number of nearby context atoms represented per residue.
+        num_mix: Number of mixture components predicted for each torsion.
+        num_positional_embeddings: Width of the relative-position embedding.
+        dropout: Dropout probability in encoder and decoder blocks.
+        coordinate_noise: Training-time Gaussian coordinate-noise standard deviation.
+        lower_bound: Lower distance bound for context radial-basis expansion.
+        upper_bound: Upper distance bound for context radial-basis expansion.
+    """
 
     hidden_size: int = 128
     edge_size: int = 128
-    num_encoder_layers: int = 3
-    num_decoder_layers: int = 3
+    num_encoder_blocks: int = 3
+    num_decoder_blocks: int = 3
     num_rbf: int = 16
     num_neighbors: int = 32
     num_context_atoms: int = 16
@@ -24,6 +40,10 @@ class MpnnPackerConfig(Config):
 
 
 class MpnnPackerProcessorConfig(Config):
-    r"""Tensor-shape choices for canonical Structure lowering."""
+    r"""Configure tensor shapes for canonical Structure lowering.
+
+    Args:
+        num_context_atoms: Number of nearby context atoms emitted per residue.
+    """
 
     num_context_atoms: int = 16

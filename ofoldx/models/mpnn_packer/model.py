@@ -1,4 +1,4 @@
-r"""Released MpnnPacker model."""
+r"""MpnnPacker side-chain packing model."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import torch.distributions as distributions
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ...data.molecular import AtomSite, ComponentReference, restype_3to1
+from ...data.molecular import AMINO_ACID_THREE_TO_ONE, AtomSite, ComponentReference
 from ...data.structure import Structure
 from ...model import Model
 from ...modules import residue_constants as rc
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
-    MpnnDecoderLayer,
-    MpnnEncoderLayer,
+    MpnnDecoderBlock,
+    MpnnEncoderBlock,
     MpnnRelativePositionEncoding,
     cat_neighbors_nodes,
     gather_nodes,
@@ -37,9 +37,9 @@ class MpnnPackerModel(Model):
     Predicts side-chain chi angles as a Von Mises mixture and denoises them into atom coordinates.
 
     Encodes the backbone graph and ligand context, then decodes a mixture-of-Von-Mises
-    distribution over the four side-chain chi angles per residue. [`pack`]
-    [ofoldx.models.mpnn_packer.model.MpnnPackerModel.pack] runs the released
-    iterative sampler and returns canonical packed Structures.
+    distribution over the four side-chain chi angles per residue.
+    [`pack`][ofoldx.models.mpnn_packer.model.MpnnPackerModel.pack] runs the iterative sampler and returns
+    canonical packed structures.
 
     Args:
         config: Side-chain packer configuration; a default
@@ -68,81 +68,82 @@ class MpnnPackerModel(Model):
         self.context_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
         self.node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
         self.edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
-        self.encoder_layers = nn.ModuleList(
+        self.encoder_blocks = nn.ModuleList(
             [
-                MpnnEncoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
-                for _ in range(config.num_encoder_layers)
+                MpnnEncoderBlock(config.hidden_size, config.hidden_size * 2, dropout=config.dropout)
+                for _ in range(config.num_encoder_blocks)
             ]
         )
         self.residue_context_input = nn.Linear(config.hidden_size, config.hidden_size)
         self.atom_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
         self.atom_edge_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.atom_context_layers = nn.ModuleList(
-            [MpnnDecoderLayer(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(2)]
+        self.atom_context_blocks = nn.ModuleList(
+            [MpnnDecoderBlock(config.hidden_size, config.hidden_size, dropout=config.dropout) for _ in range(2)]
         )
-        self.context_layers = nn.ModuleList(
-            [MpnnDecoderLayer(config.hidden_size, config.hidden_size * 2, dropout=config.dropout) for _ in range(2)]
+        self.context_blocks = nn.ModuleList(
+            [MpnnDecoderBlock(config.hidden_size, config.hidden_size * 2, dropout=config.dropout) for _ in range(2)]
         )
         self.context_output = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.context_dropout = nn.Dropout(config.dropout)
         self.context_norm = nn.LayerNorm(config.hidden_size)
         self.decode_edge_embedding = nn.Linear(config.edge_size, config.hidden_size)
         self.sidechain_node_embedding = nn.Linear(config.hidden_size, config.hidden_size)
-        self.linear_down = nn.Linear(2 * config.hidden_size, config.hidden_size)
-        self.decoder_layers = nn.ModuleList(
+        self.decoder_node_projection = nn.Linear(2 * config.hidden_size, config.hidden_size)
+        self.decoder_blocks = nn.ModuleList(
             [
-                MpnnDecoderLayer(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
-                for _ in range(config.num_decoder_layers)
+                MpnnDecoderBlock(config.hidden_size, config.hidden_size * 3, dropout=config.dropout)
+                for _ in range(config.num_decoder_blocks)
             ]
         )
         self.torsion_projection = nn.Linear(config.hidden_size, 4 * 3 * config.num_mix)
         self.softplus = nn.Softplus(beta=1, threshold=20)
 
-        self.reset_parameters()
+        self.post_init()
 
         buffer_device = self.torsion_projection.weight.device
         if buffer_device.type == "meta":
             buffer_device = torch.device("cpu")
         buffer_dtype = self.torsion_projection.weight.dtype
         component_ids = (*AMINO_ACID_COMPONENT_IDS, "UNK")
-        standard_restype_order = [
-            rc.restypes.index(restype_3to1[component_id]) for component_id in AMINO_ACID_COMPONENT_IDS
+        standard_amino_acid_order = [
+            rc.AMINO_ACID_ONE_LETTER_CODES.index(AMINO_ACID_THREE_TO_ONE[component_id])
+            for component_id in AMINO_ACID_COMPONENT_IDS
         ]
-        restype_order = [*standard_restype_order, len(rc.restypes)]
+        amino_acid_order = [*standard_amino_acid_order, len(rc.AMINO_ACID_ONE_LETTER_CODES)]
 
-        restype_atom37_mask = []
-        restype_chi_atom_indices = []
+        amino_acid_atom37_mask = []
+        amino_acid_chi_atom_indices = []
         for component_id in AMINO_ACID_COMPONENT_IDS:
             atom_names = {atom[0] for atom in rc.rigid_group_atom_positions[component_id]}
-            restype_atom37_mask.append([atom_name in atom_names for atom_name in rc.atom_types])
+            amino_acid_atom37_mask.append([atom_name in atom_names for atom_name in rc.atom_types])
             chi_atom_indices = [
                 [rc.atom_order[atom_name] for atom_name in chi] for chi in rc.chi_angles_atoms[component_id]
             ]
-            restype_chi_atom_indices.append(chi_atom_indices + [[0, 0, 0, 0]] * (4 - len(chi_atom_indices)))
-        restype_atom37_mask.append([False] * len(rc.atom_types))
-        restype_chi_atom_indices.append([[0, 0, 0, 0]] * 4)
+            amino_acid_chi_atom_indices.append(chi_atom_indices + [[0, 0, 0, 0]] * (4 - len(chi_atom_indices)))
+        amino_acid_atom37_mask.append([False] * len(rc.atom_types))
+        amino_acid_chi_atom_indices.append([[0, 0, 0, 0]] * 4)
 
         self.register_buffer(
-            "restype_atom14_mask",
+            "amino_acid_atom14_mask",
             torch.tensor(
-                rc.restype_atom14_mask[restype_order],
+                rc.AMINO_ACID_ATOM14_MASK[amino_acid_order],
                 dtype=torch.bool,
                 device=buffer_device,
             ),
             persistent=False,
         )
         self.register_buffer(
-            "restype_atom37_mask",
-            torch.tensor(restype_atom37_mask, dtype=torch.bool, device=buffer_device),
+            "amino_acid_atom37_mask",
+            torch.tensor(amino_acid_atom37_mask, dtype=torch.bool, device=buffer_device),
             persistent=False,
         )
         self.register_buffer(
-            "restype_atom14_to_atom37",
+            "amino_acid_atom14_to_atom37",
             torch.tensor(
                 [
                     [
                         rc.atom_order[atom_name] if atom_name else 0
-                        for atom_name in rc.restype_name_to_atom14_names[component_id]
+                        for atom_name in rc.AMINO_ACID_ATOM14_NAMES[component_id]
                     ]
                     for component_id in component_ids
                 ],
@@ -152,15 +153,15 @@ class MpnnPackerModel(Model):
             persistent=False,
         )
         self.register_buffer(
-            "restype_chi_atom_indices",
-            torch.tensor(restype_chi_atom_indices, dtype=torch.long, device=buffer_device),
+            "amino_acid_chi_atom_indices",
+            torch.tensor(amino_acid_chi_atom_indices, dtype=torch.long, device=buffer_device),
             persistent=False,
         )
         self.register_buffer(
-            "restype_chi_angles_mask",
+            "amino_acid_chi_angles_mask",
             torch.tensor(
                 [
-                    *[rc.chi_angles_mask[restype] for restype in standard_restype_order],
+                    *[rc.chi_angles_mask[amino_acid_index] for amino_acid_index in standard_amino_acid_order],
                     [False, False, False, False],
                 ],
                 dtype=torch.bool,
@@ -169,36 +170,36 @@ class MpnnPackerModel(Model):
             persistent=False,
         )
         self.register_buffer(
-            "restype_rigid_group_default_frame",
+            "amino_acid_rigid_group_default_frame",
             torch.tensor(
-                rc.restype_rigid_group_default_frame[restype_order],
+                rc.AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_order],
                 dtype=buffer_dtype,
                 device=buffer_device,
             ),
             persistent=False,
         )
         self.register_buffer(
-            "restype_atom14_to_rigid_group",
+            "amino_acid_atom14_to_rigid_group",
             torch.tensor(
-                rc.restype_atom14_to_rigid_group[restype_order],
+                rc.AMINO_ACID_ATOM14_TO_RIGID_GROUP[amino_acid_order],
                 dtype=torch.long,
                 device=buffer_device,
             ),
             persistent=False,
         )
         self.register_buffer(
-            "restype_atom14_rigid_group_positions",
+            "amino_acid_atom14_rigid_group_positions",
             torch.tensor(
-                rc.restype_atom14_rigid_group_positions[restype_order],
+                rc.AMINO_ACID_ATOM14_RIGID_GROUP_POSITIONS[amino_acid_order],
                 dtype=buffer_dtype,
                 device=buffer_device,
             ),
             persistent=False,
         )
 
-    def reset_parameters(self) -> None:
+    def initialize_parameters(self) -> None:
         r"""
-        Re-initialize MpnnPacker weights to match the released LigandMPNN scheme.
+        Re-initialize MpnnPacker weights to match the LigandMPNN scheme.
         """
 
         for parameter in self.parameters():
@@ -231,8 +232,8 @@ class MpnnPackerModel(Model):
         edge_states = self.edge_embedding(edges)
         attend_mask = gather_nodes(residue_mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = residue_mask.unsqueeze(-1) & attend_mask
-        for layer in self.encoder_layers:
-            node_states, edge_states = layer(
+        for block in self.encoder_blocks:
+            node_states, edge_states = block(
                 node_states,
                 edge_states,
                 neighbor_indices,
@@ -244,14 +245,14 @@ class MpnnPackerModel(Model):
         atom_pair_mask = context_mask[:, :, :, None] & context_mask[:, :, None, :]
         atom_nodes = self.atom_node_embedding(atom_nodes)
         atom_edges = self.atom_edge_embedding(atom_edges)
-        for layer_index, layer in enumerate(self.context_layers):
-            atom_nodes = self.atom_context_layers[layer_index](
+        for block_index, block in enumerate(self.context_blocks):
+            atom_nodes = self.atom_context_blocks[block_index](
                 atom_nodes,
                 atom_edges,
                 context_mask,
                 atom_pair_mask,
             )
-            residue_context = layer(
+            residue_context = block(
                 residue_context,
                 torch.cat([context, atom_nodes], dim=-1),
                 residue_mask,
@@ -287,13 +288,13 @@ class MpnnPackerModel(Model):
         decode_edges = self.decode_edge_embedding(decode_edges)
         edge_context = torch.cat([edge_states, decode_edges], dim=-1)
         sidechain_states = self.sidechain_node_embedding(sidechain_nodes)
-        node_states = self.linear_down(torch.cat([node_states, sidechain_states], dim=-1))
+        node_states = self.decoder_node_projection(torch.cat([node_states, sidechain_states], dim=-1))
         attend_mask = gather_nodes(residue_mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = residue_mask.unsqueeze(-1) & attend_mask
 
-        for layer in self.decoder_layers:
+        for block in self.decoder_blocks:
             neighbor_states = cat_neighbors_nodes(node_states, edge_context, neighbor_indices)
-            node_states = layer(node_states, neighbor_states, residue_mask, attend_mask)
+            node_states = block(node_states, neighbor_states, residue_mask, attend_mask)
 
         torsions = self.torsion_projection(node_states)
         torsions = torsions.reshape(node_states.shape[0], node_states.shape[1], 4, self.num_mix, 3)
@@ -331,7 +332,7 @@ class MpnnPackerModel(Model):
         num_torsion_samples: int = 16,
         generator: torch.Generator | None = None,
     ) -> MpnnPackerSamplingOutput:
-        r"""Generate one final atom14 sample with the released iterative sampler."""
+        r"""Generate one final atom14 sample with the iterative sampler."""
 
         if num_denoising_steps <= 0:
             raise ValueError("num_denoising_steps must be positive")
@@ -351,15 +352,15 @@ class MpnnPackerModel(Model):
         backbone_atom37_coordinates[:, :, :3] = input.backbone_coordinates[:, :, :3]
         backbone_atom37_coordinates[:, :, 4] = input.backbone_coordinates[:, :, 3]
 
-        restype = input.sequence_tokens.long()
-        atom14_exists = self.restype_atom14_mask[restype]
-        atom37_exists = self.restype_atom37_mask[restype]
-        atom14_to_atom37 = self.restype_atom14_to_atom37[restype]
-        chi_atom_indices = self.restype_chi_atom_indices[restype]
-        chi_angles_mask = self.restype_chi_angles_mask[restype]
-        default_frames = self.restype_rigid_group_default_frame[restype]
-        atom14_to_rigid_group = self.restype_atom14_to_rigid_group[restype]
-        atom14_rigid_group_positions = self.restype_atom14_rigid_group_positions[restype]
+        amino_acid_index = input.sequence_tokens.long()
+        atom14_exists = self.amino_acid_atom14_mask[amino_acid_index]
+        atom37_exists = self.amino_acid_atom37_mask[amino_acid_index]
+        atom14_to_atom37 = self.amino_acid_atom14_to_atom37[amino_acid_index]
+        chi_atom_indices = self.amino_acid_chi_atom_indices[amino_acid_index]
+        chi_angles_mask = self.amino_acid_chi_angles_mask[amino_acid_index]
+        default_frames = self.amino_acid_rigid_group_default_frame[amino_acid_index]
+        atom14_to_rigid_group = self.amino_acid_atom14_to_rigid_group[amino_acid_index]
+        atom14_rigid_group_positions = self.amino_acid_atom14_rigid_group_positions[amino_acid_index]
         torsion_sin_cos, _ = atom37_to_torsion_angles(
             backbone_atom37_coordinates,
             atom37_exists,
@@ -417,7 +418,7 @@ class MpnnPackerModel(Model):
             2,
             atom14_to_atom37[:, :, :, None].expand(-1, -1, -1, 3),
         )
-        fixed_unknown = ~input.pack_positions & (restype == len(AMINO_ACID_COMPONENT_IDS))
+        fixed_unknown = ~input.pack_positions & (amino_acid_index == len(AMINO_ACID_COMPONENT_IDS))
         observed_atom14_mask[:, :, :4] = torch.where(
             fixed_unknown[:, :, None],
             input.atom37_mask[:, :, [0, 1, 2, 4]],
@@ -514,7 +515,7 @@ class MpnnPackerModel(Model):
         num_torsion_samples: int = 16,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        r"""Generate independent packed Structures with the released iterative sampler."""
+        r"""Generate independent packed Structures with the iterative sampler."""
 
         if input.sequence_tokens.shape[0] != 1:
             raise ValueError("pack requires batch size one")
@@ -933,7 +934,7 @@ def pack_candidate(
         if is_selected
     }
     expected_atoms = {
-        reference: frozenset(filter(None, rc.restype_name_to_atom14_names[component_ids[reference]]))
+        reference: frozenset(filter(None, rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]]))
         for reference in selected_references
     }
     site_list = [
@@ -949,7 +950,7 @@ def pack_candidate(
     for reference, is_selected in zip(input.component_references, selected):
         if not is_selected:
             continue
-        for atom_name in rc.restype_name_to_atom14_names[component_ids[reference]][4:]:
+        for atom_name in rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:]:
             if not atom_name:
                 continue
             site = AtomSite(reference[0], reference[1], atom_name)
@@ -985,7 +986,7 @@ def pack_candidate(
     for row, (reference, is_selected) in enumerate(zip(input.component_references, selected)):
         if not is_selected:
             continue
-        for atom, atom_name in enumerate(rc.restype_name_to_atom14_names[component_ids[reference]][4:], start=4):
+        for atom, atom_name in enumerate(rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:], start=4):
             if not atom_name:
                 continue
             index = output_index[AtomSite(reference[0], reference[1], atom_name)]
@@ -1027,10 +1028,6 @@ class MpnnPackerFrame:
     operations the MpnnPacker needs. Batched over any number of leading dimensions.
 
     Args:
-        rotation: Rotation matrices with shape ``(*, 3, 3)``.
-        translation: Translations with shape ``(*, 3)``.
-
-    Attributes:
         rotation: Rotation matrices with shape ``(*, 3, 3)``.
         translation: Translations with shape ``(*, 3)``.
 
@@ -1428,7 +1425,7 @@ class MpnnPackerOutput:
 
 @dataclass(eq=False)
 class MpnnPackerSamplingOutput:
-    r"""Final tensors from one released iterative side-chain sample."""
+    r"""Final tensors from one iterative side-chain sample."""
 
     atom14_coordinates: Tensor
     atom14_mask: Tensor

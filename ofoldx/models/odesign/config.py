@@ -6,7 +6,16 @@ from chanfig import Config
 
 
 class ODesignConstraintEmbeddingsConfig(Config):
-    r"""Observed condition-geometry embedder dimensions."""
+    r"""Configure the observed condition-geometry embedder.
+
+    Args:
+        num_blocks: Number of condition embedding blocks.
+        hidden_size: Width of condition pair features.
+        num_bins: Number of condition distance bins.
+        min_distance: Lower condition distance bound, in angstroms.
+        max_distance: Upper condition distance bound, in angstroms.
+        dropout: Dropout probability in condition embedding blocks.
+    """
 
     num_blocks: int = 2
     hidden_size: int = 64
@@ -17,7 +26,15 @@ class ODesignConstraintEmbeddingsConfig(Config):
 
 
 class ODesignTrunkConfig(Config):
-    r"""Pairformer and MSA dimensions that determine the released graph."""
+    r"""Configure the Pairformer and MSA trunk.
+
+    Args:
+        num_pairformer_blocks: Number of Pairformer blocks.
+        num_msa_blocks: Number of MSA blocks.
+        pairformer_dropout: Dropout probability inside Pairformer blocks.
+        msa_dropout: Dropout probability along the MSA path.
+        pair_dropout: Dropout probability along the pair path.
+    """
 
     num_pairformer_blocks: int = 48
     num_msa_blocks: int = 4
@@ -27,7 +44,22 @@ class ODesignTrunkConfig(Config):
 
 
 class ODesignDenoiserConfig(Config):
-    r"""All-atom EDM denoiser dimensions."""
+    r"""Configure the all-atom EDM denoiser.
+
+    Args:
+        sigma_data: Data noise scale used by EDM preconditioning.
+        atom_hidden_size: Width of atom single features.
+        atom_pair_hidden_size: Width of atom pair features.
+        token_hidden_size: Width of denoiser token features.
+        num_token_encoder_blocks: Number of token encoder blocks.
+        num_token_encoder_attention_heads: Number of token encoder attention heads.
+        num_atom_encoder_blocks: Number of atom encoder blocks.
+        num_atom_encoder_attention_heads: Number of atom encoder attention heads.
+        num_atom_decoder_blocks: Number of atom decoder blocks.
+        num_atom_decoder_attention_heads: Number of atom decoder attention heads.
+        num_query_atoms: Query-window size for local atom attention.
+        num_key_atoms: Key-window size for local atom attention.
+    """
 
     sigma_data: float = 16.0
     atom_hidden_size: int = 128
@@ -44,7 +76,13 @@ class ODesignDenoiserConfig(Config):
 
 
 class ODesignPairwiseConfig(Config):
-    r"""Distogram and bond-reconstruction head dimensions."""
+    r"""Configure distogram and bond-reconstruction heads.
+
+    Args:
+        num_distogram_bins: Number of distogram output bins.
+        bond_hidden_size: Width of bond-reconstruction hidden features.
+        num_bond_types: Number of reconstructed bond types.
+    """
 
     num_distogram_bins: int = 64
     bond_hidden_size: int = 128
@@ -52,11 +90,19 @@ class ODesignPairwiseConfig(Config):
 
 
 class ODesignConfig(Config):
-    r"""Exact construction parameters for the released ODesign core graph.
+    r"""Configure the core graph shared by rigid and flexible ODesign models.
 
-    Runtime placement, operator selection, Hub transport, and training policy are
-    deliberately absent.  ``rigid`` and ``flex`` repositories differ in weights and
-    conditioning inputs, not in this graph or its state-dict contract.
+    Args:
+        token_feature_size: Width of raw token features.
+        atom_feature_size: Width of raw atom features.
+        single_size: Width of the token representation.
+        pair_size: Width of the pair representation.
+        constraint_embeddings: Condition-geometry embedding architecture.
+        relative_position_size: Width of relative-position features.
+        trunk: Pairformer and MSA trunk architecture.
+        recycling_steps: Number of trunk recycling passes.
+        denoiser: All-atom EDM denoiser architecture.
+        pairwise: Distogram and bond-reconstruction head configuration.
     """
 
     token_feature_size: int = 453
@@ -72,19 +118,11 @@ class ODesignConfig(Config):
 
 
 class ODesignProcessorConfig(Config):
-    r"""Persistent configuration for canonical ODesign lowering.
+    r"""Configure canonical ODesign input lowering for rigid or flexible receptors.
 
-    ``receptor_mode`` selects flex or rigid receptor conditioning. It is the only setting
-    that differs between the two protein
-    repositories ``ofoldx/odesign-base-prot-flex`` and ``ofoldx/odesign-base-prot-rigid``:
-    the graph, the ``ODesignConfig``, the ``__call__`` signature, and the
-    ``ODesignInput``/``ODesignOutput`` types are identical. Both repositories therefore use
-    the same architecture and select behavior through processor configuration. ``"rigid"``
-    marks every existing (non-generated)
-    receptor heavy atom as a hard fixed coordinate (the released ``diffusion`` condition,
-    receptor held rigid); ``"flex"`` regenerates receptor coordinates and pins only atoms
-    named by an explicit hard ``ODesignReferenceCoordinates``. This is additive over the
-    per-atom ``ODesignReferenceCoordinates`` path in ``processor.py``.
+    Args:
+        receptor_mode: ``"rigid"`` fixes existing receptor heavy atoms; ``"flex"`` regenerates them except for
+            explicitly fixed reference coordinates.
     """
 
     receptor_mode: str = "flex"  # "rigid" | "flex" (str, not Literal: chanfig validates fields via isinstance)

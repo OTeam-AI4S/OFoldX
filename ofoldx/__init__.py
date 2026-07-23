@@ -13,6 +13,7 @@ from .data.structure import Structure
 from .model import Model, ModelBackend
 from .models import TASKS, Task
 from .pipelines import DesignPipeline, FoldPipeline, PackPipeline, ScorePipeline
+from .processor import Processor
 from .results import (
     DesignCandidate,
     DesignResult,
@@ -24,7 +25,9 @@ from .results import (
     PackResult,
     PairMetric,
     Score,
+    Scored,
     ScoreResult,
+    best,
 )
 
 

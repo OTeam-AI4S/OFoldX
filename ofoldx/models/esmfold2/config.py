@@ -1,4 +1,4 @@
-r"""Configuration for the released ESMFold2 architecture."""
+r"""ESMFold2 architecture configuration."""
 
 from __future__ import annotations
 
@@ -6,7 +6,20 @@ from chanfig import Config
 
 
 class EsmFold2AtomEncoderConfig(Config):
-    r"""Sliding-window atom attention with three-dimensional rotary features."""
+    r"""Configure sliding-window atom attention with three-dimensional rotary features.
+
+    Args:
+        atom_hidden_size: Width of atom single features.
+        token_hidden_size: Width of token features emitted by the atom encoder.
+        num_blocks: Number of atom attention blocks.
+        num_attention_heads: Number of atom attention heads.
+        sliding_window_size: Width of the local atom attention window.
+        expansion: Feed-forward expansion factor.
+        spatial_rope_base_frequency: Base frequency for Cartesian rotary features.
+        num_spatial_rope_pairs_per_axis: Number of rotary feature pairs per Cartesian axis.
+        num_reference_space_rope_pairs: Number of rotary pairs for reference-space identifiers.
+        reference_space_rope_base_frequency: Base frequency for reference-space rotary features.
+    """
 
     atom_hidden_size: int = 128
     token_hidden_size: int = 768
@@ -16,19 +29,51 @@ class EsmFold2AtomEncoderConfig(Config):
     expansion: int = 2
     spatial_rope_base_frequency: float = 20.0
     num_spatial_rope_pairs_per_axis: int = 2
-    num_uid_rope_pairs: int = 10
-    uid_rope_base_frequency: float = 10000.0
+    num_reference_space_rope_pairs: int = 10
+    reference_space_rope_base_frequency: float = 10000.0
 
 
 class EsmFold2InputEmbeddingsConfig(Config):
-    r"""Token and atom input embedding."""
+    r"""Configure ESMFold2 token and atom input embeddings.
+
+    Args:
+        input_size: Width of raw token and atom input features.
+        atom_encoder: Sliding-window atom encoder configuration.
+    """
 
     input_size: int = 451
     atom_encoder: EsmFold2AtomEncoderConfig = EsmFold2AtomEncoderConfig()
 
 
 class EsmFold2EsmCConfig(Config):
-    r"""Architecture of the MultiMolecule ESMC child module."""
+    r"""Configure the ESMC child module.
+
+    Args:
+        vocab_size: Number of ESMC token types.
+        hidden_size: Width of transformer hidden states.
+        num_hidden_layers: Number of transformer blocks.
+        num_attention_heads: Number of self-attention heads.
+        intermediate_size: Width of feed-forward intermediate states.
+        hidden_act: Feed-forward activation function.
+        hidden_dropout: Dropout probability on hidden states.
+        attention_dropout: Dropout probability on attention weights.
+        max_position_embeddings: Maximum supported sequence length.
+        initializer_range: Standard deviation used for parameter initialization.
+        layer_norm_eps: Epsilon used by layer normalization.
+        attention_bias: Whether attention projections include biases.
+        feedforward_bias: Whether feed-forward projections include biases.
+        attention_layer_norm_bias: Whether attention layer normalization includes a bias.
+        qk_layer_norm: Whether to normalize query and key projections.
+        qk_layer_norm_bias: Whether query/key layer normalization includes a bias.
+        final_layer_norm_bias: Whether final layer normalization includes a bias.
+        residue_scaling_factor: Optional residual scaling factor; ``None`` disables scaling.
+        pad_token_id: Padding token identifier.
+        bos_token_id: Beginning-of-sequence token identifier.
+        eos_token_id: End-of-sequence token identifier.
+        unk_token_id: Unknown-residue token identifier.
+        mask_token_id: Mask token identifier.
+        null_token_id: Null token identifier.
+    """
 
     vocab_size: int = 37
     hidden_size: int = 2560
@@ -56,8 +101,15 @@ class EsmFold2EsmCConfig(Config):
     null_token_id: int = 5
 
 
-class EsmFold2LmEncoderConfig(Config):
-    r"""Pair encoder for projected ESMC representations."""
+class EsmFold2LanguageModelEncoderConfig(Config):
+    r"""Configure the pair encoder for projected ESMC representations.
+
+    Args:
+        enabled: Whether to run the language-model pair encoder.
+        num_blocks: Number of pair encoder blocks.
+        dropout: Dropout probability in pair encoder blocks.
+        per_loop_dropout: Whether to redraw language-model dropout for each recycling loop.
+    """
 
     enabled: bool = True
     num_blocks: int = 4
@@ -66,7 +118,16 @@ class EsmFold2LmEncoderConfig(Config):
 
 
 class EsmFold2MsaEncoderConfig(Config):
-    r"""Single-sequence/MSA encoder in the released folding head."""
+    r"""Configure the single-sequence or MSA encoder in the folding head.
+
+    Args:
+        enabled: Whether to run the MSA encoder.
+        msa_size: Width of MSA representations.
+        hidden_size: Width of projected MSA features.
+        num_blocks: Number of MSA encoder blocks.
+        num_msa_attention_heads: Number of MSA attention heads.
+        msa_head_dim: Per-head width of MSA attention.
+    """
 
     enabled: bool = True
     msa_size: int = 128
@@ -77,19 +138,41 @@ class EsmFold2MsaEncoderConfig(Config):
 
 
 class EsmFold2FoldingTrunkConfig(Config):
-    r"""Pair-only folding trunk."""
+    r"""Configure the pair-only folding trunk.
+
+    Args:
+        num_blocks: Number of folding trunk blocks.
+    """
 
     num_blocks: int = 48
 
 
 class EsmFold2ParcaeConfig(Config):
-    r"""Linear-recurrent trunk coda."""
+    r"""Configure the linear-recurrent trunk coda.
+
+    Args:
+        num_coda_blocks: Number of coda blocks applied after recurrent folding.
+    """
 
     num_coda_blocks: int = 2
 
 
-class EsmFold2DiffusionModuleConfig(Config):
-    r"""Diffusion score network."""
+class EsmFold2DenoiserConfig(Config):
+    r"""Configure the ESMFold2 diffusion score network.
+
+    Args:
+        sigma_data: Data noise scale used by EDM preconditioning.
+        atom_hidden_size: Width of atom single features.
+        token_hidden_size: Width of denoiser token features.
+        pair_size: Width of denoiser pair features.
+        input_size: Width of raw atom and token features.
+        fourier_embedding_size: Width of diffusion-noise Fourier features.
+        num_atom_blocks: Number of atom attention blocks.
+        num_atom_attention_heads: Number of atom attention heads.
+        num_token_blocks: Number of token transformer blocks.
+        num_token_attention_heads: Number of token transformer attention heads.
+        expansion: Feed-forward expansion factor.
+    """
 
     sigma_data: float = 16.0
     atom_hidden_size: int = 128
@@ -105,9 +188,22 @@ class EsmFold2DiffusionModuleConfig(Config):
 
 
 class EsmFold2DiffusionStructureHeadConfig(Config):
-    r"""Diffusion structure head and sampler defaults."""
+    r"""Configure the diffusion structure head and sampler defaults.
 
-    diffusion_module: EsmFold2DiffusionModuleConfig = EsmFold2DiffusionModuleConfig()
+    Args:
+        denoiser: Diffusion score-network configuration.
+        num_distogram_bins: Number of structure-head distogram bins.
+        churn_rate: Stochastic churn added during sampling.
+        min_churn_noise_level: Noise threshold below which churn is disabled.
+        noise_scale: Multiplier on churn-injected noise.
+        step_scale: Multiplier on each denoising step.
+        max_noise_level: Highest noise level in the schedule.
+        min_noise_level: Lowest non-zero noise level in the schedule.
+        rho: Exponent shaping noise-level spacing.
+        num_sampling_steps: Number of reverse-diffusion steps.
+    """
+
+    denoiser: EsmFold2DenoiserConfig = EsmFold2DenoiserConfig()
     num_distogram_bins: int = 64
     churn_rate: float = 0.8
     min_churn_noise_level: float = 1.0
@@ -120,7 +216,17 @@ class EsmFold2DiffusionStructureHeadConfig(Config):
 
 
 class EsmFold2ConfidenceHeadConfig(Config):
-    r"""Per-site and pairwise confidence heads."""
+    r"""Configure per-site and pairwise confidence heads.
+
+    Args:
+        num_plddt_bins: Number of pLDDT output bins.
+        num_pde_bins: Number of predicted-distance-error output bins.
+        num_pae_bins: Number of predicted-aligned-error output bins.
+        min_distance: Lower confidence distogram bound, in angstroms.
+        max_distance: Upper confidence distogram bound, in angstroms.
+        num_distogram_bins: Number of confidence distance bins.
+        folding_trunk: Four-block pair trunk used by the confidence head.
+    """
 
     num_plddt_bins: int = 50
     num_pde_bins: int = 64
@@ -132,7 +238,25 @@ class EsmFold2ConfidenceHeadConfig(Config):
 
 
 class EsmFold2Config(Config):
-    r"""Complete graph construction for ESMC plus the released ESMFold2 head."""
+    r"""Configure the complete ESMC and ESMFold2 folding graph.
+
+    Args:
+        single_size: Width of the token representation.
+        pair_size: Width of the pair representation.
+        num_relative_residue_bins: Number of within-chain relative-position bins.
+        num_relative_chain_bins: Number of relative-chain bins.
+        recycling_steps: Number of folding trunk recycling passes.
+        language_model_mask_probability: Default probability of masking non-special ESMC tokens.
+        msa_encoder_overwrite: Whether MSA pair features replace rather than augment language-model pair features.
+        input_embeddings: Token and sliding-window atom input embedding configuration.
+        esmc: MultiMolecule ESMC language-model configuration.
+        language_model_encoder: Per-loop language-model pair encoder configuration.
+        msa_encoder: MSA encoder configuration.
+        folding_trunk: Forty-eight-block pair folding trunk.
+        parcae: Linear-recurrent trunk coda configuration.
+        diffusion_structure_head: Diffusion score network and 14-step sampler configuration.
+        confidence: pLDDT, PDE, and PAE heads with a four-block confidence trunk.
+    """
 
     single_size: int = 384
     pair_size: int = 256
@@ -144,32 +268,35 @@ class EsmFold2Config(Config):
 
     input_embeddings: EsmFold2InputEmbeddingsConfig = EsmFold2InputEmbeddingsConfig()
     esmc: EsmFold2EsmCConfig = EsmFold2EsmCConfig()
-    lm_encoder: EsmFold2LmEncoderConfig = EsmFold2LmEncoderConfig()
+    language_model_encoder: EsmFold2LanguageModelEncoderConfig = EsmFold2LanguageModelEncoderConfig()
     msa_encoder: EsmFold2MsaEncoderConfig = EsmFold2MsaEncoderConfig()
     folding_trunk: EsmFold2FoldingTrunkConfig = EsmFold2FoldingTrunkConfig()
     parcae: EsmFold2ParcaeConfig = EsmFold2ParcaeConfig()
     diffusion_structure_head: EsmFold2DiffusionStructureHeadConfig = EsmFold2DiffusionStructureHeadConfig()
-    confidence_head: EsmFold2ConfidenceHeadConfig = EsmFold2ConfidenceHeadConfig()
+    confidence: EsmFold2ConfidenceHeadConfig = EsmFold2ConfidenceHeadConfig()
 
 
 class EsmFold2ProcessorConfig(Config):
-    r"""Input contract paired with one released ESMFold2 checkpoint."""
+    r"""Configure ESMFold2 input lowering.
+
+    Args:
+        msa_conditioning: Whether the processor accepts and lowers MSA conditioning.
+    """
 
     msa_conditioning: bool = True
 
 
 class EsmFold2ExperimentalConfidenceHeadConfig(Config):
-    r"""Confidence head of the experimental recurrent ESMFold2 graph.
+    r"""Configure the narrower pLDDT/PAE head of recurrent experimental ESMFold2 graphs.
 
-    A narrower confidence contract than the released head: pLDDT and PAE only
-    (no PDE head, no resolved head) and a 128-bin coarse-distogram pair embedding
-    over a 2.0-52.0 angstrom range. Implemented by
-    [`EsmFold2ExperimentalConfidenceHead`][ofoldx.models.esmfold2.model.EsmFold2ExperimentalConfidenceHead].
-
-    ``enabled`` reflects whether the checkpoint ships a confidence head. The design/inversion
-    and hero-critic checkpoints train it (``True``); the scaling-study critics are distogram-
-    only and disable it (``confidence_head.enabled == false`` in their config.json), so the
-    module is absent from their state dict and confidence outputs are unavailable.
+    Args:
+        enabled: Whether to build the confidence head and emit confidence outputs.
+        num_plddt_bins: Number of pLDDT output bins.
+        num_pae_bins: Number of predicted-aligned-error output bins.
+        min_distance: Lower confidence distogram bound, in angstroms.
+        max_distance: Upper confidence distogram bound, in angstroms.
+        num_distogram_bins: Number of coarse confidence distance bins.
+        folding_trunk: Four-block pair trunk used by the confidence head.
     """
 
     enabled: bool = True
@@ -182,20 +309,24 @@ class EsmFold2ExperimentalConfidenceHeadConfig(Config):
 
 
 class EsmFold2ExperimentalConfig(Config):
-    r"""Graph construction for the experimental recurrent ESMFold2 binder-design head.
+    r"""Configure the recurrent ``ESMFold2-Experimental-Fast`` binder-design graph.
 
-    A different architecture from [`EsmFold2Config`][ofoldx.models.esmfold2.EsmFold2Config]:
-    the older recurrent trunk re-injects the previous pair representation through a
-    zero-initialised ``pair_loop_proj`` each loop (no ``parcae`` linear-recurrent coda,
-    no per-loop ``lm_encoder`` trunk, no ``msa_encoder_overwrite``), integrates the ESMC
-    projection into ``z_init`` once, and carries the narrower experimental confidence
-    contract with a 128-bin distogram head. ``disable_msa_features`` mirrors the released
-    ``ESMFold2-Experimental-Fast`` single-sequence inversion checkpoint.
-
-    Defaults reflect ``biohub/ESMFold2-Experimental-Fast`` (the primary design inversion
-    model: 24 trunk blocks, MSA disabled). The MSA-conditioned ``biohub/ESMFold2-Experimental``
-    critic checkpoint sets ``folding_trunk.num_blocks = 48``, ``disable_msa_features = False``
-    and ``msa_encoder.enabled = True``; construct those from the checkpoint ``config.json``.
+    Args:
+        single_size: Width of the token representation.
+        pair_size: Width of the pair representation.
+        num_relative_residue_bins: Number of within-chain relative-position bins.
+        num_relative_chain_bins: Number of relative-chain bins.
+        recycling_steps: Number of recurrent folding passes.
+        use_msa_features: Whether to use MSA features during sequence inversion.
+        language_model_dropout: Dropout probability on language-model representations.
+        force_language_model_dropout: Whether to apply language-model dropout outside training mode.
+        language_model_weight: Weight of the ESMC sequence prior in binder-design objectives.
+        input_embeddings: Token and sliding-window atom input embedding configuration.
+        esmc: MultiMolecule ESMC language-model configuration.
+        msa_encoder: MSA encoder, disabled by default with a 32-wide attention head.
+        folding_trunk: Recurrent 24-block pair trunk.
+        diffusion_structure_head: Diffusion head overridden to 128 distogram bins.
+        confidence: Experimental pLDDT/PAE confidence-head configuration.
     """
 
     single_size: int = 384
@@ -203,16 +334,12 @@ class EsmFold2ExperimentalConfig(Config):
     num_relative_residue_bins: int = 32
     num_relative_chain_bins: int = 2
     recycling_steps: int = 4
-    disable_msa_features: bool = True
+    use_msa_features: bool = False
     language_model_dropout: float = 0.0
     force_language_model_dropout: bool = False
 
-    # Algorithm 14 ESMC pseudo-perplexity sequence-regulariser gradient weight
-    # (binder_design.py L948-L950): the fixed released hyperparameter blending the masked-LM
-    # sequence prior into the structure objective during binder design. The released default
-    # 0.15 is the general de-novo-binder weight; construct an antibody-framework design (fixed
-    # framework, mutable CDR loops) with 0.05 so the structure objective dominates the short
-    # CDR loops. ``EsmFold2DesignPipeline.design`` reads this value and never selects it at runtime.
+    # Weight of the masked-language-model sequence prior in the binder-design objective. Antibody-framework
+    # designs commonly use 0.05 so the structure objective dominates their short mutable loops.
     language_model_weight: float = 0.15
 
     input_embeddings: EsmFold2InputEmbeddingsConfig = EsmFold2InputEmbeddingsConfig()
@@ -222,10 +349,14 @@ class EsmFold2ExperimentalConfig(Config):
     diffusion_structure_head: EsmFold2DiffusionStructureHeadConfig = EsmFold2DiffusionStructureHeadConfig(
         {"num_distogram_bins": 128}
     )
-    confidence_head: EsmFold2ExperimentalConfidenceHeadConfig = EsmFold2ExperimentalConfidenceHeadConfig()
+    confidence: EsmFold2ExperimentalConfidenceHeadConfig = EsmFold2ExperimentalConfidenceHeadConfig()
 
 
 class EsmFold2ExperimentalProcessorConfig(Config):
-    r"""Input contract paired with an experimental ESMFold2 checkpoint."""
+    r"""Configure recurrent ESMFold2 binder-design input lowering.
+
+    Args:
+        msa_conditioning: Whether the processor accepts and lowers MSA conditioning.
+    """
 
     msa_conditioning: bool = False

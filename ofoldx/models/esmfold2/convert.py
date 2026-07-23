@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
@@ -30,15 +31,16 @@ from .processor import EsmFold2ExperimentalProcessor, EsmFold2Processor
 _DEFAULT_ESMC_REPOSITORY = "multimolecule/esmc-6b"
 _BIOHUB_STATE_PREFIXES = (
     ("inputs_embedder.", "input_embeddings."),
-    ("rel_pos.", "relative_position_encoding."),
+    ("rel_pos.", "relative_position_embedder."),
     ("language_model.", "language_model_pair_encoder."),
+    ("lm_encoder.", "language_model_encoder."),
     ("structure_head.", "diffusion_structure_head."),
 )
 _BIOHUB_UNUSED_STATE_KEYS = (
-    "confidence_head.s_input_to_s.weight",
-    "confidence_head.s_inputs_to_single.weight",
-    "confidence_head.s_norm.bias",
-    "confidence_head.s_norm.weight",
+    "confidence_head.input_skip_projection.weight",
+    "confidence_head.input_to_single_projection.weight",
+    "confidence_head.single_norm.bias",
+    "confidence_head.single_norm.weight",
 )
 _DTYPES = {
     "float32": torch.float32,
@@ -176,30 +178,265 @@ def resolve_esmfold2_source(
 
 
 def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, Tensor]:
-    r"""Load the released folding head, excluding Transformers bookkeeping tensors."""
+    r"""Load and strictly translate one Biohub folding-head state dictionary."""
 
-    state = load_file(str(checkpoint_path), device="cpu")
-    return {
-        _translate_biohub_state_key(name): tensor
-        for name, tensor in state.items()
-        if not name.endswith("._extra_state")
-    }
+    source_state = load_file(str(checkpoint_path), device="cpu")
+    translated: dict[str, Tensor] = {}
+
+    for source_name, tensor in source_state.items():
+        if source_name.endswith("._extra_state"):
+            continue
+        target_name = _biohub_transition_projection(source_name)
+        if target_name is None:
+            target_name = _translate_biohub_state_key(source_name)
+        for unpacked_name, unpacked_tensor in _unpack_biohub_projection(target_name, tensor):
+            _store_translated_tensor(
+                translated,
+                unpacked_name,
+                unpacked_tensor,
+                source_name=source_name,
+            )
+
+    return translated
+
+
+def _store_translated_tensor(
+    state: dict[str, Tensor],
+    name: str,
+    tensor: Tensor,
+    *,
+    source_name: str,
+) -> None:
+    if name in state:
+        raise RuntimeError(f"Biohub state keys collide at {name!r}; latest source is {source_name!r}")
+    state[name] = tensor
+
+
+def _biohub_transition_projection(name: str) -> str | None:
+    match = re.fullmatch(
+        r"structure_head\.diffusion_module\.conditioning\.([zs])_transitions\.(\d+)\.([ab])_proj\.weight",
+        name,
+    )
+    if match is None:
+        return None
+    representation, index, projection = match.groups()
+    track = "pair" if representation == "z" else "single"
+    branch = "gate" if projection == "a" else "value"
+    return (
+        "diffusion_structure_head.denoiser.conditioning."
+        f"{track}_transitions.{index}.feed_forward.{branch}_projection.weight"
+    )
+
+
+def _unpack_biohub_projection(name: str, tensor: Tensor) -> tuple[tuple[str, Tensor], ...]:
+    packed_projections = (
+        ("query_key_value_projection", ("query_projection", "key_projection", "value_projection")),
+        ("key_value_projection", ("key_projection", "value_projection")),
+        ("gate_value_projection", ("gate_projection", "value_projection")),
+        (
+            "value_gate_projection",
+            ("left_value_projection", "right_value_projection", "left_gate_projection", "right_gate_projection"),
+        ),
+        ("left_right_projection", ("left_projection", "right_projection")),
+    )
+    for packed_name, projection_names in packed_projections:
+        marker = f".{packed_name}."
+        if marker not in name:
+            continue
+        if tensor.shape[0] % len(projection_names):
+            raise RuntimeError(f"Biohub projection {name!r} cannot be split into {len(projection_names)} equal tensors")
+        prefix, suffix = name.rsplit(marker, 1)
+        return tuple(
+            (f"{prefix}.{projection_name}.{suffix}", chunk)
+            for projection_name, chunk in zip(projection_names, tensor.chunk(len(projection_names), dim=0))
+        )
+    return ((name, tensor),)
 
 
 def _translate_biohub_state_key(name: str) -> str:
     diffusion_transformer_prefix = "structure_head.diffusion_module.token_transformer."
     if name.startswith(f"{diffusion_transformer_prefix}attn_blocks."):
         block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}attn_blocks.").split(".", 1)
-        name = f"diffusion_structure_head.diffusion_module.token_transformer.blocks.{block}.attention.{suffix}"
+        name = f"diffusion_structure_head.denoiser.token_transformer.blocks.{block}.attention.{suffix}"
     elif name.startswith(f"{diffusion_transformer_prefix}transition_blocks."):
         block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}transition_blocks.").split(".", 1)
-        name = f"diffusion_structure_head.diffusion_module.token_transformer.blocks.{block}.transition.{suffix}"
+        name = f"diffusion_structure_head.denoiser.token_transformer.blocks.{block}.transition.{suffix}"
 
     for upstream_prefix, canonical_prefix in _BIOHUB_STATE_PREFIXES:
         if name.startswith(upstream_prefix):
             name = f"{canonical_prefix}{name.removeprefix(upstream_prefix)}"
             break
-    return name.replace("._engine.", ".layer.")
+
+    root_replacements = (
+        ("parcae_log_a", "parcae_log_decay"),
+        ("parcae_b_cont", "parcae_input_matrix"),
+        ("z_init_1.", "left_pair_projection."),
+        ("z_init_2.", "right_pair_projection."),
+        ("token_bonds.", "bond_projection."),
+        ("pair_loop_proj.0.", "recycling_norm."),
+        ("pair_loop_proj.1.", "recycling_projection."),
+    )
+    for source, target in root_replacements:
+        if name.startswith(source):
+            name = f"{target}{name.removeprefix(source)}"
+            break
+
+    language_model_replacements = (
+        ("language_model_pair_encoder.base_z_combine", "language_model_pair_encoder.layer_weights"),
+        ("language_model_pair_encoder.base_z_linear.0.", "language_model_pair_encoder.hidden_norm."),
+        ("language_model_pair_encoder.base_z_linear.1.", "language_model_pair_encoder.hidden_projection."),
+        (
+            "language_model_pair_encoder.base_z_mlp.0.downproject.",
+            "language_model_pair_encoder.single_to_pair.single_projection.",
+        ),
+        (
+            "language_model_pair_encoder.base_z_mlp.0.output_mlp.0.",
+            "language_model_pair_encoder.single_to_pair.pair_input_projection.",
+        ),
+        (
+            "language_model_pair_encoder.base_z_mlp.0.output_mlp.2.",
+            "language_model_pair_encoder.single_to_pair.pair_output_projection.",
+        ),
+        ("language_model_pair_encoder.base_z_mlp.1.", "language_model_pair_encoder.output_norm."),
+        ("relative_position_embedder.embed.", "relative_position_embedder.projection."),
+    )
+    for source, target in language_model_replacements:
+        name = name.replace(source, target)
+
+    structural_replacements = (
+        (".atom_attention_encoder.", ".atom_encoder."),
+        (".atom_linear.", ".atom_projection."),
+        (".atom_norm.", ".input_norm."),
+        (".atom_to_token_linear.", ".token_projection."),
+        (".token_to_atom_linear.", ".token_projection."),
+        (".atom_transformer.", ".transformer."),
+        (".coords_linear.", ".coordinate_projection."),
+        (".atom_decoder.norm.", ".atom_decoder.output_norm."),
+        (".atom_decoder.output_linear.", ".atom_decoder.coordinate_projection."),
+        (".adaln_modulation.1.", ".adaptive_norm_projection."),
+        (".attn.Wqkv.", ".attention.query_key_value_projection."),
+        (".attn.gate_proj.", ".attention.gate_projection."),
+        (".attn.out_proj.", ".attention.output_projection."),
+        (".ffn.w_up.", ".transition.gate_value_projection."),
+        (".ffn.w_down.", ".transition.output_projection."),
+        (".tri_mul_out._engine.", ".triangle_multiplication_outgoing."),
+        (".tri_mul_in._engine.", ".triangle_multiplication_incoming."),
+        (".norm_start.", ".input_norm."),
+        (".proj_bundle.", ".value_gate_projection."),
+        (".norm_mix.", ".output_norm."),
+        (".proj_emit.", ".output_projection."),
+        (".proj_gate.", ".output_gate_projection."),
+        (".outer_product_mean.norm.", ".outer_product_mean.msa_norm."),
+        (".outer_product_mean.Wout.", ".outer_product_mean.output_projection."),
+        (".outer_product_mean.W.", ".outer_product_mean.left_right_projection."),
+        (".msa_pair_weighted_averaging.norm_single.", ".msa_pair_weighted_averaging.msa_norm."),
+        (".msa_pair_weighted_averaging.compute_bias.0.", ".msa_pair_weighted_averaging.pair_norm."),
+        (
+            ".msa_pair_weighted_averaging.compute_bias.1.",
+            ".msa_pair_weighted_averaging.pair_bias_projection.",
+        ),
+        (".msa_pair_weighted_averaging.Wv.", ".msa_pair_weighted_averaging.value_projection."),
+        (".msa_pair_weighted_averaging.Wgate.", ".msa_pair_weighted_averaging.gate_projection."),
+        (".msa_pair_weighted_averaging.Wout.", ".msa_pair_weighted_averaging.output_projection."),
+    )
+    for source, target in structural_replacements:
+        name = name.replace(source, target)
+
+    if name.startswith("msa_encoder.embed."):
+        name = f"msa_encoder.msa_projection.{name.removeprefix('msa_encoder.embed.')}"
+    elif name.startswith("msa_encoder.project_inputs."):
+        name = f"msa_encoder.input_projection.{name.removeprefix('msa_encoder.project_inputs.')}"
+
+    name = re.sub(
+        r"^(folding_trunk|language_model_encoder|parcae_coda|confidence_head\.folding_trunk)"
+        r"\.blocks\.(\d+)\.pair_transition\.",
+        r"\1.blocks.\2.transition.",
+        name,
+    )
+    name = re.sub(
+        r"\.(transition|pair_transition|msa_transition)\.norm\.",
+        r".\1.input_norm.",
+        name,
+    )
+    name = re.sub(
+        r"\.(transition|pair_transition|msa_transition)\.ffn\.w12\.",
+        r".\1.feed_forward.gate_value_projection.",
+        name,
+    )
+    name = re.sub(
+        r"\.(transition|pair_transition|msa_transition)\.ffn\.w3\.",
+        r".\1.feed_forward.output_projection.",
+        name,
+    )
+
+    diffusion_replacements = (
+        (".conditioning.z_input_norm.", ".conditioning.pair_input_norm."),
+        (".conditioning.z_proj.", ".conditioning.pair_projection."),
+        (".conditioning.z_transitions.", ".conditioning.pair_transitions."),
+        (".conditioning.s_input_norm.", ".conditioning.single_input_norm."),
+        (".conditioning.s_proj.", ".conditioning.single_projection."),
+        (".conditioning.s_transitions.", ".conditioning.single_transitions."),
+        (".conditioning.fourier.w", ".conditioning.noise_embedding.frequencies"),
+        (".conditioning.fourier.b", ".conditioning.noise_embedding.phases"),
+        (".conditioning.noise_proj.", ".conditioning.noise_projection."),
+        (".diffusion_module.s_step_norm.", ".diffusion_module.single_norm."),
+        (".diffusion_module.s_to_token.", ".diffusion_module.single_projection."),
+        (".attention.adaln.", ".attention.adaptive_norm."),
+        (".transition.adaln.", ".transition.adaptive_norm."),
+        (".adaptive_norm.s_scale", ".adaptive_norm.conditioning_scale"),
+        (".adaptive_norm.s_gate.", ".adaptive_norm.gate_projection."),
+        (".adaptive_norm.s_shift.", ".adaptive_norm.shift_projection."),
+        (".attention.out_gate.", ".attention.output_gate_projection."),
+        (".attention.q_proj.", ".attention.query_projection."),
+        (".attention.kv_proj.", ".attention.key_value_projection."),
+        (".attention.g_proj.", ".attention.gate_projection."),
+        (".attention.out_proj.", ".attention.output_projection."),
+        (".attention.pair_bias_proj.", ".attention.pair_bias_projection."),
+        (".transition.lin_swish.", ".transition.feed_forward.gate_value_projection."),
+        (".transition.lin_out.", ".transition.feed_forward.output_projection."),
+        (".transition.output_gate.", ".transition.output_gate_projection."),
+    )
+    for source, target in diffusion_replacements:
+        name = name.replace(source, target)
+    name = re.sub(
+        r"\.(pair_transitions|single_transitions)\.(\d+)\.norm\.",
+        r".\1.\2.input_norm.",
+        name,
+    )
+    name = re.sub(
+        r"\.(pair_transitions|single_transitions)\.(\d+)\.out_proj\.",
+        r".\1.\2.feed_forward.output_projection.",
+        name,
+    )
+
+    confidence_replacements = (
+        ("confidence_head.boundaries", "confidence_head.distance_boundaries"),
+        ("confidence_head.dist_bin_pairwise_embed.", "confidence_head.distance_embedding."),
+        ("confidence_head.s_inputs_norm.", "confidence_head.input_norm."),
+        ("confidence_head.z_norm.", "confidence_head.pair_norm."),
+        ("confidence_head.s_to_z_prod_in1.", "confidence_head.left_product_projection."),
+        ("confidence_head.s_to_z_prod_in2.", "confidence_head.right_product_projection."),
+        ("confidence_head.s_to_z_prod_out.", "confidence_head.product_output_projection."),
+        ("confidence_head.s_to_z_transpose.", "confidence_head.right_pair_projection."),
+        ("confidence_head.s_to_z.", "confidence_head.left_pair_projection."),
+        ("confidence_head.s_norm.", "confidence_head.single_norm."),
+        ("confidence_head.s_inputs_to_single.", "confidence_head.input_to_single_projection."),
+        ("confidence_head.s_input_to_s.", "confidence_head.input_skip_projection."),
+        ("confidence_head.plddt_ln.", "confidence_head.plddt_norm."),
+        ("confidence_head.plddt_weight", "confidence_head.plddt_projection_weight"),
+        ("confidence_head.pae_ln.", "confidence_head.pae_norm."),
+        ("confidence_head.pae_head.", "confidence_head.pae_projection."),
+        ("confidence_head.pde_ln.", "confidence_head.pde_norm."),
+        ("confidence_head.pde_head.", "confidence_head.pde_projection."),
+        ("confidence_head.resolved_ln.", "confidence_head.resolved_norm."),
+        ("confidence_head.resolved_weight", "confidence_head.resolved_projection_weight"),
+        (".row_attention_pooling.attn_proj.", ".row_attention_pooling.attention_projection."),
+        (".row_attention_pooling.out_proj.", ".row_attention_pooling.output_projection."),
+    )
+    for source, target in confidence_replacements:
+        name = name.replace(source, target)
+    name = name.replace("diffusion_structure_head.diffusion_module.", "diffusion_structure_head.denoiser.", 1)
+    return name
 
 
 def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -241,15 +478,15 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
                 "expansion": atom_encoder["expansion_ratio"],
                 "spatial_rope_base_frequency": atom_encoder["spatial_rope_base_frequency"],
                 "num_spatial_rope_pairs_per_axis": atom_encoder["n_spatial_rope_pairs_per_axis"],
-                "num_uid_rope_pairs": atom_encoder["n_uid_rope_pairs"],
-                "uid_rope_base_frequency": atom_encoder["uid_rope_base_frequency"],
+                "num_reference_space_rope_pairs": atom_encoder["n_uid_rope_pairs"],
+                "reference_space_rope_base_frequency": atom_encoder["uid_rope_base_frequency"],
             },
         },
         # n_heads/dropout are inert upstream dataclass leftovers: the released
         # upstream PairUpdateBlock has neither an attention nor a dropout operation.
         "folding_trunk": {"num_blocks": folding_trunk["n_layers"]},
         "diffusion_structure_head": {
-            "diffusion_module": {
+            "denoiser": {
                 "sigma_data": diffusion["sigma_data"],
                 "atom_hidden_size": diffusion["c_atom"],
                 "token_hidden_size": diffusion["c_token"],
@@ -272,7 +509,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             "rho": structure["inference_p"],
             "num_sampling_steps": structure["inference_num_steps"],
         },
-        "confidence_head": {
+        "confidence": {
             "num_plddt_bins": confidence["num_plddt_bins"],
             "num_pde_bins": confidence["num_pde_bins"],
             "num_pae_bins": confidence["num_pae_bins"],
@@ -292,7 +529,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         # enabled/poisson_mean/min_steps/max_steps are not read by the released
         # Model; recycling_steps stores the total updates and always builds the coda.
         "parcae": {"num_coda_blocks": parcae["coda_n_layers"]},
-        "lm_encoder": {
+        "language_model_encoder": {
             "enabled": lm_encoder["enabled"],
             "num_blocks": lm_encoder["n_layers"],
             "dropout": lm_encoder["lm_dropout"],
@@ -319,7 +556,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     config.num_relative_residue_bins = raw_config["n_relative_residx_bins"]
     config.num_relative_chain_bins = raw_config["n_relative_chain_bins"]
     config.recycling_steps = int(raw_config["num_loops"]) + 1
-    config.disable_msa_features = raw_config["disable_msa_features"]
+    config.use_msa_features = not raw_config["disable_msa_features"]
     config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
     config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
 
@@ -334,63 +571,63 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     inputs = raw_config["inputs"]
     atom_encoder = inputs["atom_encoder"]
     config.input_embeddings.input_size = inputs["d_inputs"]
-    ae = config.input_embeddings.atom_encoder
-    ae.atom_hidden_size = atom_encoder["d_atom"]
-    ae.token_hidden_size = atom_encoder["d_token"]
-    ae.num_blocks = atom_encoder["n_blocks"]
-    ae.num_attention_heads = atom_encoder["n_heads"]
-    ae.sliding_window_size = atom_encoder["swa_window_size"]
-    ae.expansion = atom_encoder["expansion_ratio"]
-    ae.spatial_rope_base_frequency = atom_encoder["spatial_rope_base_frequency"]
-    ae.num_spatial_rope_pairs_per_axis = atom_encoder["n_spatial_rope_pairs_per_axis"]
-    ae.num_uid_rope_pairs = atom_encoder["n_uid_rope_pairs"]
-    ae.uid_rope_base_frequency = atom_encoder["uid_rope_base_frequency"]
+    atom_encoder_config = config.input_embeddings.atom_encoder
+    atom_encoder_config.atom_hidden_size = atom_encoder["d_atom"]
+    atom_encoder_config.token_hidden_size = atom_encoder["d_token"]
+    atom_encoder_config.num_blocks = atom_encoder["n_blocks"]
+    atom_encoder_config.num_attention_heads = atom_encoder["n_heads"]
+    atom_encoder_config.sliding_window_size = atom_encoder["swa_window_size"]
+    atom_encoder_config.expansion = atom_encoder["expansion_ratio"]
+    atom_encoder_config.spatial_rope_base_frequency = atom_encoder["spatial_rope_base_frequency"]
+    atom_encoder_config.num_spatial_rope_pairs_per_axis = atom_encoder["n_spatial_rope_pairs_per_axis"]
+    atom_encoder_config.num_reference_space_rope_pairs = atom_encoder["n_uid_rope_pairs"]
+    atom_encoder_config.reference_space_rope_base_frequency = atom_encoder["uid_rope_base_frequency"]
 
     config.folding_trunk.num_blocks = raw_config["folding_trunk"]["n_layers"]
 
     structure = raw_config["structure_head"]
     diffusion = structure["diffusion_module"]
-    sh = config.diffusion_structure_head
-    sh.num_distogram_bins = structure["distogram_bins"]
-    sh.churn_rate = structure["gamma_0"]
-    sh.min_churn_noise_level = structure["gamma_min"]
-    sh.noise_scale = structure["noise_scale"]
-    sh.step_scale = structure["step_scale"]
-    sh.max_noise_level = structure["inference_s_max"]
-    sh.min_noise_level = structure["inference_s_min"]
-    sh.rho = structure["inference_p"]
-    sh.num_sampling_steps = structure["inference_num_steps"]
-    dm = sh.diffusion_module
-    dm.sigma_data = diffusion["sigma_data"]
-    dm.atom_hidden_size = diffusion["c_atom"]
-    dm.token_hidden_size = diffusion["c_token"]
-    dm.pair_size = diffusion["c_z"]
-    dm.input_size = diffusion["c_s_inputs"]
-    dm.fourier_embedding_size = diffusion["fourier_dim"]
-    dm.num_atom_blocks = diffusion["atom_num_blocks"]
-    dm.num_atom_attention_heads = diffusion["atom_num_heads"]
-    dm.num_token_blocks = diffusion["token_num_blocks"]
-    dm.num_token_attention_heads = diffusion["token_num_heads"]
-    dm.expansion = diffusion["transition_multiplier"]
+    structure_head_config = config.diffusion_structure_head
+    structure_head_config.num_distogram_bins = structure["distogram_bins"]
+    structure_head_config.churn_rate = structure["gamma_0"]
+    structure_head_config.min_churn_noise_level = structure["gamma_min"]
+    structure_head_config.noise_scale = structure["noise_scale"]
+    structure_head_config.step_scale = structure["step_scale"]
+    structure_head_config.max_noise_level = structure["inference_s_max"]
+    structure_head_config.min_noise_level = structure["inference_s_min"]
+    structure_head_config.rho = structure["inference_p"]
+    structure_head_config.num_sampling_steps = structure["inference_num_steps"]
+    denoiser_config = structure_head_config.denoiser
+    denoiser_config.sigma_data = diffusion["sigma_data"]
+    denoiser_config.atom_hidden_size = diffusion["c_atom"]
+    denoiser_config.token_hidden_size = diffusion["c_token"]
+    denoiser_config.pair_size = diffusion["c_z"]
+    denoiser_config.input_size = diffusion["c_s_inputs"]
+    denoiser_config.fourier_embedding_size = diffusion["fourier_dim"]
+    denoiser_config.num_atom_blocks = diffusion["atom_num_blocks"]
+    denoiser_config.num_atom_attention_heads = diffusion["atom_num_heads"]
+    denoiser_config.num_token_blocks = diffusion["token_num_blocks"]
+    denoiser_config.num_token_attention_heads = diffusion["token_num_heads"]
+    denoiser_config.expansion = diffusion["transition_multiplier"]
 
     confidence = raw_config["confidence_head"]
-    ch = config.confidence_head
-    ch.enabled = confidence.get("enabled", True)
-    ch.num_distogram_bins = confidence["distogram_bins"]
-    ch.min_distance = confidence["min_dist"]
-    ch.max_distance = confidence["max_dist"]
-    ch.num_plddt_bins = confidence["num_plddt_bins"]
-    ch.num_pae_bins = confidence["num_pae_bins"]
-    ch.folding_trunk.num_blocks = confidence["folding_trunk"]["n_layers"]
+    confidence_config = config.confidence
+    confidence_config.enabled = confidence.get("enabled", True)
+    confidence_config.num_distogram_bins = confidence["distogram_bins"]
+    confidence_config.min_distance = confidence["min_dist"]
+    confidence_config.max_distance = confidence["max_dist"]
+    confidence_config.num_plddt_bins = confidence["num_plddt_bins"]
+    confidence_config.num_pae_bins = confidence["num_pae_bins"]
+    confidence_config.folding_trunk.num_blocks = confidence["folding_trunk"]["n_layers"]
 
     msa = raw_config["msa_encoder"]
-    mc = config.msa_encoder
-    mc.enabled = msa["enabled"]
-    mc.msa_size = msa["d_msa"]
-    mc.hidden_size = msa["d_hidden"]
-    mc.num_blocks = msa["n_layers"]
-    mc.num_msa_attention_heads = msa["n_heads_msa"]
-    mc.msa_head_dim = msa["msa_head_width"]
+    msa_config = config.msa_encoder
+    msa_config.enabled = msa["enabled"]
+    msa_config.msa_size = msa["d_msa"]
+    msa_config.hidden_size = msa["d_hidden"]
+    msa_config.num_blocks = msa["n_layers"]
+    msa_config.num_msa_attention_heads = msa["n_heads_msa"]
+    msa_config.msa_head_dim = msa["msa_head_width"]
 
     return config
 
@@ -485,7 +722,7 @@ def save_experimental_esmfold2_checkpoint(
         model.to(dtype=dtype)
     model.load_esmc(esmc)
     processor = EsmFold2ExperimentalProcessor(
-        EsmFold2ExperimentalProcessorConfig({"msa_conditioning": not model.config.disable_msa_features})
+        EsmFold2ExperimentalProcessorConfig({"msa_conditioning": model.config.use_msa_features})
     )
     processor.tokenizer = cast(ProteinTokenizer, tokenizer)
     EsmFold2DesignPipeline(model=model, processor=processor).save(

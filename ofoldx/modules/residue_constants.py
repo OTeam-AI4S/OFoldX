@@ -1,14 +1,8 @@
 r"""
-Shared AlphaFold2 and MpnnPacker implementation geometry for atom layouts and rigid frames.
+Amino-acid atom layouts, side-chain torsions, and rigid-frame geometry.
 
-Provenance: the amino-acid geometry tables (``chi_angles_atoms``, ``chi_angles_mask``,
-``rigid_group_atom_positions``, atom orderings, and the atom14 name
-table) are copied verbatim from AlphaFold2 / OpenFold ``residue_constants.py`` (DeepMind /
-AlQuraishi Lab, Apache-2.0). Only the subset needed by AlphaFold2 and MpnnPacker for
-shared atom37/atom14 orderings, side-chain torsion frames, and derived rigid-group tensor
-layouts is vendored here; the stereochemical-bond tables and their external data file are
-intentionally omitted. The four ``restype_*`` arrays are derived at import by
-`_make_rigid_group_constants`, matching OpenFold bit-for-bit.
+The module defines atom37 and atom14 orderings, chi-angle masks, rigid-group atom
+positions, and the derived tensors used to construct residue-local frames.
 """
 
 from __future__ import annotations
@@ -342,7 +336,7 @@ atom_order = {atom_type: index for index, atom_type in enumerate(atom_types)}
 atom_type_num = len(atom_types)  # := 37
 
 
-restype_name_to_atom14_names: dict[str, list[str]] = {
+AMINO_ACID_ATOM14_NAMES: dict[str, list[str]] = {
     "ALA": ["N", "CA", "C", "O", "CB", "", "", "", "", "", "", "", "", ""],
     "ARG": [
         "N",
@@ -592,7 +586,7 @@ restype_name_to_atom14_names: dict[str, list[str]] = {
 }
 
 
-restypes: list[str] = [
+AMINO_ACID_ONE_LETTER_CODES: list[str] = [
     "A",
     "R",
     "N",
@@ -615,20 +609,20 @@ restypes: list[str] = [
     "V",
 ]
 
-restype_num = len(restypes)  # := 20
+NUM_AMINO_ACID_TYPES = len(AMINO_ACID_ONE_LETTER_CODES)  # := 20
 
 
 # The neutral one-letter <-> component_id chemistry maps and the neutral leaving-atom /
 # hydrogen-element tables live in ``molecular`` as the single source of truth (they are
 # coordinate-free chemistry facts, not AF2 torsion geometry); consumers import them from there.
-# ``restype_1to3`` alone is pulled in below to key the genuine AF2 side-chain geometry that
+# ``AMINO_ACID_ONE_TO_THREE`` alone is pulled in below to key the genuine AF2 side-chain geometry that
 # stays in this module.
-from ..data.molecular import restype_1to3  # noqa: E402
+from ..data.molecular import AMINO_ACID_ONE_TO_THREE  # noqa: E402
 
-restype_atom14_to_rigid_group = np.zeros([21, 14], dtype=np.int64)
-restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)
-restype_atom14_rigid_group_positions = np.zeros([21, 14, 3], dtype=np.float32)
-restype_rigid_group_default_frame = np.zeros([21, 8, 4, 4], dtype=np.float32)
+AMINO_ACID_ATOM14_TO_RIGID_GROUP = np.zeros([21, 14], dtype=np.int64)
+AMINO_ACID_ATOM14_MASK = np.zeros([21, 14], dtype=np.float32)
+AMINO_ACID_ATOM14_RIGID_GROUP_POSITIONS = np.zeros([21, 14, 3], dtype=np.float32)
+AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME = np.zeros([21, 8, 4, 4], dtype=np.float32)
 
 
 def _make_rigid_transformation_4x4(ex: np.ndarray, ey: np.ndarray, translation: np.ndarray) -> np.ndarray:
@@ -650,60 +644,62 @@ def _make_rigid_transformation_4x4(ex: np.ndarray, ey: np.ndarray, translation: 
     ex_normalized = ex / np.linalg.norm(ex)
     ey_normalized = ey - np.dot(ey, ex_normalized) * ex_normalized
     ey_normalized /= np.linalg.norm(ey_normalized)
-    eznorm = np.cross(ex_normalized, ey_normalized)
-    matrix = np.stack([ex_normalized, ey_normalized, eznorm, translation]).transpose()
+    z_axis = np.cross(ex_normalized, ey_normalized)
+    matrix = np.stack([ex_normalized, ey_normalized, z_axis, translation]).transpose()
     return np.concatenate([matrix, [[0.0, 0.0, 0.0, 1.0]]], axis=0)
 
 
 def _make_rigid_group_constants() -> None:
     r"""
-    Populate the module-level ``restype_*`` atom14/frame arrays from ``rigid_group_atom_positions``.
+    Populate the module-level amino-acid atom14/frame arrays from ``rigid_group_atom_positions``.
 
     Fills the atom14-to-rigid-group map, atom14 mask, atom14 rigid-group positions, and the per-residue
     default frames (backbone, pre-omega dummy, phi, psi, and the chi frames) in place, so importing this
     module leaves the arrays ready for the side-chain Packer. Called once at import.
     """
 
-    for restype, restype_letter in enumerate(restypes):
-        resname = restype_1to3[restype_letter]
-        for atomname, group_idx, atom_position in rigid_group_atom_positions[resname]:
-            atom14idx = restype_name_to_atom14_names[resname].index(atomname)
-            restype_atom14_to_rigid_group[restype, atom14idx] = group_idx
-            restype_atom14_mask[restype, atom14idx] = 1
-            restype_atom14_rigid_group_positions[restype, atom14idx, :] = atom_position
+    for amino_acid_index, one_letter_code in enumerate(AMINO_ACID_ONE_LETTER_CODES):
+        component_id = AMINO_ACID_ONE_TO_THREE[one_letter_code]
+        for atom_name, group_index, atom_position in rigid_group_atom_positions[component_id]:
+            atom14_index = AMINO_ACID_ATOM14_NAMES[component_id].index(atom_name)
+            AMINO_ACID_ATOM14_TO_RIGID_GROUP[amino_acid_index, atom14_index] = group_index
+            AMINO_ACID_ATOM14_MASK[amino_acid_index, atom14_index] = 1
+            AMINO_ACID_ATOM14_RIGID_GROUP_POSITIONS[amino_acid_index, atom14_index, :] = atom_position
 
-    for restype, restype_letter in enumerate(restypes):
-        resname = restype_1to3[restype_letter]
-        atom_positions = {name: np.array(pos) for name, _, pos in rigid_group_atom_positions[resname]}
+    for amino_acid_index, one_letter_code in enumerate(AMINO_ACID_ONE_LETTER_CODES):
+        component_id = AMINO_ACID_ONE_TO_THREE[one_letter_code]
+        atom_positions = {name: np.array(position) for name, _, position in rigid_group_atom_positions[component_id]}
 
-        restype_rigid_group_default_frame[restype, 0, :, :] = np.eye(4)  # backbone -> backbone
-        restype_rigid_group_default_frame[restype, 1, :, :] = np.eye(4)  # pre-omega (dummy)
-        restype_rigid_group_default_frame[restype, 2, :, :] = _make_rigid_transformation_4x4(
+        AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 0, :, :] = np.eye(4)
+        AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 1, :, :] = np.eye(4)
+        AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 2, :, :] = _make_rigid_transformation_4x4(
             ex=atom_positions["N"] - atom_positions["CA"],
             ey=np.array([1.0, 0.0, 0.0]),
             translation=atom_positions["N"],
         )
-        restype_rigid_group_default_frame[restype, 3, :, :] = _make_rigid_transformation_4x4(
+        AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 3, :, :] = _make_rigid_transformation_4x4(
             ex=atom_positions["C"] - atom_positions["CA"],
             ey=atom_positions["CA"] - atom_positions["N"],
             translation=atom_positions["C"],
         )
-        if chi_angles_mask[restype][0]:
-            base_atom_names = chi_angles_atoms[resname][0]
+        if chi_angles_mask[amino_acid_index][0]:
+            base_atom_names = chi_angles_atoms[component_id][0]
             base_atom_positions = [atom_positions[name] for name in base_atom_names]
-            restype_rigid_group_default_frame[restype, 4, :, :] = _make_rigid_transformation_4x4(
+            AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 4, :, :] = _make_rigid_transformation_4x4(
                 ex=base_atom_positions[2] - base_atom_positions[1],
                 ey=base_atom_positions[0] - base_atom_positions[1],
                 translation=base_atom_positions[2],
             )
-        for chi_idx in range(1, 4):  # chi2..chi4 rotate about the previous frame origin
-            if chi_angles_mask[restype][chi_idx]:
-                axis_end_atom_name = chi_angles_atoms[resname][chi_idx][2]
+        for chi_index in range(1, 4):  # chi2..chi4 rotate about the previous frame origin
+            if chi_angles_mask[amino_acid_index][chi_index]:
+                axis_end_atom_name = chi_angles_atoms[component_id][chi_index][2]
                 axis_end_atom_position = atom_positions[axis_end_atom_name]
-                restype_rigid_group_default_frame[restype, 4 + chi_idx, :, :] = _make_rigid_transformation_4x4(
-                    ex=axis_end_atom_position,
-                    ey=np.array([-1.0, 0.0, 0.0]),
-                    translation=axis_end_atom_position,
+                AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME[amino_acid_index, 4 + chi_index, :, :] = (
+                    _make_rigid_transformation_4x4(
+                        ex=axis_end_atom_position,
+                        ey=np.array([-1.0, 0.0, 0.0]),
+                        translation=axis_end_atom_position,
+                    )
                 )
 
 

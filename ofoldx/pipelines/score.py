@@ -11,8 +11,8 @@ from ..artifacts import SaveableModel
 from ..data.molecular import MolecularSystem
 from ..data.structure import Structure
 from ..results import ScoreResult
-from ._paired import PairedPipeline
-from .generator import PipelineProcessor, processor_device, resolve_generator
+from .generator import PipelineProcessor, resolve_generator
+from .paired import PairedPipeline
 
 _ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
@@ -48,7 +48,22 @@ class ScorePipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        r"""Score one molecular input with the paired Processor and Model.
+
+        Args:
+            input: Molecular system, structure, or path to process.
+            seed: Optional integer seed used to create the operation generator; mutually exclusive
+                with ``generator``.
+            generator: Optional caller-supplied random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``ScoreResult`` containing the coordinate-conditioned target and its scientific values.
+
+        Raises:
+            ValueError: If both ``seed`` and ``generator`` are supplied.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input)
         return self.model.score(
             model_input,

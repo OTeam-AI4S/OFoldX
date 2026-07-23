@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from importlib import import_module
-from typing import Any, Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 import chanfig
 
 from ..model import Model
+from ..processor import Processor
 
 Task = Literal["fold", "design", "score", "pack"]
 TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
@@ -19,7 +20,7 @@ class ModelRegistration(NamedTuple):
 
     id: str
     model: type[Model]
-    processor: type[Any]
+    processor: type[Processor]
     processor_config: type[chanfig.Config] | None
     model_config: type[chanfig.Config]
     standard_tasks: frozenset[Task]
@@ -60,7 +61,7 @@ class ModelRegistry(chanfig.Registry):
     """
 
     by_config: dict[type[chanfig.Config], ModelRegistration]
-    by_pair: dict[tuple[type[Model], type[Any]], ModelRegistration]
+    by_pair: dict[tuple[type[Model], type[Processor]], ModelRegistration]
 
     def __init__(self) -> None:
         super().__init__(case_sensitive=True)
@@ -73,9 +74,9 @@ class ModelRegistry(chanfig.Registry):
         id: str,
         *,
         model: type[Model],
-        processor: type[Any],
+        processor: type[Processor],
         processor_config: type[chanfig.Config] | None,
-        standard_tasks: Collection[Task] = (),
+        standard_tasks: Collection[str] = (),
     ) -> None:
         r"""Register one Model/Processor pair."""
 
@@ -101,7 +102,7 @@ class ModelRegistry(chanfig.Registry):
             processor=processor,
             processor_config=processor_config,
             model_config=model_config,
-            standard_tasks=standard_task_values,
+            standard_tasks=cast(frozenset[Task], standard_task_values),
         )
         super().register(registration, id)
         self.by_pair[pair] = registration
@@ -118,16 +119,15 @@ class ModelRegistry(chanfig.Registry):
         self._import_builtin(id)
         return cast(ModelRegistration, super().lookup(id))
 
-    def for_config(self, config: object) -> ModelRegistration:
+    def for_config(self, config: chanfig.Config) -> ModelRegistration:
         r"""Return the registration selected by an exact Model config class."""
 
-        return self.by_config[type(config)]
+        return self.by_config[cast(type[chanfig.Config], type(config))]
 
-    def for_pair(self, model: object, processor: object) -> ModelRegistration:
+    def for_pair(self, model: Model, processor: Processor) -> ModelRegistration:
         r"""Return the registration for an exact Model/Processor class pair."""
 
-        model_class = cast(type[Model], type(model))
-        return self.by_pair[model_class, type(processor)]
+        return self.by_pair[type(model), type(processor)]
 
 
 MODELS = ModelRegistry()

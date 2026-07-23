@@ -42,11 +42,11 @@ class MsaTrunk(nn.Module):
         triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
         triangle_attention_hidden_size: Per-head width of each triangle-attention update.
         num_triangle_attention_heads: Number of heads in triangle attention.
-        expansion: Feed-forward expansion factor of every transition.
+        expansion: Expansion factor of every transition.
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
     Examples:
         >>> import torch
@@ -115,6 +115,7 @@ class MsaTrunk(nn.Module):
                     operator_backend=operator_backend,
                 )
             )
+        self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(blocks)
 
     def forward(
@@ -166,11 +167,11 @@ class MsaTrunk(nn.Module):
         return msa, pair
 
 
-class MsaModule(nn.Module):
+class CategoricalMsaTrunk(nn.Module):
     r"""
     MSA trunk that builds the MSA state from raw features and refines the pair representation.
 
-    Unlike [`MsaTrunk`][ofoldx.modules.trunk.msa.MsaTrunk], this module builds the MSA state inline
+    Unlike [`MsaTrunk`][ofoldx.modules.trunk.msa.MsaTrunk], this trunk builds the MSA state inline
     from integer token ids and deletion features, adds the projected single input embedding, and returns
     only the refined pair representation. The one-hot vocabulary plus the deletion and paired features must
     match ``msa_feature_size`` (``vocab_size + 3`` when ``use_paired_feature`` else ``vocab_size + 2``).
@@ -180,7 +181,7 @@ class MsaModule(nn.Module):
         pair_size: Width of the pair representation.
         msa_size: Width of the projected MSA state.
         msa_feature_size: Expected width of the concatenated MSA feature vector.
-        num_blocks: Number of [`MsaLayer`][ofoldx.modules.trunk.msa.MsaLayer] blocks.
+        num_blocks: Number of [`MsaBlock`][ofoldx.modules.trunk.msa.MsaBlock] blocks.
         vocab_size: Token vocabulary size used to one-hot the MSA ids.
         use_paired_feature: Whether to append the ``is_paired`` feature.
         outer_product_hidden_size: Hidden width of the outer-product mean.
@@ -195,7 +196,7 @@ class MsaModule(nn.Module):
 
     Examples:
         >>> import torch
-        >>> module = MsaModule(
+        >>> trunk = CategoricalMsaTrunk(
         ...     single_size=8, pair_size=4, msa_size=8, msa_feature_size=36, num_blocks=1,
         ...     vocab_size=33, outer_product_hidden_size=4, num_msa_attention_heads=2,
         ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
@@ -203,7 +204,7 @@ class MsaModule(nn.Module):
         ... ).eval()
         >>> B, S, N = 1, 2, 3
         >>> zeros = torch.zeros(B, S, N)
-        >>> pair = module(
+        >>> pair = trunk(
         ...     torch.randn(B, N, N, 4), torch.randn(B, N, 8),
         ...     msa=torch.randint(0, 33, (B, S, N)),
         ...     has_deletion=zeros, deletion_value=zeros, is_paired=zeros,
@@ -237,8 +238,9 @@ class MsaModule(nn.Module):
         self.use_paired_feature = use_paired_feature
         self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
-        self.layers = nn.ModuleList(
-            MsaLayer(
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            MsaBlock(
                 msa_size=msa_size,
                 pair_size=pair_size,
                 outer_product_hidden_size=outer_product_hidden_size,
@@ -267,7 +269,7 @@ class MsaModule(nn.Module):
         token_mask: Tensor,
     ) -> Tensor:
         r"""
-        Build the MSA state from raw features, then refine the pair representation through every layer.
+        Build the MSA state from raw features, then refine the pair representation through every block.
 
         Concatenates the one-hot MSA token ids (``vocab_size`` classes) with ``has_deletion`` and
         ``deletion_value`` (and ``is_paired`` when ``use_paired_feature``), projects the result to width
@@ -290,7 +292,7 @@ class MsaModule(nn.Module):
 
         Examples:
             >>> import torch
-            >>> module = MsaModule(
+            >>> trunk = CategoricalMsaTrunk(
             ...     single_size=8, pair_size=4, msa_size=8, msa_feature_size=36, num_blocks=1,
             ...     vocab_size=33, outer_product_hidden_size=4, num_msa_attention_heads=2,
             ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
@@ -298,7 +300,7 @@ class MsaModule(nn.Module):
             ... ).eval()
             >>> B, S, N = 1, 2, 3
             >>> zeros = torch.zeros(B, S, N)
-            >>> pair = module(
+            >>> pair = trunk(
             ...     torch.randn(B, N, N, 4), torch.randn(B, N, 8),
             ...     msa=torch.randint(0, 33, (B, S, N)),
             ...     has_deletion=zeros, deletion_value=zeros, is_paired=zeros,
@@ -318,14 +320,14 @@ class MsaModule(nn.Module):
         msa_state = msa_state + self.token_projection(single_inputs).unsqueeze(1)
 
         pair_mask = pair_mask_from_token_mask(token_mask)
-        for layer in self.layers:
-            pair, msa_state = layer(pair, msa_state, pair_mask, msa_mask)
+        for block in self.blocks:
+            pair, msa_state = block(pair, msa_state, pair_mask, msa_mask)
         return pair
 
 
-class MsaLayer(nn.Module):
+class MsaBlock(nn.Module):
     r"""
-    One MSA layer: pair-weighted averaging, MSA transition, outer-product mean, then a triangle pair update.
+    One MSA block: pair-weighted averaging, MSA transition, outer-product mean, then a triangle pair update.
 
     The pair-weighted averaging widens to ``msa_head_dim`` (32, inner 256 for 8 heads) and the
     outer-product mean can divide before projecting (see
@@ -347,13 +349,13 @@ class MsaLayer(nn.Module):
 
     Examples:
         >>> import torch
-        >>> layer = MsaLayer(
+        >>> block = MsaBlock(
         ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
         ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
         ...     expansion=2,
         ... ).eval()
         >>> pair, msa = torch.randn(1, 3, 3, 4), torch.randn(1, 2, 3, 8)
-        >>> out_pair, out_msa = layer(pair, msa, torch.ones(1, 3, 3), torch.ones(1, 2, 3))
+        >>> out_pair, out_msa = block(pair, msa, torch.ones(1, 3, 3), torch.ones(1, 2, 3))
         >>> out_pair.shape, out_msa.shape
         (torch.Size([1, 3, 3, 4]), torch.Size([1, 2, 3, 8]))
     """
@@ -415,12 +417,12 @@ class MsaLayer(nn.Module):
 
         Examples:
             >>> import torch
-            >>> layer = MsaLayer(
+            >>> block = MsaBlock(
             ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
             ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
             ...     expansion=2,
             ... ).eval()
-            >>> out_pair, out_msa = layer(
+            >>> out_pair, out_msa = block(
             ...     torch.randn(1, 3, 3, 4), torch.randn(1, 2, 3, 8),
             ...     torch.ones(1, 3, 3), torch.ones(1, 2, 3),
             ... )
@@ -454,7 +456,7 @@ class MsaPairBlock(nn.Module):
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -491,7 +493,7 @@ class MsaPairBlock(nn.Module):
             pair_size=pair_size,
             operator_backend=operator_backend,
         )
-        self.msa_stack = MsaUpdateBlock(
+        self.msa_update = MsaUpdateBlock(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
@@ -499,7 +501,7 @@ class MsaPairBlock(nn.Module):
             dropout=msa_dropout,
             operator_backend=operator_backend,
         )
-        self.pair_stack = TrianglePairUpdateBlock(
+        self.triangle_pair_update = TrianglePairUpdateBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
             triangle_attention_hidden_size=triangle_attention_hidden_size,
@@ -520,7 +522,7 @@ class MsaPairBlock(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         r"""
         Add the outer-product mean of the MSA to the pair, update the MSA against the new pair, then run
-        the triangle pair stack.
+        the triangle pair update.
 
         Args:
             msa: MSA representation `[B, S, N, msa_size]`.
@@ -543,8 +545,8 @@ class MsaPairBlock(nn.Module):
             (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
         """
         pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
-        msa = self.msa_stack(msa, pair, pair_mask=pair_mask)
-        pair = self.pair_stack(pair, pair_mask=pair_mask)
+        msa = self.msa_update(msa, pair, pair_mask=pair_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -552,7 +554,7 @@ class FinalMsaPairBlock(nn.Module):
     r"""
     Final MSA block that refines the pair representation only, leaving the MSA unchanged.
 
-    Adds the outer-product mean of the MSA to the pair representation and runs the triangle pair stack.
+    Adds the outer-product mean of the MSA to the pair representation and runs the triangle pair update.
     The MSA passes through untouched, since the last block of the trunk emits no MSA update.
 
     Args:
@@ -562,10 +564,10 @@ class FinalMsaPairBlock(nn.Module):
         triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
         triangle_attention_hidden_size: Per-head width of each triangle-attention update.
         num_triangle_attention_heads: Number of heads in triangle attention.
-        expansion: Feed-forward expansion factor of every transition.
+        expansion: Expansion factor of every transition.
         pair_dropout: Row-wise dropout probability on each pair residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -600,7 +602,7 @@ class FinalMsaPairBlock(nn.Module):
             pair_size=pair_size,
             operator_backend=operator_backend,
         )
-        self.pair_stack = TrianglePairUpdateBlock(
+        self.triangle_pair_update = TrianglePairUpdateBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
             triangle_attention_hidden_size=triangle_attention_hidden_size,
@@ -620,7 +622,7 @@ class FinalMsaPairBlock(nn.Module):
         pair_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         r"""
-        Add the outer-product mean of the MSA to the pair and run the triangle pair stack.
+        Add the outer-product mean of the MSA to the pair and run the triangle pair update.
 
         The MSA passes through unchanged, since the last block of the trunk emits no MSA update.
 
@@ -646,7 +648,7 @@ class FinalMsaPairBlock(nn.Module):
             (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
         """
         pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
-        pair = self.pair_stack(pair, pair_mask=pair_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -658,7 +660,7 @@ class MsaUpdateBlock(nn.Module):
         msa_size: Width of the MSA representation.
         pair_size: Width of the pair representation.
         num_attention_heads: Number of heads in the MSA pair-weighted averaging.
-        expansion: Feed-forward expansion factor of the transition.
+        expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability on the pair-weighted averaging residual.
         operator_backend: Operator backend selector forwarded to every submodule.
 
@@ -686,7 +688,7 @@ class MsaUpdateBlock(nn.Module):
             operator_backend=operator_backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.feed_forward = Transition(msa_size, expansion=expansion, operator_backend=operator_backend)
+        self.transition = Transition(msa_size, expansion=expansion, operator_backend=operator_backend)
 
     def forward(self, msa: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -707,7 +709,7 @@ class MsaUpdateBlock(nn.Module):
             torch.Size([1, 2, 3, 8])
         """
         msa = msa + self.rowwise_dropout(self.msa_pair_weighted_averaging(msa, pair, pair_mask=pair_mask))
-        return msa + self.feed_forward(msa)
+        return msa + self.transition(msa)
 
 
 class TrianglePairUpdateBlock(nn.Module):
@@ -722,10 +724,10 @@ class TrianglePairUpdateBlock(nn.Module):
         triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
         triangle_attention_hidden_size: Per-head width of each triangle-attention update.
         num_triangle_attention_heads: Number of heads in triangle attention.
-        expansion: Feed-forward expansion factor of the transition.
+        expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability applied to each residual.
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair (the DeepMind AlphaFold 3 convention).
+            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
 
     Examples:
@@ -776,7 +778,7 @@ class TrianglePairUpdateBlock(nn.Module):
             operator_backend=operator_backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.feed_forward = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -812,7 +814,7 @@ class TrianglePairUpdateBlock(nn.Module):
                 -2,
             ),
         )
-        return pair + self.feed_forward(pair)
+        return pair + self.transition(pair)
 
 
 class MsaPairWeightedAveraging(nn.Module):
@@ -864,9 +866,9 @@ class MsaPairWeightedAveraging(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         inner_size = num_attention_heads * head_dim
-        self.norm_msa = LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.value_projection = nn.Linear(msa_size, inner_size, bias=False)
-        self.norm_pair = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.pair_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.gate_projection = nn.Linear(msa_size, inner_size, bias=False)
         self.output_projection = nn.Linear(inner_size, msa_size, bias=False)
@@ -878,8 +880,8 @@ class MsaPairWeightedAveraging(nn.Module):
         Average MSA values along the query-residue axis with per-head weights softmaxed from the pair
         representation, then sigmoid-gate and project back.
 
-        The ``oops`` backend delegates to the OOps implementation; the ``eager`` path is the explicit
-        reference.
+        The ``oops`` backend delegates to the accelerated implementation; the ``eager`` path uses
+        ordinary PyTorch operations.
 
         Args:
             msa: MSA representation `[B, S, N, msa_size]`.
@@ -899,18 +901,18 @@ class MsaPairWeightedAveraging(nn.Module):
             msa,
             pair,
             pair_mask,
-            norm_msa_weight=self.norm_msa.weight,
-            norm_msa_bias=self.norm_msa.bias,
-            norm_pair_weight=self.norm_pair.weight,
-            norm_pair_bias=self.norm_pair.bias,
+            norm_msa_weight=self.msa_norm.weight,
+            norm_msa_bias=self.msa_norm.bias,
+            norm_pair_weight=self.pair_norm.weight,
+            norm_pair_bias=self.pair_norm.bias,
             value_weight=self.value_projection.weight,
             gate_weight=self.gate_projection.weight,
             pair_logits_weight=self.pair_projection.weight,
             output_weight=self.output_projection.weight,
             num_heads=self.num_attention_heads,
             head_dim=self.head_dim,
-            norm_msa_eps=self.norm_msa.eps,
-            norm_pair_eps=self.norm_pair.eps,
+            norm_msa_eps=self.msa_norm.eps,
+            norm_pair_eps=self.pair_norm.eps,
             operator_backend=self.operator_backend,
         )
 
@@ -955,7 +957,7 @@ class OuterProductMean(nn.Module):
         )
         self.eps = eps
         self.divide_before_projection = divide_before_projection
-        self.norm_msa = LayerNorm(msa_size)
+        self.msa_norm = LayerNorm(msa_size)
         self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
@@ -966,7 +968,7 @@ class OuterProductMean(nn.Module):
         projections and project it to a pair update.
 
         ``divide_before_projection`` and ``eps`` set the normalisation as documented on the class. The
-        ``oops`` backend delegates to the OOps implementation; the ``eager`` path is the explicit reference.
+        ``oops`` delegates to the accelerated implementation; ``eager`` uses ordinary PyTorch operations.
 
         Args:
             msa: MSA representation `[B, S, N, msa_size]`.
@@ -984,15 +986,15 @@ class OuterProductMean(nn.Module):
         return dispatch_outer_product_mean(
             msa,
             msa_mask,
-            norm_weight=self.norm_msa.weight,
-            norm_bias=self.norm_msa.bias,
+            norm_weight=self.msa_norm.weight,
+            norm_bias=self.msa_norm.bias,
             proj_left_weight=self.left_projection.weight,
             proj_right_weight=self.right_projection.weight,
             proj_left_bias=self.left_projection.bias,
             proj_right_bias=self.right_projection.bias,
             proj_out_weight=self.output_projection.weight,
             proj_out_bias=self.output_projection.bias,
-            norm_eps=self.norm_msa.eps,
+            norm_eps=self.msa_norm.eps,
             denom_eps=self.eps,
             divide_before_projection=self.divide_before_projection,
             operator_backend=self.operator_backend,

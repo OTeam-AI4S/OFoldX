@@ -17,30 +17,19 @@ class PipelineProcessor(Protocol):
     r"""Placement capabilities shared by concrete Pipeline Processors."""
 
     @property
-    def device(self) -> torch.device | str | None: ...
+    def device(self) -> torch.device:
+        r"""Return the device used for lowered tensors."""
+
+        ...
 
     def to(
         self,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> object: ...
+    ) -> object:
+        r"""Move the Processor to a device and floating-point dtype."""
 
-
-def processor_device(processor: PipelineProcessor) -> torch.device | None:
-    r"""Return the output device declared by one concrete Processor.
-
-    Processors own output placement and expose it before processing, which lets a
-    Pipeline construct the correct device-specific generator.
-
-    Args:
-        processor: A concrete Processor following the placement contract.
-
-    Returns:
-        The Processor's output device, or ``None`` for the default device.
-    """
-
-    device = processor.device
-    return None if device is None else torch.device(device)
+        ...
 
 
 def resolve_generator(

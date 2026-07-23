@@ -2,7 +2,6 @@ r"""BoltzGen structure-design and inverse-folding models with their typed tensor
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal, cast
@@ -40,11 +39,20 @@ from ...modules.embedding.position import RelativePositionEmbedder, generate_rel
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import DistogramHead
-from ...modules.transformer import ConditionedTransformer, ConditionedTransformerBlock, ConditionedTransitionBlock
+from ...modules.transformer import (
+    ConditionedTransformer,
+    ConditionedTransformerBlock,
+    TripleProductConditionedTransition,
+)
 from ...modules.transition import ConditionedTransition, RowwiseDropout, Transition
-from ...modules.trunk.msa import MsaModule, MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateBlock
+from ...modules.trunk.msa import (
+    CategoricalMsaTrunk,
+    MsaPairWeightedAveraging,
+    OuterProductMean,
+    TrianglePairUpdateBlock,
+)
 from ...modules.trunk.pairformer import PairformerStack
-from ...results import Metric, PairMetric, Score
+from ...results import Metric, PairMetric, Score, best
 from .config import BoltzGenConfig, BoltzGenInverseFoldingConfig
 
 
@@ -53,8 +61,8 @@ class BoltzGenModel(Model):
     BoltzGen structure-generating design model (``boltzgen1_diverse`` / ``boltzgen1_adherence``).
 
     The model-specific components are defined in this file: the v1
-    [`BoltzGenTemplateModule`][ofoldx.models.boltzgen.model.BoltzGenTemplateModule], an added
-    [`BoltzGenTokenDistanceModule`][ofoldx.models.boltzgen.model.BoltzGenTokenDistanceModule],
+    [`BoltzGenTemplateEmbedder`][ofoldx.models.boltzgen.model.BoltzGenTemplateEmbedder], an added
+    [`BoltzGenTokenDistanceEmbedder`][ofoldx.models.boltzgen.model.BoltzGenTokenDistanceEmbedder],
     design conditioning in the input embedder, and a structure-generation path without
     confidence or affinity heads.
     [`BoltzGenConfig`][ofoldx.models.boltzgen.config.BoltzGenConfig] carries the shared submodule settings plus
@@ -118,11 +126,10 @@ class BoltzGenModel(Model):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        # BoltzGen swap 1: v1 template module (a_proj/pairformer pattern), not the v2 embedder.
-        self.template_module = BoltzGenTemplateModule(
+        self.template_embedder = BoltzGenTemplateEmbedder(
             pair_size=pair_size,
             template_size=design.template_size,
-            num_blocks=design.template_blocks,
+            num_blocks=design.num_template_blocks,
             vocab_size=input_embeddings_config.vocab_size,
             num_bins=config.template.num_distogram_bins,
             min_dist=config.template.min_distance,
@@ -132,12 +139,11 @@ class BoltzGenModel(Model):
             miniformer_blocks=config.template.miniformer_blocks,
             operator_backend="auto",
         )
-        # BoltzGen swap 2: token-distance conditioning module. The structuretrained-small artifact omits it.
-        self.token_distance_module = (
-            BoltzGenTokenDistanceModule(
+        self.token_distance_embedder = (
+            BoltzGenTokenDistanceEmbedder(
                 pair_size=pair_size,
                 token_distance_size=design.token_distance_size,
-                num_blocks=design.token_distance_blocks,
+                num_blocks=design.num_token_distance_blocks,
                 num_bins=config.template.num_distogram_bins,
                 distance_gaussian_dim=design.distance_gaussian_dim,
                 min_dist=config.template.min_distance,
@@ -150,8 +156,8 @@ class BoltzGenModel(Model):
             else None
         )
 
-        self.msa_module = (
-            MsaModule(
+        self.msa_trunk = (
+            CategoricalMsaTrunk(
                 single_size=single_size,
                 pair_size=pair_size,
                 msa_size=trunk.msa_size,
@@ -169,7 +175,7 @@ class BoltzGenModel(Model):
                 operator_backend="auto",
             )
             if not trunk.msa_miniformer_blocks
-            else BoltzGenMiniformerMsaModule(
+            else BoltzGenMiniformerMsaTrunk(
                 single_size=single_size,
                 pair_size=pair_size,
                 msa_size=trunk.msa_size,
@@ -258,7 +264,11 @@ class BoltzGenModel(Model):
             time_dilation_end=sampler.time_dilation_end,
         )
         self.bfactor_head = BoltzGenBFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
-        self.set_backend("auto")
+        self.post_init()
+
+    def initialize_parameters(self) -> None:
+        r"""Apply the BoltzGen residual-update initialization."""
+
         _zero_initialize_boltzgen_updates(self)
 
     def _set_backend(self, backend: ModelBackend) -> None:
@@ -295,7 +305,7 @@ class BoltzGenModel(Model):
         Training path: one EDM denoising step of the structure diffusion module.
 
         This is the structure-training graph in both ``train()`` and ``eval()`` modes; those modes only control
-        ordinary stochastic layers such as dropout. It mirrors the upstream BoltzGen training diffusion step
+        ordinary stochastic layers such as dropout. It mirrors the BoltzGen training diffusion step
         (``AtomDiffusion.forward``): run the trunk,
         center-and-augment the experimental target coords, corrupt them at a log-normal-sampled noise level, and
         denoise once with the EDM-preconditioned score network. The returned candidate carries the single-step
@@ -304,7 +314,7 @@ class BoltzGenModel(Model):
 
         Args:
             input: Typed model input; training requires ``target_positions``. ``target_mask`` is the
-                resolved-atom mask for the training objective; the upstream diffusion augmentation is
+                resolved-atom mask for the training objective; the diffusion augmentation is
                 centered over ``atom_mask`` instead.
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
             generator: Optional PyTorch random generator for the augmentation, noise level, and Gaussian noise.
@@ -529,17 +539,17 @@ class BoltzGenModel(Model):
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
-                if self.token_distance_module is not None:
-                    pair = pair + self.token_distance_module(
+                if self.token_distance_embedder is not None:
+                    pair = pair + self.token_distance_embedder(
                         pair,
                         input,
                         relative_position_encoding,
                         pair_mask=pair_mask,
                     )
-                if input.template_restype is not None:
-                    pair = pair + self.template_module(pair, input, pair_mask=pair_mask)
+                if input.template_residue_type is not None:
+                    pair = pair + self.template_embedder(pair, input, pair_mask=pair_mask)
                 if input.msa is not None:
-                    pair = pair + self.msa_module(
+                    pair = pair + self.msa_trunk(
                         pair,
                         single_inputs,
                         msa=input.msa,
@@ -599,7 +609,7 @@ class BoltzGenInverseFoldingModel(Model):
             node_size=inverse_folding.node_size,
             edge_size=inverse_folding.edge_size,
             hidden_size=inverse_folding.hidden_size,
-            num_layers=inverse_folding.num_encoder_layers,
+            num_blocks=inverse_folding.num_encoder_blocks,
             num_attention_heads=inverse_folding.num_attention_heads,
             num_neighbors=inverse_folding.num_neighbors,
             dropout=inverse_folding.dropout,
@@ -610,12 +620,16 @@ class BoltzGenInverseFoldingModel(Model):
             node_size=inverse_folding.node_size,
             edge_size=inverse_folding.edge_size,
             hidden_size=inverse_folding.hidden_size,
-            num_layers=inverse_folding.num_decoder_layers,
+            num_blocks=inverse_folding.num_decoder_blocks,
             num_attention_heads=inverse_folding.num_attention_heads,
             dropout=inverse_folding.dropout,
             softmax_dropout=inverse_folding.softmax_dropout,
         )
-        self.set_backend("auto")
+        self.post_init()
+
+    def initialize_parameters(self) -> None:
+        r"""Apply the BoltzGen residual-update initialization."""
+
         _zero_initialize_boltzgen_updates(self)
 
     def _set_backend(self, backend: ModelBackend) -> None:
@@ -641,12 +655,18 @@ class BoltzGenInverseFoldingModel(Model):
             ):
                 module.operator_backend = operator_backend
 
-    def forward(self, input: BoltzGenInverseFoldingInput) -> BoltzGenInverseFoldingOutput:
+    def forward(
+        self,
+        input: BoltzGenInverseFoldingInput,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenInverseFoldingOutput:
         r"""
         Return per-token residue-type logits for structure-conditioned sequence design.
 
         Args:
             input: Typed model input.
+            generator: Optional random generator for teacher-forcing visibility.
 
         Returns:
             Design-generator output carrying sequence logits.
@@ -668,7 +688,7 @@ class BoltzGenInverseFoldingModel(Model):
         )
         edge_index, valid_mask, node, edge = self.inverse_folding_encoder(input, single_inputs=single_inputs)
         return BoltzGenInverseFoldingOutput(
-            logits=self.inverse_folding_decoder(node, edge, edge_index, valid_mask, input),
+            logits=self.inverse_folding_decoder(node, edge, edge_index, valid_mask, input, generator=generator),
         )
 
     def design(
@@ -1298,13 +1318,13 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
         return self.position_update(atom_query)
 
 
-class BoltzGenTokenDistanceModule(nn.Module):
+class BoltzGenTokenDistanceEmbedder(nn.Module):
     r"""
     Encode inter-token backbone geometry into an additive pair update.
 
     Args:
         pair_size: Width of the trunk pair representation channel.
-        token_distance_size: Hidden width of the module.
+        token_distance_size: Hidden width of the embedding.
         num_blocks: Number of pair-only pairformer blocks.
         num_bins: Number of center-distance distogram bins.
         min_dist: Lower edge (angstrom) of the distogram binning.
@@ -1329,16 +1349,17 @@ class BoltzGenTokenDistanceModule(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.norm_pair = nn.LayerNorm(pair_size)
+        self.pair_norm = nn.LayerNorm(pair_size)
         self.hidden_norm = nn.LayerNorm(token_distance_size)
         self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
         self.distance_feature_projection = nn.Linear(num_bins + 4 * pair_size, token_distance_size, bias=False)
         self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
-        self.pairformer = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             TrianglePairUpdateBlock(
                 pair_size=token_distance_size,
                 triangle_multiplication_hidden_size=token_distance_size,
@@ -1383,22 +1404,22 @@ class BoltzGenTokenDistanceModule(nn.Module):
 
         distance_features = torch.cat([distogram, self.distance_encoder(relative_position_encoding, input)], dim=-1)
         distance_features = distance_features * input.token_distance_mask.unsqueeze(-1)
-        value = self.pair_projection(self.norm_pair(pair)) + self.distance_feature_projection(
+        value = self.pair_projection(self.pair_norm(pair)) + self.distance_feature_projection(
             distance_features.to(pair.dtype)
         )
         refined = value
-        for block in self.pairformer:
+        for block in self.blocks:
             refined = block(refined, pair_mask=pair_mask)
         value = self.hidden_norm(value + refined)  # one outer residual around the (internally-residual) stack
         return self.output_projection(self.relu(value))
 
 
-class BoltzGenTemplateModule(nn.Module):
+class BoltzGenTemplateEmbedder(nn.Module):
     r"""
-    BoltzGen v1 template module: on-the-fly template geometry -> additive pair update.
+    Embed template geometry as an additive pair update.
 
     Same wrapper as
-    [`BoltzGenTokenDistanceModule`][ofoldx.models.boltzgen.model.BoltzGenTokenDistanceModule]
+    [`BoltzGenTokenDistanceEmbedder`][ofoldx.models.boltzgen.model.BoltzGenTokenDistanceEmbedder]
     (projections + pair-only pairformer), but the per-edge feature is the template
     geometry featurization (CB distogram +
     per-frame CA unit vectors + cb/frame/visibility masks + paired residue types), aggregated over the template
@@ -1433,22 +1454,23 @@ class BoltzGenTemplateModule(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.norm_pair = nn.LayerNorm(pair_size)
+        self.pair_norm = nn.LayerNorm(pair_size)
         self.hidden_norm = nn.LayerNorm(template_size)
         self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = nn.Linear(2 * vocab_size + num_bins + 5, template_size, bias=False)
         self.output_projection = nn.Linear(template_size, pair_size, bias=False)
         if miniformer_blocks:
-            self.pairformer = nn.ModuleList(
+            self.blocks = nn.ModuleList(
                 BoltzGenMiniTrianglePairUpdateBlock(pair_size=template_size, operator_backend=operator_backend)
                 for _ in range(num_blocks)
             )
         else:
-            self.pairformer = nn.ModuleList(
+            self.blocks = nn.ModuleList(
                 TrianglePairUpdateBlock(
                     pair_size=template_size,
                     triangle_multiplication_hidden_size=template_size,
@@ -1463,9 +1485,9 @@ class BoltzGenTemplateModule(nn.Module):
         r"""
         Featurize template geometry into an additive pair update, aggregated over the template axis.
 
-        Per template, builds the per-edge feature (CB distogram + per-frame CA unit vectors + cb/frame/visibility
-        masks + query/key residue-type projections), projects together with the trunk pair, refines through the
-        pair-only pairformer (batched over templates with one outer residual), then averages over present
+        Per template, builds the per-edge feature (beta-carbon distogram, per-frame alpha-carbon unit vectors,
+        validity masks, and query/key residue-type projections), projects together with the trunk pair, refines
+        through the pair-only pairformer (batched over templates with one outer residual), then averages over present
         templates and projects back to ``pair_size``.
 
         Args:
@@ -1478,48 +1500,70 @@ class BoltzGenTemplateModule(nn.Module):
 
         """
 
-        res_type = cast(Tensor, input.template_restype)
-        frame_mask = cast(Tensor, input.template_mask_frame)
-        frame_rotation = cast(Tensor, input.template_frame_rot)
-        frame_translation = cast(Tensor, input.template_frame_t)
-        cb_coords = cast(Tensor, input.template_cb)
-        ca_coords = cast(Tensor, input.template_ca)
-        cb_mask = cast(Tensor, input.template_mask_cb)
+        residue_type = cast(Tensor, input.template_residue_type)
+        frame_mask = cast(Tensor, input.template_frame_mask)
+        frame_rotations = cast(Tensor, input.template_frame_rotations)
+        frame_translations = cast(Tensor, input.template_frame_translations)
+        beta_carbon_positions = cast(Tensor, input.template_beta_carbon_positions)
+        alpha_carbon_positions = cast(Tensor, input.template_alpha_carbon_positions)
+        beta_carbon_mask = cast(Tensor, input.template_beta_carbon_mask)
         template_mask = cast(Tensor, input.template_mask)
-        visibility = cast(Tensor, input.visibility_ids)
+        visibility_index = cast(Tensor, input.template_visibility_index)
         present = template_mask.any(dim=2).float()
         count = present.sum(dim=1).clamp(min=1)
-        batch_size, num_templates, num_tokens = res_type.shape[:3]
+        batch_size, num_templates, num_tokens = residue_type.shape[:3]
 
-        pair_cb_mask = (cb_mask[..., :, None] * cb_mask[..., None, :]).unsqueeze(-1)
+        pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
         pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
-        same_visibility = (visibility[..., :, None] == visibility[..., None, :]).float()
+        same_visibility = (visibility_index[..., :, None] == visibility_index[..., None, :]).float()
 
-        cb_distances = torch.cdist(cb_coords, cb_coords)
-        boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1, device=cb_distances.device)
-        distogram = F.one_hot((cb_distances[..., None] > boundaries).sum(dim=-1).long(), num_classes=self.num_bins)
+        beta_carbon_distances = torch.cdist(
+            beta_carbon_positions,
+            beta_carbon_positions,
+        )
+        boundaries = torch.linspace(
+            self.min_dist,
+            self.max_dist,
+            self.num_bins - 1,
+            device=beta_carbon_distances.device,
+        )
+        distogram = F.one_hot(
+            (beta_carbon_distances[..., None] > boundaries).sum(dim=-1).long(),
+            num_classes=self.num_bins,
+        )
 
-        rotation = frame_rotation.unsqueeze(2).transpose(-1, -2)
-        translation = frame_translation.unsqueeze(2).unsqueeze(-1)
-        targets = ca_coords.unsqueeze(3).unsqueeze(-1)
+        rotation = frame_rotations.unsqueeze(2).transpose(-1, -2)
+        translation = frame_translations.unsqueeze(2).unsqueeze(-1)
+        targets = alpha_carbon_positions.unsqueeze(3).unsqueeze(-1)
         vector = torch.matmul(rotation, targets - translation)
         norm = torch.norm(vector, dim=-1, keepdim=True)
         unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
 
-        geom = torch.cat([distogram.to(pair.dtype), pair_cb_mask, unit_vector, pair_frame_mask], dim=-1)
-        geom = geom * same_visibility.unsqueeze(-1)
+        geometry = torch.cat(
+            [
+                distogram.to(pair.dtype),
+                pair_beta_carbon_mask,
+                unit_vector,
+                pair_frame_mask,
+            ],
+            dim=-1,
+        )
+        geometry = geometry * same_visibility.unsqueeze(-1)
         # Project the per-token residue types and broadcast over the pair, instead of materialising the
         # (B, T, N, N, 2*K) expanded one-hots: F.linear(one_hot, W_slice) == one_hot @ W_slice columns (exact).
-        residue = res_type.to(pair.dtype)
+        residue = residue_type.to(pair.dtype)
         vocab_size = residue.shape[-1]
         weight = self.template_feature_projection.weight  # (template_size, num_bins + 5 + 2*vocab_size)
-        geom_dim = weight.shape[1] - 2 * vocab_size
+        geometry_size = weight.shape[1] - 2 * vocab_size
         feature_value = (
-            F.linear(geom.to(pair.dtype), weight[:, :geom_dim])
-            + F.linear(residue, weight[:, geom_dim : geom_dim + vocab_size]).unsqueeze(-2)  # query (i) term
-            + F.linear(residue, weight[:, geom_dim + vocab_size :]).unsqueeze(-3)  # key (j) term
+            F.linear(geometry.to(pair.dtype), weight[:, :geometry_size])
+            + F.linear(
+                residue,
+                weight[:, geometry_size : geometry_size + vocab_size],
+            ).unsqueeze(-2)
+            + F.linear(residue, weight[:, geometry_size + vocab_size :]).unsqueeze(-3)
         )
-        value = self.pair_projection(self.norm_pair(pair[:, None])) + feature_value
+        value = self.pair_projection(self.pair_norm(pair[:, None])) + feature_value
         value = value.reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
         if pair_mask is not None:
             pair_mask = (
@@ -1528,7 +1572,7 @@ class BoltzGenTemplateModule(nn.Module):
                 .reshape(batch_size * num_templates, num_tokens, num_tokens)
             )
         refined = value
-        for block in self.pairformer:
+        for block in self.blocks:
             refined = block(refined, pair_mask=pair_mask)
         value = self.hidden_norm(value + refined).reshape(batch_size, num_templates, num_tokens, num_tokens, -1)
 
@@ -1553,7 +1597,7 @@ class BoltzGenDistanceTokenEncoder(nn.Module):
             stop=2.0,
             num_gaussians=distance_gaussian_dim,
         )
-        self.distance_token_bias_trans = BoltzGenProjectionTransition(
+        self.distance_transition = BoltzGenProjectionTransition(
             distance_gaussian_dim + 1 + pair_size,
             pair_size,
             out_dim,
@@ -1587,14 +1631,12 @@ class BoltzGenDistanceTokenEncoder(nn.Module):
         relative = relative_position_encoding.view(batch_size, 1, num_tokens, num_tokens, -1).expand(-1, 4, -1, -1, -1)
         bias_input = torch.cat([gaussian, distance, relative], dim=-1)
         bias = (
-            self.distance_token_bias_trans(bias_input)
-            .permute(0, 2, 3, 4, 1)
-            .reshape(batch_size, num_tokens, num_tokens, -1)
+            self.distance_transition(bias_input).permute(0, 2, 3, 4, 1).reshape(batch_size, num_tokens, num_tokens, -1)
         )
         return bias
 
 
-class BoltzGenMiniTriangularUpdate(nn.Module):
+class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
     r"""
     Compact bidirectional triangular update used by BoltzGen Miniformer artifacts.
 
@@ -1607,12 +1649,12 @@ class BoltzGenMiniTriangularUpdate(nn.Module):
 
     def __init__(self, pair_size: int = 128) -> None:
         super().__init__()
-        self.norm_in = nn.LayerNorm(pair_size, eps=1e-5)
-        self.p_in = nn.Linear(pair_size, pair_size, bias=False)
-        self.g_in = nn.Linear(pair_size, pair_size, bias=False)
-        self.norm_out = nn.LayerNorm(pair_size // 2)
-        self.p_out = nn.Linear(pair_size // 2, pair_size, bias=False)
-        self.g_out = nn.Linear(pair_size // 2, pair_size, bias=False)
+        self.input_norm = nn.LayerNorm(pair_size, eps=1e-5)
+        self.input_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.input_gate_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.output_norm = nn.LayerNorm(pair_size // 2)
+        self.output_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
+        self.output_gate_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -1629,8 +1671,8 @@ class BoltzGenMiniTriangularUpdate(nn.Module):
             Triangular update ``(B, N_token, N_token, pair_size)``.
         """
 
-        normalized = self.norm_in(pair)
-        update = self.p_in(normalized) * torch.sigmoid(self.g_in(normalized))
+        normalized = self.input_norm(pair)
+        update = self.input_projection(normalized) * torch.sigmoid(self.input_gate_projection(normalized))
         if pair_mask is not None:
             update = update * pair_mask.unsqueeze(-1).to(dtype=update.dtype, device=update.device)
         with torch.autocast("cuda", enabled=False):
@@ -1638,8 +1680,8 @@ class BoltzGenMiniTriangularUpdate(nn.Module):
             outgoing = torch.einsum("...ikd,...jkd->...ijd", left_out, right_out)
             incoming = torch.einsum("...kid,...kjd->...ijd", left_in, right_in)
             update = torch.cat((outgoing, incoming), dim=-1).to(pair.dtype)
-        update = self.norm_out(update)
-        return self.p_out(update) * torch.sigmoid(self.g_out(update))
+        update = self.output_norm(update)
+        return self.output_projection(update) * torch.sigmoid(self.output_gate_projection(update))
 
 
 class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
@@ -1663,8 +1705,8 @@ class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.triangular = BoltzGenMiniTriangularUpdate(pair_size)
-        self.transition_pair = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
+        self.pair_transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
@@ -1681,8 +1723,8 @@ class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
 
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
-        pair = pair + self.rowwise_dropout(self.triangular(pair, pair_mask=pair_mask))
-        return pair + self.transition_pair(pair)
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
+        return pair + self.pair_transition(pair)
 
 
 class BoltzGenMiniformerBlock(nn.Module):
@@ -1714,9 +1756,9 @@ class BoltzGenMiniformerBlock(nn.Module):
             num_attention_heads=num_pair_attention_heads,
             operator_backend=operator_backend,
         )
-        self.triangular = BoltzGenMiniTriangularUpdate(pair_size)
-        self.transition_single = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
-        self.transition_pair = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
+        self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+        self.pair_transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
@@ -1734,10 +1776,10 @@ class BoltzGenMiniformerBlock(nn.Module):
 
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
-        pair = pair + self.rowwise_dropout(self.triangular(pair, pair_mask=pair_mask))
-        pair = pair + self.transition_pair(pair)
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
+        pair = pair + self.pair_transition(pair)
         single = single + self.attention(single, pair, pair_mask=pair_mask)
-        return single + self.transition_single(single), pair
+        return single + self.single_transition(single), pair
 
 
 class BoltzGenMiniformerStack(nn.Module):
@@ -1763,6 +1805,7 @@ class BoltzGenMiniformerStack(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             [
                 BoltzGenMiniformerBlock(
@@ -1794,16 +1837,16 @@ class BoltzGenMiniformerStack(nn.Module):
         return single, pair
 
 
-class BoltzGenMiniformerMsaModule(nn.Module):
+class BoltzGenMiniformerMsaTrunk(nn.Module):
     r"""
-    MSA-module variant whose pair update uses BoltzGen MiniformerNoSeq blocks.
+    MSA-module variant whose pair track uses compact pair-only Miniformer blocks.
 
     Args:
         single_size: Width of the single representation channel.
         pair_size: Width of the pair representation channel.
         msa_size: Width of the MSA representation channel.
         msa_feature_size: Width of the raw per-column MSA input features.
-        num_blocks: Number of Miniformer MSA layers.
+        num_blocks: Number of Miniformer MSA blocks.
         vocab_size: Number of residue-type tokens (MSA one-hot width).
         use_paired_feature: Whether to concatenate the paired-MSA indicator feature.
         outer_product_hidden_size: Hidden width of the outer-product-mean projection.
@@ -1811,7 +1854,7 @@ class BoltzGenMiniformerMsaModule(nn.Module):
         pair_dropout: Row-wise dropout probability inside the pair-only update.
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
-        expansion: Feed-forward expansion factor inside each layer.
+        expansion: Feed-forward expansion factor inside each block.
         operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
@@ -1833,13 +1876,14 @@ class BoltzGenMiniformerMsaModule(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
         self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
-        self.layers = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             [
-                BoltzGenMiniformerMsaLayer(
+                BoltzGenMiniformerMsaBlock(
                     msa_size=msa_size,
                     pair_size=pair_size,
                     outer_product_hidden_size=outer_product_hidden_size,
@@ -1867,10 +1911,10 @@ class BoltzGenMiniformerMsaModule(nn.Module):
         token_mask: Tensor,
     ) -> Tensor:
         r"""
-        Build the MSA representation from raw MSA features and refine the pair via the Miniformer MSA layers.
+        Build the MSA representation from raw MSA features and refine the pair via the Miniformer MSA blocks.
 
         Concatenates the one-hot MSA, deletion, and (optional) paired features, projects to the MSA channel, adds
-        the token projection of the input single, then applies each Miniformer MSA layer and returns the pair.
+        the token projection of the input single, then applies each Miniformer MSA block and returns the pair.
 
         Args:
             pair: Trunk pair representation ``(B, N_token, N_token, pair_size)``.
@@ -1896,14 +1940,14 @@ class BoltzGenMiniformerMsaModule(nn.Module):
         msa_state = self.msa_projection(torch.cat(features, dim=-1))
         msa_state = msa_state + self.token_projection(single_inputs).unsqueeze(1)
         pair_mask = pair_mask_from_token_mask(token_mask)
-        for layer in self.layers:
-            pair, msa_state = layer(pair, msa_state, pair_mask, msa_mask)
+        for block in self.blocks:
+            pair, msa_state = block(pair, msa_state, pair_mask, msa_mask)
         return pair
 
 
-class BoltzGenMiniformerMsaLayer(nn.Module):
+class BoltzGenMiniformerMsaBlock(nn.Module):
     r"""
-    One MSA layer for the Miniformer MSA module: pair-weighted averaging, MSA transition, outer-product mean,
+    One MSA block for the Miniformer MSA module: pair-weighted averaging, MSA transition, outer-product mean,
     then a compact pair-only Miniformer update.
 
     Args:
@@ -1914,7 +1958,7 @@ class BoltzGenMiniformerMsaLayer(nn.Module):
         pair_dropout: Row-wise dropout probability inside the pair-only update.
         num_msa_attention_heads: Number of pair-weighted-averaging attention heads.
         msa_head_dim: Per-head dimension of the pair-weighted-averaging attention.
-        expansion: Feed-forward expansion factor inside the layer.
+        expansion: Feed-forward expansion factor inside the block.
         operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
@@ -2069,7 +2113,7 @@ class BoltzGenDenoiserConditioning(nn.Module):
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_token_transformer_blocks: Number of token-transformer blocks (one bias projection each).
         num_token_transformer_heads: Number of attention heads per token-transformer block.
-        num_conditioning_transitions: Number of transition layers in the pairwise conditioner.
+        num_conditioning_transitions: Number of transitions in the pairwise conditioner.
     """
 
     def __init__(
@@ -2204,7 +2248,7 @@ class BoltzGenDenoiser(nn.Module):
         num_token_transformer_heads: Number of attention heads per token-transformer block.
         num_atom_decoder_blocks: Number of atom-decoder blocks.
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
-        num_conditioning_transitions: Number of transition layers in the single conditioner.
+        num_conditioning_transitions: Number of transitions in the single conditioner.
         operator_backend: Operator backend selector (``"auto"``, ``"oops"``, or ``"eager"``).
     """
 
@@ -2342,7 +2386,7 @@ class BoltzGenSingleConditioning(nn.Module):
     Args:
         single_size: Width of the single representation channel (the conditioned state is ``2*single_size`` wide).
         fourier_embedding_size: Width of the noise-level Fourier embedding.
-        num_transitions: Number of refinement transition layers.
+        num_transitions: Number of refinement transitions.
         transition_expansion: Feed-forward expansion factor of each transition.
     """
 
@@ -2374,8 +2418,8 @@ class BoltzGenSingleConditioning(nn.Module):
             single_inputs: Input single representation ``(B, N_token, single_size)``.
 
         Returns:
-            Tuple of the conditioned single state ``(B, N_token, 2*single_size)`` and the pre-transition single state
-            ``(B, N_token, 2*single_size)``.
+            Tuple of the conditioned single state ``(B, N_token, 2*single_size)`` and normalized Fourier noise
+            features ``(B, fourier_embedding_size)``.
         """
 
         return condition_single(
@@ -2495,7 +2539,7 @@ class BoltzGenCoordinateDiffusion(nn.Module):
         r"""
         Draw per-sample EDM training noise levels from the ``sigma_data``-scaled log-normal.
 
-        Mirrors the upstream BoltzGen ``AtomDiffusion.noise_distribution``:
+        Mirrors the BoltzGen ``AtomDiffusion.noise_distribution``:
         ``sigma = sigma_data * exp(P_mean + P_std * z)`` with ``z ~ N(0, 1)``. Returned as a tensor (never
         ``.item()``-ed) so the value feeds tensor math end to end.
 
@@ -2548,9 +2592,9 @@ class BoltzGenCoordinateDiffusion(nn.Module):
 
     def sample_schedule_dilated(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
         r"""
-        Build the BoltzGen dilated Karras schedule used by the released design inference config.
+        Build the BoltzGen dilated Karras schedule used by the design inference config.
 
-        The schedule first maps uniformly spaced normalized times through the upstream piecewise dilation
+        The schedule first maps uniformly spaced normalized times through the piecewise dilation
         transform, then applies the same Karras ``rho`` curve as the ``karras`` schedule.
         """
 
@@ -2626,11 +2670,8 @@ class BoltzGenCoordinateDiffusion(nn.Module):
 
         coords = sigmas[0] * randn()
         denoised = None
-        # This loop preserves BoltzGen's released
-        # ``noise_scale**2 * sqrt(sigma_hat**2 - sigma_current**2)`` churn factor and the optional
-        # ``alignment_reverse_diff`` mid-step alignment. The sampler also defines the dilated Karras
-        # schedule, right-multiply (R^T @ x) augmentation, and ``torch.randn`` call sites used by the parity
-        # harness, so the complete loop remains here.
+        # The loop owns the squared-noise-scale churn factor, optional mid-step alignment, dilated Karras schedule,
+        # rigid augmentation, and random draws as one sampling algorithm.
         # The fixed Python loop controls denoiser invocation; schedule values stay as tensors so sampling does not
         # synchronize them to the host on every step.
         for index in range(len(sigmas) - 1):
@@ -2693,7 +2734,7 @@ def _center_random_augmentation(
     r"""
     Center coords on the masked centroid and apply a Haar-uniform rotation plus Gaussian translation.
 
-    Mirrors the upstream BoltzGen training augmentation (``center_random_augmentation``, Algorithm 19): the
+    Mirrors the BoltzGen training augmentation (``center_random_augmentation``, Algorithm 19): the
     coordinate-frame augmentation applied to the diffusion target before noising. Fully tensor-valued (no
     ``.item()``) so it stays inside the compiled training graph.
 
@@ -2745,8 +2786,7 @@ class BoltzGenBFactorHead(nn.Module):
         return self.projection(single)
 
 
-# Scoring heads use the Boltz-2 backbone and are optional, so the design-only generator keeps its
-# base parameter count. They implement the upstream BoltzGen ``ConfidenceModule`` and ``AffinityModule``.
+# Scoring heads are optional so the design-only generator keeps its base parameter count.
 
 
 def _gather_backbone4(
@@ -2766,8 +2806,8 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
     r"""
     Apply the BoltzGen zero-init scheme to every final-layer / gating / conditioning weight under ``module``.
 
-    Zeroing the last projection of each residual sub-block (and biasing the gate projections negative) starts every
-    block as a near-identity, matching the upstream BoltzGen initialization.
+    Zeroing each residual branch's final projection (and biasing gate projections negative) starts every
+    block as a near-identity.
 
     Args:
         module: Root module to walk; every matching child is zero-initialized in place.
@@ -2789,10 +2829,10 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
             nn.init.zeros_(child.position_update[1].weight)
         elif isinstance(child, BoltzGenDenoiser):
             nn.init.zeros_(child.single_to_token[1].weight)
-        elif isinstance(child, BoltzGenMiniTriangularUpdate):
-            nn.init.zeros_(child.g_in.weight)
-            nn.init.zeros_(child.p_out.weight)
-            nn.init.zeros_(child.g_out.weight)
+        elif isinstance(child, BoltzGenBidirectionalTriangleMultiplication):
+            nn.init.zeros_(child.input_gate_projection.weight)
+            nn.init.zeros_(child.output_projection.weight)
+            nn.init.zeros_(child.output_gate_projection.weight)
         elif isinstance(child, Transition):
             nn.init.zeros_(child.output_projection.weight)
         elif isinstance(child, GatedMultiheadAttention):
@@ -2801,7 +2841,7 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
             nn.init.zeros_(child.output_gate_projection.weight)
             if child.output_gate_projection.bias is not None:
                 nn.init.constant_(child.output_gate_projection.bias, -2.0)
-        elif isinstance(child, (ConditionedTransition, ConditionedTransitionBlock)):
+        elif isinstance(child, (ConditionedTransition, TripleProductConditionedTransition)):
             nn.init.zeros_(child.conditioning_gate_projection.weight)
             if child.conditioning_gate_projection.bias is not None:
                 nn.init.constant_(child.conditioning_gate_projection.bias, -2.0)
@@ -2879,8 +2919,8 @@ def _build_constraint_logit_mask(
         per_residue_blocked = aa_constraint_mask > 0
 
     global_blocked = torch.zeros(num_aa, dtype=torch.bool, device=device)
-    for res_type in inverse_fold_restriction:
-        global_blocked[CANONICAL_TOKENS.index(res_type)] = True
+    for residue_type in inverse_fold_restriction:
+        global_blocked[CANONICAL_TOKENS.index(residue_type)] = True
 
     combined = per_residue_blocked | global_blocked.unsqueeze(0)
     all_blocked = combined.all(dim=1)
@@ -2897,18 +2937,18 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
 
     Builds a per-structure kNN token graph from the representative-atom coordinates, featurizes each edge (backbone
     distance RBF plus relative-position / bond attributes), and refines node and edge states with graph-attention
-    layers.
+    blocks.
 
     Args:
         single_size: Width of the input-embedder token single representation.
         node_size: Width of the GNN node channel.
         edge_size: Width of the GNN edge channel.
         hidden_size: Width of the graph-attention hidden channel.
-        num_layers: Number of graph-attention layers.
-        num_attention_heads: Number of attention heads per layer.
+        num_blocks: Number of graph-attention blocks.
+        num_attention_heads: Number of attention heads per block.
         num_neighbors: Number of nearest neighbours per token.
         max_relative_position: Clamp range for the relative-position edge feature.
-        dropout: Dropout probability inside the graph-attention layers.
+        dropout: Dropout probability inside the graph-attention blocks.
         softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
         inverse_fold_noise: Coordinate-noise standard deviation used by the training graph.
     """
@@ -2919,7 +2959,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         node_size: int = 128,
         edge_size: int = 128,
         hidden_size: int = 128,
-        num_layers: int = 3,
+        num_blocks: int = 3,
         num_attention_heads: int = 4,
         num_neighbors: int = 30,
         max_relative_position: int = 32,
@@ -2928,6 +2968,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         inverse_fold_noise: float = 0.2,
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.num_neighbors = num_neighbors
         self.max_relative_position = max_relative_position
         self.inverse_fold_noise = inverse_fold_noise
@@ -2938,8 +2979,8 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
 
         self.node_input_projection = nn.Linear(single_size, node_size)
         self.edge_input_projection = nn.Linear(self.edge_input_size, edge_size)
-        self.layers = nn.ModuleList(
-            BoltzGenGraphAttentionLayer(
+        self.blocks = nn.ModuleList(
+            BoltzGenGraphAttentionEncoderBlock(
                 node_size=node_size,
                 edge_size=edge_size,
                 hidden_size=hidden_size,
@@ -2947,7 +2988,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
                 dropout=dropout,
                 softmax_dropout=softmax_dropout,
             )
-            for _ in range(num_layers)
+            for _ in range(num_blocks)
         )
         self.distance_smearing = BoltzGenGaussianSmearing(start=0.0, stop=20.0, num_gaussians=16)
 
@@ -3037,8 +3078,8 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         """
 
         src, dst = edge_index[0], edge_index[1]
-        asym = input.chain_index[valid_mask]
-        same_chain = asym[src] == asym[dst]
+        chain_index = input.chain_index[valid_mask]
+        same_chain = chain_index[src] == chain_index[dst]
         residue = input.residue_index[valid_mask]
         same_residue = residue[src] == residue[dst]
         delta = torch.clip(residue[dst] - residue[src] + self.max_relative_position, 0, 2 * self.max_relative_position)
@@ -3057,7 +3098,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
 
         Builds the kNN graph, featurizes edges (backbone-distance RBF + relative-position/bond attributes),
         projects node features (from ``single_inputs`` when the input embedder is enabled, else ``node_features``),
-        and runs the graph-attention layers.
+        and runs the graph-attention blocks.
 
         Args:
             input: Typed model input.
@@ -3075,8 +3116,8 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
 
         node = self.node_input_projection(single_inputs[valid_mask])
         edge = self.edge_input_projection(torch.cat([geometry, edge_attr, bond], dim=-1))
-        for layer in self.layers:
-            node, edge = layer(node, edge, edge_index)
+        for block in self.blocks:
+            node, edge = block(node, edge, edge_index)
         return edge_index, valid_mask, node, edge
 
 
@@ -3084,7 +3125,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
     r"""
     Graph decoder predicting residue-type logits (BoltzGen inverse folding).
 
-    Refines the encoder node states with edge-free graph-attention layers and projects to per-token residue-type
+    Refines the encoder node states with decoder graph-attention blocks and projects to per-token residue-type
     logits. The training ``forward`` uses random per-edge teacher-forcing visibility; ``sample`` decodes
     autoregressively with optional per-residue amino-acid constraints and homomer-symmetry tying.
 
@@ -3092,10 +3133,10 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         node_size: Width of the GNN node channel.
         edge_size: Width of the encoder edge channel (the decoder edge is ``edge_size + node_size`` wide).
         hidden_size: Width of the graph-attention hidden channel.
-        num_layers: Number of graph-attention layers.
-        num_attention_heads: Number of attention heads per layer.
+        num_blocks: Number of graph-attention blocks.
+        num_attention_heads: Number of attention heads per block.
         vocab_size: Number of residue-type tokens.
-        dropout: Dropout probability inside the graph-attention layers.
+        dropout: Dropout probability inside the graph-attention blocks.
         softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
@@ -3104,18 +3145,19 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         node_size: int = 128,
         edge_size: int = 128,
         hidden_size: int = 128,
-        num_layers: int = 3,
+        num_blocks: int = 3,
         num_attention_heads: int = 4,
         vocab_size: int = NUM_RESIDUE_TYPES,
         dropout: float = 0.1,
         softmax_dropout: float = 0.2,
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.vocab_size = vocab_size
-        # Each layer's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
+        # Each block's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
         decoder_edge_size = edge_size + node_size
-        self.layers = nn.ModuleList(
-            BoltzGenGraphAttentionLayerWithoutEdgeFeatures(
+        self.blocks = nn.ModuleList(
+            BoltzGenGraphAttentionDecoderBlock(
                 node_size=node_size,
                 edge_size=decoder_edge_size,
                 hidden_size=hidden_size,
@@ -3123,19 +3165,26 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
                 dropout=dropout,
                 softmax_dropout=softmax_dropout,
             )
-            for _ in range(num_layers)
+            for _ in range(num_blocks)
         )
         self.residue_type_projection = nn.Linear(vocab_size, node_size)
         self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
 
     def forward(
-        self, node: Tensor, edge: Tensor, edge_index: Tensor, valid_mask: Tensor, input: BoltzGenInverseFoldingInput
+        self,
+        node: Tensor,
+        edge: Tensor,
+        edge_index: Tensor,
+        valid_mask: Tensor,
+        input: BoltzGenInverseFoldingInput,
+        *,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
         Predict per-token residue-type logits with teacher forcing and random per-edge neighbour visibility.
 
         Each edge reveals its source residue type only when ``rand[src] < rand[dst]``, so every node attends to a
-        random subset of ground-truth neighbour identities; the decoder graph layers then refine the nodes and the
+        random subset of ground-truth neighbour identities; the decoder graph blocks then refine the nodes and the
         residue head produces logits, scattered back to the dense token grid.
 
         Args:
@@ -3144,6 +3193,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
             edge_index: Edge endpoints ``(2, E)`` into packed valid tokens.
             valid_mask: Boolean token validity mask ``(B, N_token)``.
             input: Typed model input (supplies ground-truth ``residue_type``).
+            generator: Optional random generator for neighbour visibility.
 
         Returns:
             Dense per-token residue-type logits ``(B, N_token, vocab_size)`` (zero at invalid tokens).
@@ -3153,15 +3203,15 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         with torch.no_grad():
             # Teacher forcing with random per-edge visibility: an edge reveals its source residue type only when
             # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
-            rand = torch.rand(node.shape[0], device=node.device)
+            rand = torch.rand(node.shape[0], device=node.device, generator=generator)
             visibility = rand[src] < rand[dst]
             known = input.residue_type.bool()[valid_mask][src] * visibility[:, None]
             known = known.to(edge.dtype)
         residue_rep = self.residue_type_projection(known)
         neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
 
-        for layer in self.layers:
-            node = layer(node, neighbours, edge_index)
+        for block in self.blocks:
+            node = block(node, neighbours, edge_index)
 
         logits = self.residue_type_head(node)
         batch_size, num_tokens = valid_mask.shape
@@ -3187,11 +3237,11 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         Autoregressively decode residue types one position at a time, in a random order.
 
         Each position is decoded from its (already-decoded) neighbours: the edge state carries
-        ``neighbour_node + residue_rep(decoded_neighbour)``, the decoder layers run via their single-node
+        ``neighbour_node + residue_rep(decoded_neighbour)``, the decoder blocks run via their single-node
         ``sample`` path, and the canonical-amino-acid logits are argmax'd (or temperature-sampled). Non-design
         positions are fixed to ``res_type_clone``.
 
-        Faithful to the upstream boltzgen ``InverseFoldingDecoder.sample``, including per-residue amino-acid
+        Faithful to the boltzgen ``InverseFoldingDecoder.sample``, including per-residue amino-acid
         constraints (``input.aa_constraint_mask`` + call-time ``inverse_fold_restriction``, combined into an additive
         canonical-logit mask via ``_build_constraint_logit_mask``) and, when ``tie_symmetric_sequences`` is set,
         homomer-symmetry tying (logits are averaged across a symmetric group, sampled once, and applied to every
@@ -3261,8 +3311,8 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
                     dim=-1,
                 )
                 state = node[pos : pos + 1]
-                for layer in self.layers:
-                    state = layer.sample(state, neighbours)
+                for block in self.blocks:
+                    state = block.sample(state, neighbours)
                 position_logits = self.residue_type_head(state)
                 aggregated_logits = (
                     position_logits if aggregated_logits is None else aggregated_logits + position_logits
@@ -3329,16 +3379,16 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         return groups, position_to_group
 
 
-class BoltzGenGraphAttentionLayer(nn.Module):
+class BoltzGenGraphAttentionEncoderBlock(nn.Module):
     r"""
-    One MLP-attention GNN layer with node and edge updates (encoder).
+    One MLP-attention GNN block with node and edge updates.
 
     Args:
         node_size: Width of the node channel.
         edge_size: Width of the edge channel.
         hidden_size: Width of the attention hidden channel.
         num_attention_heads: Number of attention heads.
-        dropout: Dropout probability inside the layer.
+        dropout: Dropout probability inside the block.
         softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
@@ -3405,22 +3455,21 @@ class BoltzGenGraphAttentionLayer(nn.Module):
         return node + self.node_transition(node), edge
 
 
-class BoltzGenGraphAttentionLayerWithoutEdgeFeatures(nn.Module):
+class BoltzGenGraphAttentionDecoderBlock(nn.Module):
     r"""
-    One MLP-attention GNN layer updating nodes only (decoder).
+    One MLP-attention GNN decoder block updating nodes only.
 
-    Unlike the encoder layer this does NOT mirror the message construction: the decoder's edge state already
-    carries the source-node information, so the attention weight is a function of only the destination node and
-    the edge (``cat[node[dst], edge]``) and the value is a function of only the edge (``edge``). The edge dim is
-    therefore wider than the encoder's (the reference uses ``pair_dim`` = 256). Faithful to boltzgen
-    ``MLPAttnGNNDecoder.forward``.
+    Unlike the encoder block, the decoder edge state already carries the source-node information, so the
+    attention weight is a function of only the destination node and the edge (``cat[node[dst], edge]``) and the
+    value is a function of only the edge (``edge``). The edge dim is therefore wider than the encoder edge
+    channel.
 
     Args:
         node_size: Width of the node channel.
         edge_size: Width of the (wider) decoder edge channel.
         hidden_size: Width of the attention hidden channel.
         num_attention_heads: Number of attention heads.
-        dropout: Dropout probability inside the layer.
+        dropout: Dropout probability inside the block.
         softmax_dropout: Probability of masking an attention logit before its destination-wise softmax.
     """
 
@@ -3519,10 +3568,8 @@ class BoltzGenBroadcastGaussianSmearing(nn.Module):
     def __init__(self, start: float = 0.0, stop: float = 2.0, num_gaussians: int = 32) -> None:
         super().__init__()
         offset = torch.linspace(start, stop, num_gaussians)
-        # Match the BoltzGen reference: derive the RBF width from the float32 ``offset`` spacing, not the float64
-        # analytic spacing (see BoltzGenGaussianSmearing above) so the distance features are bit-faithful to upstream.
-        # Compute the spacing on a real CPU tensor so construction under ``torch.device("meta")`` (the
-        # converter / hub load mode) does not call ``.item()`` on an unmaterialized meta tensor.
+        # Derive the RBF width from the materialized float32 center spacing. This preserves the distance-feature
+        # arithmetic and avoids calling ``.item()`` on an unmaterialized meta tensor.
         spacing = torch.linspace(start, stop, num_gaussians, device="cpu")
         self.coeff = -0.5 / (spacing[1] - spacing[0]).item() ** 2
         self.register_buffer("offset", offset)
@@ -3580,10 +3627,9 @@ class BoltzGenGaussianSmearing(nn.Module):
 
 class BoltzGenProjectionTransition(nn.Module):
     r"""
-    Channel-reshaping transition without a residual connection.
+    Channel-reshaping transition with independent input, hidden, and output widths.
 
-    Unlike the residual [`Transition`][ofoldx.modules.transition.Transition], input / hidden / output widths are
-    independent and there is no residual. Used where a transition reshapes channels.
+    Used where a transition changes channel width and therefore cannot own an identity residual at this boundary.
 
     Args:
         input_size: Width of the input channel.
@@ -3593,7 +3639,7 @@ class BoltzGenProjectionTransition(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(input_size)
+        self.input_norm = nn.LayerNorm(input_size)
         self.gate_projection = nn.Linear(input_size, hidden_size, bias=False)
         self.value_projection = nn.Linear(input_size, hidden_size, bias=False)
         self.output_projection = nn.Linear(hidden_size, output_size, bias=False)
@@ -3610,12 +3656,12 @@ class BoltzGenProjectionTransition(nn.Module):
             Reshaped features of shape `[..., output_size]`.
         """
 
-        normalized = self.norm(features)
+        normalized = self.input_norm(features)
         return self.output_projection(self.silu(self.gate_projection(normalized)) * self.value_projection(normalized))
 
 
 def _softmax_dropout(logits: Tensor, index: Tensor, num_groups: int, probability: float) -> Tensor:
-    r"""Apply the released rejection-sampled attention-logit dropout."""
+    r"""Apply the rejection-sampled attention-logit dropout."""
 
     for _ in range(10):
         dropped = torch.rand_like(logits) < probability
@@ -3726,7 +3772,7 @@ class BoltzGenLayout:
     Symbolic rows use the shared PlacementSpec reference vocabulary and resolve through
     ``placement_map`` before canonical output structures are constructed.
 
-    Attributes:
+    Args:
         system: The canonical molecular system the tensor batch was lowered from
             (``None`` for a fully-generated assembly with no input system).
         atom_sites: Model atom order aligned to the atom axis (heavy atoms, sans padding).
@@ -3759,7 +3805,7 @@ class BoltzGenInverseFoldingLayout:
     backbone residue, so ``output_residues`` is a tuple of canonical
     ``ComponentReference`` values only.
 
-    Attributes:
+    Args:
         system: The canonical molecular system the fixed backbone was lowered from.
         atom_sites: Model atom order aligned to the atom axis (heavy atoms, sans padding).
         token_sites: Model token order aligned to the token axis.
@@ -3804,7 +3850,7 @@ class BoltzGenPlacements:
 class BoltzGenDesignMask:
     r"""Positions to (re)design → ``design_mask`` on the model input.
 
-    ``positions`` are the designable residues (upstream ``design`` / complement of
+    ``positions`` are the designable residues (``design`` / complement of
     ``not_design``); every named token is marked designable.
     """
 
@@ -3813,14 +3859,11 @@ class BoltzGenDesignMask:
 
 @dataclass(frozen=True)
 class BoltzGenBinding:
-    r"""Binding-specification conditioning → ``binding_type`` ids.
+    r"""Positive and negative residue-level binding conditions.
 
-    ``binding`` is the shared :class:`~ofoldx.data.conditions.Hotspot`: a distance-free,
-    per-residue positive binding label. ``not_binding`` is the BoltzGen-specific negative label
-    (embedding id 2) that has no analog in the shared input types, so it remains on
-    :class:`BoltzGenBinding` rather than on the shared ``Hotspot`` core. Realized as the released
-    binding-specification embedding ids
-    (0 = unspecified, 1 = binding, 2 = not-binding).
+    Args:
+        binding: Residues encouraged to participate in binding.
+        not_binding: Residues discouraged from participating in binding.
     """
 
     binding: Hotspot = Hotspot(())
@@ -3831,7 +3874,7 @@ class BoltzGenBinding:
 class BoltzGenSecondaryStructure:
     r"""Per-residue secondary-structure conditioning → ``ss_type`` ids.
 
-    Each assignment pairs a residue with one of the released labels ``"H"`` (helix),
+    Each assignment pairs a residue with one of the labels ``"H"`` (helix),
     ``"E"`` (strand), or ``"L"`` (loop); unlisted residues take the masked/unspecified
     class.
     """
@@ -3841,14 +3884,13 @@ class BoltzGenSecondaryStructure:
 
 @dataclass(frozen=True)
 class BoltzGenStructureGroup:
-    r"""One structure group → per-token ``structure_group`` → ``token_distance_mask``.
+    r"""Residues whose relative geometry remains visible during design.
 
-    Geometry is exposed only *within* the
-    same **nonzero** group and distinct groups move independently. Realized through the
-    per-token ``structure_group`` id and its pairwise ``token_distance_mask``, never by
-    writing absolute coordinates; ``reference_space_id`` stays per-residue because the released
-    featurizer does not regroup it. ``group_id == 0`` is the free (ungrouped) class. See the
-    Processor lowering in ``_structure_group_ids`` and ``_token_distance_mask``.
+    Distinct nonzero groups move independently; group zero denotes unconstrained residues.
+
+    Args:
+        members: Residues belonging to the group.
+        group_id: Nonnegative group identifier.
     """
 
     members: tuple[ComponentReference, ...]
@@ -3860,7 +3902,7 @@ class BoltzGenResidueConstraint:
     r"""Per-residue amino-acid identity constraint → ``aa_constraint_mask`` (inverse folding).
 
     ``allowed`` is the set of canonical three-letter residue codes permitted at
-    ``position`` (upstream ``residue_constraints``); consumed by
+    ``position`` (``residue_constraints``); consumed by
     ``BoltzGenInverseFoldingModel`` as an ``aa_constraint_mask`` gate.
     """
 
@@ -3893,7 +3935,7 @@ class BoltzGenCovalentBond:
     (:class:`~ofoldx.data.placement.SymbolicAtomSite`) resolved through the placement
     core. ``BoltzGenProcessor`` lowers it by resolving the bond to a realized
     :class:`~ofoldx.data.molecular.SystemBond` and injecting it into the lowered system, so the
-    released head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
+    head-to-tail detector derives ``cyclic_period`` exactly as it does for a bond the
     input system already carried. The request declares no additional physical topology; a
     non-terminal link simply surfaces as a token bond. ``intent`` is a BoltzGen-specific hard/soft
     label and is not stored on the shared ``SymbolicBond``.
@@ -3930,33 +3972,12 @@ BoltzGenSchema = (
 )
 
 
-def symbolic_residue_aliases(
-    references: tuple[ComponentReference | SymbolicResidueSite, ...],
-) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
-    r"""Map canonical negative segment offsets to concrete positive trajectory identities.
-
-    Mirrors ``rfdiffusion.model.symbolic_residue_aliases`` so a fully-generated
-    ``total_len`` assembly can address its generated rows by segment/offset before
-    the shared placement core resolves.
-    """
-
-    placements: dict[str, list[SymbolicResidueSite]] = {}
-    for reference in references:
-        if isinstance(reference, SymbolicResidueSite):
-            placements.setdefault(reference.placement_id, []).append(reference)
-    return {
-        SymbolicResidueSite(placement_id, index - len(rows)): reference
-        for placement_id, rows in placements.items()
-        for index, reference in enumerate(rows)
-    }
-
-
 @dataclass(kw_only=True)
 class BoltzGenInput:
     r"""
     Input tensors consumed by BoltzGen design models.
 
-    Attributes:
+    Args:
         token_mask: Boolean token validity mask with shape ``(B, N_token)``.
         residue_index: Chain-local residue index used by relative-position features.
         chain_index: Chain ids mapped to contiguous integer indices.
@@ -3974,7 +3995,7 @@ class BoltzGenInput:
         residue_type: Query residue type one-hot features.
         msa_profile: Single-sequence MSA profile features.
         deletion_mean: Per-token deletion mean features.
-        token_bonds: Token-level covalent adjacency ``(B, N, N, 1)`` (trailing singleton per the released featurizer).
+        token_bonds: Token-level covalent adjacency ``(B, N, N, 1)`` (trailing singleton per the featurizer).
         type_bonds: Token-level bond type ids.
         contact_conditioning: Pairwise contact-conditioning class one-hot features.
         contact_threshold: Pairwise contact threshold values.
@@ -3986,7 +4007,7 @@ class BoltzGenInput:
         target_positions: Experimental atom coords consumed exclusively by the training forward. It is optional
             on the shared input because ``design`` does not consume a training target.
         target_mask: Resolved experimental-coordinate mask consumed by the training objective. It is distinct
-            from ``atom_mask`` and does not define the centroid of the upstream rigid augmentation.
+            from ``atom_mask`` and does not define the centroid of the rigid augmentation.
         frame_atom_index: Optional frame atom indices for frame-aligned losses.
         frame_mask: Optional frame validity mask.
         method_feature: Optional experimental-method ids.
@@ -3997,15 +4018,15 @@ class BoltzGenInput:
         deletion_value: Optional MSA deletion values.
         msa_paired: Optional paired-MSA flags.
         msa_mask: Optional MSA validity mask.
-        template_restype: Optional template residue type ids.
-        template_frame_rot: Optional template frame rotations.
-        template_frame_t: Optional template frame translations.
-        template_mask_frame: Optional template frame validity mask.
-        template_cb: Optional template representative-atom coords.
-        template_ca: Optional template alpha-carbon coords.
-        template_mask_cb: Optional template representative-atom mask.
+        template_residue_type: Optional template residue-type features.
+        template_frame_rotations: Optional template frame rotations.
+        template_frame_translations: Optional template frame translations.
+        template_frame_mask: Optional template frame validity mask.
+        template_beta_carbon_positions: Optional template beta-carbon positions.
+        template_alpha_carbon_positions: Optional template alpha-carbon positions.
+        template_beta_carbon_mask: Optional template beta-carbon validity mask.
         template_mask: Optional template validity mask.
-        visibility_ids: Optional visibility ids for stochastic conditioning.
+        template_visibility_index: Optional template visibility-group indices.
         binding_type: Optional binding conditioning ids.
         design_mask: Optional token mask selecting designable positions.
         ss_type: Optional secondary-structure conditioning ids.
@@ -4049,15 +4070,15 @@ class BoltzGenInput:
     deletion_value: Tensor | None = None
     msa_paired: Tensor | None = None
     msa_mask: Tensor | None = None
-    template_restype: Tensor | None = None
-    template_frame_rot: Tensor | None = None
-    template_frame_t: Tensor | None = None
-    template_mask_frame: Tensor | None = None
-    template_cb: Tensor | None = None
-    template_ca: Tensor | None = None
-    template_mask_cb: Tensor | None = None
+    template_residue_type: Tensor | None = None
+    template_frame_rotations: Tensor | None = None
+    template_frame_translations: Tensor | None = None
+    template_frame_mask: Tensor | None = None
+    template_beta_carbon_positions: Tensor | None = None
+    template_alpha_carbon_positions: Tensor | None = None
+    template_beta_carbon_mask: Tensor | None = None
     template_mask: Tensor | None = None
-    visibility_ids: Tensor | None = None
+    template_visibility_index: Tensor | None = None
     binding_type: Tensor | None = None
     design_mask: Tensor | None = None
     ss_type: Tensor | None = None
@@ -4126,7 +4147,7 @@ class BoltzGenDesignCandidate:
     variable-length property that prevents reuse of the fixed-length
     ``DesignCandidate``.
 
-    Attributes:
+    Args:
         structure: The designed complex (post inverse folding, optionally refolded by boltz2).
         scores: Whole-candidate canonical [`Score`][ofoldx.results.Score] values keyed by name.
         metrics: Axis-aligned [`Metric`][ofoldx.results.Metric] values (e.g. per-residue NLL / pLDDT).
@@ -4145,7 +4166,7 @@ class BoltzGenDesignResult:
 
     Tuple position is candidate identity for one generation context; there is no
     auxiliary index field, and no input/context/provenance field is carried
-    (matching ``ESMFold2DesignResult``). The composite upstream ranking key is a
+    (matching ``ESMFold2DesignResult``). The composite ranking key is a
     Pipeline-level argument, not part of this Result: the Result exposes the
     primitive Scores and ``best(score)`` so a caller ranks by any single canonical
     Score.
@@ -4163,16 +4184,4 @@ class BoltzGenDesignResult:
         earliest candidate wins a tie.
         """
 
-        scores = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        if directions == {"higher"}:
-            return max(self.candidates, key=lambda candidate: candidate.scores[score].value)
-        return min(self.candidates, key=lambda candidate: candidate.scores[score].value)
+        return best(self.candidates, score)

@@ -1,4 +1,4 @@
-r"""The released MpnnPacker call boundary."""
+r"""MPNN Packer side-chain packing Pipeline."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .processor import MpnnPackerProcessor
 
 
 class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
-    r"""Bind the released side-chain packer Model and Processor."""
+    r"""Bind the MPNN Packer Model and Processor."""
 
     def pack(
         self,
@@ -33,7 +33,24 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        r"""Pack the selected side chains with the released iterative sampler."""
+        r"""Pack selected side chains with the iterative sampler.
+
+        Args:
+            input: Canonical structure or local structure path.
+            sequence: Optional replacement protein sequence.
+            pack_positions: Residue occurrences to repack. ``None`` selects every eligible
+                protein residue.
+            use_atom_context: Whether nonprotein heavy atoms are visible to the packer.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_samples: Number of packed structures to generate.
+            num_denoising_steps: Number of iterative side-chain denoising steps.
+            num_torsion_samples: Number of torsion proposals evaluated per denoising step.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``PackResult`` whose predictions follow sampling order.
+        """
 
         model_input = self.processor(
             input,
@@ -65,7 +82,24 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[PackResult, ...]:
-        r"""Pack several target sequences against one source Structure."""
+        r"""Pack several target sequences against one source structure.
+
+        Args:
+            input: Canonical source structure or local structure path.
+            sequences: Replacement protein sequences in output order.
+            pack_positions: Residue occurrences to repack. ``None`` selects every eligible
+                protein residue.
+            use_atom_context: Whether nonprotein heavy atoms are visible to the packer.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_samples: Number of packed structures generated per sequence.
+            num_denoising_steps: Number of iterative side-chain denoising steps.
+            num_torsion_samples: Number of torsion proposals evaluated per denoising step.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            One ``PackResult`` per input sequence, preserving sequence order.
+        """
 
         structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         inputs = tuple(

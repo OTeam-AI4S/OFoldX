@@ -14,8 +14,8 @@ from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import MolecularSystem
 from ..data.structure import Structure
 from ..results import DesignResult
-from ._paired import PairedPipeline
-from .generator import PipelineProcessor, processor_device, resolve_generator
+from .generator import PipelineProcessor, resolve_generator
+from .paired import PairedPipeline
 
 _ModelInputT = TypeVar("_ModelInputT")
 _ProcessorOutputT_co = TypeVar("_ProcessorOutputT_co", covariant=True)
@@ -60,7 +60,26 @@ class DesignPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        r"""Design fixed-length sequences with the paired Processor and Model.
+
+        Args:
+            input: Molecular system, structure, or path to process.
+            msa: Optional multiple-sequence-alignment evidence.
+            templates: Template evidence to process with ``input``.
+            conditions: Residue-identity conditions to apply during design.
+            num_candidates: Positive number of design candidates to generate.
+            seed: Optional integer seed used to create the operation generator; mutually exclusive
+                with ``generator``.
+            generator: Optional caller-supplied random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``DesignResult`` containing generation-ordered fixed-length designs.
+
+        Raises:
+            ValueError: If both ``seed`` and ``generator`` are supplied.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input, msa=msa, templates=templates, conditions=conditions)
         return self.model.design(
             model_input,

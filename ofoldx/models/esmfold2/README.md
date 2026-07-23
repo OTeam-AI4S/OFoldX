@@ -12,81 +12,292 @@ pipeline_tag: other
 
 # ESMFold2
 
-> [!IMPORTANT]
-All-atom biomolecular structure prediction driven by ESMC-6B representations and optional protein MSAs.
-
-> [!CAUTION]
-> This family is intentionally absent from the OFoldX registry and no OFoldX ESMFold2 repository is published.
-> Registration remains blocked on a published MultiMolecule ESMC asset, caller-owned production assets for maintained
-> ESMFold2 and ESMFold2-Fast end-to-end parity, and reference parity for canonical N/DN generic-base atom/full inputs.
+All-atom biomolecular structure prediction and protein binder design driven by
+ESMC representations, with optional protein MSA evidence for supported checkpoints.
 
 ## Disclaimer
 
-This is an UNOFFICIAL OFoldX conversion of [Language Modeling Materializes a World Model of Protein Biology](https://biohub.ai/papers/esm_protein.pdf) by Salvatore Candido, Thomas Hayes, Alexander Derry, et al.
-
-The OFFICIAL repository of ESMFold2 is at [Biohub/esm](https://github.com/Biohub/esm).
-
-**The team releasing ESMFold2 did not write this model card, so this model card has been written by the OFoldX team.**
+This is an unofficial OFoldX implementation and conversion of
+[ESMFold2](https://github.com/Biohub/esm), described in
+[Language Modeling Materializes a World Model of Protein Biology](https://biohub.ai/papers/esm_protein.pdf).
+The upstream authors did not write, review, or endorse this implementation,
+conversion, or model card.
 
 ## Model Details
 
-ESMFold2 is an all-atom biomolecular structure predictor. Its released input supports standard and modified proteins, DNA, RNA, reference-conformer ligands, covalent assemblies, A3M deletion features, and paired protein MSA evidence. OFoldX implements the released input embedder, MSA encoder, pair-only folding trunk, diffusion structure head, and confidence head. The required ESMC-6B encoder is the ordinary public `model.esmc` child module implemented by MultiMolecule; its weights live in the same OFoldX state dict and repository as the folding head. `model.embeddings(input)` exposes the released token and pair embeddings directly, without running diffusion or wrapping them in another public object.
+The `ofoldx.esmfold2` architecture pairs `EsmFold2Model` with
+`EsmFold2Processor`. `EsmFold2Pipeline` exposes the released `fold` operation
+and returns `FoldResult`. The separate `ofoldx.esmfold2_experimental`
+architecture pairs `EsmFold2ExperimentalModel` with
+`EsmFold2ExperimentalProcessor`; `EsmFold2DesignPipeline` exposes the
+experimental binder `design` operation and returns the family-owned
+`EsmFold2DesignResult`.
 
-The upstream `esm` input builder also emits `disto_cond` and `disto_cond_mask`, but the released `ESMFold2Model.forward` accepts them only through `**kwargs` and never reads them; the released checkpoint has no corresponding input parameters. OFoldX therefore rejects conditions instead of presenting this upstream no-op as supported conditioning. Likewise, canonical SMILES chemistry must carry an explicit reference conformer: OFoldX does not silently generate geometry inside a Processor.
+The released folding input supports standard and modified proteins, DNA, RNA,
+reference-conformer ligands, and covalent assemblies. The Processor accepts a
+protein sequence string, FASTA path, `PolymerSequence`, a sequence of
+`PolymerSequence` values, `MolecularSystem`, or `Structure`. A `Structure`
+contributes its canonical molecular system rather than its observed
+coordinates. Optional `MSA` and `MSACollection` inputs retain aligned protein
+rows, pairing, and A3M deletion features. The Fast variants reject explicit MSA
+evidence.
 
-ESMFold2 and ESMFold2-Fast are checkpoint variants of this release graph. Fast uses 24 rather than 48 pair-folding blocks, disables the MSA encoder, rejects explicit MSA evidence through its paired Processor, and retains the published `0.1` language-model masking default. The full checkpoint uses the 48-block trunk, MSA encoder, and zero language-model masking default. The older `type="experimental"` checkpoints used by the released binder-inversion notebook have a different recurrent graph and confidence contract; they are not silently loaded as variants of `ESMFold2Model`.
+The native Model state tree begins with `input_embeddings`,
+`left_pair_projection`, `right_pair_projection`,
+`relative_position_embedder`, and `bond_projection`. ESMC layer states enter
+through `language_model_pair_encoder`; the released graph then uses its
+optional `language_model_encoder` and `msa_encoder`, `folding_trunk`, linear-recurrent
+`parcae_input_norm`, `parcae_log_decay`, `parcae_log_delta`, `parcae_input_matrix`,
+`parcae_readout`, `parcae_coda`, `diffusion_structure_head`,
+`distogram_head`, and `confidence_head`. Repeated `EsmFold2FoldingBlock`
+values live under `folding_trunk.blocks`. Each Block owns its coupled triangle
+updates and an `EsmFold2Transition`; each Transition owns the inner
+`EsmFold2FeedForward` computation. The experimental graph instead carries the
+previous pair representation through `recycling_norm` and
+`recycling_projection` and uses its narrower confidence head.
 
-### Binder design and family verb inventory
+The released Model owns a frozen MultiMolecule `EsmCModel` as its public
+`esmc` child. Converted release repositories store the ESMC and folding-head
+weights in one Model state dict, so `AutoModel` does not perform a hidden
+second repository lookup. Experimental design repositories store the selected
+ESMC masked-language-model child and tokenizer under `esmc/`; the concrete
+design Pipeline restores that child and its language-model head. Binder design
+requires the language-model head whenever the configured sequence-prior weight
+is nonzero.
 
-Beyond the released single-sequence `fold`, ESMFold2 owns a released binder-**design** operation: gradient descent on per-position soft-sequence logits through the experimental recurrent graph, followed by a discrete refold of the optimized sequence. Its output is a folded `target|binder` complex whose binder length varies across candidates, so it is coordinate-producing and variable-length and cannot reuse the shared coordinate-free, fixed-length `DesignResult`. OFoldX therefore defines a distinct, family-owned `ESMFold2DesignResult` (with `ESMFold2DesignCandidate`) in this directory; it is not a subclass of the shared carrier. `design` is not a `standard_task`: it is exposed only through the concrete `ESMFold2Pipeline`, alongside a `fold` convenience wrapper over the shared `FoldResult`.
+`EsmFold2Model.embeddings` returns the released token and pair embeddings
+before diffusion. `EsmFold2Model.forward` is a differentiable single-step
+denoising primitive, while `fold` runs recurrent refinement, diffusion
+sampling, confidence prediction, and canonical Result decoding.
 
-This wave freezes the `ESMFold2Pipeline.design` signature at contract level only. Its body is blocked on the experimental recurrent-graph checkpoints, which are not local, so it raises `NotImplementedError` and the Pipeline is intentionally **not** registered (no `register_pipeline` / `pipeline.json`). When those checkpoints land, the experimental recurrent graph — which has a different confidence contract than `ESMFold2Model` — becomes a separate registered architecture `ofoldx.esmfold2_experimental`; it is never silently loaded as a variant of the released model.
+Binder design optimizes per-position soft amino-acid logits through the
+experimental recurrent graph, combines the structure objective with the
+configured ESMC pseudo-perplexity prior, selects the best distogram proxy
+during optimization, and discretely refolds each selected sequence. A
+`binder_prompt` fixes amino acids and marks mutable positions with `#`;
+`antibody_cdr_prompt` constructs a Chothia CDR-only prompt for an antibody Fv.
+The configured sequence-prior weight is `0.15` for general binders and `0.05`
+for antibody-framework design.
+Each `EsmFold2DesignCandidate` owns the complete folded `target|binder`
+`Structure`, scalar scores, token and atom pLDDT, and PAE.
+
+### Variants
+
+| Upstream checkpoint group                                                           | Type         | Folding Blocks | MSA      | ESMC             | Confidence and role                             |
+| ----------------------------------------------------------------------------------- | ------------ | -------------: | -------- | ---------------- | ----------------------------------------------- |
+| `biohub/ESMFold2`                                                                   | release      |             48 | optional | 6B               | full confidence; folding                        |
+| `biohub/ESMFold2-Fast`                                                              | release      |             24 | no       | 6B               | full confidence; faster single-sequence folding |
+| `biohub/ESMFold2-Experimental-Fast` and `-Cutoff2025`                               | experimental |             24 | no       | 6B               | pLDDT/PAE; binder inversion                     |
+| `biohub/ESMFold2-Experimental` and `-Cutoff2025`                                    | experimental |             48 | yes      | 6B               | pLDDT/PAE; hero critic and refold               |
+| `biohub/ESMFold2-Experimental-Fast-base{300M,600M,6B}-step{250,500,750,1000,1500}k` | experimental |             24 | no       | named scale/step | distogram-only scaling critics                  |
+
+The two release checkpoints share one executable architecture. ESMFold2-Fast
+disables its MSA encoder and uses a `0.1` language-model masking default;
+ESMFold2 enables MSA conditioning and uses a zero masking default. Experimental
+checkpoints use a distinct recurrent graph and checkpoint-derived ESMC
+dimensions. Scaling critics omit the confidence head and cannot produce
+confidence outputs.
 
 ### Model Specification
 
-| Variant | Trunk Blocks | MSA Encoder | Single Size | Pair Size | Checkpoint Loops | Checkpoint Sampler Steps |
-| --- | ---: | --- | ---: | ---: | ---: | ---: |
-| ESMFold2 | 48 | Yes | 384 | 256 | 3 | 14 |
-| ESMFold2-Fast | 24 | No | 384 | 256 | 3 | 14 |
+| Property                               | Released graph                  | Experimental graph                          |
+| -------------------------------------- | ------------------------------- | ------------------------------------------- |
+| Architecture                           | `ofoldx.esmfold2`               | `ofoldx.esmfold2_experimental`              |
+| Model                                  | `EsmFold2Model`                 | `EsmFold2ExperimentalModel`                 |
+| Processor                              | `EsmFold2Processor`             | `EsmFold2ExperimentalProcessor`             |
+| Pipeline                               | `EsmFold2Pipeline`              | `EsmFold2DesignPipeline`                    |
+| Task                                   | `fold`                          | `design`                                    |
+| Result                                 | `FoldResult`                    | `EsmFold2DesignResult`                      |
+| Input size                             | 451                             | 451                                         |
+| Single / pair size                     | 384 / 256                       | 384 / 256                                   |
+| Atom / token size                      | 128 / 768                       | 128 / 768                                   |
+| Folding Blocks                         | 48 or 24                        | 48 or 24, from checkpoint                   |
+| Source loops / total recurrent updates | 3 / 4                           | 3 / 4                                       |
+| Default sampler steps                  | 14                              | 14; 15 for scaling critics                  |
+| ESMC dependency                        | 6B, 80 layers, hidden size 2560 | 30/960, 36/1152, or 80/2560 from checkpoint |
+| ESMC context                           | 2048 tokens per protein chain   | selected ESMC checkpoint limit              |
 
-> [!NOTE]
-> The folding head is driven by ESMC-6B representations (2560 hidden size, 80 language-model layers). A published
-> OFoldX ESMFold2 repository is self-contained: `AutoModel(...)` restores both the MultiMolecule ESMC child and the
-> folding head, so sequence folding never performs a hidden second Hub resolution or requires `load_esmc()`.
-
-The Biohub checkpoint contains four tensors under three `ConfidenceHead` modules that its released `forward` never
-reads. The converter discards exactly those named tensors and rejects every other unexpected key. No production-weight
-result is stored in this repository. The maintained `scripts/parity/esmfold2.py` public-output comparison reads the
-reference checkout from `~/reference` and caller-owned weights from `~/weights`, leaves generated reports local, and
-remains outside frequent CI. Its weight-free semantic mode covers the public molecular, MSA, and Result boundaries;
-production runs of both released heads and canonical N/DN generic-base atom/full-input comparison remain required.
-
-The released input builder and current audited confidence implementation both encode non-polymers as molecule type `3`;
-OFoldX preserves that identity so ligand interface pLDDT uses the intended ligand weights.
-
-The concrete `fold` method exposes every effective released inference control directly: recurrence loops, diffusion
-samples and steps, language-model masking and per-loop dropout, MSA depth/subsampling/column masking, sampler noise and
-step scales, maximum inference sigma, and convergence-based denoising exit. The upstream standard-model `early_exit`
-boolean is not copied because that argument is swallowed by `**kwargs` and has no effect; OFoldX instead exposes the
-actual `denoising_early_exit_rmsd` computation implemented by the released structure head.
-
-`AutoModel("ofoldx/esmfold2")` and `AutoProcessor("ofoldx/esmfold2")` will become valid only after every blocker above is
-closed and the architecture is registered.
+Each released `FoldPrediction` carries a complete non-hydrogen `Structure`;
+`ptm`, `iptm`, `mean_plddt`, and `complex_iplddt` scores; token and atom pLDDT;
+PAE and PDE in angstroms; and chain-pair ipTM. `fold` exposes recurrence,
+sample count, diffusion steps, language-model masking and dropout, MSA depth
+and masking, sampler scales, maximum inference sigma, and RMSD-based denoising
+exit. Stochastic Model calls accept a caller-owned `torch.Generator`; Pipeline
+calls also accept `seed`.
 
 ### Links
 
-- **Code**: [ofoldx.models.esmfold2](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/esmfold2)
-- **Paper**: [Language Modeling Materializes a World Model of Protein Biology](https://biohub.ai/papers/esm_protein.pdf)
-- **Developed by**: Salvatore Candido, Thomas Hayes, Alexander Derry, et al.
-- **Model type**: All-atom structure predictor with a pair-only folding trunk and a diffusion structure head, conditioned on ESMC-6B language-model representations
-- **Original Repository**: [Biohub/esm](https://github.com/Biohub/esm)
+- [Official source](https://github.com/Biohub/esm)
+- [Inspected source revision](https://github.com/Biohub/esm/tree/ba4d7124864eed323a93bf3cfefcd958f573b75a)
+- [ESMFold2 checkpoint](https://huggingface.co/biohub/ESMFold2)
+- [ESMFold2-Fast checkpoint](https://huggingface.co/biohub/ESMFold2-Fast)
+- [Experimental Fast checkpoint](https://huggingface.co/biohub/ESMFold2-Experimental-Fast)
+- [Experimental MSA checkpoint](https://huggingface.co/biohub/ESMFold2-Experimental)
+- [Released binder-design workflow](https://github.com/Biohub/esm/blob/ba4d7124864eed323a93bf3cfefcd958f573b75a/cookbook/tutorials/binder_design.py)
+- [MultiMolecule ESMC-6B](https://huggingface.co/multimolecule/esmc-6b)
+- [Paper](https://biohub.ai/papers/esm_protein.pdf)
+- [OFoldX implementation](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/esmfold2)
 
-## Training
+## Usage
 
-This implementation exposes the differentiable single-step denoising `forward` primitive. The paper's diffusion MSE, smooth-LDDT, polymer–ligand bond,
-distogram, and confidence losses are useful provenance; reproducing every unpublished target, mask, mini-rollout, and
-reduction is not a registration requirement. OFoldX combines the released Biohub folding head with the paired
-MultiMolecule ESMC checkpoint and does not redistribute the upstream training corpora.
+Convert the required checkpoints first, then load the resulting repository:
+
+```python
+from ofoldx import AutoModel, AutoProcessor, pipeline
+
+sequence = "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQR"
+repository = "./esmfold2"
+
+folder = pipeline("fold", model=repository, device="cuda")
+result = folder.fold(
+    sequence,
+    num_samples=4,
+    num_sampling_steps=14,
+    seed=7,
+)
+best_prediction = result.best("ptm")
+
+model = AutoModel(repository, device="cuda")
+processor = AutoProcessor(repository, device="cuda")
+batch = processor(sequence)
+token_embeddings, pair_embeddings = model.embeddings(batch)
+direct_result = model.fold(batch, num_samples=1, seed=7)
+```
+
+The MSA-capable checkpoint accepts `msa=` as an `MSA`, `MSACollection`, aligned
+FASTA, or A3M path. For multi-protein systems, use `MSACollection` to retain
+explicit entity and instance bindings.
+
+Load a converted experimental design repository through its concrete Pipeline:
+
+```python
+from ofoldx import pipeline
+
+designer = pipeline(
+    "design",
+    model="./esmfold2-experimental-fast",
+    device="cuda",
+)
+designs = designer.design(
+    "EVQLVESGGGLVQPGGSLRLSCAAS",
+    binder_length=60,
+    num_candidates=4,
+    num_optimization_steps=150,
+    seed=7,
+)
+best_design = designs.best("iptm")
+```
+
+Pass `binder_prompt` to mix fixed and mutable binder positions. For antibody
+CDR design, build the prompt with `antibody_cdr_prompt` and use an experimental
+artifact configured with the `0.05` antibody sequence-prior weight rather than
+the `0.15` general-binder default.
+
+## Checkpoints and Conversion
+
+Convert a released folding checkpoint together with the paired MultiMolecule
+ESMC-6B child:
+
+```bash
+python -m ofoldx.models.esmfold2.convert \
+  biohub/ESMFold2 \
+  ./esmfold2 \
+  --esmc multimolecule/esmc-6b
+```
+
+Use `biohub/ESMFold2-Fast` as the source for the Fast variant. Convert an
+experimental binder-design head with its masked-language-model child and
+tokenizer:
+
+```bash
+python -m ofoldx.models.esmfold2.convert \
+  biohub/ESMFold2-Experimental-Fast \
+  ./esmfold2-experimental-fast \
+  --experimental \
+  --esmc multimolecule/esmc-6b
+```
+
+The converter reads graph dimensions and checkpoint type from the source
+`config.json`. It translates source checkpoint names into the descriptive
+native state tree: for example, source `z_init_1`, `z_init_2`, and
+`token_bonds` parameters become `left_pair_projection`,
+`right_pair_projection`, and `bond_projection`. Source transition branches are
+combined into each native `transition.feed_forward.gate_value_projection`, and
+attention, conditioning, diffusion, and confidence parameters are mapped to
+their owning Modules.
+
+Release conversion rejects missing head parameters and every unexpected
+parameter after discarding exactly four confidence tensors that the released
+source forward path never reads. Experimental heads strict-load without an
+ESMC child, after which the selected child is attached. A release repository
+stores `model.json`, `processor.json`, and the combined safetensors state. A
+design repository stores the experimental root pair, the selected ESMC model
+and tokenizer under `esmc/`, and the `ofoldx.esmfold2_design` Pipeline marker.
+Converted repositories are self-contained.
+
+The 15 scaling critics name the ESMC scale and training step in their
+checkpoint IDs. Their source configs also name the corresponding ESMC
+checkpoint; conversion must use that matching dependency rather than assuming
+ESMC-6B.
+
+## Training Details
+
+### Training Data
+
+Biohub reports that ESMFold2 was trained on sequences from the Protein Data
+Bank (PDB) and AlphaFold DB (AFDB). The release model cards give a September
+2021 data cutoff for ESMFold2 and ESMFold2-Fast. ESMC was pretrained separately
+on large protein-sequence corpora; consult the selected ESMC artifact's model
+card for its data and checkpoint-specific provenance. OFoldX does not
+redistribute the upstream training corpora.
+
+### Training Procedure
+
+The paper describes diffusion MSE, smooth-LDDT, polymer-ligand bond,
+distogram, and confidence losses for the folding system. The released source
+and model cards do not publish every target construction, mask, mini-rollout,
+batching rule, and reduction needed to reproduce head training exactly.
+OFoldX exposes the differentiable single-step denoising path but does not
+present it as a complete reproduction of the unpublished training pipeline.
+
+Binder design is inference-time optimization rather than checkpoint training.
+It performs gradient descent over soft binder-sequence logits under the
+released distogram contact objective and ESMC pseudo-perplexity regularizer,
+then refolds a discrete selected sequence.
+
+## Limitations
+
+- ESMFold2 predictions are computational hypotheses, not experimental
+  measurements. Structures and designed binders require independent
+  experimental validation.
+- PDB and AFDB contain uneven coverage of protein families, conformational
+  states, modifications, disorder, and non-protein biomolecules. Accuracy may
+  degrade for underrepresented chemistry and biology.
+- Quality depends on inference-time sampling and recurrent refinement.
+  Reducing samples or steps trades accuracy for speed, while pair and atom
+  computations make large systems memory-intensive.
+- The ESMC dependency has a 2048-token context. The Processor runs one ESMC row
+  per protein chain; MSA evidence applies only to protein entities, and Fast
+  checkpoints reject it.
+- Canonical small-molecule inputs must carry an explicit, complete reference
+  conformer. The Processor does not generate geometry from SMILES. Observed
+  coordinates in a `Structure` are not folding features.
+- The released source emits distance-conditioning tensors that its released
+  folding forward path does not consume. OFoldX rejects this ineffective
+  conditioning rather than advertising it as supported.
+- Binder design currently targets one single-chain protein and one binder per
+  call. One `EsmFold2DesignPipeline` owns one converted experimental head; it
+  does not automatically reproduce the released notebook's multi-inversion,
+  hero-critic, and 15-checkpoint scaling-critic ensemble.
+- In one recorded released-ESMFold2 comparison, repeated native runs had zero
+  observed difference, global-score differences were about `2e-4`, the
+  reported coordinate discrepancy was about `0.215` angstrom, and the
+  reported PAE discrepancy was about `0.108` angstrom. Those measurements
+  characterize that checkpoint, input, dtype, seed, and settings only; they do
+  not establish numerical identity.
+- Equivalent released-weight comparison has not been established for
+  ESMFold2-Fast, the experimental checkpoints, binder design, or canonical
+  generic nucleic-acid N/DN full inputs.
 
 ## Citation
 
@@ -100,58 +311,21 @@ MultiMolecule ESMC checkpoint and does not redistribute the upstream training co
 }
 ```
 
-> [!NOTE]
-> The artifacts distributed in this repository are part of the OFoldX project.
-> If OFoldX supports your research, please cite the OFoldX project as follows:
-
-```bibtex
-@software{chen2026ofoldx,
-  author = {Chen, Zhiyuan},
-  title  = {OFoldX},
-  year   = {2026},
-  url    = {https://github.com/OTeam-AI4S/OFoldX},
-}
-```
-
 ## Contact
 
-Please use GitHub issues of [OFoldX](https://github.com/OTeam-AI4S/OFoldX/issues) for questions or comments on the model card.
-
-Please contact the authors of the [ESMFold2 paper](https://biohub.ai/papers/esm_protein.pdf) for questions or comments on the paper/model.
-
-## Numerical epsilon note
-
-- **Confidence eps `1e-6`** (`_CONFIDENCE_EPS` `model.py:3015`, plddt floor `clamp(min=1e-6)` `:3178`) is **upstream-faithful — keep, do not unify.** Part of the inherent per-family confidence-eps spread (esmfold2 1e-6 / af3 1e-8+1e-6 / protenix 1e-8 / boltz 1e-5).
-- **OPM denominator** uses a divide-before-projection form with `n_valid.clamp(min=1.0)` and `denom_eps=0.0` (`model.py:2923,2931`) — a structurally different normalization from the `count + 1e-3` divide-after form used by AF2/AF3/Boltz. Not a candidate to fold into the `1e-3` eps.
-- **Softmax mask sentinels `-1e5` (`model.py:3005`) / `-1e9` (`model.py:2445`)** are numerically inert: in fp32/bf16 the post-softmax output is bit-identical to `torch.finfo(dtype).min` (measured max-diff 0.00e+00). `finfo.min` is the dtype-safe unified form (`-1e5`/`-1e9` overflow fp16). Unify for hygiene, zero error. See `EPSILON_ANALYSIS.md`.
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card. Contact the Biohub
+authors for questions about ESMFold2, its checkpoints, or the paper.
 
 ## License
 
-This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.html).
-
-```spdx
-SPDX-License-Identifier: AGPL-3.0-or-later
-```
-
-## Limitations & intentional upstream divergences
-
-- Per-atom coordinate parity has a cross-implementation floor of **~0.215 Å**;
-  OFoldX's global scores (pLDDT, PAE, PTM) sit **at parity**. Coordinates below that
-  floor are a known cross-implementation limit, not a regression.
-- Softmax mask sentinels (`-1e5`, `-1e9`) are numerically inert (measured post-softmax
-  max-diff `0.0`); `finfo.min` is the dtype-safe unified form. See the Numerical
-  epsilon note.
-- The confidence epsilon `1e-6` and the OPM divide-before-projection normalization
-  are kept upstream-faithful and are not unified with AF2/AF3/Boltz forms.
-- A parity run applies only to the checkpoint and settings supplied to the script.
-
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **ESMFold2 / ESMFold2-Fast weights:** released by Chan Zuckerberg Biohub under
-  MIT with an additional "other" third-party notice
-  ([ESM THIRD_PARTY_NOTICE](https://github.com/Biohub/esm/blob/main/THIRD_PARTY_NOTICE.md)).
-- **Redistribution status: GREEN** for the ESMFold2 / ESMFold2-Fast folding weights
-  (MIT), provided the third-party notice is retained. **Caveat:** the separate
-  ESM-C-6B trunk weights are copyleft **AGPL-3.0**; if any variant bundles them,
-  redistribution carries AGPL source obligations and must be treated as AMBER.
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Biohub ESM source and ESMFold2 checkpoint heads:** MIT, Copyright 2026
+  Chan Zuckerberg Biohub, Inc., with the
+  [Biohub third-party notice](https://github.com/Biohub/esm/blob/ba4d7124864eed323a93bf3cfefcd958f573b75a/THIRD_PARTY_NOTICE.md)
+  retained where applicable.
+- **`multimolecule/esmc-6b` implementation and artifact:** AGPL-3.0-or-later,
+  subject to the linked
+  [MultiMolecule license materials](https://huggingface.co/multimolecule/esmc-6b/tree/62eb94c06f7013fea59a5075955658c8a5a72263).
+- Converted artifacts combine components with distinct provenance. Conversion
+  does not relicense upstream weights or remove their notices.

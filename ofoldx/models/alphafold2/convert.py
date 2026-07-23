@@ -17,6 +17,7 @@ import torch
 from torch import Tensor
 
 from ...artifacts import save_model
+from ...processor import Processor
 from .config import AlphaFold2Config
 from .converters import deepmind, openfold
 from .model import AlphaFold2Model, AlphaFold2MultimerModel
@@ -166,7 +167,7 @@ def save_alphafold2_checkpoint(
     }
     model.load_state_dict(owned, strict=True, assign=True)
     if isinstance(model, AlphaFold2MultimerModel):
-        processor: object = AlphaFold2MultimerProcessor()
+        processor: Processor = AlphaFold2MultimerProcessor()
     else:
         processor = AlphaFold2Processor()
     save_model(

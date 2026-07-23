@@ -6,7 +6,7 @@ does not register classes, import Python paths, or accept arbitrary objects.
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 from .evidence import MSA, MSACollection, Template, TemplateAlignment
 from .molecular import (
     AtomSite,
+    BondOrigin,
     ChemicalAtom,
     ChemicalBond,
     ChemicalComponent,
@@ -22,6 +23,7 @@ from .molecular import (
     MoleculeBond,
     PolymerAttachment,
     PolymerSequence,
+    PolymerType,
     SystemBond,
 )
 from .structure import ResidueNumber, Structure
@@ -205,12 +207,15 @@ def _decode_residue_numbers(value: object) -> dict[tuple[str, int], ResidueNumbe
             required={"instance_id", "component_index", "number", "insertion_code"},
             owner="ResidueNumber entry",
         )
-        reference = (data["instance_id"], data["component_index"])
+        reference = (
+            _expect_str(data["instance_id"], "ResidueNumber.instance_id"),
+            _expect_int(data["component_index"], "ResidueNumber.component_index"),
+        )
         if reference in residue_numbers:
             raise ValueError(f"Structure.residue_numbers has a duplicate reference {reference!r}")
-        residue_numbers[reference] = ResidueNumber(  # type: ignore[index]
-            number=data["number"],  # type: ignore[arg-type]
-            insertion_code=data["insertion_code"],  # type: ignore[arg-type]
+        residue_numbers[reference] = ResidueNumber(
+            number=_expect_int(data["number"], "ResidueNumber.number"),
+            insertion_code=_expect_str(data["insertion_code"], "ResidueNumber.insertion_code"),
         )
     return residue_numbers
 
@@ -248,7 +253,20 @@ def _decode_atom(value: object) -> ChemicalAtom:
         },
         owner="ChemicalAtom",
     )
-    return ChemicalAtom(**data)  # type: ignore[arg-type]
+    return ChemicalAtom(
+        atom_id=_expect_str(data["atom_id"], "ChemicalAtom.atom_id"),
+        element=_expect_str(data["element"], "ChemicalAtom.element"),
+        isotope=_expect_optional_int(data["isotope"], "ChemicalAtom.isotope"),
+        formal_charge=_expect_optional_int(data["formal_charge"], "ChemicalAtom.formal_charge"),
+        radical_electrons=_expect_optional_int(data["radical_electrons"], "ChemicalAtom.radical_electrons"),
+        explicit_hydrogens=_expect_optional_int(data["explicit_hydrogens"], "ChemicalAtom.explicit_hydrogens"),
+        implicit_hydrogens=_expect_optional_int(data["implicit_hydrogens"], "ChemicalAtom.implicit_hydrogens"),
+        implicit_hydrogens_allowed=_expect_optional_bool(
+            data["implicit_hydrogens_allowed"], "ChemicalAtom.implicit_hydrogens_allowed"
+        ),
+        aromatic=_expect_optional_bool(data["aromatic"], "ChemicalAtom.aromatic"),
+        stereo=_expect_optional_str(data["stereo"], "ChemicalAtom.stereo"),
+    )
 
 
 def _encode_bond(bond: ChemicalBond) -> dict[str, object]:
@@ -270,14 +288,16 @@ def _decode_bond(value: object) -> ChemicalBond:
         owner="ChemicalBond",
     )
     stereo_atoms_value = data["stereo_atoms"]
-    stereo_atoms = None if stereo_atoms_value is None else tuple(_expect_list(stereo_atoms_value, "stereo_atoms"))
+    stereo_atoms = (
+        None if stereo_atoms_value is None else _expect_string_pair(stereo_atoms_value, "ChemicalBond.stereo_atoms")
+    )
     return ChemicalBond(
-        atom_a=data["atom_a"],  # type: ignore[arg-type]
-        atom_b=data["atom_b"],  # type: ignore[arg-type]
-        order=data["order"],  # type: ignore[arg-type]
-        aromatic=data["aromatic"],  # type: ignore[arg-type]
-        stereo=data["stereo"],  # type: ignore[arg-type]
-        stereo_atoms=stereo_atoms,  # type: ignore[arg-type]
+        atom_a=_expect_str(data["atom_a"], "ChemicalBond.atom_a"),
+        atom_b=_expect_str(data["atom_b"], "ChemicalBond.atom_b"),
+        order=_expect_float(data["order"], "ChemicalBond.order"),
+        aromatic=_expect_bool(data["aromatic"], "ChemicalBond.aromatic"),
+        stereo=_expect_optional_str(data["stereo"], "ChemicalBond.stereo"),
+        stereo_atoms=stereo_atoms,
     )
 
 
@@ -296,7 +316,7 @@ def _decode_attachment(value: object, name: str) -> PolymerAttachment | None:
     data = _expect_object(value, name)
     _expect_keys(data, required={"atom_id", "leaving_atom_ids"}, owner=name)
     return PolymerAttachment(
-        atom_id=data["atom_id"],  # type: ignore[arg-type]
+        atom_id=_expect_str(data["atom_id"], f"{name}.atom_id"),
         leaving_atom_ids=frozenset(_expect_strings(data["leaving_atom_ids"], f"{name}.leaving_atom_ids")),
     )
 
@@ -339,7 +359,7 @@ def _decode_component(value: object) -> ChemicalComponent:
         else frozenset(_decode_bond(item) for item in _expect_list(bonds_value, "ChemicalComponent.bonds"))
     )
     return ChemicalComponent(
-        component_id=data["component_id"],  # type: ignore[arg-type]
+        component_id=_expect_str(data["component_id"], "ChemicalComponent.component_id"),
         atoms=tuple(_decode_atom(item) for item in _expect_list(data["atoms"], "ChemicalComponent.atoms")),
         bonds=bonds,
         previous_attachment=_decode_attachment(data["previous_attachment"], "previous_attachment"),
@@ -384,23 +404,16 @@ def _decode_molecule_bond(value: object) -> MoleculeBond:
         owner="MoleculeBond",
     )
     stereo_value = data["stereo_atoms"]
-    stereo_atoms = (
-        None
-        if stereo_value is None
-        else tuple(
-            tuple(_expect_list(item, "MoleculeBond.stereo_atoms entry"))
-            for item in _expect_list(stereo_value, "MoleculeBond.stereo_atoms")
-        )
-    )
+    stereo_atoms = None if stereo_value is None else _decode_molecule_stereo_atoms(stereo_value)
     return MoleculeBond(
-        component_a=data["component_a"],  # type: ignore[arg-type]
-        atom_a=data["atom_a"],  # type: ignore[arg-type]
-        component_b=data["component_b"],  # type: ignore[arg-type]
-        atom_b=data["atom_b"],  # type: ignore[arg-type]
-        order=data["order"],  # type: ignore[arg-type]
-        aromatic=data["aromatic"],  # type: ignore[arg-type]
-        stereo=data["stereo"],  # type: ignore[arg-type]
-        stereo_atoms=stereo_atoms,  # type: ignore[arg-type]
+        component_a=_expect_int(data["component_a"], "MoleculeBond.component_a"),
+        atom_a=_expect_str(data["atom_a"], "MoleculeBond.atom_a"),
+        component_b=_expect_int(data["component_b"], "MoleculeBond.component_b"),
+        atom_b=_expect_str(data["atom_b"], "MoleculeBond.atom_b"),
+        order=_expect_float(data["order"], "MoleculeBond.order"),
+        aromatic=_expect_bool(data["aromatic"], "MoleculeBond.aromatic"),
+        stereo=_expect_optional_str(data["stereo"], "MoleculeBond.stereo"),
+        stereo_atoms=stereo_atoms,
     )
 
 
@@ -426,7 +439,7 @@ def _decode_entity(value: object) -> PolymerSequence | Molecule:
     if kind == "polymer_sequence":
         _expect_keys(data, required={"kind", "polymer_type", "components"}, owner="PolymerSequence")
         return PolymerSequence(
-            polymer_type=data["polymer_type"],  # type: ignore[arg-type]
+            polymer_type=_expect_polymer_type(data["polymer_type"]),
             components=tuple(
                 _decode_component(item) for item in _expect_list(data["components"], "PolymerSequence.components")
             ),
@@ -447,7 +460,7 @@ def _decode_reference_coordinates(
     owner: str,
 ) -> tuple[tuple[float, float, float] | None, ...]:
     return tuple(
-        None if coordinate is None else tuple(_expect_list(coordinate, owner))  # type: ignore[misc]
+        None if coordinate is None else _expect_coordinate(coordinate, owner)
         for coordinate in _expect_list(value, owner)
     )
 
@@ -463,7 +476,11 @@ def _encode_site(site: AtomSite) -> dict[str, object]:
 def _decode_site(value: object) -> AtomSite:
     data = _expect_object(value, "AtomSite")
     _expect_keys(data, required={"instance_id", "component_index", "atom_id"}, owner="AtomSite")
-    return AtomSite(data["instance_id"], data["component_index"], data["atom_id"])  # type: ignore[arg-type]
+    return AtomSite(
+        _expect_str(data["instance_id"], "AtomSite.instance_id"),
+        _expect_int(data["component_index"], "AtomSite.component_index"),
+        _expect_str(data["atom_id"], "AtomSite.atom_id"),
+    )
 
 
 def _encode_system_bond(bond: SystemBond) -> dict[str, object]:
@@ -494,11 +511,11 @@ def _decode_system_bond(value: object) -> SystemBond:
     return SystemBond(
         site_a=_decode_site(data["site_a"]),
         site_b=_decode_site(data["site_b"]),
-        order=data["order"],  # type: ignore[arg-type]
-        aromatic=data["aromatic"],  # type: ignore[arg-type]
-        stereo=data["stereo"],  # type: ignore[arg-type]
-        stereo_sites=stereo_sites,  # type: ignore[arg-type]
-        origin=data["origin"],  # type: ignore[arg-type]
+        order=_expect_float(data["order"], "SystemBond.order"),
+        aromatic=_expect_bool(data["aromatic"], "SystemBond.aromatic"),
+        stereo=_expect_optional_str(data["stereo"], "SystemBond.stereo"),
+        stereo_sites=_expect_site_pair(stereo_sites, "SystemBond.stereo_sites"),
+        origin=_expect_bond_origin(data["origin"]),
     )
 
 
@@ -537,7 +554,7 @@ def decode_msa(value: object) -> MSA:
         owner="MSA",
     )
     return MSA(
-        entity_id=data["entity_id"],  # type: ignore[arg-type]
+        entity_id=_expect_str(data["entity_id"], "MSA.entity_id"),
         unpaired_sequences=tuple(_expect_strings(data["unpaired_sequences"], "MSA.unpaired_sequences")),
         unpaired_deletion_counts=_decode_uint32_matrix(
             data["unpaired_deletion_counts"], "MSA.unpaired_deletion_counts"
@@ -586,13 +603,13 @@ def decode_msa_collection(value: object) -> MSACollection:
     )
     target_value = data["target_instance_ids"]
     target_instance_ids = (
-        None if target_value is None else tuple(_expect_list(target_value, "MSACollection.target_instance_ids"))
+        None if target_value is None else tuple(_expect_strings(target_value, "MSACollection.target_instance_ids"))
     )
     return MSACollection(
         msas=tuple(decode_msa(item) for item in _expect_list(data["msas"], "MSACollection.msas")),
         row_pairing=_decode_int64_matrix(data["row_pairing"], "MSACollection.row_pairing"),
         row_is_paired=_decode_bool_matrix(data["row_is_paired"], "MSACollection.row_is_paired"),
-        target_instance_ids=target_instance_ids,  # type: ignore[arg-type]
+        target_instance_ids=target_instance_ids,
     )
 
 
@@ -654,9 +671,9 @@ def _decode_template_alignment(value: object) -> TemplateAlignment:
         owner="TemplateAlignment",
     )
     return TemplateAlignment(
-        target_entity_id=data["target_entity_id"],  # type: ignore[arg-type]
-        target_instance_id=data["target_instance_id"],  # type: ignore[arg-type]
-        template_instance_id=data["template_instance_id"],  # type: ignore[arg-type]
+        target_entity_id=_expect_str(data["target_entity_id"], "TemplateAlignment.target_entity_id"),
+        target_instance_id=_expect_optional_str(data["target_instance_id"], "TemplateAlignment.target_instance_id"),
+        template_instance_id=_expect_str(data["template_instance_id"], "TemplateAlignment.template_instance_id"),
         residue_pairs=tuple(
             _decode_residue_pair(pair)
             for pair in _expect_list(data["residue_pairs"], "TemplateAlignment.residue_pairs")
@@ -668,7 +685,10 @@ def _decode_residue_pair(value: object) -> tuple[int, int]:
     pair = _expect_list(value, "TemplateAlignment residue pair")
     if len(pair) != 2:
         raise ValueError("TemplateAlignment residue pair must have two indices")
-    return pair[0], pair[1]  # type: ignore[return-value]
+    return (
+        _expect_int(pair[0], "TemplateAlignment target residue index"),
+        _expect_int(pair[1], "TemplateAlignment template residue index"),
+    )
 
 
 def _chemical_bond_key(bond: ChemicalBond) -> tuple[object, ...]:
@@ -700,7 +720,9 @@ def _system_bond_key(bond: SystemBond) -> tuple[object, ...]:
 def _expect_object(value: object, owner: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError(f"{owner} must be a JSON object")
-    return value  # type: ignore[return-value]
+    if not all(isinstance(key, str) for key in value):
+        raise TypeError(f"{owner} keys must be strings")
+    return cast(dict[str, object], value)
 
 
 def _expect_list(value: object, owner: str) -> list[object]:
@@ -723,6 +745,97 @@ def _expect_str(value: object, owner: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{owner} must be a string")
     return value
+
+
+def _expect_optional_str(value: object, owner: str) -> str | None:
+    return None if value is None else _expect_str(value, owner)
+
+
+def _expect_int(value: object, owner: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{owner} must be an integer")
+    return value
+
+
+def _expect_optional_int(value: object, owner: str) -> int | None:
+    return None if value is None else _expect_int(value, owner)
+
+
+def _expect_float(value: object, owner: str) -> float:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        raise TypeError(f"{owner} must be a number")
+    return float(value)
+
+
+def _expect_bool(value: object, owner: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{owner} must be a boolean")
+    return value
+
+
+def _expect_optional_bool(value: object, owner: str) -> bool | None:
+    return None if value is None else _expect_bool(value, owner)
+
+
+def _expect_string_pair(value: object, owner: str) -> tuple[str, str]:
+    pair = _expect_strings(value, owner)
+    if len(pair) != 2:
+        raise ValueError(f"{owner} must contain two strings")
+    return pair[0], pair[1]
+
+
+def _expect_coordinate(value: object, owner: str) -> tuple[float, float, float]:
+    coordinate = _expect_list(value, owner)
+    if len(coordinate) != 3:
+        raise ValueError(f"{owner} coordinate must contain three numbers")
+    return (
+        _expect_float(coordinate[0], owner),
+        _expect_float(coordinate[1], owner),
+        _expect_float(coordinate[2], owner),
+    )
+
+
+def _decode_molecule_stereo_atoms(value: object) -> tuple[tuple[int, str], tuple[int, str]]:
+    raw_pairs = _expect_list(value, "MoleculeBond.stereo_atoms")
+    if len(raw_pairs) != 2:
+        raise ValueError("MoleculeBond.stereo_atoms must contain two sites")
+    pairs: list[tuple[int, str]] = []
+    for raw_pair in raw_pairs:
+        pair = _expect_list(raw_pair, "MoleculeBond.stereo_atoms entry")
+        if len(pair) != 2:
+            raise ValueError("MoleculeBond.stereo_atoms entry must contain a component index and atom ID")
+        pairs.append(
+            (
+                _expect_int(pair[0], "MoleculeBond.stereo_atoms component index"),
+                _expect_str(pair[1], "MoleculeBond.stereo_atoms atom ID"),
+            )
+        )
+    return pairs[0], pairs[1]
+
+
+def _expect_site_pair(
+    value: tuple[AtomSite, ...] | None,
+    owner: str,
+) -> tuple[AtomSite, AtomSite] | None:
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError(f"{owner} must contain two atom sites")
+    return value[0], value[1]
+
+
+def _expect_polymer_type(value: object) -> PolymerType:
+    polymer_type = _expect_str(value, "PolymerSequence.polymer_type")
+    if polymer_type not in {"protein", "rna", "dna", "dna_rna_hybrid"}:
+        raise ValueError(f"unsupported polymer type: {polymer_type!r}")
+    return cast(PolymerType, polymer_type)
+
+
+def _expect_bond_origin(value: object) -> BondOrigin:
+    origin = _expect_str(value, "SystemBond.origin")
+    if origin not in {"component", "molecule", "polymer_rule", "source", "user"}:
+        raise ValueError(f"unsupported SystemBond origin: {origin!r}")
+    return cast(BondOrigin, origin)
 
 
 def _expect_keys(data: dict[str, object], *, required: set[str], owner: str) -> None:

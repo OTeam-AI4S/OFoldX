@@ -28,7 +28,7 @@ from ..data.molecular import (
 from ..data.structure import ResidueNumber, Structure
 from .records import AtomRecord, ParsedStructure, atom_record_residue_key, unique_identifier
 
-_FORMATS = {".pdb": "pdb", ".cif": "mmcif", ".mmcif": "mmcif"}
+_FORMATS: dict[str, Literal["pdb", "mmcif"]] = {".pdb": "pdb", ".cif": "mmcif", ".mmcif": "mmcif"}
 _ATOM_LAYOUTS = frozenset({"observed", "complete_heavy", "complete_all"})
 _ALTLOC_POLICIES = frozenset({"highest_occupancy", "first"})
 
@@ -97,17 +97,17 @@ def write_structure(
         write_mmcif(structure, target)
         return LossReport() if allow_lossy else None
 
-    from .pdb import pdb_loss_fields, prepare_pdb_atoms, write_pdb
+    from . import pdb as pdb_io
 
-    atoms, dropped, rewritten = prepare_pdb_atoms(structure)
-    dropped_fields, rewritten_fields = pdb_loss_fields(structure, atoms, dropped, rewritten)
+    atoms, dropped, rewritten = pdb_io.prepare_pdb_atoms(structure)
+    dropped_fields, rewritten_fields = pdb_io.pdb_loss_fields(structure, atoms, dropped, rewritten)
     report = LossReport(dropped_fields, rewritten_fields)
     if (report.dropped_fields or report.rewritten_fields) and not allow_lossy:
         fields = sorted({*report.dropped_fields, *report.rewritten_fields})
         raise ValueError(
             "PDB cannot represent this Structure losslessly; pass allow_lossy=True " f"to acknowledge: {fields!r}"
         )
-    write_pdb(structure, target, atoms)
+    pdb_io.write_pdb(structure, target, atoms)
     return report if allow_lossy else None
 
 
@@ -128,9 +128,9 @@ def _prepare_read(
 
         parsed = parse_mmcif(source, model=model, assembly_id=assembly_id)
     else:
-        from .pdb import parse_pdb
+        from . import pdb as pdb_io
 
-        parsed = parse_pdb(source, model=model, assembly_id=assembly_id)
+        parsed = pdb_io.parse_pdb(source, model=model, assembly_id=assembly_id)
     if not parsed.rows:
         raise ValueError("structure source contains no atoms for the requested model/assembly")
 
@@ -216,7 +216,7 @@ def _materialize_component_hydrogens(component: ChemicalComponent) -> ChemicalCo
 def _structure_path(path: str | os.PathLike[str]) -> tuple[Path, Literal["pdb", "mmcif"]]:
     resolved = Path(os.path.expanduser(os.fspath(path)))
     try:
-        return resolved, _FORMATS[resolved.suffix.lower()]  # type: ignore[return-value]
+        return resolved, _FORMATS[resolved.suffix.lower()]
     except KeyError:
         raise ValueError("structure path suffix must be .pdb, .cif, or .mmcif") from None
 
@@ -576,9 +576,9 @@ def _read_source_bonds(
     system: MolecularSystem,
 ) -> tuple[SystemBond, ...]:
     if parsed.format == "pdb":
-        from .pdb import read_pdb_bonds
+        from . import pdb as pdb_io
 
-        declared = read_pdb_bonds(parsed, selected_rows, site_by_row_index)
+        declared = pdb_io.read_pdb_bonds(parsed, selected_rows, site_by_row_index)
     else:
         from .mmcif import read_mmcif_bonds
 

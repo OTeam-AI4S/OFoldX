@@ -8,7 +8,7 @@ from .context import AtomContext, AtomToTokenOutput
 from .encoders import (
     AtomConditioner,
     AtomPairEncoder,
-    AtomSelfAttentionStack,
+    AtomSelfAttention,
     AtomToTokenEncoder,
     AtomToTokenEncoderBase,
     AttentionLayout,

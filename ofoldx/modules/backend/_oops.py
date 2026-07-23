@@ -10,10 +10,14 @@ from typing import Callable
 
 from torch import nn
 
+OOpsUnsupportedError: type[NotImplementedError]
+
 try:
     import oops as _oops
-    from oops import LayerNorm, OOpsUnsupportedError
+    from oops import LayerNorm
+    from oops import OOpsUnsupportedError as _ImportedOOpsUnsupportedError
 
+    OOpsUnsupportedError = _ImportedOOpsUnsupportedError
     OOPS_AVAILABLE = True
 except ModuleNotFoundError as error:
     if error.name != "oops":
@@ -21,9 +25,10 @@ except ModuleNotFoundError as error:
     _oops = None
     OOPS_AVAILABLE = False
 
-    class OOpsUnsupportedError(NotImplementedError):  # type: ignore[no-redef]
+    class _MissingOOpsUnsupportedError(NotImplementedError):
         r"""Raised when an OOps kernel is requested but OOps is unavailable."""
 
+    OOpsUnsupportedError = _MissingOOpsUnsupportedError
     LayerNorm = nn.LayerNorm
 
 

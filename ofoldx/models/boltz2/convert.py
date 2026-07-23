@@ -46,6 +46,18 @@ def compile_rules(pairs: Iterable[tuple[str, str | None]]) -> list[Rule]:
     return [(re.compile(pattern), replacement) for pattern, replacement in pairs]
 
 
+def _unpack_triple_product_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+    marker = ".gate_value_projection."
+    if marker not in key:
+        return [(key, tensor)]
+    prefix, suffix = key.rsplit(marker, 1)
+    value, gate = tensor.chunk(2, dim=0)
+    return [
+        (f"{prefix}.value_projection.{suffix}", value),
+        (f"{prefix}.gate_projection.{suffix}", gate),
+    ]
+
+
 CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
     [
         (r"^transition\.adaln\.s_norm\.", "transition.conditioned_norm.conditioning_norm."),
@@ -69,7 +81,7 @@ CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
 )
 
 
-DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "linear.")])
+DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "projection.")])
 
 
 BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "projection.")])
@@ -92,7 +104,7 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
 
 def transition_index_rules() -> list[tuple[str, str | None]]:
     return [
-        (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.norm_input."),
+        (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.input_norm."),
         (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
         (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.value_projection."),
         (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.output_projection."),
@@ -205,7 +217,7 @@ CONTACT_CONDITIONING_RULES: list[Rule] = compile_rules(
 
 def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.layer_norm\.", f"{clean}.norm_pair."),
+        (rf"^{boltz}\.layer_norm\.", f"{clean}.pair_norm."),
         (rf"^{boltz}\.linear\.", f"{clean}.bias_projection."),
         (rf"^{boltz}\.mha\.linear_q\.", f"{clean}.attention.projection.query_projection."),
         (rf"^{boltz}\.mha\.linear_k\.", f"{clean}.attention.projection.key_projection."),
@@ -217,7 +229,7 @@ def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | No
 
 def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.norm\.", f"{clean}.norm_input."),
+        (rf"^{boltz}\.norm\.", f"{clean}.input_norm."),
         (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
         (rf"^{boltz}\.fc2\.", f"{clean}.value_projection."),
         (rf"^{boltz}\.fc3\.", f"{clean}.output_projection."),
@@ -226,8 +238,8 @@ def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
 
 def triangle_multiplication_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
-        (rf"^{boltz}\.norm_in\.", f"{clean}.norm_input."),
-        (rf"^{boltz}\.norm_out\.", f"{clean}.norm_output."),
+        (rf"^{boltz}\.norm_in\.", f"{clean}.input_norm."),
+        (rf"^{boltz}\.norm_out\.", f"{clean}.output_norm."),
         (rf"^{boltz}\.p_out\.", f"{clean}.output_projection."),
         (rf"^{boltz}\.g_out\.", f"{clean}.gate_projection."),
     ]
@@ -242,14 +254,14 @@ PAIRFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_v\.", "pair_attention.attention.projection.value_projection."),
         (r"^attention\.proj_g\.", "pair_attention.attention.projection.gate_projection."),
         (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
-        (r"^attention\.proj_z\.0\.", "pair_attention.norm_pair."),
+        (r"^attention\.proj_z\.0\.", "pair_attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
         *triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_s", "single_feed_forward"),
-        *transition_rules("transition_z", "pair_feed_forward"),
+        *transition_rules("transition_s", "single_transition"),
+        *transition_rules("transition_z", "pair_transition"),
     ]
 )
 
@@ -303,7 +315,7 @@ PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_z", "feed_forward"),
+        *transition_rules("transition_z", "transition"),
     ]
 )
 
@@ -322,7 +334,7 @@ MSA_DIRECT_TRIANGLE_RULES: list[Rule] = compile_rules(
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("z_transition", "feed_forward"),
+        *transition_rules("z_transition", "transition"),
     ]
 )
 
@@ -337,8 +349,8 @@ def convert_msa_direct_triangle(key: str, tensor: Tensor) -> list[tuple[str, Ten
 
 MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
     [
-        (r"^norm_m\.", "norm_msa."),
-        (r"^norm_z\.", "norm_pair."),
+        (r"^norm_m\.", "msa_norm."),
+        (r"^norm_z\.", "pair_norm."),
         (r"^proj_m\.", "value_projection."),
         (r"^proj_g\.", "gate_projection."),
         (r"^proj_z\.", "pair_projection."),
@@ -349,7 +361,7 @@ MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
 
 MSA_TRANSITION_RULES = compile_rules(
     [
-        (r"^norm\.", "norm_input."),
+        (r"^norm\.", "input_norm."),
         (r"^fc1\.", "gate_projection."),
         (r"^fc2\.", "value_projection."),
         (r"^fc3\.", "output_projection."),
@@ -359,7 +371,7 @@ MSA_TRANSITION_RULES = compile_rules(
 
 OUTER_PRODUCT_MEAN_RULES = compile_rules(
     [
-        (r"^norm\.", "norm_msa."),
+        (r"^norm\.", "msa_norm."),
         (r"^proj_a\.", "left_projection."),
         (r"^proj_b\.", "right_projection."),
         (r"^proj_o\.", "output_projection."),
@@ -399,7 +411,7 @@ def convert_msa_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         return [(key.replace("msa_proj.", "msa_projection.", 1), tensor)]
     if key.startswith("layers."):
         index, _, remainder = key[len("layers.") :].partition(".")
-        return [(f"layers.{index}.{new_key}", value) for new_key, value in convert_msa_layer(remainder, tensor)]
+        return [(f"blocks.{index}.{new_key}", value) for new_key, value in convert_msa_layer(remainder, tensor)]
     raise KeyError(f"unmapped MSA module key: {key}")
 
 
@@ -448,7 +460,7 @@ _DTYPES = {
 # Boltz TemplateV2Module -> OFoldX Boltz2TemplateV2Embeddings.
 TEMPLATE_FLAT_RULES: list[Rule] = compile_rules(
     [
-        (r"^z_norm\.", "norm_pair."),
+        (r"^z_norm\.", "pair_norm."),
         (r"^v_norm\.", "hidden_norm."),
         (r"^z_proj\.", "pair_projection."),
         (r"^a_proj\.", "template_projection."),
@@ -539,7 +551,7 @@ CONFIDENCE_FLAT_RULES: list[Rule] = compile_rules(
         (r"^dist_bin_pairwise_embed\.", "distance_embedding."),
         (r"^s_inputs_norm\.", "input_single_norm."),
         (r"^s_norm\.", "single_norm."),
-        (r"^z_norm\.", "norm_pair."),
+        (r"^z_norm\.", "pair_norm."),
         (r"^s_input_to_s\.", "input_single_projection."),
         (r"^s_to_z_transpose\.", "single_to_pair_col."),
         (r"^s_to_z_prod_in1\.", "single_to_pair_product_left."),
@@ -584,7 +596,7 @@ def convert_confidence_module(key: str, tensor: Tensor) -> list[tuple[str, Tenso
         return [(f"pairformer_stack.blocks.{index}.{nk}", nv) for nk, nv in convert_pairformer_layer(remainder, tensor)]
     if key.startswith("confidence_heads."):
         new = convert_keys(key[len("confidence_heads.") :], CONFIDENCE_HEAD_RULES)
-        return [("confidence_head." + new, tensor)] if new is not None else []
+        return [("output_head." + new, tensor)] if new is not None else []
     new = convert_keys(key, CONFIDENCE_FLAT_RULES)
     return [(new, tensor)] if new is not None else []
 
@@ -595,16 +607,16 @@ AFFINITY_FLAT_RULES: list[Rule] = compile_rules(
         (r"^s_to_z_prod_in1\.", "single_to_pair_product_left."),
         (r"^s_to_z_prod_in2\.", "single_to_pair_product_right."),
         (r"^z_norm\.", "pair_norm."),
-        (r"^z_linear\.", "pair_linear."),
+        (r"^z_linear\.", "pair_projection."),
         (r"^boundaries$", "boundaries"),
     ]
 )
 AFFINITY_HEAD_RULES: list[Rule] = compile_rules(
     [
-        (r"^affinity_out_mlp\.", "affinity_out_mlp."),
-        (r"^to_affinity_pred_value\.", "to_affinity_pred_value."),
-        (r"^to_affinity_pred_score\.", "to_affinity_pred_score."),
-        (r"^to_affinity_logits_binary\.", "to_affinity_logits_binary."),
+        (r"^affinity_out_mlp\.", "pair_feature_mlp."),
+        (r"^to_affinity_pred_value\.", "affinity_value_mlp."),
+        (r"^to_affinity_pred_score\.", "affinity_score_mlp."),
+        (r"^to_affinity_logits_binary\.", "binder_logit_projection."),
     ]
 )
 AFFINITY_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
@@ -613,7 +625,7 @@ AFFINITY_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
         *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
         *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
         *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_z", "pair_feed_forward"),
+        *transition_rules("transition_z", "pair_transition"),
     ]
 )
 
@@ -623,7 +635,7 @@ def convert_affinity_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[st
     Tensor-aware converter for an affinity-module pair-only Pairformer layer.
 
     The affinity head uses ``PairformerStack(single_size=0)``, whose pair transition remains named
-    ``pair_feed_forward``. Template/MSA pair-only stacks use ``TrianglePairUpdateBlock.feed_forward`` instead.
+    ``pair_transition``. Template/MSA pair-only stacks use ``TrianglePairUpdateBlock.transition`` instead.
     """
 
     split = split_fused_projection(key, tensor)
@@ -656,7 +668,7 @@ def convert_affinity_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
         ]
     if key.startswith("affinity_heads."):
         new = convert_keys(key[len("affinity_heads.") :], AFFINITY_HEAD_RULES)
-        return [("affinity_head." + new, tensor)] if new is not None else []
+        return [("output_head." + new, tensor)] if new is not None else []
     new = convert_keys(key, AFFINITY_FLAT_RULES)
     return [(new, tensor)] if new is not None else []
 
@@ -669,19 +681,20 @@ def convert_affinity_modules(state_dict: Mapping[str, torch.Tensor]) -> dict[str
         state_dict: A full Boltz-2 affinity checkpoint ``state_dict``.
 
     Returns:
-        Converted affinity head tensors under ``affinity_module*``.
+        Converted affinity head tensors under ``affinity_heads.*``.
     """
 
     converted: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        for module in ("affinity_module1", "affinity_module2"):
+        for index, module in enumerate(("affinity_module1", "affinity_module2")):
             prefix = module + "."
             if key.startswith(prefix):
                 entries = convert_affinity_module(key[len(prefix) :], value)
                 if not entries:
                     raise KeyError(f"unmapped affinity checkpoint key: {key}")
-                for new_key, new_value in entries:
-                    converted[f"{module}.{new_key}"] = new_value
+                for packed_key, packed_value in entries:
+                    for new_key, new_value in _unpack_triple_product_projection(packed_key, packed_value):
+                        converted[f"affinity_heads.{index}.{new_key}"] = new_value
                 break
     return converted
 
@@ -707,10 +720,10 @@ def convert_trunk_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         return [("input_embeddings." + new, tensor)] if new is not None else []
     if key.startswith("template_module."):
         inner = convert_template_module(key[len("template_module.") :], tensor)
-        return [("template_embeddings." + nk, nv) for nk, nv in inner]
+        return [("template_embedder." + nk, nv) for nk, nv in inner]
     if key.startswith("msa_module."):
         inner = convert_msa_module(key[len("msa_module.") :], tensor)
-        return [("msa_module." + nk, nv) for nk, nv in inner]
+        return [("msa_trunk." + nk, nv) for nk, nv in inner]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
         inner = convert_pairformer_layer(remainder, tensor)
@@ -729,7 +742,7 @@ def convert_trunk_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         return [("coordinate_diffusion.denoiser." + new, tensor)] if new is not None else []
     if key.startswith("confidence_module."):
         inner = convert_confidence_module(key[len("confidence_module.") :], tensor)
-        return [("confidence_module." + nk, nv) for nk, nv in inner]
+        return [("confidence_head." + nk, nv) for nk, nv in inner]
     if key.startswith("bfactor_module."):
         new = convert_keys(key[len("bfactor_module.") :], BFACTOR_RULES)
         return [("bfactor_head." + new, tensor)] if new is not None else []
@@ -769,8 +782,9 @@ def convert_trunk(state_dict: Mapping[str, torch.Tensor], *, allow_affinity: boo
             if allow_affinity and key.startswith(_AFFINITY_PREFIXES):
                 continue
             raise KeyError(f"unmapped Boltz-2 checkpoint key: {key}")
-        for new_key, new_value in entries:
-            converted[new_key] = new_value
+        for packed_key, packed_value in entries:
+            for new_key, new_value in _unpack_triple_product_projection(packed_key, packed_value):
+                converted[new_key] = new_value
     _pack_conditioned_adaptive_norms(converted)
     return converted
 

@@ -10,7 +10,7 @@ import torch
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines import PairedPipeline, processor_device, resolve_generator
+from ...pipelines import PairedPipeline, resolve_generator
 from ...results import FoldResult
 from .model import AlphaFold2Model, AlphaFold2MultimerModel
 from .multimer_processor import AlphaFold2MultimerProcessor
@@ -18,7 +18,7 @@ from .processor import AlphaFold2Processor
 
 
 class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
-    r"""Bind the released AlphaFold 2 monomer Model and Processor."""
+    r"""Bind the AlphaFold 2 monomer Model and Processor."""
 
     def fold(
         self,
@@ -31,9 +31,24 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one monomer and fold it with configured representation ensembles."""
+        r"""Lower one monomer and fold it with configured representation ensembles.
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        Args:
+            input: Inline sequence, FASTA path, protein sequence, molecular system, or structure
+                topology containing exactly one protein instance.
+            msa: Optional monomer MSA value or alignment path.
+            templates: Template structures with explicit target alignments.
+            num_samples: Number of structure predictions to generate.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
             model_input,
@@ -44,7 +59,7 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
 
 
 class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFold2MultimerProcessor]):
-    r"""Bind the released AlphaFold-Multimer Model and Processor."""
+    r"""Bind the AlphaFold 2 multimer Model and Processor."""
 
     def fold(
         self,
@@ -57,9 +72,23 @@ class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFo
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one assembly and fold it with configured representation ensembles."""
+        r"""Lower one assembly and fold it with configured representation ensembles.
 
-        generator = resolve_generator(seed, generator, device=processor_device(self.processor))
+        Args:
+            input: Molecular system or named/ordered protein sequences forming one assembly.
+            msa: Optional multimer MSA collection.
+            templates: Template structures with explicit target alignments.
+            num_samples: Number of structure predictions to generate.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+                Model configuration.
+
+        Returns:
+            A ``FoldResult`` whose predictions follow generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
         model_input = self.processor(input, msa=msa, templates=templates)
         return self.model.fold(
             model_input,

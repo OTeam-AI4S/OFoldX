@@ -1,4 +1,4 @@
-r"""Lower canonical biomolecular inputs to the released Protenix v0.5 graph."""
+r"""Lower canonical biomolecular inputs to Protenix tensors."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import torch
 import torch.nn.functional as F
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT
 from ...data.components import get_component
@@ -38,11 +37,12 @@ from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...modules.geometry import uniform_random_rotation
+from ...processor import Processor
 from ...references import classify_reference
 from .config import ProtenixConstraintProcessorConfig, ProtenixProcessorConfig
 from .model import ProtenixAtomContact, ProtenixInput, ProtenixPocket, ProtenixTokenContact
 
-_RESTYPE = {
+_RESIDUE_TYPE = {
     name: index
     for index, name in enumerate(
         (
@@ -82,17 +82,17 @@ _RESTYPE = {
     )
 }
 _STANDARD = {
-    "protein": frozenset(tuple(_RESTYPE)[:21]),
+    "protein": frozenset(tuple(_RESIDUE_TYPE)[:21]),
     "rna": frozenset(("A", "G", "C", "U", "N")),
     "dna": frozenset(("DA", "DG", "DC", "DT", "DN")),
 }
-_UNKNOWN = _RESTYPE["UNK"]
-_GAP = _RESTYPE["-"]
+_UNKNOWN = _RESIDUE_TYPE["UNK"]
+_GAP = _RESIDUE_TYPE["-"]
 # MSA cells are UPPERCASE one-letter symbols (or the ``-`` gap), not ChemicalComponent IDs. This
-# projects the twenty standard protein one-letter codes onto their _RESTYPE indices; ``-`` becomes
+# projects the twenty standard protein one-letter codes onto their residue-type indices; ``-`` becomes
 # the gap class and every other symbol (ambiguity codes B Z U J O X, etc.) becomes UNK.
-_MSA_RESTYPE = {
-    symbol: _RESTYPE[three]
+_MSA_RESIDUE_TYPE = {
+    symbol: _RESIDUE_TYPE[three]
     for symbol, three in {
         "A": "ALA",
         "R": "ARG",
@@ -116,12 +116,19 @@ _MSA_RESTYPE = {
         "V": "VAL",
     }.items()
 }
-_MSA_RESTYPE["-"] = _GAP
+_MSA_RESIDUE_TYPE["-"] = _GAP
 _FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 
 
-class ProtenixProcessor:
-    r"""Build the exact v0.5 atom, token, MSA, constraint, and guidance tensors."""
+class ProtenixProcessor(Processor):
+    r"""Build atom, token, MSA, and guidance tensors for Protenix folding.
+
+    Args:
+        config: Feature limits and reference-position options. Defaults to
+            ``ProtenixProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -132,22 +139,8 @@ class ProtenixProcessor:
     ) -> None:
         self.config = ProtenixProcessorConfig() if config is None else config
         if not 1 <= self.config.max_msa_rows <= 16384:
-            raise ValueError("max_msa_rows must be between 1 and the released v0.5 limit 16384")
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+            raise ValueError("max_msa_rows must be between 1 and 16384")
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -157,13 +150,23 @@ class ProtenixProcessor:
         templates: Sequence[Template | str | PathLike[str]] = (),
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        r"""Lower one canonical assembly and its evidence for the default v0.5.0 graph.
+        r"""Lower an unconstrained assembly and its evidence to ``ProtenixInput``.
 
-        The default checkpoint has no constraint embedder, so this signature
-        declares NO constraint keywords: passing ``atom_contacts``,
-        ``token_contacts``, or ``pocket`` raises ``TypeError`` at the call
-        boundary. Only the
-        :class:`ProtenixConstraintProcessor` signature accepts them.
+        Args:
+            input: Inline protein sequence, FASTA or structure path, one or more
+                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
+                contributes topology, not observed coordinates.
+            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
+            templates: Reserved template evidence; this architecture requires an empty sequence.
+            generator: Optional PyTorch generator for reference-position augmentation.
+
+        Returns:
+            A default-graph ``ProtenixInput`` containing model tensors and canonical system, atom,
+            and token identities.
+
+        Notes:
+            Atom-aligned tensors follow ``atom_sites``; token-aligned tensors follow
+            ``token_sites``.
         """
 
         return self._lower(input, msa=msa, templates=templates, generator=generator)
@@ -183,7 +186,7 @@ class ProtenixProcessor:
 
         template_values = tuple(templates)
         if template_values:
-            raise ValueError("both released Protenix v0.5 checkpoints disable template blocks")
+            raise ValueError("Protenix does not enable template blocks")
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
         system = _normalize_input(input)
@@ -208,14 +211,16 @@ class ProtenixProcessor:
 
 
 class ProtenixConstraintProcessor(ProtenixProcessor):
-    r"""Lower atom contacts, token contacts, and one pocket into the v0.5.3 constraint channels.
+    r"""Lower atom contacts, token contacts, and one pocket into Protenix constraints.
 
-    This is a DISTINCT Processor identity from the default one: its ``__call__``
-    signature ADDS the ``atom_contacts``/``token_contacts``/``pocket`` keywords that
-    the default :class:`ProtenixProcessor` signature deliberately omits. The two
-    signatures -- not a shared ``config.constraints`` runtime gate -- separate the
-    two architecture ids. Templates remain rejected --
-    both v0.5 graphs disable template blocks.
+    Its public call adds constraint arguments that :class:`ProtenixProcessor` deliberately
+    omits.
+
+    Args:
+        config: Constraint feature limits and reference-position options. Defaults to
+            ``ProtenixConstraintProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -242,12 +247,27 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         pocket: ProtenixPocket | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        r"""Lower one canonical assembly, its evidence, and its v0.5.3 constraints.
+        r"""Lower an assembly, evidence, and constraints to ``ProtenixInput``.
 
-        ``atom_contacts``, ``token_contacts``, and ``pocket`` are the released
-        constraint channels. ``generator`` seeds the single advancing draw the
-        Processor and Model share for multi-token constraint lowering; supply the
-        same generator to :meth:`ProtenixModel.fold` for a reproducible run.
+        Args:
+            input: Inline protein sequence, FASTA or structure path, one or more
+                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
+                contributes topology, not observed coordinates.
+            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
+            templates: Reserved template evidence; this architecture requires an empty sequence.
+            atom_contacts: Upper-bound constraints between exact atom pairs.
+            token_contacts: Upper-bound constraints between token-level endpoints.
+            pocket: Optional directed binder-to-residue pocket constraint.
+            generator: Optional PyTorch generator for reference-position augmentation and
+                multi-token constraint selection.
+
+        Returns:
+            A constraint-graph ``ProtenixInput`` containing model tensors and canonical system,
+            atom, and token identities.
+
+        Notes:
+            Atom-aligned tensors follow ``atom_sites``; token-aligned and constraint tensors follow
+            ``token_sites``.
         """
 
         return self._lower(
@@ -326,7 +346,7 @@ def _normalize_msa(
     if isinstance(msa, MSA | MSACollection):
         for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
             if entity.polymer_type != "protein":
-                raise ValueError("released Protenix v0.5 consumes supplied MSA evidence only for proteins")
+                raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
         return msa
 
     path = Path(msa).expanduser()
@@ -418,7 +438,7 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                             "chain_index": chain_index,
                             "entity_index": entity_index,
                             "symmetry_index": symmetry_index,
-                            "restype": _RESTYPE.get(component_id, _UNKNOWN) if standard else _UNKNOWN,
+                            "residue_type": _RESIDUE_TYPE.get(component_id, _UNKNOWN) if standard else _UNKNOWN,
                             "center": center_site,
                             "representative": representative_site,
                             "standard": standard,
@@ -448,7 +468,7 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                         "chain_index": chain_index,
                         "entity_index": entity_index,
                         "symmetry_index": symmetry_index,
-                        "restype": _UNKNOWN,
+                        "residue_type": _UNKNOWN,
                         "center": site,
                         "representative": site,
                         "standard": False,
@@ -536,11 +556,11 @@ def _features(
                 atom_token_index[site_to_atom[site]] = heavy_order[site.atom_id]
 
     _msa_rows, _msa_mask, profile, deletion_mean = _msa_features(msa, tokens, system, max_rows=max_msa_rows)
-    restype = torch.tensor([cast(int, token["restype"]) for token in tokens])
+    residue_type = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
     token_features = torch.cat(
         (
             torch.zeros(len(tokens), 384),
-            F.one_hot(restype, num_classes=32).float(),
+            F.one_hot(residue_type, num_classes=32).float(),
             profile,
             deletion_mean[:, None],
         ),
@@ -550,7 +570,7 @@ def _features(
     has_deletion = deletion_counts.clamp(0, 1)
     deletion_value = torch.atan(deletion_counts / 3.0) * (2.0 / math.pi)
 
-    pocket_feature, contact_feature, contact_atom_feature, substructure_feature = _constraint_features(
+    pocket_feature, token_contact_feature, atom_contact_feature, substructure_feature = _constraint_features(
         tokens=tokens,
         atom_contacts=atom_contacts,
         token_contacts=token_contacts,
@@ -596,8 +616,8 @@ def _features(
         has_deletion=floating(has_deletion),
         deletion_value=floating(deletion_value),
         pocket=floating(pocket_feature),
-        contact=floating(contact_feature),
-        contact_atom=floating(contact_atom_feature),
+        token_contact=floating(token_contact_feature),
+        atom_contact=floating(atom_contact_feature),
         substructure=floating(substructure_feature),
         system=system,
         atom_sites=atom_sites,
@@ -664,12 +684,12 @@ def _msa_polymer_type(system: MolecularSystem, entity_id: str) -> str | None:
     return entity.polymer_type if isinstance(entity, PolymerSequence) else None
 
 
-def _msa_symbol_restype(symbol: str) -> int:
+def _msa_symbol_residue_type(symbol: str) -> int:
     # Cells are UPPERCASE one-letter MSA symbols or ``-``; the query axis binds column i to
     # ``entity.components[i]`` so ``monomer_index`` is the column directly (query_to_entity is now the
-    # identity map). Standard residues resolve to their _RESTYPE index, ``-`` to the gap class, and
+    # identity map). Standard residues resolve to their residue-type index, ``-`` to the gap class, and
     # every other symbol (ambiguity codes) to UNK.
-    return _MSA_RESTYPE.get(symbol, _UNKNOWN)
+    return _MSA_RESIDUE_TYPE.get(symbol, _UNKNOWN)
 
 
 def _msa_descriptors(
@@ -738,14 +758,14 @@ def _msa_features(
             monomer_index = cast(int | None, token["monomer_index"])
             selected = select_msa_binding(bindings, entity_id, instance_id)
             if query or selected is None or _msa_polymer_type(system, entity_id) != "protein":
-                rows[row_index, token_index] = cast(int, token["restype"])
+                rows[row_index, token_index] = cast(int, token["residue_type"])
             elif selected[0] not in descriptor:
                 rows[row_index, token_index] = _GAP
             else:
                 key, value = selected
                 source_row, is_paired = descriptor[key]
                 pool = value.paired_sequences if is_paired else value.unpaired_sequences
-                rows[row_index, token_index] = _msa_symbol_restype(pool[source_row][cast(int, monomer_index)])
+                rows[row_index, token_index] = _msa_symbol_residue_type(pool[source_row][cast(int, monomer_index)])
 
     profile = torch.zeros(len(tokens), 32)
     deletion_mean = torch.zeros(len(tokens))
@@ -755,13 +775,13 @@ def _msa_features(
         monomer_index = cast(int | None, token["monomer_index"])
         selected = select_msa_binding(bindings, entity_id, instance_id)
         if selected is None or _msa_polymer_type(system, entity_id) != "protein":
-            profile[token_index, cast(int, token["restype"])] = 1
+            profile[token_index, cast(int, token["residue_type"])] = 1
             continue
         _key, value = selected
         # The profile and deletion mean are the entity's own alignment statistics, taken over the full
         # unpaired pool, including the query row.
         column = cast(int, monomer_index)
-        encoded = [_msa_symbol_restype(sequence[column]) for sequence in value.unpaired_sequences]
+        encoded = [_msa_symbol_residue_type(sequence[column]) for sequence in value.unpaired_sequences]
         profile[token_index] = F.one_hot(torch.tensor(encoded), num_classes=32).float().mean(dim=0)
         deletion_mean[token_index] = torch.tensor(value.unpaired_deletion_counts[:, column], dtype=torch.float32).mean()
     return rows, torch.ones_like(rows, dtype=torch.float32), profile, deletion_mean
@@ -803,13 +823,13 @@ def _constraint_features(
     generator: torch.Generator | None,
     site_to_token: dict[AtomSite, int],
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Build the four released v0.5.3 constraint pair-bias channels.
+    r"""Build the four Protenix constraint pair-bias channels.
 
-    The trained checkpoint maps atom contacts to channel 0 and token contacts to channel 1:
+    The architecture maps atom contacts to channel 0 and token contacts to channel 1:
 
-    * ``contact_atom`` -- an atom contact writes ``[max, 0]`` (channel 0 was the only
+    * ``atom_contact`` -- an atom contact writes ``[max, 0]`` (channel 0 was the only
       trained atom column); symmetric.
-    * ``contact`` -- a token contact writes ``[0, max]`` (channel 1); symmetric.
+    * ``token_contact`` -- a token contact writes ``[0, max]`` (channel 1); symmetric.
     * ``pocket`` -- a directed binder->residue fill of ``max`` on channel 0.
     * ``substructure`` -- always the all-zero grid; the embedder still runs so the pair
       baseline stays nonzero.
@@ -821,8 +841,8 @@ def _constraint_features(
 
     count = len(tokens)
     pocket_feature = torch.zeros(count, count, 1)
-    contact_feature = torch.zeros(count, count, 2)
-    contact_atom_feature = torch.zeros(count, count, 2)
+    token_contact_feature = torch.zeros(count, count, 2)
+    atom_contact_feature = torch.zeros(count, count, 2)
     substructure_feature = torch.zeros(count, count, 4)
     residue_tokens: dict[ComponentReference, list[int]] = {}
     instance_tokens: dict[str, list[int]] = {}
@@ -853,12 +873,12 @@ def _constraint_features(
 
     for atom_contact in atom_contacts:
         first, second = atom_token(atom_contact.atom_a), atom_token(atom_contact.atom_b)
-        _write_symmetric(contact_atom_feature, first, second, (atom_contact.max_distance, 0.0))
+        _write_symmetric(atom_contact_feature, first, second, (atom_contact.max_distance, 0.0))
 
     for token_contact in token_contacts:
         first = endpoint_token(token_contact.endpoint_a)
         second = endpoint_token(token_contact.endpoint_b)
-        _write_symmetric(contact_feature, first, second, (0.0, token_contact.max_distance))
+        _write_symmetric(token_contact_feature, first, second, (0.0, token_contact.max_distance))
 
     if pocket is not None:
         binder_tokens = instance_tokens.get(pocket.binder)
@@ -872,7 +892,7 @@ def _constraint_features(
             for binder_token in binder_tokens:
                 pocket_feature[binder_token, pocket_token, 0] = pocket.max_distance
 
-    return pocket_feature, contact_feature, contact_atom_feature, substructure_feature
+    return pocket_feature, token_contact_feature, atom_contact_feature, substructure_feature
 
 
 def _draw_token(candidates: list[int], generator: torch.Generator | None) -> int:

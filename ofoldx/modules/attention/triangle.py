@@ -25,15 +25,13 @@ class TriangleAttention(nn.Module):
         pair_size: Width of the pair-representation channel (query/key/value and output width).
         head_dim: Per-head dimension of the attention.
         num_attention_heads: Number of attention heads.
-        transpose_bias: If ``True`` the per-head bias is read from the pre-transpose pair (the DeepMind
-            AlphaFold 3 ending-node ``GridSelfAttention(transpose=True)`` convention); if ``False`` from
-            the pair as fed (OpenFold/AlphaFold 2, and every starting node). See the note below.
-        output_bias: Whether the attention output projection carries a learnable bias (AlphaFold 2).
-        gate_bias: Whether the output-gate projection carries a learnable bias (AlphaFold 2).
-        gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set (AlphaFold 2 uses
-            ``1.0`` to open the gate near init).
+        transpose_bias: Whether the per-head bias is read from the opposite pair orientation. Ending-node
+            callers that transpose ``pair`` can enable this to derive the bias from the pre-transpose state.
+        output_bias: Whether the attention output projection carries a learnable bias.
+        gate_bias: Whether the output-gate projection carries a learnable bias.
+        gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``sdpa`` reference otherwise. A bias-free module on the ``oops`` backend uses the
+            to ``sdpa`` otherwise. A bias-free module on the ``oops`` backend uses the
             dedicated OOps-owned ``triangle_attention`` implementation.
 
     Examples:
@@ -60,13 +58,10 @@ class TriangleAttention(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.norm_pair = LayerNorm(pair_size)
+        self.pair_norm = LayerNorm(pair_size)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
-        # DeepMind AlphaFold 3's ending-node ``GridSelfAttention`` derives its pair bias from the
-        # *pre-transpose* pair, whereas the OpenFold-style ending node (this module, fed the already
-        # transposed pair by the caller) derives it from the transposed pair. When ``transpose_bias``
-        # is set, the bias is taken from the other orientation so the two conventions agree. Defaults
-        # off to preserve the OpenFold behaviour used by other model implementations.
+        # Ending-node callers may transpose the pair before this update. In that case,
+        # ``transpose_bias`` keeps the bias tied to the original pair orientation.
         self.transpose_bias = transpose_bias
         self.attention = GatedMultiheadAttention(
             pair_size,
@@ -92,7 +87,7 @@ class TriangleAttention(nn.Module):
             pair_mask: Optional boolean keep-mask `[..., N, N]`; ``False`` key positions are excluded.
 
         Returns:
-            Gated pair update `[..., N, N, pair_size]`.
+            Additive attention update `[..., N, N, pair_size]`; the caller owns the outer residual.
 
         Examples:
             >>> import torch
@@ -106,11 +101,11 @@ class TriangleAttention(nn.Module):
             torch.Size([1, 3, 3, 8])
         """
 
-        normalized = self.norm_pair(pair)
+        normalized = self.pair_norm(pair)
         # Triangle bias term b_{jk} = Linear(z_{jk}): a per-head function of the two attended columns, shared across
         # the starting-node row/batch axis. Project the pair, then move heads ahead of the (query, key) axes and add
         # a singleton row axis so the same bias broadcasts over every row. ``transpose_bias`` reads the bias from the
-        # opposite token orientation (AlphaFold 3 ending-node convention; see ``__init__``).
+        # opposite token orientation used by ending-node attention.
         bias_source = normalized.transpose(-3, -2) if self.transpose_bias else normalized
         projected_bias = self.bias_projection(bias_source)  # (..., n_query, n_key, num_heads)
         triangle_bias = projected_bias.movedim(-1, -3).unsqueeze(-4)  # (..., 1, num_heads, n_query, n_key)
@@ -129,8 +124,9 @@ class TriangleMultiplication(nn.Module):
     Triangle multiplicative update for the pair representation.
 
     Forms gated left/right factors from the normalized pair, contracts them over a shared node to mix
-    pairwise information along triangle edges, then norms, projects back, and gates by the input. This is
-    the multiplicative half of a Pairformer triangle block; ``outgoing`` selects the contraction direction.
+    pairwise information along triangle edges, then norms, projects back, and gates by the input. It returns
+    an additive triangle update; the caller block owns the outer residual. ``outgoing`` selects the contraction
+    direction.
 
     Args:
         pair_size: Width of the input/output pair-representation channel.
@@ -138,7 +134,7 @@ class TriangleMultiplication(nn.Module):
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``eager`` reference otherwise.
+            to ``eager`` otherwise.
 
     Examples:
         >>> import torch
@@ -164,8 +160,8 @@ class TriangleMultiplication(nn.Module):
         self.operator_backend = resolve_config_operator_backend(
             operator_backend, supported=("oops", "eager"), public_default="eager"
         )
-        self.norm_input = LayerNorm(pair_size)
-        self.norm_output = LayerNorm(hidden_size)
+        self.input_norm = LayerNorm(pair_size)
+        self.output_norm = LayerNorm(hidden_size)
         self.left_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(pair_size, hidden_size, bias=False)
@@ -180,7 +176,7 @@ class TriangleMultiplication(nn.Module):
         pair_mask: Tensor | None = None,
     ) -> Tensor:
         r"""
-        Apply the gated triangle multiplicative update to the pair representation.
+        Compute the gated additive triangle update for the pair representation.
 
         Layer-norms the input, forms gated left/right factors `[..., N, N, hidden_size]`, contracts them over
         the shared node (``ikh,jkh->ijh`` outgoing, else ``kih,kjh->ijh`` incoming), then norms, projects back
@@ -192,7 +188,7 @@ class TriangleMultiplication(nn.Module):
                 contraction.
 
         Returns:
-            Updated pair representation `[..., N, N, pair_size]`.
+            Additive triangle update `[..., N, N, pair_size]`; the caller owns the outer residual.
 
         Examples:
             >>> import torch
@@ -210,17 +206,17 @@ class TriangleMultiplication(nn.Module):
             pair,
             pair_mask,
             outgoing=self.outgoing,
-            norm_input_weight=self.norm_input.weight,
-            norm_input_bias=self.norm_input.bias,
+            input_norm_weight=self.input_norm.weight,
+            input_norm_bias=self.input_norm.bias,
             left_value_weight=self.left_projection.weight,
             left_gate_weight=self.left_gate_projection.weight,
             right_value_weight=self.right_projection.weight,
             right_gate_weight=self.right_gate_projection.weight,
-            norm_output_weight=self.norm_output.weight,
-            norm_output_bias=self.norm_output.bias,
+            output_norm_weight=self.output_norm.weight,
+            output_norm_bias=self.output_norm.bias,
             output_weight=self.output_projection.weight,
             output_gate_weight=self.gate_projection.weight,
-            eps=self.norm_input.eps,
+            eps=self.input_norm.eps,
             operator_backend=self.operator_backend,
             left_value_bias=self.left_projection.bias,
             left_gate_bias=self.left_gate_projection.bias,

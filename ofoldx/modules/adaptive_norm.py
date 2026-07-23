@@ -16,9 +16,8 @@ class AdaptiveLayerNorm(nn.Module):
 
     The scale and shift projections are held as one fused ``conditioning_projection``
     (``[2 * hidden_size, conditioning_size]``, bias-free) plus a ``conditioning_scale_bias``
-    (``[hidden_size]``); this is exactly the layout the checkpoint converters emit (the scale/shift
-    weights concatenated, the scale bias kept separate), so the operator passes that packed layout to the
-    OOps-owned ``adaptive_layer_norm`` implementation with a byte-identical eager fallback.
+    (``[hidden_size]``). The selected operator backend consumes this packed parameter
+    layout directly while preserving one tensor contract across eager and accelerated paths.
 
     Args:
         hidden_size: Width of the hidden representation (affine-free normalized).

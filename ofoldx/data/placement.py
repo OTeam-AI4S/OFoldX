@@ -71,6 +71,22 @@ class SymbolicAtomSite:
     atom_id: str
 
 
+def symbolic_residue_aliases(
+    references: tuple[ComponentReference | SymbolicResidueSite, ...],
+) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
+    r"""Map negative placement offsets to their concrete positive symbolic identities."""
+
+    placements: dict[str, list[SymbolicResidueSite]] = {}
+    for reference in references:
+        if isinstance(reference, SymbolicResidueSite):
+            placements.setdefault(reference.placement_id, []).append(reference)
+    return {
+        SymbolicResidueSite(placement_id, index - len(rows)): reference
+        for placement_id, rows in placements.items()
+        for index, reference in enumerate(rows)
+    }
+
+
 def realized_instance_id(index: int) -> str:
     r"""Return the 0-based realized instance ID ``chain_{index}``."""
 

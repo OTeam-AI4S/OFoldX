@@ -2,8 +2,7 @@ r"""
 Fourier feature embeddings.
 
 Random Fourier features lift a scalar (e.g. a diffusion timestep) into a higher-dimensional
-periodic embedding that a network can condition on, following the frozen-projection scheme of
-the AlphaFold3 / diffusion timestep encoders.
+periodic embedding that a network can use for diffusion timesteps and other scalar conditions.
 """
 
 from __future__ import annotations

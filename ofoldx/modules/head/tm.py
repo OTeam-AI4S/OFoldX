@@ -1,13 +1,10 @@
 r"""
 Predicted-TM (pTM / ipTM) inner kernel.
 
-The length-dependent TM-score normalization ``d0(n)`` and the per-bin TM-score weight
-``1 / (1 + (d / d0)^2)`` are bit-for-bit identical across the AlphaFold2, AlphaFold3,
-Protenix, Boltz-1, and Boltz-2 implementations. Only the *outer* reductions differ and stay
-with each caller: which token pairs enter each average, which token count feeds ``d0`` (AF3 uses a
-per-pair interface count, Boltz/AF2 a global count, Protenix per-chain-pair sub-blocks), the
-ligand/protein interface masks, and how the row/frame max is taken. This module owns just the
-shared inner kernel those reductions call.
+This module owns the length-dependent TM-score normalization ``d0(n)`` and the
+per-bin weight ``1 / (1 + (d / d0)^2)``. Callers own all outer reductions:
+which token pairs enter an average, which token count feeds ``d0``, any interface
+masks, and row- or frame-wise maxima.
 """
 
 from __future__ import annotations
@@ -27,7 +24,7 @@ def tm_length_scale(num_tokens: Tensor | float, *, min_tokens: float = _D0_MIN_T
 
     Args:
         num_tokens: Effective token count ``n`` -- a Python scalar or a tensor of counts.
-        min_tokens: Lower clamp on ``n`` before the cube root (upstream uses 19).
+        min_tokens: Lower clamp on ``n`` before the cube root.
 
     Returns:
         ``d0`` with the same kind as ``num_tokens`` (float in, float out; tensor in, tensor out).
@@ -53,8 +50,7 @@ def tm_bin_weights(bin_centers: Tensor, num_tokens: Tensor | float) -> Tensor:
 
     When ``num_tokens`` is a tensor its ``d0`` is unsqueezed on a trailing bin axis so the weight
     broadcasts against a ``(..., num_bins)`` distribution; the caller supplies ``num_tokens`` at the
-    rank its own leading axes need (per token pair for AF3, ``[batch, 1, 1]`` for Boltz, a scalar for
-    Protenix / AF2).
+    rank required by its outer reduction, such as a per-pair count, a broadcast batch count, or a scalar.
 
     Args:
         bin_centers: ``[num_bins]`` distance-error bin centers, in Angstrom.

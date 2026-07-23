@@ -18,178 +18,236 @@ pipeline_tag: other
 
 # Boltz-2
 
-> [!IMPORTANT]
-Biomolecular structure-prediction and protein-ligand binding-affinity model converted for the OFoldX runtime.
-
-> [!NOTE]
-> The family is registered. Two Model/Processor pairs ship over two distinct
-> checkpoints: `ofoldx.boltz2` — `Boltz2Model` + `Boltz2Processor`,
-> `standard_tasks=("fold",)`, the standalone all-atom folder that resolves through
-> the generic standard fold Pipeline and returns a `FoldResult`; and
-> `ofoldx.boltz2_affinity` — `Boltz2AffinityModel` + `Boltz2AffinityProcessor`,
-> `standard_tasks=()` (its `score` is the concrete two-stage op, not a lossless
-> standard `ScorePipeline`). The concrete two-stage `Boltz2AffinityPipeline`
-> registers under the same `ofoldx.boltz2_affinity` string in the independent
-> pipeline registry.
->
-> **Affinity checkpoint provenance.** The affinity weights ship at
-> `/data/users/z/weights/boltzgen-1/boltz2_aff.ckpt` — physically co-located with
-> BoltzGen-1 weights but scientifically the released Boltz-2 affinity checkpoint
-> (`convert_boltz2_affinity_checkpoint`), not a BoltzGen model. The directory
-> layout is not a BoltzGen dependency.
+Boltz-2 is OFoldX's all-atom biomolecular structure-prediction and
+protein-ligand binding-affinity family. It provides a folding pair and a
+separate two-stage affinity pipeline built from released structure/confidence
+and affinity checkpoints.
 
 ## Disclaimer
 
-This is an UNOFFICIAL OFoldX conversion of [Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction](https://doi.org/10.1101/2025.06.14.659707) by Saro Passaro, Gabriele Corso, Jeremy Wohlwend, et al.
+This is an unofficial OFoldX conversion of
+[Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction](https://doi.org/10.1101/2025.06.14.659707)
+by Saro Passaro, Gabriele Corso, Jeremy Wohlwend, et al. The upstream authors did
+not write, review, or endorse this conversion or model card.
 
-The OFFICIAL repository of Boltz-2 is at [jwohlwend/boltz](https://github.com/jwohlwend/boltz).
-
-**The team releasing Boltz-2 did not write this model card, so this model card has been written by the OFoldX team.**
+The official Boltz-2 repository is
+[jwohlwend/boltz](https://github.com/jwohlwend/boltz). OFoldX converts released
+weights into its native parameter layout; it does not train, relicense, or claim
+ownership of the upstream models.
 
 ## Model Details
 
-Boltz-2 is an AlphaFold 3-style all-atom model for biomolecular complexes. An atom-conditioned input embedder builds the initial single and pair representations from residue-, MSA-, and atom-level features; a recycled trunk (on-the-fly V2 template embedder, an MSA module, and a deep Pairformer stack) iteratively refines those representations; an EDM diffusion sampler with in-loop weighted rigid alignment draws all-atom coordinates; and a token-level confidence head scores each sample with separate intra- and inter-chain PAE/PDE predictions.
+`Boltz2Model` embeds atom-, residue-, MSA-, method-, modification-, cyclic-, and
+molecule-level features; applies a recycled v2 template, MSA, and Pairformer
+trunk; samples atom coordinates with EDM reverse diffusion and in-loop weighted
+rigid alignment; and predicts distogram, B-factor, confidence, and ranking
+outputs.
 
-This family ships two architectures. `boltz2` is the full folding model described above. `boltz2_affinity` reuses the Boltz-2 trunk and diffusion module but disables templates and the B-factor head, and adds a pair-only affinity head: a two-module ensemble (8- and 4-block pair-only Pairformer stacks) that scores protein-ligand binding affinity. The released molecular-weight calibration is an optional call-time scoring control, not persistent model configuration.
+`Boltz2AffinityModel` retains the folding and confidence graph, disables
+templates and B-factor prediction, and adds two pair-only affinity heads. Its
+low-level `score` operation samples candidate structures, chooses the single
+greatest-iPTM sample without a pTM fallback, and returns a `ScoreResult` for that
+second-pass target. `Boltz2AffinityPipeline` owns the released two-stage
+operation: first fold and rank with the structure/confidence checkpoint, then
+crop, resample, and score with the affinity checkpoint. It returns
+`Boltz2AffinityResult`, preserving confidence-sorted first-pass predictions and
+the selected second-pass target.
 
-The affinity path selects a canonical ligand instance explicitly when the
-system contains more than one molecule. Raw affinity SMILES must first pass
-through `standardize_boltz2_affinity_smiles(...)`. That function applies the
-released ChEMBL largest-fragment standardization and returns the canonical
-`Molecule` used to construct the system for both model passes. The Processor
-derives molecular weight from that same final canonical graph, so one graph
-determines token topology, atom identities, and molecular weight. Neither raw
-SMILES nor CCD/direct-graph lowering reads chemical provenance.
+### Variants
 
-The audited upstream SMILES parser calls `RemoveHs(..., sanitize=False)` before
-`MolWt`, leaving ordinary implicit hydrogens absent from RDKit's property cache;
-the CCD path and the paper's stated molecular-weight semantics do not. OFoldX
-therefore derives chemically valid molecular weight from the final canonical
-graph. The three released correction constants are preserved, but their
-holdout-fit artifacts are not public, so the optional corrected value is not
-claimed to be bitwise-equivalent to that buggy parser path. The uncorrected
-dual-head outputs do not consume molecular weight.
+| Architecture             | Released checkpoint | Model / Processor                                 | Task exposure                      | Concrete Pipeline        |
+| ------------------------ | ------------------- | ------------------------------------------------- | ---------------------------------- | ------------------------ |
+| `ofoldx.boltz2`          | `boltz2_conf.ckpt`  | `Boltz2Model` / `Boltz2Processor`                 | standard `fold`                    | `Boltz2Pipeline`         |
+| `ofoldx.boltz2_affinity` | `boltz2_aff.ckpt`   | `Boltz2AffinityModel` / `Boltz2AffinityProcessor` | concrete `score`; no standard task | `Boltz2AffinityPipeline` |
 
-```python
-from ofoldx.models.boltz2 import (
-    Boltz2AffinityProcessor,
-    standardize_boltz2_affinity_smiles,
-)
-
-ligand_entity = standardize_boltz2_affinity_smiles(
-    "CC(=O)[O-].[Na+]",
-    entity_id="ligand",
-)
-# Build `system`/`structure` with `ligand_entity`; both passes must use that graph.
-
-batch = Boltz2AffinityProcessor(device="cuda")(
-    structure,
-    ligand="L",  # canonical Molecule instance_id
-)
-result = affinity_model.score(batch, num_samples=5)
-```
-
-The model samples candidate structures, chooses the single greatest-iPTM
-sample, and scores only that sample. It reports an IC50-like general
-`log10(measurement / µM)` affinity value (lower is stronger) and the mean of
-the two heads' binder probabilities (higher is stronger). It also retains both
-per-head values and probabilities under the six official Score keys
-(`affinity_pred_value`, `affinity_probability_binary`, `affinity_pred_value1`,
-`affinity_pred_value2`, `affinity_probability_binary1`,
-`affinity_probability_binary2`), each scoped to the selected ligand instance.
-The optional molecular-weight correction changes only the ensemble
-`affinity_pred_value`. The returned `ScoreResult.target` is the selected
-structure actually consumed by the low-level affinity heads.
-
-The concrete `Boltz2AffinityPipeline` runs the full two-stage workflow with two
-explicit model/processor components (`structure_model`/`structure_processor` for
-the fold+confidence pass, `model`/`processor` for the affinity pass); it is not
-hidden inside the Model or the standard `ScorePipeline`. Its `score(...)` folds
-the whole system with the confidence checkpoint, ranks the first-stage
-predictions by descending whole-call `confidence_score` (interface = ipTM unless
-the entire call's ipTM tensor is all-zero, then pTM;
-`confidence_score = (4·complex_plddt + interface) / 5` on the 0–1 pLDDT
-fraction) into `structure_predictions`, passes the rank-0 canonical `Structure`
-through the affinity crop, and runs the affinity checkpoint's independent
-second-pass sampling (max-iPTM selection, **no pTM fallback**). The second-pass
-coordinates are the returned `target`; first-pass coordinates are never merged
-into it.
-
-It returns a flat `Boltz2AffinityResult(target, structure_predictions, scores,
-metrics)`. The six official Scores, each scoped to the selected ligand instance,
-are: `affinity_pred_value` (two-head ensemble affinity + MW correction when
-enabled, `log10(IC50/µM)`, lower is stronger), `affinity_probability_binary`
-(mean of the two head binder probabilities, `[0,1]`, higher), the per-head
-uncorrected affinities `affinity_pred_value1`/`affinity_pred_value2`
-(`log10(IC50/µM)`, lower), and the per-head binder probabilities
-`affinity_probability_binary1`/`affinity_probability_binary2` (higher). The
-molecular-weight correction applies only to `affinity_pred_value`, never to the
-individual heads.
-
-Per DESIGN 6.2 the two passes are two independent upstream `predict_args` dicts,
-so `score(...)` splits the sampling counts faithfully: the structure/confidence
-pass takes `num_samples`/`num_sampling_steps` (upstream `diffusion_samples`/
-`sampling_steps`, defaults 1/200) and the affinity pass takes
-`affinity_num_samples`/`affinity_num_sampling_steps` (upstream
-`diffusion_samples_affinity`/`sampling_steps_affinity`, defaults 5/200). Per-pass
-recycling is faithful without an argument (each Model defaults to its own config:
-3 for the structure pass, 5 for the affinity pass). A `seed` seeds one RNG once
-and both passes draw from that single continued stream, mirroring upstream's one
-`seed_everything(seed)` before the two sequential passes. MSA is routed to both
-Processors because upstream reads both passes from the one shared `msa_dir`; the
-affinity crop / `method="other"` divergence lives inside
-`Boltz2AffinityProcessor`. The Pipeline's `to(...)` placement remains deferred
-(DESIGN 6.3).
+The affinity repository is composite: the affinity pair owns the root and the
+structure/confidence pair lives under `structure/`. The affinity checkpoint is a
+Boltz-2 checkpoint even when a source distribution stores it beside BoltzGen
+assets; storage location does not change model provenance.
 
 ### Model Specification
 
-| Architecture      | Pairformer Blocks | MSA Blocks | Single Size | Pair Size | Recycling Steps | Diffusion Blocks | Sampler Steps | Confidence Blocks |
-| ----------------- | ----------------- | ---------- | ----------- | --------- | --------------- | ---------------- | ------------- | ----------------- |
-| `boltz2`          | 64                | 4          | 384         | 128       | 3               | 24               | 200           | 8                 |
-| `boltz2_affinity` | 64                | 4          | 384         | 128       | 5               | 24               | 200           | 8                 |
+| Property                          | `ofoldx.boltz2`       | `ofoldx.boltz2_affinity` |
+| --------------------------------- | --------------------- | ------------------------ |
+| Single / pair size                | 384 / 128             | 384 / 128                |
+| Trunk Pairformer blocks           | 64                    | 64                       |
+| MSA blocks                        | 4                     | 4                        |
+| Template blocks                   | 2                     | 0 (disabled)             |
+| Denoiser token Transformer blocks | 24                    | 24                       |
+| Denoiser conditioning Transitions | 2                     | 2                        |
+| Confidence Pairformer blocks      | 8                     | 8                        |
+| Affinity Pairformer blocks        | none                  | 8 and 4                  |
+| Total trunk passes                | 4 (`recycling_steps`) | 6 (`recycling_steps`)    |
+| Reverse-diffusion steps           | 200                   | 200                      |
+| Default samples                   | 1 fold sample         | 5 affinity-pass samples  |
+| B-factor head                     | enabled               | disabled                 |
 
-> [!NOTE]
-> `boltz2_affinity` (`Boltz2AffinityConfig`) subclasses `Boltz2Config`, turns off templates and B-factor prediction,
-> retains the complete folding/confidence path, and adds the checkpoint's fixed pair of affinity heads: an 8-block
-> and a 4-block pair-only Pairformer stack. The released trunk is large, so a parameter count is not instantiated here.
+The names above follow the native OFoldX graph: repeated units are Blocks,
+stored under `blocks` and counted by fields ending in `num_blocks`; channel MLP
+units are Transitions. Source checkpoint spellings are confined to conversion.
+
+Both graphs use `sigma_data=16`, a Karras schedule with `rho=7`, noise levels
+from `160` to `1e-4` in `sigma_data` units, `churn_rate=0.8`,
+`noise_scale=1.003`, and `step_scale=1.5`. The released inference default is 200
+Euler steps.
+
+For folding, each `FoldPrediction` contains a `Structure`, token pLDDT on the
+0-100 scale, resolved probability, PAE/PDE in angstroms, and the scores `plddt`,
+`ptm`, `iptm`, `ligand_iptm`, `protein_iptm`, and `confidence_score`. First-pass
+ranking uses one whole-call fallback decision:
+
+```text
+interface = ptm if every sampled iptm is zero else iptm
+confidence_score = (4 * complex_plddt + interface) / 5
+```
+
+Here `complex_plddt` is the internal 0-1 fraction. The affinity Pipeline sorts
+first-pass predictions by this score, passes the rank-0 `Structure` through the
+affinity crop, and runs an independent second-pass sample selection by maximum
+iPTM.
+
+The two affinity heads publish six ligand-scoped scores:
+`affinity_pred_value`, `affinity_probability_binary`,
+`affinity_pred_value1`, `affinity_pred_value2`,
+`affinity_probability_binary1`, and `affinity_probability_binary2`. Affinity
+values use `log10(IC50/µM)` and prefer lower values; binder probabilities are in
+`[0, 1]` and prefer higher values. The ensemble values are the means of the two
+heads. Optional molecular-weight calibration changes only the ensemble affinity
+value `y`:
+
+```text
+y_corrected = 1.03525938 * y - 0.59992683 * MW^0.3 + 2.83288489
+```
+
+`Boltz2AffinityProcessor` selects one canonical `Molecule` instance and derives
+its molecular weight from that same final graph. Raw affinity SMILES should first
+pass through `standardize_boltz2_affinity_smiles(smiles)`, which applies the
+released ChEMBL standardization and largest-fragment selection. The returned
+`Molecule` must be the ligand graph used to build the system consumed by both
+passes.
 
 ### Links
 
-- **Code**: [ofoldx.models.boltz2](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltz2)
-- **Paper**: [Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction](https://doi.org/10.1101/2025.06.14.659707)
-- **Developed by**: Saro Passaro, Gabriele Corso, Jeremy Wohlwend, et al.
-- **Model type**: All-atom biomolecular structure-prediction trunk with an EDM diffusion sampler, a token-level confidence head, and a pair-only binding-affinity head
-- **Original Repository**: [jwohlwend/boltz](https://github.com/jwohlwend/boltz)
+- [OFoldX implementation](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltz2)
+- [Official source](https://github.com/jwohlwend/boltz)
+- [Boltz-2 paper](https://doi.org/10.1101/2025.06.14.659707)
+- [Upstream model repository](https://huggingface.co/boltz-community/boltz-2)
+- Developed by Saro Passaro, Gabriele Corso, Jeremy Wohlwend, et al.
+
+## Usage
+
+```python
+from ofoldx import AutoModel, AutoProcessor, fold, pipeline
+from ofoldx.models.boltz2 import standardize_boltz2_affinity_smiles
+
+fold_repository = "./boltz2"
+affinity_repository = "./boltz2-affinity"
+
+fold_result = fold(
+    "complex.cif",
+    model=fold_repository,
+    device="cuda",
+    num_samples=5,
+    seed=7,
+)
+
+ligand_entity = standardize_boltz2_affinity_smiles("CC(=O)[O-].[Na+]")
+system = ...  # Build one MolecularSystem that uses ligand_entity as instance "L".
+
+scorer = pipeline("score", model=affinity_repository, device="cuda")
+affinity_result = scorer.score(
+    system,
+    ligand="L",
+    num_samples=1,
+    affinity_num_samples=5,
+    molecular_weight_correction=True,
+    seed=7,
+)
+
+model = AutoModel(fold_repository, device="cuda")
+processor = AutoProcessor(fold_repository, device="cuda")
+direct_fold = model.fold(processor("complex.cif"))
+```
+
+The two Pipeline passes share one advancing RNG stream and receive the same MSA
+evidence. `num_samples` and `num_sampling_steps` control the first pass;
+`affinity_num_samples` and `affinity_num_sampling_steps` control the second.
+Direct `Boltz2AffinityModel.score` is only the low-level second pass and does not
+replace `Boltz2AffinityPipeline`.
+
+## Checkpoints and Conversion
+
+Convert the standalone folding checkpoint:
+
+```bash
+python -m ofoldx.models.boltz2.convert fold \
+  boltz2_conf.ckpt \
+  ./boltz2
+```
+
+Convert the affinity and structure checkpoints into one composite repository:
+
+```bash
+python -m ofoldx.models.boltz2.convert affinity \
+  boltz2_aff.ckpt \
+  boltz2_conf.ckpt \
+  ./boltz2-affinity
+```
+
+Both converters translate released source namespaces to native Block and
+Transition names, pack adaptive-normalization projections, and strict-load the
+result. The standalone repository contains one Model/Processor pair. The
+composite affinity repository contains the affinity pair at its root, the
+structure pair under `structure/`, and a pipeline marker selecting
+`Boltz2AffinityPipeline`. `--dtype` may cast floating tensors, and `--repo-id`
+optionally uploads the converted repository.
 
 ## Training Details
 
-Boltz-2 training is staged across structure, confidence, and affinity objectives, learning to reconstruct all-atom biomolecular complexes and to predict protein-ligand binding affinity. This describes the released weights; it is not an OFoldX training contract.
-
 ### Training Data
 
-The Boltz-2 report describes structure data from PDB structures before 2023-06-01, experimental NMR collections, MD trajectory datasets, AF2 monomer distillation, Boltz-1 complex distillation, and affinity data from PubChem, ChEMBL, BindingDB, and related filtered assay sources. OFoldX does not redistribute the training set.
-
-The Boltz-2 affinity heads use filtered assay data from sources such as PubChem, ChEMBL, and BindingDB, with decoy generation and structural-confidence filters described by the upstream report. OFoldX does not redistribute the training set.
+The Boltz-2 report describes structure data from PDB entries before 2023-06-01,
+experimental NMR collections, molecular-dynamics trajectories, AlphaFold 2
+monomer distillation, and Boltz-1 complex distillation. It describes affinity
+data from PubChem, ChEMBL, BindingDB, and related filtered assay sources, with
+decoy generation and structural-confidence filtering. OFoldX does not
+redistribute these datasets.
 
 ### Training Procedure
 
-Upstream Boltz-2 training is staged across structure, confidence, and affinity objectives. OFoldX converts a released checkpoint into a strict-loaded native model in memory. Registration still requires the complete fold/confidence boundary and concrete two-pass workflow. Training orchestration is separate from the current Model Hub gate.
+Upstream training is staged across structure, confidence, and affinity
+objectives. The report describes detached-trunk absolute and difference Huber
+losses for affinity values and a focal binary objective for binder
+classification.
 
-The technical report describes detached-trunk absolute/difference Huber losses
-and a focal binary objective, but neither the report nor the released source
-defines the exact pair construction, censor-mask denominators and reductions,
-focal-alpha convention/reduction, or normalization when a batch lacks one
-objective. The inspected source contains no affinity labels or affinity loss and
-states that updated Boltz-2 training code is forthcoming. Those details are useful
-provenance, but reproducing them exactly is not a registration requirement; OFoldX
-will define and document its own scientifically useful affinity objective.
+The inspected report and released source do not specify enough detail to
+reproduce every affinity pair construction, censor-mask denominator and
+reduction, focal-alpha convention, or empty-objective normalization. The
+inspected source also does not contain the complete affinity label/loss training
+path. OFoldX conversion does not retrain the checkpoints or claim a reproduction
+of the upstream training loop.
 
-The maintained script compares both released affinity heads and their combined
-low-level score math with the real checkpoint. Generated reports remain local. Run:
+## Limitations
 
-```bash
-python -m scripts.parity.boltz2.affinity_parity --device cuda
-```
+- Structure and affinity sampling are stochastic. The two-stage result depends
+  on both first-pass ranking and independent second-pass maximum-iPTM selection.
+- Affinity scoring requires a protein receptor and one selected, non-copied
+  `Molecule` instance. The released crop supports at most 256 tokens, 200 polymer
+  tokens, 2048 atoms, and 128 ligand atoms after hydrogen removal.
+- The audited upstream raw-SMILES path removes hydrogens without sanitizing
+  before molecular-weight calculation, which can leave ordinary implicit
+  hydrogens absent from RDKit's property cache. OFoldX computes molecular weight
+  from the chemically valid final canonical graph. The three correction
+  constants are preserved, but corrected values are not claimed bitwise equal to
+  that parser behavior; uncorrected head outputs do not use molecular weight.
+- Native pTM reductions use the dtype-aware `torch.finfo(dtype).tiny` denominator
+  for empty masks rather than a fixed cross-family epsilon.
+- Recorded released-checkpoint comparisons cover forward, confidence, diffusion,
+  sampler, and affinity calculations (5/5), with observed maximum differences
+  between 0 and `7.6e-5`; the corrected folding Processor features compared
+  exactly. This evidence is scoped to the compared checkpoints and inputs and
+  does not establish parity for every crop, ligand chemistry, Pipeline setting,
+  or stochastic sample.
 
 ## Citation
 
@@ -203,9 +261,7 @@ python -m scripts.parity.boltz2.affinity_parity --device cuda
 }
 ```
 
-> [!NOTE]
-> The artifacts distributed in this repository are part of the OFoldX project.
-> If OFoldX supports your research, please cite the OFoldX project as follows:
+If OFoldX supports your research, also cite the OFoldX software:
 
 ```bibtex
 @software{chen2026ofoldx,
@@ -218,36 +274,19 @@ python -m scripts.parity.boltz2.affinity_parity --device cuda
 
 ## Contact
 
-Please use GitHub issues of [OFoldX](https://github.com/OTeam-AI4S/OFoldX/issues) for questions or comments on the model card.
-
-Please contact the authors of the [Boltz-2 paper](https://doi.org/10.1101/2025.06.14.659707) for questions or comments on the paper/model.
-
-## Numerical epsilon note
-
-- **Confidence normalization eps `1e-5`** (`model.py:2803`) is **upstream-faithful — keep, do not unify.** Faithful to Boltz `confidence_utils`, and uses the `+ 1e-5` form consistently (unlike Boltz-1, which mixes in a `clamp_min(1e-5)` at `boltz1/model.py:3760` — audit D5). The per-family confidence-eps spread (boltz 1e-5 / af3 1e-8+1e-6 / protenix 1e-8 / esmfold2 1e-6) is an inherent cross-model difference; a shared constant would regress a family. Measured cost of unifying boltz 1e-5→1e-6 is ~2e-7 on pTM. See `EPSILON_ANALYSIS.md`.
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card. Questions about the
+upstream model should be directed to the authors of the
+[Boltz-2 paper](https://doi.org/10.1101/2025.06.14.659707).
 
 ## License
 
-This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.html).
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Upstream source and checkpoints:** MIT under the
+  [Boltz license](https://github.com/jwohlwend/boltz/blob/main/LICENSE).
+- `boltz2_conf.ckpt` and `boltz2_aff.ckpt` may be redistributed with the
+  upstream MIT notice preserved. Converted weights are not relicensed by OFoldX.
 
 ```spdx
 SPDX-License-Identifier: AGPL-3.0-or-later
 ```
-
-## Limitations & intentional upstream divergences
-
-- Boltz2 publishes the structure/confidence pair and the affinity pass as the
-  registered `Boltz2AffinityPipeline`, whose root is the affinity pass over a
-  `structure/` subpair. Global confidence and affinity scores are the qualified
-  surface; the diffusion sampler is stochastic.
-- The confidence epsilon is kept upstream-faithful (see the Numerical epsilon note).
-- A parity run applies only to the checkpoints and settings supplied to the script.
-
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code & weights:** MIT
-  ([boltz LICENSE](https://github.com/jwohlwend/boltz/blob/main/LICENSE)).
-- **Redistribution status: GREEN.** The `boltz2_conf` and affinity checkpoints are
-  permissively licensed and freely redistributable with the upstream MIT notice
-  preserved.

@@ -18,7 +18,7 @@ class DenoisingTokenEncoder(nn.Module):
     Projects the pair representation to per-block attention-bias logits (``pair_norms`` / ``bias_projections``)
     and delegates to the shared [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer]
     configured with a single adaptive norm and double-product transition. This mirrors
-    [`AtomSelfAttentionStack`][ofoldx.modules.atom.encoders.AtomSelfAttentionStack] at the token level.
+    [`AtomSelfAttention`][ofoldx.modules.atom.encoders.AtomSelfAttention] at the token level.
 
     Args:
         num_blocks: Number of token-encoder blocks; each contributes one transformer block. ``0`` makes the
@@ -28,7 +28,7 @@ class DenoisingTokenEncoder(nn.Module):
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per transformer block.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``sdpa`` reference otherwise.
+            to ``sdpa`` otherwise.
 
     Examples:
         >>> import torch

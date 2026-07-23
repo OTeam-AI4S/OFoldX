@@ -1,4 +1,4 @@
-r"""OFoldX's biological operation boundary for released NA-MPNN computations."""
+r"""NA-MPNN sequence design, scoring, and probability Pipelines."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .processor import NaMpnnProcessor
 
 
 class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
-    r"""Bind one NaMpnn Model-Processor pair for released biological operations."""
+    r"""Bind one NA-MPNN Model and Processor for mixed-polymer operations."""
 
     def design(
         self,
@@ -37,7 +37,26 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design mixed-polymer sequences on one fixed backbone."""
+        r"""Design mixed-polymer sequences on one fixed backbone.
+
+        Args:
+            input: Canonical structure or local structure path.
+            design_positions: Residue occurrences allowed to change.
+            conditions: Allowed-identity and tied-identity conditions.
+            symmetry_groups: Residue groups sharing one decoding position.
+            tied_weights: Optional sampling coefficient for each tied residue.
+            residue_logit_bias: Per-residue bias vectors over the NA-MPNN vocabulary.
+            pair_bias: Optional pairwise bias tensor aligned to lowered residue rows.
+            global_omit_tokens: One-letter residue tokens excluded from generation.
+            num_candidates: Number of complete sequences to sample.
+            temperature: Positive autoregressive sampling temperature.
+            global_logit_bias: Optional vocabulary-wide sampling bias.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``DesignResult`` containing candidates in sampling order.
+        """
 
         model_input = self.processor(
             input,
@@ -68,7 +87,19 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+        r"""Return sequence-conditioned autoregressive probabilities over decoding orders.
+
+        Args:
+            input: Canonical structure or local structure path.
+            sequence: Optional replacement sequence to evaluate.
+            design_positions: Residue occurrences included in the probability evaluation.
+            num_decoding_orders: Number of independently sampled decoding orders.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            An ``MpnnProbabilityResult`` whose leading axis follows decoding-order draw order.
+        """
 
         model_input = self.processor(input, sequence=sequence, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
@@ -85,7 +116,16 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-free all-equal-rank probabilities for every row."""
+        r"""Return sequence-free all-equal-rank probabilities for every row.
+
+        Args:
+            input: Canonical structure or local structure path.
+            design_positions: Residue occurrences included in the probability evaluation.
+            num_decoding_orders: Number of repeated evaluations to retain.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with one probability tensor per evaluation.
+        """
 
         model_input = self.processor(input, design_positions=design_positions)
         return self.model.unconditional_probabilities(
@@ -107,7 +147,23 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Average released nucleic-acid base probabilities with protein context fixed."""
+        r"""Average nucleic-acid base probabilities with protein context fixed.
+
+        Args:
+            input: Canonical structure or local structure path.
+            design_positions: Nucleic-acid residue occurrences included in the profile.
+            conditions: Allowed-identity and tied-identity conditions.
+            symmetry_groups: Residue groups sharing one decoding position.
+            global_omit_tokens: One-letter residue tokens excluded from generation.
+            num_samples: Number of sampled sequence contexts to average.
+            temperature: Positive autoregressive sampling temperature.
+            global_logit_bias: Optional vocabulary-wide sampling bias.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``ScoreResult`` containing per-residue base-probability metrics.
+        """
 
         model_input = self.processor(
             input,

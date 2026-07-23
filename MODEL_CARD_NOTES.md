@@ -24,13 +24,13 @@ identical to upstream.
 bit-identical across two independent regenerations) on 7 PDBs
 (1UBQ, 6LYZ, 1CBS, 1L2Y, 1F0R, 2N9R, 2RVB):
 
-| backend | per-res rASA max_abs | per-res rASA mean_abs | fraction_disordered exact | fraction_disordered max_abs | ranking_score max_abs |
-|---|---|---|---|---|---|
-| **biotite Shrake-Rupley (kept)** | **0.0252** | **0.0049** | **5/7** | **0.0526** | **0.0263** |
-| freesasa Lee-Richards (evaluated) | 0.0260 | 0.0053 | 4/7 | 0.0526 | 0.0263 |
+| backend                           | per-res rASA max_abs | per-res rASA mean_abs | fraction_disordered exact | fraction_disordered max_abs | ranking_score max_abs |
+| --------------------------------- | -------------------- | --------------------- | ------------------------- | --------------------------- | --------------------- |
+| **biotite Shrake-Rupley (kept)**  | **0.0252**           | **0.0049**            | **5/7**                   | **0.0526**                  | **0.0263**            |
+| freesasa Lee-Richards (evaluated) | 0.0260               | 0.0053                | 4/7                       | 0.0526                      | 0.0263                |
 
-The residual comes almost entirely from the accessibility *model* (SASA radii /
-atom set / DSSP's exact accessibility definition), not the numerical *algorithm*:
+The residual comes almost entirely from the accessibility _model_ (SASA radii /
+atom set / DSSP's exact accessibility definition), not the numerical _algorithm_:
 per-residue windowed rASA from Shrake-Rupley and Lee-Richards agree to ~0.002, well
 below the ~0.02–0.026 gap either has to `mkdssp`. Because `fraction_disordered`
 smooths over a 25-residue window and then thresholds, per-residue SASA differences

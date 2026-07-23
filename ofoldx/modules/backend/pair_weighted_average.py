@@ -46,10 +46,18 @@ def pair_weighted_average(
         msa: ``(B, S, N, msa_size)`` MSA representation.
         pair: ``(B, N, N, pair_size)`` pair representation.
         pair_mask: Optional ``(B, N, N)`` mask over invalid keys.
-        norm_msa_weight, norm_msa_bias, norm_msa_eps: MSA LayerNorm parameters.
-        norm_pair_weight, norm_pair_bias, norm_pair_eps: Pair LayerNorm parameters.
-        value_weight, gate_weight, pair_logits_weight, output_weight: Bias-free projection weights.
-        num_heads, head_dim: Attention head count and per-head width.
+        norm_msa_weight: MSA LayerNorm weight.
+        norm_msa_bias: MSA LayerNorm bias.
+        norm_pair_weight: Pair LayerNorm weight.
+        norm_pair_bias: Pair LayerNorm bias.
+        value_weight: Bias-free value projection weight.
+        gate_weight: Bias-free gate projection weight.
+        pair_logits_weight: Bias-free pair-logit projection weight.
+        output_weight: Bias-free output projection weight.
+        num_heads: Number of attention heads.
+        head_dim: Width of each attention head.
+        norm_msa_eps: Epsilon used by the MSA LayerNorm.
+        norm_pair_eps: Epsilon used by the pair LayerNorm.
         operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
 
     Returns:

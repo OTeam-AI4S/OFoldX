@@ -17,24 +17,22 @@ from ..config import (
 
 
 class AlphaFold3Config(Config):
-    r"""
-    Configuration for [`AlphaFold3Model`][ofoldx.models.alphafold3.AlphaFold3Model].
+    r"""Configure the [`AlphaFold3Model`][ofoldx.models.alphafold3.AlphaFold3Model] graph.
 
-    Instantiating with the defaults yields the AlphaFold 3 architecture. The config owns the model's
-    token/pair widths, trunk, template, denoiser, sampler, confidence, and recycling settings directly.
-
-    Attributes:
+    Args:
+        token_feature_size: Width of raw token features.
         single_size: Width of the single (token) representation.
         pair_size: Width of the pair representation.
+        atom_feature_size: Width of raw atom features.
+        relative_position_size: Width of relative-position features.
+        template: Two-block template stack with the 31-token AlphaFold 3 vocabulary and four 16-wide triangle heads.
+        trunk: Pairformer trunk configuration.
         recycling_steps: Number of trunk recycling passes.
+        denoiser: Atom/token diffusion denoiser configuration.
+        sampler: EDM reverse-diffusion sampler configuration.
+        distogram: Distogram head configuration.
+        confidence: Confidence head with single-representation clamping disabled for AlphaFold 3.
         rank_metric_eps: Denominator epsilon for the contact-weighted PAE ranking metric.
-
-    Examples:
-        >>> config = AlphaFold3Config()
-        >>> config.single_size
-        384
-        >>> config.pair_size
-        128
     """
 
     token_feature_size: int = 447
@@ -53,30 +51,17 @@ class AlphaFold3Config(Config):
     denoiser: DenoiserConfig = DenoiserConfig()
     sampler: SamplerConfig = SamplerConfig()
     distogram: DistogramConfig = DistogramConfig()
-    # DeepMind AlphaFold 3's confidence head consumes the trunk ``single`` representation
-    # unclamped (``confidence_head.py`` casts ``embeddings['single']`` straight into the
-    # pairformer with no ``clip``); the AF3 trunk single legitimately spans |x| up to ~4e4, so
-    # the shared ``single_max_abs=512`` clamp would corrupt ~20% of its entries and drive the
-    # pLDDT / resolved logits far off (cosine ~0.36).  Disable the clamp for the AF3 identity.
+    # Confidence scoring consumes the trunk single representation without magnitude clipping.
     confidence: ConfidenceConfig = ConfidenceConfig(single_max_abs=None)
     rank_metric_eps: float = 1e-6
 
 
 class AlphaFold3ProcessorConfig(Config):
-    r"""Select the input contract paired with a released AlphaFold 3 checkpoint.
+    r"""Configure AlphaFold 3 input lowering.
 
-    ``max_msa_rows`` bounds the assembled MSA depth the Processor lowers into the
-    ``msa_features`` / ``msa_mask`` tensors; the released data pipeline caps the
-    unpaired-plus-paired stack at 16384 rows.
-
-    ``ccd_revision`` is the exact wwPDB snapshot date that pins the shared
-    ``ofoldx/ccd`` Hub dataset revision passed to
-    :func:`~ofoldx.data.ccd.resolve_ccd_component` when the Processor lowers a
-    bare CCD-code ligand / ion / modified residue / glycan monomer into embedded
-    chemistry. It is a provenance pin on the resolution *source*, not a runtime
-    mode: two Processors with different ``ccd_revision`` values may lower the same
-    code to different (reproducible, auditable) chemistry. The released default is
-    the checkpoint's training CCD snapshot.
+    Args:
+        max_msa_rows: Maximum assembled depth of paired and unpaired MSA rows.
+        ccd_revision: wwPDB snapshot date used to reproducibly resolve bare CCD component codes.
     """
 
     max_msa_rows: int = 16384

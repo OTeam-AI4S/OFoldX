@@ -11,12 +11,12 @@ import numpy as np
 import torch
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import AtomSite, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .model import Boltz2Input, Boltz2Layout
 
 if TYPE_CHECKING:
@@ -114,12 +114,16 @@ _MAX_ATOMS = 2048
 _CROP_NEIGHBORHOOD = 10
 
 
-class Boltz2AffinityProcessor:
+class Boltz2AffinityProcessor(Processor):
     r"""Lower one canonical protein/small-molecule system to ``Boltz2Input``.
 
     ``ligand`` names the canonical ``Molecule`` instance scored by the affinity
     heads. It may be omitted only when the system contains exactly one eligible
     molecule instance.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -128,21 +132,7 @@ class Boltz2AffinityProcessor:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -157,6 +147,16 @@ class Boltz2AffinityProcessor:
         Molecular weight is computed from the selected canonical graph. Raw SMILES
         affinity ligands must therefore be standardized before constructing the input
         system.
+
+        Args:
+            input: Canonical molecular system, structure, or local structure path.
+            ligand: Molecule instance scored by the affinity head. May be omitted for a system
+                containing exactly one molecule instance.
+            msa: Optional MSA value, collection, or alignment path.
+            generator: Optional RNG for reference-conformer augmentation and cropping.
+
+        Returns:
+            A ligand-centered ``Boltz2Input`` for affinity scoring.
         """
 
         if isinstance(input, str | PathLike):
@@ -191,10 +191,10 @@ class Boltz2AffinityProcessor:
         if not isinstance(ligand_entity, Molecule):
             raise ValueError(f"ligand instance {ligand!r} does not reference a Molecule")
         if sum(entity_id == ligand_entity_id for entity_id in system.instances.values()) != 1:
-            raise ValueError("the released affinity protocol does not support a copied ligand entity")
+            raise ValueError("affinity scoring does not support copied ligand entities")
         ligand_atom_count, affinity_mw = _affinity_ligand_properties(ligand_entity)
         if ligand_atom_count > 128:
-            raise ValueError("the released affinity head supports at most 128 ligand atoms after RemoveHs")
+            raise ValueError("the affinity head supports at most 128 ligand atoms after removing hydrogens")
 
         normalized_msa = _normalize_msa(msa, system)
         return _prepare_boltz2_affinity_features(
@@ -209,12 +209,16 @@ class Boltz2AffinityProcessor:
         )
 
 
-class Boltz2Processor:
+class Boltz2Processor(Processor):
     r"""Lower one canonical molecular system to a whole-system folding ``Boltz2Input``.
 
     Uses the same token, atom, bond, and MSA construction as the affinity Processor
     without ligand-centered cropping or affinity tensors. The layout records
     ``affinity_instance_id = None``.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
     """
 
     def __init__(
@@ -223,21 +227,7 @@ class Boltz2Processor:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -246,7 +236,16 @@ class Boltz2Processor:
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
-        r"""Lower one whole-system folding input and its optional MSA evidence to ``Boltz2Input``."""
+        r"""Lower one whole-system folding input and its optional MSA evidence.
+
+        Args:
+            input: Canonical molecular system, structure, or local structure path.
+            msa: Optional MSA value, collection, or alignment path.
+            generator: Optional RNG for reference-conformer augmentation.
+
+        Returns:
+            A whole-system ``Boltz2Input`` for structure prediction.
+        """
 
         if isinstance(input, str | PathLike):
             input = read_structure(Path(input).expanduser())
@@ -415,15 +414,20 @@ def _prepare_boltz2_affinity_features(
                 resolved[atom_index] = True
                 target_positions[atom_index] = torch.from_numpy(structure.coordinates[source_index].copy())
 
-    ref_pos = torch.zeros(padded_atom_count, 3)
-    ref_pos[:atom_count] = torch.tensor(reference_coordinates)
-    ref_space = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_space[:atom_count] = torch.tensor(reference_space_ids)
-    _augment_reference_positions(ref_pos[:atom_count], ref_space[:atom_count], resolved, generator=generator)
+    reference_positions = torch.zeros(padded_atom_count, 3)
+    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
+    _augment_reference_positions(
+        reference_positions[:atom_count],
+        reference_space_id[:atom_count],
+        resolved,
+        generator=generator,
+    )
 
     atomic_number = torch.zeros(padded_atom_count, dtype=torch.long)
-    charge = torch.zeros(padded_atom_count)
-    atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count)
+    atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
@@ -434,8 +438,8 @@ def _prepare_boltz2_affinity_features(
     for atom_index, (site, atom_name) in enumerate(zip(atom_sites, atom_names)):
         atom = system.atom(site)
         atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
-        charge[atom_index] = atom.formal_charge
-        atom_name_chars[atom_index] = torch.tensor(
+        reference_charges[atom_index] = atom.formal_charge
+        atom_name_characters[atom_index] = torch.tensor(
             [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
         )
         atom_mask[atom_index] = True
@@ -445,10 +449,10 @@ def _prepare_boltz2_affinity_features(
 
     atom_features = torch.cat(
         (
-            ref_pos,
-            charge.unsqueeze(-1),
+            reference_positions,
+            reference_charges.unsqueeze(-1),
             torch.nn.functional.one_hot(atomic_number, 128).float(),
-            torch.nn.functional.one_hot(atom_name_chars, 64).reshape(padded_atom_count, 256).float(),
+            torch.nn.functional.one_hot(atom_name_characters, 64).reshape(padded_atom_count, 256).float(),
         ),
         dim=-1,
     )
@@ -491,8 +495,8 @@ def _prepare_boltz2_affinity_features(
         "atom_features": atom_features,
         "atom_to_token": atom_to_token,
         "atom_mask": atom_mask,
-        "reference_positions": ref_pos,
-        "reference_space_id": ref_space,
+        "reference_positions": reference_positions,
+        "reference_space_id": reference_space_id,
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,
@@ -679,15 +683,20 @@ def _prepare_boltz2_structure_features(
                 resolved[atom_index] = True
                 target_positions[atom_index] = torch.from_numpy(structure.coordinates[source_index].copy())
 
-    ref_pos = torch.zeros(padded_atom_count, 3)
-    ref_pos[:atom_count] = torch.tensor(reference_coordinates)
-    ref_space = torch.zeros(padded_atom_count, dtype=torch.long)
-    ref_space[:atom_count] = torch.tensor(reference_space_ids)
-    _augment_reference_positions(ref_pos[:atom_count], ref_space[:atom_count], resolved, generator=generator)
+    reference_positions = torch.zeros(padded_atom_count, 3)
+    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
+    _augment_reference_positions(
+        reference_positions[:atom_count],
+        reference_space_id[:atom_count],
+        resolved,
+        generator=generator,
+    )
 
     atomic_number = torch.zeros(padded_atom_count, dtype=torch.long)
-    charge = torch.zeros(padded_atom_count)
-    atom_name_chars = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count)
+    atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
@@ -698,8 +707,8 @@ def _prepare_boltz2_structure_features(
     for atom_index, (site, atom_name) in enumerate(zip(atom_sites, atom_names)):
         atom = system.atom(site)
         atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
-        charge[atom_index] = atom.formal_charge
-        atom_name_chars[atom_index] = torch.tensor(
+        reference_charges[atom_index] = atom.formal_charge
+        atom_name_characters[atom_index] = torch.tensor(
             [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
         )
         atom_mask[atom_index] = True
@@ -709,10 +718,10 @@ def _prepare_boltz2_structure_features(
 
     atom_features = torch.cat(
         (
-            ref_pos,
-            charge.unsqueeze(-1),
+            reference_positions,
+            reference_charges.unsqueeze(-1),
             torch.nn.functional.one_hot(atomic_number, 128).float(),
-            torch.nn.functional.one_hot(atom_name_chars, 64).reshape(padded_atom_count, 256).float(),
+            torch.nn.functional.one_hot(atom_name_characters, 64).reshape(padded_atom_count, 256).float(),
         ),
         dim=-1,
     )
@@ -755,8 +764,8 @@ def _prepare_boltz2_structure_features(
         "atom_features": atom_features,
         "atom_to_token": atom_to_token,
         "atom_mask": atom_mask,
-        "reference_positions": ref_pos,
-        "reference_space_id": ref_space,
+        "reference_positions": reference_positions,
+        "reference_space_id": reference_space_id,
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,
@@ -809,7 +818,7 @@ def _affinity_crop(tokens: list[dict[str, object]], *, structure: Structure | No
         atom_count = sum(len(cast(tuple[AtomSite, ...], token["atom_sites"])) for token in tokens)
         polymer_count = sum(cast(int, token["molecule_type"]) != 3 for token in tokens)
         if len(tokens) > _MAX_TOKENS or atom_count > _MAX_ATOMS or polymer_count > _MAX_POLYMER_TOKENS:
-            raise ValueError("large affinity systems require a Structure for the released ligand-centered crop")
+            raise ValueError("large affinity systems require a Structure for ligand-centered cropping")
         return list(range(len(tokens)))
 
     coordinate_index = {site: index for index, site in enumerate(structure.sites)}

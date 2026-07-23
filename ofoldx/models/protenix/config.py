@@ -1,4 +1,4 @@
-r"""Configuration for the two released Protenix v0.5 base graphs."""
+r"""Configuration for Protenix folding and constraint architectures."""
 
 from __future__ import annotations
 
@@ -15,12 +15,22 @@ from ..config import (
 
 
 class ProtenixConfig(Config):
-    r"""Configuration of the released Protenix base graph.
+    r"""Configure the Protenix base or four-branch constraint graph.
 
-    ``constraints=False`` selects the default v0.5.0 graph. Setting it to
-    ``True`` selects the v0.5.3 graph containing all four released constraint
-    embedders. The four branches are one checkpoint variant, not independently
-    configurable features.
+    Args:
+        token_feature_size: Width of raw token features.
+        single_size: Width of the token representation.
+        pair_size: Width of the pair representation.
+        atom_feature_size: Width of raw atom features.
+        relative_position_size: Width of relative-position features.
+        constraints: Whether to build the jointly trained four-branch constraint variant.
+        template: Template embedding configuration.
+        trunk: Pairformer trunk configuration.
+        recycling_steps: Number of trunk recycling passes.
+        denoiser: Coordinate denoiser configuration.
+        sampler: Reverse-diffusion sampler configuration.
+        distogram: Distogram head configuration.
+        confidence: Confidence head configuration.
     """
 
     token_feature_size: int = 449
@@ -39,27 +49,22 @@ class ProtenixConfig(Config):
 
 
 class ProtenixConstraintConfig(ProtenixConfig):
-    r"""Configuration of the released ``protenix_base_constraint_v0.5.0`` graph.
+    r"""Configure the four-branch Protenix constraint graph.
 
-    Flips ``constraints`` to ``True`` so the four-branch constraint pair-bias
-    embedder is built. Every other field is inherited unchanged from the
-    base graph; the constraint checkpoint always carries all four
-    embedders (they were trained jointly), so this is one checkpoint-variant
-    selector, not four independently toggleable features.
+    Args:
+        constraints: Whether to build the jointly trained four-branch constraint embedder; fixed to ``True`` here.
     """
 
     constraints: bool = True
 
 
 class ProtenixProcessorConfig(Config):
-    r"""Input contract of the default v0.5.0 Processor.
+    r"""Configure Protenix input lowering.
 
-    ``constraints`` is a record-only marker of which checkpoint contract this
-    config pairs with; it does NOT gate keyword acceptance. The accept/reject
-    split between the default and constraint Processors is carried entirely by the
-    two distinct ``__call__`` signatures: the default
-    :class:`~ofoldx.models.protenix.processor.ProtenixProcessor` signature omits the
-    constraint keywords, so passing them raises ``TypeError`` at the call boundary.
+    Args:
+        constraints: Whether the paired processor exposes constraint inputs.
+        max_msa_rows: Maximum MSA depth lowered into model inputs.
+        augment_reference_positions: Whether to augment reference coordinates during lowering.
     """
 
     constraints: bool = False
@@ -68,13 +73,10 @@ class ProtenixProcessorConfig(Config):
 
 
 class ProtenixConstraintProcessorConfig(ProtenixProcessorConfig):
-    r"""Input contract of the v0.5.3 constraint Processor.
+    r"""Configure Protenix constraint input lowering.
 
-    Only the paired
-    :class:`~ofoldx.models.protenix.processor.ProtenixConstraintProcessor`
-    signature declares the atom-contact, token-contact, and pocket keywords; the
-    ``constraints`` marker below merely records that this config selects the
-    constraint checkpoint contract.
+    Args:
+        constraints: Whether constraint inputs are exposed; fixed to ``True`` here.
     """
 
     constraints: bool = True

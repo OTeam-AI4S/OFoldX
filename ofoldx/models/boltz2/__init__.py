@@ -7,8 +7,8 @@ from ..registry import MODELS
 from .chemistry import standardize_boltz2_affinity_smiles
 from .config import (
     Boltz2AffinityConfig,
-    Boltz2AffinityModuleConfig,
-    Boltz2ConfidenceModuleConfig,
+    Boltz2AffinityHeadConfig,
+    Boltz2ConfidenceConfig,
     Boltz2Config,
     Boltz2DenoiserConfig,
     Boltz2InputEmbeddingsConfig,

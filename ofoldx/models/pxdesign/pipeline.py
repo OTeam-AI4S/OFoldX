@@ -1,16 +1,8 @@
-r"""PXDesign's biological operation boundary.
+r"""Coordinate-producing binder-design Pipeline for PXDesign.
 
 :class:`PxDesignPipeline` binds the native PXDesign-d generator Model+Processor and owns
 the ``design`` verb over the PXDesign topology argument (``PlacementSpec``) and
-per-residue target label (``Hotspot``), returning :class:`PxDesignDesignResult`. It mirrors
-:class:`~ofoldx.models.proteinmpnn.pipeline.ProteinMpnnPipeline` and diverges from the shared
-coordinate-free :class:`~ofoldx.pipelines.design.DesignPipeline` (which lowers
-``AllowedResidueIdentities`` / ``TiedResidueIdentities`` conditions and returns the
-coordinate-free ``DesignResult``) because PXDesign is coordinate-producing.
-
-The suite composition (backbone -> ProteinMPNN sequence -> AF2-IG / Protenix evaluation ->
-``pxdbench`` ranking) is not implemented here. Its AF2 initial-guess entry point and
-``pxdbench`` ranking, geometry, and RMSD metrics are not yet available in OFoldX.
+per-residue target label (``Hotspot``), returning :class:`PxDesignDesignResult`.
 """
 
 from __future__ import annotations
@@ -43,14 +35,22 @@ class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PxDesignDesignResult:
-        r"""Generate ranked target--binder backbone candidates for one released target.
+        r"""Generate target-binder backbone candidates.
 
-        The Processor lowers ``input`` plus PXDesign's own ``PlacementSpec`` topology and optional
-        ``Hotspot`` label to a :class:`~ofoldx.models.pxdesign.model.PxDesignInput`; the
-        Model runs the released EDM sampler and decodes each coordinate sample. The returned
-        :class:`PxDesignDesignResult` carries raw generator backbones whose ``scores`` are empty
-        (the released sampler emits no per-sample confidence); the suite Pipeline populates
-        the evaluation Scores and ranking.
+        Args:
+            input: Optional target system, observed structure, or local structure path.
+            placement: Topology containing target spans and one generated binder chain.
+            conditions: Target hotspot labels.
+            num_candidates: Number of backbone candidates to generate.
+            num_sampling_steps: Number of diffusion steps.
+            sample_chunk_size: Maximum candidates generated per model call. ``None`` generates
+                all candidates together.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``PxDesignDesignResult`` containing coordinate-bearing candidates in generation
+            order.
         """
 
         model_input = self.processor(input, placement=placement, conditions=conditions)

@@ -24,5 +24,5 @@ Canonical value serialization is the public `ofoldx.data.codec` boundary. It
 encodes and decodes `MolecularSystem`, `Structure`, MSA evidence, and templates;
 the mmCIF exchange path uses it for embedded canonical payloads.
 
-The released MPNN implementations use `ofoldx.io.read_mpnn_pdb` when they need
+The MPNN models use `ofoldx.io.read_mpnn_pdb` when they need
 their shared model-specific PDB policy rather than the generic structure reader.

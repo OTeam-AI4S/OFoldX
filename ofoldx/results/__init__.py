@@ -14,5 +14,7 @@ from .values import (
     PackResult,
     PairMetric,
     Score,
+    Scored,
     ScoreResult,
+    best,
 )

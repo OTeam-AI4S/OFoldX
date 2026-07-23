@@ -16,61 +16,187 @@ pipeline_tag: other
 
 # AlphaFold 3
 
-> [!IMPORTANT]
-All-atom biomolecular structure prediction for proteins, nucleic acids, ligands, ions, and modified residues.
+All-atom biomolecular structure prediction for proteins, nucleic acids,
+ligands, ions, modified residues, and glycan components.
 
 ## Disclaimer
 
-This is an UNOFFICIAL OFoldX conversion of [Accurate structure prediction of biomolecular interactions with AlphaFold 3](https://doi.org/10.1038/s41586-024-07487-w) by Josh Abramson, Jonas Adler, Jack Dunger, et al.
+This is an unofficial OFoldX conversion of
+[Accurate structure prediction of biomolecular interactions with AlphaFold 3](https://doi.org/10.1038/s41586-024-07487-w)
+by Josh Abramson, Jonas Adler, Jack Dunger, et al. The upstream authors did not
+write, review, or endorse this implementation or model card. The official
+repository is
+[google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3).
 
-The OFFICIAL repository of AlphaFold 3 is at [google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3).
-
-**The team releasing AlphaFold 3 did not write this model card, so this model card has been written by the OFoldX team.**
-
-> [!NOTE]
-> Official DeepMind AlphaFold 3 parameters are governed by the DeepMind model-parameter terms and are NOT redistributed by OFoldX. This card describes the AlphaFold 3 architecture entry point in the OFoldX runtime; the model weights must be obtained separately from DeepMind.
-
-> [!NOTE]
-> The architecture id `ofoldx.alphafold3` is registered as one pair `(AlphaFold3Model,
-> AlphaFold3Processor)`. `fold` is a public family method that runs the released seed-and-sample
-> diffusion pipeline and returns an `AlphaFold3FoldResult` preserving the per-seed sample groups
-> (it does not flatten into the shared `FoldResult`), so it is called directly rather than through a
-> generic standard Pipeline (`standard_tasks=()`). CCD-code ligands, ions, modified residues, and
-> glycan monomers are lowered to embedded chemistry via the shared `ofoldx/ccd` resolver at the
-> Processor boundary (values in, no live registry lookup at tensor-compute time).
+Official AlphaFold 3 parameters are obtained separately from Google DeepMind
+and are governed by the
+[Model Parameters Terms of Use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
+and
+[Prohibited Use Policy](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md).
+OFoldX does not redistribute those parameters.
 
 ## Model Details
 
-AlphaFold 3 is an all-atom structure-prediction model that jointly predicts the folded coordinates of complexes spanning proteins, nucleic acids, small-molecule ligands, ions, and covalent modifications. The OFoldX implementation follows the released architecture: input features are embedded into single (per-token) and pair representations, a deep Pairformer trunk refines those representations across recycling iterations, and a diffusion coordinate module denoises atom positions with an EDM-style reverse-diffusion sampler. A confidence head reads the trunk and sampled coordinates to produce pLDDT, PAE, PDE, and resolved-atom estimates, and a distogram head predicts binned inter-residue distances. An optional template stack embeds structural templates into the pair path.
+`ofoldx.alphafold3` registers one `AlphaFold3Model` and
+`AlphaFold3Processor` pair. Its seed-group-preserving result requires the
+concrete `AlphaFold3Pipeline`, which is registered for `fold`; the Model pair
+does not advertise a generic standard task.
+
+AlphaFold 3 embeds atom, token, MSA, template, bond, and relative-position
+features into single and pair representations. A recycled 48-block Pairformer
+trunk refines those representations, a 24-block EDM coordinate denoiser samples
+all-atom coordinates, and distogram and confidence heads produce pLDDT, PAE,
+PDE, resolved-atom estimates, and scalar/chain-level confidence summaries. The
+released template path is represented by a two-block template stack.
+
+The Processor accepts an inline protein sequence, FASTA or structure path,
+`PolymerSequence`, a sequence of polymer chains, `MolecularSystem`, or
+`Structure`, together with explicit MSA and `Template` evidence. Bare CCD-code
+ligands, ions, modified residues, and glycan monomers are resolved to embedded
+chemistry at the Processor boundary using the pinned wwPDB CCD revision
+`2022-09-28`; the tensor graph performs no live registry lookup.
+
+`model.forward` is the differentiable one-step denoising graph and requires
+caller-supplied noisy coordinates and a noise level. `model.fold` runs trunk
+recycling, stochastic reverse diffusion, confidence decoding, clash detection,
+and disorder-aware ranking. One trunk pass is shared by the samples in a seed
+group.
+
+`AlphaFold3FoldResult` preserves `AlphaFold3SeedGroup` values rather than
+flattening samples into a shared `FoldResult`. Each `FoldPrediction` contains a
+canonical `Structure`, atom-level pLDDT and resolved probability, token-level
+PAE/PDE values, chain and chain-pair summaries, pTM, ipTM,
+`ptm_iptm_average = 0.8 * iptm + 0.2 * ptm`, clash/disorder values, and ranking
+scores. `best(score)` ranks across every sample in every seed group.
+
+`model.set_backend("auto" | "torch" | "oops")` selects the operator backend
+for shared attention, transition, atom, MSA, and triangle modules.
+
+### Variants
+
+OFoldX exposes one AlphaFold 3 architecture identity,
+`ofoldx.alphafold3`. The converter reads official single-file or sharded
+record-stream parameters, compressed or uncompressed. When a directory
+contains more than one official model stem, `model_name` selects that upstream
+name; OFoldX does not assign additional synthetic variant names.
 
 ### Model Specification
 
-| Trunk Blocks | Single Size | Pair Size | Denoiser Blocks | Recycling Steps | Sampler Steps |
-| ------------ | ----------- | --------- | --------------- | --------------- | ------------- |
-| 48           | 384         | 128       | 24              | 4               | 200           |
+| Property                                | Value                                |
+| --------------------------------------- | ------------------------------------ |
+| Architecture                            | `ofoldx.alphafold3`                  |
+| Model                                   | `AlphaFold3Model`                    |
+| Processor                               | `AlphaFold3Processor`                |
+| Pipeline                                | `AlphaFold3Pipeline`                 |
+| Task                                    | `fold` through the concrete Pipeline |
+| Result                                  | `AlphaFold3FoldResult`               |
+| Pairformer trunk blocks                 | 48                                   |
+| Template blocks / `template.num_blocks` | 2                                    |
+| Denoiser token blocks                   | 24                                   |
+| Single / pair sizes                     | 384 / 128                            |
+| Default recycling steps                 | 4                                    |
+| Default diffusion samples               | 5                                    |
+| Default sampling steps                  | 200                                  |
+| Maximum lowered MSA rows                | 16,384                               |
 
-> [!NOTE]
-> These dimensions are the OFoldX default `AlphaFold3Config` values for the released architecture. The parameter count is not listed because AlphaFold 3 is a large trunk-plus-diffusion model and the default config is not instantiated on CPU for this card. The template stack is disabled by default (`template.num_blocks = 0`) and is enabled when template features are provided.
+Confidence post-processing keeps two numerical contracts separate:
+predicted-TM normalization uses the dtype's positive `tiny` value, while the
+contact-weighted PAE ranking metric uses `rank_metric_eps` (`1e-6` by default).
 
 ### Links
 
-- **Code**: [ofoldx.models.alphafold3](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/alphafold3)
-- **Paper**: [Accurate structure prediction of biomolecular interactions with AlphaFold 3](https://doi.org/10.1038/s41586-024-07487-w)
-- **Developed by**: Josh Abramson, Jonas Adler, Jack Dunger, et al.
-- **Model type**: All-atom biomolecular structure predictor with a Pairformer trunk, diffusion coordinate module, and confidence head
-- **Original Repository**: [google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3)
+- [OFoldX implementation](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/alphafold3)
+- [Official AlphaFold 3 source](https://github.com/google-deepmind/alphafold3)
+- [AlphaFold 3 paper](https://doi.org/10.1038/s41586-024-07487-w)
+- [Official parameter terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
+
+## Usage
+
+```python
+import ofoldx
+
+fold_pipeline = ofoldx.pipeline(
+    "fold",
+    model="./alphafold3",
+    device="cuda",
+)
+result = fold_pipeline.fold(
+    "complex.cif",
+    num_samples=5,
+    seed=7,
+)
+prediction = result.best("ranking_score")
+structure = prediction.structure
+```
+
+The Pipeline also accepts explicit `msa`, `templates`, `recycling_steps`, and
+`num_sampling_steps`. `seed` and `generator` are Pipeline-level controls for
+the diffusion rollouts. Direct Model use requires an `AlphaFold3Input` built by
+the Processor when the output must be decoded into canonical structures.
+
+## Checkpoints and Conversion
+
+`convert_alphafold3_model` strict-loads official parameters into an in-memory
+Model. `convert_alphafold3_checkpoint` writes a complete Pipeline repository
+containing `model.json`, `processor.json`, `pipeline.json`, and safetensors.
+
+```python
+from ofoldx.models.alphafold3.convert import (
+    convert_alphafold3_checkpoint,
+    convert_alphafold3_model,
+)
+
+model = convert_alphafold3_model("af3.bin.zst")
+convert_alphafold3_checkpoint(
+    "af3.bin.zst",
+    "./alphafold3",
+)
+```
+
+The reader accepts official `.bin`, `.bin.zst`, and their supported sharded
+filename forms. It translates the official record-stream tensors, rejects
+unexpected records outside the known non-inference metadata/projections, and
+strict-loads the native state tree.
+
+Conversion is local when `repo_id` is omitted. The converter also exposes
+explicit `repo_id` and `private` arguments, but those arguments do not determine
+or grant legal permission to upload AlphaFold 3 parameters. Users must comply
+with the official parameter terms, including restrictions on sharing.
 
 ## Training Details
 
-AlphaFold 3 is trained end-to-end to predict all-atom coordinates of biomolecular complexes, combining a diffusion coordinate objective with distogram and confidence losses. OFoldX records AlphaFold 3 as a distinct architecture and does not train these weights.
-
 ### Training Data
 
-The upstream AlphaFold 3 publication describes training on biomolecular structure and sequence resources. OFoldX does not redistribute the training corpus.
+The upstream AlphaFold 3 publication describes the biomolecular structure,
+sequence, and chemistry resources used for training. OFoldX does not
+redistribute the training corpus. Refer to the paper and its supplementary
+information for the authoritative data description.
 
 ### Training Procedure
 
-OFoldX can strict-load local official AlphaFold 3 parameter archives into a native model and persist a standard `model.json` / `processor.json` / safetensors repository via the converter. Because the official DeepMind AlphaFold 3 parameters are not redistributable (RED), any Hub upload defaults to private and a public upload is refused; the converter never uploads the parameters without an explicit private `repo_id`.
+Upstream AlphaFold 3 is trained end to end with a diffusion coordinate
+objective and auxiliary distogram and confidence objectives. OFoldX preserves
+the released inference architecture and exposes the differentiable denoising
+step; converting official parameters does not reproduce or claim the complete
+upstream training system.
+
+## Limitations
+
+- AlphaFold 3 outputs are predictions with varying confidence and are not
+  experimental evidence. They are not intended or validated for clinical use.
+- Inference is stochastic and computationally demanding. Results depend on the
+  parameter set, biological evidence, seed, sample count, recycling and
+  sampling steps, dtype, and backend.
+- The Processor lowers supplied MSA and template evidence; it does not perform
+  the upstream database-search pipeline.
+- A reference comparison reported pair-representation relative-L2 of `0.0587`,
+  above a tight numerical target. Treat full numerical parity as incomplete.
+- The complete reverse-diffusion sampler and DSSP-derived disorder/ranking
+  terms have not been independently validated end to end against the official
+  implementation. Strict checkpoint loading alone does not establish that
+  equivalence.
+- Bare CCD codes resolve against the pinned `2022-09-28` snapshot; callers that
+  require different chemistry must provide a fully specified canonical system.
 
 ## Citation
 
@@ -86,9 +212,7 @@ OFoldX can strict-load local official AlphaFold 3 parameter archives into a nati
 }
 ```
 
-> [!NOTE]
-> The artifacts distributed in this repository are part of the OFoldX project.
-> If OFoldX supports your research, please cite the OFoldX project as follows:
+If OFoldX supports your research, also cite:
 
 ```bibtex
 @software{chen2026ofoldx,
@@ -101,43 +225,24 @@ OFoldX can strict-load local official AlphaFold 3 parameter archives into a nati
 
 ## Contact
 
-Please use GitHub issues of [OFoldX](https://github.com/OTeam-AI4S/OFoldX/issues) for questions or comments on the model card.
-
-Please contact the authors of the [AlphaFold 3 paper](https://doi.org/10.1038/s41586-024-07487-w) for questions or comments on the paper/model.
-
-## Numerical epsilon note
-
-- **Confidence normalization** is family-local. `alphafold3_predicted_tm_score` divides by the valid-pair count plus `torch.finfo(mask.dtype).tiny`; the contact-weighted PAE rank metric uses `AlphaFold3Config.rank_metric_eps` (`1e-6` by default). These are separate numerical contracts and should not share one epsilon.
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card. Questions about the
+original model should be directed to the AlphaFold 3 authors.
 
 ## License
 
-This model implementation is licensed under the [GNU Affero General Public License](https://www.gnu.org/licenses/agpl-3.0.html).
-
-```spdx
-SPDX-License-Identifier: AGPL-3.0-or-later
-```
-
-## Limitations & intentional upstream divergences
-
-- The pair representation reaches a relative-L2 of **0.0587** against the reference
-  in this session — marginal and above the tight per-atom targets; it is flagged as
-  not-yet-tight rather than fully validated.
-- The full diffusion sampler end-to-end and the DSSP-derived features are **not
-  validated** in this session's audit.
-- Confidence heads and global scores are audited; the confidence-epsilon spread is
-  documented in the Numerical epsilon note and kept upstream-faithful.
-- A parity run applies only to the checkpoint and settings supplied to the script.
-
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code:** AlphaFold3 source is Apache-2.0
-  ([alphafold3 LICENSE](https://github.com/google-deepmind/alphafold3/blob/main/LICENSE)).
-- **AlphaFold3 model parameters:** RESTRICTIVE. The
-  [Weights Terms of Use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Official AlphaFold 3 source:** Apache-2.0.
+- **Official AlphaFold 3 parameters:** governed by the
+  [Model Parameters Terms of Use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)
   and
-  [Prohibited Use Policy](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md)
-  permit only certain **non-commercial** uses, forbid use by or on behalf of
-  commercial organizations, and do not grant third-party redistribution.
-- **Redistribution status: RED.** No public upload of AF3 parameters (or weights
-  derived from them) is permissible without an explicit owner/DeepMind decision.
+  [Prohibited Use Policy](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md),
+  not by AGPL or Apache-2.0.
+
+The official terms permit only specified non-commercial uses by or on behalf
+of non-commercial organizations, prohibit commercial use, and prohibit
+publishing or sharing the parameters except within an organization as allowed
+by those terms. Parameters may be used only when received directly from Google.
+Consult the current official terms before use; conversion does not relicense
+the parameters or grant redistribution rights. The front-matter license
+describes the OFoldX implementation, not the official parameters.

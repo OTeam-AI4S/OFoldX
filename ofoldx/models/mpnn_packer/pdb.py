@@ -64,8 +64,11 @@ def write_pdb(
         metric = prediction.metrics.get(f"chi{chi_index + 1}_log_density")
         if metric is not None:
             density_by_group[chi_index + 4] = dict(zip(metric.axis, metric.values, strict=True))
-    restype_index = {
-        component_id: index for index, component_id in enumerate(rc.restype_1to3[restype] for restype in rc.restypes)
+    amino_acid_index_by_component = {
+        component_id: index
+        for index, component_id in enumerate(
+            rc.AMINO_ACID_ONE_TO_THREE[code] for code in rc.AMINO_ACID_ONE_LETTER_CODES
+        )
     }
 
     lines: list[str] = []
@@ -134,12 +137,12 @@ def write_pdb(
                 raise ValueError(f"PDB cannot encode occupancy {occupancy!r}")
 
         b_value = 0.0
-        restype = restype_index.get(component_id)
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein" and restype is not None:
-            atom14_names = rc.restype_name_to_atom14_names[component_id]
+        amino_acid_index = amino_acid_index_by_component.get(component_id)
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein" and amino_acid_index is not None:
+            atom14_names = rc.AMINO_ACID_ATOM14_NAMES[component_id]
             if atom_id in atom14_names:
                 atom14_index = atom14_names.index(atom_id)
-                rigid_group = int(rc.restype_atom14_to_rigid_group[restype, atom14_index])
+                rigid_group = int(rc.AMINO_ACID_ATOM14_TO_RIGID_GROUP[amino_acid_index, atom14_index])
                 density = density_by_group.get(rigid_group, {}).get(reference)
                 if density is not None:
                     b_value = float(density)

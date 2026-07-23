@@ -50,6 +50,7 @@ from .placement import (
     PlacementMap,
     PlacementSpec,
     SymbolicResidueSite,
+    symbolic_residue_aliases,
     validate_placement,
 )
 from .structure import ResidueNumber, Structure

@@ -1,7 +1,7 @@
 r"""
 Operator-backend dispatch layer.
 
-Every dispatched operator has a public PyTorch reference implementation. The
+Every dispatched operator has a public PyTorch implementation. The
 private OOps adapter exposes OOps-owned implementations and dispatch; models select it
 through the shared dispatcher without changing tensor contracts or state dicts.
 """

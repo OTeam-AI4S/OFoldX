@@ -2,7 +2,7 @@ r"""Canonical coordinate-free molecular values and exact occurrence references."
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
@@ -85,24 +85,27 @@ def one_letter_to_component(
 
 
 # Coordinate-free one-letter/component mappings derived from the canonical tables.
-restype_1to3: dict[str, str] = dict(_STANDARD_COMPONENTS["protein"])
-restype_3to1: dict[str, str] = {component: letter for letter, component in restype_1to3.items()}
+AMINO_ACID_ONE_TO_THREE: dict[str, str] = dict(_STANDARD_COMPONENTS["protein"])
+AMINO_ACID_THREE_TO_ONE: dict[str, str] = {component: letter for letter, component in AMINO_ACID_ONE_TO_THREE.items()}
 # The 20 standard amino-acid component ids as an order-independent membership set, for
 # callers that only need "is this a standard amino acid" (e.g. the PDB reader). This is a
 # general chemistry fact, distinct from any model's token ordering (e.g. the MPNN vocab).
-STANDARD_AMINO_ACID_IDS: frozenset[str] = frozenset(restype_3to1)
-# ``restype_1to3`` extended with the unknown-residue letter ``X`` -> ``UNK``. Kept
+STANDARD_AMINO_ACID_IDS: frozenset[str] = frozenset(AMINO_ACID_THREE_TO_ONE)
+# ``AMINO_ACID_ONE_TO_THREE`` extended with the unknown-residue letter ``X`` -> ``UNK``. Kept
 # distinct so callers opt in to ``X``.
-restype_1to3_with_unknown: dict[str, str] = {**restype_1to3, "X": "UNK"}
+AMINO_ACID_ONE_TO_THREE_WITH_UNKNOWN: dict[str, str] = {
+    **AMINO_ACID_ONE_TO_THREE,
+    "X": "UNK",
+}
 # One-letter -> CCD-code maps for nucleic polymers: standard core plus the strict
 # extensions and permissive unknowns.
-dna_1to3: dict[str, str] = {
+DNA_ONE_TO_THREE: dict[str, str] = {
     **_STANDARD_COMPONENTS["dna"],
     **_EXTENDED_COMPONENTS["dna"],
     "X": _UNKNOWN_COMPONENT["dna"],
     "N": _UNKNOWN_COMPONENT["dna"],
 }
-rna_1to3: dict[str, str] = {
+RNA_ONE_TO_THREE: dict[str, str] = {
     **_STANDARD_COMPONENTS["rna"],
     **_EXTENDED_COMPONENTS["rna"],
     "X": _UNKNOWN_COMPONENT["rna"],
@@ -485,12 +488,83 @@ class MolecularSystem:
 
         yield from self.bonds
 
-    def retain_bonds_after_component_mutation(
+    def replace_components(
         self,
-        mutated: MolecularSystem,
-        changed_components: set[ComponentReference] | frozenset[ComponentReference],
+        replacements: Mapping[ComponentReference, ChemicalComponent],
+    ) -> MolecularSystem:
+        r"""Return a system with selected component occurrences replaced.
+
+        Copies of one entity remain shared when they realize the same component
+        sequence and split into distinct entities when they diverge. Stored system
+        bonds are retained whenever all of their sites still exist.
+        """
+
+        if not replacements:
+            return self
+
+        changed_references = frozenset(
+            reference
+            for reference, replacement in replacements.items()
+            if self.component(reference).component_id != replacement.component_id
+        )
+        instances_by_entity: dict[str, list[str]] = {entity_id: [] for entity_id in self.entities}
+        for instance_id, entity_id in self.instances.items():
+            instances_by_entity[entity_id].append(instance_id)
+
+        used_ids = set(self.entities)
+        entities: dict[str, PolymerSequence | Molecule] = {}
+        instance_entities: dict[str, str] = {}
+        for entity_id, original in self.entities.items():
+            original_signature = tuple(component.component_id for component in original.components)
+            groups: dict[tuple[str, ...], tuple[PolymerSequence | Molecule, list[str]]] = {}
+            for instance_id in instances_by_entity[entity_id]:
+                components = tuple(
+                    replacements.get((instance_id, index), component)
+                    for index, component in enumerate(original.components)
+                )
+                if components == original.components:
+                    realized = original
+                elif isinstance(original, PolymerSequence):
+                    realized = PolymerSequence(original.polymer_type, components)
+                else:
+                    realized = Molecule(components, original.bonds)
+                signature = tuple(component.component_id for component in components)
+                if signature in groups:
+                    groups[signature][1].append(instance_id)
+                else:
+                    groups[signature] = (realized, [instance_id])
+
+            primary_signature = original_signature if original_signature in groups else next(iter(groups))
+            ordered_signatures = (
+                primary_signature,
+                *(signature for signature in groups if signature != primary_signature),
+            )
+            for signature in ordered_signatures:
+                entity, instance_ids = groups[signature]
+                if signature == primary_signature:
+                    output_id = entity_id
+                else:
+                    suffix = 2
+                    output_id = f"{entity_id}_{suffix}"
+                    while output_id in used_ids:
+                        suffix += 1
+                        output_id = f"{entity_id}_{suffix}"
+                    used_ids.add(output_id)
+                entities[output_id] = original if signature == original_signature else entity
+                for instance_id in instance_ids:
+                    instance_entities[instance_id] = output_id
+
+        instances = {instance_id: instance_entities[instance_id] for instance_id in self.instances}
+        candidate = MolecularSystem(entities, instances)
+        bonds = self._bonds_after_component_replacement(candidate, changed_references)
+        return MolecularSystem(entities, instances, bonds)
+
+    def _bonds_after_component_replacement(
+        self,
+        replaced: MolecularSystem,
+        changed_references: frozenset[ComponentReference],
     ) -> frozenset[SystemBond]:
-        r"""Drop a stored bond only when component mutation removed one of its sites."""
+        r"""Drop a stored bond only when component replacement removed one of its sites."""
 
         retained = []
         for bond in self.bonds:
@@ -502,9 +576,9 @@ class MolecularSystem:
             removed_by_mutation = False
             for site in sites:
                 try:
-                    mutated.atom(site)
+                    replaced.atom(site)
                 except KeyError:
-                    if (site.instance_id, site.component_index) not in changed_components:
+                    if (site.instance_id, site.component_index) not in changed_references:
                         raise
                     removed_by_mutation = True
             if not removed_by_mutation:

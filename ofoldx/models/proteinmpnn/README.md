@@ -9,190 +9,192 @@ library_name: ofoldx
 pipeline_tag: other
 ---
 
-# ProteinMpnn
+# ProteinMPNN
 
-ProteinMpnn is OFoldX's implementation of the ProteinMPNN message-passing
-inverse-folding model for designing amino-acid
-sequences on a fixed protein backbone. OFoldX provides an independent implementation
-of the released model family. The upstream authors did not create, review, or endorse
-this conversion or model card.
+ProteinMPNN is OFoldX's implementation of the ProteinMPNN message-passing
+inverse-folding family for amino-acid sequence design on a fixed protein
+backbone.
 
-## OFoldX API
+## Disclaimer
 
-One converted repository contains the paired `ProteinMpnnModel` and
-`ProteinMpnnProcessor`, identified by `ofoldx.proteinmpnn`. The paired
-`ProteinMpnnPipeline` exposes the complete biological operation surface:
+This is an unofficial OFoldX implementation of
+[ProteinMPNN](https://github.com/dauparas/ProteinMPNN). The upstream authors did
+not write, review, or endorse this implementation, conversion, or model card.
 
-- `design(...) -> ProteinMpnnDesignResult`;
-- `score(...) -> ScoreResult`;
-- `autoregressive_probabilities(...) -> MpnnProbabilityResult`;
-- `sequence_free_autoregressive_probabilities(...) -> MpnnProbabilityResult`;
-- `conditional_probabilities(...) -> MpnnProbabilityResult`; and
-- `unconditional_probabilities(...) -> MpnnProbabilityResult`.
+## Model Details
 
-The Model additionally exposes the tensor-level `encode`, `forward`, and `sample`
-operations alongside the four probability methods. `forward` returns `MpnnOutput`
-with raw per-residue logits and the effective decoding ranks. One `sample` resolves
-tied and untied inputs on a single causal path and returns `MpnnSamplingOutput` with
-sampled tokens, raw in-pass log probabilities, sampling probabilities, and decoding
-ranks.
+A converted repository contains a `ProteinMpnnModel` and
+`ProteinMpnnProcessor` pair under the architecture ID
+`ofoldx.proteinmpnn`. `ProteinMpnnPipeline` exposes:
 
-Load a converted local or Hub repository with the paired Auto factories:
+- `design`, returning `ProteinMpnnDesignResult`;
+- `score`, returning `ScoreResult`; and
+- `autoregressive_probabilities`,
+  `sequence_free_autoregressive_probabilities`,
+  `conditional_probabilities`, and
+  `unconditional_probabilities`, each returning
+  `MpnnProbabilityResult`.
+
+The Model also exposes `encode`, differentiable `forward`, and
+`sample`. `forward` returns `ProteinMpnnOutput` with
+raw per-residue logits and the effective decoding ranks.
+`sample` returns `ProteinMpnnSamplingOutput` with sampled
+tokens, in-pass log probabilities, sampling probabilities, and decoding ranks.
+`ProteinMpnnDesignAndPackPipeline` composes sequence design with the
+independent MPNN Packer family.
+
+### Variants
+
+The inspected release contains twelve checkpoint files:
+
+| Graph         | Collection               | Checkpoints                                                |
+| ------------- | ------------------------ | ---------------------------------------------------------- |
+| full backbone | vanilla                  | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt`, `v_48_030.pt` |
+| full backbone | soluble                  | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt`, `v_48_030.pt` |
+| CA-only       | CA                       | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt`                |
+| full backbone | tracked training example | `training/exp_020/model_weights/epoch_last.pt`             |
+
+All use one public Model, Processor, and Result contract. `ca_only`
+selects the released coordinate and feature graph. Vanilla and soluble training
+and the filename noise label are weight provenance, not additional architecture
+IDs.
+
+### Model Specification
+
+| Property          | Value                    |
+| ----------------- | ------------------------ |
+| Architecture      | `ofoldx.proteinmpnn`     |
+| Model             | `ProteinMpnnModel`       |
+| Processor         | `ProteinMpnnProcessor`   |
+| Pipeline          | `ProteinMpnnPipeline`    |
+| Tasks             | `design`, `score`        |
+| Hidden size       | 128                      |
+| Encoder blocks    | 3 (`num_encoder_blocks`) |
+| Decoder blocks    | 3 (`num_decoder_blocks`) |
+| Neighbors         | 48 (`num_neighbors`)     |
+| Dropout           | 0.1                      |
+| Coordinate graphs | full N/CA/C/O or CA-only |
+
+`ProteinMpnnProcessor` accepts a canonical `Structure` or a
+local PDB path. Its path arm follows the released fixed-column reader: it consumes
+`ATOM` records and `HETATM` MSE, keeps the first duplicate
+atom, retains residue numbers and insertion codes, and ignores occupancy. Load
+mmCIF through the canonical `Structure` API before passing it to the
+Processor.
+
+Full-backbone rows require finite observed N/CA/C/O coordinates; CA-only rows
+require finite observed CA coordinates. `design_positions` uses
+canonical `(instance_id, component_index)` references. The Processor
+also accepts `AllowedResidueIdentities`,
+`TiedResidueIdentities`, tied weights, per-residue logit bias, and
+PSSM coefficients, probabilities, and log odds. Sampling additionally supports
+global bias and omissions, PSSM mixing and thresholding, temperature, and
+inference-time `backbone_noise` in angstroms.
+
+Tied members share one causal rank and are sampled simultaneously; fixed rows
+precede designed rows. Explicit `torch.long` ranks reproduce one causal
+order. Each design candidate contains a complete coordinate-free
+`MolecularSystem` and the scores `designed_sequence_nll`,
+`global_sequence_nll`, and `sequence_recovery`.
+`result.input_score` contains the repeated native-sequence score from
+the same invocation. Ranking always names a score explicitly, for example
+`result.best("designed_sequence_nll")`.
+
+### Links
+
+- [Official source](https://github.com/dauparas/ProteinMPNN)
+- [Audited source revision](https://github.com/dauparas/ProteinMPNN/tree/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57)
+- [ProteinMPNN paper](https://doi.org/10.1126/science.add2187)
+
+## Usage
 
 ```python
 from ofoldx import AutoModel, AutoProcessor, pipeline
 
 repository = "./proteinmpnn-v_48_020"
-model = AutoModel(repository, device="cuda")
-processor = AutoProcessor(repository, device="cuda")
+designer = pipeline("design", model=repository, device="cuda")
 
-batch = processor("target.pdb")
-log_probabilities = model(batch, seed=7)
-score = model.score(batch, num_decoding_orders=8, seed=7)
-result = model.design(
-    batch,
+result = designer.design(
+    "target.pdb",
     num_candidates=4,
     num_decoding_orders=8,
     temperature=0.1,
     seed=7,
 )
-
-designer = pipeline("design", model=repository, device="cuda")
-same_public_operation = designer.design("target.pdb", num_candidates=4, seed=7)
-```
-
-`result.candidates` is generation ordered. Each candidate contains a complete
-coordinate-free `MolecularSystem` and the scores `designed_sequence_nll`,
-`global_sequence_nll`, and `sequence_recovery`. `result.input_score` contains the
-native repeated input-sequence score produced by the same invocation. Use
-`result.best("designed_sequence_nll")` or another explicit score name when ranking
-candidates; there is no implicit best-score choice.
-
-## Inputs and controls
-
-`ProteinMpnnProcessor` accepts a canonical `Structure` or a local PDB path. The PDB
-path follows the audited ProteinMPNN reader contract rather than the general OFoldX
-PDBx reader: it consumes `ATOM` records and `HETATM` MSE, keeps the first duplicate
-atom, retains source residue numbering and insertion codes, and ignores occupancy.
-Pass mmCIF through the canonical `Structure` API instead of passing an mmCIF path to
-this family Processor.
-
-Full-backbone mode requires finite observed N/CA/C/O coordinates. CA-only mode
-requires finite observed CA coordinates. `design_positions` selects canonical
-`(instance_id, component_index)` references. `sequence` supplies an alternate target
-for scoring. The Processor also accepts the family-owned controls
-`AllowedResidueIdentities`, `TiedResidueIdentities`, tied weights, per-residue logit
-bias, and PSSM coefficients, probabilities, and log odds.
-
-Sampling controls remain ordinary Model arguments:
-
-```python
-sampled = model.sample(
-    batch,
-    num_samples=4,
-    temperature=0.2,
-    backbone_noise=0.05,
-    global_logit_bias=global_bias,
-    global_omit_token_mask=global_omit,
-    pssm_mixture=0.4,
-    pssm_log_odds_threshold=0.0,
+native_score = designer.score("target.pdb", num_decoding_orders=8, seed=7)
+probabilities = designer.autoregressive_probabilities(
+    "target.pdb",
+    num_decoding_orders=8,
     seed=7,
 )
+
+model = AutoModel(repository, device="cuda")
+processor = AutoProcessor(repository, device="cuda")
+batch = processor("target.pdb")
+output = model(batch)
+sampled = model.sample(batch, num_samples=4, temperature=0.2)
 ```
 
-One `sample` resolves both tied and untied Processor inputs. Generated decoding
-ranks place fixed rows before designed rows; tied members share one rank and are
-sampled simultaneously. A caller may pass explicit `torch.long` ranks to reproduce
-one exact causal order. `model.design` samples from the processed input and realizes
-the sampled identities while preserving instance and resolvable bond identity.
+Direct Model stochastic operations accept a caller-owned
+`torch.Generator`; Pipeline operations additionally accept `seed`.
+OFoldX follows explicit device and dtype choices, with mixed precision controlled
+by the caller's dtype or AMP policy.
 
-`backbone_noise` is an inference-time coordinate perturbation in angstroms. The
-checkpoint filename's noise suffix describes training provenance and is not a
-runtime default or a serialized configuration field. OFoldX follows explicit user
-device and dtype choices; mixed precision remains the caller's AMP or dtype policy.
+## Checkpoints and Conversion
 
-## Released checkpoints
-
-The behavior audit used source revision
-[`8907e6671bfbfc92303b5f79c4b5e6ce47cdef57`](https://github.com/dauparas/ProteinMPNN/tree/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57).
-The complete executable inventory at that revision is:
-
-| Graph | Collection | Checkpoints |
-| --- | --- | --- |
-| full backbone | vanilla | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt`, `v_48_030.pt` |
-| full backbone | soluble | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt`, `v_48_030.pt` |
-| CA-only | CA | `v_48_002.pt`, `v_48_010.pt`, `v_48_020.pt` |
-| full backbone | tracked training example | `training/exp_020/model_weights/epoch_last.pt` |
-
-All twelve use the same public Model, Processor, and Result contracts. `ca_only` is
-a Model and Processor configuration value because it selects the released coordinate
-and feature graph. Vanilla versus soluble training and the noise label are weight
-provenance, not additional architecture IDs.
-
-The released CA checkpoints contain five tensors whose outputs are never consumed
-by the upstream graph. Conversion drops exactly those five tensors and no others;
-the native CA graph does not preserve a dead node-projection branch.
-
-## Conversion
-
-OFoldX does not fetch checkpoints during conversion. With the local source checkout
-under `~/reference` and weights under `~/weights`, convert one checkpoint explicitly:
+Convert an acquired checkpoint explicitly:
 
 ```bash
 python -m ofoldx.models.proteinmpnn.convert \
-  ~/weights/mpnn-weights/proteinmpnn_v_48_020.pt \
+  v_48_020.pt \
   ./proteinmpnn-v_48_020
 ```
 
-The converter reads the released checkpoint with restricted PyTorch loading, maps
-the complete live state dictionary, strict-loads the native Model, and writes:
+The converter uses restricted PyTorch loading, derives the block counts,
+neighbor count, hidden size, and `ca_only` graph from the checkpoint,
+maps every live tensor, and strict-loads the native Model. It writes
+`model.json`, `processor.json`, safetensors weights, and the
+concrete `pipeline.json` marker. `--repo-id` optionally
+uploads that repository, and `--private` requests a private Hub
+repository.
 
-```text
-model.json
-processor.json
-model.safetensors          # or its standard shard index and shards
-pipeline.json
-```
+Released CA checkpoints contain five tensors whose outputs are never consumed
+by the upstream graph. Conversion drops exactly those five dead tensors and no
+others.
 
-`model.json` records `ofoldx.proteinmpnn` and the concrete Model config;
-`processor.json` records only the paired Processor config. There is no schema,
-contract version, digest, fingerprint, or duplicated checkpoint-variant field.
-Repository history and reproducibility belong to the selected Hub revision.
+## Training Details
 
-## Manual parity
+### Training Data
 
-The on-demand comparison is
-[`scripts/parity/proteinmpnn.py`](../../../scripts/parity/proteinmpnn.py):
+The inspected release distinguishes vanilla and soluble checkpoint collections
+and includes one tracked training example. It does not provide a complete
+per-checkpoint training-data manifest from which every released weight can be
+reproduced.
 
-```bash
-python -m scripts.parity.proteinmpnn --device cpu
-```
+### Training Procedure
 
-It reads the caller-supplied upstream checkout from `~/reference/ProteinMPNN` and the full and
-soluble checkpoints from `~/weights/mpnn-weights`. An ordinary run checks conversion
-and explicit-rank forward computation for all twelve checkpoints, then compares the
-released probability, scoring, sampling, and Processor paths on representative full
-and CA graphs. Corrected tied-group behavior is checked against its declared native
-mathematics because the inspected upstream implementation contains confirmed defects.
-Those defects and their evidence are recorded in
-[`UPSTREAM_BUGS.md`](../../../UPSTREAM_BUGS.md).
+The checkpoint filename noise suffix records upstream training provenance; it is
+not a runtime default or serialized Model configuration field.
+`ProteinMpnnModel.forward` is differentiable, and OFoldX exposes the
+family loss primitives, but OFoldX does not claim to reproduce the complete
+upstream training pipeline. Training orchestration belongs to the unified OFoldX
+Runner.
 
-This is a manual scientific diagnostic. It is not collected by pytest, does not run
-in frequent CI, writes no validation report, and is not a registration or publication
-gate.
+## Limitations
 
-## Scope
-
-ProteinMpnn performs fixed-backbone sequence design and sequence scoring. It does
-not generate backbones or pack side-chain coordinates. Non-protein entities remain
-part of the canonical system but are not Model sequence rows. Training belongs to
-OFoldX's unified Runner rather than a family-specific upstream training wrapper.
-
-OFoldX code and documentation are distributed under `AGPL-3.0-or-later`. The audited
-upstream ProteinMPNN repository publishes its source and checkpoint files under its
-[MIT License](https://github.com/dauparas/ProteinMPNN/blob/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57/LICENSE).
-Preserve the upstream notice when redistributing upstream or converted checkpoint
-material. Converted weights are not relicensed by OFoldX.
+- ProteinMPNN designs and scores sequences on fixed backbones. It does not
+  generate backbones or pack side-chain coordinates.
+- Non-protein entities remain in the canonical system but are not Model sequence
+  rows.
+- The `global_label_membrane_mpnn_v_48_020` and
+  `per_residue_label_membrane_mpnn_v_48_020` checkpoints require a
+  distinct membrane-conditioned graph and are not ProteinMPNN variants.
+- Existing released-weight comparison tooling covers an earlier ProteinMPNN
+  implementation surface. Real-weight parity is not established for the current
+  Model, Processor, Pipeline, and conversion behavior.
+- Confirmed upstream tied-group defects are implemented according to the declared
+  mathematics; details are recorded in
+  [`UPSTREAM_BUGS.md`](../../../UPSTREAM_BUGS.md).
 
 ## Citation
 
@@ -209,24 +211,17 @@ material. Converted weights are not relicensed by OFoldX.
 }
 ```
 
-Upstream source: [dauparas/ProteinMPNN](https://github.com/dauparas/ProteinMPNN).
+## Contact
 
-## Limitations & intentional upstream divergences
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card.
 
-- ProteinMpnn performs fixed-backbone sequence design and scoring; it does not
-  generate backbones or pack side-chain coordinates.
-- **MembraneMpnn is deferred:** the `global_label_membrane_mpnn_v_48_020` and
-  `per_residue_label_membrane_mpnn_v_48_020` checkpoints are present in the inventory
-  but are **not** a released variant this session. The soluble and vanilla
-  `*_v_48_*` variants are the qualified surface.
-- A parity run applies only to the checkpoints and settings supplied to the script.
+## License
 
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code & weights:** MIT
-  ([ProteinMPNN LICENSE](https://github.com/dauparas/ProteinMPNN/blob/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57/LICENSE),
-  Copyright (c) 2022 Justas Dauparas).
-- **Redistribution status: GREEN.** The vanilla and soluble checkpoints are
-  permissively licensed and freely redistributable with the upstream MIT notice
-  preserved; the deferred membrane checkpoints share the same MIT terms.
+- **OFoldX implementation and documentation:** AGPL-3.0-or-later.
+- **Upstream source and checkpoints:** MIT under the
+  [ProteinMPNN license](https://github.com/dauparas/ProteinMPNN/blob/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57/LICENSE),
+  Copyright (c) 2022 Justas Dauparas.
+- The vanilla, soluble, CA-only, and membrane checkpoints may be redistributed
+  with the upstream MIT notice preserved. Converted weights are not relicensed
+  by OFoldX.

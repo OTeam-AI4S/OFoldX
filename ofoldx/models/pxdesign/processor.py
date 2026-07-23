@@ -9,7 +9,6 @@ from typing import cast
 
 import torch
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data import (
     ExistingSpan,
@@ -23,10 +22,11 @@ from ...data.components import get_component
 from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
 from ...data.structure import Structure
 from ...io.structure import read_structure
+from ...processor import Processor
 from .config import PxDesignProcessorConfig
 from .model import Hotspot, PxDesignInput, PxDesignLayout
 
-_RESTYPE_INDEX = {
+_RESIDUE_TYPE_INDEX = {
     "ALA": 0,
     "ARG": 1,
     "ASN": 2,
@@ -59,12 +59,18 @@ _RESTYPE_INDEX = {
     "DT": 29,
     "DN": 30,
 }
-_GENERATED_RESTYPE = 32
+_GENERATED_RESIDUE_TYPE = 32
 _GENERATED_ATOM_IDS = frozenset(atom.atom_id for atom in get_component("GLY").atoms if atom.element != "H")
 
 
-class PxDesignProcessor:
-    r"""Lower one target-conditioned binder-design problem to tensors."""
+class PxDesignProcessor(Processor):
+    r"""Lower one target-conditioned binder-design problem to tensors.
+
+    Args:
+        config: PXDesign preprocessing options. Defaults to ``PxDesignProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -74,21 +80,7 @@ class PxDesignProcessor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = PxDesignProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime tensor placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -97,7 +89,16 @@ class PxDesignProcessor:
         placement: PlacementSpec,
         conditions: Sequence[Hotspot] = (),
     ) -> PxDesignInput:
-        r"""Encode one fixed-length protein-binder design problem."""
+        r"""Encode one fixed-length protein-binder design problem.
+
+        Args:
+            input: Optional target system, observed structure, or local structure path.
+            placement: Topology containing target spans and one generated binder chain.
+            conditions: Target hotspot labels.
+
+        Returns:
+            A ``PxDesignInput`` with aligned target, binder, atom, and hotspot values.
+        """
 
         if isinstance(input, str | PathLike):
             input = read_structure(Path(input).expanduser())
@@ -130,16 +131,16 @@ class PxDesignProcessor:
                 if isinstance(part, GeneratedSegment):
                     generated_items.append((group, placement_id, part))
         if len(generated_items) != 1:
-            raise ValueError("released PXDesign generates exactly one binder chain")
+            raise ValueError("PxDesign generates exactly one binder chain")
         generated_group, generated_id, generated = generated_items[0]
         if generated.polymer_type != "protein":
-            raise ValueError("released PXDesign generates protein binders only")
+            raise ValueError("PxDesign generates protein binders only")
         if generated.min_length != generated.max_length:
-            raise ValueError("released PXDesign requires one fixed binder length")
+            raise ValueError("PxDesign requires one fixed binder length")
         if tuple(placement[generated_group].values()) != (generated,):
             raise ValueError("the PXDesign binder must be a separate generated chain")
         if next(reversed(placement)) != generated_group:
-            raise ValueError("released PXDesign requires the generated binder after its target chains")
+            raise ValueError("PxDesign requires the generated binder after its target chains")
         existing_chain_values: list[tuple[ExistingSpan, ...]] = []
         for group, placements in placement.items():
             if group == generated_group:
@@ -193,7 +194,7 @@ class PxDesignProcessor:
         for instance_id, component_index in modeled_residues:
             entity = cast(PolymerSequence, system.entities[system.instances[instance_id]])
             component_id = entity.components[component_index].component_id
-            if component_id not in _RESTYPE_INDEX:
+            if component_id not in _RESIDUE_TYPE_INDEX:
                 unsupported_components.add(component_id)
         if unsupported_components:
             raise ValueError(
@@ -221,15 +222,18 @@ class PxDesignProcessor:
         atom_features, reference_charges = _atom_features(system, sites, reference_mask)
         atom_to_token = torch.tensor([site_to_token[site] for site in sites], dtype=torch.int64)
         token_count = len(token_sites)
-        restype = torch.zeros(token_count, 36, dtype=torch.float32)
+        residue_type = torch.zeros(token_count, 36, dtype=torch.float32)
         generated_residues = frozenset(generated_map.values())
         for token_index, (residue, component_id) in enumerate(zip(token_residues, token_components)):
             index = (
-                _GENERATED_RESTYPE
+                _GENERATED_RESIDUE_TYPE
                 if residue in generated_residues
-                else _RESTYPE_INDEX.get(component_id, _RESTYPE_INDEX["UNK"])
+                else _RESIDUE_TYPE_INDEX.get(
+                    component_id,
+                    _RESIDUE_TYPE_INDEX["UNK"],
+                )
             )
-            restype[token_index, index] = 1.0
+            residue_type[token_index, index] = 1.0
 
         observed = {} if structure is None else {site: row for row, site in enumerate(structure.sites)}
         representative_coordinates = torch.zeros(token_count, 3, dtype=torch.float32)
@@ -243,8 +247,8 @@ class PxDesignProcessor:
             coordinates = structure.coordinates[row]
             representative_coordinates[token_index] = torch.from_numpy(coordinates.copy())
             representative_mask[token_index] = True
-        conditional_templ = torch.zeros(token_count, token_count, dtype=torch.int64)
-        conditional_templ_mask = representative_mask[:, None] & representative_mask[None, :]
+        template_distance_bins = torch.zeros(token_count, token_count, dtype=torch.int64)
+        template_pair_mask = representative_mask[:, None] & representative_mask[None, :]
         if bool(representative_mask.any()):
             rows = torch.nonzero(representative_mask, as_tuple=True)[0]
             distances = torch.cdist(
@@ -256,7 +260,7 @@ class PxDesignProcessor:
                 dim=-1,
             )
             ii, jj = torch.meshgrid(rows, rows, indexing="ij")
-            conditional_templ[ii, jj] = bins
+            template_distance_bins[ii, jj] = bins
 
         chain_index, entity_index, symmetry_index, residue_index = _token_indices(
             system,
@@ -279,15 +283,15 @@ class PxDesignProcessor:
                 device=self.device,
                 dtype=self.dtype,
             ),
-            restype=restype.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            residue_type=residue_type.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             plddt=torch.zeros(1, token_count, 1, dtype=self.dtype, device=self.device),
             hotspot=torch.tensor(
                 [residue in hotspot_residues for residue in token_residues],
                 dtype=self.dtype,
                 device=self.device,
             ).reshape(1, token_count, 1),
-            conditional_templ=conditional_templ.unsqueeze(0).to(self.device),
-            conditional_templ_mask=conditional_templ_mask.unsqueeze(0).to(self.device),
+            template_distance_bins=template_distance_bins.unsqueeze(0).to(self.device),
+            template_pair_mask=template_pair_mask.unsqueeze(0).to(self.device),
             layout=PxDesignLayout(
                 system=system,
                 sites=sites,

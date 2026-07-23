@@ -18,20 +18,19 @@ _BUILTIN_PIPELINE_MODULES = {
     "ofoldx.alphafold3": "ofoldx.models.alphafold3",
     "ofoldx.boltz1": "ofoldx.models.boltz1",
     "ofoldx.boltz2": "ofoldx.models.boltz2",
+    "ofoldx.boltz2_affinity": "ofoldx.models.boltz2",
+    "ofoldx.boltzgen": "ofoldx.models.boltzgen",
     "ofoldx.esmfold2": "ofoldx.models.esmfold2",
     "ofoldx.esmfold2_design": "ofoldx.models.esmfold2",
     "ofoldx.ligandmpnn": "ofoldx.models.ligandmpnn",
     "ofoldx.mpnn_packer": "ofoldx.models.mpnn_packer",
     "ofoldx.nampnn": "ofoldx.models.nampnn",
+    "ofoldx.odesign": "ofoldx.models.odesign",
+    "ofoldx.proteinmpnn": "ofoldx.models.proteinmpnn",
     "ofoldx.protenix": "ofoldx.models.protenix",
     "ofoldx.protenix_constraint": "ofoldx.models.protenix",
-    "ofoldx.proteinmpnn": "ofoldx.models.proteinmpnn",
     "ofoldx.pxdesign": "ofoldx.models.pxdesign",
     "ofoldx.rfdiffusion": "ofoldx.models.rfdiffusion",
-    # Multi-pair pipelines register their repository loader.
-    "ofoldx.boltz2_affinity": "ofoldx.models.boltz2",
-    "ofoldx.odesign": "ofoldx.models.odesign",
-    "ofoldx.boltzgen": "ofoldx.models.boltzgen",
 }
 
 
@@ -49,7 +48,15 @@ class RepositoryLoader(Protocol):
 
 
 class PipelineRegistration(NamedTuple):
-    r"""One concrete pipeline registration."""
+    r"""One concrete pipeline registration.
+
+    Attributes:
+        id: Stable pipeline identifier stored in repository metadata.
+        pipeline: Concrete Pipeline class.
+        tasks: Standard task verbs implemented by the Pipeline.
+        architectures: Model architectures routed to this Pipeline when no marker is present.
+        repository_loader: Optional loader for a class-defined repository layout.
+    """
 
     id: str
     pipeline: type[object]
@@ -79,11 +86,19 @@ class PipelineRegistry(chanfig.Registry):
         id: str,
         *,
         pipeline: type[object],
-        tasks: Collection[Task],
+        tasks: Collection[str],
         architectures: Collection[str] = (),
         repository_loader: RepositoryLoader | None = None,
     ) -> None:
-        r"""Register a concrete pipeline and its architecture routes."""
+        r"""Register a concrete pipeline and its architecture routes.
+
+        Args:
+            id: Stable pipeline identifier.
+            pipeline: Concrete Pipeline class.
+            tasks: Standard task verbs implemented by ``pipeline``.
+            architectures: Model architectures routed to ``pipeline`` when no marker is present.
+            repository_loader: Optional loader for a class-defined repository layout.
+        """
 
         self._import_builtin(id)
 
@@ -104,7 +119,7 @@ class PipelineRegistry(chanfig.Registry):
         registration = PipelineRegistration(
             id=id,
             pipeline=pipeline,
-            tasks=task_values,
+            tasks=cast(frozenset[Task], task_values),
             architectures=architecture_values,
             repository_loader=repository_loader,
         )

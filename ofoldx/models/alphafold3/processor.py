@@ -1,12 +1,8 @@
-r"""Lower canonical biomolecular inputs to the released DeepMind AlphaFold 3 graph.
+r"""Lower canonical biomolecular inputs to AlphaFold 3 tensors.
 
-This is the DeepMind AlphaFold 3 identity (distinct from the Protenix graph). The
-Processor accepts canonical molecular assemblies with MSA and template evidence and
-emits the AlphaFold 3 token, MSA, and template tensors: the 31-class target restype vocabulary
-(``POLYMER_TYPES_WITH_UNKNOWN_AND_GAP``), the 32-class MSA vocabulary
-(``POLYMER_TYPES_WITH_ALL_UNKS_AND_GAP``), the ``msa_features`` / ``msa_mask`` stack
-(one-hot + ``has_deletion`` + ``deletion_value``), and the pre-packed
-``TemplateFeatures`` the released :class:`TemplateEmbedder` consumes.
+The Processor accepts canonical molecular assemblies with MSA and template evidence. It
+produces atom, token, MSA, and template features while preserving canonical identities in
+the accompanying layout.
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ import torch
 import torch.nn.functional as F
 from multimolecule.io import read_fasta_records
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT
 from ...data.ccd import resolve_ccd_component
@@ -49,14 +44,15 @@ from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...modules.embedding import TemplateFeatures
+from ...processor import Processor
 from ...references import classify_reference
 from .config import AlphaFold3ProcessorConfig
 from .model import AlphaFold3Input
 
-# AlphaFold 3 target restype vocabulary (POLYMER_TYPES_WITH_UNKNOWN_AND_GAP, 31 classes):
+# AlphaFold 3 target residue-type vocabulary (POLYMER_TYPES_WITH_UNKNOWN_AND_GAP, 31 classes):
 # 20 standard amino acids, UNK, the gap, then A G C U (RNA) DA DG DC DT (DNA) and the shared
 # unknown-nucleic N. This is the one-hot alphabet of ``create_target_feat`` and the MSA profile.
-_TARGET_RESTYPE = {
+_TARGET_RESIDUE_TYPE = {
     name: index
     for index, name in enumerate(
         (
@@ -94,23 +90,23 @@ _TARGET_RESTYPE = {
         )
     )
 }
-_TARGET_VOCAB_SIZE = len(_TARGET_RESTYPE)  # 31
+_TARGET_VOCAB_SIZE = len(_TARGET_RESIDUE_TYPE)  # 31
 # The MSA one-hot alphabet (POLYMER_TYPES_WITH_ALL_UNKS_AND_GAP, 32 classes) extends the target
 # vocabulary with a distinct unknown-DNA class DN, so ``create_msa_feat`` one-hots over 32.
 _MSA_VOCAB_SIZE = _TARGET_VOCAB_SIZE + 1  # 32
-_UNKNOWN = _TARGET_RESTYPE["UNK"]
-_GAP = _TARGET_RESTYPE["-"]
+_UNKNOWN = _TARGET_RESIDUE_TYPE["UNK"]
+_GAP = _TARGET_RESIDUE_TYPE["-"]
 _STANDARD = {
-    "protein": frozenset(tuple(_TARGET_RESTYPE)[:21]),
+    "protein": frozenset(tuple(_TARGET_RESIDUE_TYPE)[:21]),
     "rna": frozenset(("A", "G", "C", "U", "N")),
     "dna": frozenset(("DA", "DG", "DC", "DT", "DN")),
 }
 # MSA cells are UPPERCASE one-letter symbols (or ``-``), not ChemicalComponent IDs. AlphaFold 3
-# consumes MSA evidence only for proteins (mirroring the released Protenix gate), so this projects the
+# consumes MSA evidence only for proteins, so this projects the
 # twenty protein one-letter codes onto their target indices; ``-`` becomes the gap and every other
 # symbol (ambiguity codes B Z U J O X, etc.) becomes UNK.
-_MSA_RESTYPE = {
-    symbol: _TARGET_RESTYPE[three]
+_MSA_RESIDUE_TYPE = {
+    symbol: _TARGET_RESIDUE_TYPE[three]
     for symbol, three in {
         "A": "ALA",
         "R": "ARG",
@@ -134,25 +130,32 @@ _MSA_RESTYPE = {
         "V": "VAL",
     }.items()
 }
-_MSA_RESTYPE["-"] = _GAP
+_MSA_RESIDUE_TYPE["-"] = _GAP
 _FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
-# Released AlphaFold 3 template distogram bins: 39 lower breaks over [3.25, 50.75] (squared).
+# AlphaFold 3 template distogram bins: 39 lower breaks over [3.25, 50.75] (squared).
 _TEMPLATE_DISTOGRAM_MIN = 3.25
 _TEMPLATE_DISTOGRAM_MAX = 50.75
 
 
-def _restype_index(component_id: str, standard: bool) -> int:
-    r"""Target restype index; unknown DNA folds onto the shared unknown-nucleic class N."""
+def _residue_type_index(component_id: str, standard: bool) -> int:
+    r"""Target residue-type index; unknown DNA folds onto the shared unknown-nucleic class N."""
 
     if not standard:
         return _UNKNOWN
     if component_id == "DN":
         component_id = "N"
-    return _TARGET_RESTYPE.get(component_id, _UNKNOWN)
+    return _TARGET_RESIDUE_TYPE.get(component_id, _UNKNOWN)
 
 
-class AlphaFold3Processor:
-    r"""Build the exact AlphaFold 3 atom, token, MSA, and template tensors."""
+class AlphaFold3Processor(Processor):
+    r"""Build AlphaFold 3 atom, token, MSA, and template tensors.
+
+    Args:
+        config: Feature limits and CCD resolution settings. Defaults to
+            ``AlphaFold3ProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -163,22 +166,8 @@ class AlphaFold3Processor:
     ) -> None:
         self.config = AlphaFold3ProcessorConfig() if config is None else config
         if not 1 <= self.config.max_msa_rows <= 16384:
-            raise ValueError("max_msa_rows must be between 1 and the released limit 16384")
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update output placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+            raise ValueError("max_msa_rows must be between 1 and 16384")
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -187,7 +176,23 @@ class AlphaFold3Processor:
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold3Input:
-        r"""Lower one canonical assembly and its MSA / template evidence."""
+        r"""Lower one canonical assembly and its evidence to ``AlphaFold3Input``.
+
+        Args:
+            input: Inline protein sequence, FASTA or structure path, one or more
+                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
+                contributes topology, not observed coordinates.
+            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
+            templates: Template evidence aligned to the target polymers.
+
+        Returns:
+            An ``AlphaFold3Input`` containing model tensors and canonical system, atom, and token
+            identities.
+
+        Notes:
+            Atom-aligned tensors follow ``atom_sites``; token-aligned tensors follow
+            ``token_sites``.
+        """
 
         system = _normalize_input(input)
         system = _resolve_components(system, revision=self.config.ccd_revision)
@@ -398,7 +403,7 @@ def _tokenize(system: MolecularSystem) -> list[dict[str, object]]:
                             "chain_index": chain_index,
                             "entity_index": entity_index,
                             "symmetry_index": symmetry_index,
-                            "restype": _restype_index(component_id, standard),
+                            "residue_type": _residue_type_index(component_id, standard),
                             "center": center_site,
                             "representative": representative_site,
                             "standard": standard,
@@ -427,7 +432,7 @@ def _tokenize(system: MolecularSystem) -> list[dict[str, object]]:
                         "chain_index": chain_index,
                         "entity_index": entity_index,
                         "symmetry_index": symmetry_index,
-                        "restype": _UNKNOWN,
+                        "residue_type": _UNKNOWN,
                         "center": site,
                         "representative": site,
                         "standard": False,
@@ -474,11 +479,11 @@ def _features(
     atom_token_index = _atom_token_offsets(tokens, system, atom_sites, site_to_atom)
 
     profile, deletion_mean = _profile_features(msa, tokens, system)
-    restype = torch.tensor([cast(int, token["restype"]) for token in tokens])
+    residue_type = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
     token_features = torch.cat(
         (
             torch.zeros(len(tokens), 384),
-            F.one_hot(restype, num_classes=_TARGET_VOCAB_SIZE).float(),
+            F.one_hot(residue_type, num_classes=_TARGET_VOCAB_SIZE).float(),
             profile,
             deletion_mean[:, None],
         ),
@@ -677,7 +682,7 @@ def _msa_rows_and_deletions(
             monomer_index = cast(int | None, token["monomer_index"])
             selected = select_msa_binding(bindings, entity_id, instance_id)
             if query or selected is None or _msa_polymer_type(system, entity_id) != "protein":
-                rows[row_index, token_index] = cast(int, token["restype"])
+                rows[row_index, token_index] = cast(int, token["residue_type"])
             elif selected[0] not in descriptor:
                 rows[row_index, token_index] = _GAP
             else:
@@ -686,7 +691,7 @@ def _msa_rows_and_deletions(
                 pool = value.paired_sequences if is_paired else value.unpaired_sequences
                 deletion_pool = value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts
                 symbol = pool[source_row][cast(int, monomer_index)]
-                rows[row_index, token_index] = _MSA_RESTYPE.get(symbol, _UNKNOWN)
+                rows[row_index, token_index] = _MSA_RESIDUE_TYPE.get(symbol, _UNKNOWN)
                 deletions[row_index, token_index] = float(deletion_pool[source_row, cast(int, monomer_index)])
     return rows, deletions
 
@@ -727,11 +732,11 @@ def _profile_features(
         monomer_index = cast(int | None, token["monomer_index"])
         selected = select_msa_binding(bindings, entity_id, instance_id)
         if selected is None or _msa_polymer_type(system, entity_id) != "protein":
-            profile[token_index, cast(int, token["restype"])] = 1
+            profile[token_index, cast(int, token["residue_type"])] = 1
             continue
         _key, value = selected
         column = cast(int, monomer_index)
-        encoded = [_MSA_RESTYPE.get(sequence[column], _UNKNOWN) for sequence in value.unpaired_sequences]
+        encoded = [_MSA_RESIDUE_TYPE.get(sequence[column], _UNKNOWN) for sequence in value.unpaired_sequences]
         profile[token_index] = F.one_hot(torch.tensor(encoded), num_classes=_TARGET_VOCAB_SIZE).float().mean(dim=0)
         deletion_mean[token_index] = torch.tensor(value.unpaired_deletion_counts[:, column], dtype=torch.float32).mean()
     return profile, deletion_mean
@@ -780,8 +785,8 @@ def _template_backbone(positions: Tensor, mask: Tensor) -> tuple[Tensor, Tensor,
     r"""Pseudo-beta positions/mask and per-pair unit vectors in each residue's backbone frame.
 
     ``positions`` / ``mask`` are ``[N, 4, *]`` over the dense backbone atoms (N, CA, C, CB); glycine
-    carries no CB so its pseudo-beta falls back to CA (index 1). Frames follow the released
-    ``make_backbone_rigid`` convention: x-axis along ``C - CA`` with ``N - CA`` in the xy-plane.
+    carries no CB so its pseudo-beta falls back to CA (index 1). Each frame places the x-axis along
+    ``C - CA`` with ``N - CA`` in the xy-plane.
     """
 
     nitrogen, alpha, carbon, beta = positions.unbind(dim=1)
@@ -842,11 +847,11 @@ def _template_features(
 
     per_template_positions: list[Tensor] = []
     per_template_mask: list[Tensor] = []
-    per_template_restype: list[Tensor] = []
+    per_template_residue_type: list[Tensor] = []
     for template in templates:
         positions = torch.zeros(token_count, 4, 3)
         atom_mask = torch.zeros(token_count, 4)
-        restype = torch.full((token_count,), float(_GAP)).to(torch.long)
+        residue_type = torch.full((token_count,), float(_GAP)).to(torch.long)
         coordinates = _structure_atom_lookup(template.structure)
         for alignment in template.alignments:
             template_entity_id = template.structure.system.instances[alignment.template_instance_id]
@@ -865,16 +870,16 @@ def _template_features(
                     alignment.template_instance_id,
                     template_component,
                 )
-                residue_index = _restype_index(
+                residue_type_index = _residue_type_index(
                     component.component_id, _is_standard(component, template_entity.polymer_type)
                 )
                 for target_token in targets:
                     positions[target_token] = backbone
                     atom_mask[target_token] = backbone_mask
-                    restype[target_token] = residue_index
+                    residue_type[target_token] = residue_type_index
         per_template_positions.append(positions)
         per_template_mask.append(atom_mask)
-        per_template_restype.append(restype)
+        per_template_residue_type.append(residue_type)
 
     distograms: list[Tensor] = []
     pseudo_beta_masks: list[Tensor] = []
@@ -892,7 +897,7 @@ def _template_features(
     return TemplateFeatures(
         distogram=torch.stack(distograms).unsqueeze(0),
         pseudo_beta_mask=torch.stack(pseudo_beta_masks).unsqueeze(0),
-        residue_type=torch.stack(per_template_restype).unsqueeze(0),
+        residue_type=torch.stack(per_template_residue_type).unsqueeze(0),
         unit_vector=torch.stack(unit_vectors).unsqueeze(0),
         backbone_frame_mask=torch.stack(backbone_masks).unsqueeze(0),
         template_mask=torch.ones(1, len(templates)),

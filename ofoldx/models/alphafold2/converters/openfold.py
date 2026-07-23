@@ -30,46 +30,50 @@ _ATTENTION_PROJECTION_MAP = {
     "linear_g": "gate_projection",
 }
 _TOP_LEVEL_PREFIX_MAP = {
-    "input_embedder.linear_tf_m.": "input_embeddings.preprocess_1d.",
-    "input_embedder.linear_msa_m.": "input_embeddings.preprocess_msa.",
-    "input_embedder.linear_tf_z_i.": "input_embeddings.left_single.",
-    "input_embedder.linear_tf_z_j.": "input_embeddings.right_single.",
-    "input_embedder.linear_relpos.": "input_embeddings.relpos_projection.",
-    "recycling_embedder.linear.": "recycling_embeddings.prev_pos_linear.",
-    "recycling_embedder.layer_norm_m.": "recycling_embeddings.prev_msa_first_row_norm.",
-    "recycling_embedder.layer_norm_z.": "recycling_embeddings.prev_pair_norm.",
+    "input_embedder.linear_tf_m.": "input_embeddings.token_projection.",
+    "input_embedder.linear_msa_m.": "input_embeddings.msa_projection.",
+    "input_embedder.linear_tf_z_i.": "input_embeddings.pair_left_projection.",
+    "input_embedder.linear_tf_z_j.": "input_embeddings.pair_right_projection.",
+    "input_embedder.linear_relpos.": "input_embeddings.relative_position_projection.",
+    "recycling_embedder.linear.": "recycling_embeddings.previous_positions_projection.",
+    "recycling_embedder.layer_norm_m.": "recycling_embeddings.previous_msa_first_row_norm.",
+    "recycling_embedder.layer_norm_z.": "recycling_embeddings.previous_pair_norm.",
     "extra_msa_embedder.linear.": "extra_msa_embeddings.extra_msa_projection.",
     "evoformer.linear.": "single_projection.",
-    "template_angle_embedder.linear_1.": "template_msa_embeddings.template_single_embedding.",
-    "template_angle_embedder.linear_2.": "template_msa_embeddings.template_projection.",
-    "template_pair_embedder.linear.": "template_embedder.single_template_embedding.embedding2d.",
-    "template_pair_stack.layer_norm.": "template_embedder.single_template_embedding.output_layer_norm.",
-    "aux_heads.distogram.linear.": "distogram_head.linear.",
+    "template_angle_embedder.linear_1.": "template_msa_embedder.input_projection.",
+    "template_angle_embedder.linear_2.": "template_msa_embedder.output_projection.",
+    "template_pair_embedder.linear.": "template_embedder.single_template_embedder.template_pair_projection.",
+    "template_pair_stack.layer_norm.": "template_embedder.single_template_embedder.output_norm.",
+    "aux_heads.distogram.linear.": "distogram_head.projection.",
     "aux_heads.masked_msa.linear.": "masked_msa_head.logits.",
     "aux_heads.experimentally_resolved.linear.": "experimentally_resolved_head.logits.",
     "aux_heads.tm.linear.": "predicted_aligned_error_head.logits.",
-    "aux_heads.plddt.layer_norm.": "predicted_lddt_head.input_layer_norm.",
-    "aux_heads.plddt.linear_1.": "predicted_lddt_head.act_0.",
-    "aux_heads.plddt.linear_2.": "predicted_lddt_head.act_1.",
+    "aux_heads.plddt.layer_norm.": "predicted_lddt_head.input_norm.",
+    "aux_heads.plddt.linear_1.": "predicted_lddt_head.input_projection.",
+    "aux_heads.plddt.linear_2.": "predicted_lddt_head.hidden_projection.",
     "aux_heads.plddt.linear_3.": "predicted_lddt_head.logits.",
 }
 _STRUCTURE_PREFIX_MAP = {
-    "structure_module.layer_norm_s.": "structure_module.single_layer_norm.",
-    "structure_module.linear_in.": "structure_module.initial_projection.",
-    "structure_module.layer_norm_z.": "structure_module.pair_layer_norm.",
-    "structure_module.ipa.head_weights": ("structure_module.layer.invariant_point_attention.trainable_point_weights"),
-    "structure_module.ipa.linear_q.": "structure_module.layer.invariant_point_attention.q_scalar.",
-    "structure_module.ipa.linear_kv.": "structure_module.layer.invariant_point_attention.kv_scalar.",
-    "structure_module.ipa.linear_q_points.": ("structure_module.layer.invariant_point_attention.q_point_local."),
-    "structure_module.ipa.linear_kv_points.": ("structure_module.layer.invariant_point_attention.kv_point_local."),
-    "structure_module.ipa.linear_b.": "structure_module.layer.invariant_point_attention.attention_2d.",
-    "structure_module.ipa.linear_out.": ("structure_module.layer.invariant_point_attention.output_projection."),
-    "structure_module.layer_norm_ipa.": "structure_module.layer.attention_layer_norm.",
-    "structure_module.transition.layer_norm.": "structure_module.layer.transition_layer_norm.",
-    "structure_module.bb_update.linear.": "structure_module.layer.backbone_update.",
-    "structure_module.angle_resnet.linear_in.": "structure_module.layer.sidechain.input_projection.0.",
-    "structure_module.angle_resnet.linear_initial.": "structure_module.layer.sidechain.input_projection.1.",
-    "structure_module.angle_resnet.linear_out.": "structure_module.layer.sidechain.unnormalized_angles.",
+    "structure_module.layer_norm_s.": "structure_module.single_norm.",
+    "structure_module.linear_in.": "structure_module.input_projection.",
+    "structure_module.layer_norm_z.": "structure_module.pair_norm.",
+    "structure_module.ipa.head_weights": ("structure_module.block.invariant_point_attention.trainable_point_weights"),
+    "structure_module.ipa.linear_q.": "structure_module.block.invariant_point_attention.query_scalar_projection.",
+    "structure_module.ipa.linear_kv.": "structure_module.block.invariant_point_attention.key_value_scalar_projection.",
+    "structure_module.ipa.linear_q_points.": (
+        "structure_module.block.invariant_point_attention.query_point_projection."
+    ),
+    "structure_module.ipa.linear_kv_points.": (
+        "structure_module.block.invariant_point_attention.key_value_point_projection."
+    ),
+    "structure_module.ipa.linear_b.": "structure_module.block.invariant_point_attention.pair_bias_projection.",
+    "structure_module.ipa.linear_out.": ("structure_module.block.invariant_point_attention.output_projection."),
+    "structure_module.layer_norm_ipa.": "structure_module.block.attention_norm.",
+    "structure_module.transition.layer_norm.": "structure_module.block.transition_norm.",
+    "structure_module.bb_update.linear.": "structure_module.block.backbone_update.",
+    "structure_module.angle_resnet.linear_in.": "structure_module.block.sidechain.input_projections.0.",
+    "structure_module.angle_resnet.linear_initial.": "structure_module.block.sidechain.input_projections.1.",
+    "structure_module.angle_resnet.linear_out.": "structure_module.block.sidechain.angle_projection.",
 }
 
 
@@ -142,10 +146,10 @@ def normalize_openfold_state_key(key: str) -> str:
 
     template_match = _TEMPLATE_BLOCK_KEY_RE.fullmatch(key)
     if template_match is not None:
-        layer_index, rest = template_match.groups()
+        block_index, rest = template_match.groups()
         return (
-            "template_embedder.single_template_embedding.template_pair_stack.layers."
-            f"{layer_index}.{_normalize_pair_stack_key(rest)}"
+            "template_embedder.single_template_embedder.template_pair_stack.blocks."
+            f"{block_index}.{_normalize_pair_stack_key(rest, transition_name='transition')}"
         )
 
     block_match = _BLOCK_KEY_RE.fullmatch(key)
@@ -165,22 +169,23 @@ def _load_openfold_checkpoint(
 
 
 def _normalize_evoformer_block_key(stack_name: str, block_index: str, rest: str) -> str:
+    stack_name = "evoformer_stack" if stack_name == "evoformer" else stack_name
     block_prefix = f"{stack_name}.blocks.{block_index}"
     if rest.startswith("msa_att_row."):
-        return f"{block_prefix}.msa_stack.msa_row_attention_with_pair_bias." + _normalize_msa_row_key(
+        return f"{block_prefix}.msa_block.msa_row_attention_with_pair_bias." + _normalize_msa_row_key(
             rest.removeprefix("msa_att_row.")
         )
     if rest.startswith("msa_att_col._msa_att."):
-        return f"{block_prefix}.msa_stack.msa_column_attention." + _normalize_msa_column_attention_key(
+        return f"{block_prefix}.msa_block.msa_column_attention." + _normalize_msa_column_attention_key(
             rest.removeprefix("msa_att_col._msa_att.")
         )
     if rest.startswith("msa_att_col.layer_norm_m."):
         suffix = rest.removeprefix("msa_att_col.layer_norm_m.")
-        return f"{block_prefix}.msa_stack.msa_column_global_attention.query_norm.{suffix}"
+        return f"{block_prefix}.msa_block.msa_column_global_attention.query_norm.{suffix}"
     if rest.startswith("msa_att_col.global_attention."):
         suffix = rest.removeprefix("msa_att_col.global_attention.")
         return (
-            f"{block_prefix}.msa_stack.msa_column_global_attention.attention.projection."
+            f"{block_prefix}.msa_block.msa_column_global_attention.attention.projection."
             + _normalize_attention_projection_key(suffix)
         )
     if rest.startswith("core.outer_product_mean."):
@@ -188,11 +193,11 @@ def _normalize_evoformer_block_key(stack_name: str, block_index: str, rest: str)
             rest.removeprefix("core.outer_product_mean.")
         )
     if rest.startswith("core.msa_transition."):
-        return f"{block_prefix}.msa_stack.feed_forward." + _normalize_transition_key(
+        return f"{block_prefix}.msa_block.transition." + _normalize_transition_key(
             rest.removeprefix("core.msa_transition.")
         )
     if rest.startswith("core."):
-        return f"{block_prefix}.pair_stack.{_normalize_pair_stack_key(rest.removeprefix('core.'))}"
+        return f"{block_prefix}.pair_block.{_normalize_pair_stack_key(rest.removeprefix('core.'))}"
     raise ValueError(f"unsupported OpenFold Evoformer block key tail: {rest!r}")
 
 
@@ -200,9 +205,9 @@ def _normalize_msa_row_key(rest: str) -> str:
     if rest.startswith("layer_norm_m."):
         return "query_norm." + rest.removeprefix("layer_norm_m.")
     if rest.startswith("layer_norm_z."):
-        return "feat_2d_norm." + rest.removeprefix("layer_norm_z.")
+        return "pair_norm." + rest.removeprefix("layer_norm_z.")
     if rest.startswith("linear_z."):
-        return "feat_2d_weights." + rest.removeprefix("linear_z.")
+        return "pair_bias_projection." + rest.removeprefix("linear_z.")
     if rest.startswith("mha."):
         return "attention.projection." + _normalize_attention_projection_key(rest.removeprefix("mha."))
     raise ValueError(f"unsupported OpenFold MSA row-attention key tail: {rest!r}")
@@ -220,7 +225,7 @@ def _normalize_outer_product_mean_key(rest: str) -> str:
     return _replace_prefix_required(
         rest,
         {
-            "layer_norm.": "norm_msa.",
+            "layer_norm.": "msa_norm.",
             "linear_1.": "left_projection.",
             "linear_2.": "right_projection.",
             "linear_out.": "output_projection.",
@@ -229,7 +234,7 @@ def _normalize_outer_product_mean_key(rest: str) -> str:
     )
 
 
-def _normalize_pair_stack_key(rest: str) -> str:
+def _normalize_pair_stack_key(rest: str, *, transition_name: str = "transition") -> str:
     if rest.startswith("tri_mul_out."):
         return "triangle_multiplication_outgoing." + _normalize_triangle_multiplication_key(
             rest.removeprefix("tri_mul_out."), outgoing=True
@@ -245,7 +250,7 @@ def _normalize_pair_stack_key(rest: str) -> str:
     if rest.startswith("tri_att_end."):
         return "triangle_attention_ending_node." + _normalize_triangle_attention_key(rest.removeprefix("tri_att_end."))
     if rest.startswith("pair_transition."):
-        return "feed_forward." + _normalize_transition_key(rest.removeprefix("pair_transition."))
+        return transition_name + "." + _normalize_transition_key(rest.removeprefix("pair_transition."))
     raise ValueError(f"unsupported OpenFold pair-stack key tail: {rest!r}")
 
 
@@ -270,8 +275,8 @@ def _normalize_triangle_multiplication_key(rest: str, *, outgoing: bool) -> str:
             "linear_b_g.": right_gate,
             "linear_z.": "output_projection.",
             "linear_g.": "gate_projection.",
-            "layer_norm_in.": "norm_input.",
-            "layer_norm_out.": "norm_output.",
+            "layer_norm_in.": "input_norm.",
+            "layer_norm_out.": "output_norm.",
         },
         source="OpenFold triangle-multiplication key tail",
     )
@@ -279,10 +284,10 @@ def _normalize_triangle_multiplication_key(rest: str, *, outgoing: bool) -> str:
 
 def _normalize_triangle_attention_key(rest: str) -> str:
     # The unified TriangleAttention (shared bias-free module + the AlphaFold 2 subclass) registers its
-    # pre-attention LayerNorm as ``norm_pair`` and its per-head triangle-bias projection as
+    # pre-attention LayerNorm as ``pair_norm`` and its per-head triangle-bias projection as
     # ``bias_projection`` (the OpenFold names are ``layer_norm``/``linear``). See TRUNK_EINSUM_LOCK.md.
     if rest.startswith("layer_norm."):
-        return "norm_pair." + rest.removeprefix("layer_norm.")
+        return "pair_norm." + rest.removeprefix("layer_norm.")
     if rest.startswith("linear."):
         return "bias_projection." + rest.removeprefix("linear.")
     if rest.startswith("mha."):
@@ -294,9 +299,9 @@ def _normalize_transition_key(rest: str) -> str:
     return _replace_prefix_required(
         rest,
         {
-            "layer_norm.": "input_layer_norm.",
-            "linear_1.": "transition1.",
-            "linear_2.": "transition2.",
+            "layer_norm.": "input_norm.",
+            "linear_1.": "input_projection.",
+            "linear_2.": "output_projection.",
         },
         source="OpenFold transition key tail",
     )
@@ -319,12 +324,12 @@ def _normalize_structure_module_key(key: str) -> str | None:
         linear_index, _, suffix = rest.partition(".")
         if linear_index in {"1", "2", "3"} and suffix:
             target_index = int(linear_index) - 1
-            return f"structure_module.layer.transition.layers.{target_index}.{suffix}"
+            return f"structure_module.block.transition.projections.{target_index}.{suffix}"
     angle_match = re.fullmatch(r"structure_module\.angle_resnet\.layers\.(\d+)\.linear_([12])\.(.+)", key)
     if angle_match is not None:
         block_index, linear_index, suffix = angle_match.groups()
         target_name = "linear1" if linear_index == "1" else "linear2"
-        return f"structure_module.layer.sidechain.layers.{block_index}.{target_name}.{suffix}"
+        return f"structure_module.block.sidechain.blocks.{block_index}.{target_name}.{suffix}"
     return None
 
 

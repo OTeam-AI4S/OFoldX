@@ -10,7 +10,6 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from torch import Tensor
-from typing_extensions import Self
 
 from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
@@ -29,6 +28,7 @@ from ...modules.mpnn import (
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
+from ...processor import Processor
 from .config import ProteinMpnnProcessorConfig
 from .model import ProteinMpnnInput
 
@@ -46,8 +46,14 @@ class _LoweredRows(NamedTuple):
     component_ids: tuple[str | None, ...]
 
 
-class ProteinMpnnProcessor:
-    r"""Lower one canonical protein Structure to the released ProteinMPNN tensors."""
+class ProteinMpnnProcessor(Processor):
+    r"""Lower one canonical protein structure to ProteinMPNN tensors.
+
+    Args:
+        config: ProteinMPNN preprocessing options. Defaults to ``ProteinMpnnProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -57,21 +63,7 @@ class ProteinMpnnProcessor:
         dtype: torch.dtype | None = None,
     ) -> None:
         self.config = ProteinMpnnProcessorConfig() if config is None else config
-        self.device = torch.device("cpu" if device is None else device)
-        self.dtype = torch.float32 if dtype is None else dtype
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""Update runtime placement in place and return this Processor."""
-
-        if device is not None:
-            self.device = torch.device(device)
-        if dtype is not None:
-            self.dtype = dtype
-        return self
+        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -86,7 +78,31 @@ class ProteinMpnnProcessor:
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
     ) -> ProteinMpnnInput:
-        r"""Select the arm from the expression: a path lowers fixed columns, a Structure the updated graph."""
+        r"""Lower a PDB path or canonical ``Structure`` to ``ProteinMpnnInput``.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            sequence: Optional replacement sequence. A bare one-letter string requires one protein
+                instance; a mapping may provide one-letter strings or component-ID sequences by
+                instance.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with the required backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
+            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
+                ``pssm_probabilities``.
+            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
+            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
+
+        Returns:
+            A single-example ``ProteinMpnnInput`` carrying aligned tensors, source structure, and
+            component references.
+
+        Notes:
+            Paths use ``process_pdb`` fixed-column row mapping; ``Structure`` values use
+            ``process_structure`` observed-CA row mapping.
+        """
 
         if isinstance(input, (str, PathLike)):
             return self.process_pdb(
@@ -128,7 +144,32 @@ class ProteinMpnnProcessor:
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
     ) -> ProteinMpnnInput:
-        r"""Lower a PDB path with original ProteinMPNN fixed-column semantics."""
+        r"""Lower a PDB path with ProteinMPNN fixed-column semantics.
+
+        Args:
+            path: Local PDB path.
+            chains: Optional chain identifiers retained from the PDB.
+            sequence: Optional replacement sequence. A bare one-letter string requires one protein
+                instance; a mapping may provide one-letter strings or component-ID sequences by
+                instance.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with the required backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
+            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
+                ``pssm_probabilities``.
+            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
+            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
+
+        Returns:
+            A single-example ``ProteinMpnnInput`` lowered from the selected PDB chains.
+
+        Notes:
+            Rows order designed chains before remaining chains, with each group sorted by chain
+            identifier. Integer residue-number gaps become masked rows with ``None`` component
+            references; ``residue_index`` follows ``100 * chain_index + global_row_index``.
+        """
 
         structure = _read_proteinmpnn_pdb(path, chains)
         structure, system = self._resolve_target(structure, sequence)
@@ -159,7 +200,33 @@ class ProteinMpnnProcessor:
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
         filter_by_occupancy: bool = True,
     ) -> ProteinMpnnInput:
-        r"""Lower a canonical Structure with the updated LigandMPNN protein/soluble semantics."""
+        r"""Lower a canonical ``Structure`` to ``ProteinMpnnInput``.
+
+        Args:
+            structure: Coordinate-bearing canonical protein structure.
+            sequence: Optional replacement sequence. A bare one-letter string requires one protein
+                instance; a mapping may provide one-letter strings or component-ID sequences by
+                instance.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with the required backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
+            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
+                ``pssm_probabilities``.
+            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
+            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+
+        Returns:
+            A single-example ``ProteinMpnnInput`` lowered from the canonical structure.
+
+        Notes:
+            Rows follow observed CA sites in ``structure.sites`` order, and
+            ``component_references`` uses the same axis. ``residue_index`` uses component indices
+            when source residue numbers are absent and source numbers with duplicate offsets when
+            present.
+        """
 
         structure, system = self._resolve_target(structure, sequence)
         rows = self._lower_structure_rows(structure, system, design_positions, filter_by_occupancy)
@@ -226,55 +293,8 @@ class ProteinMpnnProcessor:
         if not changed_references:
             return structure, system
 
-        entities: dict[str, PolymerSequence | Molecule] = {}
-        instance_entities: dict[str, str] = {}
-        allocated_ids = set(system.entities)
-        for entity_id, entity in system.entities.items():
-            entity_instances = tuple(
-                instance_id
-                for instance_id, instance_entity_id in system.instances.items()
-                if instance_entity_id == entity_id
-            )
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                entities[entity_id] = entity
-                for instance_id in entity_instances:
-                    instance_entities[instance_id] = entity_id
-                continue
-
-            groups: dict[tuple[str, ...], list[str]] = {}
-            components_by_ids: dict[
-                tuple[str, ...],
-                tuple[ChemicalComponent, ...],
-            ] = {}
-            for instance_id in entity_instances:
-                components = target_components[instance_id]
-                component_ids = tuple(component.component_id for component in components)
-                groups.setdefault(component_ids, []).append(instance_id)
-                components_by_ids[component_ids] = components
-            original_ids = tuple(component.component_id for component in entity.components)
-            ordered_ids = tuple(groups)
-            retained_ids = original_ids if original_ids in groups else ordered_ids[0]
-            next_suffix = 2
-            for component_ids in ordered_ids:
-                if component_ids == retained_ids:
-                    target_entity_id = entity_id
-                else:
-                    while f"{entity_id}_{next_suffix}" in allocated_ids:
-                        next_suffix += 1
-                    target_entity_id = f"{entity_id}_{next_suffix}"
-                    allocated_ids.add(target_entity_id)
-                    next_suffix += 1
-                entities[target_entity_id] = PolymerSequence(
-                    "protein",
-                    components_by_ids[component_ids],
-                )
-                for instance_id in groups[component_ids]:
-                    instance_entities[instance_id] = target_entity_id
-
-        instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-        candidate_system = MolecularSystem(entities, instances)
-        retained_bonds = system.retain_bonds_after_component_mutation(candidate_system, changed_references)
-        system = MolecularSystem(entities, instances, retained_bonds)
+        replacements = {reference: target_components[reference[0]][reference[1]] for reference in changed_references}
+        system = system.replace_components(replacements)
 
         consumed_atoms = ("CA",) if self.config.ca_only else _BACKBONE_ATOMS
         indices: list[int] = []
@@ -798,7 +818,7 @@ def _read_proteinmpnn_pdb(
     path: str | PathLike[str],
     chains: Sequence[str] | None = None,
 ) -> Structure:
-    r"""Read the exact fixed-column PDB slice released with ProteinMPNN."""
+    r"""Read the ProteinMPNN fixed-column PDB slice."""
 
     residue_keys_by_chain: dict[str, list[tuple[str, int, str]]] = {}
     component_id_by_residue: dict[tuple[str, int, str], str] = {}

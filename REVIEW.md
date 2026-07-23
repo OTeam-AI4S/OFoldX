@@ -134,7 +134,7 @@ and remain rejected.
 
 The frozen bounded value is deliberately smaller than source identity:
 
-~~~python
+```python
 @dataclass(frozen=True)
 class ResidueNumber:
     number: int
@@ -142,7 +142,7 @@ class ResidueNumber:
 
 class Structure:
     residue_numbers: dict[ComponentReference, ResidueNumber] | None
-~~~
+```
 
 `ComponentReference` already identifies the instance, so a second `asym_id` would
 be redundant for MPNN lowering. `None` means that a programmatic or decoded
@@ -228,7 +228,7 @@ Packer back under LigandMPNN.
 The audited released implementation contradicts several current OFoldX assumptions:
 
 - an explicit target sequence may replace identities already known in the input;
-  the packer still does not *choose* residue identities;
+  the packer still does not _choose_ residue identities;
 - every changed identity must also be selected for packing;
 - the standalone selection is just `positions`; `repack_everything` is a
   design-to-pack composition control, not a second Model/Processor selection API;
@@ -582,20 +582,20 @@ surfaces. The current code still lacks that complete probability, sampling,
 coefficient, reader, and membrane implementation, so resolution of Tik does not
 make the worktree complete.
 
-| Family | Official surface currently missing or wrongly deferred | Required ownership consequence |
-| --- | --- | --- |
-| LigandMPNN | Per-residue membrane, global membrane, soluble, and protein model types | One Protein graph for ordinary/soluble weights, one Membrane Model graph, and two concrete membrane Processors/Pipelines because whole-structure and per-residue labels have different biological signatures. |
-| RFdiffusion | Independent structure inpainting, `provide_seq`, scaffold SS/block adjacency/crop, and the `rep_r_min=0` all-pairs substrate branch | Concrete RFdiffusion controls and potential Modules; the branch is scientific behavior, not an escape hatch. |
-| Boltz-2 | Forced contact/pocket/template guidance, complete fold/confidence outputs, embeddings, and two-stage affinity | Family-owned force/threshold semantics and the released concrete affinity Pipeline. |
-| Protenix | Nine released v1/v2/ESM/ISM variants, RNA-MSA/template behavior, and TFG | Complete variant pairs and explicit TFG sampling/potential surface. |
-| ESMFold2 | Experimental graph, soft-sequence inversion, its checkpoints, and released binder-design composition | Separate Experimental pair(s) and a concrete binder-design Pipeline. |
-| AlphaFold 2 | AlphaFold-Multimer, all monomer/PTM presets, ensemble/recycle controls, and relaxation | Distinct Multimer pair(s), complete heads and controls, and an explicit released postprocess path. |
-| AlphaFold 3 | Canonical Processor/fold, seed × sample grouping, embeddings, contact probabilities, and complete confidence summaries/matrices | A complete concrete fold surface rather than only the raw tensor graph. |
-| Boltz-1 | Canonical fold, steering/FK potentials, embeddings, and complete confidence outputs | Concrete fold arguments, public potential Modules, and complete Result decoding. |
-| BoltzGen | Released design → inverse-fold → fold/affinity → analysis/filter/ranking system and complete schema controls | Raw pairs plus one explicit multi-pair BoltzGen Pipeline; no generic workflow or Condition bag. |
-| ODesign | OInvFold modality checkpoints and full beam/temperature/top-k composition | Separate OInvFold pairs plus the concrete ODesign Pipeline; uncertain de novo ligand identity must stay honest in a family Result. |
-| PXDesign | ProteinMPNN sequencing, AF2-IG/optional Protenix evaluation, ranking, filtering, and all controls | The released concrete multi-pair PXDesign Pipeline. |
-| NA-MPNN | Mixed-polymer token support, source residue ordering, incomplete-residue chemistry, token symmetry, pair bias, opposite-order scoring, specificity, core objectives, and two released weight distributions are not represented correctly by the current worktree | One direct mixed-polymer Model and two weight repositories; a concrete Processor/Pipeline and typed probability/sampling outputs, with training-data ownership frozen separately rather than hidden in Model config. |
+| Family      | Official surface currently missing or wrongly deferred                                                                                                                                                                                                           | Required ownership consequence                                                                                                                                                                                       |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LigandMPNN  | Per-residue membrane, global membrane, soluble, and protein model types                                                                                                                                                                                          | One Protein graph for ordinary/soluble weights, one Membrane Model graph, and two concrete membrane Processors/Pipelines because whole-structure and per-residue labels have different biological signatures.        |
+| RFdiffusion | Independent structure inpainting, `provide_seq`, scaffold SS/block adjacency/crop, and the `rep_r_min=0` all-pairs substrate branch                                                                                                                              | Concrete RFdiffusion controls and potential Modules; the branch is scientific behavior, not an escape hatch.                                                                                                         |
+| Boltz-2     | Forced contact/pocket/template guidance, complete fold/confidence outputs, embeddings, and two-stage affinity                                                                                                                                                    | Family-owned force/threshold semantics and the released concrete affinity Pipeline.                                                                                                                                  |
+| Protenix    | Nine released v1/v2/ESM/ISM variants, RNA-MSA/template behavior, and TFG                                                                                                                                                                                         | Complete variant pairs and explicit TFG sampling/potential surface.                                                                                                                                                  |
+| ESMFold2    | Experimental graph, soft-sequence inversion, its checkpoints, and released binder-design composition                                                                                                                                                             | Separate Experimental pair(s) and a concrete binder-design Pipeline.                                                                                                                                                 |
+| AlphaFold 2 | AlphaFold-Multimer, all monomer/PTM presets, ensemble/recycle controls, and relaxation                                                                                                                                                                           | Distinct Multimer pair(s), complete heads and controls, and an explicit released postprocess path.                                                                                                                   |
+| AlphaFold 3 | Canonical Processor/fold, seed × sample grouping, embeddings, contact probabilities, and complete confidence summaries/matrices                                                                                                                                  | A complete concrete fold surface rather than only the raw tensor graph.                                                                                                                                              |
+| Boltz-1     | Canonical fold, steering/FK potentials, embeddings, and complete confidence outputs                                                                                                                                                                              | Concrete fold arguments, public potential Modules, and complete Result decoding.                                                                                                                                     |
+| BoltzGen    | Released design → inverse-fold → fold/affinity → analysis/filter/ranking system and complete schema controls                                                                                                                                                     | Raw pairs plus one explicit multi-pair BoltzGen Pipeline; no generic workflow or Condition bag.                                                                                                                      |
+| ODesign     | OInvFold modality checkpoints and full beam/temperature/top-k composition                                                                                                                                                                                        | Separate OInvFold pairs plus the concrete ODesign Pipeline; uncertain de novo ligand identity must stay honest in a family Result.                                                                                   |
+| PXDesign    | ProteinMPNN sequencing, AF2-IG/optional Protenix evaluation, ranking, filtering, and all controls                                                                                                                                                                | The released concrete multi-pair PXDesign Pipeline.                                                                                                                                                                  |
+| NA-MPNN     | Mixed-polymer token support, source residue ordering, incomplete-residue chemistry, token symmetry, pair bias, opposite-order scoring, specificity, core objectives, and two released weight distributions are not represented correctly by the current worktree | One direct mixed-polymer Model and two weight repositories; a concrete Processor/Pipeline and typed probability/sampling outputs, with training-data ownership frozen separately rather than hidden in Model config. |
 
 This also reopens the apparent shared `Contact`/`Pocket` contract: Protenix
 constraints and Boltz forced guidance use similar nouns but do not yet have proven
@@ -646,7 +646,7 @@ owner-reserved-but-deferred ids to routable `_BUILTIN_PIPELINE_MODULES` entries 
 `save` → on-disk root + named sub-pairs + one-field marker → factory `from_repository`
 reconstruction with per-pair weight round-trip through a fresh interpreter for each of
 the three; this is implementation evidence, not a committed test or publication gate.
-Multi-pair *placement* (DESIGN §6.3) and complete family checkpoint publication stay
+Multi-pair _placement_ (DESIGN §6.3) and complete family checkpoint publication stay
 open.
 
 Shared Hub infrastructure has substantial implementation, but no overall percentage
@@ -1080,11 +1080,12 @@ native or OOps kernel follows only from measured performance evidence. OOps rema
 optional.
 
 Depending on the complete official `alphafold3==3.0.3` package would force Python
->=3.12, JAX/CUDA12, Haiku, Tokamax, a fixed RDKit, Linux-oriented native builds,
-five CMake `FetchContent` repositories, and a separate post-install `build_data`
-step merely to obtain DSSP and CCD. A system `mkdssp` adds path/version/process
-state and has no exact-output evidence. Both are larger system contracts than the
-narrow family-owned alternatives.
+
+> =3.12, JAX/CUDA12, Haiku, Tokamax, a fixed RDKit, Linux-oriented native builds,
+> five CMake `FetchContent` repositories, and a separate post-install `build_data`
+> step merely to obtain DSSP and CCD. A system `mkdssp` adds path/version/process
+> state and has no exact-output evidence. Both are larger system contracts than the
+> narrow family-owned alternatives.
 
 AF3 remains reopened before complete family Tok only for exact CCD provenance,
 redistribution terms, and offline asset inclusion. The direct AF-RSA implementation
@@ -1144,6 +1145,7 @@ attribution remain part of the reopened writer contract. None belongs in
 `FoldResult`, provenance, a manifest fingerprint, or generic lifecycle machinery.
 
 <!-- proposed 2026-07-16 via §3.3 freeze-drafting investigation; OWNER VERDICT 2026-07-16: REOPENED — freeze REJECTED; DESIGN §3.3 corrected back to reopened and the reopened candidate rewritten with the blockers below -->
+
 ## Owner review — §3.3 value-shape slice (+ §3.4.3 `iter_bonds()`, §3.5.2 atom-access)
 
 **Verdict: REOPENED.** The §3.3 value-shape freeze is rejected. The committed `ofoldx/data/molecular.py` already implements frozen §3.4.1's dict `MolecularSystem`, so a migration landing spot for the stale io/processor calls is still needed — but the proposed frozen shape was wrong on the points below, and DESIGN §3.3's premature `Status: frozen` was corrected back to reopened (it does not authorize Tok).
@@ -1154,7 +1156,7 @@ Freeze-blockers (must be resolved before any §3.3 freeze):
 - **Keep the 5-member `PolymerType` including `"pna"`.** The proposed 4-member alias makes `pna` unrepresentable before family lowering resolves it.
 - **`from_one_letter` must support** protein `X → UNK`, RNA `N → N`, and DNA `N → DN`.
 - **`from_smiles` emits one `UNL` `ChemicalComponent`** carrying its atoms plus `ChemicalBond` edges — not a separate `MoleculeBond` type resolved against a side table.
-- **Import classification is declaration-driven:** `PolymerSequence.polymer_type` is a fact the producer declares, with a format-local component-ID fallback permitted *inside* the importer — never a reusable public chemistry-keyed classifier.
+- **Import classification is declaration-driven:** `PolymerSequence.polymer_type` is a fact the producer declares, with a format-local component-ID fallback permitted _inside_ the importer — never a reusable public chemistry-keyed classifier.
 - **MSA/Template entity serialization is not owned here.** `Template.target`/`.monomers` are not fields on the committed shapes, so every "`encode_msa`/`encode_template` reuse verbatim" claim is void; that serialization moves to reopened §3.6.
 - **`iter_bonds()` is not complete.** Its incident-bond-removal predicate (coupled to `iter_atoms()`) and cross-layer physical-pair dedup remain unresolved. (The `BondOrigin` domain is now resolved: `geometry_inferred` was deleted, so committed code and §3.4.3 both carry the 5 members `component/molecule/polymer_rule/source/user`.)
 
@@ -1162,6 +1164,7 @@ Preserved factual/migration findings: the stale callers are `io/structure.py` pl
 
 <!-- proposed 2026-07-16 via §3.5.1 freeze-drafting investigation; OWNER VERDICT 2026-07-16: ACCEPTED (carrier only) -->
 <!-- PARTIALLY SUPERSEDED 2026-07-20: the six-field carrier freeze below stands unchanged, but its "does NOT authorize the codec/writer" and "stays in the reopened §3.5 Structure I/O contract" carve-out was RATIFIED — the implemented read/exchange-write/LossReport surface is now frozen as DESIGN §3.5.3. See "Owner review — §3.5 Structure I/O contract ratification" at the end of this file. Only the codec `instances` ordered-entry-array (§3.4.1) stays open. -->
+
 ## Owner review — §3.5.1 Structure value carrier
 
 **Verdict: ACCEPTED (carrier only).** The six-field `Structure` (`system`, `sites`, `coordinates`, `coordinate_mask`, `occupancy`, `residue_numbers`) plus `ResidueNumber(number: int, insertion_code: str = "")` carrier is frozen in DESIGN §3.5.1 exactly as committed in `ofoldx/data/structure.py`. This covers ONLY the carrier: the writer policy (label/auth column selection, B-factor/altloc placeholders, one-based fallback), the exact codec JSON shape, the "author when present, else label" rule, and "nonpolymer extra entries are harmless" are removed from DESIGN and stay in the reopened §3.5 Structure I/O contract. This freeze does NOT authorize implementing the codec (`encode_structure`/`decode_structure`) or the writer.
@@ -1169,6 +1172,7 @@ Preserved factual/migration findings: the stale callers are `io/structure.py` pl
 Sequencing (factual): this carrier does not by itself make `_codec.py` or `io/structure.py` compile — both also target the pre-§3.4.1 `MolecularSystem` and must land together with the §3.3/§3.4.1 codec-system migration and the reopened §3.5 I/O rewrite; §3.5.1 does not unblock §3.3 (the dependency runs the other way).
 
 <!-- proposed 2026-07-16 via §3.7.2 Protenix conditioning freeze-drafting; OWNER VERDICT 2026-07-16: REOPENED — positive API rejected, v0.5 constraint slice only -->
+
 ## Owner review — §3.7.2 Protenix conditioning
 
 **Verdict: REOPENED — v0.5 constraint SLICE only (not Protenix end-to-end).** The proposed positive conditioning API (shared-looking min/max-band records, `ProtenixLayout`, a heterogeneous `conditions` bag) is rejected. The DESIGN §3.7.2 negative cross-family contract (no shared `Condition` record) stays frozen. Refined direction for the eventual v0.5 constraint slice:
@@ -1190,6 +1194,7 @@ Recorded code bugs (preserved; fix separately, NOT now):
 
 <!-- proposed 2026-07-16 via §3.7.3 Contig investigation; STILL_PARTIAL — direction only, awaiting owner -->
 <!-- SUPERSEDED 2026-07-18: the placement/contig contract was ratified + FROZEN (placement axis DONE; exhaustion = full partition; realized-id unified to chain_{n}). See "§3.7 caveats — NOW RESOLVED" and "OWNER VERDICTS (2026-07-18)" below. The per-family chain_lengths re-home finding recorded below remains valid. -->
+
 ## Owner review — §3.7.3 Contig / placement
 
 **Verdict: REOPENED (STILL_PARTIAL).** The synthesized candidate resolves its core (shared placement records, pre-realization symbolic references, a `placement_map` output surface), but the Contig core is NOT frozen — it is gated on two blockers:
@@ -1200,6 +1205,7 @@ Recorded code bugs (preserved; fix separately, NOT now):
 Preserved factual findings: the realization paths differ — ODesign copies-and-renumbers (fresh `odesign_chain_N` + indices, `processor.py:446,470-473`), while RFdiffusion and PXDesign carry existing spans verbatim as `(source_instance_id, source_index)` (`model.py:6352`; `processor.py:296-303`). The in-tree `Contig.chain_lengths` read by both `odesign/processor.py:716` and `rfdiffusion/model.py:6270` is a false shared invariant and must re-home per family. Generated-topology guarantees that DO hold: declared outer/inner order is preserved; every declared placement appears exactly once (zero-length → `()`); every `placement_map` `ComponentReference` names a realized-output occurrence. The per-declared-instance exhaustion/partition invariant — recorded here as withdrawn while this audit was open — was later **ratified as exhaustive (a full partition)** by the 2026-07-18 owner verdict (see "§3.7 caveats — NOW RESOLVED" and "OWNER VERDICTS (2026-07-18)" below); this audit line is superseded on that point. `SymbolicBond` stays a separate open item, not a Contig-core gate.
 
 <!-- proposed 2026-07-16 via §5.3.4 coordinate-design freeze-drafting; OWNER VERDICT 2026-07-16: ACCEPTED (simpler shared carrier) -->
+
 ## §5.3.4 Coordinate-bearing design — owner review
 
 **Verdict: ACCEPTED (simpler shared carrier).** The three coordinate-generating families (RFdiffusion, ODesign, PXDesign) currently shove realized `Structure` objects into `DesignResult.candidates` behind `# type: ignore[arg-type]` (`rfdiffusion/model.py:6518`, `pxdesign/model.py:168`) or an unsuppressed mismatch (`odesign/model.py:243`). The accepted fix widens the shared `DesignCandidate` with both an optional coordinate realization and a metrics map:
@@ -1220,6 +1226,7 @@ class DesignCandidate:
 **REJECT `RFdiffusionDesignCandidate`.** The proposed family subtype is rejected: adding a non-defaulted field after the base's defaulted fields would raise at class-creation time; `self_consistency` misnames upstream's per-residue predicted-lDDT ("Predicted lDDT of x0"); and the pLDDT scale (0-1 vs. scaling) and Metric axis are not frozen. RFdiffusion's predicted-lDDT (decoded at `model.py:4172`, currently unpacked-then-dropped at `model.py:6499`) now has a home in the shared `metrics` map, but its exact Metric axis/unit — and whether RFdiffusion also publishes a derived scalar Score — stay a reopened RFdiffusion family decision.
 
 <!-- proposed 2026-07-16 via §5.4.3 affinity investigation; OWNER VERDICT 2026-07-16: ACCEPTED (narrow fact only) -->
+
 ## §5.4.3 Boltz-2 affinity — owner review
 
 **Verdict: ACCEPTED (narrow fact only).** Narrow accepted fact: `Boltz2AffinityModel.score(...) -> ScoreResult` — the released affinity output is scalar Scores over one selected coordinate-conditioned target and fits the already-frozen shared `ScoreResult(target, scores, metrics)` with no affinity-specific Result type. Committed `model.py:716-750` already conforms.
@@ -1241,10 +1248,12 @@ Full composition is REOPENED because:
 ### A. Freezable NOW — §3.7.2 family-owned spatial (no Contig coupling)
 
 **A1. `ODesignReferenceCoordinates` (from `ReferenceCoordinates`) — fixed/constraint coordinates.** Endpoints are EXISTING input `AtomSite`s only: the processor rejects any reference site whose coordinates are not observed in the input (`processor.py:298-299`), so this record has zero symbolic/generated coupling. It drives two learned/sampler surfaces that are pure §3.7.2: `fixed_coordinate_mask` (hard intent → EDM `condition_mask`, `model.py:286`) and `constraint_coordinate_mask` → the pairwise `constraint_distogram` learned channel (`processor.py:328-334`, `ConstraintDistogramEmbedder` in `model.py:454-497`).
+
 - Concrete record (family-owned, e.g. `odesign/conditions.py`): `sites: tuple[AtomSite, ...]`, `intent: Literal["hard", "soft"]`, `tolerance_angstrom: float`, `weight: float | None`. The validation is family-owned, not a shared protocol: `"preference"` is rejected and `weight` must be `None`/`1.0` (`processor.py:134-137`); `"hard"` also sets `fixed_coordinate_mask` (`processor.py:296-297`) and is verified post-generation (§B).
 - Migration: processor named param `reference_coordinates: Sequence[ODesignReferenceCoordinates] = ()`.
 
 **A2. `ODesignHotspot` (the LEARNED half of `Contact`) — soft per-residue hotspot flag.** The only tensor the model consumes is `token_features[..., 452] = hotspot` (`processor.py:320`), a per-residue binary label over EXISTING input residues/atoms — upstream `is_hotspot_residue`. `_hotspot_tokens` (`processor.py:1108-1136`) SKIPS every symbolic/generated reference (`processor.py:1122`) and requires ≥1 input hotspot (`processor.py:1135`). Per REVIEW.md:196 and DESIGN §3.7.3:1402, an ODesign hotspot is a residue label, NOT a synthetic 8 Å contact; the two-sided `side_a`/`side_b` + `cutoff_angstrom` framing is a shared-`Contact` artifact and must NOT be preserved as the learned record.
+
 - Concrete record: a hotspot set naming existing input residues/atoms — `residues: tuple[AtomSite | tuple[str, int], ...]` (matching the `AtomSite` / `(instance_id, component_index)` endpoints the lowering accepts at `processor.py:162,169`). Consumed strictly as a soft signal (`processor.py:139-142` forces `intent == "soft"`, `weight` `None`/`1.0`); the protein-only-unless-exact-atom rule stays family-owned (`processor.py:158-172`).
 - Migration: processor named param `hotspots: Sequence[ODesignHotspot] = ()`.
 
@@ -1255,6 +1264,7 @@ Full composition is REOPENED because:
 ### C. BLOCKED on §3.7.3 Contig — X1 BoltzGen + X2 outer-key (STILL_PARTIAL)
 
 `Contig`, `GeneratedSegment`, `ExistingSpan`, `SymbolicResidueSite`, `SymbolicAtomSite` drive generation-topology realization (`_materialize_contig` `processor.py:407-605`; `_realize_ranges` `processor.py:703-943`; the layout identity maps `contract.py:29-32`). These CANNOT re-home to a frozen public shape — three concrete ODesign facts land squarely on the two open §3.7.3 blockers, and the current record shapes are the ones DESIGN §3.7.3 explicitly withholds:
+
 - **X2 (outer-key = handle vs. id).** ODesign synthesizes fresh `odesign_chain_N` / `odesign_entity_N` ids and renumbers (`processor.py:446,470-473,495`) instead of honoring a caller outer key — the exact case REVIEW.md:1172 leaves unratified.
 - **`chain_lengths` re-home.** `Contig.chain_lengths` (`processor.py:716`) is the false shared invariant; ODesign owns per-chain exact lengths (DESIGN §3.7.3:1364, REVIEW.md:1174). Must become a family-owned field, not a shared one.
 - **Record shape contradicts the DESIGN candidate core.** Current `SymbolicResidueSite(segment_id, offset)` is 2-field (`processor.py:511-512,780-781`), but DESIGN §3.7.3:1389 requires 3-field `(instance_id, placement_id, offset)`; current `GeneratedSegment` carries an embedded `.segment_id` field (`processor.py:156,718,774`), but DESIGN §3.7.3:1355 gives placements identity via the mapping KEY, not a value field ("the same ordinary value may occur more than once without acquiring a hidden ID"); current `Contig.chains` is `tuple[tuple[part, ...], ...]` where DESIGN's candidate is a nested ordered dict. Re-homing these as-is would freeze precisely the shapes X2 is meant to decide. Keep them family-local and non-public (private placeholders, explicitly TODO'd) until X1/X2 resolve. `ExistingSpan(instance_id, start, stop)` alone matches DESIGN §3.7.3:1352, but it has no standalone use outside the blocked `Contig`.
@@ -1262,22 +1272,23 @@ Full composition is REOPENED because:
 ### D. SEPARATELY BLOCKED — `DesiredCovalentLink` (§3.3 cyclic closure + §3.7.3 `SymbolicBond`)
 
 Cyclic head-to-tail closure (`_materialize_cyclic_links` `processor.py:608-700`; `model.py:568`). Two independent gates, neither of them Contig:
+
 - The closure SystemBond synthesis is blocked on the reopened §3.3 cyclic-closure `SystemBond` contract: committed `PolymerAttachment` no longer carries `order`/`aromatic`, so the synthesized bond falls back to polymer-rule defaults and the attachment-chemistry compatibility checks are dropped (`processor.py:640-644` TODO; REVIEW.md:1137 preserved finding).
 - The request record with a GENERATED endpoint (`SymbolicAtomSite`) is blocked on the §3.7.3 `SymbolicBond` contract (DESIGN §3.7.3:1407-1411: no accepted endpoint/chemistry/ownership). A link between EXISTING `AtomSite`s is already `MolecularSystem` topology (DESIGN §3.7.3:1409), so no condition record is needed there — `DesiredCovalentLink` cannot be frozen as a public record in either form.
 
 ### Removed-record site inventory (migration per site)
 
-| Record | ODesign sites | Disposition |
-| --- | --- | --- |
-| `ReferenceCoordinates` | contract.py:16,29; processor.py:29,124,133,288,299,610; model.py:22,535,571 | **Freeze now** → `ODesignReferenceCoordinates` (§A1), named param `reference_coordinates=` |
-| `Contact` (learned) | processor.py:24,124,138,159,172,1118,1135 | **Freeze now** → `ODesignHotspot` (§A2), named param `hotspots=`; drop `side_a/side_b/cutoff` learned framing |
-| `Contact` (hard-distance check) | model.py:18,551,598-622 | **Reopened §3.7↔§5** (§B); symbolic endpoints Contig-coupled |
-| `Contig` | contract.py:14,29; processor.py:25,124,129,131,143,408,417,610,704; model.py:19,568 | **BLOCKED §3.7.3** (§C); shape unresolved, `chain_lengths` re-home |
-| `GeneratedSegment` | processor.py:28,156,164,455,464,711,718,735,773,778,1122,1181; model.py:21,616 | **BLOCKED §3.7.3** (§C); drop embedded `segment_id`, identity moves to key |
-| `ExistingSpan` | processor.py:27,464,482 | **BLOCKED §3.7.3** (§C); no standalone use outside `Contig` |
-| `SymbolicResidueSite` | contract.py:17,30; processor.py:31,166,413,437,511-512,611,780-781,1187; model.py:24,578 | **BLOCKED §3.7.3** (§C); 2-field → 3-field is the X2 decision |
-| `SymbolicAtomSite` | processor.py:30,162,1122,1178; model.py:23,607 | **BLOCKED §3.7.3** (§C) + `SymbolicBond` (§D) |
-| `DesiredCovalentLink` | contract.py:15,29; processor.py:26,124,143,610,646; model.py:20,568 | **BLOCKED §3.3 + §3.7.3** (§D); not a public record |
+| Record                          | ODesign sites                                                                            | Disposition                                                                                                   |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `ReferenceCoordinates`          | contract.py:16,29; processor.py:29,124,133,288,299,610; model.py:22,535,571              | **Freeze now** → `ODesignReferenceCoordinates` (§A1), named param `reference_coordinates=`                    |
+| `Contact` (learned)             | processor.py:24,124,138,159,172,1118,1135                                                | **Freeze now** → `ODesignHotspot` (§A2), named param `hotspots=`; drop `side_a/side_b/cutoff` learned framing |
+| `Contact` (hard-distance check) | model.py:18,551,598-622                                                                  | **Reopened §3.7↔§5** (§B); symbolic endpoints Contig-coupled                                                  |
+| `Contig`                        | contract.py:14,29; processor.py:25,124,129,131,143,408,417,610,704; model.py:19,568      | **BLOCKED §3.7.3** (§C); shape unresolved, `chain_lengths` re-home                                            |
+| `GeneratedSegment`              | processor.py:28,156,164,455,464,711,718,735,773,778,1122,1181; model.py:21,616           | **BLOCKED §3.7.3** (§C); drop embedded `segment_id`, identity moves to key                                    |
+| `ExistingSpan`                  | processor.py:27,464,482                                                                  | **BLOCKED §3.7.3** (§C); no standalone use outside `Contig`                                                   |
+| `SymbolicResidueSite`           | contract.py:17,30; processor.py:31,166,413,437,511-512,611,780-781,1187; model.py:24,578 | **BLOCKED §3.7.3** (§C); 2-field → 3-field is the X2 decision                                                 |
+| `SymbolicAtomSite`              | processor.py:30,162,1122,1178; model.py:23,607                                           | **BLOCKED §3.7.3** (§C) + `SymbolicBond` (§D)                                                                 |
+| `DesiredCovalentLink`           | contract.py:15,29; processor.py:26,124,143,610,646; model.py:20,568                      | **BLOCKED §3.3 + §3.7.3** (§D); not a public record                                                           |
 
 ### Layout / signature migration (Protenix corrected direction applied)
 
@@ -1286,6 +1297,7 @@ Cyclic head-to-tail closure (`_materialize_cyclic_links` `processor.py:608-700`;
 - **Records re-home into the ODesign package, not `data.conditions`.** The freezable §A records become public family records; the §C/§D records stay family-local and non-public until §3.7.3 (X1/X2) and §3.3/`SymbolicBond` resolve.
 
 <!-- proposed 2026-07-17 via CCD asset-distribution investigation (AF3 full-ligand + Protenix/Boltz ligand blocker); OWNER VERDICT 2026-07-17: ACCEPTED -->
+
 ## Owner review — CCD asset distribution (§3.2 / §3.5 importer resolution)
 
 **Verdict: ACCEPTED.** The wwPDB Chemical Component Dictionary is distributed as a Hub `dataset` repo `ofoldx/ccd` — Parquet, one component per row, revision = the wwPDB snapshot date — loaded via the existing `ofoldx/hub.py` `snapshot_download` and lowered to `ChemicalComponent` VALUES by an IMPORT-TIME resolver `ofoldx/data/ccd/resolver.py::resolve_ccd_component(component_id, *, revision)`. This reuses MultiMolecule's dataset DISTRIBUTION pattern (Hub-hosted Parquet + snapshot download), NOT its runtime `Dataset` class — no runtime dataset object enters tensor compute.
@@ -1295,6 +1307,7 @@ Cyclic head-to-tail closure (`_materialize_cyclic_links` `processor.py:608-700`;
 Rationale/impact: unblocks the AF3 full-ligand path and the Protenix/Boltz ligand paths, which need CCD component atoms/bonds resolved before lowering. Flows into DESIGN §3.2 / §3.5 (importer resolution) when those sections freeze.
 
 <!-- proposed 2026-07-17 via AlphaFold2 family-boundary investigation; OWNER VERDICT 2026-07-17: ACCEPTED — one family, two arch ids -->
+
 ## Owner review — AlphaFold2 / AF-Multimer family boundary (§1.1 / §7.1)
 
 **Verdict: ACCEPTED — ONE `alphafold2` family, TWO registered arch ids.** Package `ofoldx.models.alphafold2` holds the shared Evoformer / ExtraMSA / IPA trunk and registers two arch ids / two main entry points: `ofoldx.alphafold2` (monomer + pTM) and `ofoldx.alphafold2_multimer` (paired MSA, asym/entity/sym features, ipTM, chain permutation, `model_*_multimer_v3`). Per §1.1 "no partial family" they ship TOGETHER — no monomer-first release.
@@ -1302,6 +1315,7 @@ Rationale/impact: unblocks the AF3 full-ligand path and the Protenix/Boltz ligan
 Rationale: multimer is a genuinely different concrete INPUT/OUTPUT type — it REQUIRES chain-identity features + paired-MSA semantics and emits ipTM — so it is a second arch id, not a config flag on the monomer processor. It is named to stay unambiguously AF2 (both ids live under the one family). This resolves under the §7.1 registration contract (a pair is not inferred from tensor shape/heads/tasks/keys but from the concrete input/output type) and the §1.1 complete-family gate.
 
 <!-- proposed 2026-07-17 via entry-point/arch-split criterion elevation (generalized from AF2 vs multimer); OWNER VERDICT 2026-07-17: ACCEPTED — reusable criterion -->
+
 ## Owner review — General entry-point / arch-split rule (§7.1)
 
 **Verdict: ACCEPTED as a reusable owner criterion.** Split a family into SEPARATE registered (arch, entry-point) pairs ONLY when the Processor call SIGNATURE / required input-output TYPE differs. A checkpoint-selected graph variant with the SAME Processor signature stays ONE arch with a config field.
@@ -1312,6 +1326,7 @@ Rationale: multimer is a genuinely different concrete INPUT/OUTPUT type — it R
 This is consistent with §7.1 ("registration does not infer a pair from tensor shape, a head checklist, tasks, variants, or keys"): the discriminator is the caller-visible Processor signature, not internal tensor structure. Flows into §7.1 as the standing split criterion.
 
 <!-- proposed 2026-07-17 via ProteinMPNN ca_only config-vs-axis review; OWNER VERDICT 2026-07-17: ACCEPTED — ca_only stays, no §4.7 change -->
+
 ## Owner review — ProteinMPNN `ca_only` stays config-only (§4.7)
 
 **Verdict: ACCEPTED — `ca_only` stays; NO change to §4.7.** `ca_only` is config-only: it is never a runtime call arg, it is auto-derived at conversion from the checkpoint's edge-embedding input width (416 CA-only vs 167 full-backbone), and it is read from `model.json` exactly like a transformers `is_decoder` config boolean.
@@ -1319,11 +1334,13 @@ This is consistent with §7.1 ("registration does not infer a pair from tensor s
 Rationale: the two alternatives are both worse and already rejected. Splitting the arch is rejected because both graphs share ONE Processor signature (the split rule above), and a magic edge-width int at compute time is a "false axis" already rejected under §4.7. Keeping `ca_only` as a converted config field is the minimal correct encoding. No §4.7 change.
 
 <!-- proposed 2026-07-17 via ESMFold2 trunk/child weight-provenance investigation; OWNER VERDICT 2026-07-17: ACCEPTED — narrow fact -->
+
 ## Owner review — ESMFold2 ESMC child + trunk weight provenance
 
 **Verdict: ACCEPTED (narrow fact).** ESMFold2's ESMC child is `multimolecule/esmc-6b` (Hub). The ESMFold2 / ESMFold2-Fast trunk weights are NOT available locally → they are node4 / HF-gated, and parity for the ESMFold2 trunk must run against the gated weights there.
 
 <!-- proposed 2026-07-17 via MPNN biological-op batch-semantics reconciliation (DESIGN-frozen vs ROADMAP-reopened gap); OWNER VERDICT 2026-07-17: ACCEPTED — ratifies _require_single_target -->
+
 ## Owner review — MPNN biological-op batch semantics (§4.7 / §4.10)
 
 **Verdict: ACCEPTED — keep B=1 for one-target biological ops.** The one-target biological ops (`sample` / `score` / `design` / `probabilities` / `specificity_profile`) in ProteinMPNN, LigandMPNN, and NA-MPNN keep B=1. Raw `forward` / `encode` stay B>=1 (training / collate). Multi-target bsz>=1 is deliberately NOT added — revisit ONLY on a concrete, measured serving / screening need.
@@ -1331,6 +1348,7 @@ Rationale: the two alternatives are both worse and already rejected. Splitting t
 This ratifies the currently-implemented `_require_single_target` guard and closes the DESIGN-frozen-vs-ROADMAP-reopened gap on §4.7 / §4.10 batch semantics: the biological ops are single-target by contract, so the guard is correct rather than a limitation to lift.
 
 <!-- 2026-07-18 PARITY-PUSH-2 — parity results log (not an owner decision); details/tables in SESSION_NOTES.md §2 -->
+
 ## 2026-07-18 PARITY-PUSH-2 — parity findings
 
 Second parity push. Numbers are GPU (A100) with relative tolerance where applicable.
@@ -1339,11 +1357,11 @@ Second parity push. Numbers are GPU (A100) with relative tolerance where applica
 - **af2-MULTIMER — [SUPERSEDED — see the two sections below].** This dated bullet is stale. af2-multimer strict weight-load is now **CLEAN** (0/0/0, 93.2M params) and the IPA/QuatRigid structure module is **bit-exact** (max_abs 0.0) vs OpenFold v2.2.0; full deep-forward golden is in progress. The "3 buckets not implemented" claim no longer holds — all three are implemented.
 - **AF3 native trunk — [SUPERSEDED — see the two sections below].** This dated bullet is stale. The pair-pathway defect (pair cos 0.011, absmax ~73,791) was **CONFIRMED REAL and FIXED** (4 converter/orientation bugs). It is no longer "suspected".
 - **esmfold2 — determinism SOLVED; global PASS; per-atom at floor.** Non-determinism is solved (**det==0**). Global scores **PASS** (~**2e-4**). Per-atom coords/pae sit at an **irreducible cross-impl floor** (**0.215 Å** coords / **0.108** pae) and will not reach 1e-4 — a different-implementation floor, not a bug.
-- **Checkpoint sweep — mostly PASS.** PASS for **boltz1, boltz2, odesign (×2), boltzgen (3 of 4)**; **FAIL boltzgen `structuretrained_small`** (a *different architecture*, expected); **pxdesign** covered sampler-only.
+- **Checkpoint sweep — mostly PASS.** PASS for **boltz1, boltz2, odesign (×2), boltzgen (3 of 4)**; **FAIL boltzgen `structuretrained_small`** (a _different architecture_, expected); **pxdesign** covered sampler-only.
 - **Contract drafts.** Written to `CONTRACT_DRAFTS.md` with **3 owner decisions pending**.
 
-
 <!-- 2026-07-18 CONSOLIDATION — supersedes PARITY-PUSH-2 af2/af3 status; parity findings log + owner verdicts -->
+
 ## 2026-07-18 — af2/af3 status update + owner verdicts (supersedes PARITY-PUSH-2)
 
 This section reflects the TRUE current state and supersedes the af2/af3 lines in the 2026-07-18 PARITY-PUSH-2
@@ -1355,7 +1373,7 @@ The earlier "suspected real pair-pathway defect" (pair cos 0.011, absmax ~73,791
 FIXED. Root cause was **four** distinct defects on the pair pathway:
 
 1. **Triangle-multiplicative even/odd factor-split interleave** — the two projected factors were split as a
-   *contiguous chunk* instead of the correct *even/odd interleave*. This was the source of the magnitude blow-up.
+   _contiguous chunk_ instead of the correct _even/odd interleave_. This was the source of the magnitude blow-up.
 2. **Incoming-swap** on the triangle-multiplicative incoming pathway.
 3. **`target_feat` channel rotation-by-63** — a channel roll that scrambled the MSA projection.
 4. **Ending-node attention-bias transpose** — wrong transpose orientation on the ending-node attention bias.
@@ -1399,11 +1417,12 @@ The three earlier open caveats are closed; the placement axis is DONE (contig→
 coords byte-identical). See "2026-07-18 OWNER PRINCIPLES + VERDICTS" below.
 
 a. **rfdiffusion — RESOLVED.** `placement_map` is now adopted **4/4** (all four design families use the frozen
-   placement_map surface).
+placement_map surface).
 b. **Realized-id minting — RESOLVED.** Unified to a single `chain_{n}` spelling across families.
 c. **Coverage-vs-exhaustion — RESOLVED.** Exhaustive realization (the full partition) is the ratified rule.
 
 <!-- 2026-07-18 OWNER PRINCIPLES + VERDICTS — records the binding owner principles and the confirmed-stable verdicts; principle detail also lives in CLEANUP_TRACKER.md -->
+
 ## 2026-07-18 OWNER PRINCIPLES + VERDICTS
 
 ### Owner principles (binding)
@@ -1427,16 +1446,16 @@ c. **Coverage-vs-exhaustion — RESOLVED.** Exhaustive realization (the full par
 
 ### Confirmed-stable results these verdicts rest on (will not regress)
 
-| result | status | numbers |
-| --- | --- | --- |
-| af3 pair-pathway bug | CONFIRMED REAL + FIXED (stable) | single cos **0.99998**, pair cos **0.9985** (relL2 0.054, deep-stack fp accumulation), distogram cos **0.9993**; downstream denoiser/confidence/trunk-at-real-tol validation IN PROGRESS |
-| af2 monomer | deep-forward VALIDATED | **1.42e-4 Å** vs OpenFold (deterministic fixed-feature) |
-| af2 stochastic fold | IMPLEMENTED + VALIDATED (Draft 1) | Stage-1 feature parity **bitwise 0.0** vs OpenFold per-stage, Stage-2 trunk **4.16e-5 Å**, adversarial RNG-aligned |
-| af2 multimer | strict-load CLEAN | **0/0/0**, 93.2M params; IPA/QuatRigid bit-exact **max_abs 0.0** vs OpenFold v2.2.0; full deep-forward golden IN PROGRESS |
-| placement axis | DONE | contig→placement (`PlacementSpec`), `placement_map` 4/4, exhaustive coverage, 6 projections, realized-id `chain_{n}` (rfdiffusion coords byte-identical) |
-| component-cleanup-1 | DONE (parity-gated, no regression) | `_best()`/`expected_plddt()`/`_component_from_raw`; `asym_id`→`chain_index`; `hhblits_profile`→`msa_profile`; `Boltz2AffinityResult`→`AffinityResult` |
-| esmfold2 | determinism SOLVED; global parity | det==0, global ~**2e-4**; per-atom coords/pae at an irreducible cross-impl floor (**0.215 Å**) — characterized, not a bug |
-| checkpoint sweep | mostly PASS | boltz1 / boltz2 / odesign (×2) / boltzgen (3 of 4) PASS; boltzgen `structuretrained_small` different-arch FAIL; pxdesign sampler-only |
+| result               | status                             | numbers                                                                                                                                                                                  |
+| -------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| af3 pair-pathway bug | CONFIRMED REAL + FIXED (stable)    | single cos **0.99998**, pair cos **0.9985** (relL2 0.054, deep-stack fp accumulation), distogram cos **0.9993**; downstream denoiser/confidence/trunk-at-real-tol validation IN PROGRESS |
+| af2 monomer          | deep-forward VALIDATED             | **1.42e-4 Å** vs OpenFold (deterministic fixed-feature)                                                                                                                                  |
+| af2 stochastic fold  | IMPLEMENTED + VALIDATED (Draft 1)  | Stage-1 feature parity **bitwise 0.0** vs OpenFold per-stage, Stage-2 trunk **4.16e-5 Å**, adversarial RNG-aligned                                                                       |
+| af2 multimer         | strict-load CLEAN                  | **0/0/0**, 93.2M params; IPA/QuatRigid bit-exact **max_abs 0.0** vs OpenFold v2.2.0; full deep-forward golden IN PROGRESS                                                                |
+| placement axis       | DONE                               | contig→placement (`PlacementSpec`), `placement_map` 4/4, exhaustive coverage, 6 projections, realized-id `chain_{n}` (rfdiffusion coords byte-identical)                                 |
+| component-cleanup-1  | DONE (parity-gated, no regression) | `_best()`/`expected_plddt()`/`_component_from_raw`; `asym_id`→`chain_index`; `hhblits_profile`→`msa_profile`; `Boltz2AffinityResult`→`AffinityResult`                                    |
+| esmfold2             | determinism SOLVED; global parity  | det==0, global ~**2e-4**; per-atom coords/pae at an irreducible cross-impl floor (**0.215 Å**) — characterized, not a bug                                                                |
+| checkpoint sweep     | mostly PASS                        | boltz1 / boltz2 / odesign (×2) / boltzgen (3 of 4) PASS; boltzgen `structuretrained_small` different-arch FAIL; pxdesign sampler-only                                                    |
 
 ### Owner verdicts
 
@@ -1445,7 +1464,7 @@ c. **Coverage-vs-exhaustion — RESOLVED.** Exhaustive realization (the full par
 2. **Contig X1 — BoltzGen-first.** Build the BoltzGen placement realization first, then freeze the placement contract
    across all four design families.
 3. **Contig X2 — placement-keyed identity.** Global-unique `placement_id`; 2-field `SymbolicResidueSite(placement_id,
-   offset)`; realized instance id unified to `chain_{n}`. This is the "one correct way"; the placement axis is DONE
+offset)`; realized instance id unified to `chain_{n}`. This is the "one correct way"; the placement axis is DONE
    and this supersedes the earlier "Open §3.7 caveats".
 4. **MultiMolecule (MM) is a data-point to critically evaluate, not a template.** MM validates the
    orchestration-boundary principle (every MM model is non-stochastic), but OFoldX sits ABOVE it: per-family
@@ -1454,6 +1473,7 @@ c. **Coverage-vs-exhaustion — RESOLVED.** Exhaustive realization (the full par
    mechanism via generator threading.
 
 <!-- 2026-07-19 MIGRATION/CLEANUP ROUND — COMPLETE — final consolidation of the coverage/validation bug-hunt + cross-cutting cleanup wave + contract freezes; authoritative status lives in CLEANUP_TRACKER.md, per-family env/results in SESSION_NOTES.md -->
+
 ## 2026-07-19 MIGRATION/CLEANUP ROUND — COMPLETE
 
 This round closed the coverage/validation bug-hunt, the cross-cutting cleanup wave (RNG / dtype / naming /
@@ -1467,14 +1487,14 @@ The coverage thesis — "unvalidated areas hide real bugs" — was vindicated: *
 all fixed and parity-gated, plus one shared-module regression the cleanup itself introduced and then fixed by
 subclassing.
 
-| area | count | root causes | post-fix |
-| --- | --- | --- | --- |
-| af3 pair-pathway | 4 | tri-mult even/odd factor-split interleave (magnitude blow-up), incoming-swap, `target_feat` channel rotation-by-63, ending-node bias transpose | pair cos 0.011→**0.9985**, distogram 0.10→**0.9993**, single→**0.99998** |
-| af3 confidence | 3 | `single_max_abs`=512 clamp (→None; corrupted pLDDT/resolved), PDE symmetrize-logits-not-pair, token channel-order rotation on confidence projections | confidence cos **0.99999**, trunk cos ≥**0.998** |
-| af3 denoiser | 2 | cross-attn key double-norm (norm raw hidden), key-window gather zero-pad→clamp-inward | denoiser cos 0.278→**1.0** |
-| boltz2 processor | 1 | folding `method_feature` 4 ('other', copied from affinity)→**1** ('x-ray') — perturbed every folding activation via method_embedding | all tensors **0.0** |
-| af2-multimer | 3 | rel-encoding used `chain_index` not `symmetry_index`, template embedder missing `tri_mul_first`, Evoformer+extraMSA missing `opm-first` (+ processor Gram-Schmidt `template_backbone_frame`) | rel-L2 **0.0** all quantities; monomer no-regress **4.16e-5** |
-| boltz1 | 1 | `count.clamp_min(1e-5)`→`+1e-5` on 7 denominators (`complex_pde` deliberately kept — upstream no-eps) | ptm **1e-8** / iptm **1e-10** |
+| area             | count | root causes                                                                                                                                                                                  | post-fix                                                                 |
+| ---------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| af3 pair-pathway | 4     | tri-mult even/odd factor-split interleave (magnitude blow-up), incoming-swap, `target_feat` channel rotation-by-63, ending-node bias transpose                                               | pair cos 0.011→**0.9985**, distogram 0.10→**0.9993**, single→**0.99998** |
+| af3 confidence   | 3     | `single_max_abs`=512 clamp (→None; corrupted pLDDT/resolved), PDE symmetrize-logits-not-pair, token channel-order rotation on confidence projections                                         | confidence cos **0.99999**, trunk cos ≥**0.998**                         |
+| af3 denoiser     | 2     | cross-attn key double-norm (norm raw hidden), key-window gather zero-pad→clamp-inward                                                                                                        | denoiser cos 0.278→**1.0**                                               |
+| boltz2 processor | 1     | folding `method_feature` 4 ('other', copied from affinity)→**1** ('x-ray') — perturbed every folding activation via method_embedding                                                         | all tensors **0.0**                                                      |
+| af2-multimer     | 3     | rel-encoding used `chain_index` not `symmetry_index`, template embedder missing `tri_mul_first`, Evoformer+extraMSA missing `opm-first` (+ processor Gram-Schmidt `template_backbone_frame`) | rel-L2 **0.0** all quantities; monomer no-regress **4.16e-5**            |
+| boltz1           | 1     | `count.clamp_min(1e-5)`→`+1e-5` on 7 denominators (`complex_pde` deliberately kept — upstream no-eps)                                                                                        | ptm **1e-8** / iptm **1e-10**                                            |
 
 **Cross-attn shared-module regression** (introduced by the af3 denoiser key-double-norm fix; caught by the
 cross-family re-check): Protenix/odesign/pxdesign are `query_normed` (upstream double-adaLN), AF3 is raw. Fixed with a
@@ -1486,17 +1506,17 @@ sampler_parity). Boltz/BoltzGen/ESMFold inert. New real parity scripts added: `p
 
 ### 2. All fold+design cores numerically validated
 
-| family | status | numbers |
-| --- | --- | --- |
-| alphafold2 | mono + multi + stochastic VALIDATED | monomer **1.42e-4 Å**; stochastic Stage-1 bitwise **0.0** / Stage-2 **4.16e-5 Å**; multimer rel-L2 **0.0** (strict-load 0/0/0, 93.2M) |
-| alphafold3 | trunk + confidence + denoiser VALIDATED | single **0.99998** / distogram **0.9993** / confidence **0.99999** / denoiser **1.0**; pair rel-L2 **0.0587** marginal (see caveats) |
-| protenix | FAITHFUL | per-op bisect **0–1e-6**; query_normed cross-attn confirmed |
-| boltz1 / boltz2 | PASS (4/4, 5/5) | **0–8.6e-5**; boltz2 method_feature + dtype-transparency fixes |
-| boltzgen | FAITHFUL | denoiser **2.4e-4**, reverse-EDM **1.1e-4** |
-| odesign | FAITHFUL | 40-step **4.9e-4 Å**, 100-step **4.3e-4 Å** |
-| pxdesign | FAITHFUL | real denoiser rel-L2 **1e-6** |
-| rfdiffusion | PASS (8/8) | worst **5.5e-4 Å** |
-| proteinmpnn / ligandmpnn / mpnn_packer | validated | pre-/this-session real-weight |
+| family                                 | status                                  | numbers                                                                                                                               |
+| -------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| alphafold2                             | mono + multi + stochastic VALIDATED     | monomer **1.42e-4 Å**; stochastic Stage-1 bitwise **0.0** / Stage-2 **4.16e-5 Å**; multimer rel-L2 **0.0** (strict-load 0/0/0, 93.2M) |
+| alphafold3                             | trunk + confidence + denoiser VALIDATED | single **0.99998** / distogram **0.9993** / confidence **0.99999** / denoiser **1.0**; pair rel-L2 **0.0587** marginal (see caveats)  |
+| protenix                               | FAITHFUL                                | per-op bisect **0–1e-6**; query_normed cross-attn confirmed                                                                           |
+| boltz1 / boltz2                        | PASS (4/4, 5/5)                         | **0–8.6e-5**; boltz2 method_feature + dtype-transparency fixes                                                                        |
+| boltzgen                               | FAITHFUL                                | denoiser **2.4e-4**, reverse-EDM **1.1e-4**                                                                                           |
+| odesign                                | FAITHFUL                                | 40-step **4.9e-4 Å**, 100-step **4.3e-4 Å**                                                                                           |
+| pxdesign                               | FAITHFUL                                | real denoiser rel-L2 **1e-6**                                                                                                         |
+| rfdiffusion                            | PASS (8/8)                              | worst **5.5e-4 Å**                                                                                                                    |
+| proteinmpnn / ligandmpnn / mpnn_packer | validated                               | pre-/this-session real-weight                                                                                                         |
 
 **Caveats (recorded, not defects):** esmfold2 per-atom coords at a **0.215 Å** cross-impl floor (global scores PASS
 ~**2e-4**); af3 residual pair **rel-L2 0.0587** marginally over the 0.05 gate = deep-stack cross-framework fp
@@ -1514,14 +1534,14 @@ re-validate pending); **MembraneMpnn deferred** by owner.
 
 ### 4. Cross-cutting cleanup (all landed, parity-gated)
 
-| axis | outcome |
-| --- | --- |
-| RNG (X-wave) | model graph = pure `(tensors, generator)`; shared `resolve_generator` (`pipelines/_generator.py`); esmfold2 documented **P1-exception** (single ordered global stream + integer-seeded golden) |
-| dtype-transparency | boltz2 `.double()` **removed**, measured **7.58e-7** @ n_step=200; boltzgen `noise_scale²` faithful preserved |
-| naming (A0–A5) | contig→placement, asym_id→chain_index, Boltz2AffinityResult→AffinityResult, hhblits_profile→msa_profile, one-letter table (A5/B-nv1) |
-| unification | shared `ConfidenceHead` (B-eq1), pTM kernel (B-nv8, max_abs **0.0**), Trunk triangle/OPM (B-nv2/3/4 — AF2 = thin biased **subclass**, ~21Å einsum byte-exact **0.0**), converter schema (B-nv10) |
-| softmax sentinel | 4 magic magnitudes → one dtype-aware `finfo.min` |
-| OOps backend | VALIDATED (`scripts/parity/backend/oops_parity.py`, fp32 rel-L2 ~1e-6/0) + audited (integration healthy) |
+| axis               | outcome                                                                                                                                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| RNG (X-wave)       | model graph = pure `(tensors, generator)`; shared `resolve_generator` (`pipelines/_generator.py`); esmfold2 documented **P1-exception** (single ordered global stream + integer-seeded golden)   |
+| dtype-transparency | boltz2 `.double()` **removed**, measured **7.58e-7** @ n_step=200; boltzgen `noise_scale²` faithful preserved                                                                                    |
+| naming (A0–A5)     | contig→placement, asym_id→chain_index, Boltz2AffinityResult→AffinityResult, hhblits_profile→msa_profile, one-letter table (A5/B-nv1)                                                             |
+| unification        | shared `ConfidenceHead` (B-eq1), pTM kernel (B-nv8, max_abs **0.0**), Trunk triangle/OPM (B-nv2/3/4 — AF2 = thin biased **subclass**, ~21Å einsum byte-exact **0.0**), converter schema (B-nv10) |
+| softmax sentinel   | 4 magic magnitudes → one dtype-aware `finfo.min`                                                                                                                                                 |
+| OOps backend       | VALIDATED (`scripts/parity/backend/oops_parity.py`, fp32 rel-L2 ~1e-6/0) + audited (integration healthy)                                                                                         |
 
 ### 5. Structural principles confirmed
 
@@ -1535,16 +1555,17 @@ re-validate pending); **MembraneMpnn deferred** by owner.
 
 ### 6. Remaining (explicitly NOT done — none blocks this round)
 
-| item | why deferred |
-| --- | --- |
-| OP2 AdaLN → OOps fused kernel | perf-only, optional (converter already emits the fused layout) |
-| surface per-family confidence eps as config | hygiene |
-| NA-MPNN released-ckpt re-validate | contract in-transition |
-| esmfold2 pure-P1 RNG | owner-gated golden-regeneration |
-| MembraneMpnn | deferred by owner |
-| publication-level §9.1 | all-checkpoint coverage, model cards, Hub repos (separate large scope) |
+| item                                        | why deferred                                                           |
+| ------------------------------------------- | ---------------------------------------------------------------------- |
+| OP2 AdaLN → OOps fused kernel               | perf-only, optional (converter already emits the fused layout)         |
+| surface per-family confidence eps as config | hygiene                                                                |
+| NA-MPNN released-ckpt re-validate           | contract in-transition                                                 |
+| esmfold2 pure-P1 RNG                        | owner-gated golden-regeneration                                        |
+| MembraneMpnn                                | deferred by owner                                                      |
+| publication-level §9.1                      | all-checkpoint coverage, model cards, Hub repos (separate large scope) |
 
 <!-- 2026-07-19 DESIGN-GOAL PUSH — closes the autonomous items still open after the MIGRATION/CLEANUP ROUND; from here only owner-gated / no-runnable-path items remain. Authoritative status in CLEANUP_TRACKER.md. -->
+
 ## 2026-07-19 DESIGN-GOAL PUSH — autonomous items complete
 
 The final push closed every remaining **autonomous** item from the cleanup tracker. The codebase is now at the
@@ -1554,26 +1575,26 @@ strictly owner-gated or has no runnable path — not autonomous work.
 
 ### 1. Autonomous items closed this push
 
-| id | item | outcome |
-| --- | --- | --- |
-| X7 | softmax mask sentinel | 4 magic magnitudes → one dtype-aware `finfo.min` |
-| X8 / eps | AF2 OPM eps + per-family confidence eps | eps analysis (`EPSILON_ANALYSIS.md`): only the softmax-sentinel is math-unifiable (applied); per-family eps upstream-faithful, kept and config-surfaced in the family READMEs |
-| X5 | boltz2 `.double()` | removed (dtype-transparent, measured **7.58e-7** @ n_step=200); boltzgen `noise_scale²` faithful preserved |
-| A3 | `sample_schedule_af3` → `karras` | renamed |
-| A5 | residue_constants neutral maps | moved |
-| A6 / A7 | triangle direction spelling / spelling nits | unified (folded into trunk / B) |
-| B-nv1 | one-letter table | unified |
-| B-nv8 | pTM kernel extract | done (`modules/head/tm.py`; max_abs **0.0** across 5 families) |
-| B-nv10 | converter schema | frozen ordinary-pair schema (per-family README schema tables + `HUB_PUBLISH_PLAN.md` §7.3) |
-| OP2 | AdaptiveLayerNorm → OOps fused `adaptive_layer_norm` | re-wired to consume the converter's fused `conditioning_projection (2*hidden,cond)` layout — the #1 converter-weight-surgery win; consumers (Protenix/Boltz/ESMFold cond) parity-gated no-regression |
-| OP3 | TriangleAttention → OOps flash `triangle_attention` (+ varlen) | routed (Trunk wave); OP1 parity covers TriangleAttention e2e |
-| OP4 | PWA dual-eps | gated `norm_pair_eps` guard landed (Trunk wave) — was rel-L2 0.125 when eps-unequal |
-| C9 | NA-MPNN released-ckpt re-validate | VALIDATED under the frozen API |
-| — | all-checkpoint coverage | §9.1 checkpoint inventory covers every published variant (per-family lists in `HUB_PUBLISH_PLAN.md`) |
-| — | biotite venv fix | per-family venv pins isolated (1.4.0 / 1.7.1 / 1.0.1) — parity imports OFoldX + upstream in one process |
-| — | boltz2 `contract.py` | typed tensor boundary frozen (with the method_feature 4→1 + dtype-transparency fixes) |
-| — | mpnn_packer README | authored model card / side-chain-packing contract (`processor.json` `atom_context_num`) |
-| — | §9.1 publication docs | documented limitations + licensing/redistribution facts per family (READMEs + `HUB_PUBLISH_PLAN.md`) |
+| id       | item                                                           | outcome                                                                                                                                                                                              |
+| -------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| X7       | softmax mask sentinel                                          | 4 magic magnitudes → one dtype-aware `finfo.min`                                                                                                                                                     |
+| X8 / eps | AF2 OPM eps + per-family confidence eps                        | eps analysis (`EPSILON_ANALYSIS.md`): only the softmax-sentinel is math-unifiable (applied); per-family eps upstream-faithful, kept and config-surfaced in the family READMEs                        |
+| X5       | boltz2 `.double()`                                             | removed (dtype-transparent, measured **7.58e-7** @ n_step=200); boltzgen `noise_scale²` faithful preserved                                                                                           |
+| A3       | `sample_schedule_af3` → `karras`                               | renamed                                                                                                                                                                                              |
+| A5       | residue_constants neutral maps                                 | moved                                                                                                                                                                                                |
+| A6 / A7  | triangle direction spelling / spelling nits                    | unified (folded into trunk / B)                                                                                                                                                                      |
+| B-nv1    | one-letter table                                               | unified                                                                                                                                                                                              |
+| B-nv8    | pTM kernel extract                                             | done (`modules/head/tm.py`; max_abs **0.0** across 5 families)                                                                                                                                       |
+| B-nv10   | converter schema                                               | frozen ordinary-pair schema (per-family README schema tables + `HUB_PUBLISH_PLAN.md` §7.3)                                                                                                           |
+| OP2      | AdaptiveLayerNorm → OOps fused `adaptive_layer_norm`           | re-wired to consume the converter's fused `conditioning_projection (2*hidden,cond)` layout — the #1 converter-weight-surgery win; consumers (Protenix/Boltz/ESMFold cond) parity-gated no-regression |
+| OP3      | TriangleAttention → OOps flash `triangle_attention` (+ varlen) | routed (Trunk wave); OP1 parity covers TriangleAttention e2e                                                                                                                                         |
+| OP4      | PWA dual-eps                                                   | gated `norm_pair_eps` guard landed (Trunk wave) — was rel-L2 0.125 when eps-unequal                                                                                                                  |
+| C9       | NA-MPNN released-ckpt re-validate                              | VALIDATED under the frozen API                                                                                                                                                                       |
+| —        | all-checkpoint coverage                                        | §9.1 checkpoint inventory covers every published variant (per-family lists in `HUB_PUBLISH_PLAN.md`)                                                                                                 |
+| —        | biotite venv fix                                               | per-family venv pins isolated (1.4.0 / 1.7.1 / 1.0.1) — parity imports OFoldX + upstream in one process                                                                                              |
+| —        | boltz2 `contract.py`                                           | typed tensor boundary frozen (with the method_feature 4→1 + dtype-transparency fixes)                                                                                                                |
+| —        | mpnn_packer README                                             | authored model card / side-chain-packing contract (`processor.json` `atom_context_num`)                                                                                                              |
+| —        | §9.1 publication docs                                          | documented limitations + licensing/redistribution facts per family (READMEs + `HUB_PUBLISH_PLAN.md`)                                                                                                 |
 
 ### 2. FINAL remaining — owner-gated or no runnable path (NOT autonomous)
 
@@ -1597,6 +1618,7 @@ that does not exist today.
   (contract-level: different arch / deferred / bounded-reopened vertical), not defects.
 
 <!-- proposed 2026-07-20 via §3.5 Structure I/O ratification investigation; OWNER VERDICT 2026-07-20: ACCEPTED (freeze the implemented I/O surface; scope only the codec instances-ordering facet open) -->
+
 ## Owner review — §3.5 Structure I/O contract ratification
 
 **Verdict: ACCEPTED.** The Structure I/O surface that was implemented and public-exported after the 2026-07-16 §3.5.1

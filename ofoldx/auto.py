@@ -3,8 +3,9 @@ r"""Canonical overloaded AutoModel and AutoProcessor factories."""
 from __future__ import annotations
 
 from os import PathLike
-from typing import Any
+from typing import cast
 
+import chanfig
 import torch
 
 from .hub import (
@@ -16,6 +17,7 @@ from .hub import (
 )
 from .model import Model
 from .models.registry import MODELS
+from .processor import Processor
 
 
 class AutoModel:
@@ -23,7 +25,7 @@ class AutoModel:
 
     def __new__(
         cls,
-        pretrained_or_config: object,
+        pretrained_or_config: chanfig.Config | str | PathLike[str],
         *,
         revision: str | None = None,
         token: str | None = None,
@@ -66,7 +68,7 @@ class AutoModel:
 class AutoProcessor:
     r"""Load a registered Processor from a model repository."""
 
-    def __new__(
+    def __new__(  # type: ignore[misc]
         cls,
         pretrained: str | PathLike[str],
         *,
@@ -74,7 +76,7 @@ class AutoProcessor:
         token: str | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> Any:
+    ) -> Processor:
         repository = resolve_repository(
             pretrained,
             revision=revision,
@@ -92,7 +94,7 @@ class AutoProcessor:
         token: str | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> Any:
+    ) -> Processor:
         r"""Thin familiar spelling of ``AutoProcessor(pretrained, ...)``."""
 
-        return cls(pretrained, revision=revision, token=token, device=device, dtype=dtype)
+        return cast(Processor, cls(pretrained, revision=revision, token=token, device=device, dtype=dtype))

@@ -1,4 +1,4 @@
-r"""OFoldX's biological operation boundary for released ProteinMPNN computations."""
+r"""ProteinMPNN sequence design, scoring, and probability Pipelines."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ _GENERATED_TOKEN_INDEX_BY_LETTER["X"] = AMINO_ACID_UNKNOWN_TOKEN
 
 
 class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]):
-    r"""Bind one ProteinMpnn Model–Processor pair for biological operations."""
+    r"""Bind one ProteinMPNN Model and Processor for biological operations."""
 
     def design(
         self,
@@ -60,7 +60,38 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnDesignResult:
-        r"""Design sequences for selected positions on a fixed backbone."""
+        r"""Design ProteinMPNN sequences on a fixed backbone.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with the required backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
+            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
+                ``pssm_probabilities``.
+            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
+            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
+            num_candidates: Number of complete sequence candidates to sample.
+            num_decoding_orders: Number of decoding orders used to score the input sequence.
+            temperature: Positive autoregressive sampling temperature.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            global_logit_bias: Global bias vector over the 21-token vocabulary.
+            global_omit_tokens: One-letter residue tokens excluded from sampling.
+            pssm_mixture: Global PSSM mixture weight between zero and one.
+            pssm_log_odds_threshold: Optional minimum PSSM log odds retained during sampling.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            A ``ProteinMpnnDesignResult`` containing sampled candidates and the input-sequence
+            ``ScoreResult``.
+
+        Notes:
+            ``seed`` and ``generator`` are mutually exclusive. Candidates follow sampling order;
+            input-score evaluations follow decoding-order draw order.
+        """
 
         model_input = self.processor(
             input,
@@ -97,7 +128,26 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Score one sequence over independently drawn decoding orders."""
+        r"""Score a ProteinMPNN sequence over independently drawn decoding orders.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            sequence: Optional target sequence as one-letter text or an instance-to-sequence
+                mapping. ``None`` scores the structure's identities.
+            design_positions: Residue occurrences included in the designed-sequence score.
+                ``None`` selects every valid protein occurrence.
+            num_decoding_orders: Number of independent decoding orders to evaluate.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            A ``ScoreResult`` containing designed and global sequence NLL scores.
+
+        Notes:
+            Score ``evaluations`` follow the decoding-order axis. ``seed`` and ``generator`` are
+            mutually exclusive.
+        """
 
         model_input = self.processor(input, sequence=sequence, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
@@ -119,7 +169,25 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+        r"""Compute sequence-conditioned autoregressive probabilities.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences treated as designable. ``None`` selects every
+                valid protein occurrence.
+            conditions: Tied-identity conditions applied to decoding order.
+            num_decoding_orders: Number of independent decoding orders to evaluate.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with sequence-conditioned logits and decoding ranks.
+
+        Notes:
+            The leading tensor axis enumerates decoding orders, and the residue axis follows
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(input, design_positions=design_positions, conditions=conditions)
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
@@ -141,7 +209,25 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return order-dependent sequence-free autoregressive probabilities."""
+        r"""Compute sequence-free autoregressive probabilities.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences treated as designable. ``None`` selects every
+                valid protein occurrence.
+            conditions: Tied-identity conditions applied to decoding order.
+            num_decoding_orders: Number of independent decoding orders to evaluate.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with sequence-free logits and decoding ranks.
+
+        Notes:
+            The leading tensor axis enumerates decoding orders, and the residue axis follows
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(input, design_positions=design_positions, conditions=conditions)
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
@@ -162,7 +248,25 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-last conditional probabilities for every row."""
+        r"""Compute target-last conditional probabilities for every residue row.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences marked as designable in the returned carrier.
+                ``None`` selects every valid protein occurrence.
+            num_decoding_orders: Number of independent base decoding orders to evaluate.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with each target decoded after all other residues.
+
+        Notes:
+            ``logits`` use decoding-order, target-residue, and vocabulary axes;
+            ``decoding_ranks`` add a final residue-order axis. Residue axes follow
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(input, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
@@ -183,7 +287,25 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-first sequence-free probabilities for every row."""
+        r"""Compute target-first unconditional probabilities for every residue row.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path.
+            design_positions: Residue occurrences marked as designable in the returned carrier.
+                ``None`` selects every valid protein occurrence.
+            num_decoding_orders: Number of independent base decoding orders to evaluate.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator.
+
+        Returns:
+            An ``MpnnProbabilityResult`` with each target decoded before all other residues.
+
+        Notes:
+            ``logits`` use decoding-order, target-residue, and vocabulary axes;
+            ``decoding_ranks`` add a final residue-order axis. Residue axes follow
+            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         model_input = self.processor(input, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
@@ -196,12 +318,15 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
 
 
 class ProteinMpnnDesignAndPackPipeline:
-    r"""Compose the ProteinMpnn designer with the MpnnPacker over one source.
+    r"""Compose the ProteinMPNN designer with MPNN Packer over one source.
 
-    The released protein and soluble combined command designs sequences on a fixed
-    backbone and then packs each design. Both stages read one canonical
-    ``Structure`` parsed exactly once, and a supplied random stream is consumed by
-    design first and advanced pack-major across every candidate.
+    The Pipeline designs sequences on a fixed backbone and then packs each design. Both stages
+    read one canonical ``Structure`` parsed exactly once, and a supplied random stream is
+    consumed by design first and advanced pack-major across every candidate.
+
+    Args:
+        designer: ProteinMPNN sequence-design Pipeline.
+        packer: MPNN Packer Pipeline applied to each designed sequence.
     """
 
     def __init__(
@@ -252,7 +377,45 @@ class ProteinMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]:
-        r"""Design sequences on one canonical Structure and pack each candidate."""
+        r"""Design ProteinMPNN sequences and pack every resulting candidate.
+
+        Args:
+            input: Canonical ``Structure`` or local PDB path, parsed once for both stages.
+            design_positions: Protein residue occurrences to design. ``None`` selects every
+                occurrence with the required backbone coordinates.
+            conditions: Allowed-identity and tied-identity conditions.
+            tied_weights: Optional sampling coefficient for each member of a tied group.
+            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
+            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
+                ``pssm_probabilities``.
+            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
+            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
+            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            num_candidates: Number of complete sequence candidates to sample.
+            num_decoding_orders: Number of decoding orders used to score the input sequence.
+            temperature: Positive autoregressive sampling temperature.
+            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            global_logit_bias: Global bias vector over the 21-token vocabulary.
+            global_omit_tokens: One-letter residue tokens excluded from sampling.
+            pssm_mixture: Global PSSM mixture weight between zero and one.
+            pssm_log_odds_threshold: Optional minimum PSSM log odds retained during sampling.
+            use_packing_atom_context: Whether the packing stage uses nonprotein atom context.
+            repack_everything: Whether to pack every eligible residue instead of only designed
+                positions.
+            num_packs_per_candidate: Number of packed structures generated per sequence candidate.
+            num_denoising_steps: Number of side-chain denoising steps per packed structure.
+            num_torsion_samples: Number of torsion proposals evaluated per denoising step.
+            seed: Optional integer seed.
+            generator: Optional PyTorch random generator advanced through design before packing.
+
+        Returns:
+            A pair containing the ``ProteinMpnnDesignResult`` and one ``PackResult`` per sequence
+            candidate.
+
+        Notes:
+            The ``PackResult`` tuple follows candidate order, and each result's predictions follow
+            packing-sample order. ``seed`` and ``generator`` are mutually exclusive.
+        """
 
         structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.designer.processor.process_structure(
@@ -307,7 +470,7 @@ def _global_omit_token_mask(
     *,
     device: torch.device,
 ) -> Tensor | None:
-    r"""Lower released one-letter omit tokens to a generatable-class support mask.
+    r"""Lower one-letter omit tokens to a generatable-class support mask.
 
     An empty selection carries no omission and enables ProteinMPNN's reachable
     twenty-first generated class. Every token is a generatable one-letter identity;

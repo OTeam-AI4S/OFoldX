@@ -16,6 +16,7 @@ bsz  waste |     NT fwd      pad fwd  fwd spd/mem |      NT f+b        pad f+b  
   8  1.16x | 1247ms/53708M 974ms/24626M 0.78x/2.18 |          OOM  7054ms/57734M       -
  16  1.12x |          OOM  1934ms/48867M      -     |          OOM           OOM        -
 ```
+
 (`spd` = padded_time / NT_time, >1 means NT faster; `mem` = NT_peak / padded_peak, <1 means NT lighter.)
 
 ## Reading the result
@@ -48,11 +49,13 @@ bsz  waste |     NT fwd       pad fwd  fwd spd/mem |      NT f+b        pad f+b 
   2  1.39x | 4139ms/31477M 3072ms/26471M 0.74x/1.19 | 6465ms/34386M 5239ms/26560M  0.81x/1.29
   4  1.22x |          OOM  4768ms/49390M     -       |          OOM  8851ms/51492M       -
 ```
+
 NT is SLOWER (0.74-0.81x) and uses MORE memory (1.19-1.29x), and OOMs at bsz=4 where padded fits. A historical
 one-off phase profile (bsz=2, two 256-token structs) measured: trunk NT 1.53x slower / 0.94x mem; diff_denoise (grad)
 2.02x slower / **1.76x mem**; diff_rollout (no_grad) 1.13x slower / **0.20x mem**.
 
 **Why NT loses here:**
+
 1. **Fixed crop kills token-length variance.** Antibodies cropped to 256 cluster AT 256, so the trunk (the bulk
    of compute, token×token pair) has ~no padding waste to skip; the fused segmented/varlen Triton kernels are
    then pure overhead vs cuBLAS dense batched matmul (1.53x). NT's trunk win needs structures meaningfully

@@ -2,8 +2,8 @@ r"""
 Backend dispatch for the gated triangle multiplicative update.
 
 The dispatcher owns backend selection and calling-convention adaptation.
-[`TriangleMultiplication`][] passes the ordinary tensor arguments without a
-second validation layer.
+[`TriangleMultiplication`][ofoldx.modules.attention.triangle.TriangleMultiplication] passes the ordinary tensor
+arguments without a second validation layer.
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ def triangle_multiplication(
     pair_mask: Tensor | None,
     *,
     outgoing: bool,
-    norm_input_weight: Tensor,
-    norm_input_bias: Tensor,
+    input_norm_weight: Tensor,
+    input_norm_bias: Tensor,
     left_value_weight: Tensor,
     left_gate_weight: Tensor,
     right_value_weight: Tensor,
     right_gate_weight: Tensor,
-    norm_output_weight: Tensor,
-    norm_output_bias: Tensor,
+    output_norm_weight: Tensor,
+    output_norm_bias: Tensor,
     output_weight: Tensor,
     output_gate_weight: Tensor,
     eps: float,
@@ -57,18 +57,25 @@ def triangle_multiplication(
             contraction.
         outgoing: Contract over the outgoing edge (``ikh,jkh->ijh``) when ``True``, else the incoming
             edge (``kih,kjh->ijh``).
-        norm_input_weight, norm_input_bias: Input LayerNorm parameters.
-        left_value_weight, left_gate_weight: Bias-free left factor value/gate projection weights;
-            ``hidden_size`` is ``left_value_weight.shape[0]``.
-        right_value_weight, right_gate_weight: Bias-free right factor value/gate projection weights.
-        norm_output_weight, norm_output_bias: Output LayerNorm parameters applied to the contraction.
-        output_weight: Bias-free projection back to ``pair_size``.
-        output_gate_weight: Bias-free gate projection applied to the normalized input.
+        input_norm_weight: Input LayerNorm weight.
+        input_norm_bias: Input LayerNorm bias.
+        left_value_weight: Left factor value-projection weight; ``hidden_size`` is
+            ``left_value_weight.shape[0]``.
+        left_gate_weight: Left factor gate-projection weight.
+        right_value_weight: Right factor value-projection weight.
+        right_gate_weight: Right factor gate-projection weight.
+        output_norm_weight: Output LayerNorm weight applied to the contraction.
+        output_norm_bias: Output LayerNorm bias applied to the contraction.
+        output_weight: Projection weight mapping back to ``pair_size``.
+        output_gate_weight: Gate-projection weight applied to the normalized input.
         eps: LayerNorm epsilon shared by the input and output normalizations.
         operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
-        left_value_bias, left_gate_bias, right_value_bias, right_gate_bias, output_bias,
-            output_gate_bias: Optional per-projection biases (AlphaFold 2 lineage). Default ``None`` ⇒
-            the projection is applied bias-free, byte-identical to the AlphaFold 3 lineage.
+        left_value_bias: Optional left value-projection bias.
+        left_gate_bias: Optional left gate-projection bias.
+        right_value_bias: Optional right value-projection bias.
+        right_gate_bias: Optional right gate-projection bias.
+        output_bias: Optional output-projection bias.
+        output_gate_bias: Optional output gate-projection bias.
 
     Returns:
         ``(..., N, N, pair_size)`` pair update, matching the shape of ``pair``.
@@ -83,14 +90,14 @@ def triangle_multiplication(
         ...     pair,
         ...     None,
         ...     outgoing=True,
-        ...     norm_input_weight=torch.ones(pair_size),
-        ...     norm_input_bias=torch.zeros(pair_size),
+        ...     input_norm_weight=torch.ones(pair_size),
+        ...     input_norm_bias=torch.zeros(pair_size),
         ...     left_value_weight=torch.randn(hidden_size, pair_size),
         ...     left_gate_weight=torch.randn(hidden_size, pair_size),
         ...     right_value_weight=torch.randn(hidden_size, pair_size),
         ...     right_gate_weight=torch.randn(hidden_size, pair_size),
-        ...     norm_output_weight=torch.ones(hidden_size),
-        ...     norm_output_bias=torch.zeros(hidden_size),
+        ...     output_norm_weight=torch.ones(hidden_size),
+        ...     output_norm_bias=torch.zeros(hidden_size),
         ...     output_weight=torch.randn(pair_size, hidden_size),
         ...     output_gate_weight=torch.randn(pair_size, pair_size),
         ...     eps=1e-5,
@@ -111,14 +118,14 @@ def triangle_multiplication(
             pair,
             pair_mask,
             outgoing=outgoing,
-            norm_input_weight=norm_input_weight,
-            norm_input_bias=norm_input_bias,
+            input_norm_weight=input_norm_weight,
+            input_norm_bias=input_norm_bias,
             left_value_weight=left_value_weight,
             left_gate_weight=left_gate_weight,
             right_value_weight=right_value_weight,
             right_gate_weight=right_gate_weight,
-            norm_output_weight=norm_output_weight,
-            norm_output_bias=norm_output_bias,
+            output_norm_weight=output_norm_weight,
+            output_norm_bias=output_norm_bias,
             output_weight=output_weight,
             output_gate_weight=output_gate_weight,
             left_value_bias=left_value_bias,
@@ -131,7 +138,7 @@ def triangle_multiplication(
         )
     hidden_size = left_value_weight.shape[0]
     pair_size = pair.shape[-1]
-    normalized = torch.nn.functional.layer_norm(pair, (pair_size,), norm_input_weight, norm_input_bias, eps)
+    normalized = torch.nn.functional.layer_norm(pair, (pair_size,), input_norm_weight, input_norm_bias, eps)
     left = torch.nn.functional.linear(normalized, left_value_weight, left_value_bias) * torch.sigmoid(
         torch.nn.functional.linear(normalized, left_gate_weight, left_gate_bias)
     )
@@ -141,7 +148,7 @@ def triangle_multiplication(
     left, right = _mask_triangle_factors(left, right, pair_mask)
     equation = "...ikh,...jkh->...ijh" if outgoing else "...kih,...kjh->...ijh"
     update = torch.einsum(equation, left, right)
-    normed_update = torch.nn.functional.layer_norm(update, (hidden_size,), norm_output_weight, norm_output_bias, eps)
+    normed_update = torch.nn.functional.layer_norm(update, (hidden_size,), output_norm_weight, output_norm_bias, eps)
     update = torch.nn.functional.linear(normed_update, output_weight, output_bias)
     return update * torch.sigmoid(torch.nn.functional.linear(normalized, output_gate_weight, output_gate_bias))
 

@@ -15,15 +15,15 @@ class PairBiasedSelfAttention(nn.Module):
     Self-attention over the single representation with the pair representation as per-head bias.
 
     Layer-norms the single and pair inputs, projects the normalized pair to a per-head additive
-    attention bias, and runs gated self-attention. This is the token-level attention block of the
-    Pairformer/trunk, where pairwise geometry conditions single-representation mixing.
+    attention bias, and runs gated self-attention. It returns an additive attention update; the
+    caller block owns the outer residual.
 
     Args:
         hidden_size: Width of the single-representation token channel.
         pair_size: Width of the pair-representation channel used to derive the bias.
         num_attention_heads: Number of attention heads.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
-            to the ``sdpa`` reference otherwise.
+            to ``sdpa`` otherwise.
 
     Examples:
         >>> import torch
@@ -52,7 +52,7 @@ class PairBiasedSelfAttention(nn.Module):
             query_bias=True,
             operator_backend=operator_backend,
         )
-        self.norm_pair = LayerNorm(pair_size, bias=True)
+        self.pair_norm = LayerNorm(pair_size, bias=True)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
 
     def forward(
@@ -62,7 +62,7 @@ class PairBiasedSelfAttention(nn.Module):
         pair_mask: Tensor | None = None,
     ) -> Tensor:
         r"""
-        Layer-norm the single and pair inputs, project the pair to a per-head bias, and self-attend.
+        Layer-norm the inputs, project the pair bias, and return an additive attention update.
 
         The normalized ``pair`` is linearly projected to ``num_attention_heads`` channels and moved to
         `[..., num_heads, N, N]` as the additive per-head bias; ``hidden`` then attends over its ``N``
@@ -75,7 +75,7 @@ class PairBiasedSelfAttention(nn.Module):
                 are excluded from the softmax.
 
         Returns:
-            Updated single representation `[..., N, hidden_size]`.
+            Additive attention update `[..., N, hidden_size]`; the caller owns the outer residual.
 
         Examples:
             >>> import torch
@@ -90,6 +90,6 @@ class PairBiasedSelfAttention(nn.Module):
         """
 
         normalized = self.hidden_norm(hidden)
-        pair_normalized = self.norm_pair(pair)
+        pair_normalized = self.pair_norm(pair)
         bias = self.bias_projection(pair_normalized).movedim(-1, -3)
         return self.attention(normalized, biases=(bias,), attention_mask=pair_mask)

@@ -102,7 +102,7 @@ def atom_records_from_array(
     occupancies = annotation("occupancy")
     b_factors = annotation("b_factor")
     altloc_ids = annotation("altloc_id")
-    sym_ids = annotation("sym_id")
+    symmetry_ids = annotation("sym_id")
     auth_asym_ids = annotation("auth_asym_id")
     auth_seq_ids = annotation("auth_seq_id")
     auth_comp_ids = annotation("auth_comp_id")
@@ -177,7 +177,7 @@ def atom_records_from_array(
                 b_factor=_optional_float(_at(b_factors, index)),
                 coordinates=coordinate,
                 coordinate_present=coordinate_present,
-                symmetry_id=present_string(_at(sym_ids, index)),
+                symmetry_id=present_string(_at(symmetry_ids, index)),
                 canonical_site=canonical_site,
             )
         )

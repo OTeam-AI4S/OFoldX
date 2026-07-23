@@ -55,18 +55,51 @@ _HEAD_SCOPE_MAP = {
     "predicted_lddt_head": "predicted_lddt_head",
 }
 _INPUT_EMBEDDING_SCOPE_MAP = {
-    "preprocess_1d": "preprocess_1d",
-    "preprocess_msa": "preprocess_msa",
-    "left_single": "left_single",
-    "right_single": "right_single",
-    "relpos_projection": "relpos_projection",
+    "preprocess_1d": "token_projection",
+    "preprocess_msa": "msa_projection",
+    "left_single": "pair_left_projection",
+    "right_single": "pair_right_projection",
+    "relpos_projection": "relative_position_projection",
     # Official AF2 has this typo in the Haiku module name.
-    "pair_activiations": "relpos_projection",
+    "pair_activiations": "relative_position_projection",
+}
+_TEMPLATE_PROJECTION_SCOPE_MAP = {
+    "embedding2d": "template_pair_projection",
+    "template_pair_embedding_0": "distogram_projection",
+    "template_pair_embedding_1": "pseudo_beta_mask_projection",
+    "template_pair_embedding_2": "column_residue_type_projection",
+    "template_pair_embedding_3": "row_residue_type_projection",
+    "template_pair_embedding_4": "unit_vector_x_projection",
+    "template_pair_embedding_5": "unit_vector_y_projection",
+    "template_pair_embedding_6": "unit_vector_z_projection",
+    "template_pair_embedding_7": "backbone_pair_mask_projection",
+    "template_pair_embedding_8": "query_pair_projection",
+    "output_linear": "output_projection",
+}
+_STRUCTURE_PROJECTION_SCOPE_MAP = {
+    "q_scalar": "query_scalar_projection",
+    "kv_scalar": "key_value_scalar_projection",
+    "q_point_local": "query_point_projection",
+    "kv_point_local": "key_value_point_projection",
+    "attention_2d": "pair_bias_projection",
+    "q_scalar_projection": "query_scalar_projection",
+    "k_scalar_projection": "key_scalar_projection",
+    "v_scalar_projection": "value_scalar_projection",
+    "q_point_projection": "query_point_projection",
+    "k_point_projection": "key_point_projection",
+    "v_point_projection": "value_point_projection",
+}
+_STRUCTURE_SCOPE_MAP = {
+    "single_layer_norm": "single_norm",
+    "pair_layer_norm": "pair_norm",
+    "initial_projection": "input_projection",
+    "attention_layer_norm": "attention_norm",
+    "transition_layer_norm": "transition_norm",
 }
 _RECYCLING_SCOPE_MAP = {
-    "prev_pos_linear": "prev_pos_linear",
-    "prev_msa_first_row_norm": "prev_msa_first_row_norm",
-    "prev_pair_norm": "prev_pair_norm",
+    "prev_pos_linear": "previous_positions_projection",
+    "prev_msa_first_row_norm": "previous_msa_first_row_norm",
+    "prev_pair_norm": "previous_pair_norm",
 }
 _EXTRA_MSA_EMBEDDINGS_SCOPE_MAP = {
     "extra_msa_activations": "extra_msa_projection",
@@ -75,20 +108,21 @@ _EXTRA_MSA_EMBEDDINGS_SCOPE_MAP = {
 _STACK_SCOPE_MAP = {
     "outer_product_mean": ("outer_product_mean",),
     "layer_norm_input": ("layer_norm_input",),
-    "input_layer_norm": ("input_layer_norm",),
-    "transition1": ("transition1",),
-    "transition2": ("transition2",),
+    "input_layer_norm": ("input_norm",),
+    "output_layer_norm": ("output_norm",),
+    "transition1": ("input_projection",),
+    "transition2": ("output_projection",),
     "msa_row_attention_with_pair_bias": ("msa_stack", "msa_row_attention_with_pair_bias"),
     "msa_column_attention": ("msa_stack", "msa_column_attention"),
     "msa_column_global_attention": ("msa_stack", "msa_column_global_attention"),
-    "msa_transition": ("msa_stack", "feed_forward"),
+    "msa_transition": ("msa_stack", "transition"),
     "triangle_multiplication_outgoing": ("pair_stack", "triangle_multiplication_outgoing"),
     "triangle_multiplication_incoming": ("pair_stack", "triangle_multiplication_incoming"),
     "triangle_attention_starting_node": ("pair_stack", "triangle_attention_starting_node"),
     "triangle_attention_ending_node": ("pair_stack", "triangle_attention_ending_node"),
-    "pair_transition": ("pair_stack", "feed_forward"),
+    "pair_transition": ("pair_stack", "transition"),
     "query_norm": ("query_norm",),
-    "feat_2d_norm": ("feat_2d_norm",),
+    "feat_2d_norm": ("pair_norm",),
     "layer_norm": ("layer_norm",),
     "center_layer_norm": ("center_layer_norm",),
     "left_gate": ("left_gate",),
@@ -245,7 +279,7 @@ def normalize_official_param_key(key: str) -> str:
 
     Examples:
         >>> normalize_official_param_key("alphafold/alphafold_iteration/evoformer/preprocess_1d//weights")
-        'input_embeddings.preprocess_1d.weight'
+        'input_embeddings.token_projection.weight'
         >>> normalize_official_param_key("alphafold/alphafold_iteration/structure_module/layer_norm//scale")
         'structure_module.layer_norm.weight'
     """
@@ -257,7 +291,7 @@ def normalize_official_param_key(key: str) -> str:
     elif parts[:1] == ["alphafold"]:
         parts = parts[1:]
     normalized_parts = _normalize_scope_parts(parts)
-    combined = _rename_triangle_attention_children([*normalized_parts, *_normalize_parameter_parts(name)])
+    combined = _rename_attention_children([*normalized_parts, *_normalize_parameter_parts(name)])
     return ".".join(combined)
 
 
@@ -271,13 +305,14 @@ def _expand_stacked_tensor(
         return {target_key: converted_tensor}
     if ".template_pair_stack.stacked.pair_stack." in target_key:
         marker = ".template_pair_stack.stacked.pair_stack."
-        replacement = ".template_pair_stack.layers.{index}."
-    elif ".template_embedding_iteration.layers.stacked.pair_stack." in target_key:
-        marker = ".template_embedding_iteration.layers.stacked.pair_stack."
-        replacement = ".template_embedding_iteration.layers.{index}."
+        replacement = ".template_pair_stack.blocks.{index}."
+    elif ".template_embedding_iteration.blocks.stacked.pair_stack." in target_key:
+        marker = ".template_embedding_iteration.blocks.stacked.pair_stack."
+        replacement = ".template_pair_stack.blocks.{index}."
     elif ".blocks.stacked." in target_key:
         marker = ".blocks.stacked."
         replacement = ".blocks.{index}."
+        target_key = target_key.replace(".msa_stack.", ".msa_block.").replace(".pair_stack.", ".pair_block.")
     elif ".layers.stacked." in target_key:
         marker = ".layers.stacked."
         replacement = ".layers.{index}."
@@ -296,7 +331,7 @@ def _is_stacked_tensor(source_key: str, target_key: str, tensor: Tensor) -> bool
             ".layers.stacked.",
             ".blocks.stacked.",
             ".template_pair_stack.stacked.pair_stack.",
-            ".template_embedding_iteration.layers.stacked.pair_stack.",
+            ".template_embedding_iteration.blocks.stacked.pair_stack.",
         )
     ):
         return False
@@ -340,7 +375,7 @@ def _normalize_scope_parts(parts: list[str]) -> list[str]:
 
 def _normalize_evoformer_scope(parts: list[str]) -> list[str]:
     if not parts:
-        return ["evoformer"]
+        return ["evoformer_stack"]
     input_embeddings_scope = _INPUT_EMBEDDING_SCOPE_MAP.get(parts[0])
     if input_embeddings_scope is not None:
         return ["input_embeddings", input_embeddings_scope, *_normalize_stack_scope(parts[1:])]
@@ -353,16 +388,20 @@ def _normalize_evoformer_scope(parts: list[str]) -> list[str]:
     if parts[0] == "single_activations":
         return ["single_projection", *_normalize_stack_scope(parts[1:])]
     if parts[0] in {"template_single_embedding", "template_projection"}:
-        return ["template_msa_embeddings", *_normalize_stack_scope(parts)]
+        projection = {
+            "template_single_embedding": "input_projection",
+            "template_projection": "output_projection",
+        }[parts[0]]
+        return ["template_msa_embedder", projection, *_normalize_stack_scope(parts[1:])]
     if parts[0] == "template_embedding":
         return ["template_embedder", *_normalize_stack_scope(parts[1:])]
     if parts[0] == "evoformer_iteration":
-        return ["evoformer", "blocks", "stacked", *_normalize_evoformer_block_scope(parts[1:])]
+        return ["evoformer_stack", "blocks", "stacked", *_normalize_evoformer_block_scope(parts[1:])]
     if parts[0] == "extra_msa_iteration":
         return ["extra_msa_stack", "blocks", "stacked", *_normalize_evoformer_block_scope(parts[1:])]
     if parts[0] == "extra_msa_stack":
         return ["extra_msa_stack", "blocks", "stacked", *_normalize_evoformer_block_scope(parts[1:])]
-    return ["evoformer", *_normalize_stack_scope(parts)]
+    return ["evoformer_stack", *_normalize_stack_scope(parts)]
 
 
 def _normalize_evoformer_block_scope(parts: list[str]) -> list[str]:
@@ -384,6 +423,10 @@ def _normalize_stack_scope(parts: list[str]) -> list[str]:
         if part == "__layer_stack_no_state":
             normalized.append("stacked")
             continue
+        template_projection = _TEMPLATE_PROJECTION_SCOPE_MAP.get(part)
+        if template_projection is not None:
+            normalized.append(template_projection)
+            continue
         mapped = _STACK_SCOPE_MAP.get(part)
         if mapped is None:
             normalized.append(part)
@@ -394,24 +437,24 @@ def _normalize_stack_scope(parts: list[str]) -> list[str]:
 
 def _rename_outer_product_mean_norm(normalized: list[str]) -> list[str]:
     # The outer-product mean now subclasses the shared ``OuterProductMean``, whose pre-LayerNorm is
-    # registered as ``norm_msa``; the official Haiku scope names it ``layer_norm_input`` (the same
+    # registered as ``msa_norm``; the official Haiku scope names it ``layer_norm_input`` (the same
     # name the triangle-multiplication norm uses, which must keep its ``layer_norm_input`` target).
     for index in range(1, len(normalized)):
         if normalized[index] == "layer_norm_input" and normalized[index - 1] == "outer_product_mean":
-            normalized[index] = "norm_msa"
+            normalized[index] = "msa_norm"
     return _rename_triangle_multiplication_children(normalized)
 
 
 # Child-leaf renames for the unified ``TriangleMultiplication``: the shared bias-free module names its
-# submodules ``norm_input``/``norm_output``/``left_gate_projection``/``right_gate_projection``/
+# submodules ``input_norm``/``output_norm``/``left_gate_projection``/``right_gate_projection``/
 # ``gate_projection`` (the official Haiku scope uses ``layer_norm_input``/``center_layer_norm``/
 # ``left_gate``/``right_gate``/``gating_linear``). For the *incoming* update the shared module fixes the
 # canonical einsum ``"...kih,...kjh->...ijh"`` (left owns row ``i``, right owns column ``j``), so the
 # left/right value and gate projections must swap to reproduce DeepMind's own ``"...kjc,...kic->..."``
 # incoming contraction. Outgoing loads straight through. See TRUNK_EINSUM_LOCK.md.
 _TRIANGLE_MULTIPLICATION_CHILD_MAP = {
-    "layer_norm_input": "norm_input",
-    "center_layer_norm": "norm_output",
+    "layer_norm_input": "input_norm",
+    "center_layer_norm": "output_norm",
     "left_projection": "left_projection",
     "right_projection": "right_projection",
     "left_gate": "left_gate_projection",
@@ -428,18 +471,20 @@ _TRIANGLE_MULTIPLICATION_CHILD_MAP_SWAPPED = {
 }
 
 
-# Child renames for the unified ``TriangleAttention`` (shared bias-free module + the AlphaFold 2
-# subclass): its pre-attention LayerNorm is registered ``norm_pair`` and its per-head triangle-bias
-# projection ``bias_projection`` (the official Haiku names are ``query_norm``/``feat_2d_weights``, which
-# other modules — MSA row/column attention — keep). Scope the rename to a triangle-attention parent.
+# Child renames for native attention state trees. Source modules reuse
+# ``feat_2d_weights`` for different pair-bias projections, so parent scope owns the mapping.
 _TRIANGLE_ATTENTION_PARENTS = frozenset({"triangle_attention_starting_node", "triangle_attention_ending_node"})
-_TRIANGLE_ATTENTION_CHILD_MAP = {"query_norm": "norm_pair", "feat_2d_weights": "bias_projection"}
+_TRIANGLE_ATTENTION_CHILD_MAP = {"query_norm": "pair_norm", "feat_2d_weights": "bias_projection"}
+_MSA_ROW_ATTENTION_CHILD_MAP = {"feat_2d_weights": "pair_bias_projection"}
 
 
-def _rename_triangle_attention_children(parts: list[str]) -> list[str]:
+def _rename_attention_children(parts: list[str]) -> list[str]:
     for index in range(1, len(parts)):
-        if parts[index - 1] in _TRIANGLE_ATTENTION_PARENTS:
+        parent = parts[index - 1]
+        if parent in _TRIANGLE_ATTENTION_PARENTS:
             parts[index] = _TRIANGLE_ATTENTION_CHILD_MAP.get(parts[index], parts[index])
+        elif parent == "msa_row_attention_with_pair_bias":
+            parts[index] = _MSA_ROW_ATTENTION_CHILD_MAP.get(parts[index], parts[index])
     return parts
 
 
@@ -459,8 +504,16 @@ def _rename_triangle_multiplication_children(normalized: list[str]) -> list[str]
 def _normalize_structure_module_scope(parts: list[str]) -> list[str]:
     normalized: list[str] = []
     for part in parts:
+        structure_scope = _STRUCTURE_SCOPE_MAP.get(part)
+        if structure_scope is not None:
+            normalized.append(structure_scope)
+            continue
+        projection = _STRUCTURE_PROJECTION_SCOPE_MAP.get(part)
+        if projection is not None:
+            normalized.append(projection)
+            continue
         if part == "fold_iteration":
-            normalized.append("layer")
+            normalized.append("block")
             continue
         if part == "affine_update":
             normalized.append("backbone_update")
@@ -475,24 +528,28 @@ def _normalize_structure_module_scope(parts: list[str]) -> list[str]:
             normalized.append("sidechain")
             continue
 
+        if part == "unnormalized_angles" and "sidechain" in normalized:
+            normalized.append("angle_projection")
+            continue
+
         transition_index = _repeated_haiku_index(part, "transition")
-        if transition_index is not None and "layer" in normalized and "sidechain" not in normalized:
-            normalized.extend(("transition", "layers", str(transition_index)))
+        if transition_index is not None and "block" in normalized and "sidechain" not in normalized:
+            normalized.extend(("transition", "projections", str(transition_index)))
             continue
 
         input_projection_index = _repeated_haiku_index(part, "input_projection")
         if input_projection_index is not None and "sidechain" in normalized:
-            normalized.extend(("input_projection", str(input_projection_index)))
+            normalized.extend(("input_projections", str(input_projection_index)))
             continue
 
         resblock1_index = _repeated_haiku_index(part, "resblock1")
         if resblock1_index is not None and "sidechain" in normalized:
-            normalized.extend(("layers", str(resblock1_index), "linear1"))
+            normalized.extend(("blocks", str(resblock1_index), "input_projection"))
             continue
 
         resblock2_index = _repeated_haiku_index(part, "resblock2")
         if resblock2_index is not None and "sidechain" in normalized:
-            normalized.extend(("layers", str(resblock2_index), "linear2"))
+            normalized.extend(("blocks", str(resblock2_index), "output_projection"))
             continue
 
         normalized.append(part)
@@ -512,7 +569,13 @@ def _repeated_haiku_index(name: str, base: str) -> int | None:
 
 def _normalize_head_scope(parts: list[str]) -> list[str]:
     if parts[:2] == ["distogram_head", "half_logits"]:
-        return ["distogram_head", "linear"]
+        return ["distogram_head", "projection"]
+    if parts[:2] == ["predicted_lddt_head", "act_0"]:
+        return ["predicted_lddt_head", "input_projection", *parts[2:]]
+    if parts[:2] == ["predicted_lddt_head", "act_1"]:
+        return ["predicted_lddt_head", "hidden_projection", *parts[2:]]
+    if parts[:2] == ["predicted_lddt_head", "input_layer_norm"]:
+        return ["predicted_lddt_head", "input_norm", *parts[2:]]
     return parts
 
 

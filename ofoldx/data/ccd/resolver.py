@@ -14,8 +14,8 @@ from ..molecular import (
     PolymerAttachment,
 )
 
+# Hub dataset repository that distributes the CCD as Parquet rows.
 CCD_DATASET_REPOSITORY = "ofoldx/ccd"
-r"""The Hub dataset repository that distributes the CCD as Parquet rows."""
 
 _POLYMER_CHEM_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
@@ -148,15 +148,15 @@ def _lower_reference_coordinates(
     component_id: str,
     count: int,
 ) -> tuple[tuple[float, float, float] | None, ...]:
-    r"""Lower ``ref_coords`` to a per-atom coordinate tuple aligned to the atoms."""
+    r"""Lower reference coordinates to a per-atom coordinate tuple aligned to the atoms."""
 
-    raw = row.get("ref_coords")
+    raw = row.get("reference_coordinates")
     if raw is None:
         return ()
     if not isinstance(raw, (list, tuple)):
-        raise TypeError(f"CCD row {component_id!r} ref_coords must be a list")
+        raise TypeError(f"CCD row {component_id!r} reference_coordinates must be a list")
     if len(raw) != count:
-        raise ValueError(f"CCD row {component_id!r} ref_coords misaligns with atom_ids")
+        raise ValueError(f"CCD row {component_id!r} reference_coordinates misaligns with atom_ids")
 
     coordinates: list[tuple[float, float, float] | None] = []
     for entry in raw:
@@ -164,7 +164,7 @@ def _lower_reference_coordinates(
             coordinates.append(None)
             continue
         if not isinstance(entry, (list, tuple)) or len(entry) != 3:
-            raise TypeError(f"CCD row {component_id!r} ref_coords entry must be an (x, y, z) triple")
+            raise TypeError(f"CCD row {component_id!r} reference_coordinates entry must be an (x, y, z) triple")
         coordinates.append((float(entry[0]), float(entry[1]), float(entry[2])))
     return tuple(coordinates)
 

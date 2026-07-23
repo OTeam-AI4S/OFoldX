@@ -4,7 +4,7 @@ Official DeepMind AlphaFold-Multimer checkpoint conversion.
 AF-Multimer parameters ship as ``params_model_{1..5}_multimer_v3.npz`` inside
 ``alphafold_params_2022-12-06.tar``. They share the flat Haiku ``scope//name``
 convention with the monomer parameters, so this module reuses the monomer tensor
-layout conversion and stacked-layer expansion and only overrides the scope
+layout conversion and stacked-tensor expansion and only overrides the scope
 normalization that differs on the multimer surface: the chain-relative input
 embedder (``position_activations``), the multimer template embedder, the 22-class
 masked-MSA head, and the interface-TM head.
@@ -30,11 +30,11 @@ from ..model import AlphaFold2Model, AlphaFold2MultimerModel
 from . import deepmind
 
 _MULTIMER_INPUT_EMBEDDING_SCOPE_MAP = {
-    "position_activations": "position_activations",
-    "preprocess_1d": "preprocess_1d",
-    "preprocess_msa": "preprocess_msa",
-    "left_single": "left_single",
-    "right_single": "right_single",
+    "position_activations": "relative_position_projection",
+    "preprocess_1d": "token_projection",
+    "preprocess_msa": "msa_projection",
+    "left_single": "pair_left_projection",
+    "right_single": "pair_right_projection",
 }
 
 
@@ -83,8 +83,8 @@ def convert_official_multimer_state_dict(
 # activation as ``proj[..., :c]`` (left/a operand) and ``proj[..., c:]`` (right/b operand)
 # and applies the same layer norms and gating, so recovering the unfused native layout is a
 # pure row split of the fused output dimension -- mathematically identical, no model change.
-# The two LayerNorms are also renamed (``left_norm_input`` -> ``norm_input``, ``center_norm`` ->
-# ``norm_output``, the shared module's names); the fused-operand ``gating_linear`` output gate was
+# The two LayerNorms are also renamed (``left_norm_input`` -> ``input_norm``, ``center_norm`` ->
+# ``output_norm``, the shared module's names); the fused-operand ``gating_linear`` output gate was
 # already renamed to the shared ``gate_projection`` by the monomer scope normalizer's
 # triangle-multiplication post-pass, and ``output_projection`` shares its name. This applies uniformly
 # to the Evoformer, extra-MSA, and multimer template pair stacks, all of which reuse the native module.
@@ -99,7 +99,7 @@ _TRIANGLE_MULTIPLICATION_SCOPES = (
     "triangle_multiplication_outgoing",
     "triangle_multiplication_incoming",
 )
-_TRIANGLE_RENAME = {"left_norm_input": "norm_input", "center_norm": "norm_output"}
+_TRIANGLE_RENAME = {"left_norm_input": "input_norm", "center_norm": "output_norm"}
 _TRIANGLE_SPLIT_OUTGOING = {
     "projection": ("left_projection", "right_projection"),
     "gate": ("left_gate_projection", "right_gate_projection"),
@@ -193,12 +193,12 @@ def normalize_multimer_param_key(key: str) -> str:
     # The multimer template embedder's per-iteration pair stack ships as a bare Haiku
     # ``hk.layer_stack`` (leading layer dimension, no ``__layer_stack_no_state`` scope marker), so
     # the shared normalizer maps it to ``template_embedding_iteration.pair_stack.*`` without a
-    # ``layers.stacked`` marker. Insert it so ``_expand_stacked_layer_tensor`` unrolls
-    # the two layers into ``template_embedding_iteration.layers.{0,1}.pair_stack.*``.
+    # ``blocks.stacked`` marker. Insert it so ``_expand_stacked_tensor`` unrolls
+    # the two source blocks into native ``template_pair_stack.blocks.{0,1}.*`` keys.
     if ".template_embedding_iteration.pair_stack." in normalized:
         normalized = normalized.replace(
             ".template_embedding_iteration.pair_stack.",
-            ".template_embedding_iteration.layers.stacked.pair_stack.",
+            ".template_embedding_iteration.blocks.stacked.pair_stack.",
         )
     return normalized
 

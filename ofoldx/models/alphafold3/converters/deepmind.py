@@ -308,18 +308,18 @@ _MSA_STACK_SCOPE = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack"
 # Per-context Haiku scopes for the four Pairformer-block instances enumerated by the shared schema.
 # The DeepMind layout math (splits, transposes, glu chunking) stays entirely inside the leaf helpers.
 _PAIRFORMER_CONTEXTS = {
-    "trunk": ("diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer", True, "pair_feed_forward"),
-    "msa_pair": (_MSA_STACK_SCOPE, False, "feed_forward"),
+    "trunk": ("diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer", True, "pair_transition"),
+    "msa_pair": (_MSA_STACK_SCOPE, False, "transition"),
     "template": (
         "diffuser/evoformer/template_embedding/single_template_embedding/"
         "__layer_stack_no_per_layer/template_embedding_iteration",
         False,
-        "feed_forward",
+        "transition",
     ),
     "confidence": (
         "diffuser/confidence_head/__layer_stack_no_per_layer/confidence_pairformer",
         True,
-        "pair_feed_forward",
+        "pair_transition",
     ),
 }
 _ATOM_ENCODER_CONTEXTS = {
@@ -398,7 +398,7 @@ def _top_level_ref(model_key: str) -> _OfficialParamRef | None:
         "pair_recycle_norm.bias": _ref(_k("diffuser/evoformer/prev_embedding_layer_norm", "offset")),
         "single_recycle_norm.weight": _ref(_k("diffuser/evoformer/prev_single_embedding_layer_norm", "scale")),
         "single_recycle_norm.bias": _ref(_k("diffuser/evoformer/prev_single_embedding_layer_norm", "offset")),
-        "distogram_head.linear.weight": _ref(_k("diffuser/distogram_head/half_logits", "weights"), "linear"),
+        "distogram_head.projection.weight": _ref(_k("diffuser/distogram_head/half_logits", "weights"), "linear"),
     }
     return mapping.get(model_key)
 
@@ -407,8 +407,8 @@ def _outer_product_mean_ref(rest: str, block: int, scope: str) -> _OfficialParam
     norm_scope = f"{scope}/outer_product_mean/layer_norm_input"
     opm_scope = f"{scope}/outer_product_mean"
     mapping = {
-        "norm_msa.weight": _ref(_k(norm_scope, "scale"), "identity", block),
-        "norm_msa.bias": _ref(_k(norm_scope, "offset"), "identity", block),
+        "msa_norm.weight": _ref(_k(norm_scope, "scale"), "identity", block),
+        "msa_norm.bias": _ref(_k(norm_scope, "offset"), "identity", block),
         "left_projection.weight": _ref(_k(f"{opm_scope}/left_projection", "weights"), "linear", block),
         "right_projection.weight": _ref(_k(f"{opm_scope}/right_projection", "weights"), "linear", block),
         "output_projection.weight": _ref(_k(opm_scope, "output_w"), "opm_output", block),
@@ -420,10 +420,10 @@ def _outer_product_mean_ref(rest: str, block: int, scope: str) -> _OfficialParam
 def _msa_attention_ref(rest: str, block: int, scope: str) -> _OfficialParamRef | None:
     base = f"{scope}/msa_attention1"
     mapping = {
-        "norm_msa.weight": _ref(_k(f"{base}/act_norm", "scale"), "identity", block),
-        "norm_msa.bias": _ref(_k(f"{base}/act_norm", "offset"), "identity", block),
-        "norm_pair.weight": _ref(_k(f"{base}/pair_norm", "scale"), "identity", block),
-        "norm_pair.bias": _ref(_k(f"{base}/pair_norm", "offset"), "identity", block),
+        "msa_norm.weight": _ref(_k(f"{base}/act_norm", "scale"), "identity", block),
+        "msa_norm.bias": _ref(_k(f"{base}/act_norm", "offset"), "identity", block),
+        "pair_norm.weight": _ref(_k(f"{base}/pair_norm", "scale"), "identity", block),
+        "pair_norm.bias": _ref(_k(f"{base}/pair_norm", "offset"), "identity", block),
         "value_projection.weight": _ref(_k(f"{base}/v_projection", "weights"), "linear", block),
         "pair_projection.weight": _ref(_k(f"{base}/pair_logits", "weights"), "linear", block),
         "gate_projection.weight": _ref(_k(f"{base}/gating_query", "weights"), "linear", block),
@@ -435,9 +435,9 @@ def _msa_attention_ref(rest: str, block: int, scope: str) -> _OfficialParamRef |
 def _template_ref(rest: str) -> _OfficialParamRef | None:
     base = "diffuser/evoformer/template_embedding"
     single = f"{base}/single_template_embedding"
-    if rest == "norm_pair.weight":
+    if rest == "pair_norm.weight":
         return _ref(_k(f"{single}/query_embedding_norm", "scale"))
-    if rest == "norm_pair.bias":
+    if rest == "pair_norm.bias":
         return _ref(_k(f"{single}/query_embedding_norm", "offset"))
     if rest == "pair_projection.weight":
         return _ref(_k(f"{single}/template_pair_embedding_8", "weights"), "linear")
@@ -505,10 +505,12 @@ def _denoiser_conditioner_ref(rest: str, base: str) -> _OfficialParamRef | None:
     }
     if rest in mapping:
         return mapping[rest]
-    for index, target in enumerate(("pair_feed_forward_1", "pair_feed_forward_2")):
+    for index in range(2):
+        target = f"pair_transitions.{index}"
         if rest.startswith(target + "."):
             return _flat_diffusion_transition_ref(rest.removeprefix(target + "."), f"{base}/pair_transition_{index}ffw")
-    for index, target in enumerate(("single_feed_forward_1", "single_feed_forward_2")):
+    for index in range(2):
+        target = f"single_transitions.{index}"
         if rest.startswith(target + "."):
             return _flat_diffusion_transition_ref(
                 rest.removeprefix(target + "."), f"{base}/single_transition_{index}ffw"
@@ -559,9 +561,9 @@ def _atom_decoder_ref(rest: str, base: str) -> _OfficialParamRef | None:
     }
     if rest in mapping:
         return mapping[rest]
-    if rest.startswith("atom_attention_stack."):
+    if rest.startswith("atom_self_attention."):
         return _atom_attention_stack_ref(
-            rest.removeprefix("atom_attention_stack."),
+            rest.removeprefix("atom_self_attention."),
             f"{base}/diffusion_atom_transformer_decoder/"
             "__layer_stack_with_per_layer/diffusion_atom_transformer_decoder",
         )
@@ -607,15 +609,15 @@ def _atom_encoder_ref(rest: str, *, base: str, stack: str, include_trunk: bool) 
             {
                 "single_norm.weight": _ref(_k(f"{base}_lnorm_trunk_single_cond", "scale")),
                 "single_to_atom_projection.weight": _ref(_k(f"{base}_embed_trunk_single_cond", "weights"), "linear"),
-                "norm_pair.weight": _ref(_k(f"{base}_lnorm_trunk_pair_cond", "scale")),
+                "pair_norm.weight": _ref(_k(f"{base}_lnorm_trunk_pair_cond", "scale")),
                 "pair_projection.weight": _ref(_k(f"{base}_embed_trunk_pair_cond", "weights"), "linear"),
                 "noisy_position_projection.weight": _ref(_k(f"{base}_atom_positions_to_features", "weights"), "linear"),
             }
         )
     if rest in mapping:
         return mapping[rest]
-    if rest.startswith("atom_attention_stack."):
-        return _atom_attention_stack_ref(rest.removeprefix("atom_attention_stack."), stack)
+    if rest.startswith("atom_self_attention."):
+        return _atom_attention_stack_ref(rest.removeprefix("atom_self_attention."), stack)
     return None
 
 
@@ -661,8 +663,8 @@ def _pairformer_block_ref(
         return _transition_ref(rest.removeprefix(pair_transition_target + "."), block, f"{scope}/pair_transition")
     if with_single and rest.startswith("pair_attention."):
         return _single_attention_ref(rest.removeprefix("pair_attention."), block, scope)
-    if with_single and rest.startswith("single_feed_forward."):
-        return _transition_ref(rest.removeprefix("single_feed_forward."), block, f"{scope}/single_transition")
+    if with_single and rest.startswith("single_transition."):
+        return _transition_ref(rest.removeprefix("single_transition."), block, f"{scope}/single_transition")
     return None
 
 
@@ -676,10 +678,10 @@ def _triangle_multiplication_ref(rest: str, block: int, scope: str) -> _Official
     left_split = "split_right_linear" if incoming else "split_left_linear"
     right_split = "split_left_linear" if incoming else "split_right_linear"
     mapping = {
-        "norm_input.weight": _ref(_k(f"{scope}/left_norm_input", "scale"), "identity", block),
-        "norm_input.bias": _ref(_k(f"{scope}/left_norm_input", "offset"), "identity", block),
-        "norm_output.weight": _ref(_k(f"{scope}/center_norm", "scale"), "identity", block),
-        "norm_output.bias": _ref(_k(f"{scope}/center_norm", "offset"), "identity", block),
+        "input_norm.weight": _ref(_k(f"{scope}/left_norm_input", "scale"), "identity", block),
+        "input_norm.bias": _ref(_k(f"{scope}/left_norm_input", "offset"), "identity", block),
+        "output_norm.weight": _ref(_k(f"{scope}/center_norm", "scale"), "identity", block),
+        "output_norm.bias": _ref(_k(f"{scope}/center_norm", "offset"), "identity", block),
         "left_projection.weight": _ref(_k(f"{scope}/projection", "weights"), left_split, block),
         "right_projection.weight": _ref(_k(f"{scope}/projection", "weights"), right_split, block),
         "left_gate_projection.weight": _ref(_k(f"{scope}/gate", "weights"), left_split, block),
@@ -692,8 +694,8 @@ def _triangle_multiplication_ref(rest: str, block: int, scope: str) -> _Official
 
 def _grid_attention_ref(rest: str, block: int, scope: str) -> _OfficialParamRef | None:
     mapping = {
-        "norm_pair.weight": _ref(_k(f"{scope}/act_norm", "scale"), "identity", block),
-        "norm_pair.bias": _ref(_k(f"{scope}/act_norm", "offset"), "identity", block),
+        "pair_norm.weight": _ref(_k(f"{scope}/act_norm", "scale"), "identity", block),
+        "pair_norm.bias": _ref(_k(f"{scope}/act_norm", "offset"), "identity", block),
         "bias_projection.weight": _ref(_k(f"{scope}/pair_bias_projection", "weights"), "linear", block),
         "attention.projection.query_projection.weight": _ref(
             _k(f"{scope}/q_projection", "weights"), "linear_transposed", block
@@ -716,8 +718,8 @@ def _single_attention_ref(rest: str, block: int, scope: str) -> _OfficialParamRe
     mapping = {
         "hidden_norm.weight": _ref(_k(f"{scope}/single_attention_layer_norm", "scale"), "identity", block),
         "hidden_norm.bias": _ref(_k(f"{scope}/single_attention_layer_norm", "offset"), "identity", block),
-        "norm_pair.weight": _ref(_k(f"{scope}/single_pair_logits_norm", "scale"), "identity", block),
-        "norm_pair.bias": _ref(_k(f"{scope}/single_pair_logits_norm", "offset"), "identity", block),
+        "pair_norm.weight": _ref(_k(f"{scope}/single_pair_logits_norm", "scale"), "identity", block),
+        "pair_norm.bias": _ref(_k(f"{scope}/single_pair_logits_norm", "offset"), "identity", block),
         "bias_projection.weight": _ref(_k(f"{scope}/single_pair_logits_projection", "weights"), "linear", block),
         "attention.projection.query_projection.weight": _ref(
             _k(f"{scope}/single_attention_q_projection", "weights"), "linear", block
@@ -744,8 +746,8 @@ def _single_attention_ref(rest: str, block: int, scope: str) -> _OfficialParamRe
 def _transition_ref(rest: str, block: int | None, scope: str) -> _OfficialParamRef | None:
     indices = () if block is None else (block,)
     mapping = {
-        "norm_input.weight": _ref(_k(f"{scope}/input_layer_norm", "scale"), "identity", *indices),
-        "norm_input.bias": _ref(_k(f"{scope}/input_layer_norm", "offset"), "identity", *indices),
+        "input_norm.weight": _ref(_k(f"{scope}/input_layer_norm", "scale"), "identity", *indices),
+        "input_norm.bias": _ref(_k(f"{scope}/input_layer_norm", "offset"), "identity", *indices),
         "gate_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_gate", *indices),
         "value_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_value", *indices),
         "output_projection.weight": _ref(_k(f"{scope}/transition2", "weights"), "linear", *indices),
@@ -755,8 +757,8 @@ def _transition_ref(rest: str, block: int | None, scope: str) -> _OfficialParamR
 
 def _flat_diffusion_transition_ref(rest: str, scope: str) -> _OfficialParamRef | None:
     mapping = {
-        "norm_input.weight": _ref(_k(f"{scope}_layer_norm", "scale")),
-        "norm_input.bias": _ref(_k(f"{scope}_layer_norm", "offset")),
+        "input_norm.weight": _ref(_k(f"{scope}_layer_norm", "scale")),
+        "input_norm.bias": _ref(_k(f"{scope}_layer_norm", "offset")),
         "gate_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_gate"),
         "value_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_value"),
         "output_projection.weight": _ref(_k(f"{scope}_transition2", "weights"), "linear"),

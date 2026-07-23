@@ -55,6 +55,7 @@ class CoordinateDenoiser(nn.Module):
         pair_size: Width of the token pair representation.
         token_feature_size: Width of the raw per-token conditioning features.
         atom_feature_size: Width of the raw per-atom input features.
+        embed_relative_position: Whether to project relative-position buckets before pair conditioning.
         num_atom_encoder_blocks: Number of atom-encoder attention blocks.
         num_atom_encoder_attention_heads: Number of attention heads per atom-encoder block.
         num_atom_decoder_blocks: Number of atom-decoder attention blocks.
@@ -62,6 +63,8 @@ class CoordinateDenoiser(nn.Module):
         num_query_atoms: Query window size for local atom attention.
         num_key_atoms: Key window size for local atom attention.
         operator_backend: Backend selector passed to the attention/transition operators.
+        cross_attention_key_source: Whether atom key/value normalization starts from the raw hidden state
+            or the query-normalized state.
 
     Examples:
         >>> denoiser = CoordinateDenoiser(
@@ -154,8 +157,7 @@ class CoordinateDenoiser(nn.Module):
             reference_positions: Centered reference-conformer atom coords, shape `[..., num_atoms, 3]`.
             reference_space_id: Per-atom conformer/space identifier used to gate cross-window pairs,
                 shape `[..., num_atoms]`.
-            num_valid_atoms: Number of real atoms; enables the DeepMind AF3 clamped/shifted key window so
-                the diffusion atom transformer attends over the same key neighbourhoods as the reference.
+            num_valid_atoms: Number of real atoms; enables clamped key windows containing only real atoms.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.LocalAtomGeometry] describing the local
@@ -291,7 +293,7 @@ class DenoisingConditioner(nn.Module):
     Fourier-embedded EDM log-noise into the single representation, so downstream refinement is
     aware of both sequence geometry and the current noise level. Each branch is a
     norm/projection followed by two [`Transition`][ofoldx.modules.transition.Transition]
-    feed-forward blocks.
+    updates.
 
     Args:
         relative_position_size: Width of the relative-position feature bucket embedding input.
@@ -301,6 +303,7 @@ class DenoisingConditioner(nn.Module):
         single_size: Width of the conditioned single representation.
         noise_embedding_size: Width of the Fourier noise embedding.
         sigma_data: EDM data-scale hyperparameter used to normalise the log-noise.
+        embed_relative_position: Whether to project relative-position buckets before pair conditioning.
 
     Examples:
         >>> conditioner = DenoisingConditioner(pair_size=128, single_size=384)
@@ -328,16 +331,14 @@ class DenoisingConditioner(nn.Module):
         )
         self.pair_input_norm = LayerNorm(pair_input_size, bias=False)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
-        self.pair_feed_forward_1 = Transition(pair_size, expansion=2)
-        self.pair_feed_forward_2 = Transition(pair_size, expansion=2)
+        self.pair_transitions = nn.ModuleList(Transition(pair_size, expansion=2) for _ in range(2))
 
         self.single_conditioning_norm = LayerNorm(single_conditioning_size, bias=False)
         self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
         self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
         self.noise_norm = LayerNorm(noise_embedding_size, bias=False)
         self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
-        self.single_feed_forward_1 = Transition(single_size, expansion=2)
-        self.single_feed_forward_2 = Transition(single_size, expansion=2)
+        self.single_transitions = nn.ModuleList(Transition(single_size, expansion=2) for _ in range(2))
 
     def forward(
         self,
@@ -385,7 +386,7 @@ class DenoisingConditioner(nn.Module):
             relative_position_conditioning,
             norm=self.pair_input_norm,
             projection=self.pair_projection,
-            transitions=[self.pair_feed_forward_1, self.pair_feed_forward_2],
+            transitions=self.pair_transitions,
         )
         denoising_single, _ = condition_single(
             single,
@@ -396,7 +397,7 @@ class DenoisingConditioner(nn.Module):
             noise_fourier=self.noise_embedding,
             noise_norm=self.noise_norm,
             noise_projection=self.noise_projection,
-            transitions=[self.single_feed_forward_1, self.single_feed_forward_2],
+            transitions=self.single_transitions,
             sample_axis=True,
         )
         return denoising_single, denoising_pair
@@ -404,12 +405,11 @@ class DenoisingConditioner(nn.Module):
 
 def _relative_position_one_hot(buckets: RelativePositionBuckets) -> Tensor:
     r"""
-    Materialise AlphaFold 3's raw relative-position feature vector.
+    Materialize an unprojected relative-position feature vector.
 
-    The official DeepMind diffusion head concatenates ``pair_embedding`` with the
-    raw relative features (residue offset, token offset, same entity, chain
-    offset), whereas Protenix-style checkpoints first project those features to
-    ``pair_size``. This helper is used only for the official-AF3 conditioner.
+    Concatenates residue offsets, token offsets, same-entity indicators, and chain
+    offsets for conditioners that consume the raw categorical features alongside
+    pair embeddings.
     """
 
     residue = F.one_hot(buckets.residue_bucket.long(), num_classes=buckets.residue_size)

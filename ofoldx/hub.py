@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import NamedTuple, NoReturn, cast
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
 
+import chanfig
 import torch
 
 from .model import Model
@@ -20,7 +21,11 @@ from .models.registry import (
     MODELS,
     ModelRegistration,
 )
+from .processor import Processor
 from .references import classify_reference
+
+if TYPE_CHECKING:
+    from huggingface_hub import CommitInfo
 
 MODEL_METADATA = ("model.json",)
 PROCESSOR_METADATA = ("model.json", "processor.json")
@@ -141,7 +146,7 @@ def upload_repository(
     commit_message: str | None = None,
     allow_patterns: Sequence[str] | None = None,
     delete_patterns: Sequence[str] | None = MIRROR_REPOSITORY,
-) -> object:
+) -> CommitInfo:
     r"""Upload one local model repository to a Hub repo, creating it if absent.
 
     The upload counterpart to :func:`resolve_hub_repository`: a thin wrapper over
@@ -249,7 +254,7 @@ def load_model(
 def load_registered_model(
     repository: ResolvedRepository,
     registration: ModelRegistration,
-    config: object,
+    config: chanfig.Config,
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
@@ -294,7 +299,7 @@ def load_processor(
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> object:
+) -> Processor:
     registration, _ = model_values(repository.path)
     return load_registered_processor(
         repository,
@@ -310,7 +315,7 @@ def load_registered_processor(
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> object:
+) -> Processor:
     processor_config = registration.processor_config
     config_path = repository.path / "processor.json"
     if processor_config is None:
@@ -321,7 +326,8 @@ def load_registered_processor(
     values = load_json_object(config_path)
     if "architecture" in values:
         raise ValueError("processor.json must not repeat the model architecture")
-    return registration.processor(processor_config(values), device=device, dtype=dtype)
+    processor = cast(Callable[..., Processor], registration.processor)
+    return processor(processor_config(values), device=device, dtype=dtype)
 
 
 def _weight_map(path: Path) -> dict[str, str]:

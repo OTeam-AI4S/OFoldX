@@ -20,7 +20,7 @@ class GatedMultiheadAttention(nn.Module):
 
     Wraps a [`MultiheadAttentionProjection`][ofoldx.modules.attention.multihead.MultiheadAttentionProjection]
     and dispatches the scaled-dot-product core to the resolved operator backend
-    (OOps-owned dispatch or a pure-PyTorch reference). This is the shared attention block used by the trunk,
+    (OOps-owned dispatch or a pure-PyTorch implementation). This is the shared attention block used by the trunk,
     atom, and diffusion stacks; higher-level modules supply the pair-derived ``biases``.
 
     Args:
@@ -35,7 +35,8 @@ class GatedMultiheadAttention(nn.Module):
         output_bias: Whether the output projection carries a learnable bias.
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
-        torch_backend: Fixed PyTorch reference used when ``operator_backend="auto"`` cannot use OOps.
+        gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
+        torch_backend: PyTorch implementation used when ``operator_backend="auto"`` cannot use OOps.
         operator_backend: Backend selector; ``"auto"`` picks ``oops`` when available and falls back
             to ``torch_backend`` otherwise.
 

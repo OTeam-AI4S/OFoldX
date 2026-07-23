@@ -32,8 +32,8 @@ class MpnnObjective:
       weight=...)`` over ``valid_mask & design_mask`` (positions actually scored).
     - Return ``(log_probabilities, loss)``.
 
-    The label-smoothing weight (upstream 0.1) is a construction-time hyperparameter
-    on this objective, not a Model/Processor config field.
+    The label-smoothing weight is a construction-time hyperparameter on this objective,
+    not a Model or Processor config field.
     """
 
     def __init__(self, *, label_smoothing: float = 0.1) -> None:
@@ -44,8 +44,7 @@ class MpnnObjective:
 
         ``model(batch)`` runs the family's teacher-forced training graph: it
         encodes the backbone, draws a fixed-first causal decoding order, and
-        returns sequence-conditioned logits over the random order (upstream's
-        training ``forward``). The vocabulary log probabilities feed the model's
+        returns sequence-conditioned logits over the random order. The vocabulary log probabilities feed the model's
         own unreduced label-smoothed cross entropy, which this objective
         masked-means over the positions that are both present and designed.
         """

@@ -43,16 +43,19 @@ def outer_product_mean(
     Args:
         msa: ``(B, S, N, msa_size)`` MSA representation.
         msa_mask: Optional ``(B, S, N)`` mask zeroing invalid rows and counting valid pairs.
-        norm_weight, norm_bias, norm_eps: LayerNorm parameters for the pre-normalization.
-        proj_left_weight, proj_right_weight: Left/right projection weights.
-        proj_out_weight, proj_out_bias: Output projection (affine).
-        proj_left_bias, proj_right_bias: Optional left/right projection biases; ``None`` keeps the
-            projections bias-free (the AF3-lineage path). The AlphaFold 2 outer-product mean supplies
-            both.
+        norm_weight: LayerNorm weight for the pre-normalization.
+        norm_bias: LayerNorm bias for the pre-normalization.
+        proj_left_weight: Left projection weight.
+        proj_right_weight: Right projection weight.
+        proj_out_weight: Output projection weight.
+        proj_out_bias: Output projection bias.
+        norm_eps: Epsilon used by the pre-normalization.
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
         operator_backend: ``"auto"`` / ``"oops"`` / ``"eager"``.
+        proj_left_bias: Optional left projection bias; ``None`` keeps the projection bias-free.
+        proj_right_bias: Optional right projection bias; ``None`` keeps the projection bias-free.
 
     Returns:
         ``(B, N, N, pair_size)`` pair update, where ``pair_size`` is the row count of ``proj_out_weight``.

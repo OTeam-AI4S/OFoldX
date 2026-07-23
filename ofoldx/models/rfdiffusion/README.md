@@ -12,164 +12,246 @@ pipeline_tag: other
 
 # RFdiffusion
 
-> [!IMPORTANT]
-Denoising-diffusion generative model for de novo protein backbone design, motif scaffolding, and binder design.
+Denoising-diffusion generation for de novo protein backbones, motif
+scaffolding, inpainting, interfaces, and binder design.
 
 ## Disclaimer
 
-This is an UNOFFICIAL OFoldX conversion of [De novo design of protein structure and function with RFdiffusion](https://doi.org/10.1038/s41586-023-06415-8) by Joseph L. Watson, David Juergens, Nathaniel R. Bennett, et al.
-
-The OFFICIAL repository of RFdiffusion is at [RosettaCommons/RFdiffusion](https://github.com/RosettaCommons/RFdiffusion).
-
-**The team releasing RFdiffusion did not write this model card, so this model card has been written by the OFoldX team.**
+This is an unofficial OFoldX conversion of
+[De novo design of protein structure and function with RFdiffusion](https://doi.org/10.1038/s41586-023-06415-8)
+by Joseph L. Watson, David Juergens, Nathaniel R. Bennett, et al. The upstream
+authors did not write, review, or endorse this implementation or model card.
+The official repository is
+[RosettaCommons/RFdiffusion](https://github.com/RosettaCommons/RFdiffusion).
 
 ## Model Details
 
-RFdiffusion is a generative model that produces novel protein backbones by reversing a denoising-diffusion process over residue frames. A RoseTTAFold-style structure network serves as the denoising trunk: at each diffusion timestep it consumes the current noised backbone (through MSA, pair, and template embedders) and predicts a cleaner set of residue frames, refined by an SE(3)-equivariant structure module. A native reverse-diffusion sampler drives a single design trajectory from Gaussian noise down to a finished backbone, coupling a Euclidean diffuser for C-alpha translations with an IGSO3 diffuser for backbone-frame rotations. OFoldX expresses de novo segments, motif scaffolding, inpainting, interfaces, compactness, smooth coordination, substrate interactions, point-group symmetry, cyclic closure, and fold conditioning through canonical conditions rather than RFdiffusion-specific strings. Fold-conditioned checkpoints consume one canonical `Template`; its explicit target-to-template alignment conditions the aligned output rows, while unaligned target rows remain masked.
+RFdiffusion generates protein backbones by reversing diffusion over residue
+frames. A RoseTTAFold-style denoiser embeds MSA, pair, template, sequence, and
+timestep features; main and extra trunk blocks update those representations;
+SE(3)-equivariant structure modules predict cleaner frames; and a native
+sampler couples Euclidean C-alpha translation diffusion with IGSO(3) rotation
+diffusion.
 
-`RfDiffusionModel.forward(batch)` is the differentiable denoiser and returns every released training head. `RfDiffusionModel.design(batch)` runs reverse diffusion. Operator selection belongs to the Model: `model.set_backend("torch")`, `model.set_backend("oops")`, or `model.set_backend("auto")`.
+`ofoldx.rfdiffusion` registers `RfDiffusionModel` with
+`RfDiffusionProcessor`. Coordinate-bearing, variable-topology results use the
+concrete `RfDiffusionPipeline`, registered for `design`, rather than the generic
+coordinate-free design result.
 
-An `ExistingSpan` keeps its canonical sequence visible by default, matching the
-released contig-map semantics. Sequence is masked only when the caller explicitly
-passes ordinary component references through `inpaint_sequence=(...)`; generated
-segments remain masked to the denoiser. Their canonical output identity is CCD
-`UNK`, while the Structure contains only the backbone sites RFdiffusion produced;
-the upstream poly-glycine PDB rendering is not promoted to a chemical prediction.
-`num_sampling_steps` defines the active translation, rotation, denoiser,
-and timestep-feature schedules together rather than truncating a schedule built for
-a different number of steps. Hard singleton residue identities and fixed placement
-chain totals are preserved through canonical Result decoding.
+`model.forward(input)` is one differentiable denoising pass and returns all
+released heads: single and pair representations, backbone coordinates, state
+and torsion values, sequence logits, pLDDT, four pair-geometry logits,
+resolved logits, and backbone/torsion trajectories. `model.design(input)` runs
+reverse diffusion and returns `RfDiffusionDesignResult`.
 
-`design` exposes the released CA/frame noise scales and independent `constant` or
-`linear` schedules. `final_noise_scale_ca` and `final_noise_scale_frame` are optional
-linear-interpolation endpoints; a different endpoint with a constant schedule is an
-error rather than a silent no-op. The timestep-one endpoint is not itself sampled
-when the final step returns the denoiser's raw `pX0`.
+Each `RfDiffusionDesignCandidate` contains the decoded backbone `Structure`, a
+realized grouped `placement_map`, post-design `condition_evaluations`, residue
+`plddt` on the 0-100 scale, and `mean_plddt`. Unconstrained generated residues
+decode as CCD `UNK`; existing identities and explicit singleton identity
+conditions are preserved. The Structure contains the N, CA, C, and O backbone
+sites produced by RFdiffusion, plus retained or explicitly referenced context
+where applicable.
 
-The raw sampler returns that upstream `pX0`. `RfDiffusionModel.design` separately
-Kabsch-aligns it to a fixed motif when requested and then restores the fixed rows as
-a canonical Result postcondition. Final pLDDT, `pX0`, and `x_{t-1}` diagnostics are
-always present. Full reverse-order trajectories (`T, T-1, ..., final_step`) are
-retained on CPU only with `return_trajectory=True`.
+Topology is declared with `RfDiffusionPlacements`, `GeneratedSegment`, and
+`ExistingSpan`. Ranged generated segments may realize different lengths per
+candidate. The `length` argument is the combined generated-length bound across
+all generated segments, excluding receptor `ExistingSpan` rows.
 
-Because RFdiffusion is coordinate-producing and variable-topology (`ContigMap.length`
-is sampled per candidate), `design` returns the family-owned `RfDiffusionDesignResult`, not
-the shared coordinate-free `DesignResult`. It lives in this family's own directory and
-is not a subclass or widening of the shared record (DESIGN.md §5.3.1/§5.3.3), mirroring
-the migrated `ESMFold2DesignResult`. Each `RfDiffusionDesignCandidate` owns the complete
-decoded backbone `Structure` (which owns its `MolecularSystem` via `Structure.system`);
-tuple position in `RfDiffusionDesignResult.candidates` is sample identity, and
-`RfDiffusionDesignResult.best("mean_plddt")` selects the earliest best design under one named
-Score. The Result carries two mapped values and nothing else (no logits, distograms,
-torsion/backbone trajectories, timesteps, or `pX0`/`x_{t-1}`; no conditions or run
-controls):
+The Processor and Pipeline expose de novo generation, motif scaffolding,
+sequence inpainting, partial diffusion, fold conditioning, hotspot and residue
+identity conditioning, symbolic bonds, fixed reference coordinates, distance
+and coordination guidance, radius-of-gyration guidance, substrate interaction,
+secondary-structure conditioning, cyclic closure, and cyclic, dihedral,
+tetrahedral, octahedral, or icosahedral symmetry. Fold-conditioned checkpoints
+accept one explicitly aligned `Template`.
 
-- `plddt` — a per-residue `Metric`, unit `"0-100"`, whose `axis` is every output
-  residue (generated `UNK` + existing) in output-row order. The released expectation on
-  `(0, 1]` is multiplied by 100 in decode so the §5.1 cross-family reserved `plddt` name
-  carries its reserved 0-100 scale (a mapping requirement, not a sampler change).
-- `mean_plddt` — a whole-design scalar `Score`, unit `"0-100"`, `preferred="higher"`,
-  the arithmetic mean of `plddt` over all output residues.
+The sampler exposes independent C-alpha and frame noise scales with `constant`
+or `linear` schedules. Distinct final noise endpoints require a linear
+schedule. `num_sampling_steps` rebuilds the active translation, rotation,
+denoiser, and timestep-feature schedules together. The final public coordinates
+come from the upstream raw `pX0`; optional motif alignment and fixed-row
+restoration are applied while decoding the canonical result.
 
-`design` also owns the family-owned `length` (`ContigMap.length`) topology argument: the
-combined generated length across all inpaint chains, excluding receptor `ExistingSpan`
-rows. It is a concrete family operation argument (distinct from ODesign per-chain lengths
-and BoltzGen `total_len`), not a shared placement-core invariant, and is accepted and validated at
-the Processor. Its cross-segment realization, together with `provide_seq` on generated
-rows and the placement core, remains owner-gated pending the
-reopened §3.7 placement identity (§3.7.3 X1/X2).
+`model.set_backend("auto" | "torch" | "oops")` selects the RFdiffusion SE(3)
+operator backend.
 
-Point-group projection uses the audited upstream C/D/T/O/I matrix order, copies the
-first unit's sequence into every unit, and inserts the released residue-index unit
-breaks before every network call. The polyhedral sets have an OFoldX-owned rounded
-lexicographic canonical order before the fixed upstream permutation, so SciPy's
-internal generator order is irrelevant. C, D, T, and I directly rotate the first unit.
-Octahedral projection can additionally recenter each rotated unit and place it at
-`symmetry_radius_angstrom` through the ordinary `symmetry_recenter` execution
-argument. OFoldX does not copy the upstream `t3` alias or the inert
-`model_only_neighbors` option as separate public semantics.
+### Variants
+
+The released checkpoint inventory is:
+
+- `Base_ckpt.pt`
+- `Complex_base_ckpt.pt`
+- `Complex_Fold_base_ckpt.pt`
+- `InpaintSeq_ckpt.pt`
+- `InpaintSeq_Fold_ckpt.pt`
+- `ActiveSite_ckpt.pt`
+- `Base_epoch8_ckpt.pt`
+
+All use the `ofoldx.rfdiffusion` architecture identity. The converter recovers
+checkpoint-specific denoiser, diffuser, and preprocessing values, including
+feature widths, self-conditioning, motif-track freezing, and fold-conditioning
+channels.
 
 ### Model Specification
 
-| Main Blocks | Extra Blocks | Refinement Blocks | MSA Size | Pair Size | Diffusion Timesteps |
-| ----------- | ------------ | ----------------- | -------- | --------- | ------------------- |
-| 32          | 4            | 4                 | 256      | 128       | 50                  |
+| Property                                    | Value                                  |
+| ------------------------------------------- | -------------------------------------- |
+| Architecture                                | `ofoldx.rfdiffusion`                   |
+| Model                                       | `RfDiffusionModel`                     |
+| Processor                                   | `RfDiffusionProcessor`                 |
+| Pipeline                                    | `RfDiffusionPipeline`                  |
+| Task                                        | `design` through the concrete Pipeline |
+| Result                                      | `RfDiffusionDesignResult`              |
+| Main trunk blocks / `num_main_blocks`       | 32                                     |
+| Extra trunk blocks / `num_extra_blocks`     | 4                                      |
+| Refinement blocks / `num_refinement_blocks` | 4                                      |
+| MSA / full-MSA / pair sizes                 | 256 / 64 / 128                         |
+| Diffusion timesteps / `num_timesteps`       | 50                                     |
+| Translation schedule                        | linear, beta `0.01` to `0.07`          |
+| Rotation process                            | IGSO(3), linear beta `1.5` to `2.5`    |
 
-> [!NOTE]
-> These dimensions describe the released `base` RFdiffusion checkpoint as configured in
-> [`RfDiffusionConfig`][ofoldx.models.rfdiffusion.config.RfDiffusionConfig]. The equivariant refinement network uses
-> an SE(3)-transformer structure module (a single block of 32 channels across 2 degrees for the main blocks, and a
-> wider 64-scalar top-k refinement stack). The parameter count is omitted here because RFdiffusion is a large trunk
-> model that OFoldX does not instantiate at card-build time.
+These dimensions describe the default/base configuration. A converted
+checkpoint's stored configuration is authoritative for that variant.
 
-OFoldX represents auxiliary geometry through canonical conditions instead of upstream potential strings. In
-particular, monomer and binder compactness use `RfDiffusionRadiusOfGyration`. Dimer compactness is expressed by one
-`RfDiffusionRadiusOfGyration` condition per monomer, normally with half the desired total weight on each condition. Each term
-uses its own monomer centroid. This intentionally corrects the released `dimer_ROG` helper's unambiguous typo, which
-computes the second monomer's radius around the first monomer's centroid.
+OFoldX represents geometric guidance with typed canonical conditions rather
+than upstream potential strings. `RfDiffusionCoordination` evaluates the
+released smooth coordination function
 
-The released contact-number potentials map to `RfDiffusionCoordination`; OFoldX evaluates their analytic
-`1 / (1 + x**6)` form, removing the upstream quotient's undefined `0 / 0` points without changing the scientific
-function. `RfDiffusionSubstrateInteraction` implements the released default nearest-substrate attraction and clearance using
-protein C-alpha distances and a substrate frame anchored to the fixed motif. The
-released `rep_r_min=0` branch instead switches repulsion to an all-pairs
-calculation. That is distinct scientific behavior and the complete family API must
-retain it as an explicit RFdiffusion potential control rather than hide it behind
-the default `RfDiffusionSubstrateInteraction` meaning.
+`1 / (1 + x**6)`
+
+directly, avoiding the upstream quotient's undefined `0 / 0` points without
+changing the scientific function. Radius-of-gyration conditions compute each
+target set around its own centroid, including separate monomer terms for dimer
+compactness. `RfDiffusionSubstrateInteraction` implements nearest-substrate
+attraction and clearance from a fixed substrate frame.
+
+Point-group projection follows the released C/D/T/O/I matrix order, copies the
+first unit's sequence across units, and inserts residue-index breaks before
+network calls. Octahedral projection can additionally recenter units and place
+them at `symmetry_radius_angstrom`.
 
 ### Links
 
-- **Code**: [ofoldx.models.rfdiffusion](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/rfdiffusion)
-- **Paper**: [De novo design of protein structure and function with RFdiffusion](https://doi.org/10.1038/s41586-023-06415-8)
-- **Developed by**: Joseph L. Watson, David Juergens, Nathaniel R. Bennett, et al.
-- **Model type**: Denoising-diffusion backbone generator with a RoseTTAFold-style denoising trunk and an SE(3)-equivariant structure module
-- **Original Repository**: [RosettaCommons/RFdiffusion](https://github.com/RosettaCommons/RFdiffusion)
+- [OFoldX implementation](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/rfdiffusion)
+- [Official RFdiffusion source](https://github.com/RosettaCommons/RFdiffusion)
+- [RFdiffusion paper](https://doi.org/10.1038/s41586-023-06415-8)
+- [Official RFdiffusion license](https://github.com/RosettaCommons/RFdiffusion/blob/main/LICENSE)
+
+## Usage
+
+```python
+import ofoldx
+from ofoldx.data.placement import GeneratedSegment
+from ofoldx.models.rfdiffusion import RfDiffusionPlacements
+
+placement = RfDiffusionPlacements(
+    placements={
+        "design": {
+            "backbone": GeneratedSegment("protein", 100, 100),
+        }
+    }
+)
+design_pipeline = ofoldx.pipeline(
+    "design",
+    model="./rfdiffusion-base",
+    device="cuda",
+)
+result = design_pipeline.design(
+    placement=placement,
+    num_candidates=4,
+    seed=7,
+)
+candidate = result.best("mean_plddt")
+structure = candidate.structure
+```
+
+For motif scaffolding or binder design, pass a canonical `Structure` or
+`MolecularSystem`, combine `ExistingSpan` and `GeneratedSegment` placements,
+and supply the required typed conditions. One caller-controlled `seed` or
+`generator` advances across every requested candidate.
+
+## Checkpoints and Conversion
+
+`convert_rfdiffusion_checkpoint` strict-loads one official checkpoint into an
+in-memory Model. `save_rfdiffusion_checkpoint` writes `model.json`,
+`processor.json`, safetensors, and the concrete RFdiffusion `pipeline.json`
+marker.
+
+```python
+from ofoldx.models.rfdiffusion.convert import (
+    convert_rfdiffusion_checkpoint,
+    save_rfdiffusion_checkpoint,
+)
+
+model = convert_rfdiffusion_checkpoint(
+    "Base_ckpt.pt",
+    schedule_source="T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl",
+)
+save_rfdiffusion_checkpoint(
+    "Base_ckpt.pt",
+    "./rfdiffusion-base",
+    schedule_source="T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl",
+)
+```
+
+Conversion requires the released IGSO(3) lookup table as the original pickle or
+a value-equivalent NPZ. The five float64 arrays are copied into persistent
+`igso3_*` buffers in `model.safetensors`; inference does not read a separate
+schedule file.
+
+The value-preserving NPZ conversion came from
+`schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl`
+at RosettaCommons/RFdiffusion revision
+`2d0c003df46b9db41d119321f15403dec3716cd9`. The source SHA-256 is
+`cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23`;
+the converted NPZ SHA-256 is
+`89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8`.
+All five arrays retain their float64 values.
+
+Only checkpoint fields consumed by the denoiser, diffuser, or preprocessing
+graph become `RfDiffusionConfig`. Stored but inert fields are not promoted to
+public configuration; `freeze_track_motif`, which changes the structure track,
+is retained. Supplying `repo_id` requests an upload after local conversion;
+conversion does not relicense the checkpoint or schedule.
 
 ## Training Details
 
-RFdiffusion is trained as a denoising-diffusion generative model: a RoseTTAFold-style structure network is fine-tuned
-to denoise noised residue frames back toward true protein structures, with self-conditioning across timesteps.
-
 ### Training Data
 
-RFdiffusion fine-tunes a RoseTTAFold-style structure network as a denoising diffusion model over PDB protein
-structures. OFoldX does not redistribute the training set.
+RFdiffusion fine-tunes a RoseTTAFold-style structure network as a denoising
+diffusion model over PDB protein structures. Refer to the RFdiffusion paper for
+the authoritative upstream data construction. OFoldX does not redistribute the
+training set.
 
 ### Training Procedure
 
-Upstream RFdiffusion noises residue frames with Gaussian C-alpha translation noise and rotational Brownian motion,
-trains denoising to true frames with self-conditioning, and uses checkpoint-specific inference configs. OFoldX converts
-released checkpoints into strict-loaded native Models and persists them through the standard model repository format.
-Its missing upstream trainer is provenance, not a blocker. Training
-support is separate from the Model Hub registration gate.
+The upstream procedure adds Gaussian C-alpha translation noise and rotational
+Brownian motion to residue frames, then trains the network to denoise toward
+the true frames with self-conditioning across timesteps. Checkpoints carry
+their architecture, diffusion, and preprocessing settings.
 
-## Real-checkpoint qualification
+OFoldX exposes the differentiable denoiser and converts released inference
+checkpoints. It does not claim to reproduce the complete upstream trainer.
 
-Production-weight parity is a manual, low-frequency release gate, never part of frequent CI. The maintained comparison
-covers all seven official checkpoints—`Base_ckpt.pt`, `Complex_base_ckpt.pt`, `Complex_Fold_base_ckpt.pt`,
-`InpaintSeq_ckpt.pt`, `InpaintSeq_Fold_ckpt.pt`, `ActiveSite_ckpt.pt`, and `Base_epoch8_ckpt.pt`—and all nine released
-network outputs: the four geometric heads, sequence and resolved logits, backbone and torsion trajectories, and pLDDT
-logits.
+## Limitations
 
-Only checkpoint fields read by the audited graph or sampler become `RfDiffusionConfig`. Stored but inert fields such as
-`d_time_emb`, `use_motif_timestep`, `aa_decode_steps`, and `sequence_decode` are not turned into public configuration;
-`freeze_track_motif`, which does change the structure track, is retained.
-
-The bundled `rfdiffusion_schedule.npz` is a safe, value-preserving conversion of
-`schedules/T_50_omega_1000_min_sigma_0_02_min_b_1_5_max_b_2_5_schedule_linear.pkl` from
-RosettaCommons/RFdiffusion revision `2d0c003df46b9db41d119321f15403dec3716cd9`. The source SHA-256 is
-`cd79d3b77b3dc80d727ae0295f932b88cdfc0e5805e0ced29ce3c719518a1e23`; the packaged archive SHA-256 is
-`89f97b26604e875e05907d465856d9b5ae5f9375482cc463dfa8d007d6e05db8`. It retains all five float64 arrays exactly.
-
-The maintained [`scripts/parity/rfdiffusion_denoiser.py`](../../../scripts/parity/rfdiffusion_denoiser.py)
-and companion RFdiffusion scripts reproduce the reference comparisons from code in
-`~/reference` and checkpoints in `~/weights`; generated reports remain local.
-Family-specific qualification lives in those maintained parity scripts. Frequent CI
-covers only shared and operator invariants with tiny self-contained fixtures; it does
-not run family design trajectories or download production checkpoints. RFdiffusion
-is registered after passing low-frequency released-weight sampled-output acceptance,
-default-Inductor full-graph compilation, and the standard
-repository/Auto/Pipeline/top-level path.
+- RFdiffusion generates protein backbones. It does not design a final amino-acid
+  sequence or pack side chains; unconstrained generated residues are `UNK`.
+- Sampling is stochastic and results depend on the checkpoint, topology,
+  conditions, seed, sampling schedule, dtype, and backend.
+- One fold-conditioning `Template` is supported. Template evidence and
+  secondary-structure conditioning require a fold-conditioned checkpoint, and
+  template-conditioned generated segments must have fixed lengths.
+- `RfDiffusionDesignResult` intentionally omits raw denoiser logits, diffusion
+  timesteps, `pX0`, `x_{t-1}`, and backbone/torsion trajectories. Those remain
+  tensor/sampler diagnostics rather than candidate values.
+- The non-default upstream `rep_r_min=0` all-pairs substrate-repulsion branch is
+  not represented by `RfDiffusionSubstrateInteraction`.
+- OFoldX does not expose the upstream `t3` symmetry alias or the inert
+  `model_only_neighbors` option as separate semantics.
+- Strict checkpoint loading validates the converted key and shape surface, not
+  complete numerical equivalence for every released checkpoint or stochastic
+  design trajectory.
 
 ## Citation
 
@@ -186,9 +268,7 @@ repository/Auto/Pipeline/top-level path.
 }
 ```
 
-> [!NOTE]
-> The artifacts distributed in this repository are part of the OFoldX project.
-> If OFoldX supports your research, please cite the OFoldX project as follows:
+If OFoldX supports your research, also cite:
 
 ```bibtex
 @software{chen2026ofoldx,
@@ -201,24 +281,21 @@ repository/Auto/Pipeline/top-level path.
 
 ## Contact
 
-Please use GitHub issues of [OFoldX](https://github.com/OTeam-AI4S/OFoldX/issues) for questions or comments on the model card.
-
-Please contact the authors of the [RFdiffusion paper](https://doi.org/10.1038/s41586-023-06415-8) for questions or comments on the paper/model.
+Please use [OFoldX GitHub issues](https://github.com/OTeam-AI4S/OFoldX/issues)
+for questions about this implementation or model card. Questions about the
+original model should be directed to the RFdiffusion authors.
 
 ## License
 
-The [official RFdiffusion license](https://github.com/RosettaCommons/RFdiffusion/blob/main/LICENSE)
-is BSD 3-Clause and explicitly covers both the University of Washington source code
-and the model weights referenced for download by the official README. A repository
-containing converted RFdiffusion weights remains subject to that copyright notice,
-its redistribution conditions, and its disclaimer; the frontmatter license describes
-that model artifact.
+The official RFdiffusion BSD 3-Clause license explicitly covers both the
+University of Washington source code and the model weights referenced for
+download by the official README. Converted checkpoints and the converted
+schedule table remain subject to its copyright notice, redistribution
+conditions, and disclaimer. The native OFoldX implementation and documentation
+are separate project code licensed under AGPL-3.0-or-later; OFoldX does not
+relicense the upstream weights or claim upstream endorsement.
 
-The native OFoldX implementation is separate OFoldX project code licensed under
-AGPL-3.0-or-later. OFoldX does not relicense the upstream RFdiffusion weights or
-claim that the upstream authors endorsed this conversion.
-
-The bundled schedule asset retains this upstream notice:
+The upstream notice is:
 
 > BSD License
 >
@@ -241,7 +318,7 @@ The bundled schedule asset retains this upstream notice:
 > may be used to endorse or promote products derived from this software without
 > specific prior written permission.
 >
-> THIS SOFTWARE IS PROVIDED BY THE UNIVERSITY OF WASHINGTON AND CONTRIBUTORS “AS IS”
+> THIS SOFTWARE IS PROVIDED BY THE UNIVERSITY OF WASHINGTON AND CONTRIBUTORS "AS IS"
 > AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 > WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
 > IN NO EVENT SHALL THE UNIVERSITY OF WASHINGTON OR CONTRIBUTORS BE LIABLE FOR ANY
@@ -251,22 +328,3 @@ The bundled schedule asset retains this upstream notice:
 > OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
 > OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 > THE POSSIBILITY OF SUCH DAMAGE.
-
-## Limitations & intentional upstream divergences
-
-- RFdiffusion generates backbones by diffusion; it does not design final sequence or
-  pack side chains. The release inventory carries several checkpoints (`Base`,
-  `Complex_base`, `ActiveSite`, `InpaintSeq`, fold-conditioned variants); publication
-  must state which are qualified. The sampler is stochastic.
-- The bundled schedule asset retains the upstream BSD notice.
-- A parity run applies only to the checkpoint and settings supplied to the script.
-
-## Licensing & redistribution
-
-- **OFoldX implementation & docs:** `AGPL-3.0-or-later`.
-- **Upstream code & weights:** BSD-3-Clause; the license explicitly covers both the
-  University of Washington source code and the model weights
-  ([RFdiffusion LICENSE](https://github.com/RosettaCommons/RFdiffusion/blob/main/LICENSE),
-  Copyright (c) 2023 University of Washington).
-- **Redistribution status: GREEN.** RFdiffusion checkpoints are redistributable under
-  BSD-3-Clause provided the copyright notice, conditions, and disclaimer are retained.
