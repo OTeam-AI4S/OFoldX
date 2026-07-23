@@ -20,10 +20,10 @@ keywords = [
 license = "AGPL-3.0-or-later"
 license-files = [ "LICENSE.md" ]
 maintainers = [
-  { name = "Zhiyuan Chen", email = "this@zyc.ai" },
+  { name = "Zhiyuan Chen", email = "z@valtech.ai" },
 ]
 authors = [
-  { name = "Zhiyuan Chen", email = "this@zyc.ai" },
+  { name = "Zhiyuan Chen", email = "z@valtech.ai" },
 ]
 requires-python = ">=3.10"
 classifiers = [
