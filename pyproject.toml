@@ -53,15 +53,11 @@ dependencies = [
   "huggingface-hub>=0.24",
   "multimolecule>=0.2",
   "numpy",
-  # pyarrow is a direct import in ofoldx/data/ccd/resolver.py (AF3 CCD resolution path); it is
-  # currently present only transitively via multimolecule->datasets, so declare it directly.
   "pyarrow",
   "rdkit",
   "safetensors>=0.2.8",
   "scipy",
   "torch",
-  # transformers is a direct import in ofoldx/models/esmfold2/convert.py; present today only
-  # transitively via multimolecule (a hard transformers dep), so declare it directly.
   "transformers",
   "typing-extensions>=4",
   "zstandard",
