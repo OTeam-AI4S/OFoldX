@@ -20,17 +20,12 @@ from ...data.placement import (
     validate_placement,
 )
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
-from ...modules.adaptive_norm import AdaptiveLayerNorm
+from ...model import Model
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
-from ...modules.atom.transfer import (
-    TokenPairToLocalAtomPairBroadcast,
-    TokenToAtomBroadcast,
-    dense_mean_to_tokens,
-)
+from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
-from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention, TriangleMultiplication
+from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
@@ -270,25 +265,6 @@ class BoltzGenModel(Model):
         r"""Apply the BoltzGen residual-update initialization."""
 
         _zero_initialize_boltzgen_updates(self)
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator implementation used by this model."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    GatedMultiheadAttention,
-                    Transition,
-                    TriangleMultiplication,
-                    MsaPairWeightedAveraging,
-                    OuterProductMean,
-                    TokenToAtomBroadcast,
-                    TokenPairToLocalAtomPairBroadcast,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
@@ -627,25 +603,6 @@ class BoltzGenInverseFoldingModel(Model):
         r"""Apply the BoltzGen residual-update initialization."""
 
         _zero_initialize_boltzgen_updates(self)
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator implementation used by this model."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    GatedMultiheadAttention,
-                    Transition,
-                    TriangleMultiplication,
-                    MsaPairWeightedAveraging,
-                    OuterProductMean,
-                    TokenToAtomBroadcast,
-                    TokenPairToLocalAtomPairBroadcast,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
@@ -2106,6 +2063,7 @@ class BoltzGenDenoiserConditioning(nn.Module):
         num_token_transformer_blocks: Number of token-transformer blocks (one bias projection each).
         num_token_transformer_heads: Number of attention heads per token-transformer block.
         num_conditioning_transitions: Number of transitions in the pairwise conditioner.
+        operator_backend: Public backend request forwarded to the pairwise conditioner.
     """
 
     def __init__(
@@ -2124,12 +2082,14 @@ class BoltzGenDenoiserConditioning(nn.Module):
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
         num_conditioning_transitions: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
+            operator_backend=operator_backend,
         )
         self.atom_encoder = BoltzGenAtomEncoder(
             atom_feature_size=atom_feature_size,
@@ -2266,6 +2226,7 @@ class BoltzGenDenoiser(nn.Module):
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_transitions=num_conditioning_transitions,
+            operator_backend=operator_backend,
         )
         self.atom_attention_encoder = BoltzGenAtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -2380,6 +2341,7 @@ class BoltzGenSingleConditioning(nn.Module):
         fourier_embedding_size: Width of the noise-level Fourier embedding.
         num_transitions: Number of refinement transitions.
         transition_expansion: Feed-forward expansion factor of each transition.
+        operator_backend: Public backend request forwarded to every transition.
     """
 
     def __init__(
@@ -2388,6 +2350,7 @@ class BoltzGenSingleConditioning(nn.Module):
         fourier_embedding_size: int = 256,
         num_transitions: int = 2,
         transition_expansion: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
@@ -2397,7 +2360,8 @@ class BoltzGenSingleConditioning(nn.Module):
         self.fourier_norm = LayerNorm(fourier_embedding_size)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=transition_expansion) for _ in range(num_transitions)
+            Transition(hidden, expansion=transition_expansion, operator_backend=operator_backend)
+            for _ in range(num_transitions)
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:

@@ -61,6 +61,7 @@ class ConfidenceHead(nn.Module):
         symmetrize_pde_before_projection: Whether the PDE projector symmetrizes the pair state before the
             norm/projection instead of symmetrizing the projected logits.
         persistent_distance_bins: Whether the distance-bin buffers are stored in ``state_dict``.
+        operator_backend: Public backend request forwarded to the Pairformer and atom projector.
     """
 
     def __init__(
@@ -89,6 +90,7 @@ class ConfidenceHead(nn.Module):
         use_distance_projection: bool = True,
         symmetrize_pde_before_projection: bool = True,
         persistent_distance_bins: bool = True,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
@@ -113,12 +115,14 @@ class ConfidenceHead(nn.Module):
             expansion=expansion,
             dropout=dropout,
             ending_node_transpose_bias=ending_node_transpose_bias,
+            operator_backend=operator_backend,
         )
         self.atom_projector = AtomConfidenceProjector(
             single_size=single_size,
             num_plddt_bins=num_plddt_bins,
             num_resolved_bins=num_resolved_bins,
             max_atoms_per_token=max_atoms_per_token,
+            operator_backend=operator_backend,
         )
         self.pair_projector = PairConfidenceProjector(
             pair_size=pair_size,
@@ -277,6 +281,7 @@ class AtomConfidenceProjector(nn.Module):
         num_plddt_bins: Number of pLDDT bins.
         num_resolved_bins: Number of resolved-classification bins.
         max_atoms_per_token: Maximum atoms per token, sizing the per-offset weight tables.
+        operator_backend: Public backend request forwarded to token-to-atom broadcast.
     """
 
     def __init__(
@@ -285,13 +290,14 @@ class AtomConfidenceProjector(nn.Module):
         num_plddt_bins: int = 50,
         num_resolved_bins: int = 2,
         max_atoms_per_token: int = 24,
+        operator_backend: str = "auto",
     ):
         super().__init__()
         self.plddt_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_plddt_bins))
         self.resolved_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_resolved_bins))
         self.plddt_norm = LayerNorm(single_size)
         self.resolved_norm = LayerNorm(single_size)
-        self.token_to_atom_broadcast = TokenToAtomBroadcast()
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

@@ -151,6 +151,7 @@ class EsmFold2Model(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator backend used by the folding head."""
 
+        super()._set_backend(backend)
         self._backends.configure(backend)
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
@@ -1036,6 +1037,7 @@ class EsmFold2ExperimentalModel(Model):
     def _set_backend(self, backend: ModelBackend) -> None:
         r"""Apply the operator backend; design-gradient operations remain eager."""
 
+        super()._set_backend(backend)
         self._backends.configure(backend)
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
@@ -2779,18 +2781,18 @@ class EsmFold2MsaPairWeightedAveraging(nn.Module):
                 msa.transpose(1, 2),
                 pair,
                 pair_attention_mask,
-                norm_msa_weight=self.msa_norm.weight,
-                norm_msa_bias=self.msa_norm.bias,
-                norm_pair_weight=self.pair_norm.weight,
-                norm_pair_bias=self.pair_norm.bias,
+                msa_norm_weight=self.msa_norm.weight,
+                msa_norm_bias=self.msa_norm.bias,
+                pair_norm_weight=self.pair_norm.weight,
+                pair_norm_bias=self.pair_norm.bias,
                 value_weight=self.value_projection.weight,
                 gate_weight=self.gate_projection.weight,
                 pair_logits_weight=self.pair_bias_projection.weight,
                 output_weight=self.output_projection.weight,
                 num_heads=self.num_attention_heads,
                 head_dim=self.head_width,
-                norm_msa_eps=self.msa_norm.eps,
-                norm_pair_eps=self.pair_norm.eps,
+                msa_norm_eps=self.msa_norm.eps,
+                pair_norm_eps=self.pair_norm.eps,
                 operator_backend="oops",
             ).transpose(1, 2)
 

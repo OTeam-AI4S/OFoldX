@@ -123,6 +123,7 @@ class ConditionedTransition(nn.Module):
         hidden_size: Input and output hidden width.
         conditioning_size: Conditioning tensor width.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
+        operator_backend: Public backend request forwarded to the adaptive norm.
 
     Examples:
         >>> import torch
@@ -138,10 +139,15 @@ class ConditionedTransition(nn.Module):
         hidden_size: int = 768,
         conditioning_size: int = 384,
         expansion: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         expanded_size = expansion * hidden_size
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(
+            hidden_size,
+            conditioning_size,
+            operator_backend=operator_backend,
+        )
         self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
         self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)

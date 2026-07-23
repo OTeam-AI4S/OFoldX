@@ -18,7 +18,7 @@ resolver. It is the boundary-time counterpart to
 ```python
 from ofoldx.data.ccd import resolve_ccd_component
 
-component = resolve_ccd_component(component_id, *, revision)
+component = resolve_ccd_component("HEM", revision="2026-07-23")
 # -> ofoldx.data.molecular.ChemicalComponent
 ```
 

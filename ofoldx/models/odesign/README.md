@@ -43,10 +43,6 @@ generated backbones with ProteinMPNN or LigandMPNN.
 | ----------------- | ---------- | ----------- | --------- | --------------------- | ------------------ | --------- |
 | 48                | 4          | 384         | 128       | 24                    | 355.648            | 1260.502  |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 generated residues (512 atom
-rows), one recycling pass, and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.odesign](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/odesign)
@@ -57,16 +53,23 @@ rows), one recycling pass, and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
+### Direct Use
+
+#### Biomolecular Design
+
+Use the high-level `design` API:
+
 ```python
 import ofoldx
 
-result = ofoldx.design("target.cif", model="oteam/odesign-flex")
+output = ofoldx.design("target.cif", model="oteam/odesign-flex")
 ```
 
 ## Training Details
@@ -82,18 +85,6 @@ OFoldX preserves the released inference graph and exposes the differentiable
 one-step denoiser. It does not add an OFoldX-specific training objective to the
 model. Rigid and flexible receptor behavior is a conditioning difference rather
 than a separate architecture.
-
-## Limitations
-
-- The released de novo ligand CLI creates atoms without sufficient element,
-  reference-component, and sanitized bond identity to construct a truthful
-  canonical molecule. That generation mode is not exposed.
-- De novo nucleic-acid generation and non-protein OInvFold beam decoding are not
-  included in this protein composition.
-- Existing canonical molecules are supported as structural context.
-- The core model has no per-sample confidence head. Distogram and token-bond
-  logits remain raw outputs rather than fabricated ranking scores.
-- Sampling is stochastic and depends on the supplied seed or generator.
 
 ## Citation
 

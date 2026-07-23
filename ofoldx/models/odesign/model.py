@@ -30,16 +30,11 @@ from ...data.placement import (
 from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
-from ...modules.adaptive_norm import AdaptiveLayerNorm
+from ...model import Model
 from ...modules.atom import (
     AtomToTokenEncoder,
-    AtomToTokenEncoderBase,
     LocalAtomGeometry,
-    TokenPairToLocalAtomPairBroadcast,
-    TokenToAtomBroadcast,
 )
-from ...modules.attention import GatedMultiheadAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler
@@ -50,9 +45,7 @@ from ...modules.embedding import (
 )
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
-from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
-from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import Metric, Score, best
 from .config import ODesignConfig
 
@@ -79,6 +72,7 @@ class ODesignModel(Model):
             min_distance=config.constraint_embeddings.min_distance,
             max_distance=config.constraint_embeddings.max_distance,
             dropout=config.constraint_embeddings.dropout,
+            operator_backend="auto",
         )
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
@@ -137,26 +131,6 @@ class ODesignModel(Model):
         if self.distogram_head.projection.bias is not None:
             nn.init.zeros_(self.distogram_head.projection.bias)
         self.post_init()
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the public PyTorch or OOps operator path."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    AtomToTokenEncoderBase,
-                    GatedMultiheadAttention,
-                    MsaPairWeightedAveraging,
-                    OuterProductMean,
-                    TokenPairToLocalAtomPairBroadcast,
-                    TokenToAtomBroadcast,
-                    Transition,
-                    TriangleMultiplication,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
@@ -468,6 +442,7 @@ class ODesignConstraintEmbeddings(nn.Module):
         min_distance: float = 3.25,
         max_distance: float = 50.75,
         dropout: float = 0.25,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_bins = num_bins
@@ -481,6 +456,7 @@ class ODesignConstraintEmbeddings(nn.Module):
             single_size=0,
             pair_size=hidden_size,
             dropout=dropout,
+            operator_backend=operator_backend,
         )
         self.hidden_norm = LayerNorm(hidden_size)
         self.activation = nn.ReLU()

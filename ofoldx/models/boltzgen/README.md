@@ -54,11 +54,6 @@ inverse folding to assign amino-acid sequences to generated backbones.
 | Structure-trained small | 384 / 128           | 12 Miniformer + 3 MSA Blocks         | 8 token Blocks            | 136.848            | 333.935   |
 | Inverse folding         | 128 / 128           | 6 graph encoder Blocks, 30 neighbors | 3 graph decoder Blocks    | 3.029              | 13.639    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured on 128 residues. Structure variants use 512 atom
-rows, one recycling pass, and one denoising step; inverse folding uses one
-teacher-forced sequence forward.
-
 ### Links
 
 - **Code**: [ofoldx.models.boltzgen](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltzgen)
@@ -69,16 +64,23 @@ teacher-forced sequence forward.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
+### Direct Use
+
+#### Biomolecular Design
+
+Use the high-level `design` API:
+
 ```python
 import ofoldx
 
-result = ofoldx.design(
+output = ofoldx.design(
     None,
     model="oteam/boltzgen-diverse",
     total_len=120,
@@ -101,20 +103,6 @@ regions. Training noise follows
 `sigma = sigma_data * exp(-1.2 + 1.5 * z)`, `z ~ N(0, 1)`, with loss weight
 `(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2`. The inverse-folding model
 uses a separate structure-conditioned residue-prediction objective.
-
-## Limitations
-
-- Structure generation and temperature-based inverse folding are stochastic.
-  Candidate coordinates and sequences depend on the advancing generator stream.
-- The structure-design models do not contain confidence or affinity heads.
-  Those scores exist only when compatible external pairs are composed into the
-  Pipeline.
-- The current Pipeline implements structure design, inverse folding, optional
-  refolding, optional affinity scoring, and result assembly. It does not expose
-  separate released `design_folding`, filtering, or composite-ranking stages.
-- Before optional refolding, designed side-chain atoms are added at the origin
-  and marked present, matching the released sequence-remap convention; the
-  structure designer predicts the backbone coordinates, not packed side chains.
 
 ## Citation
 

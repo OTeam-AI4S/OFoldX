@@ -64,3 +64,21 @@ def test_conditioned_transformer_block_rejects_malformed_mask(block: Conditioned
             bias=torch.zeros(2, 4, 4, 1),
             mask=torch.ones(2, 3, dtype=torch.bool),
         )
+
+
+@pytest.mark.parametrize("backend", ("torch", "oops"))
+@pytest.mark.parametrize("transition", ("double", "triple"))
+def test_conditioned_transformer_block_propagates_backend(backend: str, transition: str) -> None:
+    block = ConditionedTransformerBlock(
+        hidden_size=4,
+        conditioning_size=3,
+        num_attention_heads=1,
+        operator_backend=backend,
+        cross_attention_mode=True,
+        transition=transition,
+    )
+
+    assert block.conditioned_norm.operator_backend == backend
+    assert block.key_value_norm.operator_backend == backend
+    assert block.attention.operator_backend == backend
+    assert block.transition.conditioned_norm.operator_backend == backend

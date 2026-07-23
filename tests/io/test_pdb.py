@@ -53,7 +53,7 @@ def test_pdb_keeps_separate_het_residues_as_separate_single_component_molecules(
 @pytest.mark.xfail(
     reason="reopened §3.5: the LossReport contract (dropped/rewritten field vocabulary and the "
     "removed format field) is the reopened §3.5 lossy-write reporting decision",
-    strict=False,
+    strict=True,
 )
 def test_pdb_fails_by_default_and_returns_exact_loss_report_when_acknowledged(tmp_path: Path) -> None:
     structure = _heterogeneous_structure()

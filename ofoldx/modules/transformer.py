@@ -30,7 +30,7 @@ class ConditionedTransformer(nn.Module):
         num_attention_heads: Number of attention heads per block.
         hidden_size: Width of the token/atom channel that flows through the stack.
         conditioning_size: Width of the conditioning channel; defaults to ``hidden_size``.
-        operator_backend: Which operator backend the attention runs; see
+        operator_backend: Which operator backend the block runs; see
             [ofoldx.modules.backend][].
         cross_attention_mode: Whether each block adds a second adaptive norm on the key/value path.
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
@@ -176,10 +176,18 @@ class ConditionedTransformerBlock(nn.Module):
         super().__init__()
         self.cross_attention_mode = cross_attention_mode
         self.cross_attention_key_source = cross_attention_key_source
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(
+            hidden_size,
+            conditioning_size,
+            operator_backend=operator_backend,
+        )
         if cross_attention_mode:
             # A second adaptive norm on the key/value path.
-            self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
+            self.key_value_norm = AdaptiveLayerNorm(
+                hidden_size,
+                conditioning_size,
+                operator_backend=operator_backend,
+            )
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
@@ -189,9 +197,18 @@ class ConditionedTransformerBlock(nn.Module):
         )
         self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
         if transition == "triple":
-            self.transition: nn.Module = TripleProductConditionedTransition(hidden_size, conditioning_size)
+            self.transition: nn.Module = TripleProductConditionedTransition(
+                hidden_size,
+                conditioning_size,
+                operator_backend=operator_backend,
+            )
         elif transition == "double":
-            self.transition = ConditionedTransition(hidden_size, conditioning_size, expansion=2)
+            self.transition = ConditionedTransition(
+                hidden_size,
+                conditioning_size,
+                expansion=2,
+                operator_backend=operator_backend,
+            )
         else:
             raise ValueError(f"unknown transition: {transition!r} (expected 'triple' or 'double')")
         self.sigmoid = nn.Sigmoid()
@@ -280,6 +297,7 @@ class TripleProductConditionedTransition(nn.Module):
         hidden_size: Input and output hidden width.
         conditioning_size: Conditioning tensor width driving the adaptive norm and output gate.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
+        operator_backend: Public backend request forwarded to the adaptive norm.
 
     Examples:
         >>> import torch
@@ -290,10 +308,20 @@ class TripleProductConditionedTransition(nn.Module):
         torch.Size([2, 3, 8])
     """
 
-    def __init__(self, hidden_size: int, conditioning_size: int, expansion: int = 2) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        conditioning_size: int,
+        expansion: int = 2,
+        operator_backend: str = "auto",
+    ) -> None:
         super().__init__()
         inner_size = hidden_size * expansion
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size)
+        self.conditioned_norm = AdaptiveLayerNorm(
+            hidden_size,
+            conditioning_size,
+            operator_backend=operator_backend,
+        )
         self.gate_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.expand_projection = nn.Linear(hidden_size, inner_size, bias=False)

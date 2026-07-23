@@ -43,10 +43,6 @@ packing is provided separately by [MPNN Packer](../mpnn_packer/README.md).
 | ----------- | -------------- | ------------------- | -------------- | -------------- | --------- | ------------- | ------------------ | --------- |
 | 128         | 3              | 2                   | 2              | 3              | 32        | 25            | 2.619              | 34.458    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one teacher-forced forward over 128 protein
-residues.
-
 ### Links
 
 - **Code**: [ofoldx.models.ligandmpnn](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/ligandmpnn)
@@ -57,14 +53,18 @@ residues.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can design a protein sequence in its atomic context with the high-level
-`design` API:
+### Direct Use
+
+#### Sequence Design
+
+Use the high-level `design` API:
 
 ```python
 import ofoldx
@@ -84,15 +84,6 @@ ligands, nucleic acids, metals, and other non-protein entities.
 LigandMPNN uses autoregressive sequence recovery with coordinate perturbations
 for robustness. OFoldX exposes a differentiable teacher-forced
 `forward` path for training and fine-tuning.
-
-## Limitations
-
-- LigandMPNN designs protein sequence on a fixed backbone with atomic context.
-  It does not generate backbones or pack side chains.
-- Side-chain packing belongs to MPNN Packer, and combined design-to-pack
-  cardinality belongs to the concrete composition.
-- LigandMPNN intentionally exposes aligned probability distributions rather
-  than a scalar `ScoreResult`.
 
 ## Citation
 

@@ -17,16 +17,11 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
-from ...modules.adaptive_norm import AdaptiveLayerNorm
+from ...model import Model
 from ...modules.atom import (
     AtomToTokenEncoder,
-    AtomToTokenEncoderBase,
     LocalAtomGeometry,
-    TokenPairToLocalAtomPairBroadcast,
-    TokenToAtomBroadcast,
 )
-from ...modules.attention import GatedMultiheadAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler, EdmScheduler
@@ -38,9 +33,7 @@ from ...modules.embedding import (
 )
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import ConfidenceHead, DistogramHead, expected_plddt, tm_bin_weights
-from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
-from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import (
     FoldPrediction,
     FoldResult,
@@ -187,26 +180,6 @@ class ProtenixModel(Model):
         nn.init.zeros_(self.confidence_head.pair_projector.pde_projection.weight)
         if self.constraint_embeddings is not None:
             self.constraint_embeddings.reset_parameters()
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the public PyTorch or OOps operator path."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    AtomToTokenEncoderBase,
-                    GatedMultiheadAttention,
-                    MsaPairWeightedAveraging,
-                    OuterProductMean,
-                    TokenPairToLocalAtomPairBroadcast,
-                    TokenToAtomBroadcast,
-                    Transition,
-                    TriangleMultiplication,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,

@@ -21,7 +21,7 @@ from torch import Tensor, nn
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
+from ...model import Model
 from ...modules import residue_constants
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm
@@ -29,7 +29,6 @@ from ...modules.head import DistogramHead, tm_bin_weights
 from ...modules.transition import RowwiseDropout
 from ...modules.trunk import EvoformerStack
 from ...modules.trunk.evoformer import (
-    AlphaFold2OuterProductMean,
     AlphaFold2TriangleAttention,
     AlphaFold2TriangleMultiplication,
     EvoformerTransition,
@@ -197,16 +196,6 @@ class AlphaFold2Model(Model):
             num_output=heads.masked_msa.num_output,
         )
         self.post_init()
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the public PyTorch or OOps attention path."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (GatedMultiheadAttention, AlphaFold2OuterProductMean, AlphaFold2TriangleMultiplication),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
@@ -1321,7 +1310,7 @@ class AlphaFold2MultimerInputEmbeddings(nn.Module):
         )
         relative_position = F.one_hot(final_offset.long(), num_classes=2 * max_relative_index + 2).to(torch.float32)
 
-        entity_same = (input.entity_index.unsqueeze(-1) == input.entity_index.unsqueeze(-2)).to(torch.float32)
+        same_entity = (input.entity_index.unsqueeze(-1) == input.entity_index.unsqueeze(-2)).to(torch.float32)
 
         # The relative-chain feature uses the per-entity copy index, not the global
         # chain index. These coincide only when same-entity copies are contiguously
@@ -1331,12 +1320,12 @@ class AlphaFold2MultimerInputEmbeddings(nn.Module):
         symmetry_offset = symmetry_index.unsqueeze(-1) - symmetry_index.unsqueeze(-2)
         clipped_chain = torch.clamp(symmetry_offset + max_chain, min=0, max=2 * max_chain)
         final_chain = torch.where(
-            entity_same.to(torch.bool),
+            same_entity.to(torch.bool),
             clipped_chain,
             torch.full_like(clipped_chain, 2 * max_chain + 1),
         )
         relative_chain = F.one_hot(final_chain.long(), num_classes=2 * max_chain + 2).to(torch.float32)
-        return torch.cat([relative_position, entity_same.unsqueeze(-1), relative_chain], dim=-1)
+        return torch.cat([relative_position, same_entity.unsqueeze(-1), relative_chain], dim=-1)
 
 
 class AlphaFold2RecyclingEmbeddings(nn.Module):

@@ -51,7 +51,7 @@ from ...data.placement import SymbolicAtomSite, SymbolicResidueSite
 from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import symbolic_residue_aliases
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
+from ...model import Model
 from ...modules.backend import _oops
 from ...modules.backend.resolve import resolve_tensor_operator_backend
 from ...results import Metric, Score, best
@@ -123,19 +123,6 @@ class RfDiffusionModel(Model):
         r"""Return the model-baked IGSO(3) lookup table as the sampler's schedule dict."""
 
         return {name: getattr(self, f"igso3_{name}").detach().cpu().numpy() for name, _ in _IGSO3_FIELDS}
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator backend used by the RFdiffusion SE(3) path."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                RfDiffusionSe3TensorProductConvolution
-                | RfDiffusionSe3Convolution
-                | RfDiffusionSe3Attention
-                | RfDiffusionSe3Transformer,
-            ):
-                module.operator_backend = backend
 
     def forward(self, input: RfDiffusionInput) -> RfDiffusionOutput:
         r"""Run one ordinary differentiable denoising pass."""

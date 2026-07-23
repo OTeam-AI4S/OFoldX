@@ -52,12 +52,6 @@ first predict and rank structures, then resample and score the selected complex.
 | Structure | 64                | 2               | 8                 | none            | 384         | 128       | 4            | 506.725            | 1615.889  |
 | Affinity  | 64                | 0               | 8                 | 8 + 4           | 384         | 128       | 6            | 515.055            | 1806.891  |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 residues (640 atom rows), one
-query-only MSA row, and one trunk pass. The structure row includes one denoising
-step; the affinity row includes the two-head affinity ensemble on supplied
-coordinates.
-
 ### Links
 
 - **Code**: [ofoldx.models.boltz2](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltz2)
@@ -68,13 +62,18 @@ coordinates.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-### Structure Prediction
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
@@ -82,7 +81,9 @@ import ofoldx
 output = ofoldx.fold("complex.cif", model="oteam/boltz2")
 ```
 
-### Binding Affinity Prediction
+#### Binding Affinity Prediction
+
+Use the high-level `score` API:
 
 ```python
 import ofoldx
@@ -107,18 +108,6 @@ Training is staged across structure, confidence, and affinity
 objectives. The report describes detached-trunk absolute and difference Huber
 losses for affinity values and a focal binary objective for binder
 classification.
-
-## Limitations
-
-- Structure and affinity sampling are stochastic. The two-stage result depends
-  on both first-pass ranking and independent second-pass maximum-iPTM selection.
-- Affinity scoring requires a protein receptor and one selected, non-copied
-  `Molecule` instance. The released crop supports at most 256 tokens, 200 polymer
-  tokens, 2048 atoms, and 128 ligand atoms after hydrogen removal.
-- Molecular-weight calibration is computed from the final canonical ligand
-  graph. Raw SMILES should be standardized before constructing the input.
-- Native pTM reductions use the dtype-aware `torch.finfo(dtype).tiny` denominator
-  for empty masks rather than a fixed cross-family epsilon.
 
 ## Citation
 

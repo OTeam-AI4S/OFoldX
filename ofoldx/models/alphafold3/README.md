@@ -47,10 +47,6 @@ ipTM, disorder, and ranking scores.
 | ----------------- | --------------- | --------------- | ----------- | --------- | --------------- | -------------- | ------------------ | --------- |
 | 48                | 2               | 24              | 384         | 128       | 4               | 200            | 368.317            | 1226.198  |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 residues (641 atom rows), one
-query-only MSA row, one recycling pass, and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.alphafold3](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/alphafold3)
@@ -61,13 +57,18 @@ query-only MSA row, one recycling pass, and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can predict a biomolecular complex with the high-level `fold` API:
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
@@ -89,19 +90,6 @@ information for the authoritative data description.
 AlphaFold 3 is trained end to end with a diffusion coordinate objective and
 auxiliary distogram and confidence objectives. OFoldX preserves the inference
 architecture and exposes the differentiable denoising step.
-
-## Limitations
-
-- AlphaFold 3 outputs are predictions with varying confidence and are not
-  experimental evidence. They are not intended or validated for clinical use.
-- Inference is stochastic and computationally demanding. Results depend on the
-  parameter set, biological evidence, seed, sample count, recycling and
-  sampling steps, dtype, and backend.
-- The Processor lowers supplied MSA and template evidence; it does not perform
-  the upstream database-search pipeline.
-- Bare CCD codes resolve against the bundled chemical component dictionary;
-  callers that require different chemistry must provide a fully specified
-  canonical system.
 
 ## Citation
 

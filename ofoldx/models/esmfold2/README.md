@@ -47,11 +47,6 @@ differentiable critic for protein binder sequence design.
 | Experimental      | 48             | yes | 6B   | 384         | 256       | 128       | 768        | 4                 | 14             | 6568.980           | 4335.312  |
 | Experimental Fast | 24             | no  | 6B   | 384         | 256       | 128       | 768        | 4                 | 14             | 6531.170           | 3046.822  |
 
-Parameter counts include the frozen ESMC-6B backbone. FLOPs use PyTorch's
-`FlopCounterMode`, with each multiply-add counted as two operations. They are
-measured in bfloat16 for one batch of 128 residues (640 atom rows), one
-query-only MSA row, one recurrent update, and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.esmfold2](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/esmfold2)
@@ -62,19 +57,37 @@ query-only MSA row, one recurrent update, and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can predict a protein structure from its sequence with the high-level
-`fold` API:
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
 
 output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/esmfold2")
+```
+
+#### Binder Design
+
+Use the high-level `design` API:
+
+```python
+import ofoldx
+
+output = ofoldx.design(
+    "target.fasta",
+    model="oteam/esmfold2-experimental",
+    binder_length=80,
+)
 ```
 
 ## Training Details
@@ -101,30 +114,6 @@ Binder design is inference-time optimization rather than model training.
 It performs gradient descent over soft binder-sequence logits under the
 released distogram contact objective and ESMC pseudo-perplexity regularizer,
 then refolds a discrete selected sequence.
-
-## Limitations
-
-- ESMFold2 predictions are computational hypotheses, not experimental
-  measurements. Structures and designed binders require independent
-  experimental validation.
-- PDB and AFDB contain uneven coverage of protein families, conformational
-  states, modifications, disorder, and non-protein biomolecules. Accuracy may
-  degrade for underrepresented chemistry and biology.
-- Quality depends on inference-time sampling and recurrent refinement.
-  Reducing samples or steps trades accuracy for speed, while pair and atom
-  computations make large systems memory-intensive.
-- The ESMC dependency has a 2048-token context. The Processor runs one ESMC row
-  per protein chain; MSA evidence applies only to protein entities, and Fast
-  variants reject it.
-- Canonical small-molecule inputs must carry an explicit, complete reference
-  conformer. The Processor does not generate geometry from SMILES. Observed
-  coordinates in a `Structure` are not folding features.
-- The released source emits distance-conditioning tensors that its released
-  folding forward path does not consume. OFoldX rejects this ineffective
-  conditioning rather than advertising it as supported.
-- Binder design currently targets one single-chain protein and one binder per
-  call. It does not automatically run the multi-inversion, hero-critic, and
-  scaling-critic ensemble from the released workflow.
 
 ## Citation
 

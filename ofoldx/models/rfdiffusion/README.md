@@ -49,11 +49,6 @@ design through model-specific conditioning.
 | ----------- | ------------ | ----------------- | -------- | --------- | ------------------- | ------------------ | --------- |
 | 32          | 4            | 4                 | 256      | 128       | 50                  | 59.808             | 549.535   |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 generated residues and one
-denoising timestep using the base configuration. Variant configurations may
-differ in their conditioning dimensions.
-
 ### Links
 
 - **Code**: [ofoldx.models.rfdiffusion](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/rfdiffusion)
@@ -64,11 +59,18 @@ differ in their conditioning dimensions.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
+
+### Direct Use
+
+#### Backbone Design
+
+Use the high-level `design` API:
 
 ```python
 import ofoldx
@@ -76,7 +78,7 @@ from ofoldx.data import GeneratedSegment
 from ofoldx.models.rfdiffusion import RfDiffusionPlacements
 
 placement = RfDiffusionPlacements({"binder": {"binder": GeneratedSegment("protein", 100, 100)}})
-result = ofoldx.design(None, model="oteam/rfdiffusion-base", placement=placement)
+output = ofoldx.design(None, model="oteam/rfdiffusion-base", placement=placement)
 ```
 
 ## Training Details
@@ -94,23 +96,6 @@ The training procedure adds Gaussian C-alpha translation noise and rotational
 Brownian motion to residue frames, then trains the network to denoise toward
 the true frames with self-conditioning across timesteps. OFoldX exposes the
 differentiable denoiser for training and fine-tuning.
-
-## Limitations
-
-- RFdiffusion generates protein backbones. It does not design a final amino-acid
-  sequence or pack side chains; unconstrained generated residues are `UNK`.
-- Sampling is stochastic and results depend on the model, topology,
-  conditions, seed, sampling schedule, dtype, and backend.
-- One fold-conditioning `Template` is supported. Template evidence and
-  secondary-structure conditioning require a fold-conditioned variant, and
-  template-conditioned generated segments must have fixed lengths.
-- `RfDiffusionDesignResult` intentionally omits raw denoiser logits, diffusion
-  timesteps, `pX0`, `x_{t-1}`, and backbone/torsion trajectories. Those remain
-  tensor/sampler diagnostics rather than candidate values.
-- The non-default upstream `rep_r_min=0` all-pairs substrate-repulsion branch is
-  not represented by `RfDiffusionSubstrateInteraction`.
-- OFoldX does not expose the upstream `t3` symmetry alias or the inert
-  `model_only_neighbors` option as separate semantics.
 
 ## Citation
 

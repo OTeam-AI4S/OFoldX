@@ -66,7 +66,7 @@ def test_unknown_component_requires_an_explicit_complete_graph(tmp_path: Path) -
 @pytest.mark.xfail(
     reason="reopened §3.5: complete_all hydrogen-count materialization is a reopened §3.5 I/O "
     "graph transform; §3.5.1/§3.3 also removed component provenance",
-    strict=False,
+    strict=True,
 )
 def test_complete_all_materializes_hydrogen_counts_as_an_explicit_graph_transform(tmp_path: Path) -> None:
     path = tmp_path / "methane.pdb"

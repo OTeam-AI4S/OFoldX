@@ -373,11 +373,12 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             operator_backend=operator_backend,
             cross_attention_key_source=cross_attention_key_source,
         )
-        self.token_to_atom_broadcast = TokenToAtomBroadcast()
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
         self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
         self.token_pair_to_local_atom_pair_broadcast = TokenPairToLocalAtomPairBroadcast(
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
+            operator_backend=operator_backend,
         )
         self.single_norm = LayerNorm(single_size, bias=False)
         self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
@@ -1185,7 +1186,7 @@ class TokenToAtomDecoder(nn.Module):
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
-        self.token_to_atom_broadcast = TokenToAtomBroadcast()
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
         self.atom_self_attention = AtomSelfAttention(
             atom_hidden_size=atom_hidden_size,
             conditioning_size=atom_hidden_size,

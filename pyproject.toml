@@ -102,7 +102,7 @@ ini_options.addopts = "--import-mode=importlib --doctest-modules --cov=ofoldx"
 ini_options.markers = [
   "lfs: tests that involve large file handling and should be excluded from CI",
 ]
-ini_options.testpaths = [ "tests" ]
+ini_options.testpaths = [ "ofoldx", "tests" ]
 
 [tool.coverage]
 run.branch = true

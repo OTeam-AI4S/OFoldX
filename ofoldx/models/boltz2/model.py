@@ -23,13 +23,11 @@ from torch import Tensor, nn
 
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
-from ...modules.adaptive_norm import AdaptiveLayerNorm
+from ...model import Model
 from ...modules.atom.encoders import PackedAtomAttention
 from ...modules.atom.pair_encoding import encode_atom_pair
-from ...modules.atom.transfer import TokenPairToLocalAtomPairBroadcast, TokenToAtomBroadcast, dense_mean_to_tokens
+from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
-from ...modules.attention import GatedMultiheadAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
@@ -43,8 +41,6 @@ from ...modules.transformer import ConditionedTransformer
 from ...modules.transition import Transition
 from ...modules.trunk.msa import (
     CategoricalMsaTrunk,
-    MsaPairWeightedAveraging,
-    OuterProductMean,
     TrianglePairUpdateBlock,
 )
 from ...modules.trunk.pairformer import PairformerStack
@@ -229,25 +225,6 @@ class Boltz2Model(Model):
         if config.predict_bfactor:
             self.bfactor_head = Boltz2BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
         self.post_init()
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator implementation used by this model."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    GatedMultiheadAttention,
-                    Transition,
-                    TriangleMultiplication,
-                    MsaPairWeightedAveraging,
-                    OuterProductMean,
-                    TokenToAtomBroadcast,
-                    TokenPairToLocalAtomPairBroadcast,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
@@ -1798,6 +1775,7 @@ class Boltz2DenoiserConditioning(nn.Module):
         num_token_transformer_blocks: Number of token-transformer blocks whose biases are precomputed.
         num_token_transformer_heads: Head count for the token-transformer biases.
         num_conditioning_transitions: Number of transitions in the pairwise conditioner.
+        operator_backend: Public backend request forwarded to the pairwise conditioner.
     """
 
     def __init__(
@@ -1816,12 +1794,14 @@ class Boltz2DenoiserConditioning(nn.Module):
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
         num_conditioning_transitions: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
+            operator_backend=operator_backend,
         )
         self.atom_encoder = Boltz2AtomEncoder(
             atom_feature_size=atom_feature_size,
@@ -1950,6 +1930,7 @@ class Boltz2Denoiser(nn.Module):
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_conditioning_transitions=num_conditioning_transitions,
+            operator_backend=operator_backend,
         )
         self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -2059,6 +2040,7 @@ class Boltz2SingleConditioning(nn.Module):
         fourier_embedding_size: Width of the Fourier noise-level embedding.
         num_conditioning_transitions: Number of transitions refining the conditioned single.
         expansion: Transition expansion factor.
+        operator_backend: Public backend request forwarded to every transition.
     """
 
     def __init__(
@@ -2067,6 +2049,7 @@ class Boltz2SingleConditioning(nn.Module):
         fourier_embedding_size: int = 256,
         num_conditioning_transitions: int = 2,
         expansion: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
@@ -2076,7 +2059,8 @@ class Boltz2SingleConditioning(nn.Module):
         self.fourier_norm = LayerNorm(fourier_embedding_size)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=expansion) for _ in range(num_conditioning_transitions)
+            Transition(hidden, expansion=expansion, operator_backend=operator_backend)
+            for _ in range(num_conditioning_transitions)
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
@@ -2418,6 +2402,7 @@ class Boltz2AffinityHead(nn.Module):
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
             expansion=expansion,
+            operator_backend=operator_backend,
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=num_blocks,

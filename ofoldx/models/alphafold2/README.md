@@ -47,11 +47,6 @@ complexes.
 | Monomer pTM | 48               | 4                | 8                | 256      | 128       | 384         | 4               | 93.237             | 1283.216  |
 | Multimer    | 48               | 4                | 8                | 256      | 128       | 384         | 21              | 93.224             | 11592.924 |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 residues, one query-only MSA
-row, no templates, and one recycling pass. The configured recycling-step counts
-are shown separately.
-
 ### Links
 
 - **Code**: [ofoldx.models.alphafold2](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/alphafold2)
@@ -63,14 +58,18 @@ are shown separately.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can predict a protein structure from its sequence with the high-level
-`fold` API:
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
@@ -95,19 +94,6 @@ chain-relative features and interface confidence.
 
 OFoldX preserves a differentiable final recycle and the released inference
 module boundaries.
-
-## Limitations
-
-- AlphaFold 2 predicts structures; it does not provide experimental validation.
-- Monomer input is limited to one standard protein instance. Multimer input is
-  limited to protein polymer chains; ligands, nucleic acids, and heterogeneous
-  assemblies are not accepted by this family.
-- Coordinates on a monomer `Structure` input are not consumed as template
-  evidence. Templates require explicit canonical alignments.
-- Amber/OpenMM relaxation is not included; `fold` returns unrelaxed structures.
-- Sampling is stochastic unless the caller supplies a seed or generator, and
-  results also depend on MSA, template, recycling, ensemble, dtype, and backend
-  settings.
 
 ## Citation
 

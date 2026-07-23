@@ -39,10 +39,6 @@ selected side chains are rebuilt.
 | ----------- | -------------- | ------------------- | -------------- | -------------- | --------- | ------------- | ------------------ | ------------------ | --------- |
 | 128         | 3              | 2                   | 2              | 3              | 32        | 16            | 3                  | 3.572              | 22.896    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one side-chain packing forward over 128
-protein residues.
-
 ### Links
 
 - **Code**: [ofoldx.models.mpnn_packer](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/mpnn_packer)
@@ -53,14 +49,18 @@ protein residues.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can pack side chains for a fixed backbone and sequence with the high-level
-`pack` API:
+### Direct Use
+
+#### Side-Chain Packing
+
+Use the high-level `pack` API:
 
 ```python
 import ofoldx
@@ -80,17 +80,6 @@ conformations and optional local non-protein atom context.
 The model predicts mixture distributions over side-chain chi angles and applies
 iterative coordinate refinement. OFoldX exposes a differentiable
 `forward` over an explicit atom14 state.
-
-## Limitations
-
-- MPNN Packer rebuilds side chains on a fixed backbone. It does not design
-  sequence, generate backbone coordinates, or move backbone atoms.
-- `pack` requires batch size one. `pack_sequences` batches
-  several target sequences while retaining one canonical realization mapping
-  per sequence.
-- Fixed, backbone-only, ALA, GLY, and unselected residues preserve their
-  observed atoms.
-- Atom coordinates retain the stochasticity of the iterative packing process.
 
 ## Citation
 

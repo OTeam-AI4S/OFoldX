@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ofoldx.modules.atom import AtomConditioner, AtomPairEncoder, PackedAtomAttention
+from ofoldx.modules.atom import (
+    AtomConditioner,
+    AtomPairEncoder,
+    CoordinateAtomToTokenEncoder,
+    PackedAtomAttention,
+    TokenToAtomDecoder,
+)
 
 
 @pytest.fixture
@@ -87,7 +93,38 @@ def test_invalid_inputs(pair_encoder: AtomPairEncoder) -> None:
         num_attention_heads=2,
         num_query_atoms=2,
         num_key_atoms=4,
-        operator_backend="sdpa",
+        operator_backend="torch",
     )
     with pytest.raises(ValueError, match="unsupported attention_layout"):
         attention(torch.zeros(1, 5, 8), torch.zeros(1, 5, 8), torch.zeros(1, 5, 5, 1), attention_layout="bogus")
+
+
+@pytest.mark.parametrize("backend", ("torch", "oops"))
+def test_coordinate_atom_modules_propagate_backend(backend: str) -> None:
+    encoder = CoordinateAtomToTokenEncoder(
+        token_hidden_size=8,
+        atom_hidden_size=8,
+        atom_pair_hidden_size=4,
+        single_size=6,
+        pair_size=5,
+        num_blocks=1,
+        num_attention_heads=2,
+        num_query_atoms=2,
+        num_key_atoms=4,
+        atom_feature_size=6,
+        operator_backend=backend,
+    )
+    decoder = TokenToAtomDecoder(
+        token_hidden_size=8,
+        atom_hidden_size=8,
+        atom_pair_hidden_size=4,
+        num_blocks=1,
+        num_attention_heads=2,
+        num_query_atoms=2,
+        num_key_atoms=4,
+        operator_backend=backend,
+    )
+
+    assert encoder.token_to_atom_broadcast.operator_backend == backend
+    assert encoder.token_pair_to_local_atom_pair_broadcast.operator_backend == backend
+    assert decoder.token_to_atom_broadcast.operator_backend == backend

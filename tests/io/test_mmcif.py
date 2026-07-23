@@ -96,7 +96,7 @@ _struct_conn.pdbx_value_order
 @pytest.mark.xfail(
     reason="reopened §3.5: source-evidence nonpolymer grouping (which HETATM occurrences share "
     "one Molecule entity and their component order) is the reopened §3.5 classification decision",
-    strict=False,
+    strict=True,
 )
 def test_external_mmcif_groups_ordered_nonpolymer_positions_by_entity_and_asym(tmp_path: Path) -> None:
     path = tmp_path / "multi-component-ligand.cif"

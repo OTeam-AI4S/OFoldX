@@ -39,10 +39,6 @@ models.
 | ----------- | --------- | --------------------- | ------------------- | ------------------- | ------------------ | --------- |
 | 384         | 128       | 16                    | 4                   | 4                   | 139.011            | 49.888    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 generated residues (513 atom
-rows) and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.pxdesign](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/pxdesign)
@@ -52,17 +48,24 @@ rows) and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
+### Direct Use
+
+#### Backbone Design
+
+Use the high-level `design` API:
+
 ```python
 import ofoldx
 from ofoldx.models.pxdesign import from_binder
 
-result = ofoldx.design(
+output = ofoldx.design(
     None,
     model="oteam/pxdesign",
     placement=from_binder(100),
@@ -80,20 +83,6 @@ target-conditioned backbone generation.
 
 PXDesign-d uses an EDM coordinate-denoising objective. OFoldX exposes the
 differentiable one-step denoiser for training and fine-tuning.
-
-## Limitations
-
-- The full PXDesign suite is not implemented because its AlphaFold 2
-  initial-guess stage and PXDesignBench ranking and geometry code are not
-  available in OFoldX.
-- Standard protein, RNA, DNA, and non-polymer target components are supported.
-  MSE is canonicalized to MET as in the released parser; other modified polymer
-  components require a truthful canonical-parent transform and are rejected.
-- Target placements currently retain complete polymer chains. The released
-  target-cropping path is not represented as a partial structure.
-- PXDesign-d does not consume MSA evidence. The full suite passes target MSAs to
-  downstream folding and filtering models.
-- Sampling is stochastic unless the caller supplies a seed or generator.
 
 ## Citation
 

@@ -24,18 +24,18 @@ def pair_weighted_average(
     pair: Tensor,
     pair_mask: Tensor | None,
     *,
-    norm_msa_weight: Tensor,
-    norm_msa_bias: Tensor,
-    norm_pair_weight: Tensor,
-    norm_pair_bias: Tensor,
+    msa_norm_weight: Tensor,
+    msa_norm_bias: Tensor,
+    pair_norm_weight: Tensor,
+    pair_norm_bias: Tensor,
     value_weight: Tensor,
     gate_weight: Tensor,
     pair_logits_weight: Tensor,
     output_weight: Tensor,
     num_heads: int,
     head_dim: int,
-    norm_msa_eps: float,
-    norm_pair_eps: float,
+    msa_norm_eps: float,
+    pair_norm_eps: float,
     operator_backend: str,
 ) -> Tensor:
     r"""
@@ -46,18 +46,18 @@ def pair_weighted_average(
         msa: ``(B, S, N, msa_size)`` MSA representation.
         pair: ``(B, N, N, pair_size)`` pair representation.
         pair_mask: Optional ``(B, N, N)`` mask over invalid keys.
-        norm_msa_weight: MSA LayerNorm weight.
-        norm_msa_bias: MSA LayerNorm bias.
-        norm_pair_weight: Pair LayerNorm weight.
-        norm_pair_bias: Pair LayerNorm bias.
+        msa_norm_weight: MSA LayerNorm weight.
+        msa_norm_bias: MSA LayerNorm bias.
+        pair_norm_weight: Pair LayerNorm weight.
+        pair_norm_bias: Pair LayerNorm bias.
         value_weight: Bias-free value projection weight.
         gate_weight: Bias-free gate projection weight.
         pair_logits_weight: Bias-free pair-logit projection weight.
         output_weight: Bias-free output projection weight.
         num_heads: Number of attention heads.
         head_dim: Width of each attention head.
-        norm_msa_eps: Epsilon used by the MSA LayerNorm.
-        norm_pair_eps: Epsilon used by the pair LayerNorm.
+        msa_norm_eps: Epsilon used by the MSA LayerNorm.
+        pair_norm_eps: Epsilon used by the pair LayerNorm.
         operator_backend: Public backend request: ``"auto"``, ``"torch"``, or ``"oops"``.
 
     Returns:
@@ -74,18 +74,18 @@ def pair_weighted_average(
         ...     msa,
         ...     pair,
         ...     None,
-        ...     norm_msa_weight=torch.ones(4),
-        ...     norm_msa_bias=torch.zeros(4),
-        ...     norm_pair_weight=torch.ones(6),
-        ...     norm_pair_bias=torch.zeros(6),
+        ...     msa_norm_weight=torch.ones(4),
+        ...     msa_norm_bias=torch.zeros(4),
+        ...     pair_norm_weight=torch.ones(6),
+        ...     pair_norm_bias=torch.zeros(6),
         ...     value_weight=torch.randn(num_heads * head_dim, 4),
         ...     gate_weight=torch.randn(num_heads * head_dim, 4),
         ...     pair_logits_weight=torch.randn(num_heads, 6),
         ...     output_weight=torch.randn(4, num_heads * head_dim),
         ...     num_heads=num_heads,
         ...     head_dim=head_dim,
-        ...     norm_msa_eps=1e-5,
-        ...     norm_pair_eps=1e-5,
+        ...     msa_norm_eps=1e-5,
+        ...     pair_norm_eps=1e-5,
         ...     operator_backend="torch",
         ... )
         >>> out.shape
@@ -103,23 +103,23 @@ def pair_weighted_average(
             msa,
             pair,
             pair_mask,
-            norm_msa_weight=norm_msa_weight,
-            norm_msa_bias=norm_msa_bias,
-            norm_pair_weight=norm_pair_weight,
-            norm_pair_bias=norm_pair_bias,
+            msa_norm_weight=msa_norm_weight,
+            msa_norm_bias=msa_norm_bias,
+            pair_norm_weight=pair_norm_weight,
+            pair_norm_bias=pair_norm_bias,
             value_weight=value_weight,
             gate_weight=gate_weight,
             pair_logits_weight=pair_logits_weight,
             output_weight=output_weight,
             num_heads=num_heads,
-            norm_msa_eps=norm_msa_eps,
-            norm_pair_eps=norm_pair_eps,
+            msa_norm_eps=msa_norm_eps,
+            pair_norm_eps=pair_norm_eps,
         )
 
-    normalized = torch.nn.functional.layer_norm(msa, (msa.shape[-1],), norm_msa_weight, norm_msa_bias, norm_msa_eps)
+    normalized = torch.nn.functional.layer_norm(msa, (msa.shape[-1],), msa_norm_weight, msa_norm_bias, msa_norm_eps)
     values = torch.nn.functional.linear(normalized, value_weight).reshape(*normalized.shape[:-1], num_heads, head_dim)
     pair_normalized = torch.nn.functional.layer_norm(
-        pair, (pair.shape[-1],), norm_pair_weight, norm_pair_bias, norm_pair_eps
+        pair, (pair.shape[-1],), pair_norm_weight, pair_norm_bias, pair_norm_eps
     )
     logits = torch.nn.functional.linear(pair_normalized, pair_logits_weight).movedim(-1, -3)
     if pair_mask is not None:

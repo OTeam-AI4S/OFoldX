@@ -108,6 +108,7 @@ class CoordinateDenoiser(nn.Module):
             single_size=single_size,
             sigma_data=sigma_data,
             embed_relative_position=embed_relative_position,
+            operator_backend=operator_backend,
         )
         self.atom_encoder = CoordinateAtomToTokenEncoder(
             token_hidden_size=token_hidden_size,
@@ -304,6 +305,7 @@ class DenoisingConditioner(nn.Module):
         noise_embedding_size: Width of the Fourier noise embedding.
         sigma_data: EDM data-scale hyperparameter used to normalise the log-noise.
         embed_relative_position: Whether to project relative-position buckets before pair conditioning.
+        operator_backend: Public backend request forwarded to the pair and single transitions.
 
     Examples:
         >>> conditioner = DenoisingConditioner(pair_size=128, single_size=384)
@@ -321,6 +323,7 @@ class DenoisingConditioner(nn.Module):
         noise_embedding_size: int = 256,
         sigma_data: float = 16.0,
         embed_relative_position: bool = True,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.sigma_data = sigma_data
@@ -331,14 +334,18 @@ class DenoisingConditioner(nn.Module):
         )
         self.pair_input_norm = LayerNorm(pair_input_size, bias=False)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
-        self.pair_transitions = nn.ModuleList(Transition(pair_size, expansion=2) for _ in range(2))
+        self.pair_transitions = nn.ModuleList(
+            Transition(pair_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
+        )
 
         self.single_conditioning_norm = LayerNorm(single_conditioning_size, bias=False)
         self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
         self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
         self.noise_norm = LayerNorm(noise_embedding_size, bias=False)
         self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
-        self.single_transitions = nn.ModuleList(Transition(single_size, expansion=2) for _ in range(2))
+        self.single_transitions = nn.ModuleList(
+            Transition(single_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
+        )
 
     def forward(
         self,

@@ -52,10 +52,6 @@ substructures.
 | Base       | 48                | 24              | 4                 | 449        | 384         | 128       | 10               | 368.088            | 1329.532  |
 | Constraint | 48                | 24              | 4                 | 449        | 384         | 128       | 10               | 368.304            | 1473.988  |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 residues (641 atom rows), one
-query-only MSA row, one recycling pass, and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.protenix](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/protenix)
@@ -66,13 +62,18 @@ query-only MSA row, one recycling pass, and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can predict a biomolecular complex with the high-level `fold` API:
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
@@ -94,21 +95,6 @@ Protenix trains the trunk, distogram, confidence, and coordinate-denoising graph
 jointly. The diffusion objective denoises noised ground-truth coordinates, while
 the auxiliary heads supervise geometry and confidence. The constraint variant
 additionally trains all four pair-bias embedders.
-
-## Limitations
-
-- Current OFoldX support is limited to the default and constraint graphs.
-- Both implemented graphs disable templates. Supplying a non-empty `templates`
-  argument raises `ValueError`.
-- The default pair cannot consume constraints. The constraint pair exposes only
-  upper-bound atom/token contacts and one pocket; its substructure branch remains
-  a zero grid.
-- `ProtenixAtomContact` maps `max_distance` to the model's trained
-  atom-contact channel and exposes no legacy channel-order mode.
-- Folding is stochastic because MSA subsets, reference augmentation, and
-  diffusion sampling advance the caller's generator.
-- TM and chain-gPDE empty denominators use the current dtype's
-  `torch.finfo(dtype).tiny`; this is a Protenix-local numerical behavior.
 
 ## Citation
 

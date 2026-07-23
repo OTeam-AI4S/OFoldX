@@ -44,9 +44,6 @@ scoring, and protein-DNA specificity prediction.
 | --------------- | ----------- | -------------- | -------------- | --------- | ---------------------- | ------------------ | --------- |
 | 33              | 128         | 3              | 3              | 32        | 16                     | 2.293              | 12.245    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one teacher-forced forward over 128 residues.
-
 ### Links
 
 - **Code**: [ofoldx.models.nampnn](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/nampnn)
@@ -57,14 +54,18 @@ operations. They are measured for one teacher-forced forward over 128 residues.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can design protein or nucleic-acid sequences on a fixed backbone with the
-high-level `design` API:
+### Direct Use
+
+#### Sequence Design
+
+Use the high-level `design` API:
 
 ```python
 import ofoldx
@@ -85,15 +86,6 @@ specificity, respectively.
 `NaMpnnModel.forward` supports protein, DNA, and RNA coordinate
 noise and optional protein-first decoding. OFoldX also exposes the
 label-smoothed sequence objective used by the model.
-
-## Limitations
-
-- NA-MPNN changes sequence identity on an existing fixed backbone. It does not
-  generate coordinates or pack side chains.
-- At least one complete supported polymer row is required; coordinate-free
-  systems are not accepted.
-- A canonical protein residue cannot realize as a nucleic acid, or vice versa,
-  so cross-polymer tokens are masked before sampling.
 
 ## Citation
 

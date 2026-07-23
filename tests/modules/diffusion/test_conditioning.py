@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from ofoldx.modules.diffusion.conditioning import condition_pair, condition_single
+from ofoldx.modules.diffusion.conditioning import PairwiseConditioning, condition_pair, condition_single
 
 
 class NoiseFeatures(nn.Module):
@@ -71,3 +71,15 @@ def test_condition_pair_applies_relative_position_and_transitions() -> None:
 
     assert pair.shape == (2, 3, 3, 4)
     torch.testing.assert_close(pair, torch.ones(2, 3, 3, 4))
+
+
+@pytest.mark.parametrize("backend", ("torch", "oops"))
+def test_pairwise_conditioning_propagates_backend(backend: str) -> None:
+    conditioning = PairwiseConditioning(
+        pair_size=4,
+        relative_position_size=3,
+        num_transitions=2,
+        operator_backend=backend,
+    )
+
+    assert {transition.operator_backend for transition in conditioning.transitions} == {backend}

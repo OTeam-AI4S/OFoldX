@@ -48,10 +48,6 @@ reduced geometric input.
 | Soluble  | N, CA, C, O    | 128         | 3              | 3              | 48        | 1.660              | 10.734    |
 | CA-only  | CA             | 128         | 3              | 3              | 48        | 1.629              | 10.343    |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one teacher-forced forward over 128 protein
-residues.
-
 ### Links
 
 - **Code**: [ofoldx.models.proteinmpnn](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/proteinmpnn)
@@ -62,14 +58,18 @@ residues.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can design a protein sequence from a backbone with the high-level
-`design` API:
+### Direct Use
+
+#### Sequence Design
+
+Use the high-level `design` API:
 
 ```python
 import ofoldx
@@ -90,15 +90,6 @@ proteins, while the CA-only variant uses reduced backbone geometry.
 ProteinMPNN uses an autoregressive sequence-recovery objective with coordinate
 perturbations for robustness. `ProteinMpnnModel.forward` is
 differentiable and exposes the logits needed to train or fine-tune the model.
-
-## Limitations
-
-- ProteinMPNN designs and scores sequences on fixed backbones. It does not
-  generate backbones or pack side-chain coordinates.
-- Non-protein entities remain in the canonical system but are not Model sequence
-  rows.
-- Membrane-conditioned models require additional labels and are not supported by
-  this implementation.
 
 ## Citation
 

@@ -76,4 +76,8 @@ class Model(nn.Module):
         return self
 
     def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply a validated backend to model-specific operator owners."""
+        r"""Apply a validated backend to every operator owner in the model graph."""
+
+        for module in self.modules():
+            if hasattr(module, "operator_backend"):
+                module.operator_backend = backend

@@ -48,10 +48,6 @@ the same model rather than separate variants.
 | ----------------- | ---------- | --------------- | ----------------- | ----------- | --------- | ------------ | -------------- | ------------------ | --------- |
 | 48                | 4          | 24              | 48                | 384         | 128       | 4            | 200            | 592.008            | 1259.473  |
 
-FLOPs use PyTorch's `FlopCounterMode`, with each multiply-add counted as two
-operations. They are measured for one batch of 128 residues (640 atom rows), one
-query-only MSA row, one trunk pass, and one denoising step.
-
 ### Links
 
 - **Code**: [ofoldx.models.boltz1](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/boltz1)
@@ -61,13 +57,18 @@ query-only MSA row, one trunk pass, and one denoising step.
 
 ## Usage
 
-Install OFoldX:
+The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
+library. Install it with pip:
 
 ```bash
 pip install ofoldx
 ```
 
-You can predict a biomolecular complex with the high-level `fold` API:
+### Direct Use
+
+#### Structure Prediction
+
+Use the high-level `fold` API:
 
 ```python
 import ofoldx
@@ -90,16 +91,6 @@ drawn as
 `sigma = sigma_data * exp(-1.2 + 1.5 * z)`, where `z ~ N(0, 1)`, and the
 coordinate loss weight is
 `(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2`.
-
-## Limitations
-
-- Reverse diffusion is stochastic; one sampled coordinate set is not a
-  deterministic statement of model quality.
-- Pocket and steering behavior is limited to the controls exposed by
-  `Boltz1Pipeline`.
-- Empty confidence reductions use the dtype-aware
-  `torch.finfo(dtype).tiny` denominator rather than a fixed cross-family
-  normalization constant.
 
 ## Citation
 

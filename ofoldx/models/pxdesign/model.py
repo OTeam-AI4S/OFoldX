@@ -13,20 +13,12 @@ from torch import Tensor, nn
 from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
-from ...modules.adaptive_norm import AdaptiveLayerNorm
-from ...modules.atom import (
-    AtomToTokenEncoder,
-    AtomToTokenEncoderBase,
-    TokenPairToLocalAtomPairBroadcast,
-    TokenToAtomBroadcast,
-)
-from ...modules.attention import GatedMultiheadAttention
+from ...model import Model
+from ...modules.atom import AtomToTokenEncoder
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.geometry import uniform_random_rotation
-from ...modules.transition import Transition
 from ...results import Metric, Score, best
 from .config import PxDesignConfig
 
@@ -64,23 +56,6 @@ class PxDesignModel(Model):
         )
         self.coordinate_sampler = PxDesignSampler(config)
         self.post_init()
-
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the public PyTorch or OOps operator path."""
-
-        for module in self.modules():
-            if isinstance(
-                module,
-                (
-                    AdaptiveLayerNorm,
-                    AtomToTokenEncoderBase,
-                    GatedMultiheadAttention,
-                    TokenPairToLocalAtomPairBroadcast,
-                    TokenToAtomBroadcast,
-                    Transition,
-                ),
-            ):
-                module.operator_backend = backend
 
     def forward(
         self,
