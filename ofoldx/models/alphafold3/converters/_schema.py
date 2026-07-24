@@ -20,7 +20,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AF3Node:
-    r"""One resolved OFoldX-AF3 model key.
+    r"""
+    One resolved OFoldX-AF3 model key.
 
     Args:
         section: The top-level submodule the key belongs to (e.g. ``"pairformer"``, ``"atom_encoder"``).
@@ -41,7 +42,8 @@ _PAIRFORMER_BLOCK = re.compile(r"blocks\.(\d+)\.(.+)")
 
 
 def resolve(model_key: str) -> AF3Node | None:
-    r"""Route an OFoldX-AF3 model key to its ``(section, context, rest, block)`` schema node.
+    r"""
+    Route an OFoldX-AF3 model key to its ``(section, context, rest, block)`` schema node.
 
     Returns ``None`` for keys outside the shared AF3 tree (model-specific heads are handled by each converter
     before it consults this schema).

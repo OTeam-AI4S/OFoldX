@@ -1,8 +1,5 @@
 r"""
-Backend dispatch for the position-wise transition (SwiGLU) operator.
-
-The dispatcher owns backend selection and calling-convention adaptation. Modules
-pass the ordinary tensor arguments without a second validation layer.
+Backend-dispatched SwiGLU transition.
 """
 
 from __future__ import annotations
@@ -49,24 +46,6 @@ def transition(
 
     Returns:
         ``[..., hidden_size]`` transformed activations.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.transition import transition
-        >>> _ = torch.manual_seed(0)
-        >>> hidden = torch.randn(2, 4)
-        >>> out = transition(
-        ...     hidden,
-        ...     norm_weight=torch.ones(4),
-        ...     norm_bias=torch.zeros(4),
-        ...     gate_weight=torch.randn(6, 4),
-        ...     up_weight=torch.randn(6, 4),
-        ...     down_weight=torch.randn(4, 6),
-        ...     eps=1e-5,
-        ...     operator_backend="torch",
-        ... )
-        >>> out.shape
-        torch.Size([2, 4])
     """
 
     backend = resolve_tensor_operator_backend(

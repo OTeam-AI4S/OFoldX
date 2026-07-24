@@ -1,4 +1,6 @@
-r"""Convert released ProteinMPNN checkpoints to native OFoldX repositories."""
+r"""
+Convert released ProteinMPNN checkpoints to native OFoldX repositories.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +32,8 @@ def convert_proteinmpnn_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert one released ProteinMPNN checkpoint and save its paired Pipeline.
+    r"""
+    Convert one released ProteinMPNN checkpoint and save its paired Pipeline.
 
     Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
     uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
@@ -66,7 +69,8 @@ def convert_proteinmpnn_checkpoint(
 
 
 def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    r"""Translate every live released ProteinMPNN tensor to its native name.
+    r"""
+    Translate every live released ProteinMPNN tensor to its native name.
 
     The released Cα checkpoints contain five parameters whose outputs are never
     consumed by the upstream model. Those parameters are the only tensors omitted
@@ -152,7 +156,9 @@ def convert_proteinmpnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str
 
 
 def main(argv: list[str] | None = None) -> None:
-    r"""Run ProteinMPNN checkpoint conversion from the command line."""
+    r"""
+    Run ProteinMPNN checkpoint conversion from the command line.
+    """
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)

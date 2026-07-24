@@ -1,9 +1,11 @@
-r"""BoltzGen structure-design and inverse-folding implementations."""
+r"""
+BoltzGen structure-design and inverse-folding implementations.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import (
     BoltzGenConfig,
     BoltzGenDenoiserConfig,
@@ -38,22 +40,21 @@ from .pipeline import BoltzGenFoldModel, BoltzGenPipeline, BoltzGenScoreModel, B
 from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 from .projection import DesignMaskResidue, from_design_mask, to_design_mask
 
-# Design loads the structure and inverse-folding pairs through the concrete multi-pair pipeline.
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
     processor_config=None,
     standard_tasks=(),
 )
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.boltzgen_ifold",
     model=BoltzGenInverseFoldingModel,
     processor=BoltzGenInverseFoldingProcessor,
     processor_config=None,
     standard_tasks=(),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.boltzgen",
     pipeline=BoltzGenPipeline,
     tasks=("design",),

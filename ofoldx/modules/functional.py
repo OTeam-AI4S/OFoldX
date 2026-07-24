@@ -19,12 +19,6 @@ def pair_mask_from_token_mask(token_mask: Tensor) -> Tensor:
 
     Returns:
         `[..., N_token, N_token]` boolean pair-validity mask.
-
-    Examples:
-        >>> import torch
-        >>> token_mask = torch.tensor([[1, 1, 0]])
-        >>> pair_mask_from_token_mask(token_mask).int().tolist()
-        [[[1, 1, 0], [1, 1, 0], [0, 0, 0]]]
     """
 
     token_mask = token_mask.bool()
@@ -45,12 +39,6 @@ def pair_mask_from_msa_mask(msa_mask: Tensor) -> Tensor:
     Returns:
         `[..., N_token, N_token]` boolean pair-validity mask for tokens with at least one valid
         MSA row.
-
-    Examples:
-        >>> import torch
-        >>> msa_mask = torch.tensor([[[1, 0, 0], [0, 1, 0]]])
-        >>> pair_mask_from_msa_mask(msa_mask).int().tolist()
-        [[[1, 1, 0], [1, 1, 0], [0, 0, 0]]]
     """
 
     token_mask = msa_mask.bool().any(dim=-2)

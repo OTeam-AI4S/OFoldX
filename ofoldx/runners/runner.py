@@ -1,11 +1,5 @@
-r"""The unified config-only Danling Runner for OFoldX Models.
-
-Construction is config-only (DESIGN §10.3): the Runner takes a
-[`RunnerConfig`][ofoldx.runners.config.RunnerConfig] and builds the Model, Processor,
-datasets, objective, and collate from it, then hands optimizer / scheduler /
-dataloader / checkpoint building to danling. Family Models stay
-inference-and-forward-only; the training loss is produced by the resolved
-objective (see [`ofoldx.runners.objectives`][]), never by the Model.
+r"""
+Training, evaluation, and inference runner for registered OFoldX models.
 """
 
 from __future__ import annotations
@@ -28,7 +22,12 @@ from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
 
 @RUNNERS.register("ofoldx", default=True)
 class Runner(dl.Runner):
-    r"""Train, evaluate, and infer with any registered OFoldX Model family."""
+    r"""
+    Train, evaluate, and run forward inference for a registered model.
+
+    Args:
+        config: Runner configuration or values used to construct one.
+    """
 
     config: RunnerConfig
 
@@ -58,11 +57,12 @@ class Runner(dl.Runner):
     # -- construction --------------------------------------------------------
 
     def build_model(self) -> Model:
-        r"""Build the Model from ``config.model`` and record its architecture id.
+        r"""
+        Build the configured model.
 
-        ``config.model.pretrained`` loads a registered Model with weights;
-        otherwise the Model is randomly initialized from ``config.model.name``
-        plus the remaining ``config.model`` keys (typed-config overrides).
+        Returns:
+            A pretrained model when ``model.pretrained`` is set, otherwise a model
+            initialized from the registered architecture config.
         """
 
         from ..models.registry import MODELS
@@ -79,7 +79,12 @@ class Runner(dl.Runner):
         return registration.model(typed_config)
 
     def build_datasets(self) -> dict[str, Any]:
-        r"""Build one [`StructureDataset`][ofoldx.runners.dataset.StructureDataset] per configured split."""
+        r"""
+        Build datasets for configured splits.
+
+        Returns:
+            Structure datasets keyed by split name.
+        """
 
         from ..models.registry import MODELS
         from .dataset import StructureDataset
@@ -101,7 +106,15 @@ class Runner(dl.Runner):
     # -- batch movement ------------------------------------------------------
 
     def to_device(self, data: Any) -> Any:
-        r"""Move batch tensors while preserving the family Input dataclass layout."""
+        r"""
+        Move tensors in a nested batch to the runner device.
+
+        Args:
+            data: Tensor, dataclass, mapping, or sequence batch.
+
+        Returns:
+            The batch with tensor values moved to the runner device.
+        """
 
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
@@ -122,6 +135,15 @@ class Runner(dl.Runner):
     # -- steps ---------------------------------------------------------------
 
     def train_step(self, data: Any) -> tuple[Any, Tensor]:
+        r"""
+        Run one optimization step.
+
+        Args:
+            data: Batch accepted by the configured objective.
+
+        Returns:
+            The model output and scalar training loss.
+        """
         data = self.to_device(data)
         with self.train_context():
             output, loss = self.objective(self.model, data)
@@ -130,6 +152,15 @@ class Runner(dl.Runner):
         return output, loss
 
     def evaluate_step(self, data: Any) -> tuple[Any, Tensor]:
+        r"""
+        Evaluate one batch without parameter updates.
+
+        Args:
+            data: Batch accepted by the configured objective.
+
+        Returns:
+            The model output and scalar evaluation loss.
+        """
         data = self.to_device(data)
         model = self.ema or self.model
         with self.infer_context():
@@ -137,6 +168,15 @@ class Runner(dl.Runner):
         return output, loss
 
     def infer_step(self, data: Any) -> Any:
+        r"""
+        Run one model forward pass without gradients.
+
+        Args:
+            data: Positional model input or mapping of model arguments.
+
+        Returns:
+            The model output.
+        """
         data = self.to_device(data)
         model = self.ema or self.model
         with self.infer_context():
@@ -144,11 +184,17 @@ class Runner(dl.Runner):
 
     @torch.inference_mode()
     def infer(self, split: str = "infer") -> list[Any]:
-        r"""Return the family forward outputs for one configured split.
+        r"""
+        Run forward inference over one configured split.
 
-        This drives the Model's forward graph in batches; the Result-producing
-        inference surface (``processor -> model.fold -> FoldResult``) remains the
-        Pipelines' responsibility.
+        Args:
+            split: Dataset split to evaluate.
+
+        Returns:
+            Model outputs in dataloader order.
+
+        Raises:
+            KeyError: If ``split`` has no dataloader.
         """
 
         self.mode = RunnerMode.infer

@@ -36,13 +36,17 @@ TIED_OUTPUT_PROJECTION = re.compile(
 
 
 def is_tied_output_projection(key: str) -> bool:
-    r"""Return whether ``key`` is a released Boltz checkpoint's tied projection duplicate."""
+    r"""
+    Return whether ``key`` is a released Boltz checkpoint's tied projection duplicate.
+    """
 
     return TIED_OUTPUT_PROJECTION.search(key) is not None
 
 
 def compile_rules(pairs: Iterable[tuple[str, str | None]]) -> list[Rule]:
-    r"""Compile ordered string regex pairs into conversion rules."""
+    r"""
+    Compile ordered string regex pairs into conversion rules.
+    """
 
     return [(re.compile(pattern), replacement) for pattern, replacement in pairs]
 
@@ -101,7 +105,7 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
 )
 
 
-def transition_index_rules() -> list[tuple[str, str | None]]:
+def _transition_index_rules() -> list[tuple[str, str | None]]:
     return [
         (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.input_norm."),
         (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
@@ -117,17 +121,17 @@ SINGLE_CONDITIONING_RULES: list[Rule] = compile_rules(
         (r"^fourier_embed\.proj\.", "noise_fourier.projection."),
         (r"^norm_fourier\.", "fourier_norm."),
         (r"^fourier_to_single\.", "fourier_projection."),
-        *transition_index_rules(),
+        *_transition_index_rules(),
     ]
 )
 
 
 PAIRWISE_CONDITIONING_RULES: list[Rule] = compile_rules(
-    [(r"^dim_pairwise_init_proj\.", "init_projection."), *transition_index_rules()]
+    [(r"^dim_pairwise_init_proj\.", "init_projection."), *_transition_index_rules()]
 )
 
 
-def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+def _triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
         (rf"^{boltz}\.layer_norm\.", f"{clean}.pair_norm."),
         (rf"^{boltz}\.linear\.", f"{clean}.bias_projection."),
@@ -139,7 +143,7 @@ def triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | No
     ]
 
 
-def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+def _transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
         (rf"^{boltz}\.norm\.", f"{clean}.input_norm."),
         (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
@@ -148,7 +152,7 @@ def transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     ]
 
 
-def triangle_multiplication_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
+def _triangle_multiplication_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
         (rf"^{boltz}\.norm_in\.", f"{clean}.input_norm."),
         (rf"^{boltz}\.norm_out\.", f"{clean}.output_norm."),
@@ -168,12 +172,12 @@ PAIRFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
         (r"^attention\.proj_z\.0\.", "pair_attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
-        *triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
-        *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
-        *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
-        *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_s", "single_transition"),
-        *transition_rules("transition_z", "pair_transition"),
+        *_triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("transition_s", "single_transition"),
+        *_transition_rules("transition_z", "pair_transition"),
     ]
 )
 
@@ -202,7 +206,7 @@ FUSED_TRIANGLE_PROJECTIONS = {
 }
 
 
-def split_fused_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]] | None:
+def _split_fused_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]] | None:
     if key not in FUSED_TRIANGLE_PROJECTIONS:
         return None
     block, left, right = FUSED_TRIANGLE_PROJECTIONS[key]
@@ -213,8 +217,8 @@ def split_fused_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]
     ]
 
 
-def convert_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
-    split = split_fused_projection(key, tensor)
+def _convert_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+    split = _split_fused_projection(key, tensor)
     if split is not None:
         return split
     new_key = convert_keys(key, PAIRFORMER_LAYER_RULES)
@@ -223,17 +227,17 @@ def convert_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor
 
 PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
     [
-        *triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
-        *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
-        *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
-        *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("transition_z", "transition"),
+        *_triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("transition_z", "transition"),
     ]
 )
 
 
-def convert_pair_only_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
-    split = split_fused_projection(key, tensor)
+def _convert_pair_only_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+    split = _split_fused_projection(key, tensor)
     if split is not None:
         return split
     new_key = convert_keys(key, PAIR_ONLY_LAYER_RULES)
@@ -242,17 +246,17 @@ def convert_pair_only_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
 
 MSA_DIRECT_TRIANGLE_RULES: list[Rule] = compile_rules(
     [
-        *triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
-        *triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
-        *triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
-        *triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
-        *transition_rules("z_transition", "transition"),
+        *_triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
+        *_triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_transition_rules("z_transition", "transition"),
     ]
 )
 
 
-def convert_msa_direct_triangle(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
-    split = split_fused_projection(key, tensor)
+def _convert_msa_direct_triangle(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+    split = _split_fused_projection(key, tensor)
     if split is not None:
         return split
     new_key = convert_keys(key, MSA_DIRECT_TRIANGLE_RULES)
@@ -291,9 +295,9 @@ OUTER_PRODUCT_MEAN_RULES = compile_rules(
 )
 
 
-def convert_msa_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+def _convert_msa_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     if key.startswith("pair_weighted_averaging."):
-        converted = reprefix(
+        converted = _reprefix(
             key,
             "pair_weighted_averaging.",
             "pair_weighted_averaging.",
@@ -301,34 +305,36 @@ def convert_msa_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         )
         return [(cast(str, converted), tensor)]
     if key.startswith("msa_transition."):
-        converted = reprefix(key, "msa_transition.", "msa_transition.", MSA_TRANSITION_RULES)
+        converted = _reprefix(key, "msa_transition.", "msa_transition.", MSA_TRANSITION_RULES)
         return [(cast(str, converted), tensor)]
     if key.startswith("outer_product_mean."):
-        converted = reprefix(key, "outer_product_mean.", "outer_product_mean.", OUTER_PRODUCT_MEAN_RULES)
+        converted = _reprefix(key, "outer_product_mean.", "outer_product_mean.", OUTER_PRODUCT_MEAN_RULES)
         return [(cast(str, converted), tensor)]
     if key.startswith("pairformer_layer."):
-        inner = convert_pair_only_layer(key[len("pairformer_layer.") :], tensor)
+        inner = _convert_pair_only_layer(key[len("pairformer_layer.") :], tensor)
         return [(f"triangle_pair_update.{new_key}", value) for new_key, value in inner]
     if key.startswith(("tri_mul_out.", "tri_mul_in.", "tri_att_start.", "tri_att_end.", "z_transition.")):
         return [
-            (f"triangle_pair_update.{new_key}", value) for new_key, value in convert_msa_direct_triangle(key, tensor)
+            (f"triangle_pair_update.{new_key}", value) for new_key, value in _convert_msa_direct_triangle(key, tensor)
         ]
     raise KeyError(f"unmapped MSA layer key: {key}")
 
 
-def convert_msa_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+def _convert_msa_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     if key.startswith("s_proj."):
         return [(key.replace("s_proj.", "token_projection.", 1), tensor)]
     if key.startswith("msa_proj."):
         return [(key.replace("msa_proj.", "msa_projection.", 1), tensor)]
     if key.startswith("layers."):
         index, _, remainder = key[len("layers.") :].partition(".")
-        return [(f"blocks.{index}.{new_key}", value) for new_key, value in convert_msa_layer(remainder, tensor)]
+        return [(f"blocks.{index}.{new_key}", value) for new_key, value in _convert_msa_layer(remainder, tensor)]
     raise KeyError(f"unmapped MSA module key: {key}")
 
 
 def convert_keys(key: str, rules: list[Rule]) -> str | None:
-    r"""Apply the first matching rename/drop rule to ``key``."""
+    r"""
+    Apply the first matching rename/drop rule to ``key``.
+    """
 
     for pattern, replacement in rules:
         if pattern.search(key):
@@ -336,14 +342,14 @@ def convert_keys(key: str, rules: list[Rule]) -> str | None:
     return key
 
 
-def apply_converter(key: str, converter: Converter) -> str | None:
+def _apply_converter(key: str, converter: Converter) -> str | None:
     if callable(converter):
         return converter(key)
     return convert_keys(key, converter)
 
 
-def reprefix(key: str, old_prefix: str, new_prefix: str, converter: Converter) -> str | None:
-    converted = apply_converter(key[len(old_prefix) :], converter)
+def _reprefix(key: str, old_prefix: str, new_prefix: str, converter: Converter) -> str | None:
+    converted = _apply_converter(key[len(old_prefix) :], converter)
     return None if converted is None else new_prefix + converted
 
 
@@ -393,7 +399,9 @@ def convert_boltz1_state_dict(
 
 
 def _pack_conditioned_adaptive_norms(state_dict: dict[str, Tensor]) -> None:
-    r"""Pack upstream Boltz AdaLN scale/shift projections into the shared fused layout."""
+    r"""
+    Pack upstream Boltz AdaLN scale/shift projections into the shared fused layout.
+    """
 
     # The fused module splits scale first and shift second; only upstream s_scale carries a bias.
     scale_weight_suffix = ".conditioned_norm.gate_projection.weight"
@@ -426,11 +434,11 @@ def convert_boltz1_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         input_inner = convert_input_embedder_key(key[len("input_embedder.") :], tensor)
         return [] if input_inner is None else [(input_inner[0], input_inner[1])]
     if key.startswith("msa_module."):
-        msa_items = convert_msa_module(key[len("msa_module.") :], tensor)
+        msa_items = _convert_msa_module(key[len("msa_module.") :], tensor)
         return [(f"msa_trunk.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = convert_pairformer_layer(remainder, tensor)
+        pairformer_items = _convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
@@ -575,17 +583,17 @@ def convert_confidence_module_key(key: str, tensor: Tensor) -> list[tuple[str, T
         input_inner = convert_input_embedder_key(key[len("input_embedder.") :], tensor)
         return [] if input_inner is None else [(input_inner[0], input_inner[1])]
     if key.startswith("msa_module."):
-        msa_items = convert_msa_module(key[len("msa_module.") :], tensor)
+        msa_items = _convert_msa_module(key[len("msa_module.") :], tensor)
         return [(f"msa_trunk.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = convert_pairformer_layer(remainder, tensor)
+        pairformer_items = _convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
     if key.startswith("pairformer_stack.layers."):
         index, _, remainder = key[len("pairformer_stack.layers.") :].partition(".")
-        pairformer_items = convert_pairformer_layer(remainder, tensor)
+        pairformer_items = _convert_pairformer_layer(remainder, tensor)
         return [
             (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
         ]
@@ -629,9 +637,6 @@ def convert_boltz1_checkpoint(
 
     Raises:
         KeyError: If a source key is unmapped.
-
-    Examples:
-        >>> model = convert_boltz1_checkpoint("boltz1_conf.ckpt")  # doctest: +SKIP
     """
 
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
@@ -828,7 +833,8 @@ def save_boltz1_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert a Boltz-1 ``.ckpt`` and write a standard OFoldX repository.
+    r"""
+    Convert a Boltz-1 ``.ckpt`` and write a standard OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_boltz1_checkpoint`][ofoldx.models.boltz1.convert.convert_boltz1_checkpoint], pairs
@@ -854,6 +860,10 @@ def save_boltz1_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run boltz1 checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="original Boltz-1 .ckpt (e.g. boltz1_conf.ckpt)")
     parser.add_argument("output_dir", type=Path)

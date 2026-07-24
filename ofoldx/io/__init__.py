@@ -1,4 +1,6 @@
-r"""Canonical structure I/O."""
+r"""
+PDB, mmCIF, MSA, and MPNN-specific input functions.
+"""
 
 from __future__ import annotations
 

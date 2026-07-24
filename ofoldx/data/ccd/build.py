@@ -1,4 +1,5 @@
-r"""Convert wwPDB ``components.cif`` to CCD Parquet rows.
+r"""
+Convert wwPDB ``components.cif`` to CCD Parquet rows.
 
 This is the offline producer for the ``ofoldx/ccd`` Hub dataset. It parses the
 wwPDB Chemical Component Dictionary mmCIF (``components.cif`` / ``components.cif.gz``)
@@ -44,10 +45,19 @@ _VALUE_ORDER = {"SING": 1.0, "DOUB": 2.0, "TRIP": 3.0, "QUAD": 4.0, "AROM": 1.5}
 
 
 def build_rows(components_cif_path: str) -> list[dict[str, object]]:
-    r"""Parse a wwPDB ``components.cif`` into resolver-schema rows.
+    r"""
+    Parse a wwPDB `components.cif` into resolver-schema rows.
 
-    The input may be the plain or gzip-compressed multi-data CCD file. Component
-    identifiers must be unique across data blocks.
+    The input may be the plain or gzip-compressed multi-data CCD file.
+
+    Args:
+        components_cif_path: Path to the plain or gzip-compressed CCD mmCIF file.
+
+    Returns:
+        One resolver-schema mapping per component data block.
+
+    Raises:
+        ValueError: If a component identifier occurs in more than one data block.
     """
 
     from biotite.structure.io.pdbx import CIFFile
@@ -77,7 +87,13 @@ def build_rows(components_cif_path: str) -> list[dict[str, object]]:
 
 
 def write_parquet(rows: Iterable[dict[str, object]], output_path: str) -> None:
-    r"""Write resolver-schema rows to a single Parquet shard."""
+    r"""
+    Write resolver-schema rows to a single Parquet shard.
+
+    Args:
+        rows: Component rows to serialize.
+        output_path: Destination Parquet path.
+    """
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -86,10 +102,17 @@ def write_parquet(rows: Iterable[dict[str, object]], output_path: str) -> None:
 
 
 def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
-    r"""Lower one parsed CCD mmCIF ``data_`` block into a resolver-schema row.
+    r"""
+    Lower one parsed CCD mmCIF data block into a resolver-schema row.
 
-    ``block`` is the flat ``{category.item: [values...]}`` mapping produced by a
-    multi-data mmCIF parser, exactly the shape ``ccd_pickle_gen.py`` pickles.
+    Args:
+        block: Flat `category.item` mapping produced by a multi-data mmCIF parser.
+
+    Returns:
+        The normalized component row consumed by the CCD resolver.
+
+    Raises:
+        ValueError: If required CCD fields are missing, inconsistent, or invalid.
     """
 
     component_id = _one(block, "_chem_comp.id")
@@ -168,7 +191,8 @@ def _attachments(
     bond_atom_a: Sequence[str] = (),
     bond_atom_b: Sequence[str] = (),
 ) -> tuple[str | None, list[str], str | None, list[str]]:
-    r"""Derive default linear-polymer attachments for a polymer component.
+    r"""
+    Derive default linear-polymer attachments for a polymer component.
 
     Non-polymer components carry no attachments. For polymers the backbone anchor
     atoms follow the standard convention (protein ``N``/``C``, nucleic ``P``/``O3'``)

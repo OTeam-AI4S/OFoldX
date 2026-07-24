@@ -1,9 +1,5 @@
 r"""
-Operator-backend dispatch layer.
-
-Every dispatched operator has a canonical PyTorch implementation. Provider adapters
-own the OOps, cuEquivariance, Apex, and DeepSpeed calling conventions. A model selects
-one provider without changing tensor contracts, parameter ownership, or state dicts.
+Operator dispatch across supported acceleration backends.
 """
 
 from __future__ import annotations

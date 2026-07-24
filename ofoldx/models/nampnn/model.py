@@ -1,9 +1,10 @@
-r"""NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structures."""
+r"""
+NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structures.
+"""
 
 from __future__ import annotations
 
 import math
-import operator
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,12 +29,14 @@ from ...modules.mpnn import (
     nearest_neighbors,
     nll_loss,
     radial_basis,
+    validate_positive_integer,
     virtual_beta_carbon,
 )
 from ...results import DesignCandidate, DesignResult, Metric, MpnnProbabilityResult, Score, ScoreResult
 from .config import NaMpnnConfig
 
-MIXED_POLYMER_ATOM_NAMES = (
+#: Protein, DNA, and RNA atom channels used by NA-MPNN input features.
+NA_MPNN_ATOM_NAMES = (
     "N",
     "CA",
     "C",
@@ -51,8 +54,9 @@ MIXED_POLYMER_ATOM_NAMES = (
     "O2'",
     "C1'",
 )
-MIXED_POLYMER_ATOM_TO_INDEX = {name: index for index, name in enumerate(MIXED_POLYMER_ATOM_NAMES)}
-MIXED_POLYMER_COMPONENT_IDS = (
+NA_MPNN_ATOM_INDEX = {name: index for index, name in enumerate(NA_MPNN_ATOM_NAMES)}
+#: Protein, DNA, and RNA residue components in NA-MPNN vocabulary order.
+NA_MPNN_COMPONENT_IDS = (
     "ALA",
     "ARG",
     "ASN",
@@ -87,26 +91,34 @@ MIXED_POLYMER_COMPONENT_IDS = (
     "MAS",
     "PAD",
 )
-MIXED_POLYMER_TOKEN_BY_COMPONENT = {name: index for index, name in enumerate(MIXED_POLYMER_COMPONENT_IDS)}
-PAD_TOKEN = MIXED_POLYMER_TOKEN_BY_COMPONENT["PAD"]
-INVALID_GENERATION_TOKEN_IDS = (
-    MIXED_POLYMER_TOKEN_BY_COMPONENT["UNK"],
-    MIXED_POLYMER_TOKEN_BY_COMPONENT["DX"],
-    MIXED_POLYMER_TOKEN_BY_COMPONENT["RX"],
-    MIXED_POLYMER_TOKEN_BY_COMPONENT["MAS"],
-    MIXED_POLYMER_TOKEN_BY_COMPONENT["PAD"],
+NA_MPNN_TOKEN_BY_COMPONENT = {name: index for index, name in enumerate(NA_MPNN_COMPONENT_IDS)}
+NA_MPNN_PADDING_TOKEN_ID = NA_MPNN_TOKEN_BY_COMPONENT["PAD"]
+NA_MPNN_INVALID_GENERATION_TOKEN_IDS = (
+    NA_MPNN_TOKEN_BY_COMPONENT["UNK"],
+    NA_MPNN_TOKEN_BY_COMPONENT["DX"],
+    NA_MPNN_TOKEN_BY_COMPONENT["RX"],
+    NA_MPNN_TOKEN_BY_COMPONENT["MAS"],
+    NA_MPNN_TOKEN_BY_COMPONENT["PAD"],
 )
 # Contiguous generatable token columns per polymer type. RNA shares the DNA columns
 # in the shared-token mode and owns tokens 26..29 in separate-token mode.
-PROTEIN_GENERATABLE_TOKEN_IDS = tuple(range(0, 20))
-DNA_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
-RNA_SHARED_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
-RNA_SEPARATE_GENERATABLE_TOKEN_IDS = tuple(range(26, 30))
-_RNA_SHARED_INPUT_TOKENS = frozenset((*RNA_SHARED_GENERATABLE_TOKEN_IDS, MIXED_POLYMER_TOKEN_BY_COMPONENT["DX"]))
+NA_MPNN_PROTEIN_GENERATABLE_TOKEN_IDS = tuple(range(0, 20))
+NA_MPNN_DNA_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
+NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS = tuple(range(21, 25))
+NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS = tuple(range(26, 30))
+_RNA_SHARED_INPUT_TOKENS = frozenset((*NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS, NA_MPNN_TOKEN_BY_COMPONENT["DX"]))
 
 
 class NaMpnnModel(Model):
-    r"""Message-passing Model for fixed-backbone protein and nucleic-acid design."""
+    r"""
+    Design protein and nucleic-acid sequences with NA-MPNN.
+
+    Accepts [`NaMpnnInput`][ofoldx.models.nampnn.model.NaMpnnInput] and returns
+    [`NaMpnnOutput`][ofoldx.models.nampnn.model.NaMpnnOutput].
+
+    Args:
+        config: Model architecture and inference configuration.
+    """
 
     config_class = NaMpnnConfig
     config: NaMpnnConfig
@@ -131,7 +143,9 @@ class NaMpnnModel(Model):
         self.post_init()
 
     def initialize_parameters(self) -> None:
-        r"""Apply the Xavier-uniform matrix initialization."""
+        r"""
+        Apply the Xavier-uniform matrix initialization.
+        """
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -143,20 +157,26 @@ class NaMpnnModel(Model):
 
     @staticmethod
     def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""Validate the independent decoding-order evaluation count."""
+        r"""
+        Validate the independent decoding-order evaluation count.
+        """
 
-        return _positive_integer(num_decoding_orders, "num_decoding_orders")
+        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
 
     @staticmethod
     def _require_single_target(input: NaMpnnInput) -> None:
-        r"""Reject an execution-batch axis on one-target biological operations."""
+        r"""
+        Reject an execution-batch axis on one-target biological operations.
+        """
 
         if input.atom_coordinates.shape[0] != 1 or len(input.structures) != 1:
             raise ValueError("this NaMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
     def _repeat_input(input: NaMpnnInput, count: int) -> NaMpnnInput:
-        r"""Repeat one biological input into ``count`` aligned evaluation rows."""
+        r"""
+        Repeat one biological input into ``count`` aligned evaluation rows.
+        """
 
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
@@ -190,7 +210,9 @@ class NaMpnnModel(Model):
         logits: Tensor,
         decoding_ranks: Tensor,
     ) -> MpnnProbabilityResult:
-        r"""Wrap aligned per-evaluation logits with the one target's identity."""
+        r"""
+        Wrap aligned per-evaluation logits with the one target's identity.
+        """
 
         return MpnnProbabilityResult(
             target=input.structures[0],
@@ -209,7 +231,8 @@ class NaMpnnModel(Model):
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw fixed-first causal ranks directly from aligned causal-unit IDs.
+        r"""
+        Draw fixed-first causal ranks directly from aligned causal-unit IDs.
 
         Every causal unit receives one random priority; members of a unit share its
         priority through ``tied_group_ids`` and therefore share its rank, while
@@ -236,7 +259,8 @@ class NaMpnnModel(Model):
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw one causal ranking shared across the sampling evaluation axis.
+        r"""
+        Draw one causal ranking shared across the sampling evaluation axis.
 
         The sampler decodes one biological structure many times with an
         order shared across the draw axis so tied members stay simultaneous; only
@@ -262,7 +286,9 @@ class NaMpnnModel(Model):
         polymer_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the one coordinate encoder shared by every operation."""
+        r"""
+        Run the one coordinate encoder shared by every operation.
+        """
 
         coordinates = input.atom_coordinates
         protein_noise, dna_noise, rna_noise = polymer_noise
@@ -308,7 +334,9 @@ class NaMpnnModel(Model):
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
-        r"""Return raw teacher-forced logits for one exact causal ranking."""
+        r"""
+        Return raw teacher-forced logits for one exact causal ranking.
+        """
 
         token_states = self.token_embedding(sequence_tokens)
         sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
@@ -333,7 +361,9 @@ class NaMpnnModel(Model):
         neighbor_indices: Tensor,
         residue_mask: Tensor,
     ) -> Tensor:
-        r"""Return sequence-free all-equal-rank logits: every row sees no decoded neighbor."""
+        r"""
+        Return sequence-free all-equal-rank logits: every row sees no decoded neighbor.
+        """
 
         mask = residue_mask.to(dtype=node_states.dtype)
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(node_states), edge_states, neighbor_indices)
@@ -353,7 +383,20 @@ class NaMpnnModel(Model):
         rna_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Return the shared node states, edge states, and neighbor indices."""
+        r"""
+        Encode a batch of mixed-polymer backbones as residue graph states.
+
+        Args:
+            input: NA-MPNN tensors with batch and residue axes.
+            protein_noise: Gaussian coordinate-noise standard deviation for proteins.
+            dna_noise: Gaussian coordinate-noise standard deviation for DNA.
+            rna_noise: Gaussian coordinate-noise standard deviation for RNA.
+            generator: Random generator used for coordinate noise.
+
+        Returns:
+            Node states with shape ``(B, L, H)``, edge states with shape
+            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+        """
 
         return self._encode(
             input,
@@ -372,11 +415,22 @@ class NaMpnnModel(Model):
         rna_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> NaMpnnOutput:
-        r"""Return the single teacher-forced differentiable sequence-conditioned pass.
+        r"""
+        Predict residue logits conditioned on the input sequence and decoding order.
 
-        ``decode_protein_first`` and the three polymer coordinate noises are the
-        training-only augmentation; inference operations never expose
-        them. The returned ranks are the exact causal order used.
+        Args:
+            input: NA-MPNN tensors with batch size ``B`` and ``L`` residue rows.
+            decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
+                decode earlier.
+            decode_protein_first: Whether generated protein rows precede generated
+                nucleic-acid rows when ranks are drawn.
+            protein_noise: Gaussian coordinate-noise standard deviation for proteins.
+            dna_noise: Gaussian coordinate-noise standard deviation for DNA.
+            rna_noise: Gaussian coordinate-noise standard deviation for RNA.
+            generator: Random generator used for the order and coordinate noise.
+
+        Returns:
+            Vocabulary logits and the decoding ranks used for the forward pass.
         """
 
         node_states, edge_states, neighbor_indices = self._encode(
@@ -402,7 +456,9 @@ class NaMpnnModel(Model):
         decode_protein_first: bool,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw the noised training decode order, protein-first when asked."""
+        r"""
+        Draw the noised training decode order, protein-first when asked.
+        """
 
         device = input.residue_mask.device
         decode_mask = (input.residue_mask & input.design_positions).to(torch.float32)
@@ -426,7 +482,20 @@ class NaMpnnModel(Model):
         decoding_ranks: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+        r"""
+        Evaluate sequence-conditioned probabilities over decoding orders.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            generator: Random generator used to draw decoding orders.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and decoding ranks with shape ``(num_decoding_orders, num_residues)``.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -456,7 +525,17 @@ class NaMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-free all-equal-rank probabilities for every row."""
+        r"""
+        Evaluate sequence-free probabilities without decoded neighbors.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_decoding_orders: Number of identical evaluation rows to return.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and all-zero ranks with shape ``(num_decoding_orders, num_residues)``.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -490,10 +569,24 @@ class NaMpnnModel(Model):
         global_logit_bias: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> NaMpnnSamplingOutput:
-        r"""Sample sequences, resolving token-symmetry groups on one causal path."""
+        r"""
+        Sample mixed-polymer sequences under the processed constraints.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_samples: Number of sequences to sample.
+            temperature: Positive sampling temperature.
+            decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``.
+            global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
+            generator: Random generator used for orders and token sampling.
+
+        Returns:
+            Sampled token IDs, model log probabilities, sampling probabilities,
+            and decoding ranks, each with a leading ``num_samples`` axis.
+        """
 
         self._require_single_target(input)
-        num_samples = _positive_integer(num_samples, "num_samples")
+        num_samples = validate_positive_integer(num_samples, "num_samples")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
@@ -526,7 +619,7 @@ class NaMpnnModel(Model):
         forward_context = forward_mask * encoder_context
         block_states = [node_states] + [torch.zeros_like(node_states) for _ in self.decoder_blocks]
 
-        sequence_tokens = torch.full((num_samples, length), PAD_TOKEN, dtype=torch.long, device=device)
+        sequence_tokens = torch.full((num_samples, length), NA_MPNN_PADDING_TOKEN_ID, dtype=torch.long, device=device)
         log_probabilities = node_states.new_zeros(num_samples, length, vocabulary)
         sampling_probabilities = torch.zeros_like(log_probabilities)
 
@@ -600,7 +693,9 @@ class NaMpnnModel(Model):
 
     @staticmethod
     def _ordered_units(tied_group_ids: Tensor, ranks: Tensor) -> list[list[int]]:
-        r"""Return the shared causal units as ascending-rank member lists."""
+        r"""
+        Return the shared causal units as ascending-rank member lists.
+        """
 
         members_by_id: dict[int, list[int]] = {}
         for index, group_id in enumerate(tied_group_ids.tolist()):
@@ -621,7 +716,9 @@ class NaMpnnModel(Model):
         forward_context: Tensor,
         residue_mask: Tensor,
     ) -> Tensor:
-        r"""Incrementally decode one position across the whole evaluation axis."""
+        r"""
+        Incrementally decode one position across the whole evaluation axis.
+        """
 
         edge_slice = edge_states[:, position : position + 1]
         neighbor_slice = neighbor_indices[:, position : position + 1]
@@ -644,7 +741,8 @@ class NaMpnnModel(Model):
         sequence_tokens: Tensor,
         vocabulary: int,
     ) -> Tensor:
-        r"""Directed adjacent-token pair contribution for one target member row.
+        r"""
+        Directed adjacent-token pair contribution for one target member row.
 
         External context rows use the pre-rank-block sampled tokens, ``self`` stays
         at PAD, and another internal member is evaluated at the shared candidate
@@ -656,7 +754,7 @@ class NaMpnnModel(Model):
         device = sequence_tokens.device
         row_bias = pair_bias[:, member]  # [S, V, L, V]
         context = sequence_tokens.clone()
-        context[:, member] = PAD_TOKEN
+        context[:, member] = NA_MPNN_PADDING_TOKEN_ID
         gathered = torch.gather(
             row_bias,
             -1,
@@ -685,7 +783,9 @@ class NaMpnnModel(Model):
         sampled_tokens: list[int],
         design_positions: list[bool],
     ) -> MolecularSystem:
-        r"""Realize one candidate while preserving entity and bond identity."""
+        r"""
+        Realize one candidate while preserving entity and bond identity.
+        """
 
         replacements = {
             reference: get_component(_component_from_token(int(token), polymer_type))
@@ -709,10 +809,23 @@ class NaMpnnModel(Model):
         global_logit_bias: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design complete coordinate-free protein/DNA/RNA MolecularSystems."""
+        r"""
+        Design protein, DNA, and RNA sequence candidates on a fixed backbone.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_candidates: Number of sequence candidates to sample.
+            temperature: Positive sampling temperature.
+            global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
+            generator: Random generator used for orders and token sampling.
+
+        Returns:
+            Designed molecular systems and per-candidate confidence scores in
+            sampling order.
+        """
 
         self._require_single_target(input)
-        num_candidates = _positive_integer(num_candidates, "num_candidates")
+        num_candidates = validate_positive_integer(num_candidates, "num_candidates")
         sampled = self.sample(
             input,
             num_samples=num_candidates,
@@ -780,7 +893,20 @@ class NaMpnnModel(Model):
         global_logit_bias: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Average nucleic-acid sampling probabilities with protein context fixed."""
+        r"""
+        Estimate nucleic-acid base preferences with protein identities fixed.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_samples: Number of sampled sequence contexts to average.
+            temperature: Positive sampling temperature.
+            global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
+            generator: Random generator used for orders and token sampling.
+
+        Returns:
+            Per-residue A, C, G, and T/U probability metrics for selected
+            nucleic-acid positions.
+        """
 
         self._require_single_target(input)
         na_design = input.design_positions & ~input.protein_mask
@@ -826,12 +952,12 @@ class NaMpnnModel(Model):
         axis = tuple(reference for _index, reference in na_rows)
         token_columns = {
             row: (
-                DNA_GENERATABLE_TOKEN_IDS
+                NA_MPNN_DNA_GENERATABLE_TOKEN_IDS
                 if polymer_types[row] == "dna"
                 else (
-                    RNA_SHARED_GENERATABLE_TOKEN_IDS
+                    NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS
                     if int(input.sequence_tokens[0, row]) in _RNA_SHARED_INPUT_TOKENS
-                    else RNA_SEPARATE_GENERATABLE_TOKEN_IDS
+                    else NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS
                 )
             )
             for row, _reference in na_rows
@@ -853,28 +979,26 @@ class NaMpnnModel(Model):
         return ScoreResult(target=input.structures[0], scores={}, metrics=metrics)
 
 
-def _positive_integer(value: int, name: str) -> int:
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
-
-
 class NaMpnnFeatures(nn.Module):
-    r"""Geometric feature encoder for unified protein/nucleic-acid polymer graphs."""
+    r"""
+    Encode protein and nucleic-acid coordinates as an MPNN graph.
+
+    Args:
+        config: NA-MPNN architecture configuration.
+    """
 
     def __init__(self, config: NaMpnnConfig) -> None:
         super().__init__()
-        self.num_neighbors = config.get("k_neighbors", config.num_neighbors)
+        self.num_neighbors = config.num_neighbors
         self.num_rbf = config.num_rbf
         self.num_polymer_types = config.num_polymer_types
         self.include_predicted_na_n = config.include_predicted_na_n
-        self.nitrogen_index = MIXED_POLYMER_ATOM_TO_INDEX["N"]
-        self.alpha_carbon_index = MIXED_POLYMER_ATOM_TO_INDEX["CA"]
-        self.carbonyl_carbon_index = MIXED_POLYMER_ATOM_TO_INDEX["C"]
-        self.oxygen_4_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["O4'"]
-        self.carbon_1_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["C1'"]
-        self.carbon_2_prime_index = MIXED_POLYMER_ATOM_TO_INDEX["C2'"]
+        self.nitrogen_index = NA_MPNN_ATOM_INDEX["N"]
+        self.alpha_carbon_index = NA_MPNN_ATOM_INDEX["CA"]
+        self.carbonyl_carbon_index = NA_MPNN_ATOM_INDEX["C"]
+        self.oxygen_4_prime_index = NA_MPNN_ATOM_INDEX["O4'"]
+        self.carbon_1_prime_index = NA_MPNN_ATOM_INDEX["C1'"]
+        self.carbon_2_prime_index = NA_MPNN_ATOM_INDEX["C2'"]
         total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
         self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
         self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
@@ -898,7 +1022,24 @@ class NaMpnnFeatures(nn.Module):
         dna_mask: Tensor,
         rna_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Build node features, edge features, and nearest-neighbor indices."""
+        r"""
+        Build graph features from mixed-polymer coordinates.
+
+        Args:
+            atom_coordinates: Atom coordinates with shape ``(B, N, A, 3)``.
+            atom_mask: Atom validity mask with shape ``(B, N, A)``.
+            residue_mask: Residue validity mask with shape ``(B, N)``.
+            residue_index: Chain-local residue indices with shape ``(B, N)``.
+            chain_index: Molecular-instance indices with shape ``(B, N)``.
+            polymer_type_index: Polymer category IDs with shape ``(B, N)``.
+            protein_mask: Protein-residue mask with shape ``(B, N)``.
+            dna_mask: DNA-residue mask with shape ``(B, N)``.
+            rna_mask: RNA-residue mask with shape ``(B, N)``.
+
+        Returns:
+            Node features ``(B, N, C)``, neighbor-edge features ``(B, N, K, C)``,
+            and neighbor indices ``(B, N, K)``.
+        """
 
         dtype = atom_coordinates.dtype
         atom_mask = atom_mask.to(dtype=dtype)
@@ -950,7 +1091,9 @@ class NaMpnnFeatures(nn.Module):
 
 
 def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
-    r"""Reconstruct the idealized nucleic-acid base nitrogen coordinate."""
+    r"""
+    Reconstruct the idealized nucleic-acid base nitrogen coordinate.
+    """
 
     b = c1prime - o4prime
     c = c2prime - c1prime
@@ -959,7 +1102,9 @@ def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
 
 
 def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tensor, num_bins: int) -> Tensor:
-    r"""RBF-encode every ordered atom-pair distance for each neighbor edge."""
+    r"""
+    RBF-encode every ordered atom-pair distance for each neighbor edge.
+    """
 
     flat = coordinates.reshape(coordinates.shape[0], coordinates.shape[1], -1)
     neighbor_flat = gather_nodes(flat, neighbor_indices)
@@ -975,12 +1120,14 @@ def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tens
 
 
 def _component_from_token(token: int, polymer_type: str) -> str:
-    r"""Realize one sampled token as a canonical component under its polymer type."""
+    r"""
+    Realize one sampled token as a canonical component under its polymer type.
+    """
 
     if polymer_type == "protein":
         if token >= 20:
             raise RuntimeError(f"NA-MPNN sampled non-protein token {token} for a protein residue")
-        return MIXED_POLYMER_COMPONENT_IDS[token]
+        return NA_MPNN_COMPONENT_IDS[token]
     if polymer_type == "dna":
         if not 21 <= token <= 24:
             raise RuntimeError(f"NA-MPNN sampled non-DNA token {token} for a DNA residue")
@@ -1013,20 +1160,24 @@ _POLYMER_DNA = 1
 _POLYMER_RNA = 2
 
 
-def smoothed_loss(
+def nampnn_polymer_label_smoothed_nll_loss(
     sequence_tokens: Tensor,
     log_probabilities: Tensor,
     polymer_type_index: Tensor,
     *,
     weight: float = 0.1,
 ) -> Tensor:
-    r"""Return the per-token polymer-specific label-smoothed cross entropy.
+    r"""
+    Compute polymer-specific label-smoothed cross entropy.
 
-    Each row's smoothing mass ``weight`` is distributed uniformly over that row's
-    own polymer residue-type set (protein 21, DNA 5, RNA 5), and the true column is
-    scaled by ``1 - weight`` before the eps is added, matching NA-MPNN's
-    ``loss_smoothed``. At ``weight=0`` this reduces to [`nll_loss`][]. The
-    result has shape ``sequence_tokens.shape``.
+    Args:
+        sequence_tokens: Target token IDs with shape ``(..., L)``.
+        log_probabilities: Vocabulary log probabilities with shape ``(..., L, V)``.
+        polymer_type_index: Protein, DNA, or RNA category IDs with shape ``(..., L)``.
+        weight: Smoothing mass distributed over tokens of the same polymer type.
+
+    Returns:
+        Per-residue losses with shape ``(..., L)``.
     """
 
     num_classes = log_probabilities.shape[-1]
@@ -1069,15 +1220,37 @@ def smoothed_loss(
 
 @dataclass(eq=False)
 class NaMpnnInput:
-    r"""Aligned tensors and canonical identities consumed by NA-MPNN operations.
+    r"""
+    Inputs for NA-MPNN sequence design and scoring.
 
-    One biological Processor call owns one ``Structure``; the leading tensor axis
-    is an execution-evaluation axis, not a scientific batch. ``tied_group_ids``
-    is the dense causal-unit contract: exact ties, token symmetry groups,
-    same-entity shared instances, and bonded fixing all lower into it so the graph
-    hot path never reasons about nested Python groups. Aligned residue bias and
-    tied weights are ordinary zero/one tensors; the dominant ``[B, L, V, L, V]``
-    pair tensor is ``None`` when absent.
+    Args:
+        atom_coordinates: Polymer atom coordinates with shape
+            ``(batch_size, num_residues, num_atom_types, 3)``.
+        atom_mask: Atom-validity mask with shape
+            ``(batch_size, num_residues, num_atom_types)``.
+        sequence_tokens: Residue token IDs with shape ``(batch_size, num_residues)``.
+        residue_mask: Valid-residue mask with shape ``(batch_size, num_residues)``.
+        residue_index: Residue indices with shape ``(batch_size, num_residues)``.
+        chain_index: Chain indices with shape ``(batch_size, num_residues)``.
+        polymer_type_index: Polymer-type IDs with shape
+            ``(batch_size, num_residues)``.
+        protein_mask: Protein-residue mask with shape ``(batch_size, num_residues)``.
+        dna_mask: DNA-residue mask with shape ``(batch_size, num_residues)``.
+        rna_mask: RNA-residue mask with shape ``(batch_size, num_residues)``.
+        design_positions: Positions eligible for design with shape
+            ``(batch_size, num_residues)``.
+        tied_group_ids: Autoregressive unit ID for each residue row.
+        structures: Source structure for each batch item.
+        component_references: Component occurrence aligned to every residue row.
+        polymer_types: Polymer type aligned to every residue row.
+        conditions: Sequence constraints associated with each batch item.
+        tied_weights: Optional tied-group weights with shape ``(batch_size, num_residues)``.
+        residue_logit_bias: Optional additive bias with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        allowed_token_mask: Optional token mask with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        pair_logit_bias: Optional pair-conditioned bias with shape
+            ``(batch_size, num_residues, vocabulary_size, num_residues, vocabulary_size)``.
     """
 
     atom_coordinates: Tensor
@@ -1104,27 +1277,57 @@ class NaMpnnInput:
 
 @dataclass(eq=False)
 class NaMpnnOutput:
-    r"""Raw logits and exact causal ranks from an NA-MPNN sequence graph."""
+    r"""
+    Outputs from one NA-MPNN forward pass.
+
+    Args:
+        logits: Vocabulary logits with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(batch_size, num_residues)``.
+    """
 
     logits: Tensor
     decoding_ranks: Tensor
 
     @property
     def log_probabilities(self) -> Tensor:
-        r"""Return vocabulary log probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary log probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.log_softmax(dim=-1)
 
     @property
     def probabilities(self) -> Tensor:
-        r"""Return vocabulary probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.softmax(dim=-1)
 
 
 @dataclass(eq=False)
 class NaMpnnSamplingOutput:
-    r"""Complete aligned tensor output from the NA-MPNN sequence sampler."""
+    r"""
+    Outputs from NA-MPNN autoregressive sampling.
+
+    Args:
+        sequence_tokens: Sampled token IDs with shape
+            ``(num_samples, num_residues)``.
+        log_probabilities: Model log probabilities with shape
+            ``(num_samples, num_residues, vocabulary_size)``.
+        sampling_probabilities: Sampling distribution used at each position, with the
+            same shape as ``log_probabilities``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(num_samples, num_residues)``.
+    """
 
     sequence_tokens: Tensor
     log_probabilities: Tensor

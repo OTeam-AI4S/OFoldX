@@ -1,4 +1,6 @@
-r"""Configuration values for the two BoltzGen architectures."""
+r"""
+Configuration values for the two BoltzGen architectures.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class BoltzGenInputEmbeddingsConfig(Config):
-    r"""Configure BoltzGen atom and token input embeddings.
+    r"""
+    Configure BoltzGen atom and token input embeddings.
 
     Args:
         num_atom_encoder_blocks: Number of atom encoder blocks.
@@ -30,7 +33,8 @@ class BoltzGenInputEmbeddingsConfig(Config):
 
 
 class BoltzGenTrunkConfig(Config):
-    r"""Configure the Pairformer and MSA trunk shared by BoltzGen structure-design variants.
+    r"""
+    Configure the Pairformer and MSA trunk shared by BoltzGen structure-design variants.
 
     Args:
         num_pairformer_blocks: Number of pair trunk blocks.
@@ -68,7 +72,8 @@ class BoltzGenTrunkConfig(Config):
 
 
 class BoltzGenTemplateConfig(Config):
-    r"""Configure geometry shared by template and token-distance conditioning.
+    r"""
+    Configure geometry shared by template and token-distance conditioning.
 
     Args:
         num_distogram_bins: Number of distance bins.
@@ -88,7 +93,8 @@ class BoltzGenTemplateConfig(Config):
 
 
 class BoltzGenDenoiserConfig(Config):
-    r"""Configure the BoltzGen EDM score network.
+    r"""
+    Configure the BoltzGen EDM score network.
 
     Args:
         num_token_transformer_blocks: Number of token transformer blocks.
@@ -120,7 +126,8 @@ class BoltzGenDenoiserConfig(Config):
 
 
 class BoltzGenSamplerConfig(Config):
-    r"""Configure the BoltzGen reverse-diffusion schedule.
+    r"""
+    Configure the BoltzGen reverse-diffusion schedule.
 
     Args:
         num_sampling_steps: Number of reverse-diffusion steps.
@@ -150,7 +157,8 @@ class BoltzGenSamplerConfig(Config):
 
 
 class BoltzGenStructureDesignConfig(Config):
-    r"""Configure structure-design template and token-distance modules.
+    r"""
+    Configure structure-design template and token-distance modules.
 
     Args:
         template_size: Width of structure-design template features.
@@ -170,7 +178,8 @@ class BoltzGenStructureDesignConfig(Config):
 
 
 class BoltzGenInverseFoldingModuleConfig(Config):
-    r"""Configure the BoltzGen inverse-folding atom encoder and residue graph.
+    r"""
+    Configure the BoltzGen inverse-folding atom encoder and residue graph.
 
     Args:
         node_size: Width of projected node features.
@@ -206,7 +215,8 @@ class BoltzGenInverseFoldingModuleConfig(Config):
 
 
 class BoltzGenConfig(Config):
-    r"""Configure the parameterized BoltzGen structure-design architecture.
+    r"""
+    Configure the parameterized BoltzGen structure-design architecture.
 
     Args:
         single_size: Width of the token representation.
@@ -253,7 +263,8 @@ class BoltzGenConfig(Config):
 
     @classmethod
     def structuretrained_small(cls) -> BoltzGenConfig:
-        r"""Return the reduced BoltzGen structure-design configuration.
+        r"""
+        Return the reduced BoltzGen structure-design configuration.
 
         This variant preserves the single, pair, atom, and EDM dimensions while using a shallower graph:
 
@@ -285,7 +296,8 @@ class BoltzGenConfig(Config):
 
 
 class BoltzGenInverseFoldingConfig(Config):
-    r"""Configure the distinct BoltzGen inverse-folding architecture.
+    r"""
+    Configure the distinct BoltzGen inverse-folding architecture.
 
     Args:
         single_size: Width of the token representation.

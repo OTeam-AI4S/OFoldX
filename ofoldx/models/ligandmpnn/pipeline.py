@@ -1,4 +1,6 @@
-r"""LigandMPNN sequence design and probability Pipelines."""
+r"""
+LigandMPNN sequence design and probability Pipelines.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +26,9 @@ if TYPE_CHECKING:
 
 
 class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
-    r"""Bind one LigandMPNN Model and Processor for biological operations."""
+    r"""
+    Protein sequence design pipeline for LigandMPNN.
+    """
 
     def design(
         self,
@@ -45,10 +49,11 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design LigandMPNN sequences with ligand and residue context.
+        r"""
+        Design LigandMPNN sequences with ligand and residue context.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -108,10 +113,11 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute sequence-conditioned LigandMPNN autoregressive probabilities.
+        r"""
+        Compute sequence-conditioned LigandMPNN autoregressive probabilities.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -162,10 +168,11 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute sequence-free LigandMPNN autoregressive probabilities.
+        r"""
+        Compute sequence-free LigandMPNN autoregressive probabilities.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -215,10 +222,11 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute target-last conditional probabilities for every residue row.
+        r"""
+        Compute target-last conditional probabilities for every residue row.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
@@ -267,10 +275,11 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute target-first unconditional probabilities for every residue row.
+        r"""
+        Compute target-first unconditional probabilities for every residue row.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
@@ -308,16 +317,12 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
 
 
 class LigandMpnnDesignAndPackPipeline:
-    r"""Compose the LigandMPNN designer with MPNN Packer over one source.
-
-    The Pipeline designs sequences with ligand and residue context and then packs each design.
-    Both stages read one canonical ``Structure`` parsed
-    exactly once, keep three genuinely distinct context controls, and share a single
-    random stream advanced design-first then pack-major across every candidate.
+    r"""
+    Design protein sequences with LigandMPNN and pack their side chains.
 
     Args:
-        designer: LigandMPNN sequence-design Pipeline.
-        packer: MPNN Packer Pipeline applied to each designed sequence.
+        designer: LigandMPNN sequence-design pipeline.
+        packer: Side-chain packing pipeline.
     """
 
     def __init__(
@@ -334,7 +339,16 @@ class LigandMpnnDesignAndPackPipeline:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Place both children on one device and dtype in place."""
+        r"""
+        Move the designer and packer to a device and dtype.
+
+        Args:
+            device: Destination device. ``None`` preserves the current device.
+            dtype: Destination floating-point dtype. ``None`` preserves the current dtype.
+
+        Returns:
+            This pipeline.
+        """
 
         self.designer.to(device=device, dtype=dtype)
         self.packer.to(device=device, dtype=dtype)
@@ -364,10 +378,11 @@ class LigandMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[DesignResult, tuple[PackResult, ...]]:
-        r"""Design LigandMPNN sequences and pack every resulting candidate.
+        r"""
+        Design LigandMPNN sequences and pack every resulting candidate.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path, parsed once for both stages.
+            input: A ``Structure`` or local PDB path, parsed once for both stages.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -446,7 +461,8 @@ class LigandMpnnDesignAndPackPipeline:
 def _candidate_protein_sequences(
     system: MolecularSystem,
 ) -> dict[str, tuple[str, ...]]:
-    r"""Map each protein instance to its realized component-ID sequence.
+    r"""
+    Map each protein instance to its realized component-ID sequence.
 
     The composition passes only complete per-instance component-ID sequences to the
     Packer; it never forwards logits, ranks, interface masks, or feature tensors.

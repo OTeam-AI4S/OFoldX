@@ -47,7 +47,9 @@ def _as_openfold_tensor_state(value: object) -> Mapping[str, Tensor] | None:
 
 
 def _select_openfold_inference_state(checkpoint: object) -> Mapping[str, Tensor]:
-    r"""Select the inference weights from one released or training OpenFold checkpoint."""
+    r"""
+    Select the inference weights from one released or training OpenFold checkpoint.
+    """
 
     if not isinstance(checkpoint, Mapping):
         raise TypeError("OpenFold checkpoint is not a mapping")
@@ -137,7 +139,8 @@ def save_alphafold2_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert an AlphaFold 2 checkpoint and write a standard OFoldX repository.
+    r"""
+    Convert an AlphaFold 2 checkpoint and write a standard OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_alphafold2_checkpoint`][ofoldx.models.alphafold2.convert.convert_alphafold2_checkpoint],
@@ -181,6 +184,10 @@ def save_alphafold2_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run alphafold2 checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="AlphaFold 2 checkpoint (DeepMind NPZ/tar or OpenFold)")
     parser.add_argument("output_dir", type=Path)

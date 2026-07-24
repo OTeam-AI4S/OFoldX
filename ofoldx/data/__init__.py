@@ -1,4 +1,6 @@
-r"""Canonical public molecular data values."""
+r"""
+Public molecular data types and codecs.
+"""
 
 from __future__ import annotations
 

@@ -1,31 +1,31 @@
-r"""ProteinMPNN inverse-folding implementation."""
+r"""
+ProteinMPNN inverse-folding implementation.
+"""
 
 from __future__ import annotations
 
-from ...modules.mpnn import nll_loss, tied_groups_from_ids
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import ProteinMpnnConfig, ProteinMpnnProcessorConfig
 from .model import (
-    CaProteinMpnnFeatures,
+    ProteinMpnnCaFeatures,
     ProteinMpnnDesignResult,
     ProteinMpnnInput,
     ProteinMpnnModel,
     ProteinMpnnOutput,
     ProteinMpnnSamplingOutput,
-    smoothed_loss,
 )
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
     processor_config=ProteinMpnnProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.proteinmpnn",
     pipeline=ProteinMpnnPipeline,
     tasks=("design", "score"),

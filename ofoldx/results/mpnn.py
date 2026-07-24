@@ -1,4 +1,6 @@
-r"""Structure-conditioned MPNN probability result carrier."""
+r"""
+Structure-conditioned MPNN probability result carrier.
+"""
 
 from __future__ import annotations
 
@@ -12,17 +14,20 @@ from ..data.structure import Structure
 
 @dataclass(eq=False)
 class MpnnProbabilityResult:
-    r"""Repeated aligned probability output for one structure-conditioned MPNN call.
+    r"""
+    Probability evaluations from a structure-conditioned MPNN.
 
     Args:
-        target: Canonical structure used for conditioning.
-        component_references: Residue references aligned to the sequence axis. ``None`` marks a
-            padded or unresolved row.
-        sequence_tokens: Input token ids with shape ``[residues]``.
-        residue_mask: Valid-residue mask with shape ``[residues]``.
-        design_positions: Designed-position mask with shape ``[residues]``.
-        logits: Vocabulary logits with shape ``[evaluations, residues, vocabulary]``.
-        decoding_ranks: Autoregressive ranks with shape ``[evaluations, residues]``.
+        target: Structure used for conditioning.
+        component_references: Component occurrence for each residue row; ``None`` marks
+            padding or an unresolved row.
+        sequence_tokens: Input token IDs with shape ``(num_residues,)``.
+        residue_mask: Valid-residue mask with shape ``(num_residues,)``.
+        design_positions: Designed-position mask with shape ``(num_residues,)``.
+        logits: Vocabulary logits with shape
+            ``(num_evaluations, num_residues, vocabulary_size)``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(num_evaluations, num_residues)``.
     """
 
     target: Structure
@@ -35,24 +40,46 @@ class MpnnProbabilityResult:
 
     @property
     def log_probabilities(self) -> Tensor:
-        r"""Return vocabulary log probabilities for every retained evaluation."""
+        r"""
+        Return log probabilities for every evaluation.
+
+        Returns:
+            A tensor with shape
+            ``(num_evaluations, num_residues, vocabulary_size)``.
+        """
 
         return self.logits.log_softmax(dim=-1)
 
     @property
     def probabilities(self) -> Tensor:
-        r"""Return vocabulary probabilities for every retained evaluation."""
+        r"""
+        Return probabilities for every evaluation.
+
+        Returns:
+            A tensor with shape
+            ``(num_evaluations, num_residues, vocabulary_size)``.
+        """
 
         return self.logits.softmax(dim=-1)
 
     @property
     def mean_probabilities(self) -> Tensor:
-        r"""Average vocabulary probabilities over the leading evaluation axis."""
+        r"""
+        Return probabilities averaged over evaluations.
+
+        Returns:
+            A tensor with shape ``(num_residues, vocabulary_size)``.
+        """
 
         return self.probabilities.mean(dim=0)
 
     @property
     def probability_standard_deviation(self) -> Tensor:
-        r"""Return the population standard deviation over repeated evaluations."""
+        r"""
+        Return population standard deviations over evaluations.
+
+        Returns:
+            A tensor with shape ``(num_residues, vocabulary_size)``.
+        """
 
         return self.probabilities.std(dim=0, correction=0)

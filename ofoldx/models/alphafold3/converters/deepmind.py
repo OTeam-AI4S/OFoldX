@@ -181,7 +181,9 @@ def load_official_alphafold3_params(
     *,
     model_name: str | None = None,
 ) -> dict[str, Tensor]:
-    r"""Load official DeepMind AlphaFold 3 parameters as ``"scope//name"`` tensors."""
+    r"""
+    Load official DeepMind AlphaFold 3 parameters as ``"scope//name"`` tensors.
+    """
 
     model_files, compressed, resolved_model_name = select_official_model_files(params_path, model_name=model_name)
     tensors: dict[str, Tensor] = {}

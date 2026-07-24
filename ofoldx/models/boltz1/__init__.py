@@ -1,9 +1,11 @@
-r"""Boltz-1 structure-prediction implementation."""
+r"""
+Boltz-1 structure-prediction implementation.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import (
     Boltz1ConfidenceConfig,
     Boltz1Config,
@@ -22,14 +24,14 @@ from .model import (
 from .pipeline import Boltz1Pipeline
 from .processor import Boltz1Processor
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.boltz1",
     model=Boltz1Model,
     processor=Boltz1Processor,
     processor_config=None,
     standard_tasks=("fold",),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.boltz1",
     pipeline=Boltz1Pipeline,
     tasks=("fold",),

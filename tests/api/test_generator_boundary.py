@@ -1,4 +1,5 @@
-r"""Lock the single seed|generator resolution point at the Pipeline boundary.
+r"""
+Lock the single seed|generator resolution point at the Pipeline boundary.
 
 Per the OWNER principle the model graph is a pure function of ``(tensors, generator)``: a Pipeline
 accepts ``seed=`` / ``generator=`` / neither, resolves them once, and forwards the resulting
@@ -38,7 +39,9 @@ def _make_pipeline(pipeline_class, tiny_classes):
 @pytest.mark.parametrize(("pipeline_class", "method"), _PIPELINES)
 @pytest.mark.parametrize("rng", ["seed", "generator", "neither"])
 def test_pipeline_accepts_seed_generator_or_neither(pipeline_class, method, rng, tiny_classes):
-    r"""Every standard Pipeline accepts seed / generator / neither with no TypeError."""
+    r"""
+    Every standard Pipeline accepts seed / generator / neither with no TypeError.
+    """
 
     pipeline, model = _make_pipeline(pipeline_class, tiny_classes)
     kwargs = {"seed": 123} if rng == "seed" else {"generator": torch.Generator()} if rng == "generator" else {}
@@ -56,7 +59,9 @@ def test_pipeline_accepts_seed_generator_or_neither(pipeline_class, method, rng,
 
 @pytest.mark.parametrize(("pipeline_class", "method"), _PIPELINES)
 def test_pipeline_never_leaks_seed_into_model(pipeline_class, method, tiny_classes):
-    r"""The integer seed is resolved at the boundary and never forwarded to the model graph."""
+    r"""
+    The integer seed is resolved at the boundary and never forwarded to the model graph.
+    """
 
     pipeline, model = _make_pipeline(pipeline_class, tiny_classes)
 
@@ -67,7 +72,9 @@ def test_pipeline_never_leaks_seed_into_model(pipeline_class, method, tiny_class
 
 @pytest.mark.parametrize(("pipeline_class", "method"), _PIPELINES)
 def test_pipeline_rejects_seed_and_generator_together(pipeline_class, method, tiny_classes):
-    r"""seed and generator are mutually exclusive at the single resolution point."""
+    r"""
+    seed and generator are mutually exclusive at the single resolution point.
+    """
 
     pipeline, _ = _make_pipeline(pipeline_class, tiny_classes)
 

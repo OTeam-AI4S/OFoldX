@@ -1,4 +1,6 @@
-r"""Common lifecycle for registered OFoldX models."""
+r"""
+Common lifecycle for registered OFoldX models.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +11,16 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
+#: Backend request accepted by [`Model.set_backend`][].
 ModelBackend = Literal["auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"]
 
 
 class Model(nn.Module):
-    r"""Base class for top-level models managed by OFoldX.
+    r"""
+    Base class for OFoldX models.
 
-    Concrete models retain their own constructor and forward signatures. This class owns
-    only the state shared by every registered model: ordinary ``nn.Module`` initialization,
-    its concrete config, and the requested public operator-backend policy. Models without
-    dispatched operators are naturally unaffected by that policy.
+    Args:
+        config: Architecture configuration stored with the model.
     """
 
     config_class: ClassVar[type[chanfig.Config]]
@@ -31,22 +33,35 @@ class Model(nn.Module):
         self.backend = "auto"
 
     def post_init(self, *, backend: ModelBackend = "auto") -> None:
-        r"""Finish model-specific initialization and apply the initial backend policy."""
+        r"""
+        Initialize model parameters and select an operator backend.
+
+        Subclasses may override this hook when initialization requires additional
+        model-wide work.
+
+        Args:
+            backend: Operator backend selected after parameter initialization.
+        """
 
         self.initialize_parameters()
         self.set_backend(backend)
 
     def initialize_parameters(self) -> None:
-        r"""Apply additional model-level initialization after child construction.
+        r"""
+        Initialize parameters owned by the model.
 
-        PyTorch modules already initialize their own parameters during construction,
-        so the default hook intentionally does nothing. Architectures override this
-        hook only when they own additional initialization rules.
+        The default implementation leaves module constructors' initialization
+        unchanged. Subclasses may override it for architecture-specific rules.
         """
 
     @property
     def device(self) -> torch.device:
-        r"""Device of this model's parameters or buffers."""
+        r"""
+        Return the device of this model's parameters or buffers.
+
+        Returns:
+            The first parameter or buffer device, or CPU when the model has neither.
+        """
 
         for tensor in self.parameters():
             return tensor.device
@@ -56,7 +71,13 @@ class Model(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        r"""Floating-point dtype used by this model."""
+        r"""
+        Return the floating-point dtype used by this model.
+
+        Returns:
+            The first floating-point or complex parameter or buffer dtype, or the
+            default PyTorch dtype when the model has neither.
+        """
 
         for tensor in self.parameters():
             if tensor.is_floating_point() or tensor.is_complex():
@@ -67,7 +88,19 @@ class Model(nn.Module):
         return torch.get_default_dtype()
 
     def set_backend(self, backend: ModelBackend) -> Self:
-        r"""Select one operator provider across the model while preserving PyTorch semantics."""
+        r"""
+        Select the backend used by dispatched model operators.
+
+        Args:
+            backend: Backend name. ``"auto"`` selects the best available implementation,
+                while the remaining values request a specific implementation.
+
+        Returns:
+            This model.
+
+        Raises:
+            ValueError: If ``backend`` is not supported.
+        """
 
         if backend not in ("auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"):
             raise ValueError("backend must be exactly one of: auto, torch, sdpa, oops, cueq, apex, deepspeed")
@@ -76,8 +109,6 @@ class Model(nn.Module):
         return self
 
     def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply a validated backend to every operator owner in the model graph."""
-
         for module in self.modules():
             if hasattr(module, "operator_backend"):
                 module.operator_backend = backend

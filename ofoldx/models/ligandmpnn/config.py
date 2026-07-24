@@ -1,4 +1,6 @@
-r"""Configuration values for the LigandMPNN model and processor."""
+r"""
+Configuration values for the LigandMPNN model and processor.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class LigandMpnnConfig(Config):
-    r"""Configure the shared architecture of the LigandMPNN sequence graphs.
+    r"""
+    Configure the shared architecture of the LigandMPNN sequence graphs.
 
     Args:
         hidden_size: Shared width of node, edge, and decoder hidden states.
@@ -24,10 +27,11 @@ class LigandMpnnConfig(Config):
 
 
 class LigandMpnnProcessorConfig(Config):
-    r"""Configure persistent LigandMPNN input lowering.
+    r"""
+    Configure LigandMPNN input processing.
 
     Args:
-        num_context_atoms: Padded nearest-context extent emitted per residue; this does not change learned shapes.
+        num_context_atoms: Number of nearby context atoms retained per residue.
     """
 
     num_context_atoms: int = 25

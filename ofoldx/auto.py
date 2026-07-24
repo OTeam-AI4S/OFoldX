@@ -1,4 +1,6 @@
-r"""Canonical overloaded AutoModel and AutoProcessor factories."""
+r"""
+Automatic model and processor factories.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +23,9 @@ from .processor import Processor
 
 
 class AutoModel:
-    r"""Construct a registered Model from a typed config or model repository."""
+    r"""
+    Construct a registered model or load one from a model repository.
+    """
 
     def __new__(
         cls,
@@ -32,6 +36,21 @@ class AutoModel:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Model:
+        r"""
+        Construct a model from a config or repository.
+
+        Args:
+            pretrained_or_config: A registered architecture config, local model
+                repository, or Hugging Face Hub repository ID.
+            revision: Hub revision to load. Valid only for a Hub repository.
+            token: Hugging Face access token used for private repositories.
+            device: Device onto which the model is loaded.
+            dtype: Floating-point dtype applied after loading.
+
+        Returns:
+            The model registered for the supplied config or repository metadata.
+        """
+
         if not isinstance(pretrained_or_config, str | PathLike):
             if revision is not None:
                 raise ValueError("revision is valid only when AutoModel loads a model repository")
@@ -60,13 +79,27 @@ class AutoModel:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Model:
-        r"""Thin familiar spelling of ``AutoModel(pretrained, ...)``."""
+        r"""
+        Load a registered model from a local or Hugging Face Hub repository.
+
+        Args:
+            pretrained: Local model repository or Hugging Face Hub repository ID.
+            revision: Hub revision to load.
+            token: Hugging Face access token used for private repositories.
+            device: Device onto which the model is loaded.
+            dtype: Floating-point dtype applied after loading.
+
+        Returns:
+            The model declared by the repository metadata.
+        """
 
         return cls(pretrained, revision=revision, token=token, device=device, dtype=dtype)
 
 
 class AutoProcessor:
-    r"""Load a registered Processor from a model repository."""
+    r"""
+    Load a registered processor from a model repository.
+    """
 
     def __new__(  # type: ignore[misc]
         cls,
@@ -77,6 +110,20 @@ class AutoProcessor:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Processor:
+        r"""
+        Load a processor from a local or Hugging Face Hub repository.
+
+        Args:
+            pretrained: Local model repository or Hugging Face Hub repository ID.
+            revision: Hub revision to load.
+            token: Hugging Face access token used for private repositories.
+            device: Device used for tensors produced by the processor.
+            dtype: Floating-point dtype used for tensors produced by the processor.
+
+        Returns:
+            The processor declared by the repository metadata.
+        """
+
         repository = resolve_repository(
             pretrained,
             revision=revision,
@@ -95,6 +142,18 @@ class AutoProcessor:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Processor:
-        r"""Thin familiar spelling of ``AutoProcessor(pretrained, ...)``."""
+        r"""
+        Load a registered processor from a local or Hugging Face Hub repository.
+
+        Args:
+            pretrained: Local model repository or Hugging Face Hub repository ID.
+            revision: Hub revision to load.
+            token: Hugging Face access token used for private repositories.
+            device: Device used for tensors produced by the processor.
+            dtype: Floating-point dtype used for tensors produced by the processor.
+
+        Returns:
+            The processor declared by the repository metadata.
+        """
 
         return cast(Processor, cls(pretrained, revision=revision, token=token, device=device, dtype=dtype))

@@ -1,10 +1,5 @@
 r"""
 AlphaFold 3 top-level model.
-
-Assembles the native AlphaFold 3 structure-prediction path from the shared OFoldX modules: atom-to-token
-input embedding, the recycled Pairformer trunk with optional MSA and template updates, the EDM coordinate
-denoiser/sampler diffusion path, and the distogram and pLDDT/PAE/PDE/resolved confidence heads. ``forward`` is
-the ordinary differentiable denoising graph; full sampling stays internal until canonical decoding is complete.
 """
 
 from __future__ import annotations
@@ -54,15 +49,13 @@ from .config import AlphaFold3Config
 
 class AlphaFold3Model(Model):
     r"""
-    AlphaFold 3 structure-prediction model assembled from the shared OFoldX modules.
+    Predict biomolecular complex structures with AlphaFold 3.
 
-    Wires the input embedder, MSA and template embedders, the recycled Pairformer trunk, the EDM
-    coordinate denoiser/sampler, and the distogram and confidence heads into a single model.
+    Accepts [`AlphaFold3Input`][ofoldx.models.alphafold3.model.AlphaFold3Input] and returns
+    [`AlphaFold3Output`][ofoldx.models.alphafold3.model.AlphaFold3Output].
 
     Args:
-        config: Model configuration; see
-            [`AlphaFold3Config`][ofoldx.models.alphafold3.AlphaFold3Config].
-
+        config: Model architecture and inference configuration.
     """
 
     config_class = AlphaFold3Config
@@ -167,9 +160,8 @@ class AlphaFold3Model(Model):
             dropout=config.confidence.pairformer_dropout,
             ending_node_transpose_bias=True,
             single_max_abs=config.confidence.single_max_abs,
-            # AlphaFold 3 confidence flags: no extra single LayerNorm, no raw-distance projection channel,
-            # and PDE symmetrizes the projected LOGITS (DeepMind ``left + swapaxes(left, -2, -3)``). The
-            # Distance-bin buffers are derived and therefore non-persistent.
+            # This confidence head omits single normalization and raw-distance projection.
+            # PDE logits are symmetrized after projection; distance bins are derived buffers.
             use_single_norm=False,
             use_distance_projection=False,
             symmetrize_pde_before_projection=False,
@@ -180,15 +172,10 @@ class AlphaFold3Model(Model):
 
     def initialize_parameters(self) -> None:
         r"""
-        Zero-initialize the recycling and PAE/PDE projection weights after construction.
+        Zero-initialize the recycling and PAE/PDE output projections.
 
-        The recycling and PAE/PDE output projections start at zero, so the first
-        recycling pass and an untrained confidence head contribute nothing.
-
-        Examples:
-            >>> from ofoldx.models.alphafold3 import AlphaFold3Config, AlphaFold3Model  # doctest: +SKIP
-            >>> model = AlphaFold3Model(AlphaFold3Config())  # doctest: +SKIP
-            >>> model.initialize_parameters()  # doctest: +SKIP
+        Returns:
+            ``None``.
         """
 
         nn.init.zeros_(self.pair_recycle_projection.weight)
@@ -204,7 +191,25 @@ class AlphaFold3Model(Model):
         noise_level: Tensor,
         recycling_steps: int | None = None,
     ) -> AlphaFold3Output:
-        r"""Denoise caller-supplied coordinates at a caller-supplied EDM noise level."""
+        r"""
+        Denoise atom coordinates at specified EDM noise levels.
+
+        Args:
+            input: Model features with batch, token, and atom axes ``(B, N, A)``.
+            noisy_coordinates: Noisy coordinates with shape ``(B, S, A, 3)`` in
+                angstroms.
+            noise_level: EDM noise standard deviations with shape ``(B, S)`` in
+                angstroms.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+
+        Returns:
+            Denoised coordinates and confidence tensors with the shapes described
+            by [`AlphaFold3Output`][]. No diffusion sampling is performed.
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive.
+        """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
@@ -228,7 +233,9 @@ class AlphaFold3Model(Model):
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> AlphaFold3Output:
-        r"""Run coordinate sampling and confidence heads."""
+        r"""
+        Run coordinate sampling and confidence heads.
+        """
 
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
@@ -253,24 +260,31 @@ class AlphaFold3Model(Model):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> AlphaFold3FoldResult:
-        r"""Run AlphaFold 3 folding and preserve the diffusion seed group.
+        r"""
+        Predict structures for one molecular assembly.
 
-        One trunk pass is shared by ``num_samples`` diffusion rollouts. The returned
-        [`AlphaFold3FoldResult`][] preserves that group, while [`best`][]
-        ranks predictions across all groups.
-
-        ``generator`` drives the rollouts; ``None`` uses the ambient PyTorch RNG.
+        One trunk pass is shared by all coordinate samples. ``generator`` controls
+        the initial Gaussian coordinates, stochastic churn, and per-step rigid
+        augmentations; ``None`` uses PyTorch's ambient random state.
 
         Args:
-            input: A Processor-built carrier containing ``system``, ``atom_sites``, and ``token_sites``.
-            num_samples: Diffusion rollouts drawn for the seed group (default 5).
-            generator: The already-resolved RNG driving the diffusion rollouts; ``None`` uses the
-                ambient RNG.
-            recycling_steps: Trunk recycling passes; defaults to the config value.
-            num_sampling_steps: Diffusion sampling steps; defaults to the config value.
+            input: Processor output for one assembly, including molecular identities
+                aligned to the atom and token axes.
+            num_samples: Number of diffusion samples. ``None`` uses five.
+            generator: Optional generator for coordinate diffusion.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
+                configured value.
 
         Returns:
-            A result containing one seed group.
+            One seed group containing generation-ordered predictions. Structure
+            coordinates, PAE, and PDE values are in angstroms; pLDDT is on
+            ``0--100``.
+
+        Raises:
+            ValueError: If a count is not positive or the input lacks molecular
+                identities required to decode structures.
         """
 
         num_samples = 5 if num_samples is None else num_samples
@@ -308,7 +322,8 @@ class AlphaFold3Model(Model):
         generator: torch.Generator | None,
         seed: int | None,
     ) -> AlphaFold3SeedGroup:
-        r"""Sample one seed's diffusion rollouts and decode them into one seed group.
+        r"""
+        Sample one seed's diffusion rollouts and decode them into one seed group.
 
         Shares one trunk pass across ``num_samples`` rollouts, decodes each sample's
         [`Structure`][ofoldx.data.structure.Structure], and computes pTM, ipTM, PAE/PDE
@@ -355,7 +370,7 @@ class AlphaFold3Model(Model):
 
         pae_single_mask = np.tile(frame_mask[:, None], (1, token_count))
         frame_pair_mask = frame_mask[:, None] & frame_mask[None, :]
-        tm_interface = tm_adjusted_pae(
+        tm_interface = alphafold3_tm_adjusted_pae(
             pae_logits,
             pair_mask=torch.from_numpy(frame_pair_mask).unsqueeze(0).expand(pae_logits.shape[0], -1, -1),
             chain_index=torch.from_numpy(chain_indices).unsqueeze(0).expand(pae_logits.shape[0], -1),
@@ -384,7 +399,7 @@ class AlphaFold3Model(Model):
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
             )
-            disorder = fraction_disordered(structure)
+            disorder = alphafold3_fraction_disordered(structure)
             clash = alphafold3_has_clash(structure)
             sample_ranking_score = alphafold3_ranking_score(
                 float(ptm[sample_index]), float(iptm[sample_index]), disorder, clash
@@ -483,7 +498,9 @@ class AlphaFold3Model(Model):
         representations: _AlphaFold3TrunkOutput,
         coordinates: Tensor,
     ) -> AlphaFold3Output:
-        r"""Compute distogram and confidence predictions."""
+        r"""
+        Compute distogram and confidence predictions.
+        """
 
         token_embedding = representations.token_embedding
         single = representations.single
@@ -514,7 +531,9 @@ class AlphaFold3Model(Model):
         input: AlphaFold3Input,
         representations: _AlphaFold3TrunkOutput,
     ) -> CoordinateDenoiseContext:
-        r"""Assemble conditioning shared by ``forward`` and the sampler."""
+        r"""
+        Assemble conditioning shared by ``forward`` and the sampler.
+        """
 
         return CoordinateDenoiseContext(
             atom_features=input.atom_features,
@@ -538,7 +557,9 @@ class AlphaFold3Model(Model):
         )
 
     def _denoise(self, inputs: CoordinateDenoisingInput) -> Tensor:
-        r"""Run the FP32 diffusion head independently of trunk autocast."""
+        r"""
+        Run the FP32 diffusion head independently of trunk autocast.
+        """
 
         with torch.autocast(device_type=inputs.noisy_coords.device.type, enabled=False):
             return self.coordinate_denoiser(inputs)
@@ -551,31 +572,18 @@ class AlphaFold3Model(Model):
         max_error_bin: float = 31.0,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
-        Compute the pTM / ipTM / ptm_iptm_average summary from a model output.
-
-        This is an opt-in, parameter-free post-processing step over the PAE logits already produced by
-        the confidence head: callers run `forward` and then pass the output plus the input here to
-        get the scalar tensor summaries. Chains are read from ``input.chain_index`` and the valid frame
-        mask from ``input.token_mask``.
-
-        The third element is ``0.8 * ipTM + 0.2 * pTM``. ``ranking_score`` also
-        includes DSSP disorder and clash terms, which require a decoded Structure
-        and are finalized in [`fold`][].
+        Compute pTM, ipTM, and their weighted average from PAE logits.
 
         Args:
-            output: Structure-prediction output carrying ``pae_logits``.
-            input: The model input the output was produced from.
-            max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
+            output: Predictions whose PAE logits have shape ``(B, S, N, N, D)``.
+            input: The corresponding model input. ``token_mask`` and
+                ``chain_index`` have shape ``(B, N)``.
+            max_error_bin: Upper edge of the resolved PAE bins in angstroms.
 
         Returns:
-            Scalar pTM / ipTM / ptm_iptm_average summaries per leading batch and sample axis.
-
-        Examples:
-            >>> model = AlphaFold3Model(AlphaFold3Config()).eval()  # doctest: +SKIP
-            >>> input = processor("complex.cif")  # doctest: +SKIP
-            >>> ptm, iptm, ptm_iptm_average = model.confidence_summary(model(input), input)  # doctest: +SKIP
-            >>> ptm_iptm_average.shape  # doctest: +SKIP
-            torch.Size([1, 1])
+            Three tensors with shape ``(B, S)``: pTM, ipTM, and
+            ``0.8 * ipTM + 0.2 * pTM``. For single-chain systems, the third value
+            uses pTM in place of undefined ipTM.
         """
 
         num_tokens = output.pae_logits.shape[-2]
@@ -670,7 +678,9 @@ class AlphaFold3Model(Model):
         pair_mask: Tensor,
         recycling_steps: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""Run the differentiable recycling loop."""
+        r"""
+        Run the differentiable recycling loop.
+        """
 
         template_features = input.template_features
         if template_features is not None:
@@ -741,13 +751,6 @@ class AlphaFold3Model(Model):
 class AlphaFold3InputEmbeddings(nn.Module):
     r"""
     Build token input embeddings by encoding atoms to tokens and appending the token-feature tail.
-
-    Runs the atom-to-token encoder over the packed atom features, then concatenates the encoder's token
-    channels with the trailing per-token features to form the initial token embedding.
-
-    Args:
-        single_size: Width of the single (token) representation.
-        atom_feature_size: Width of the packed per-atom feature vector.
     """
 
     def __init__(
@@ -776,26 +779,6 @@ class AlphaFold3InputEmbeddings(nn.Module):
         token_mask: Tensor | None = None,
         local_geometry: LocalAtomGeometry | None = None,
     ) -> Tensor:
-        r"""
-        Return token embeddings concatenating atom-derived channels with the token-feature tail.
-
-        Args:
-            atom_features: Packed per-atom features ``(..., N_atom, atom_feature_size)``.
-            reference_positions: Centered reference-conformer atom coords ``(..., N_atom, 3)``.
-            reference_charges: Per-atom reference formal charges ``(..., N_atom, 1)`` (``arcsinh``-compressed
-                before encoding).
-            reference_mask: Boolean mask for valid reference-conformer atoms ``(..., N_atom)``.
-            token_features: Packed per-token features ``(..., N_token, token_feature_size)``.
-            atom_to_token: Token index for each atom ``(..., N_atom)``.
-            num_tokens: Number of tokens ``N_token``.
-            atom_mask: Optional boolean atom validity mask ``(..., N_atom)``.
-            token_mask: Optional boolean token validity mask ``(..., N_token)``; masked tokens are zeroed.
-            local_geometry: Optional precomputed local atom geometry for the atom encoder.
-
-        Returns:
-            Token embedding ``(..., N_token, single_size + token_tail)``.
-        """
-
         atom_dtype = self.atom_encoder.atom_conditioner.atom_feature_projection.weight.dtype
         # Reference features remain FP32 even when the Evoformer uses a lower precision.
         with torch.autocast(device_type=reference_positions.device.type, enabled=False):
@@ -827,20 +810,6 @@ class AlphaFold3InputEmbeddings(nn.Module):
         atom_mask: Tensor,
         num_tokens: int,
     ) -> LocalAtomGeometry:
-        r"""
-        Build local atom geometry using the input atom-encoder layout.
-
-        Args:
-            reference_positions: Centered reference-conformer atom coords ``(..., N_atom, 3)``.
-            reference_space_id: Reference-conformer group id for each atom ``(..., N_atom)``.
-            atom_to_token: Token index for each packed atom ``(..., N_atom)``.
-            atom_mask: Valid packed-atom mask ``(..., N_atom)``.
-            num_tokens: Number of tokens in the dense reference layout.
-
-        Returns:
-            Local atom geometry for the input atom encoder.
-        """
-
         return _build_alphafold3_local_geometry(
             self.atom_encoder.atom_pair_encoder.local_geometry_builder.windowing,
             reference_positions=reference_positions,
@@ -860,7 +829,9 @@ def _build_alphafold3_local_geometry(
     atom_mask: Tensor,
     num_tokens: int,
 ) -> LocalAtomGeometry:
-    r"""Build AF3 local atom geometry and key-space ids."""
+    r"""
+    Build AF3 local atom geometry and key-space ids.
+    """
 
     atom_mask = atom_mask.to(torch.bool)
     num_valid_atoms = int(atom_mask.sum(-1).amax().item())
@@ -896,20 +867,26 @@ _IPTM_WEIGHT = 0.8
 
 
 def _uniform_bin_centers(num_bins: int, minimum: float, maximum: float) -> Tensor:
-    r"""Return the midpoints of ``num_bins`` equal bins tiling ``[minimum, maximum]``."""
+    r"""
+    Return the midpoints of ``num_bins`` equal bins tiling ``[minimum, maximum]``.
+    """
 
     edges = torch.linspace(minimum, maximum, num_bins + 1)
     return (edges[:-1] + edges[1:]) / 2
 
 
 def _expected_bin_value(logits: Tensor, centers: Tensor) -> Tensor:
-    r"""Take the softmax expectation of ``logits`` over categorical distance/error ``centers``."""
+    r"""
+    Take the softmax expectation of ``logits`` over categorical distance/error ``centers``.
+    """
 
     return logits.softmax(dim=-1) @ centers.to(logits.dtype)
 
 
 def _contact_probability(distogram_logits: Tensor) -> Tensor:
-    r"""Probability that a token pair is within 8 Angstrom under the distogram head."""
+    r"""
+    Probability that a token pair is within 8 Angstrom under the distogram head.
+    """
 
     centers = _uniform_bin_centers(distogram_logits.shape[-1], 2.3125, 21.6875)
     return distogram_logits.softmax(dim=-1)[..., centers < 8.0].sum(dim=-1)
@@ -926,7 +903,7 @@ def alphafold3_pae_bin_centers(
 
     Args:
         num_bins: Number of PAE logit bins.
-        max_error_bin: Upper edge of the resolved (non-catch-all) bins in Angstrom.
+        max_error_bin: Upper edge of the resolved (non-catch-all) bins in angstroms.
         device: Optional device for the returned tensor.
 
     Returns:
@@ -934,18 +911,6 @@ def alphafold3_pae_bin_centers(
 
     Raises:
         ValueError: If ``num_bins`` is less than two.
-
-    Examples:
-        >>> import torch
-        >>> centers = alphafold3_pae_bin_centers(4)
-        >>> centers.shape
-        torch.Size([4])
-        >>> centers.round(decimals=3).tolist()
-        [7.75, 23.25, 38.75, 54.25]
-        >>> alphafold3_pae_bin_centers(1)
-        Traceback (most recent call last):
-            ...
-        ValueError: num_bins must be at least 2, got 1
     """
 
     if num_bins < 2:
@@ -956,7 +921,7 @@ def alphafold3_pae_bin_centers(
     return torch.cat([centers, centers[-1:] + step], dim=0)
 
 
-def tm_adjusted_pae(
+def alphafold3_tm_adjusted_pae(
     pae_logits: Tensor,
     *,
     pair_mask: Tensor,
@@ -977,20 +942,10 @@ def tm_adjusted_pae(
         pair_mask: ``[..., N_token, N_token]`` boolean mask of valid frame pairs.
         chain_index: ``[..., N_token]`` chain index per token.
         interface: If ``True``, use the interface token count for ``d0``; else the global count.
-        max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
+        max_error_bin: Upper edge of the resolved PAE bins in angstroms.
 
     Returns:
         ``[..., N_token, N_token]`` TM-adjusted PAE.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> logits = torch.randn(1, 3, 3, 4)
-        >>> mask = torch.ones(1, 3, dtype=torch.bool)
-        >>> pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-        >>> chain_index = torch.tensor([[0, 0, 1]])
-        >>> tm_adjusted_pae(logits, pair_mask=pair_mask, chain_index=chain_index, interface=False).shape
-        torch.Size([1, 3, 3])
     """
 
     num_bins = pae_logits.shape[-1]
@@ -1030,18 +985,6 @@ def alphafold3_predicted_tm_score(
 
     Returns:
         ``[...]`` pTM or ipTM score.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> adjusted = torch.rand(1, 3, 3)
-        >>> mask = torch.ones(1, 3, dtype=torch.bool)
-        >>> pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-        >>> chain_index = torch.tensor([[0, 0, 1]])
-        >>> alphafold3_predicted_tm_score(
-        ...     adjusted, pair_mask=pair_mask, chain_index=chain_index, interface=False
-        ... ).shape
-        torch.Size([1])
     """
 
     mask = pair_mask.to(adjusted_pae.dtype)
@@ -1072,32 +1015,18 @@ def alphafold3_confidence_summary(
         pae_logits: ``[..., N_token, N_token, num_bins]`` predicted-aligned-error logits.
         frame_mask: ``[..., N_token]`` boolean mask of tokens with a valid frame.
         chain_index: ``[..., N_token]`` chain index per token.
-        max_error_bin: Upper edge of the resolved PAE bins in Angstrom.
+        max_error_bin: Upper edge of the resolved PAE bins in angstroms.
 
     Returns:
         Scalar pTM / ipTM / ptm_iptm_average summaries broadcast over the leading batch/sample axes.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> logits = torch.randn(1, 3, 3, 4)
-        >>> frame_mask = torch.ones(1, 3, dtype=torch.bool)
-        >>> chain_index = torch.tensor([[0, 0, 1]])
-        >>> ptm, iptm, ptm_iptm_average = alphafold3_confidence_summary(
-        ...     logits, frame_mask=frame_mask, chain_index=chain_index
-        ... )
-        >>> ptm.shape
-        torch.Size([1])
-        >>> ptm_iptm_average.shape
-        torch.Size([1])
     """
 
     frame_mask = frame_mask.to(torch.bool)
     pair_mask = frame_mask.unsqueeze(-1) & frame_mask.unsqueeze(-2)
-    global_adjusted = tm_adjusted_pae(
+    global_adjusted = alphafold3_tm_adjusted_pae(
         pae_logits, pair_mask=pair_mask, chain_index=chain_index, interface=False, max_error_bin=max_error_bin
     )
-    interface_adjusted = tm_adjusted_pae(
+    interface_adjusted = alphafold3_tm_adjusted_pae(
         pae_logits, pair_mask=pair_mask, chain_index=chain_index, interface=True, max_error_bin=max_error_bin
     )
     ptm = alphafold3_predicted_tm_score(global_adjusted, pair_mask=pair_mask, chain_index=chain_index, interface=False)
@@ -1112,13 +1041,17 @@ def alphafold3_confidence_summary(
 
 
 def _weighted_mean(mask: np.ndarray, value: np.ndarray, axis: object) -> np.ndarray:
-    r"""Compute a contact/frame-weighted mean."""
+    r"""
+    Compute a contact/frame-weighted mean.
+    """
 
     return np.mean(mask * value, axis=axis) / (np.finfo(value.dtype).tiny + np.mean(mask, axis=axis))
 
 
 def _weighted_nanmean(value: np.ndarray, mask: np.ndarray, axis: int) -> np.ndarray:
-    r"""Compute a NaN-aware weighted mean; empty slices return NaN."""
+    r"""
+    Compute a NaN-aware weighted mean; empty slices return NaN.
+    """
 
     mask = mask.astype(float)
     nan_idxs = np.where(np.isnan(value))
@@ -1129,7 +1062,9 @@ def _weighted_nanmean(value: np.ndarray, mask: np.ndarray, axis: int) -> np.ndar
 
 
 def _chain_pair_pde(full_pde: np.ndarray, chain_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    r"""Compute per-chain-pair mean and minimum predicted distance error."""
+    r"""
+    Compute per-chain-pair mean and minimum predicted distance error.
+    """
 
     unique = np.unique(chain_indices)
     num_chains = len(unique)
@@ -1148,7 +1083,9 @@ def _chain_pair_pde(full_pde: np.ndarray, chain_indices: np.ndarray) -> tuple[np
 def _pde_single(
     chain_indices: np.ndarray, full_pde: np.ndarray, contact_probs: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Compute contact-weighted intra-chain, cross-chain, and per-token PDE."""
+    r"""
+    Compute contact-weighted intra-chain, cross-chain, and per-token PDE.
+    """
 
     unique = np.unique(chain_indices)
     num_chains = len(unique)
@@ -1174,7 +1111,9 @@ def _chain_pair_pae(
     mask: np.ndarray,
     contact_probs: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Compute per-chain-pair mean and minimum predicted aligned error."""
+    r"""
+    Compute per-chain-pair mean and minimum predicted aligned error.
+    """
 
     if contact_probs is None:
         contact_probs = np.ones(full_pae.shape[1:], dtype=float)
@@ -1206,7 +1145,9 @@ def _chain_pair_pae(
 def _predicted_tm_score_np(
     tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, chain_index: np.ndarray, interface: bool
 ) -> float:
-    r"""Compute scalar pTM or ipTM for one sample."""
+    r"""
+    Compute scalar pTM or ipTM for one sample.
+    """
 
     if interface:
         pair_mask = pair_mask * (chain_index[:, None] != chain_index[None, :])
@@ -1218,7 +1159,9 @@ def _predicted_tm_score_np(
 
 
 def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, chain_index: np.ndarray) -> np.ndarray:
-    r"""Compute the per-chain-pair ipTM matrix for one sample."""
+    r"""
+    Compute the per-chain-pair ipTM matrix for one sample.
+    """
 
     unique = list(np.unique(chain_index))
     num_chains = len(unique)
@@ -1238,7 +1181,8 @@ def _chain_pairwise_iptm(tm_adjusted_pae: np.ndarray, pair_mask: np.ndarray, cha
 
 
 def _reduce_chain_pair(chain_pair: np.ndarray, *, agg_over_col: bool) -> tuple[np.ndarray, np.ndarray]:
-    r"""Reduce chain pairs to intra-chain and cross-chain means.
+    r"""
+    Reduce chain pairs to intra-chain and cross-chain means.
 
     Chain weights are uniform.
     """
@@ -1259,7 +1203,9 @@ def _pae_metrics(
     contact_probs: np.ndarray,
     tm_adjusted_pae_interface: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    r"""Compute per-chain ipTM/PAE aggregates and the chain-pair ipTM matrix."""
+    r"""
+    Compute per-chain ipTM/PAE aggregates and the chain-pair ipTM matrix.
+    """
 
     chain_pair_contact_weighted, _, _ = _chain_pair_pae(full_pae, chain_indices, mask=mask, contact_probs=contact_probs)
     chain_pair_iptm = np.stack(
@@ -1289,7 +1235,9 @@ def _pae_metrics(
 
 
 def _rank_metric(full_pae: np.ndarray, contact_probs: np.ndarray, *, rank_metric_eps: float) -> np.ndarray:
-    r"""Compute a contact-weighted PAE ranking metric; higher is better."""
+    r"""
+    Compute a contact-weighted PAE ranking metric; higher is better.
+    """
 
     return -np.sum(full_pae * contact_probs[None, :, :], axis=(-2, -1)) / (np.sum(contact_probs) + rank_metric_eps)
 
@@ -1300,7 +1248,7 @@ _CLASH_PENALIZATION_WEIGHT = 100.0
 
 # Maximum accessible surface areas from Sander & Rost 1994
 # (https://doi.org/10.1002/prot.340200303), used by AlphaFold-RSA.
-MAX_ACCESSIBLE_SURFACE_AREA = {
+_MAX_ACCESSIBLE_SURFACE_AREA = {
     "ALA": 106.0,
     "ARG": 248.0,
     "ASN": 157.0,
@@ -1330,8 +1278,9 @@ _RASA_WINDOW = 25
 _POLYMER_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
-def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered_: float, has_clash_: bool) -> float:
-    r"""Return the AlphaFold 3 ranking score for one sample.
+def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered: float, has_clash: bool) -> float:
+    r"""
+    Return the AlphaFold 3 ranking score for one sample.
 
     ``ptm_iptm_average + 0.5 * fraction_disordered - 100 * has_clash``, with pTM
     substituted for the ipTM term when ipTM is ``NaN``.
@@ -1339,8 +1288,8 @@ def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered_: floa
     Args:
         ptm: The predicted global TM score.
         iptm: The interface predicted TM score (``NaN`` for single-chain systems).
-        fraction_disordered_: The AlphaFold-RSA disorder fraction in ``[0, 1]``.
-        has_clash_: Whether the structure has at least one clashing chain.
+        fraction_disordered: The AlphaFold-RSA disorder fraction in ``[0, 1]``.
+        has_clash: Whether the structure has at least one clashing chain.
 
     Returns:
         The scalar ranking score (higher is better).
@@ -1352,19 +1301,20 @@ def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered_: floa
         ptm_iptm_average = _IPTM_WEIGHT * iptm + (1.0 - _IPTM_WEIGHT) * ptm
     return (
         ptm_iptm_average
-        + _FRACTION_DISORDERED_WEIGHT * fraction_disordered_
-        - _CLASH_PENALIZATION_WEIGHT * float(has_clash_)
+        + _FRACTION_DISORDERED_WEIGHT * fraction_disordered
+        - _CLASH_PENALIZATION_WEIGHT * float(has_clash)
     )
 
 
-def fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RASA_DISORDER_CUTOFF) -> float:
-    r"""Fraction of protein residues predicted disordered by windowed AlphaFold-RSA.
+def alphafold3_fraction_disordered(structure: Structure, rasa_disorder_cutoff: float = _RASA_DISORDER_CUTOFF) -> float:
+    r"""
+    Fraction of protein residues predicted disordered by windowed AlphaFold-RSA.
 
     Restricts to protein chains, computes a windowed (window 25) relative solvent
     accessible surface area per residue with DSSP 4.4.7 semantics, and returns the mean
-    fraction of residues whose rASA exceeds ``rasa_disorder_cutoff``. Identical
-    chain sequences reuse a cached rASA
-    profile. Calculation errors propagate rather than being reinterpreted as an
+    fraction of residues whose rASA exceeds ``rasa_disorder_cutoff``. Repeated
+    chain sequences reuse a cached rASA profile. Calculation errors propagate
+    rather than being reinterpreted as an
     absent chain.
 
     Args:
@@ -1399,7 +1349,8 @@ def alphafold3_has_clash(
     min_clashes_for_overlap: int = 100,
     min_fraction_for_overlap: float = 0.5,
 ) -> bool:
-    r"""Whether the structure has at least one clashing polymer chain.
+    r"""
+    Whether the structure has at least one clashing polymer chain.
 
     Restricts to protein / RNA / DNA polymer atoms, then flags a chain as
     overlapping when more than ``min_clashes_for_overlap`` of its atoms lie within
@@ -1444,10 +1395,11 @@ def alphafold3_has_clash(
 
 
 def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) -> np.ndarray:
-    r"""Windowed per-residue rASA for one protein chain (AlphaFold-RSA).
+    r"""
+    Windowed per-residue rASA for one protein chain (AlphaFold-RSA).
 
     Runs the DSSP 4.4.7 solvent-accessibility algorithm over the chain, normalizes each residue's
-    accessible surface area by [`MAX_ACCESSIBLE_SURFACE_AREA`][], clips to ``1.0``, and
+    accessible surface area by [`_MAX_ACCESSIBLE_SURFACE_AREA`][], clips to ``1.0``, and
     averages over a reflect-padded window.
     Raises ``RuntimeError`` when the chain has no complete DSSP residues.
     """
@@ -1457,7 +1409,7 @@ def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) ->
         raise RuntimeError("DSSP produced no accessible-area rows")
     rasa = []
     for residue_name, area in accessible:
-        max_area = MAX_ACCESSIBLE_SURFACE_AREA.get(residue_name, MAX_ACCESSIBLE_SURFACE_AREA["ALA"])
+        max_area = _MAX_ACCESSIBLE_SURFACE_AREA.get(residue_name, _MAX_ACCESSIBLE_SURFACE_AREA["ALA"])
         normalized = area / max_area
         rasa.append(min(normalized, 1.0))
 
@@ -1474,7 +1426,9 @@ _DSSP_SURFACE_POINT_COUNT = 401
 
 
 def _dssp_surface_dots() -> np.ndarray:
-    r"""Return the 401-point Fibonacci sphere used by DSSP 4.4.7."""
+    r"""
+    Return the 401-point Fibonacci sphere used by DSSP 4.4.7.
+    """
 
     n = (_DSSP_SURFACE_POINT_COUNT - 1) // 2
     indices = np.arange(-n, n + 1, dtype=np.int32)
@@ -1499,7 +1453,8 @@ _DSSP_SURFACE_POINT_WEIGHT = np.float32(4.0 * np.pi / _DSSP_SURFACE_POINT_COUNT)
 
 
 def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[str, float]]:
-    r"""Return per-residue ``(residue_name, accessible_area)`` for one protein chain.
+    r"""
+    Return per-residue ``(residue_name, accessible_area)`` for one protein chain.
 
     This implements the DSSP 4.4.7 accessibility calculation with its atom radii,
     401-point Fibonacci sphere, water radius, overlap test, and integer output
@@ -1593,7 +1548,9 @@ def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[
 
 
 def _protein_instance_ids(structure: Structure) -> list[str]:
-    r"""Instance ids of protein polymer chains, in system order."""
+    r"""
+    Instance ids of protein polymer chains, in system order.
+    """
 
     system = structure.system
     instance_ids: list[str] = []
@@ -1605,14 +1562,18 @@ def _protein_instance_ids(structure: Structure) -> list[str]:
 
 
 def _chain_sequence(structure: Structure, instance_id: str) -> str:
-    r"""Return the protein sequence used by the cross-chain rASA cache."""
+    r"""
+    Return the protein sequence used by the cross-chain rASA cache.
+    """
 
     entity = structure.system.entities[structure.system.instances[instance_id]]
     return "".join(AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components)
 
 
 def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Observed polymer atom coordinates, component indices, and instance IDs."""
+    r"""
+    Observed polymer atom coordinates, component indices, and instance IDs.
+    """
 
     system = structure.system
     coordinates: list[np.ndarray] = []
@@ -1637,7 +1598,9 @@ def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.nda
 
 
 def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]]:
-    r"""Find atom neighbors within ``cutoff_radius`` using a cKDTree."""
+    r"""
+    Find atom neighbors within ``cutoff_radius`` using a cKDTree.
+    """
 
     from scipy import spatial
 
@@ -1647,7 +1610,9 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
 
 @dataclass(frozen=True, kw_only=True)
 class _AlphaFold3TrunkOutput:
-    r"""Named representations returned by the AlphaFold 3 recycling trunk."""
+    r"""
+    Named representations returned by the AlphaFold 3 recycling trunk.
+    """
 
     token_embedding: Tensor
     single: Tensor
@@ -1657,15 +1622,38 @@ class _AlphaFold3TrunkOutput:
 
 @dataclass(kw_only=True)
 class AlphaFold3Input:
-    r"""Tensors consumed by the AlphaFold 3 graph.
+    r"""
+    Tensor and molecular-layout input for AlphaFold 3.
 
-    ``reference_charges`` has the unique shape ``[..., N_atom, 1]``.
+    ``B`` is batch size, ``N`` token count, ``A`` atom count, ``M`` MSA depth, and
+    ``T`` template count.
 
-    ``system``, ``atom_sites``, and ``token_sites`` carry the canonical identities
-    used to reconstruct the folding result. They are optional so the pure-tensor
-    model graph (``forward`` / ``_sample``) can be driven with bare tensors, but the
-    [`AlphaFold3Processor`][] always populates them so [`AlphaFold3Model.fold`][]
-    can decode coordinates back into a [`Structure`][ofoldx.data.structure.Structure].
+    Args:
+        token_mask: Valid-token mask with shape ``(B, N)``.
+        residue_index: Chain-local residue indices with shape ``(B, N)``.
+        chain_index: Molecular-instance indices with shape ``(B, N)``.
+        entity_index: Molecular-entity indices with shape ``(B, N)``.
+        symmetry_index: Copy indices within each entity with shape ``(B, N)``.
+        token_index: Token indices within each residue with shape ``(B, N)``.
+        atom_features: Reference atom features with shape ``(B, A, C_atom)``.
+        atom_to_token: Token index for each atom with shape ``(B, A)``.
+        atom_mask: Valid-atom mask with shape ``(B, A)``.
+        reference_positions: Reference conformer coordinates with shape
+            ``(B, A, 3)`` in angstroms.
+        reference_space_id: Reference conformer group IDs with shape ``(B, A)``.
+        atom_token_index: Atom indices within each token with shape ``(B, A)``.
+        token_to_rep_atom: Representative atom index for each token with shape
+            ``(B, N)``.
+        token_features: Per-token input features with shape ``(B, N, C_token)``.
+        reference_mask: Reference-coordinate validity mask with shape ``(B, A)``.
+        reference_charges: Reference formal charges with shape ``(B, A, 1)``.
+        token_bonds: Token-level bond adjacency with shape ``(B, N, N)``.
+        msa_features: Optional MSA features with shape ``(B, M, N, C_msa)``.
+        msa_mask: Optional MSA validity mask with shape ``(B, M, N)``.
+        template_features: Optional features for ``T`` structural templates.
+        system: Molecular system represented by the tensors.
+        atom_sites: Atom occurrences aligned to the atom axis.
+        token_sites: Molecular occurrences aligned to the token axis.
     """
 
     token_mask: Tensor
@@ -1695,7 +1683,21 @@ class AlphaFold3Input:
 
 @dataclass
 class AlphaFold3Output:
-    r"""Predictions computed by one AlphaFold 3 denoising call."""
+    r"""
+    Predictions from one AlphaFold 3 denoising call.
+
+    Args:
+        coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        plddt_logits: Per-atom confidence logits with shape ``(B, S, A, D_plddt)``.
+        pae_logits: Token-pair aligned-error logits with shape
+            ``(B, S, N, N, D_pae)``.
+        pde_logits: Token-pair distance-error logits with shape
+            ``(B, S, N, N, D_pde)``.
+        resolved_logits: Per-atom resolved-state logits with shape
+            ``(B, S, A, D_resolved)``.
+    """
 
     coordinates: Tensor
     distogram_logits: Tensor
@@ -1706,7 +1708,12 @@ class AlphaFold3Output:
 
     @property
     def plddt(self) -> Tensor:
-        r"""Expected pLDDT on the conventional 0--100 scale."""
+        r"""
+        Return expected per-atom pLDDT.
+
+        Returns:
+            Confidence values with shape ``(B, S, A)`` on the ``0--100`` scale.
+        """
 
         return expected_plddt(self.plddt_logits)
 
@@ -1716,7 +1723,8 @@ class AlphaFold3Output:
 
 @dataclass(eq=False)
 class AlphaFold3SeedGroup:
-    r"""One diffusion seed and its generation-ordered samples.
+    r"""
+    One diffusion seed and its generation-ordered samples.
 
     Args:
         seed: The integer diffusion seed shared by every sample, when one was supplied.
@@ -1730,7 +1738,8 @@ class AlphaFold3SeedGroup:
 
 @dataclass(eq=False)
 class AlphaFold3FoldResult:
-    r"""One AlphaFold 3 folding result preserving its per-seed sample groups.
+    r"""
+    One AlphaFold 3 folding result preserving its per-seed sample groups.
 
     Args:
         seed_groups: One [`AlphaFold3SeedGroup`][] per seed, in the order the
@@ -1740,12 +1749,11 @@ class AlphaFold3FoldResult:
     seed_groups: tuple[AlphaFold3SeedGroup, ...]
 
     def best(self, score: str) -> FoldPrediction:
-        r"""Return the earliest best prediction under one explicit score.
+        r"""
+        Return the earliest best prediction under one explicit score.
 
-        Pools every sample across every seed group and ranks the pool by the named
-        [`Score`][ofoldx.results.Score], using the
-        explicit-direction, identical-unit, identical-scope, NaN-rejecting,
-        infinity-rankable, earliest-tie semantics of [`best`][ofoldx.results.FoldResult.best].
+        Samples from all seed groups are pooled before ranking. Ties retain
+        generation order.
 
         Args:
             score: The name of the per-sample score to rank on.

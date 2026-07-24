@@ -1,8 +1,5 @@
 r"""
-Template embedding modules.
-
-Embed structural-template pair features (distograms, unit vectors, residue types, validity masks)
-into the trunk pair representation.
+Structural-template embeddings.
 """
 
 from __future__ import annotations
@@ -20,11 +17,9 @@ from ..trunk.msa import TrianglePairUpdateBlock
 @dataclass
 class TemplateFeatures:
     r"""
-    Typed template features consumed by ``TemplateEmbedder``.
+    Template features consumed by [`TemplateEmbedder`][].
 
-    Bundles the per-template geometric and residue features into a single typed container so they can
-    be moved between devices/dtypes together and passed through the embedder as one argument. All
-    tensors carry a leading ``num_templates`` axis (``[..., num_templates, ...]``).
+    Every tensor carries a ``num_templates`` axis.
 
     Args:
         distogram: ``[..., num_templates, N_token, N_token, num_distogram_bins]`` template pair distogram
@@ -48,12 +43,6 @@ class TemplateEmbedder(nn.Module):
     r"""
     Embed template-derived pair features into pair representations.
 
-    Consumes pre-packed [`TemplateFeatures`][ofoldx.modules.embedding.template.TemplateFeatures],
-    projects each template's geometric and residue features into a hidden pair channel (added to a
-    projection of the normalized trunk pair), refines it through ``num_blocks`` pair-only triangle
-    update blocks, and returns the per-template mean projected back to ``pair_size``. When
-    ``num_blocks == 0`` or no templates are present, a zero update is returned.
-
     Args:
         pair_size: Width of the trunk pair representation this update is added into.
         hidden_size: Width of the internal template pair channel.
@@ -67,22 +56,6 @@ class TemplateEmbedder(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to the triangle update blocks.
-
-    Examples:
-        >>> import torch
-        >>> embedder = TemplateEmbedder(
-        ...     pair_size=8, hidden_size=4, num_blocks=0, vocab_size=2, num_distogram_bins=3
-        ... )
-        >>> pair = torch.zeros(1, 5, 5, 8)
-        >>> templates = TemplateFeatures(
-        ...     distogram=torch.zeros(1, 0, 5, 5, 3),
-        ...     pseudo_beta_mask=torch.zeros(1, 0, 5, 5),
-        ...     residue_type=torch.zeros(1, 0, 5, dtype=torch.long),
-        ...     unit_vector=torch.zeros(1, 0, 5, 5, 3),
-        ...     backbone_frame_mask=torch.zeros(1, 0, 5, 5),
-        ... )
-        >>> embedder(pair, templates).shape  # num_blocks == 0 -> zero update
-        torch.Size([1, 5, 5, 8])
     """
 
     def __init__(
@@ -134,10 +107,6 @@ class TemplateEmbedder(nn.Module):
         r"""
         Return template pair updates for an input pair representation.
 
-        Each template is embedded and refined independently, optionally masked by ``template_mask``,
-        then averaged over templates and projected back to ``pair_size``. Returns a zero update when
-        the embedder is disabled (``num_blocks == 0``) or no templates are present.
-
         Args:
             pair: ``[..., N_token, N_token, pair_size]`` trunk pair representation.
             templates: Pre-packed template features.
@@ -145,24 +114,8 @@ class TemplateEmbedder(nn.Module):
                 triangle update blocks.
 
         Returns:
-            ``[..., N_token, N_token, pair_size]`` template pair update to add into ``pair``.
-
-        Examples:
-            >>> import torch
-            >>> embedder = TemplateEmbedder(
-            ...     pair_size=8, hidden_size=4, num_blocks=0, vocab_size=2, num_distogram_bins=3
-            ... )
-            >>> pair = torch.zeros(1, 4, 4, 8)
-            >>> templates = TemplateFeatures(
-            ...     distogram=torch.zeros(1, 0, 4, 4, 3),
-            ...     pseudo_beta_mask=torch.zeros(1, 0, 4, 4),
-            ...     residue_type=torch.zeros(1, 0, 4, dtype=torch.long),
-            ...     unit_vector=torch.zeros(1, 0, 4, 4, 3),
-            ...     backbone_frame_mask=torch.zeros(1, 0, 4, 4),
-            ... )
-            >>> update = embedder(pair, templates)
-            >>> update.shape, bool(update.abs().sum() == 0)
-            (torch.Size([1, 4, 4, 8]), True)
+            ``[..., N_token, N_token, pair_size]`` template pair update. The
+            update is zero when ``num_blocks == 0`` or the template count is zero.
         """
 
         if self.num_blocks == 0 or templates.distogram.shape[-4] == 0:

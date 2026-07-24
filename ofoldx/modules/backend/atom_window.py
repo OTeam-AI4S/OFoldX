@@ -1,12 +1,5 @@
 r"""
-Backend dispatch for the atom/token transfer operators.
-
-Three closely related index-driven operators move features between the atom axis and the token axis:
-``atom_to_token_mean`` (masked segmented mean of atom features onto tokens), ``token_to_atom_broadcast``
-(gather each atom's token row), and ``token_pair_to_atom_window_gather`` (gather token-pair features into
-atom-local pair windows). Each dispatcher owns the OOps call and a pure-torch eager
-implementation with the same tensor contract. Modules pass normalized inputs plus
-their requested ``operator_backend`` and never branch on the backend themselves.
+Backend-dispatched atom/token transfer operators.
 """
 
 from __future__ import annotations
@@ -49,17 +42,6 @@ def atom_to_token_mean(
 
     Returns:
         ``[..., N_token, C]`` token features.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.atom_window import atom_to_token_mean
-        >>> atom = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-        >>> atom_to_token = torch.tensor([0, 0, 1])
-        >>> out = atom_to_token_mean(
-        ...     atom, atom_to_token, num_tokens=2, atom_mask=None, eps=1e-6, operator_backend="torch"
-        ... )
-        >>> out.tolist()
-        [[2.0, 3.0], [5.0, 6.0]]
     """
 
     backend = resolve_tensor_operator_backend(
@@ -103,14 +85,6 @@ def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_ba
 
     Returns:
         ``[..., N_atom, C]`` atom features.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.atom_window import token_to_atom_broadcast
-        >>> token = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
-        >>> atom_to_token = torch.tensor([0, 1, 1])
-        >>> token_to_atom_broadcast(token, atom_to_token, operator_backend="torch").tolist()
-        [[10.0, 11.0], [20.0, 21.0], [20.0, 21.0]]
     """
 
     backend = resolve_tensor_operator_backend(
@@ -145,20 +119,12 @@ def token_pair_to_atom_window_gather(
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
         operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        num_valid_atoms: Number of contiguous valid atoms at the start of the atom
+            axis. When provided, key windows are shifted away from padding where
+            possible.
 
     Returns:
         ``[..., N_blocks, n_queries, n_keys, C]`` local atom-pair features.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.atom_window import token_pair_to_atom_window_gather
-        >>> token_pair = torch.arange(16).reshape(4, 4, 1).float()
-        >>> atom_to_token = torch.tensor([0, 1, 2, 3])
-        >>> out = token_pair_to_atom_window_gather(
-        ...     token_pair, atom_to_token, n_queries=2, n_keys=4, operator_backend="torch"
-        ... )
-        >>> out.shape
-        torch.Size([2, 2, 4, 1])
     """
 
     backend = resolve_tensor_operator_backend(

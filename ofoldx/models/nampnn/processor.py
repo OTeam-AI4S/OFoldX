@@ -1,4 +1,6 @@
-r"""Canonical mixed-polymer Structure lowering for NA-MPNN."""
+r"""
+NA-MPNN input processing.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +19,12 @@ from ...io.structure import read_structure
 from ...processor import Processor
 from .config import NaMpnnProcessorConfig
 from .model import (
-    DNA_GENERATABLE_TOKEN_IDS,
-    MIXED_POLYMER_ATOM_NAMES,
-    MIXED_POLYMER_TOKEN_BY_COMPONENT,
-    PROTEIN_GENERATABLE_TOKEN_IDS,
-    RNA_SEPARATE_GENERATABLE_TOKEN_IDS,
-    RNA_SHARED_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_ATOM_NAMES,
+    NA_MPNN_DNA_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_PROTEIN_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_TOKEN_BY_COMPONENT,
     NaMpnnInput,
 )
 
@@ -33,17 +35,17 @@ _REQUIRED_ATOMS = {
     "rna": ("OP1", "OP2", "P", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'"),
 }
 _GENERATED_COMPONENTS = {
-    "protein": tuple(MIXED_POLYMER_TOKEN_BY_COMPONENT)[:20],
+    "protein": tuple(NA_MPNN_TOKEN_BY_COMPONENT)[:20],
     "dna": ("DA", "DC", "DG", "DT"),
     "rna": ("A", "C", "G", "U"),
 }
 _DNA_COMPONENTS = frozenset({"DA", "DC", "DG", "DT", "DX"})
 _RNA_COMPONENTS = frozenset({"A", "C", "G", "U", "RX"})
 _SHARED_NUCLEIC_TOKENS = {
-    "A": MIXED_POLYMER_TOKEN_BY_COMPONENT["DA"],
-    "C": MIXED_POLYMER_TOKEN_BY_COMPONENT["DC"],
-    "G": MIXED_POLYMER_TOKEN_BY_COMPONENT["DG"],
-    "U": MIXED_POLYMER_TOKEN_BY_COMPONENT["DT"],
+    "A": NA_MPNN_TOKEN_BY_COMPONENT["DA"],
+    "C": NA_MPNN_TOKEN_BY_COMPONENT["DC"],
+    "G": NA_MPNN_TOKEN_BY_COMPONENT["DG"],
+    "U": NA_MPNN_TOKEN_BY_COMPONENT["DT"],
 }
 _POLYMER_TYPE_INDEX = {"protein": 0, "dna": 1, "rna": 2}
 
@@ -52,19 +54,11 @@ _Row = tuple[ComponentReference, str, str, int, int, np.ndarray, tuple[bool, ...
 
 
 class NaMpnnProcessor(Processor):
-    r"""Lower one protein/DNA/RNA structure into the NA-MPNN 16-atom layout.
-
-    The Processor has two arms selected by the expression: a ``sequence`` override
-    lowers the score arm over an explicit observed sequence, while the default
-    design/probability arm lowers conditions, token symmetry, and the aligned
-    bias tensors. Both arms derive residue indices from ``Structure.residue_numbers``
-    with a running-count renumber, type polymers from the canonical
-    component, and demote incomplete or unoccupied residues to an invalid unknown
-    token.
+    r"""
+    Prepare mixed protein and nucleic-acid structures for NA-MPNN.
 
     Args:
-        config: NA-MPNN token and nucleic-acid options. Defaults to
-            ``NaMpnnProcessorConfig()``.
+        config: NA-MPNN token options. Defaults to ``NaMpnnProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -92,10 +86,11 @@ class NaMpnnProcessor(Processor):
         pair_bias: Tensor | None = None,
         global_omit_tokens: Sequence[str] = (),
     ) -> NaMpnnInput:
-        r"""Lower one mixed-polymer structure for scoring, design, or probabilities.
+        r"""
+        Prepare one mixed-polymer structure for scoring or sequence design.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             sequence: Optional replacement sequence selecting the scoring arm. A bare string
                 requires one polymer instance; a mapping addresses instances explicitly.
             design_positions: Residue occurrences to evaluate or design. ``None`` selects every
@@ -104,7 +99,7 @@ class NaMpnnProcessor(Processor):
             symmetry_groups: Residue groups sharing one decoding position.
             tied_weights: Optional sampling coefficient for each tied residue.
             residue_logit_bias: Per-residue bias vectors over the NA-MPNN vocabulary.
-            pair_bias: Optional pairwise bias tensor aligned to the lowered residue rows.
+            pair_bias: Optional adjacent-token bias matrix with shape ``(33, 33)``.
             global_omit_tokens: One-letter residue tokens excluded from generation.
 
         Returns:
@@ -147,7 +142,9 @@ class NaMpnnProcessor(Processor):
         raise ValueError(f"NA-MPNN cannot consume polymer type {entity.polymer_type!r}")
 
     def _lower_rows(self, structure: Structure) -> list[_Row]:
-        r"""Lower every polymer residue to aligned coordinates, masks, and identity."""
+        r"""
+        Lower every polymer residue to aligned coordinates, masks, and identity.
+        """
 
         system = structure.system
         site_index = {site: index for index, site in enumerate(structure.sites)}
@@ -169,7 +166,7 @@ class NaMpnnProcessor(Processor):
                 polymer_type = self._polymer_type(entity, component.component_id)
                 row_coordinates: list[np.ndarray] = []
                 row_mask: list[bool] = []
-                for atom_name in MIXED_POLYMER_ATOM_NAMES:
+                for atom_name in NA_MPNN_ATOM_NAMES:
                     index = site_index.get(AtomSite(instance_id, component_index, atom_name))
                     present = (
                         index is not None
@@ -178,7 +175,7 @@ class NaMpnnProcessor(Processor):
                     )
                     row_mask.append(present)
                     row_coordinates.append(structure.coordinates[index] if present else np.zeros(3, dtype=np.float32))
-                valid = all(row_mask[MIXED_POLYMER_ATOM_NAMES.index(name)] for name in _REQUIRED_ATOMS[polymer_type])
+                valid = all(row_mask[NA_MPNN_ATOM_NAMES.index(name)] for name in _REQUIRED_ATOMS[polymer_type])
                 raw.append((reference, component.component_id, polymer_type, chain_index))
                 coordinates.append(np.stack(row_coordinates))
                 atom_masks.append(tuple(row_mask))
@@ -212,7 +209,9 @@ class NaMpnnProcessor(Processor):
 
     @staticmethod
     def _renumber(source_numbers: Sequence[int]) -> list[int]:
-        r"""Apply running-count renumbering for repeats and insertion codes."""
+        r"""
+        Apply running-count renumbering for repeats and insertion codes.
+        """
 
         renumbered: list[int] = []
         count = 0
@@ -226,19 +225,19 @@ class NaMpnnProcessor(Processor):
 
     def _component_token(self, component_id: str, polymer_type: str) -> int:
         if polymer_type == "rna" and self.config.shared_nucleic_tokens:
-            return _SHARED_NUCLEIC_TOKENS.get(component_id, MIXED_POLYMER_TOKEN_BY_COMPONENT["DX"])
+            return _SHARED_NUCLEIC_TOKENS.get(component_id, NA_MPNN_TOKEN_BY_COMPONENT["DX"])
         unknown = {"protein": "UNK", "dna": "DX", "rna": "RX"}[polymer_type]
-        return MIXED_POLYMER_TOKEN_BY_COMPONENT.get(component_id, MIXED_POLYMER_TOKEN_BY_COMPONENT[unknown])
+        return NA_MPNN_TOKEN_BY_COMPONENT.get(component_id, NA_MPNN_TOKEN_BY_COMPONENT[unknown])
 
     def _generatable_tokens(self, polymer_type: str) -> tuple[int, ...]:
         if polymer_type == "protein":
-            return PROTEIN_GENERATABLE_TOKEN_IDS
+            return NA_MPNN_PROTEIN_GENERATABLE_TOKEN_IDS
         if polymer_type == "dna":
-            return DNA_GENERATABLE_TOKEN_IDS
+            return NA_MPNN_DNA_GENERATABLE_TOKEN_IDS
         return (
-            RNA_SHARED_GENERATABLE_TOKEN_IDS
+            NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS
             if self.config.shared_nucleic_tokens
-            else RNA_SEPARATE_GENERATABLE_TOKEN_IDS
+            else NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS
         )
 
     def _tensor(self, values: list, dtype: torch.dtype) -> Tensor:
@@ -296,14 +295,16 @@ class NaMpnnProcessor(Processor):
         sequence: str | Mapping[str, str | Sequence[str]],
         design_positions: Sequence[ComponentReference] | None,
     ) -> NaMpnnInput:
-        r"""Lower an explicit observed sequence for autoregressive scoring."""
+        r"""
+        Lower an explicit observed sequence for autoregressive scoring.
+        """
 
         overrides = self._resolve_sequence_override(structure.system, rows, sequence)
         sequence_tokens = [
             (
                 self._component_token(overrides.get(row[0], row[1]), row[2])
                 if row[7]
-                else MIXED_POLYMER_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
+                else NA_MPNN_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
             )
             for row in rows
         ]
@@ -383,7 +384,9 @@ class NaMpnnProcessor(Processor):
         pair_bias: Tensor | None,
         global_omit_tokens: tuple[str, ...],
     ) -> NaMpnnInput:
-        r"""Lower conditions, token symmetry, and bias tensors for design and probabilities."""
+        r"""
+        Lower conditions, token symmetry, and bias tensors for design and probabilities.
+        """
 
         system = structure.system
         length = len(rows)
@@ -392,7 +395,7 @@ class NaMpnnProcessor(Processor):
             (
                 self._component_token(row[1], row[2])
                 if row[7]
-                else MIXED_POLYMER_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
+                else NA_MPNN_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
             )
             for row in rows
         ]
@@ -517,8 +520,8 @@ class NaMpnnProcessor(Processor):
     def _allowed_token_mask(self, rows: list[_Row], global_omit_tokens: tuple[str, ...]) -> Tensor:
         omit_tokens: set[int] = set()
         for token in global_omit_tokens:
-            if token in MIXED_POLYMER_TOKEN_BY_COMPONENT:
-                omit_tokens.add(MIXED_POLYMER_TOKEN_BY_COMPONENT[token])
+            if token in NA_MPNN_TOKEN_BY_COMPONENT:
+                omit_tokens.add(NA_MPNN_TOKEN_BY_COMPONENT[token])
             else:
                 raise ValueError(f"unknown NA-MPNN omit token {token!r}")
         mask = torch.zeros(1, len(rows), _VOCAB_SIZE, dtype=torch.bool, device=self.device)
@@ -571,7 +574,9 @@ class NaMpnnProcessor(Processor):
         return values
 
     def _pair_logit_bias(self, rows: list[_Row], pair_bias: Tensor | None) -> Tensor | None:
-        r"""Build the directed adjacent-token pair bias from a [33, 33] matrix."""
+        r"""
+        Build the directed adjacent-token pair bias from a [33, 33] matrix.
+        """
 
         if pair_bias is None:
             return None

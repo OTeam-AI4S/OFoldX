@@ -1,4 +1,6 @@
-r"""Public scientific result values."""
+r"""
+Public scientific result values.
+"""
 
 from __future__ import annotations
 

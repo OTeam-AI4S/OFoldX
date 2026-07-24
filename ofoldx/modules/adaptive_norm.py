@@ -23,12 +23,6 @@ class AdaptiveLayerNorm(nn.Module):
         hidden_size: Width of the hidden representation (affine-free normalized).
         conditioning_size: Width of the conditioning vector driving the scale and shift.
         operator_backend: Which operator backend to run; see [ofoldx.modules.backend][].
-
-    Examples:
-        >>> import torch
-        >>> norm = AdaptiveLayerNorm(8, 4, operator_backend="torch")
-        >>> norm(torch.randn(2, 3, 8), torch.randn(2, 3, 4)).shape
-        torch.Size([2, 3, 8])
     """
 
     def __init__(self, hidden_size: int, conditioning_size: int, operator_backend: str = "auto") -> None:

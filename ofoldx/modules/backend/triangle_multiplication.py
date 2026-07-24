@@ -1,9 +1,5 @@
 r"""
-Backend dispatch for the gated triangle multiplicative update.
-
-The dispatcher owns backend selection and calling-convention adaptation.
-[`TriangleMultiplication`][ofoldx.modules.attention.triangle.TriangleMultiplication] passes the ordinary tensor
-arguments without a second validation layer.
+Backend-dispatched gated triangle multiplication.
 """
 
 from __future__ import annotations
@@ -81,32 +77,6 @@ def triangle_multiplication(
 
     Returns:
         ``(..., N, N, pair_size)`` pair update, matching the shape of ``pair``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.triangle_multiplication import triangle_multiplication
-        >>> _ = torch.manual_seed(0)
-        >>> pair_size, hidden_size = 4, 5
-        >>> pair = torch.randn(1, 3, 3, pair_size)
-        >>> out = triangle_multiplication(
-        ...     pair,
-        ...     None,
-        ...     outgoing=True,
-        ...     input_norm_weight=torch.ones(pair_size),
-        ...     input_norm_bias=torch.zeros(pair_size),
-        ...     left_value_weight=torch.randn(hidden_size, pair_size),
-        ...     left_gate_weight=torch.randn(hidden_size, pair_size),
-        ...     right_value_weight=torch.randn(hidden_size, pair_size),
-        ...     right_gate_weight=torch.randn(hidden_size, pair_size),
-        ...     output_norm_weight=torch.ones(hidden_size),
-        ...     output_norm_bias=torch.zeros(hidden_size),
-        ...     output_weight=torch.randn(pair_size, hidden_size),
-        ...     output_gate_weight=torch.randn(pair_size, pair_size),
-        ...     eps=1e-5,
-        ...     operator_backend="torch",
-        ... )
-        >>> out.shape
-        torch.Size([1, 3, 3, 4])
     """
 
     hidden_size = left_value_weight.shape[0]
@@ -199,7 +169,9 @@ def _concatenate_optional_biases(
     first_weight: Tensor,
     second_weight: Tensor,
 ) -> Tensor | None:
-    r"""Pack two optional projection biases for cuEquivariance's fused input projection."""
+    r"""
+    Pack two optional projection biases for cuEquivariance's fused input projection.
+    """
 
     if first is None and second is None:
         return None

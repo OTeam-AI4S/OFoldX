@@ -1,20 +1,5 @@
-r"""Multi-stage biological design operations for BoltzGen.
-
-``BoltzGenPipeline`` binds the structure-design and inverse-fold Model/Processor pairs
-with optional fold and affinity stages. It runs structure design, inverse folding,
-optional refolding, optional affinity scoring, and result analysis in that order.
-
-The folding and affinity stages depend on structural fold and score protocols
-([`BoltzGenFoldModel`][] ``.fold(batch) -> FoldResult`` /
-[`BoltzGenScoreModel`][] ``.score(batch) -> ScoreResult``), so any compatible
-implementation can be injected. ``fold`` /
-``affinity`` and their Processors are **injected optional dependencies** typed against these
-Protocols; BoltzGen does not alter the composed model interfaces.
-
-Composition controls optional stages: refolding runs when a fold Model/Processor pair is
-present, and affinity scoring runs when a score Model/Processor pair is present. The
-inverse-fold identities are written into each candidate structure before optional refolding;
-per-residue NLL remains exposed as a ``Metric`` axis.
+r"""
+Structure and sequence design operations for BoltzGen.
 """
 
 from __future__ import annotations
@@ -48,48 +33,114 @@ from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 
 
 class BoltzGenFoldModel(Protocol):
-    r"""A fold-capable OFoldX Model exposing ``.fold(batch) -> FoldResult``.
-
-    BoltzGen composes the folding stage through this structural interface, allowing any
-    conforming OFoldX fold model to be injected.
+    r"""
+    Interface required from an optional structure-prediction stage.
     """
 
-    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
+    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object:
+        r"""
+        Move the structure-prediction model to a device and dtype.
 
-    def fold(self, batch: object, *, num_samples: int = ..., generator: torch.Generator | None = ...) -> FoldResult: ...
+        Args:
+            device: Destination device. ``None`` leaves the device unchanged.
+            dtype: Destination floating-point dtype. ``None`` leaves the dtype unchanged.
+
+        Returns:
+            The stage model after conversion.
+        """
+
+        ...
+
+    def fold(
+        self,
+        batch: object,
+        *,
+        num_samples: int = ...,
+        generator: torch.Generator | None = ...,
+    ) -> FoldResult:
+        r"""
+        Predict structures for a processed batch.
+
+        Args:
+            batch: Input produced by the paired stage processor.
+            num_samples: Number of structures to predict.
+            generator: Random generator used by model sampling.
+
+        Returns:
+            Structure predictions and their associated scores.
+        """
+
+        ...
 
 
 class BoltzGenScoreModel(Protocol):
-    r"""A score-capable OFoldX Model exposing ``.score(batch) -> ScoreResult``."""
+    r"""
+    Interface required from an optional affinity-scoring stage.
+    """
 
-    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object: ...
+    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object:
+        r"""
+        Move the affinity model to a device and dtype.
 
-    def score(self, batch: object, *, generator: torch.Generator | None = ...) -> ScoreResult: ...
+        Args:
+            device: Destination device. ``None`` leaves the device unchanged.
+            dtype: Destination floating-point dtype. ``None`` leaves the dtype unchanged.
+
+        Returns:
+            The stage model after conversion.
+        """
+
+        ...
+
+    def score(self, batch: object, *, generator: torch.Generator | None = ...) -> ScoreResult:
+        r"""
+        Score a processed structure batch.
+
+        Args:
+            batch: Input produced by the paired stage processor.
+            generator: Random generator used by model sampling.
+
+        Returns:
+            Scores for the processed structures.
+        """
+
+        ...
 
 
 class BoltzGenStageProcessor(PipelineProcessor, Protocol):
-    r"""Generic OFoldX Processor: a device-placeable callable lowering an input to a batch."""
+    r"""
+    Interface required from an optional stage processor.
+    """
 
-    def __call__(self, input: object, /) -> object: ...
+    def __call__(self, input: object, /) -> object:
+        r"""
+        Prepare one input for a paired pipeline stage.
+
+        Args:
+            input: Stage-specific input object.
+
+        Returns:
+            The batch consumed by the paired stage model.
+        """
+
+        ...
 
 
 class BoltzGenPipeline(CompositePipeline):
-    r"""Bind the BoltzGen design/inverse-fold pairs and optional evaluation stages.
+    r"""
+    Structure and sequence design pipeline for BoltzGen.
 
     Args:
-        design_model: The structure-diffusion designer.
-        design_processor: Its lowering Processor.
-        inverse_folding_model: The inverse-folding designer.
-        inverse_folding_processor: Its lowering Processor.
-        fold: Optional injected fold-capable Model; refold runs iff present.
-        fold_processor: Optional injected fold Processor paired with ``fold``.
-        affinity: Optional injected score-capable Model; affinity runs iff present.
-        affinity_processor: Optional injected affinity Processor paired with ``affinity``.
+        design_model: Structure design model.
+        design_processor: Processor for structure design.
+        inverse_folding_model: Sequence design model.
+        inverse_folding_processor: Processor for sequence design.
+        fold: Optional structure prediction stage.
+        fold_processor: Processor paired with ``fold``.
+        affinity: Optional affinity scoring stage.
+        affinity_processor: Processor paired with ``affinity``.
     """
 
-    # The structure-design pair owns the repository root, the
-    # inverse-fold pair lives at ``ifold/``, and the composed fold/affinity stages are optional
-    # sub-pairs (``required=False``) — written and reloaded only when they were injected.
     pair_layout = (
         CompositePair("", "design_model", "design_processor"),
         CompositePair("ifold", "inverse_folding_model", "inverse_folding_processor"),
@@ -135,27 +186,27 @@ class BoltzGenPipeline(CompositePipeline):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> BoltzGenDesignResult:
-        r"""Run the multi-stage design flow and return a ``BoltzGenDesignResult``.
+        r"""
+        Generate structures, assign sequences, and evaluate optional stages.
 
         Args:
-            input: Optional target/context system, structure, or path.
-            placement: Optional whole-assembly generation topology.
-            total_len: Whole-assembly token budget used when generated rows are materialized.
+            input: Optional target or context system, structure, or local structure path.
+                ``None`` requests a fully generated assembly.
+            placement: Optional topology of existing and generated molecular segments.
+            total_len: Total token budget used to realize generated segments.
             conditions: BoltzGen conditioning records.
-            num_candidates: Number of designs (structure samples) to draw — the standard
-                OFoldX design-count axis, forwarded to the design model as ``num_samples``.
-            num_sampling_steps: Optional EDM sampling steps.
-            temperature: Optional inverse-fold sampling temperature.
-            seed: Optional integer seed (mutually exclusive with ``generator``).
-            generator: Optional RNG for reproducible sampling.
+            num_candidates: Number of structure and sequence candidates.
+            num_sampling_steps: Number of coordinate-diffusion steps. ``None`` uses
+                the model configuration.
+            temperature: Inverse-folding sampling temperature. ``None`` selects the
+                highest-logit residue at each decoded position.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
 
         Returns:
-            One ``BoltzGenDesignResult`` with one candidate per drawn design.
-
-        Notes:
-            Stage order is structure design, inverse folding, optional refolding, optional
-            affinity scoring, then analysis into ``BoltzGenDesignCandidate`` values. Optional
-            stages run only when their corresponding Model-Processor pairs are present.
+            A [`BoltzGenDesignResult`][] containing candidates in generation order.
+            Each candidate contains the sequence-assigned structure and any scores or
+            metrics produced by configured fold and affinity stages.
         """
 
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
@@ -205,19 +256,22 @@ class BoltzGenPipeline(CompositePipeline):
         num_sequences: int = 1,
         generator: torch.Generator | None = None,
     ) -> BoltzGenDesignResult:
-        r"""Run inverse folding as a standalone fixed-backbone operation.
+        r"""
+        Design sequences for a fixed structure.
 
         Args:
-            input: Canonical fixed-backbone structure or local structure path.
+            input: Fixed structure or local structure path.
             design: Residue occurrences whose identities may change.
             aa_constraints: Per-residue amino-acid constraints.
             symmetry: Residue groups sharing one sequence identity.
-            temperature: Optional inverse-fold sampling temperature.
+            temperature: Categorical sampling temperature. ``None`` selects the
+                highest-logit residue at each decoded position.
             num_sequences: Number of sequences to sample.
-            generator: Optional PyTorch random generator.
+            generator: Random generator used for decode order and residue sampling.
 
         Returns:
-            A ``BoltzGenDesignResult`` containing candidates in sampling order.
+            A [`BoltzGenDesignResult`][] containing sequence-assigned structures in
+            sampling order.
         """
 
         inverse_folding_input = self.inverse_folding_processor(
@@ -247,7 +301,9 @@ class BoltzGenPipeline(CompositePipeline):
         inverse_folding_output: BoltzGenInverseFoldingOutput,
         generator: torch.Generator | None,
     ) -> BoltzGenDesignCandidate:
-        r"""Remap the designed sequence and attach per-residue NLL and optional stage scores."""
+        r"""
+        Remap the designed sequence and attach per-residue NLL and optional stage scores.
+        """
 
         layout = inverse_folding_input.layout
         assert layout is not None
@@ -291,7 +347,8 @@ class BoltzGenPipeline(CompositePipeline):
 
 
 def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
-    r"""Map one sample's model atom coords back onto canonical sites → ``Structure``.
+    r"""
+    Map one sample's model atom coords back onto canonical sites → ``Structure``.
 
     Model atom order is placed onto the system's complete heavy-atom sites while preserving
     residue identity.
@@ -323,7 +380,9 @@ def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
 
 
 def _fixed_backbone_structure(input: object) -> Structure:
-    r"""Return the input as a ``Structure`` for candidate carrying (standalone inverse fold)."""
+    r"""
+    Return the input as a ``Structure`` for candidate carrying (standalone inverse fold).
+    """
 
     from pathlib import Path
 
@@ -352,7 +411,8 @@ _DESIGN_TOKEN_TO_COMPONENT: dict[int, str] = dict(
 
 
 def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference, ...]:
-    r"""The concrete design (generated) residue references the design step marked.
+    r"""
+    The concrete design (generated) residue references the design step marked.
 
     Read off ``design_batch.design_mask`` over ``layout.output_residues``; only concrete
     [`ComponentReference`][ofoldx.data.molecular.ComponentReference] rows are returned (a symbolic generated row
@@ -372,7 +432,8 @@ def _remap_designed_sequence(
     inverse_folding_input: BoltzGenInverseFoldingInput,
     inverse_folding_output: BoltzGenInverseFoldingOutput,
 ) -> Structure:
-    r"""Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
+    r"""
+    Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
 
     At every design token, the argmax token id is mapped to its canonical component and written
     into the output system. Backbone ``{N, CA, C, O}`` coordinates are retained; remaining heavy
@@ -397,7 +458,9 @@ def _remap_designed_sequence(
 
 
 def _write_designed_structure(backbone: Structure, designed: dict[ComponentReference, str]) -> Structure:
-    r"""Rebuild ``backbone`` with the designed component identities and dummy designed side chains."""
+    r"""
+    Rebuild ``backbone`` with the designed component identities and dummy designed side chains.
+    """
 
     system = backbone.system
     design_positions = set(designed)

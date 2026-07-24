@@ -1,4 +1,6 @@
-r"""Canonical molecular lowering for ODesign."""
+r"""
+Input processing for ODesign structure generation.
+"""
 
 from __future__ import annotations
 
@@ -152,10 +154,12 @@ _MSA_SYMBOL_TOKENS = {
 
 
 class ODesignProcessor(Processor):
-    r"""Lower canonical systems, evidence, and supported conditions to ``ODesignInput``.
+    r"""
+    Convert supported structure-design inputs into `ODesignInput`.
 
     Args:
-        config: ODesign preprocessing options. Defaults to ``ODesignProcessorConfig()``.
+        config: ODesign input-processing options. Defaults to
+            ``ODesignProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -177,14 +181,16 @@ class ODesignProcessor(Processor):
         *,
         generator: torch.Generator | None = None,
     ) -> ODesignInput:
-        r"""Resolve variable placement lengths into one fixed tensor layout.
+        r"""
+        Sample variable placement lengths and rebuild a fixed tensor layout.
 
         Args:
-            input: Lowered design input with unresolved placement ranges.
-            generator: Optional RNG used to sample variable lengths.
+            input: Design input whose placement contains variable-length generated
+                segments.
+            generator: Random generator used to sample segment lengths.
 
         Returns:
-            An ``ODesignInput`` with one realized fixed-length layout.
+            An [`ODesignInput`][] with a fixed-length molecular layout and tensor axes.
         """
 
         return _realize_ranges(input, generator)
@@ -198,17 +204,21 @@ class ODesignProcessor(Processor):
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
         receptor_mode: str | None = None,
     ) -> ODesignInput:
-        r"""Validate and lower one unbatched canonical ODesign example.
+        r"""
+        Build model inputs for one structure-design problem.
 
         Args:
             input: Optional context system, structure, or local structure path.
-            placement: Optional output topology containing existing spans and generated segments.
-            msa: Optional MSA value, collection, or alignment path.
+            placement: Optional topology of existing and generated molecular segments.
+            msa: Optional MSA evidence or alignment path.
             conditions: Hotspot, symbolic-bond, and reference-coordinate conditions.
-            receptor_mode: Optional receptor annotation carried by the model layout.
+            receptor_mode: Receptor treatment for this call. ``"rigid"`` fixes existing
+                receptor heavy atoms; ``"flex"`` regenerates them except where reference
+                coordinates explicitly fix atoms. ``None`` uses the processor configuration.
 
         Returns:
-            An ``ODesignInput`` with aligned token, atom, condition, and placement values.
+            An [`ODesignInput`][] with batch size one and aligned token, atom, MSA,
+            condition, placement, and molecular-layout axes.
         """
 
         condition_values = tuple(conditions)
@@ -495,24 +505,22 @@ def from_design_mask(
     group_of: Callable[[int], str],
     placement_id_of: Callable[[int], str],
 ) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a run-length [`PlacementSpec`][].
+    r"""
+    Convert ODesign residue specifications to placements.
 
-    ``residues`` is the realized output layout in order; ``group_of(i)`` labels residue ``i``'s
-    declaration group (its ODesign output chain) and ``placement_id_of(i)`` its placement.
-    Maximal consecutive runs that share one ``(group, placement_id)`` collapse into one
-    placement: a run of [`ODesignDesignedResidue`][] of one ``polymer_type`` becomes
-    ``GeneratedSegment(polymer_type, n, n)`` (exact realized length), and a run of
-    [`ODesignFixedResidue`][] drawn contiguously from one source instance becomes the half-open
-    ``ExistingSpan(instance_id, start, stop)``. A run also breaks when ``polymer_type`` changes,
-    when the source instance changes, or when ``source_index`` is not the previous ``+ 1`` — so
-    interleaving and discontiguous crops are preserved as ordered placements within the group.
+    Args:
+        residues: Designed or fixed residue specifications in output order.
+        group_of: Function returning the placement group for each residue index.
+        placement_id_of: Function returning the placement identifier for each residue
+            index. Each identifier must occupy one contiguous run.
 
-    Losslessness: lossless over ODesign's polymer surface — the per-residue designed flag,
-    each designed residue's ``polymer_type``, and each fixed residue's exact source residue are
-    all recoverable (see [`to_design_mask`][] for the inverse). A designed non-polymer
-    (ligand ``num_atoms``) residue has no ``PlacementValue`` and is
-    rejected here rather than silently dropped. The partition is exhaustive — every input
-    residue belongs to exactly one placement, so no realized row is unaddressable.
+    Returns:
+        Placements containing exact-length generated polymer segments for designed
+        runs and existing spans for fixed runs.
+
+    Raises:
+        ValueError: If a designed residue is not a supported polymer residue, a
+            placement identifier is reused, or the resulting placements are invalid.
     """
 
     placement: PlacementSpec = {}
@@ -603,16 +611,16 @@ def to_design_mask(
     placement: PlacementSpec,
     placement_map: PlacementMap,
 ) -> tuple[list[bool], list[str]]:
-    r"""Project a realized [`PlacementSpec`][] back onto a per-output-residue design mask.
+    r"""
+    Convert realized ODesign placements to a residue design mask.
 
-    Returns ``(design_mask, groups)`` over the realized output rows in declared order: a
-    [`GeneratedSegment`][] occurrence (its realized length read from ``placement_map``, so
-    ranged ``min != max`` segments resolve to their sampled length) contributes ``True`` rows,
-    an [`ExistingSpan`][] contributes ``stop - start`` ``False`` rows, and each row carries
-    its declaration group (the outer key). This is the exact inverse of [`from_design_mask`][]
-    over the polymer surface. Coverage is exhaustive: exactly one mask row is emitted per
-    realized residue with no gap or overlap; zero-length placements contribute no rows. Thus
-    ``design_mask`` and ``groups`` partition the whole realized layout.
+    Args:
+        placement: Declared generated segments and existing spans.
+        placement_map: Realized residue references for each placement.
+
+    Returns:
+        A pair containing the designed-status flag and declaration-group label for
+        each realized residue, in placement declaration order.
     """
 
     design_mask: list[bool] = []
@@ -631,7 +639,9 @@ def to_design_mask(
 
 
 def _msa_symbol_token(symbol: str, polymer_type: str) -> int:
-    r"""Lower one uppercase MSA symbol (or ``-`` gap) to an ODesign residue token."""
+    r"""
+    Lower one uppercase MSA symbol (or ``-`` gap) to an ODesign residue token.
+    """
 
     if symbol == "-":
         return _MSA_GAP
@@ -647,7 +657,9 @@ def _normalize_input(input):
 
 
 def _sites_with_reference_coordinates(system: MolecularSystem) -> tuple[AtomSite, ...]:
-    r"""Select model atoms while leaving canonical-only terminal atoms unresolved."""
+    r"""
+    Select model atoms while leaving canonical-only terminal atoms unresolved.
+    """
 
     sites = []
     for site, atom in system.iter_atoms():
@@ -674,7 +686,8 @@ def _materialize_placement(
     dict[tuple[str, int], tuple[str, int]],
     dict[AtomSite, AtomSite],
 ]:
-    r"""Materialize one exact mixed PlacementSpec and its source-to-output identity maps.
+    r"""
+    Materialize one exact mixed PlacementSpec and its source-to-output identity maps.
 
     Returns the realized ``placement_map`` (the output surface for generated
     placements: ``declaration_group -> placement_id -> ordered ComponentReference tuple``)
@@ -892,7 +905,9 @@ def _materialize_cyclic_links(
     instance_of: dict[str, str],
     source_atom_map: dict[AtomSite, AtomSite],
 ) -> tuple[MolecularSystem, frozenset[str], frozenset[frozenset[AtomSite]]]:
-    r"""Materialize requested head-to-tail polymer closures."""
+    r"""
+    Materialize requested head-to-tail polymer closures.
+    """
 
     source_atoms = source_atom_map
     bonds = set(system.bonds)
@@ -1274,7 +1289,9 @@ def _build_tokens(
     tuple[tuple[str, int] | None, ...],
     tuple[PolymerSequence | Molecule, ...],
 ]:
-    r"""Build the ODesign token groups and their molecular identities."""
+    r"""
+    Build the ODesign token groups and their molecular identities.
+    """
 
     sites_by_residue: dict[tuple[str, int], list[AtomSite]] = {}
     for site in sites:
@@ -1313,7 +1330,9 @@ def _build_token_indices(
     token_residues: Sequence[tuple[str, int] | None],
     token_entities: Sequence[PolymerSequence | Molecule],
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Build ODesign chain, entity, symmetry, and residue index tensors."""
+    r"""
+    Build ODesign chain, entity, symmetry, and residue index tensors.
+    """
 
     chain_by_instance = {instance_id: index for index, instance_id in enumerate(system.instances)}
     entity_ids = []
@@ -1349,7 +1368,9 @@ def _build_token_bonds(
     *,
     excluded: frozenset[frozenset[AtomSite]],
 ) -> Tensor:
-    r"""Build the symmetric ODesign token-bond adjacency tensor."""
+    r"""
+    Build the symmetric ODesign token-bond adjacency tensor.
+    """
 
     bonds = torch.zeros(len(token_sites), len(token_sites), dtype=torch.float32)
     for bond in system.iter_bonds():
@@ -1367,7 +1388,9 @@ def _build_cyclic_period(
     token_sites: Sequence[Sequence[AtomSite]],
     cyclic_instances: frozenset[str],
 ) -> Tensor:
-    r"""Build the cyclic-polymer period associated with each ODesign token."""
+    r"""
+    Build the cyclic-polymer period associated with each ODesign token.
+    """
 
     counts = {
         instance_id: sum(group[0].instance_id == instance_id for group in token_sites)
@@ -1426,7 +1449,9 @@ def _normalize_msa(
 
 
 def _aligned_symbols(sequence: str) -> str:
-    r"""Project one aligned FASTA row to an uppercase one-letter symbol string (``.`` folds to ``-``)."""
+    r"""
+    Project one aligned FASTA row to an uppercase one-letter symbol string (``.`` folds to ``-``).
+    """
 
     return "".join("-" if symbol in "-." else symbol for symbol in sequence.upper())
 

@@ -1,8 +1,5 @@
-r"""Coordinate-producing binder-design Pipeline for PXDesign.
-
-[`PxDesignPipeline`][] binds the native PXDesign-d generator Model+Processor and owns
-the ``design`` verb over the PXDesign topology argument (``PlacementSpec``) and
-per-residue target label (``Hotspot``), returning [`PxDesignDesignResult`][].
+r"""
+Protein backbone design operations for PXDesign.
 """
 
 from __future__ import annotations
@@ -13,15 +10,18 @@ from os import PathLike
 import torch
 
 from ...data import PlacementSpec
+from ...data.conditions import Hotspot
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline, resolve_generator
-from .model import Hotspot, PxDesignDesignResult, PxDesignModel
+from .model import PxDesignDesignResult, PxDesignModel
 from .processor import PxDesignProcessor
 
 
 class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
-    r"""Bind one PXDesign-d Model--Processor pair and own the ``design`` verb."""
+    r"""
+    Protein backbone design pipeline for PXDesign.
+    """
 
     def design(
         self,
@@ -35,22 +35,24 @@ class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PxDesignDesignResult:
-        r"""Generate target-binder backbone candidates.
+        r"""
+        Generate target-binder backbone candidates.
 
         Args:
             input: Optional target system, observed structure, or local structure path.
-            placement: Topology containing target spans and one generated binder chain.
+            placement: Topology containing complete target spans and one fixed-length
+                generated protein chain.
             conditions: Target hotspot labels.
-            num_candidates: Number of backbone candidates to generate.
-            num_sampling_steps: Number of diffusion steps.
-            sample_chunk_size: Maximum candidates generated per model call. ``None`` generates
-                all candidates together.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            num_candidates: Number of backbone candidates.
+            num_sampling_steps: Number of EDM sampling steps.
+            sample_chunk_size: Maximum number of candidates denoised together. ``None``
+                processes all candidates together.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
 
         Returns:
-            A ``PxDesignDesignResult`` containing coordinate-bearing candidates in generation
-            order.
+            A [`PxDesignDesignResult`][] containing coordinate-bearing structures in
+            sampling order. Coordinates are in angstroms.
         """
 
         model_input = self.processor(input, placement=placement, conditions=conditions)

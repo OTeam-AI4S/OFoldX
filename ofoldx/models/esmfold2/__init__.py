@@ -1,9 +1,12 @@
-r"""ESMFold2 folding and experimental design implementations."""
+r"""
+ESMFold2 folding and experimental design implementations.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS, Task
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
+from ..registry import Task as _Task
 from .config import (
     EsmFold2AtomEncoderConfig,
     EsmFold2ConfidenceHeadConfig,
@@ -22,7 +25,6 @@ from .config import (
     EsmFold2ProcessorConfig,
 )
 from .model import (
-    EsmFold2BackendSettings,
     EsmFold2DesignCandidate,
     EsmFold2DesignResult,
     EsmFold2ExperimentalModel,
@@ -39,10 +41,10 @@ from .processor import (
     is_antibody_sequence,
 )
 
-_FOLD_TASKS: tuple[Task, ...] = ("fold",)
-_DESIGN_TASKS: tuple[Task, ...] = ("design",)
+_FOLD_TASKS: tuple[_Task, ...] = ("fold",)
+_DESIGN_TASKS: tuple[_Task, ...] = ("design",)
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.esmfold2",
     model=EsmFold2Model,
     processor=EsmFold2Processor,
@@ -50,8 +52,7 @@ MODELS.register_model(
     standard_tasks=_FOLD_TASKS,
 )
 
-# The experimental graph uses a distinct processor and the concrete design pipeline.
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.esmfold2_experimental",
     model=EsmFold2ExperimentalModel,
     processor=EsmFold2ExperimentalProcessor,
@@ -59,13 +60,13 @@ MODELS.register_model(
     standard_tasks=(),
 )
 
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.esmfold2",
     pipeline=EsmFold2Pipeline,
     tasks=_FOLD_TASKS,
     architectures=("ofoldx.esmfold2",),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.esmfold2_design",
     pipeline=EsmFold2DesignPipeline,
     tasks=_DESIGN_TASKS,

@@ -1,9 +1,5 @@
 r"""
-Shared diffusion conditioning components.
-
-Provides the reusable [`PairwiseConditioning`][ofoldx.modules.diffusion.conditioning.PairwiseConditioning] module
-and lower-level functional helpers for combining trunk representations with noise-level and relative-position
-features.
+Diffusion-conditioning components.
 """
 
 from __future__ import annotations
@@ -49,7 +45,7 @@ class PairwiseConditioning(nn.Module):
 
     def forward(self, pair_trunk: Tensor, relative_position_encoding: Tensor) -> Tensor:
         r"""
-        Project concatenated pair features and refine them with residual transitions.
+        Apply relative-position conditioning to a pair representation.
 
         Args:
             pair_trunk: Trunk pair representation ``[..., N_token, N_token, pair_size]``.
@@ -59,6 +55,7 @@ class PairwiseConditioning(nn.Module):
         Returns:
             Conditioned pair representation ``[..., N_token, N_token, pair_size]``.
         """
+
         return condition_pair(
             pair_trunk,
             relative_position_encoding,
@@ -82,11 +79,7 @@ def condition_single(
     sample_axis: bool = False,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Noise-condition a single representation.
-
-    Concatenate the two single inputs, norm + project, add projected-normalized Fourier noise features, then apply
-    ``transitions``. ``scaled_noise`` is already caller-scaled. ``sample_axis`` inserts an explicit diffusion-sample
-    axis for callers that keep samples separate from the batch axis. Returns ``(single, normed_noise_features)``.
+    Condition two single representations on a scaled noise level.
 
     Args:
         single_a: First ``[..., N_token, C]`` single representation.
@@ -101,30 +94,11 @@ def condition_single(
         sample_axis: If ``True``, insert a diffusion-sample axis before the token axis.
 
     Returns:
-        A ``(single, normed_noise)`` tuple: the conditioned single representation of shape `[..., N_token, C]` (or
-        `[..., N_sample, N_token, C]` when ``sample_axis`` is set) and the normalized noise features of shape
-        `[..., C]`.
-
-    Examples:
-        >>> import torch
-        >>> from torch import nn
-        >>> _ = torch.manual_seed(0)
-        >>> single_a = torch.zeros(1, 2, 4)
-        >>> single_b = torch.zeros(1, 2, 4)
-        >>> single, noise = condition_single(
-        ...     single_a,
-        ...     single_b,
-        ...     torch.zeros(1, 1),
-        ...     norm=nn.LayerNorm(8),
-        ...     projection=nn.Linear(8, 4),
-        ...     noise_fourier=nn.Linear(1, 4),
-        ...     noise_norm=nn.LayerNorm(4),
-        ...     noise_projection=nn.Linear(4, 4),
-        ...     transitions=[],
-        ... )
-        >>> single.shape, noise.shape
-        (torch.Size([1, 2, 4]), torch.Size([1, 4]))
+        The conditioned single representation with shape ``[..., N_token, C]``,
+        or ``[..., N_sample, N_token, C]`` when ``sample_axis`` is true, and
+        normalized noise features with shape ``[..., C]``.
     """
+
     single = projection(norm(torch.cat([single_a, single_b], dim=-1)))
     normed_noise = noise_norm(noise_fourier(scaled_noise).to(single.dtype))
     base = single.unsqueeze(-3) if sample_axis else single
@@ -143,10 +117,7 @@ def condition_pair(
     transitions: Iterable[nn.Module],
 ) -> Tensor:
     r"""
-    Relative-position-condition a pair representation.
-
-    Concatenate the trunk pair with the (already embedded) relative-position encoding, norm + project, then apply
-    the ``transitions``.
+    Condition a pair representation on relative-position features.
 
     Args:
         pair_trunk: ``[..., N_token, N_token, C_pair]`` trunk pair representation.
@@ -156,24 +127,10 @@ def condition_pair(
         transitions: Transition modules applied residually.
 
     Returns:
-        Conditioned pair representation of shape `[..., N_token, N_token, C_pair]`.
-
-    Examples:
-        >>> import torch
-        >>> from torch import nn
-        >>> _ = torch.manual_seed(0)
-        >>> pair_trunk = torch.zeros(1, 2, 2, 4)
-        >>> relative_position_encoding = torch.zeros(1, 2, 2, 4)
-        >>> pair = condition_pair(
-        ...     pair_trunk,
-        ...     relative_position_encoding,
-        ...     norm=nn.LayerNorm(8),
-        ...     projection=nn.Linear(8, 4),
-        ...     transitions=[],
-        ... )
-        >>> pair.shape
-        torch.Size([1, 2, 2, 4])
+        Conditioned pair representation with shape
+        ``[..., N_token, N_token, C_pair]``.
     """
+
     pair = projection(norm(torch.cat([pair_trunk, relative_position_encoding], dim=-1)))
     for transition in transitions:
         pair = pair + transition(pair)

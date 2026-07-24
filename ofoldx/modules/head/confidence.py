@@ -1,10 +1,5 @@
 r"""
 Confidence prediction from trunk representations and sampled coordinates.
-
-The shared head predicts pLDDT, PAE, PDE, and resolved logits. Constructor flags
-select optional single-state clipping and normalization, raw-distance projection,
-PDE symmetrization order, and persistent distance bins without changing the public
-tensor contract.
 """
 
 from __future__ import annotations
@@ -20,7 +15,15 @@ from .frames import gather_atoms_by_index, insert_sample_axis
 
 
 def expected_plddt(logits: Tensor) -> Tensor:
-    r"""Expected pLDDT on the conventional 0--100 scale from per-bin logits."""
+    r"""
+    Compute expected pLDDT from categorical logits.
+
+    Args:
+        logits: Confidence-bin logits with shape ``(..., num_bins)``.
+
+    Returns:
+        Expected pLDDT with shape ``(...)`` on the 0--100 scale.
+    """
 
     centers = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype) + 0.5
     return (logits.softmax(dim=-1) * centers * (100.0 / logits.shape[-1])).sum(dim=-1)
@@ -28,11 +31,7 @@ def expected_plddt(logits: Tensor) -> Tensor:
 
 class ConfidenceHead(nn.Module):
     r"""
-    Predict pLDDT, PAE, PDE, and resolved logits from the trunk single/pair states and predicted coords.
-
-    Embeds representative-atom distances into the pair state, runs a small Pairformer stack, and projects to
-    the atom-level (pLDDT / resolved) and pair-level (PAE / PDE) confidence logits. Each diffusion sample is
-    scored independently and the per-sample logits are stacked on a leading sample axis.
+    Predict pLDDT, PAE, PDE, and resolved logits.
 
     Args:
         single_size: Width of the single (token) representation.
@@ -195,11 +194,7 @@ class ConfidenceHead(nn.Module):
 
 class ConfidencePairEmbedder(nn.Module):
     r"""
-    Augment the pair state with token-embedding projections and representative-atom distance features.
-
-    Adds left/right token-embedding projections plus a binned one-hot projection of the representative-atom
-    pairwise distances, so the confidence Pairformer sees the predicted geometry. When
-    ``use_distance_projection`` is set (Protenix), an additional raw-distance projection channel is added.
+    Add token and representative-atom distance features to a pair state.
 
     Args:
         pair_size: Width of the pair representation.
@@ -207,8 +202,8 @@ class ConfidencePairEmbedder(nn.Module):
         distance_bin_start: Lower edge of the distance one-hot bins in Angstrom.
         distance_bin_end: Upper edge of the distance one-hot bins in Angstrom.
         distance_bin_step: Width of each distance bin in Angstrom.
-        use_distance_projection: Whether to add a raw-distance projection channel (Protenix).
-        persistent_distance_bins: Whether the distance-bin buffers appear in ``state_dict`` (Protenix).
+        use_distance_projection: Whether to add a raw-distance projection channel.
+        persistent_distance_bins: Whether distance-bin buffers appear in ``state_dict``.
     """
 
     def __init__(
@@ -270,11 +265,7 @@ class ConfidencePairEmbedder(nn.Module):
 
 class AtomConfidenceProjector(nn.Module):
     r"""
-    Project token single representations to per-atom pLDDT and resolved logits.
-
-    Broadcasts each token's single representation to its atoms, then contracts each atom's normalized
-    features against the weight matrix selected by its within-token offset, giving a distinct projection
-    per atom position.
+    Project token representations to per-atom pLDDT and resolved logits.
 
     Args:
         single_size: Width of the single (token) representation.
@@ -333,15 +324,6 @@ class AtomConfidenceProjector(nn.Module):
         return plddt_logits, resolved_logits
 
     def _gather_atom_weight(self, weight: Tensor, atom_token_index: Tensor) -> Tensor:
-        r"""
-        Select each atom's per-within-token-offset weight matrix ``[..., N_atom, C, B]`` per element.
-
-        ``F.embedding`` on the flattened ``[max_atoms_per_token, C*B]`` table gathers a per-element (batched)
-        ``atom_token_index`` correctly — unlike dense-parameter advanced indexing ``weight[atom_token_index]``
-        with the ``ncb`` einsum, which assumes one shared 1-D index (bsz=1). The trailing ``C*B -> (C, B)`` split
-        is over static dims. (Out-of-range offsets raise in ``F.embedding``; no ``.max()`` sync needed.)
-        """
-
         num_offsets, channels, bins = weight.shape
         gathered = F.embedding(atom_token_index, weight.reshape(num_offsets, channels * bins))
         return gathered.reshape(*gathered.shape[:-1], channels, bins)
@@ -349,17 +331,7 @@ class AtomConfidenceProjector(nn.Module):
 
 class PairConfidenceProjector(nn.Module):
     r"""
-    Project the pair representation to PAE and (symmetrized) PDE logits.
-
-    PAE is projected from the normalized pair state. ``symmetrize_before_projection`` selects between
-    two PDE symmetrization orders:
-
-    - ``False``: symmetrize the projected distance-error *logits*:
-      ``left = pde_projection(pde_norm(pair)); pde = left + left.transpose(-2, -3)``.
-    - ``True``: symmetrize the pair *state* before normalization and projection:
-      ``pde = pde_projection(pde_norm(pair + pair.transpose(-2, -3)))``.
-
-    Because ``LayerNorm`` is non-linear, the two conventions are distinct functions.
+    Project pair representations to PAE and symmetric PDE logits.
 
     Args:
         pair_size: Width of the pair representation.
@@ -385,7 +357,7 @@ class PairConfidenceProjector(nn.Module):
 
     def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:
         r"""
-        Project the pair state to PAE and (symmetrized) PDE logits.
+        Project the pair state to PAE and symmetric PDE logits.
 
         Args:
             pair: Token pair state ``(..., N_token, N_token, pair_size)``.

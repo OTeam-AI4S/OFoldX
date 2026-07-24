@@ -1,11 +1,5 @@
 r"""
-Backend dispatch for the adaptive (conditioned) layer-norm operator.
-
-The dispatcher owns backend selection and calling-convention adaptation. Modules pass the ordinary
-tensor arguments -- the fused ``conditioning_projection`` weight ``[2 * hidden_size, conditioning_size]``
-and the ``[hidden_size]`` ``conditioning_scale_bias`` -- without a second validation layer. The
-``"oops"`` backend delegates to the OOps-owned implementation; ``"eager"`` runs the
-equivalent pure-PyTorch composition.
+Backend-dispatched adaptive layer normalization.
 """
 
 from __future__ import annotations
@@ -54,24 +48,6 @@ def adaptive_layer_norm(
 
     Returns:
         ``[..., hidden_size]`` conditioned activations.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.adaptive_norm import adaptive_layer_norm
-        >>> _ = torch.manual_seed(0)
-        >>> hidden = torch.randn(2, 8)
-        >>> conditioning = torch.randn(2, 4)
-        >>> out = adaptive_layer_norm(
-        ...     hidden,
-        ...     conditioning,
-        ...     conditioning_norm_weight=torch.ones(4),
-        ...     projection_weight=torch.randn(16, 4),
-        ...     scale_bias=torch.zeros(8),
-        ...     eps=1e-5,
-        ...     operator_backend="torch",
-        ... )
-        >>> out.shape
-        torch.Size([2, 8])
     """
 
     backend = resolve_tensor_operator_backend(

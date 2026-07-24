@@ -10,7 +10,9 @@ from ofoldx.modules.trunk import PairformerBlock, PairformerStack
 
 @pytest.fixture
 def kwargs() -> dict[str, Any]:
-    r"""Shared small Pairformer config using the family-wide PyTorch reference."""
+    r"""
+    Shared small Pairformer config using the family-wide PyTorch reference.
+    """
     return {
         "single_size": 8,
         "pair_size": 4,

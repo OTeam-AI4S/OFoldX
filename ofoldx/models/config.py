@@ -1,4 +1,6 @@
-r"""Shared configuration blocks for diffusion structure models."""
+r"""
+Shared configuration blocks for diffusion structure models.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +8,10 @@ from chanfig import Config
 
 
 class DistogramConfig(Config):
-    r"""Configure a head that predicts binned inter-residue distances from pair representations.
+    r"""
+    Configure a head that predicts binned inter-residue distances from pair representations.
 
-    Attributes:
+    Args:
         num_bins: Number of distance bins the head predicts over.
     """
 
@@ -16,9 +19,10 @@ class DistogramConfig(Config):
 
 
 class ConfidenceConfig(Config):
-    r"""Configure confidence metrics and the Pairformer trunk that predicts them.
+    r"""
+    Configure confidence metrics and the Pairformer trunk that predicts them.
 
-    Attributes:
+    Args:
         num_plddt_bins: Number of pLDDT confidence bins.
         num_resolved_bins: Number of resolved-atom bins.
         num_pae_bins: Number of predicted-aligned-error bins.
@@ -56,9 +60,10 @@ class ConfidenceConfig(Config):
 
 
 class TrunkConfig(Config):
-    r"""Configure the Pairformer trunk that refines single, pair, and MSA representations.
+    r"""
+    Configure the Pairformer trunk that refines single, pair, and MSA representations.
 
-    Attributes:
+    Args:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
         pairformer_dropout: Dropout probability applied inside each Pairformer block.
         msa_dropout: Dropout probability applied along the MSA path.
@@ -72,9 +77,10 @@ class TrunkConfig(Config):
 
 
 class TemplateConfig(Config):
-    r"""Configure the optional stack that embeds structural templates into pair representations.
+    r"""
+    Configure the optional stack that embeds structural templates into pair representations.
 
-    Attributes:
+    Args:
         hidden_size: Width of the template pair embedding.
         num_blocks: Number of template Pairformer blocks; ``0`` disables the template path.
         vocab_size: Number of template token types.
@@ -96,9 +102,10 @@ class TemplateConfig(Config):
 
 
 class DenoiserConfig(Config):
-    r"""Configure the atom and token stacks of the diffusion coordinate denoiser.
+    r"""
+    Configure the atom and token stacks of the diffusion coordinate denoiser.
 
-    Attributes:
+    Args:
         num_token_encoder_blocks: Number of token-level transformer blocks in the denoiser trunk.
         num_token_encoder_attention_heads: Number of attention heads in the token-level trunk.
         sigma_data: Data noise scale used by the EDM preconditioning.
@@ -128,9 +135,10 @@ class DenoiserConfig(Config):
 
 
 class SamplerConfig(Config):
-    r"""Configure the solver and noise schedule for EDM reverse diffusion.
+    r"""
+    Configure the solver and noise schedule for EDM reverse diffusion.
 
-    Attributes:
+    Args:
         solver: Name of the ODE/SDE solver driving the reverse diffusion (e.g. ``"euler"``).
         num_sampling_steps: Number of reverse-diffusion steps.
         churn_rate: Fraction of steps that re-inject noise (stochastic churn).

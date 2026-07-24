@@ -1,4 +1,6 @@
-r"""RFdiffusion denoiser, sampler, and public scientific modules."""
+r"""
+RFdiffusion denoiser, sampler, and public scientific modules.
+"""
 
 from __future__ import annotations
 
@@ -74,10 +76,14 @@ _IGSO3_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
 
 
 class RfDiffusionModel(Model):
-    r"""The RFdiffusion RoseTTAFold denoiser and design sampler.
+    r"""
+    Generate protein backbones with RFdiffusion.
 
-    ``forward`` always means one differentiable denoising pass.  ``design`` is the
-    explicit reverse-diffusion task method and returns canonical Structures.
+    Accepts [`RfDiffusionInput`][ofoldx.models.rfdiffusion.model.RfDiffusionInput] and returns
+    [`RfDiffusionOutput`][ofoldx.models.rfdiffusion.model.RfDiffusionOutput] from one denoising pass.
+
+    Args:
+        config: Model architecture and inference configuration.
     """
 
     config_class = RfDiffusionConfig
@@ -120,12 +126,28 @@ class RfDiffusionModel(Model):
         self.post_init()
 
     def _igso3_schedule(self) -> dict[str, np.ndarray]:
-        r"""Return the model-baked IGSO(3) lookup table as the sampler's schedule dict."""
+        r"""
+        Return the model-baked IGSO(3) lookup table as the sampler's schedule dict.
+        """
 
         return {name: getattr(self, f"igso3_{name}").detach().cpu().numpy() for name, _ in _IGSO3_FIELDS}
 
     def forward(self, input: RfDiffusionInput) -> RfDiffusionOutput:
-        r"""Run one ordinary differentiable denoising pass."""
+        r"""
+        Run one differentiable RFdiffusion denoising pass.
+
+        ``B`` is batch size, ``N`` is residue count, and ``T`` is the number of
+        structure-update blocks.
+
+        Args:
+            input: Processed input containing noisy atom coordinates with shape
+                ``(B, N, A, 3)`` in angstroms and one diffusion timestep per batch item.
+
+        Returns:
+            An [`RfDiffusionOutput`][] containing final backbone coordinates with shape
+            ``(B, N, 3, 3)``, residue and pair representations, sequence and confidence
+            logits, and structure trajectories with a leading ``T`` axis.
+        """
 
         (
             latent_msa,
@@ -139,7 +161,7 @@ class RfDiffusionModel(Model):
             latent_msa,
             full_msa,
             input.sequence,
-            input.noisy_coords,
+            input.noisy_coordinates,
             input.residue_index,
             template_single_features=template_single_features,
             template_pair_features=template_pair_features,
@@ -157,7 +179,9 @@ class RfDiffusionModel(Model):
         self,
         input: RfDiffusionInput,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""Build the exact MSA/template feature channels."""
+        r"""
+        Build the exact MSA/template feature channels.
+        """
 
         sequence = input.sequence
         batch_size, length = sequence.shape[:2]
@@ -173,7 +197,7 @@ class RfDiffusionModel(Model):
 
         template_single_features = sequence.new_zeros((batch_size, 1, length, 21))
         visible_sequence = sequence[..., :21].clone()
-        masked = sequence[..., MASK_TOKEN] > 0.5
+        masked = sequence[..., RFDIFFUSION_MASK_TOKEN_ID] > 0.5
         visible_sequence[..., 20] = visible_sequence[..., 20].masked_fill(masked, 1)
         template_single_features[..., :21] = visible_sequence[:, None]
         time = 1 - input.timestep.to(sequence.dtype) / float(self.num_timesteps)
@@ -198,7 +222,7 @@ class RfDiffusionModel(Model):
         if self.template_single_feature_size == 28:
             template_single_features = torch.cat((template_single_features, input.secondary_structure[:, None]), dim=-1)
 
-        coords = input.noisy_coords.clone()
+        coords = input.noisy_coordinates.clone()
         if self.sidechain_input:
             coords[:, :, 3:] = coords[:, :, 3:].masked_fill(masked[:, :, None, None], float("nan"))
         else:
@@ -210,8 +234,8 @@ class RfDiffusionModel(Model):
             (coords[:, None], coords.new_full((batch_size, 1, length, 13, 3), float("nan"))),
             dim=3,
         )
-        template_pair_features = template_pair_features_from_coordinates(template_coordinates)
-        template_torsion_features = build_template_torsion_features(
+        template_pair_features = _template_pair_features(template_coordinates)
+        template_torsion_features = _template_torsion_features(
             template_coordinates,
             template_single_features[..., :21].argmax(dim=-1).reshape(batch_size, length),
         )
@@ -252,30 +276,40 @@ class RfDiffusionModel(Model):
         guidance_decay: str = "constant",
         generator: torch.Generator | None = None,
     ) -> RfDiffusionDesignResult:
-        r"""Generate canonical backbone Structures, sampling variable placement lengths per candidate.
+        r"""
+        Generate protein-backbone structures from one processed design request.
 
         Args:
-            input: One processed RFdiffusion design request.
+            input: Processed design input with batch size one. Variable generated-segment
+                lengths are sampled independently for each candidate.
             num_candidates: Number of independently sampled backbone candidates.
-            num_sampling_steps: Number of reverse-diffusion steps, or the configured default.
-            final_step: Last diffusion timestep to execute.
-            partial_steps: Optional partial-diffusion horizon.
-            noise_scale_ca: Initial translation-noise scale.
-            final_noise_scale_ca: Final translation-noise scale for a linear schedule.
-            ca_noise_schedule: Constant or linear translation-noise schedule.
-            noise_scale_frame: Initial frame-noise scale.
-            final_noise_scale_frame: Final frame-noise scale for a linear schedule.
-            frame_noise_schedule: Constant or linear frame-noise schedule.
-            align_motif: Whether to align generated coordinates to fixed motif residues.
-            return_trajectory: Whether to retain reverse-diffusion trajectories on CPU.
-            symmetry_recenter: Whether to recenter symmetric assemblies during sampling.
-            symmetry_radius_angstrom: Radius used to place symmetric subunits.
-            guidance_scale: Strength of geometric potential guidance.
-            guidance_decay: Schedule applied to geometric guidance.
-            generator: Optional PyTorch random generator.
+            num_sampling_steps: Number of active reverse-diffusion timesteps. ``None``
+                uses the configured value.
+            final_step: Last reverse-diffusion timestep to execute, inclusive.
+            partial_steps: Starting timestep for partial diffusion from observed
+                coordinates. ``None`` starts from the active schedule maximum.
+            noise_scale_ca: Initial multiplier for C-alpha translation noise.
+            final_noise_scale_ca: Final translation-noise multiplier for a linear
+                schedule. ``None`` uses ``noise_scale_ca``.
+            ca_noise_schedule: Translation-noise schedule, ``"constant"`` or ``"linear"``.
+            noise_scale_frame: Initial multiplier for backbone-frame rotation noise.
+            final_noise_scale_frame: Final frame-noise multiplier for a linear schedule.
+                ``None`` uses ``noise_scale_frame``.
+            frame_noise_schedule: Frame-noise schedule, ``"constant"`` or ``"linear"``.
+            align_motif: Whether to align each sampled structure to fixed motif residues.
+            return_trajectory: Whether to retain all reverse steps internally during
+                sampling. Trajectories are not included in the returned result.
+            symmetry_recenter: Whether to recenter symmetry units before radial placement.
+            symmetry_radius_angstrom: Radial placement distance in angstroms.
+            guidance_scale: Multiplier for differentiable geometric-condition guidance.
+            guidance_decay: Guidance schedule: ``"constant"``, ``"linear"``,
+                ``"quadratic"``, or ``"cubic"``.
+            generator: Random generator used for length realization and diffusion noise.
 
         Returns:
-            Coordinate-bearing candidates in generation order, with optional trajectories.
+            An [`RfDiffusionDesignResult`][] containing structures in sampling order.
+            Coordinates are in angstroms; each candidate's pLDDT metric uses a 0--100
+            scale.
         """
 
         if num_candidates <= 0:
@@ -320,33 +354,6 @@ class RfDiffusionModel(Model):
 class RfDiffusionDenoiser(nn.Module):
     r"""
     RoseTTAFold trunk driving one RFdiffusion denoising step.
-
-    Ported RoseTTAFold network: embeds the MSA/pair/state representations, injects template and recycling
-    features, runs the [`RfDiffusionTrunk`][ofoldx.models.rfdiffusion.model.RfDiffusionTrunk] track,
-    and reads out amino-acid logits, pLDDT, and the denoised backbone. The
-    [`RfDiffusionSampler`][ofoldx.models.rfdiffusion.model.RfDiffusionSampler] calls this
-    once per diffusion timestep.
-
-    Args:
-        num_extra_blocks: Number of extra-MSA trunk blocks.
-        num_main_blocks: Number of main trunk blocks.
-        num_refinement_blocks: Number of top-k structure-refinement iterations.
-        msa_size: Width of the latent MSA representation.
-        full_msa_size: Width of the extra (full) MSA representation.
-        pair_size: Width of the pair representation.
-        template_size: Width of the template pair representation.
-        num_msa_attention_heads: Number of MSA attention heads.
-        num_pair_attention_heads: Number of pair attention heads.
-        num_template_attention_heads: Number of template attention heads.
-        hidden_size: Per-head hidden width shared across the attention stacks.
-        template_hidden_size: Per-head hidden width used inside the template stack.
-        dropout: Dropout probability applied throughout the trunk.
-        template_single_feature_size: Width of per-token template features.
-        template_pair_feature_size: Width of pairwise template features.
-        freeze_track_motif: Whether to stop structure updates on motif residues in the track.
-        trunk_se3: SE(3) sizing dict for the main-block structure module.
-        refinement_se3: SE(3) sizing dict for the top-k refinement structure module.
-        vocab_size: Number of amino-acid tokens the sequence head predicts over.
     """
 
     def __init__(
@@ -452,36 +459,6 @@ class RfDiffusionDenoiser(nn.Module):
         Tensor,
         Tensor,
     ]:
-        r"""
-        Run one RoseTTAFold denoising pass over the noisy structure.
-
-        Embeds inputs, folds in recycling and template features, runs the iterative track, applies the final
-        predicted frames to the local backbone, and reads out the auxiliary heads.
-
-        Args:
-            latent_msa: Latent MSA features `[B, N, L, msa_size]`.
-            full_msa: Extra (full) MSA features `[B, N_full, L, ...]`.
-            seq: One-hot sequence features `[B, L, 22]`.
-            coords: Noisy backbone coords `[B, L, A, 3]`.
-            residue_index: Residue-index tensor `[B, L]` used for relative-position features.
-            template_single_features: Per-token template features; required for inference.
-            template_pair_features: Pairwise template features; required for inference.
-            template_coordinates: Template backbone coords; required for inference.
-            template_torsion_features: Template torsion features; required for inference.
-            previous_msa: Recycled MSA state, or `None` to start from zeros.
-            previous_pair: Recycled pair state, or `None` to start from zeros.
-            previous_state: Recycled node state, or `None` to start from zeros.
-            fixed_structure_mask: Per-residue motif mask `[L]`; motif residues are frozen when configured.
-            cyclic_mask: Optional cyclic-residue mask for cyclic-peptide relative positions.
-
-        Returns:
-            The final denoising representations and predictions followed by the geometry,
-            pLDDT, resolved-residue, backbone-trajectory, and torsion-trajectory training outputs.
-
-        Raises:
-            ValueError: If any required template feature is `None`.
-        """
-
         batch_size, _, length = latent_msa.shape[:3]
         latent_msa, pair, state = self.msa_embeddings(latent_msa, seq, residue_index, cyclic_mask)
         full_msa = self.extra_msa_embeddings(full_msa, seq)
@@ -558,19 +535,6 @@ class RfDiffusionDenoiser(nn.Module):
 class RfDiffusionMsaEmbeddings(nn.Module):
     r"""
     Embed the latent MSA, pair, and node-state representations from sequence features.
-
-    Projects the raw MSA features and adds a per-residue query embedding, builds the initial pair
-    representation from left/right sequence embeddings plus relative positions, and produces the initial node
-    state. This is the entry embedding of the RoseTTAFold trunk.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation.
-        state_size: Width of the node-state representation.
-        input_feature_size: Width of the raw per-position MSA input features.
-        minpos: Minimum relative-position bin for the 2D positional encoding.
-        maxpos: Maximum relative-position bin for the 2D positional encoding.
-        dropout: Dropout probability applied to the embedded features.
     """
 
     def __init__(
@@ -596,13 +560,11 @@ class RfDiffusionMsaEmbeddings(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the embedding weights to the RoseTTAFold scheme (Lecun-normal, zero bias)."""
-
-        self.input_projection = init_lecun_normal(self.input_projection)
-        self.query_embedding = init_lecun_normal(self.query_embedding)
-        self.left_pair_embedding = init_lecun_normal(self.left_pair_embedding)
-        self.right_pair_embedding = init_lecun_normal(self.right_pair_embedding)
-        self.state_embedding = init_lecun_normal(self.state_embedding)
+        self.input_projection = _initialize_lecun_normal(self.input_projection)
+        self.query_embedding = _initialize_lecun_normal(self.query_embedding)
+        self.left_pair_embedding = _initialize_lecun_normal(self.left_pair_embedding)
+        self.right_pair_embedding = _initialize_lecun_normal(self.right_pair_embedding)
+        self.state_embedding = _initialize_lecun_normal(self.state_embedding)
         _zero_bias(self.input_projection)
 
     def forward(
@@ -612,20 +574,6 @@ class RfDiffusionMsaEmbeddings(nn.Module):
         residue_index: torch.Tensor,
         cyclize: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""
-        Embed the MSA, pair, and node-state tensors.
-
-        Args:
-            msa: Raw MSA features `[B, N, L, input_feature_size]`.
-            seq: One-hot sequence features `[B, L, 22]`.
-            residue_index: Residue-index tensor `[B, L]`.
-            cyclize: Optional cyclic-residue mask forwarded to the positional encoding.
-
-        Returns:
-            A tuple ``(msa, pair, state)`` of the embedded MSA `[B, N, L, msa_size]`, pair
-            `[B, L, L, pair_size]`, and node-state `[B, L, state_size]` representations.
-        """
-
         msa_depth = msa.shape[1]
         msa = self.input_projection(msa)
         query = _one_hot_lookup(seq, self.query_embedding).unsqueeze(1)
@@ -642,15 +590,6 @@ class RfDiffusionMsaEmbeddings(nn.Module):
 class RfDiffusionExtraMsaEmbeddings(nn.Module):
     r"""
     Embed the extra (full) MSA stack from its raw features.
-
-    Projects the wider, shallower extra-MSA input and adds the per-residue query embedding, mirroring
-    [`RfDiffusionMsaEmbeddings`][ofoldx.models.rfdiffusion.model.RfDiffusionMsaEmbeddings] but without
-    the pair/state outputs.
-
-    Args:
-        msa_size: Width of the extra-MSA representation.
-        input_feature_size: Width of the raw per-position extra-MSA input features.
-        dropout: Dropout probability applied to the embedded features.
     """
 
     def __init__(
@@ -666,23 +605,10 @@ class RfDiffusionExtraMsaEmbeddings(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the projection to the RoseTTAFold scheme (Lecun-normal, zero bias)."""
-
-        self.input_projection = init_lecun_normal(self.input_projection)
+        self.input_projection = _initialize_lecun_normal(self.input_projection)
         _zero_bias(self.input_projection)
 
     def forward(self, msa: torch.Tensor, seq: torch.Tensor) -> torch.Tensor:
-        r"""
-        Embed the extra MSA.
-
-        Args:
-            msa: Raw extra-MSA features `[B, N_full, L, input_feature_size]`.
-            seq: One-hot sequence features `[B, L, 22]` used for the query embedding.
-
-        Returns:
-            The embedded extra MSA `[B, N_full, L, msa_size]`.
-        """
-
         msa_depth = msa.shape[1]
         msa = self.input_projection(msa)
         query = _one_hot_lookup(seq, self.query_embedding).unsqueeze(1)
@@ -692,22 +618,6 @@ class RfDiffusionExtraMsaEmbeddings(nn.Module):
 class RfDiffusionTemplateEmbedder(nn.Module):
     r"""
     Fold template features into the pair and node-state representations.
-
-    Embeds per-token and pairwise template features, refines them through a
-    [`RfDiffusionTemplatePairStack`][ofoldx.models.rfdiffusion.model.RfDiffusionTemplatePairStack],
-    then attends over templates to update the pair representation and the per-residue node state.
-
-    Args:
-        template_single_feature_size: Width of per-token template features.
-        template_pair_feature_size: Width of pairwise template features.
-        torsion_size: Width of the template torsion feature appended to the per-token input.
-        pair_size: Width of the pair representation being updated.
-        state_size: Width of the node-state representation being updated.
-        num_blocks: Number of pair-update blocks in the template stack.
-        template_size: Internal width of the template pair representation.
-        num_attention_heads: Number of attention heads.
-        hidden_size: Per-head hidden width.
-        dropout: Dropout probability used inside the template stack.
     """
 
     def __init__(
@@ -743,13 +653,11 @@ class RfDiffusionTemplateEmbedder(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the template projections to the RoseTTAFold scheme."""
-
-        self.pair_projection = init_lecun_normal(self.pair_projection)
+        self.pair_projection = _initialize_lecun_normal(self.pair_projection)
         _zero_bias(self.pair_projection)
         nn.init.kaiming_normal_(self.single_input_projection.weight, nonlinearity="relu")
         _zero_bias(self.single_input_projection)
-        self.single_output_projection = init_lecun_normal(self.single_output_projection)
+        self.single_output_projection = _initialize_lecun_normal(self.single_output_projection)
         _zero_bias(self.single_output_projection)
 
     def forward(
@@ -761,21 +669,6 @@ class RfDiffusionTemplateEmbedder(nn.Module):
         pair: torch.Tensor,
         state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""
-        Update the pair and node-state representations with template features.
-
-        Args:
-            template_single_features: Per-token template features `[B, T, L, template_single_feature_size]`.
-            template_pair_features: Pairwise template features `[B, T, L, L, template_pair_feature_size]`.
-            template_torsion_features: Template torsion features `[B, T, L, torsion_size]`.
-            template_coordinates: Template backbone coords `[B, T, L, A, 3]`.
-            pair: Pair representation `[B, L, L, pair_size]` to update.
-            state: Node-state representation `[B, L, state_size]` to update.
-
-        Returns:
-            The updated ``(pair, state)`` representations.
-        """
-
         batch_size, template_count, length, _ = template_single_features.shape
 
         left = template_single_features.unsqueeze(3).expand(-1, -1, -1, length, -1)
@@ -783,7 +676,7 @@ class RfDiffusionTemplateEmbedder(nn.Module):
         template_pair = self.pair_projection(torch.cat((template_pair_features, left, right), dim=-1))
 
         template_coordinates = template_coordinates.reshape(batch_size * template_count, length, -1, 3)
-        radial_features = rbf(torch.cdist(template_coordinates[:, :, 1], template_coordinates[:, :, 1]))
+        radial_features = _radial_basis(torch.cdist(template_coordinates[:, :, 1], template_coordinates[:, :, 1]))
         template_pair = self.template_pair_stack(template_pair, radial_features)
 
         template_single = torch.cat((template_single_features, template_torsion_features), dim=-1)
@@ -805,16 +698,6 @@ class RfDiffusionTemplateEmbedder(nn.Module):
 class RfDiffusionTemplatePairStack(nn.Module):
     r"""
     Stack of pair-update blocks that refines the template pair representation.
-
-    Runs ``num_blocks`` [`RfDiffusionPairBlock`][ofoldx.models.rfdiffusion.model.RfDiffusionPairBlock] blocks over the
-    flattened template batch, then layer-normalizes the result.
-
-    Args:
-        num_blocks: Number of pair-update blocks.
-        template_size: Width of the template pair representation.
-        num_attention_heads: Number of attention heads per block.
-        hidden_size: Per-head hidden width per block.
-        dropout: Dropout probability applied inside each block.
     """
 
     def __init__(
@@ -839,17 +722,6 @@ class RfDiffusionTemplatePairStack(nn.Module):
         self.output_norm = LayerNorm(template_size)
 
     def forward(self, template_pair: torch.Tensor, radial_features: torch.Tensor) -> torch.Tensor:
-        r"""
-        Refine the template pair representation.
-
-        Args:
-            template_pair: Template pair features `[B, T, L, L, template_size]`.
-            radial_features: Radial-basis distance features `[B*T, L, L, 36]` used as the structure bias.
-
-        Returns:
-            The refined, layer-normalized template pair features `[B, T, L, L, template_size]`.
-        """
-
         batch_size, template_count, length = template_pair.shape[:3]
         template_pair = template_pair.reshape(batch_size * template_count, length, length, -1)
         for block in self.blocks:
@@ -861,14 +733,6 @@ class RfDiffusionTemplatePairStack(nn.Module):
 class RfDiffusionRecyclingEmbeddings(nn.Module):
     r"""
     Fold the previous iteration's MSA, pair, state, and structure back into the trunk inputs.
-
-    Normalizes the recycled MSA/pair/state and adds a pair contribution derived from the previous backbone's
-    pseudo-C-beta distogram, providing the recycling signal RoseTTAFold conditions on.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation.
-        state_size: Width of the node-state representation.
     """
 
     def __init__(self, msa_size: int = 256, pair_size: int = 128, state_size: int = 32) -> None:
@@ -880,9 +744,7 @@ class RfDiffusionRecyclingEmbeddings(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the distance projection to the RoseTTAFold scheme (Lecun-normal, zero bias)."""
-
-        self.pair_projection = init_lecun_normal(self.pair_projection)
+        self.pair_projection = _initialize_lecun_normal(self.pair_projection)
         _zero_bias(self.pair_projection)
 
     def forward(
@@ -892,26 +754,13 @@ class RfDiffusionRecyclingEmbeddings(nn.Module):
         coords: torch.Tensor,
         state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""
-        Build the recycled MSA, pair, and state contributions.
-
-        Args:
-            msa: Previous-iteration MSA row `[B, L, msa_size]`.
-            pair: Previous-iteration pair representation `[B, L, L, pair_size]`.
-            coords: Previous-iteration backbone coords `[B, L, A, 3]`.
-            state: Previous-iteration node state `[B, L, state_size]`.
-
-        Returns:
-            A tuple ``(msa, pair, state)`` of the recycled contributions to add back into the trunk inputs.
-        """
-
         _, length = pair.shape[:2]
         state = self.state_norm(state)
         left_state = state.unsqueeze(2).expand(-1, -1, length, -1)
         right_state = state.unsqueeze(1).expand(-1, length, -1, -1)
 
-        cbeta = generate_cbeta(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2])
-        dist = rbf(torch.cdist(cbeta, cbeta))
+        cbeta = _beta_carbon(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2])
+        dist = _radial_basis(torch.cdist(cbeta, cbeta))
         dist = self.pair_projection(torch.cat((dist, left_state, right_state), dim=-1))
 
         msa = self.msa_norm(msa)
@@ -922,24 +771,6 @@ class RfDiffusionRecyclingEmbeddings(nn.Module):
 class RfDiffusionTrunk(nn.Module):
     r"""
     The RoseTTAFold track: stacked iteration blocks plus a top-k structure refiner.
-
-    Runs the extra-MSA blocks, then the main blocks, then several top-k structure-refinement steps, detaching
-    frames between stages. Returns the final representations along with the per-step frame and torsion
-    trajectories used to build the denoised structure.
-
-    Args:
-        num_extra_blocks: Number of extra-MSA iteration blocks.
-        num_main_blocks: Number of main iteration blocks.
-        num_refinement_blocks: Number of top-k structure-refinement steps.
-        msa_size: Width of the latent MSA representation.
-        full_msa_size: Width of the extra (full) MSA representation.
-        pair_size: Width of the pair representation.
-        hidden_size: Per-head hidden width shared across the blocks.
-        num_msa_attention_heads: Number of MSA attention heads.
-        num_pair_attention_heads: Number of pair attention heads.
-        trunk_se3: SE(3) sizing dict for the main/extra structure steps.
-        refinement_se3: SE(3) sizing dict for the top-k refinement steps.
-        dropout: Dropout probability applied throughout the track.
     """
 
     def __init__(
@@ -1011,11 +842,9 @@ class RfDiffusionTrunk(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the state projections between stages to the RoseTTAFold scheme."""
-
-        self.state_input_projection = init_lecun_normal(self.state_input_projection)
+        self.state_input_projection = _initialize_lecun_normal(self.state_input_projection)
         nn.init.zeros_(self.state_input_projection.bias)
-        self.state_output_projection = init_lecun_normal(self.state_output_projection)
+        self.state_output_projection = _initialize_lecun_normal(self.state_output_projection)
         nn.init.zeros_(self.state_output_projection.bias)
 
     def forward(
@@ -1030,25 +859,6 @@ class RfDiffusionTrunk(nn.Module):
         cyclic_mask: Tensor | None = None,
         fixed_structure_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Run the full track and return the final representations and frame trajectory.
-
-        Args:
-            seq: Sequence features (passed through to blocks).
-            msa: Latent MSA representation `[B, N, L, msa_size]`.
-            full_msa: Extra (full) MSA representation.
-            pair: Pair representation `[B, L, L, pair_size]`.
-            coords_in: Initial backbone coords `[B, L, 3, 3]`.
-            state: Initial node-state representation `[B, L, ...]`.
-            residue_index: Residue-index tensor `[B, L]`.
-            cyclic_mask: Optional cyclic-residue mask.
-            fixed_structure_mask: Per-residue mask `[L]` freezing motif frame updates.
-
-        Returns:
-            A tuple ``(msa, pair, rotations, translations, alpha, state)`` where ``rotations``, ``translations``
-            and ``alpha`` are stacked over all track steps `[steps, ...]`.
-        """
-
         fixed_structure_mask = (
             torch.zeros_like(residue_index, dtype=torch.bool) if fixed_structure_mask is None else fixed_structure_mask
         )
@@ -1133,20 +943,6 @@ class RfDiffusionTrunk(nn.Module):
 class RfDiffusionTrunkBlock(nn.Module):
     r"""
     One RoseTTAFold iteration block over the MSA, pair, and structure representations.
-
-    Chains the MSA update, MSA-to-pair outer product, pair update, and one structure step, returning the
-    refreshed representations and frames. The trunk stacks many of these.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation.
-        num_msa_attention_heads: Number of MSA attention heads.
-        num_pair_attention_heads: Number of pair attention heads.
-        use_global_attn: Whether the MSA update uses global column attention.
-        hidden_size: Per-head hidden width for the pair/structure updates.
-        msa_hidden_size: Per-head hidden width for the MSA update; defaults to ``hidden_size``.
-        dropout: Dropout probability applied throughout the block.
-        se3_config: SE(3) sizing dict for the structure step.
     """
 
     def __init__(
@@ -1200,25 +996,6 @@ class RfDiffusionTrunkBlock(nn.Module):
         fixed_structure_mask: Tensor,
         cyclic_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Run one iteration block over MSA, pair, and structure.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-            pair: Pair representation `[B, L, L, pair_size]`.
-            input_rotations: Current per-residue rotations `[B, L, 3, 3]`.
-            input_translations: Current per-residue translations `[B, L, 3]`.
-            coords: Current backbone coords `[B, L, A, 3]`.
-            state: Node-state representation `[B, L, state_size]`.
-            residue_index: Residue-index tensor `[B, L]`.
-            fixed_structure_mask: Per-residue mask `[L]` freezing motif frame updates.
-            cyclic_mask: Optional cyclic-residue mask.
-
-        Returns:
-            A tuple ``(msa, pair, rotations, translations, state, alpha)`` with the updated representations,
-            frames, node state, and predicted torsions.
-        """
-
         radial_features = _backbone_ca_distogram(coords)
         msa = self.msa_block(msa, pair, radial_features, state)
         pair = pair + self.outer_product_mean(msa)
@@ -1241,16 +1018,6 @@ class RfDiffusionTrunkBlock(nn.Module):
 class RfDiffusionRelativePositionEmbedding(nn.Module):
     r"""
     Relative-position embedding added to the pair representation.
-
-    Buckets the signed residue separation into ``minpos..maxpos`` bins and adds a learned embedding to each
-    pair entry. Cyclic chains wrap the separation around the cycle length so cyclic-peptide topologies are
-    encoded correctly.
-
-    Args:
-        hidden_size: Width of the pair representation the embedding is added to.
-        minpos: Minimum (most negative) relative position bin.
-        maxpos: Maximum relative position bin.
-        dropout: Dropout probability applied to the summed pair features.
     """
 
     def __init__(self, hidden_size: int, minpos: int = -32, maxpos: int = 32, dropout: float = 0.1) -> None:
@@ -1264,18 +1031,6 @@ class RfDiffusionRelativePositionEmbedding(nn.Module):
     def forward(
         self, pair: torch.Tensor, residue_index: torch.Tensor, cyclize: torch.Tensor | None = None
     ) -> torch.Tensor:
-        r"""
-        Add the bucketed relative-position embedding to ``pair``.
-
-        Args:
-            pair: Pair representation `[B, L, L, hidden_size]`.
-            residue_index: Residue-index tensor `[B, L]`.
-            cyclize: Optional cyclic-residue mask; wraps separations within a cyclic chain.
-
-        Returns:
-            The pair representation with the relative-position embedding added, dropout applied.
-        """
-
         boundaries = torch.arange(self.minpos, self.maxpos, device=pair.device)
         seqsep = residue_index[:, None, :] - residue_index[:, :, None]
         cyclic_residues = _cyclic_mask(cyclize, residue_index)
@@ -1296,18 +1051,6 @@ class RfDiffusionRelativePositionEmbedding(nn.Module):
 class RfDiffusionMsaBlock(nn.Module):
     r"""
     Update the MSA representation from the pair, structure, and node-state signals.
-
-    Injects the pair bias (plus a backbone distogram) and the node state into the MSA, then runs row attention
-    with pair bias, column (or global column) attention, and a transition update.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation providing the attention bias.
-        num_attention_heads: Number of attention heads.
-        state_size: Width of the node-state representation.
-        hidden_size: Per-head hidden width.
-        dropout: Dropout probability applied to the row-attention update.
-        use_global_attn: Whether to use global column attention (for the extra-MSA stack).
     """
 
     def __init__(
@@ -1342,27 +1085,12 @@ class RfDiffusionMsaBlock(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the pair and state projections to the RoseTTAFold scheme."""
-
-        self.pair_projection = init_lecun_normal(self.pair_projection)
-        self.state_projection = init_lecun_normal(self.state_projection)
+        self.pair_projection = _initialize_lecun_normal(self.pair_projection)
+        self.state_projection = _initialize_lecun_normal(self.state_projection)
         nn.init.zeros_(self.pair_projection.bias)
         nn.init.zeros_(self.state_projection.bias)
 
     def forward(self, msa: Tensor, pair: Tensor, radial_features: Tensor, state: Tensor) -> Tensor:
-        r"""
-        Update the MSA with pair-biased row and column attention followed by a transition.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-            pair: Pair representation `[B, L, L, pair_size]`.
-            radial_features: Backbone CA distogram `[B, L, L, 36]` concatenated into the pair bias.
-            state: Node-state representation `[B, L, state_size]`.
-
-        Returns:
-            The updated MSA representation `[B, N, L, msa_size]`.
-        """
-
         batch_size, _, length = msa.shape[:3]
         pair_bias = torch.cat((self.pair_norm(pair), radial_features), dim=-1)
         pair_bias = self.pair_projection(pair_bias)
@@ -1378,17 +1106,6 @@ class RfDiffusionMsaBlock(nn.Module):
 class RfDiffusionPairBlock(nn.Module):
     r"""
     Update the pair representation with structure-biased axial attention.
-
-    Adds a structure bias derived from the backbone distance features, then applies row and column
-    [`RfDiffusionPairAxialAttention`][ofoldx.models.rfdiffusion.model.RfDiffusionPairAxialAttention] followed by a
-    transition update.
-
-    Args:
-        pair_size: Width of the pair representation.
-        num_attention_heads: Number of axial-attention heads.
-        hidden_size: Per-head hidden width.
-        rbf_size: Width of the radial-basis distance features feeding the structure bias.
-        dropout: Dropout probability applied to the axial-attention updates.
     """
 
     def __init__(
@@ -1414,25 +1131,12 @@ class RfDiffusionPairBlock(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the RBF embedding/projection to the RoseTTAFold scheme."""
-
         nn.init.kaiming_normal_(self.radial_embedding.weight, nonlinearity="relu")
         nn.init.zeros_(self.radial_embedding.bias)
-        self.radial_projection = init_lecun_normal(self.radial_projection)
+        self.radial_projection = _initialize_lecun_normal(self.radial_projection)
         nn.init.zeros_(self.radial_projection.bias)
 
     def forward(self, pair: Tensor, radial_features: Tensor) -> Tensor:
-        r"""
-        Update the pair representation with structure-biased row and column axial attention.
-
-        Args:
-            pair: Pair representation `[B, L, L, pair_size]`.
-            radial_features: Radial-basis backbone distance features `[B, L, L, rbf_size]`.
-
-        Returns:
-            The updated pair representation `[B, L, L, pair_size]`.
-        """
-
         structure_bias = self.radial_projection(F.relu_(self.radial_embedding(radial_features)))
         pair = pair + self.row_dropout(self.row_attention(pair, structure_bias))
         pair = pair + self.column_dropout(self.column_attention(pair, structure_bias))
@@ -1442,14 +1146,6 @@ class RfDiffusionPairBlock(nn.Module):
 class RfDiffusionOuterProductMean(nn.Module):
     r"""
     Compute the MSA outer-product update for the pair representation.
-
-    Projects the normalized MSA to left/right features, forms their outer product over the MSA axis, and
-    returns the projected RoseTTAFold pair update. The enclosing trunk block owns the residual addition.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair update.
-        hidden_size: Width of the left/right projections whose outer product feeds the pair update.
     """
 
     def __init__(
@@ -1466,26 +1162,14 @@ class RfDiffusionOuterProductMean(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the projections (left/right Lecun-normal, output zeroed) to the RoseTTAFold scheme."""
-
-        self.left_projection = init_lecun_normal(self.left_projection)
-        self.right_projection = init_lecun_normal(self.right_projection)
+        self.left_projection = _initialize_lecun_normal(self.left_projection)
+        self.right_projection = _initialize_lecun_normal(self.right_projection)
         nn.init.zeros_(self.left_projection.bias)
         nn.init.zeros_(self.right_projection.bias)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, msa: Tensor) -> Tensor:
-        r"""
-        Compute the MSA outer-product update.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-
-        Returns:
-            The additive pair update `[B, L, L, pair_size]`.
-        """
-
         batch_size, num_sequences, length = msa.shape[:3]
         msa = self.msa_norm(msa)
         left = self.left_projection(msa)
@@ -1497,18 +1181,6 @@ class RfDiffusionOuterProductMean(nn.Module):
 class RfDiffusionStructureUpdate(nn.Module):
     r"""
     Structure-update module: refine backbone frames with an SE(3)-equivariant transformer.
-
-    Embeds the MSA/pair/state features into node and edge features, builds a residue graph (full or top-k),
-    runs the
-    [`RfDiffusionSe3StructureModule`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3StructureModule],
-    and applies the predicted translation and rotation updates to the input frames. Runs with autocast
-    disabled so the equivariant math stays in fp32.
-
-    Args:
-        msa_size: Width of the MSA row input.
-        pair_size: Width of the pair representation.
-        state_size: Width of the node-state representation.
-        se3_config: SE(3) sizing dict (defaults applied when `None`).
     """
 
     def __init__(
@@ -1538,11 +1210,9 @@ class RfDiffusionStructureUpdate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the node/edge embeddings to the RoseTTAFold scheme (Lecun-normal, zero bias)."""
-
-        self.node_projection = init_lecun_normal(self.node_projection)
-        self.pair_projection = init_lecun_normal(self.pair_projection)
-        self.geometry_projection = init_lecun_normal(self.geometry_projection)
+        self.node_projection = _initialize_lecun_normal(self.node_projection)
+        self.pair_projection = _initialize_lecun_normal(self.pair_projection)
+        self.geometry_projection = _initialize_lecun_normal(self.geometry_projection)
         nn.init.zeros_(self.node_projection.bias)
         nn.init.zeros_(self.pair_projection.bias)
         nn.init.zeros_(self.geometry_projection.bias)
@@ -1561,26 +1231,6 @@ class RfDiffusionStructureUpdate(nn.Module):
         cyclic_mask: Tensor | None = None,
         top_k: int = 64,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Refine backbone frames and predict torsions with the SE(3) transformer.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-            pair: Pair representation `[B, L, L, pair_size]`.
-            input_rotations: Current per-residue rotations `[B, L, 3, 3]`.
-            input_translations: Current per-residue translations (CA) `[B, L, 3]`.
-            coords: Current backbone coords `[B, L, A, 3]`.
-            state: Node-state representation `[B, L, state_size]`.
-            residue_index: Residue-index tensor `[B, L]`.
-            fixed_structure_mask: Per-residue mask `[L]`; frame updates are zeroed on masked (motif) residues.
-            cyclic_mask: Optional cyclic-residue mask for neighbor features.
-            top_k: Number of neighbors for the residue graph; `0` builds the full graph.
-
-        Returns:
-            A tuple ``(rotations, translations, state, alpha)`` of the updated frames, node state, and
-            predicted torsion angles.
-        """
-
         batch_size, _, length = msa.shape[:3]
         fixed_structure_mask = (
             torch.zeros_like(residue_index, dtype=torch.bool) if fixed_structure_mask is None else fixed_structure_mask
@@ -1592,15 +1242,15 @@ class RfDiffusionStructureUpdate(nn.Module):
         node = self.node_norm(self.node_projection(node))
         pair = self.pair_edge_norm(self.pair_projection(self.pair_norm(pair)))
 
-        neighbor = get_seqsep(residue_index, cyclic_mask)
+        neighbor = _sequence_separation(residue_index, cyclic_mask)
         pair = torch.cat((pair, _backbone_ca_distogram(coords), neighbor), dim=-1)
         pair = self.geometry_norm(self.geometry_projection(pair))
 
         ca_coords = coords[:, :, 1, :]
         graph, edge_features = (
-            make_topk_graph(ca_coords, pair, residue_index, top_k=top_k)
+            _top_k_graph(ca_coords, pair, residue_index, top_k=top_k)
             if top_k != 0
-            else make_full_graph(ca_coords, pair, residue_index)
+            else _full_graph(ca_coords, pair, residue_index)
         )
         vector_features = (coords - ca_coords.unsqueeze(2)).reshape(batch_size * length, -1, 3)
         shift = self.structure_module(graph, node.reshape(batch_size * length, -1, 1), vector_features, edge_features)
@@ -1621,11 +1271,6 @@ class RfDiffusionStructureUpdate(nn.Module):
 class RfDiffusionTransition(nn.Module):
     r"""
     Pre-norm transition with a ReLU-activated expansion.
-
-    Args:
-        hidden_size: Input and output width.
-        expansion: Inner-width expansion factor.
-        dropout: Dropout probability applied after the activation.
     """
 
     def __init__(self, hidden_size: int, expansion: int, dropout: float = 0.1) -> None:
@@ -1637,24 +1282,12 @@ class RfDiffusionTransition(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the block (input Kaiming, output zeroed) to the RoseTTAFold scheme."""
-
         nn.init.kaiming_normal_(self.input_projection.weight, nonlinearity="relu")
         nn.init.zeros_(self.input_projection.bias)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, src: torch.Tensor) -> torch.Tensor:
-        r"""
-        Compute the pre-norm transition update.
-
-        Args:
-            src: Input tensor `[..., hidden_size]`.
-
-        Returns:
-            The transformed tensor `[..., hidden_size]`.
-        """
-
         src = self.input_norm(src)
         return self.output_projection(self.dropout(F.relu_(self.input_projection(src))))
 
@@ -1662,15 +1295,6 @@ class RfDiffusionTransition(nn.Module):
 class RfDiffusionMultiheadAttention(nn.Module):
     r"""
     Multi-head scaled dot-product attention with separate query/key sizes.
-
-    Generic (non-axial) attention used by the template embedding to attend over templates.
-
-    Args:
-        query_size: Width of the query input.
-        key_size: Width of the key/value input.
-        num_attention_heads: Number of attention heads.
-        head_dim: Per-head dimension.
-        output_size: Width of the projected output.
     """
 
     def __init__(
@@ -1687,8 +1311,6 @@ class RfDiffusionMultiheadAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the projections (Xavier for q/k/v, zeroed output) to the RoseTTAFold scheme."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
         nn.init.xavier_uniform_(self.value_projection.weight)
@@ -1696,18 +1318,6 @@ class RfDiffusionMultiheadAttention(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        r"""
-        Compute multi-head attention of ``query`` over ``key``/``value``.
-
-        Args:
-            query: Query tensor `[B, Q, query_size]`.
-            key: Key tensor `[B, K, key_size]`.
-            value: Value tensor `[B, K, key_size]`.
-
-        Returns:
-            The attended output `[B, Q, output_size]`.
-        """
-
         batch_size, query_len = query.shape[:2]
         key_len = key.shape[1]
         query = self.query_projection(query).reshape(batch_size, query_len, self.num_attention_heads, self.head_dim)
@@ -1722,15 +1332,6 @@ class RfDiffusionMultiheadAttention(nn.Module):
 class RfDiffusionMsaSequenceWeighting(nn.Module):
     r"""
     Per-head softmax weights over MSA rows relative to the query row.
-
-    Produces the sequence-attention weights that reweight MSA rows inside
-    [`RfDiffusionMsaRowAttentionWithPairBias`][ofoldx.models.rfdiffusion.model.RfDiffusionMsaRowAttentionWithPairBias].
-
-    Args:
-        msa_size: Width of the MSA representation.
-        num_attention_heads: Number of attention heads.
-        head_dim: Per-head dimension.
-        dropout: Dropout probability applied to the weights.
     """
 
     def __init__(self, msa_size: int, num_attention_heads: int, head_dim: int, dropout: float = 0.1) -> None:
@@ -1744,22 +1345,10 @@ class RfDiffusionMsaSequenceWeighting(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the query/key projections with Xavier uniform."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
 
     def forward(self, msa: torch.Tensor) -> torch.Tensor:
-        r"""
-        Compute per-head sequence-attention weights over MSA rows.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-
-        Returns:
-            Softmax weights `[B, N, L, num_attention_heads, 1]` over the MSA-row axis.
-        """
-
         batch_size, msa_depth, length = msa.shape[:3]
         query = self.query_projection(msa[:, 0]).view(batch_size, 1, length, self.num_attention_heads, self.head_dim)
         key = self.key_projection(msa).view(batch_size, msa_depth, length, self.num_attention_heads, self.head_dim)
@@ -1770,17 +1359,6 @@ class RfDiffusionMsaSequenceWeighting(nn.Module):
 class RfDiffusionMsaRowAttentionWithPairBias(nn.Module):
     r"""
     Row (per-column) MSA attention biased by the pair representation and gated.
-
-    Attends across residues within each MSA row, adds a per-head bias projected from the pair representation,
-    reweights rows by the
-    [`RfDiffusionMsaSequenceWeighting`][ofoldx.models.rfdiffusion.model.RfDiffusionMsaSequenceWeighting],
-    and gates the output.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation providing the attention bias.
-        num_attention_heads: Number of attention heads.
-        head_dim: Per-head dimension.
     """
 
     def __init__(
@@ -1802,29 +1380,16 @@ class RfDiffusionMsaRowAttentionWithPairBias(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize projections to the RoseTTAFold scheme (Xavier q/k/v, gate open, zeroed output)."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
         nn.init.xavier_uniform_(self.value_projection.weight)
-        self.bias_projection = init_lecun_normal(self.bias_projection)
+        self.bias_projection = _initialize_lecun_normal(self.bias_projection)
         nn.init.zeros_(self.gate_projection.weight)
         nn.init.ones_(self.gate_projection.bias)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, msa: torch.Tensor, pair: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply pair-biased, sequence-weighted, gated row attention.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-            pair: Pair representation `[B, L, L, pair_size]` providing the per-head bias.
-
-        Returns:
-            An additive MSA attention update `[B, N, L, msa_size]`; the caller owns the residual.
-        """
-
         batch_size, msa_depth, length = msa.shape[:3]
         msa = self.msa_norm(msa)
         pair = self.pair_norm(pair)
@@ -1848,13 +1413,6 @@ class RfDiffusionMsaRowAttentionWithPairBias(nn.Module):
 class RfDiffusionMsaColumnAttention(nn.Module):
     r"""
     Column (per-row) MSA attention across sequences, gated.
-
-    Attends across MSA rows at each residue position, then gates the output. Used for the latent MSA stack.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        num_attention_heads: Number of attention heads.
-        head_dim: Per-head dimension.
     """
 
     def __init__(self, msa_size: int = 256, num_attention_heads: int = 8, head_dim: int = 32) -> None:
@@ -1871,8 +1429,6 @@ class RfDiffusionMsaColumnAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize projections to the RoseTTAFold scheme (Xavier q/k/v, gate open, zeroed output)."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
         nn.init.xavier_uniform_(self.value_projection.weight)
@@ -1882,16 +1438,6 @@ class RfDiffusionMsaColumnAttention(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, msa: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply gated column attention across MSA rows.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-
-        Returns:
-            An additive MSA attention update `[B, N, L, msa_size]`; the caller owns the residual.
-        """
-
         batch_size, msa_depth, length = msa.shape[:3]
         msa = self.msa_norm(msa)
         query = self.query_projection(msa).reshape(
@@ -1911,14 +1457,6 @@ class RfDiffusionMsaColumnAttention(nn.Module):
 class RfDiffusionMsaColumnGlobalAttention(nn.Module):
     r"""
     Global column MSA attention with a mean-pooled query, gated.
-
-    Cheaper column attention for the deep extra-MSA stack: the query is mean-pooled over rows and the key/value
-    share a single head, keeping the cost linear in MSA depth.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        num_attention_heads: Number of attention heads for the query/gate.
-        head_dim: Per-head dimension.
     """
 
     def __init__(self, msa_size: int = 64, num_attention_heads: int = 8, head_dim: int = 8) -> None:
@@ -1935,8 +1473,6 @@ class RfDiffusionMsaColumnGlobalAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize projections to the RoseTTAFold scheme (Xavier q/k/v, gate open, zeroed output)."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
         nn.init.xavier_uniform_(self.value_projection.weight)
@@ -1946,16 +1482,6 @@ class RfDiffusionMsaColumnGlobalAttention(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, msa: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply gated global column attention with a mean-pooled query.
-
-        Args:
-            msa: MSA representation `[B, N, L, msa_size]`.
-
-        Returns:
-            An additive MSA attention update broadcast to `[B, 1, L, msa_size]`; the caller owns the residual.
-        """
-
         batch_size, msa_depth, length = msa.shape[:3]
         msa = self.msa_norm(msa)
         query = (
@@ -1975,17 +1501,6 @@ class RfDiffusionMsaColumnGlobalAttention(nn.Module):
 class RfDiffusionPairAxialAttention(nn.Module):
     r"""
     Axial (row or column) attention over the pair representation with an additive bias, gated.
-
-    Attends along one axis of the pair map at a time (transposing for the row case), adds a per-head bias from
-    a structure feature, and gates the output. The workhorse of
-    [`RfDiffusionPairBlock`][ofoldx.models.rfdiffusion.model.RfDiffusionPairBlock].
-
-    Args:
-        pair_size: Width of the pair representation.
-        bias_size: Width of the bias feature the per-head bias is projected from.
-        num_attention_heads: Number of attention heads.
-        head_dim: Per-head dimension.
-        is_row: Whether to attend along rows (`True`) or columns (`False`).
     """
 
     def __init__(
@@ -2012,29 +1527,16 @@ class RfDiffusionPairAxialAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize projections to the RoseTTAFold scheme (Xavier q/k/v, gate open, zeroed output)."""
-
         nn.init.xavier_uniform_(self.query_projection.weight)
         nn.init.xavier_uniform_(self.key_projection.weight)
         nn.init.xavier_uniform_(self.value_projection.weight)
-        self.bias_projection = init_lecun_normal(self.bias_projection)
+        self.bias_projection = _initialize_lecun_normal(self.bias_projection)
         nn.init.zeros_(self.gate_projection.weight)
         nn.init.ones_(self.gate_projection.bias)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, pair: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply biased, gated axial attention to the pair representation.
-
-        Args:
-            pair: Pair representation `[B, L, L, pair_size]`.
-            bias: Bias feature `[B, L, L, bias_size]` projected into the per-head bias.
-
-        Returns:
-            An additive pair-attention update `[B, L, L, pair_size]`; the caller owns the residual.
-        """
-
         batch_size, length = pair.shape[:2]
         if self.is_row:
             pair = pair.permute(0, 2, 1, 3)
@@ -2056,21 +1558,8 @@ class RfDiffusionPairAxialAttention(nn.Module):
 
 
 class RfDiffusionGraph:
-    r"""Sparse residue graph consumed by the SE(3) transformer.
-
-    Stores destination-sorted CSR edges, relative positions, and pair-derived
-    edge features. The row offsets delimit the destination segments used by the
-    equivariant reductions.
-
-    Args:
-        coordinates: Backbone C-alpha coordinates with shape [B, L, 3].
-        pair: Pair representation with shape [B, L, L, C].
-        batch: Per-edge batch indices.
-        source_residue_index: Per-edge source-residue indices.
-        destination_residue_index: Per-edge destination-residue indices.
-        edge_mask: Per-edge validity mask.
-        batch_size: Number of graphs.
-        length: Number of residues per graph.
+    r"""
+    Sparse residue graph consumed by the SE(3) transformer.
     """
 
     def __init__(
@@ -2108,92 +1597,47 @@ class RfDiffusionGraph:
         self.row_offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
 
     def edges(self) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""Return the source and destination global node-index tensors."""
-
         return self.source, self.destination
 
 
-class Fiber(dict[int, int]):
+class RfDiffusionSe3Fiber(dict[int, int]):
     r"""
     Degree-to-channel structure of an SE(3)-equivariant feature space.
-
-    A dict mapping each representation degree to its channel count, with helpers to enumerate degrees,
-    channels, and the total flattened feature width. Ported from the NVIDIA SE(3)-Transformer.
-
-    Args:
-        structure: A mapping or iterable of ``(degree, channels)`` pairs.
     """
 
     def __init__(self, structure: Mapping[int, int] | Iterable[tuple[int, int]]) -> None:
         super().__init__(sorted(dict(structure).items()))
 
     def __missing__(self, degree: int) -> int:
-        r"""Return zero channels for a degree absent from the fiber."""
-
         return 0
 
     @property
     def degrees(self) -> list[int]:
-        r"""Sorted list of representation degrees present in the fiber."""
-
         return sorted(self)
 
     @property
     def channels(self) -> list[int]:
-        r"""Channel counts, one per degree in `degrees` order."""
-
         return [self[degree] for degree in self.degrees]
 
     @property
     def num_features(self) -> int:
-        r"""Total flattened feature width, summing ``channels * degree_to_dim(degree)`` over all degrees."""
-
-        return sum(channels * degree_to_dim(degree) for degree, channels in self.items())
+        return sum(channels * _degree_to_dimension(degree) for degree, channels in self.items())
 
     @staticmethod
-    def create(num_degrees: int, num_channels: int) -> Fiber:
-        r"""
-        Build a uniform fiber with ``num_channels`` channels for each degree ``0..num_degrees-1``.
-
-        Args:
-            num_degrees: Number of consecutive degrees (starting at 0) to include.
-            num_channels: Channel count assigned to every degree.
-
-        Returns:
-            The constructed [`Fiber`][ofoldx.models.rfdiffusion.model.Fiber].
-
-        Examples:
-            >>> from ofoldx.models.rfdiffusion.model import Fiber
-            >>> fiber = Fiber.create(3, 16)
-            >>> fiber.degrees
-            [0, 1, 2]
-            >>> fiber.num_features
-            144
-        """
-
-        return Fiber((degree, num_channels) for degree in range(num_degrees))
+    def create(num_degrees: int, num_channels: int) -> RfDiffusionSe3Fiber:
+        return RfDiffusionSe3Fiber((degree, num_channels) for degree in range(num_degrees))
 
     def __add__(self, other):
-        r"""Add two fibers channel-wise per degree, or add an int to every degree's channel count."""
-
-        if isinstance(other, Fiber):
-            return Fiber({degree: channels + other[degree] for degree, channels in self.items()})
+        if isinstance(other, RfDiffusionSe3Fiber):
+            return RfDiffusionSe3Fiber({degree: channels + other[degree] for degree, channels in self.items()})
         if isinstance(other, int):
-            return Fiber({degree: channels + other for degree, channels in self.items()})
+            return RfDiffusionSe3Fiber({degree: channels + other for degree, channels in self.items()})
         return NotImplemented
 
 
 class RfDiffusionSe3RadialProfile(nn.Module):
     r"""
     MLP mapping invariant edge features to the radial weights of an SE(3) convolution.
-
-    Args:
-        num_freq: Number of radial frequencies produced per channel pair.
-        channels_in: Number of input channels.
-        channels_out: Number of output channels.
-        edge_dim: Width of the invariant edge features.
-        mid_dim: Hidden width of the MLP.
-        use_layer_norm: Whether to layer-norm the hidden activations.
     """
 
     def __init__(
@@ -2218,32 +1662,12 @@ class RfDiffusionSe3RadialProfile(nn.Module):
         self.mlp = nn.Sequential(*[module for module in modules if module is not None])
 
     def forward(self, features: Tensor) -> Tensor:
-        r"""
-        Map invariant edge ``features`` to flattened radial weights.
-
-        Args:
-            features: Invariant edge features `[E, edge_dim]`.
-
-        Returns:
-            Radial weights `[E, num_freq * channels_in * channels_out]`.
-        """
-
         return self.mlp(features)
 
 
 class RfDiffusionSe3TensorProductConvolution(nn.Module):
     r"""
     A single degree-in to degree-out SE(3) convolution parameterized by a radial profile.
-
-    Applies the radial MLP to the edge features, then contracts the resulting weights against the
-    equivariant basis (or a plain matmul when no basis is given). Ported from the NVIDIA SE(3)-Transformer.
-
-    Args:
-        freq_sum: Number of radial frequencies for this degree pair.
-        channels_in: Number of input channels.
-        channels_out: Number of output channels.
-        edge_dim: Width of the invariant edge features.
-        use_layer_norm: Whether the radial MLP layer-norms its hidden activations.
     """
 
     def __init__(
@@ -2268,18 +1692,6 @@ class RfDiffusionSe3TensorProductConvolution(nn.Module):
         )
 
     def forward(self, features: Tensor, invariant_edge_features: Tensor, basis: Tensor | None) -> Tensor:
-        r"""
-        Convolve ``features`` using radial weights derived from the edge features.
-
-        Args:
-            features: Per-edge input features.
-            invariant_edge_features: Invariant edge features `[E, edge_dim]` feeding the radial MLP.
-            basis: Equivariant basis for the degree pair, or `None` for a plain matmul.
-
-        Returns:
-            The convolved output features.
-        """
-
         radial_weights = self.radial_profile(invariant_edge_features).view(
             -1, self.channels_out, self.channels_in * self.freq_sum
         )
@@ -2291,15 +1703,9 @@ class RfDiffusionSe3TensorProductConvolution(nn.Module):
 class RfDiffusionSe3Linear(nn.Module):
     r"""
     Degree-wise equivariant linear layer: an independent channel mix per representation degree.
-
-    Ported from the NVIDIA SE(3)-Transformer.
-
-    Args:
-        fiber_in: Input fiber structure.
-        fiber_out: Output fiber structure.
     """
 
-    def __init__(self, fiber_in: Fiber, fiber_out: Fiber) -> None:
+    def __init__(self, fiber_in: RfDiffusionSe3Fiber, fiber_out: RfDiffusionSe3Fiber) -> None:
         super().__init__()
         self.weights = nn.ParameterDict(
             {
@@ -2311,16 +1717,6 @@ class RfDiffusionSe3Linear(nn.Module):
         )
 
     def forward(self, features: dict[str, Tensor]) -> dict[str, Tensor]:
-        r"""
-        Apply the per-degree channel mix.
-
-        Args:
-            features: Per-degree feature dict keyed by string degree.
-
-        Returns:
-            The mixed per-degree feature dict.
-        """
-
         return {
             degree: torch.einsum("oc,ncd->nod", weight, features[degree]) for degree, weight in self.weights.items()
         }
@@ -2329,34 +1725,17 @@ class RfDiffusionSe3Linear(nn.Module):
 class RfDiffusionSe3Norm(nn.Module):
     r"""
     Equivariant norm-nonlinearity: rescale each degree's feature by a learned function of its norm.
-
-    Group-normalizes the per-degree feature magnitudes, applies a nonlinearity, and rescales the original
-    (direction-preserving) features by the new magnitudes. Ported from the NVIDIA SE(3)-Transformer.
-
-    Args:
-        fiber: Fiber structure whose degrees are normalized.
-        nonlinearity: Activation applied to the normalized magnitudes; defaults to ReLU.
     """
 
     NORM_CLAMP = 2**-24
 
-    def __init__(self, fiber: Fiber, nonlinearity: nn.Module | None = None) -> None:
+    def __init__(self, fiber: RfDiffusionSe3Fiber, nonlinearity: nn.Module | None = None) -> None:
         super().__init__()
         self.fiber = fiber
         self.group_norm = nn.GroupNorm(num_groups=len(fiber.degrees), num_channels=sum(fiber.channels))
         self.nonlinearity = nn.ReLU() if nonlinearity is None else nonlinearity
 
     def forward(self, features: dict[str, Tensor]) -> dict[str, Tensor]:
-        r"""
-        Apply the equivariant norm-nonlinearity.
-
-        Args:
-            features: Per-degree feature dict keyed by string degree.
-
-        Returns:
-            The rescaled per-degree feature dict.
-        """
-
         output: dict[str, Tensor] = {}
         norms = [
             features[str(degree)].norm(dim=-1, keepdim=True).clamp(min=self.NORM_CLAMP) for degree in self.fiber.degrees
@@ -2372,28 +1751,13 @@ class RfDiffusionSe3Norm(nn.Module):
 class RfDiffusionSe3Convolution(nn.Module):
     r"""
     SE(3)-equivariant graph convolution (message passing) between two fibers.
-
-    Gathers source-node features (plus per-degree edge features) along the graph edges, applies a
-    [`RfDiffusionSe3TensorProductConvolution`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3TensorProductConvolution]
-    per degree pair, optionally adds a self-interaction, and pools messages onto destination nodes. Ported from
-    the NVIDIA SE(3)-Transformer.
-
-    Args:
-        fiber_in: Input node fiber.
-        fiber_out: Output node fiber.
-        fiber_edge: Edge fiber.
-        pool: Whether to sum messages onto destination nodes (vs. returning per-edge messages).
-        use_layer_norm: Whether the radial MLPs layer-norm their hidden activations.
-        self_interaction: Whether to add a per-degree self-interaction from the destination node.
-        max_degree: Maximum representation degree involved in the convolution.
-        allow_fused_output: Whether a fused (un-split) output tensor may be returned when possible.
     """
 
     def __init__(
         self,
-        fiber_in: Fiber,
-        fiber_out: Fiber,
-        fiber_edge: Fiber,
+        fiber_in: RfDiffusionSe3Fiber,
+        fiber_out: RfDiffusionSe3Fiber,
+        fiber_edge: RfDiffusionSe3Fiber,
         pool: bool = True,
         use_layer_norm: bool = False,
         self_interaction: bool = False,
@@ -2419,7 +1783,7 @@ class RfDiffusionSe3Convolution(nn.Module):
 
         if self.fused_output:
             for degree_out, channels_out in fiber_out.items():
-                sum_freq = sum(degree_to_dim(min(degree_out, degree)) for degree in fiber_in.degrees)
+                sum_freq = sum(_degree_to_dimension(min(degree_out, degree)) for degree in fiber_in.degrees)
                 self.output_convolutions[str(degree_out)] = RfDiffusionSe3TensorProductConvolution(
                     sum_freq,
                     list(channels_in_set)[0],
@@ -2429,7 +1793,7 @@ class RfDiffusionSe3Convolution(nn.Module):
                 )
         else:
             for degree_in, channels_in in fiber_in.items():
-                sum_freq = sum(degree_to_dim(min(degree_in, degree)) for degree in fiber_out.degrees)
+                sum_freq = sum(_degree_to_dimension(min(degree_in, degree)) for degree in fiber_out.degrees)
                 self.input_convolutions[str(degree_in)] = RfDiffusionSe3TensorProductConvolution(
                     sum_freq,
                     channels_in,
@@ -2453,19 +1817,6 @@ class RfDiffusionSe3Convolution(nn.Module):
         graph,
         basis: dict[str, Tensor],
     ) -> dict[str, Tensor] | Tensor:
-        r"""
-        Run the equivariant graph convolution.
-
-        Args:
-            node_feats: Per-degree node features keyed by string degree.
-            edge_features: Per-degree edge features; degree ``"0"`` carries the invariant radial input.
-            graph: Sparse residue graph exposing ``edges()``, ``row_offsets``, and ``num_nodes``.
-            basis: Per-degree-pair equivariant bases.
-
-        Returns:
-            The convolved per-degree node features, or a fused tensor when ``allow_fused_output`` applies.
-        """
-
         invariant_edge_features = edge_features["0"].squeeze(-1)
         source, destination = graph.edges()
         in_features = []
@@ -2491,7 +1842,7 @@ class RfDiffusionSe3Convolution(nn.Module):
                     feature, invariant_edge_features, basis[f"in{degree_in}_fused"]
                 )
             if not self.allow_fused_output or self.self_interaction or self.pool:
-                out = unfuse_features(out_tensor, self.fiber_out.degrees)
+                out = _unfuse_features(out_tensor, self.fiber_out.degrees)
             else:
                 return out_tensor
 
@@ -2518,18 +1869,9 @@ class RfDiffusionSe3Convolution(nn.Module):
 class RfDiffusionSe3Attention(nn.Module):
     r"""
     Multi-head SE(3)-equivariant attention over graph edges.
-
-    Scores each edge from the invariant projection of its key and destination query, applies a per-node
-    (segment) softmax, and aggregates the value features onto destination nodes. Ported from the NVIDIA
-    SE(3)-Transformer.
-
-    Args:
-        num_heads: Number of equivariant attention heads.
-        key_fiber: Fiber of the key/query features.
-        value_fiber: Fiber of the value features.
     """
 
-    def __init__(self, num_heads: int, key_fiber: Fiber, value_fiber: Fiber) -> None:
+    def __init__(self, num_heads: int, key_fiber: RfDiffusionSe3Fiber, value_fiber: RfDiffusionSe3Fiber) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.key_fiber = key_fiber
@@ -2543,19 +1885,6 @@ class RfDiffusionSe3Attention(nn.Module):
         query: dict[str, Tensor],
         graph,
     ) -> dict[str, Tensor]:
-        r"""
-        Aggregate value features by edge attention onto destination nodes.
-
-        Args:
-            value: Fused per-edge value features.
-            key: Fused per-edge key features.
-            query: Per-degree destination-node query features.
-            graph: Sparse residue graph exposing ``dst``, ``row_offsets``, and ``num_nodes``.
-
-        Returns:
-            The attended per-degree node features keyed by string degree.
-        """
-
         key_heads = key.reshape(key.shape[0], self.num_heads, -1)
         query_tensor = torch.cat([query[str(degree)] for degree in self.key_fiber.degrees], dim=-1)
         query_heads = query_tensor.reshape(query_tensor.shape[0], self.num_heads, -1)
@@ -2581,43 +1910,27 @@ class RfDiffusionSe3Attention(nn.Module):
             ),
         )
         feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])
-        return unfuse_features(feat_out, self.value_fiber.degrees)
+        return _unfuse_features(feat_out, self.value_fiber.degrees)
 
 
 class RfDiffusionSe3AttentionBlock(nn.Module):
     r"""
     One SE(3)-equivariant attention block: key/value convolution, query linear, attention, and projection.
-
-    Computes fused keys and values with a
-    [`RfDiffusionSe3Convolution`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3Convolution], queries with a
-    [`RfDiffusionSe3Linear`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3Linear], runs
-    [`RfDiffusionSe3Attention`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3Attention], and projects the
-    concatenation of the attended features and the residual node features to the output fiber. Ported from the
-    NVIDIA SE(3)-Transformer.
-
-    Args:
-        fiber_in: Input node fiber.
-        fiber_out: Output node fiber.
-        fiber_edge: Edge fiber.
-        num_heads: Number of equivariant attention heads.
-        channels_div: Channel-division factor for the value fiber.
-        use_layer_norm: Whether the convolutions layer-norm their radial hidden activations.
-        max_degree: Maximum representation degree.
     """
 
     def __init__(
         self,
-        fiber_in: Fiber,
-        fiber_out: Fiber,
-        fiber_edge: Fiber,
+        fiber_in: RfDiffusionSe3Fiber,
+        fiber_out: RfDiffusionSe3Fiber,
+        fiber_edge: RfDiffusionSe3Fiber,
         num_heads: int = 4,
         channels_div: int = 2,
         use_layer_norm: bool = False,
         max_degree: int = 1,
     ) -> None:
         super().__init__()
-        value_fiber = Fiber((degree, channels // channels_div) for degree, channels in fiber_out.items())
-        key_query_fiber = Fiber(
+        value_fiber = RfDiffusionSe3Fiber((degree, channels // channels_div) for degree, channels in fiber_out.items())
+        key_query_fiber = RfDiffusionSe3Fiber(
             (degree, channels) for degree, channels in value_fiber.items() if degree in fiber_in.degrees
         )
         self.key_value_projection = RfDiffusionSe3Convolution(
@@ -2641,19 +1954,6 @@ class RfDiffusionSe3AttentionBlock(nn.Module):
         graph: RfDiffusionGraph,
         basis: dict[str, Tensor],
     ) -> dict[str, Tensor]:
-        r"""
-        Run one equivariant attention block.
-
-        Args:
-            node_features: Per-degree node features keyed by string degree.
-            edge_features: Per-degree edge features.
-            graph: Sparse residue graph.
-            basis: Per-degree-pair equivariant bases.
-
-        Returns:
-            The per-degree output node features after attention and projection.
-        """
-
         fused_key_value = self.key_value_projection(node_features, edge_features, graph, basis)
         key, value = self._get_key_value_from_fused(fused_key_value)
         query = self.query_projection(node_features)
@@ -2665,8 +1965,6 @@ class RfDiffusionSe3AttentionBlock(nn.Module):
         return self.output_norm(self.output_projection(z_concat))
 
     def _get_key_value_from_fused(self, fused_key_value: Tensor) -> tuple[Tensor, Tensor]:
-        r"""Split the fused key/value tensor along the feature axis into ``(key, value)``."""
-
         value, key = torch.chunk(fused_key_value, chunks=2, dim=-2)
         return key, value
 
@@ -2674,36 +1972,21 @@ class RfDiffusionSe3AttentionBlock(nn.Module):
 class RfDiffusionSe3Transformer(nn.Module):
     r"""
     Stack of equivariant attention blocks plus a final convolution over a residue graph.
-
-    Repeats [`RfDiffusionSe3AttentionBlock`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3AttentionBlock]
-    blocks, then applies a self-interacting
-    [`RfDiffusionSe3Convolution`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3Convolution] readout. Ported
-    from the NVIDIA SE(3)-Transformer.
-
-    Args:
-        num_blocks: Number of attention blocks.
-        fiber_in: Input node fiber.
-        fiber_hidden: Hidden node fiber.
-        fiber_out: Output node fiber.
-        num_heads: Number of equivariant attention heads.
-        channels_div: Channel-division factor for the value fibers.
-        fiber_edge: Edge fiber; empty when `None`.
-        use_layer_norm: Whether the convolutions layer-norm their radial hidden activations.
     """
 
     def __init__(
         self,
         num_blocks: int,
-        fiber_in: Fiber,
-        fiber_hidden: Fiber,
-        fiber_out: Fiber,
+        fiber_in: RfDiffusionSe3Fiber,
+        fiber_hidden: RfDiffusionSe3Fiber,
+        fiber_out: RfDiffusionSe3Fiber,
         num_heads: int,
         channels_div: int,
-        fiber_edge: Fiber | None = None,
+        fiber_edge: RfDiffusionSe3Fiber | None = None,
         use_layer_norm: bool = True,
     ) -> None:
         super().__init__()
-        fiber_edge = Fiber({}) if fiber_edge is None else fiber_edge
+        fiber_edge = RfDiffusionSe3Fiber({}) if fiber_edge is None else fiber_edge
         self.num_blocks = num_blocks
         self.fiber_edge = fiber_edge
         self.num_heads = num_heads
@@ -2741,20 +2024,6 @@ class RfDiffusionSe3Transformer(nn.Module):
         edge_features: dict[str, Tensor] | None = None,
         basis: dict[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        r"""
-        Run the equivariant transformer over the graph.
-
-        Args:
-            graph: Sparse residue graph exposing ``relative_positions``, ``edges()``, ``row_offsets``, and
-                ``num_nodes``.
-            node_feats: Per-degree input node features keyed by string degree.
-            edge_features: Per-degree input edge features, or `None`.
-            basis: Precomputed equivariant bases; computed from ``graph.relative_positions`` when `None`.
-
-        Returns:
-            The per-degree output node features.
-        """
-
         basis = basis or cast(
             "dict[str, Tensor]",
             _se3_basis(
@@ -2763,7 +2032,7 @@ class RfDiffusionSe3Transformer(nn.Module):
                 operator_backend=self.operator_backend,
             ),
         )
-        edge_features = get_populated_edge_features(graph.relative_positions, edge_features)
+        edge_features = _populated_edge_features(graph.relative_positions, edge_features)
         for block in self.blocks:
             node_feats = block(node_feats, edge_features, graph, basis)
         return self.output_projection(node_feats, edge_features, graph, basis)
@@ -2771,23 +2040,7 @@ class RfDiffusionSe3Transformer(nn.Module):
 
 class RfDiffusionSe3StructureModule(nn.Module):
     r"""
-    RfDiffusion-facing adapter around
-    [`RfDiffusionSe3Transformer`][ofoldx.models.rfdiffusion.model.RfDiffusionSe3Transformer].
-
-    Constructs the input, hidden, output, and edge fibers from the configured SE(3) sizes and exposes the plain
-    ``(graph, type_0, type_1, edge)`` call signature the structure module uses.
-
-    Args:
-        num_blocks: Number of attention blocks.
-        num_channels: Hidden channel width per degree.
-        num_degrees: Number of hidden degrees.
-        num_attention_heads: Number of equivariant attention heads.
-        div: Channel-division factor for the value fibers.
-        l0_in_features: Width of the incoming degree-0 (scalar) node feature.
-        l0_out_features: Width of the outgoing degree-0 (scalar) node feature.
-        l1_in_features: Number of incoming degree-1 (vector) node features.
-        l1_out_features: Number of outgoing degree-1 (vector) node features.
-        num_edge_features: Width of the scalar edge feature.
+    Adapt the SE(3) transformer to RFdiffusion structure features.
     """
 
     def __init__(
@@ -2805,10 +2058,10 @@ class RfDiffusionSe3StructureModule(nn.Module):
     ) -> None:
         super().__init__()
         self.num_vector_inputs = l1_in_features
-        fiber_edge = Fiber({0: num_edge_features})
-        fiber_in = Fiber({0: l0_in_features, 1: l1_in_features})
-        fiber_hidden = Fiber.create(num_degrees, num_channels)
-        fiber_out = Fiber({0: l0_out_features, 1: l1_out_features})
+        fiber_edge = RfDiffusionSe3Fiber({0: num_edge_features})
+        fiber_in = RfDiffusionSe3Fiber({0: l0_in_features, 1: l1_in_features})
+        fiber_hidden = RfDiffusionSe3Fiber.create(num_degrees, num_channels)
+        fiber_out = RfDiffusionSe3Fiber({0: l0_out_features, 1: l1_out_features})
         self.transformer = RfDiffusionSe3Transformer(
             num_blocks=num_blocks,
             fiber_in=fiber_in,
@@ -2827,19 +2080,6 @@ class RfDiffusionSe3StructureModule(nn.Module):
         type_1_features: Tensor | None = None,
         edge_features: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        r"""
-        Run the wrapped SE(3) transformer.
-
-        Args:
-            graph: Sparse residue graph.
-            type_0_features: Degree-0 (scalar) node features.
-            type_1_features: Degree-1 (vector) node features, or `None` when no vector input is used.
-            edge_features: Scalar edge features.
-
-        Returns:
-            The per-degree output node features (``"0"`` state and ``"1"`` frame updates).
-        """
-
         node_features = {"0": type_0_features}
         if self.num_vector_inputs > 0:
             node_features["1"] = type_1_features
@@ -2849,13 +2089,6 @@ class RfDiffusionSe3StructureModule(nn.Module):
 class RfDiffusionStructuredDropout(nn.Module):
     r"""
     Structured dropout that can share the drop mask along one axis.
-
-    When ``broadcast_dim`` is set, the same Bernoulli mask is applied across that axis (e.g. dropping whole
-    rows or columns of the pair map), matching the RoseTTAFold axial-dropout behavior.
-
-    Args:
-        broadcast_dim: Axis to broadcast the drop mask over, or `None` for standard elementwise dropout.
-        dropout: Drop probability.
     """
 
     def __init__(self, broadcast_dim: int | None = None, dropout: float = 0.15) -> None:
@@ -2864,16 +2097,6 @@ class RfDiffusionStructuredDropout(nn.Module):
         self.dropout = dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply structured dropout to ``x`` (identity in eval mode).
-
-        Args:
-            x: Input tensor.
-
-        Returns:
-            The dropped, rescaled tensor while training; ``x`` unchanged otherwise.
-        """
-
         if not self.training or self.dropout == 0:
             return x
         shape = list(x.shape)
@@ -2886,16 +2109,12 @@ class RfDiffusionStructuredDropout(nn.Module):
 class RfDiffusionAllAtomReconstruction(nn.Module):
     r"""
     Reconstruct RFdiffusion atom14 coords from backbone frames and predicted torsion angles.
-
-    Composes the backbone frame with the per-torsion rigid transforms and torsion rotations from the embedded
-    RoseTTAFold all-atom kinematics tables to place every sidechain atom. Holds those tables as non-persistent
-    buffers.
     """
 
     def __init__(self) -> None:
         super().__init__()
         with torch.device("cpu"):
-            frame_indices, base_frame_transforms, base_frame_coordinates = rf_all_atom_kinematics()
+            frame_indices, base_frame_transforms, base_frame_coordinates = _all_atom_kinematics()
         self.register_buffer("frame_indices", frame_indices, persistent=False)
         self.register_buffer("base_frame_transforms", base_frame_transforms, persistent=False)
         self.register_buffer("base_frame_coordinates", base_frame_coordinates, persistent=False)
@@ -2906,18 +2125,6 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
         coords: torch.Tensor,
         alphas: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""
-        Reconstruct atom14 coords from backbone frames and torsions.
-
-        Args:
-            seq: Per-token residue ids `[B, L]`.
-            coords: Backbone coords `[B, L, 3, 3]` (N/CA/C).
-            alphas: Torsion angles `[B, L, 10, 2]`; defaults to the identity torsion when `None`.
-
-        Returns:
-            A tuple ``(frames, coords_out)`` of the per-torsion frames and the atom14 coords `[B, L, 14, 3]`.
-
-        """
         seq = seq.long()
         batch_size, length = coords.shape[:2]
         if alphas is None:
@@ -2925,15 +2132,15 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
             alphas[..., 0] = 1.0
         alphas = alphas.to(device=coords.device, dtype=coords.dtype)
 
-        rotations, translations = rigid_from_3_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
+        rotations, translations = _rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
         rtf0 = torch.eye(4, dtype=coords.dtype, device=coords.device).repeat(batch_size, length, 1, 1)
         rtf0[:, :, :3, :3] = rotations
         rtf0[:, :, :3, 3] = translations
 
         rts = self.base_frame_transforms.to(device=coords.device, dtype=coords.dtype)[seq]
-        rtf1 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 0], make_rotation_x(alphas[:, :, 0]))
-        rtf2 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 1], make_rotation_x(alphas[:, :, 1]))
-        rtf3 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 2], make_rotation_x(alphas[:, :, 2]))
+        rtf1 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 0], _rotation_x(alphas[:, :, 0]))
+        rtf2 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 1], _rotation_x(alphas[:, :, 1]))
+        rtf3 = torch.einsum("blij,bljk,blkm->blim", rtf0, rts[:, :, 2], _rotation_x(alphas[:, :, 2]))
 
         base_coords = self.base_frame_coordinates.to(device=coords.device, dtype=coords.dtype)[seq]
         nc_midpoint = 0.5 * (base_coords[:, :, 2, :3] + base_coords[:, :, 0, :3])
@@ -2950,20 +2157,20 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
         )
         cb_axis_2 = torch.cross(cb_ref - ca_ref, nc_projection, dim=-1)
         cb_axis_2 = cb_axis_2 / torch.linalg.norm(cb_axis_2, dim=-1, keepdim=True).clamp_min(1e-8)
-        cb_rot_1 = make_rot_axis(alphas[:, :, 7], cb_axis_1)
-        cb_rot_2 = make_rot_axis(alphas[:, :, 8], cb_axis_2)
+        cb_rot_1 = _rotation_about_axis(alphas[:, :, 7], cb_axis_1)
+        cb_rot_2 = _rotation_about_axis(alphas[:, :, 8], cb_axis_2)
         rtf8 = torch.einsum("blij,bljk,blkm->blim", rtf0, cb_rot_1, cb_rot_2)
 
         rtf4 = torch.einsum(
             "blij,bljk,blkm,blmn->blin",
             rtf8,
             rts[:, :, 3],
-            make_rotation_x(alphas[:, :, 3]),
-            make_rotation_z(alphas[:, :, 9]),
+            _rotation_x(alphas[:, :, 3]),
+            _rotation_z(alphas[:, :, 9]),
         )
-        rtf5 = torch.einsum("blij,bljk,blkm->blim", rtf4, rts[:, :, 4], make_rotation_x(alphas[:, :, 4]))
-        rtf6 = torch.einsum("blij,bljk,blkm->blim", rtf5, rts[:, :, 5], make_rotation_x(alphas[:, :, 5]))
-        rtf7 = torch.einsum("blij,bljk,blkm->blim", rtf6, rts[:, :, 6], make_rotation_x(alphas[:, :, 6]))
+        rtf5 = torch.einsum("blij,bljk,blkm->blim", rtf4, rts[:, :, 4], _rotation_x(alphas[:, :, 4]))
+        rtf6 = torch.einsum("blij,bljk,blkm->blim", rtf5, rts[:, :, 5], _rotation_x(alphas[:, :, 5]))
+        rtf7 = torch.einsum("blij,bljk,blkm->blim", rtf6, rts[:, :, 6], _rotation_x(alphas[:, :, 6]))
         frames = torch.stack((rtf0, rtf1, rtf2, rtf3, rtf4, rtf5, rtf6, rtf7, rtf8), dim=2)
 
         gather_index = self.frame_indices.to(device=coords.device)[seq][..., None, None].repeat(1, 1, 1, 4, 4)
@@ -2975,16 +2182,6 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
 class RfDiffusionTorsionHead(nn.Module):
     r"""
     Predict sidechain and backbone torsion angles from the MSA row and node state.
-
-    Two residual MLP blocks over the summed MSA/state features, projecting to 10 torsion angles encoded as
-    ``(cos, sin)`` pairs. Used by
-    [`RfDiffusionStructureUpdate`][ofoldx.models.rfdiffusion.model.RfDiffusionStructureUpdate] each structure
-    step.
-
-    Args:
-        msa_size: Width of the MSA row input.
-        state_size: Width of the node-state input.
-        hidden_size: Hidden width of the residual MLP blocks.
     """
 
     def __init__(
@@ -3006,11 +2203,9 @@ class RfDiffusionTorsionHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Re-initialize the MLP layers to the RoseTTAFold scheme (residual branches zero-initialized)."""
-
-        self.msa_projection = init_lecun_normal(self.msa_projection)
-        self.state_projection = init_lecun_normal(self.state_projection)
-        self.output_projection = init_lecun_normal(self.output_projection)
+        self.msa_projection = _initialize_lecun_normal(self.msa_projection)
+        self.state_projection = _initialize_lecun_normal(self.state_projection)
+        self.output_projection = _initialize_lecun_normal(self.output_projection)
         nn.init.zeros_(self.msa_projection.bias)
         nn.init.zeros_(self.state_projection.bias)
         nn.init.zeros_(self.output_projection.bias)
@@ -3026,17 +2221,6 @@ class RfDiffusionTorsionHead(nn.Module):
         nn.init.zeros_(self.second_transition_output.bias)
 
     def forward(self, seq: Tensor, state: Tensor) -> Tensor:
-        r"""
-        Predict torsion angles from the MSA row and node state.
-
-        Args:
-            seq: MSA query row `[B, L, msa_size]`.
-            state: Node-state representation `[B, L, state_size]`.
-
-        Returns:
-            Torsion angles `[B, L, 10, 2]` as ``(cos, sin)`` pairs.
-        """
-
         batch_size, length = seq.shape[:2]
         hidden = self.msa_projection(self.msa_norm(seq)) + self.state_projection(self.state_norm(state))
         hidden = hidden + self.first_transition_output(F.relu_(self.first_transition_input(F.relu_(hidden))))
@@ -3047,23 +2231,15 @@ class RfDiffusionTorsionHead(nn.Module):
 class RfDiffusionPairwiseGeometryHead(nn.Module):
     r"""
     Predict the RfDiffusion 6D distance/orientation logits from the pair representation.
-
-    Projects the pair map into symmetric (distance, omega) and asymmetric (theta, phi) logits; the symmetric
-    branch is symmetrized across the residue axes.
-
-    Args:
-        n_feat: Width of the input pair representation.
     """
 
     def __init__(self, n_feat: int) -> None:
         super().__init__()
-        self.asymmetric_projection = nn.Linear(n_feat, THETA_BINS + PHI_BINS)
-        self.symmetric_projection = nn.Linear(n_feat, DIST_BINS + OMEGA_BINS)
+        self.asymmetric_projection = nn.Linear(n_feat, _THETA_BINS + _PHI_BINS)
+        self.symmetric_projection = nn.Linear(n_feat, _DISTANCE_BINS + _OMEGA_BINS)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Zero-initialize the distance/orientation heads (the RoseTTAFold scheme)."""
-
         _zero_init(self.symmetric_projection)
         _zero_init(self.asymmetric_projection)
 
@@ -3071,21 +2247,11 @@ class RfDiffusionPairwiseGeometryHead(nn.Module):
         self,
         pair: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""
-        Predict the 6D geometry logits.
-
-        Args:
-            pair: Pair representation `[B, L, L, n_feat]`.
-
-        Returns:
-            A tuple ``(dist, omega, theta, phi)`` of channel-first logit maps.
-        """
-
-        theta_logits, phi_logits = self.asymmetric_projection(pair).split((THETA_BINS, PHI_BINS), dim=-1)
+        theta_logits, phi_logits = self.asymmetric_projection(pair).split((_THETA_BINS, _PHI_BINS), dim=-1)
 
         symmetric_logits = self.symmetric_projection(pair)
         symmetric_logits = symmetric_logits + symmetric_logits.transpose(1, 2)
-        dist_logits, omega_logits = symmetric_logits.split((DIST_BINS, OMEGA_BINS), dim=-1)
+        dist_logits, omega_logits = symmetric_logits.split((_DISTANCE_BINS, _OMEGA_BINS), dim=-1)
 
         return (
             _channel_first(dist_logits),
@@ -3098,10 +2264,6 @@ class RfDiffusionPairwiseGeometryHead(nn.Module):
 class RfDiffusionMaskedTokenHead(nn.Module):
     r"""
     Predict per-position amino-acid logits from the MSA representation.
-
-    Args:
-        n_feat: Width of the input MSA representation.
-        vocab_size: Number of amino-acid tokens to predict over.
     """
 
     def __init__(self, n_feat: int, vocab_size: int = 21) -> None:
@@ -3111,21 +2273,9 @@ class RfDiffusionMaskedTokenHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Zero-initialize the token head (the RoseTTAFold scheme)."""
-
         _zero_init(self.projection)
 
     def forward(self, msa: torch.Tensor) -> torch.Tensor:
-        r"""
-        Predict amino-acid logits over all MSA positions.
-
-        Args:
-            msa: MSA representation `[B, N, L, n_feat]`.
-
-        Returns:
-            Channel-first logits `[B, vocab_size, N*L]`.
-        """
-
         batch_size, msa_depth, length = msa.shape[:3]
         logits = self.projection(msa).movedim(-1, 1)
         return logits.reshape(batch_size, self.vocab_size, msa_depth * length)
@@ -3134,10 +2284,6 @@ class RfDiffusionMaskedTokenHead(nn.Module):
 class RfDiffusionPredictedLddtHead(nn.Module):
     r"""
     Predict binned per-residue pLDDT logits from the node state.
-
-    Args:
-        n_feat: Width of the input node-state representation.
-        n_bin_lddt: Number of pLDDT bins.
     """
 
     def __init__(self, n_feat: int, n_bin_lddt: int = 50) -> None:
@@ -3146,31 +2292,15 @@ class RfDiffusionPredictedLddtHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Zero-initialize the pLDDT head (the RoseTTAFold scheme)."""
-
         _zero_init(self.projection)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        r"""
-        Predict binned pLDDT logits.
-
-        Args:
-            state: Node-state representation `[B, L, n_feat]`.
-
-        Returns:
-            Channel-first pLDDT logits `[B, n_bin_lddt, L]`.
-        """
-
         return self.projection(state).movedim(-1, 1)
 
 
 class RfDiffusionExperimentallyResolvedHead(nn.Module):
     r"""
     Predict the per-residue "experimentally resolved" logit from the MSA row and node state.
-
-    Args:
-        msa_size: Width of the MSA row input.
-        state_size: Width of the node-state input.
     """
 
     def __init__(self, msa_size: int, state_size: int) -> None:
@@ -3181,40 +2311,18 @@ class RfDiffusionExperimentallyResolvedHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        r"""Zero-initialize the resolved head (the RoseTTAFold scheme)."""
-
         _zero_init(self.projection)
 
     def forward(self, seq: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        r"""
-        Predict the per-residue resolved logit.
-
-        Args:
-            seq: MSA query row `[B, L, msa_size]`.
-            state: Node-state representation `[B, L, state_size]`.
-
-        Returns:
-            The per-residue resolved logit `[B, L]`.
-        """
-
         normalized_seq = self.msa_norm(seq)
         normalized_state = self.state_norm(state)
         logits = self.projection(torch.cat((normalized_seq, normalized_state), dim=-1))
         return logits.squeeze(-1)
 
 
-class EuclideanDiffuser:
+class RfDiffusionTranslationDiffuser:
     r"""
     Discrete Gaussian translation diffuser for backbone CA positions.
-
-    Applies the forward variance-preserving noising kernel to CA translations across all timesteps, using the
-    beta schedule from [`get_beta_schedule`][ofoldx.models.rfdiffusion.model.get_beta_schedule].
-
-    Args:
-        num_timesteps: Total number of diffusion timesteps.
-        beta_initial: Initial beta of the translation schedule.
-        beta_final: Final beta of the translation schedule.
-        schedule_type: Schedule shape; only `"linear"` is supported.
     """
 
     def __init__(
@@ -3226,7 +2334,7 @@ class EuclideanDiffuser:
         schedule_type: str = "linear",
     ) -> None:
         self.num_timesteps = integer_index(num_timesteps)
-        self.beta_schedule, _, _ = get_beta_schedule(
+        self.beta_schedule, _, _ = _beta_schedule(
             self.num_timesteps,
             beta_initial,
             beta_final,
@@ -3242,20 +2350,6 @@ class EuclideanDiffuser:
         num_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Noise CA translations across all timesteps.
-
-        Args:
-            coords: Backbone coords `[L, A, 3]` to noise.
-            diffusion_mask: Per-residue mask; masked (motif) residues stay fixed.
-            var_scale: Multiplier on the per-step variance.
-            generator: Optional RNG for reproducible noise.
-
-        Returns:
-            A tuple ``(noised, deltas)`` of the per-timestep noised coords and per-step deltas, each with the
-            timestep axis first.
-        """
-
         bb_stack: list[Tensor] = []
         delta_stack: list[Tensor] = []
         current = coords
@@ -3283,20 +2377,6 @@ class EuclideanDiffuser:
         var_scale: float = 1.0,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Apply one forward noising step to CA translations at timestep ``t``.
-
-        Args:
-            x: Backbone coords `[L, A, 3]`.
-            t: One-indexed timestep.
-            diffusion_mask: Per-residue mask; masked residues stay fixed.
-            var_scale: Multiplier on the step variance.
-            generator: Optional RNG for reproducible noise.
-
-        Returns:
-            A tuple ``(noised, delta)`` of the noised coords and the CA delta applied.
-
-        """
         t_idx = t - 1
         ca_coords = x[:, 1]
         beta_t = self.beta_schedule.to(device=x.device, dtype=x.dtype)[t_idx]
@@ -3309,28 +2389,9 @@ class EuclideanDiffuser:
         return x + delta[:, None], delta
 
 
-class Igso3Diffuser:
+class RfDiffusionIgso3Diffuser:
     r"""
     Isotropic-Gaussian-on-SO(3) (IGSO3) rotation diffuser and reverse sampler.
-
-    Diffuses residue-frame rotations forward with IGSO3 noise and samples the reverse process. Precomputes (and
-    caches to disk) the IGSO3 CDFs and score norms for inverse-CDF sampling.
-
-    Args:
-        num_timesteps: Total number of diffusion timesteps.
-        min_sigma: Minimum IGSO3 noise sigma.
-        max_sigma: Maximum IGSO3 noise sigma.
-        min_b: Minimum drift coefficient (linear schedule).
-        max_b: Maximum drift coefficient (linear schedule).
-        cache_dir: Directory for the precomputed IGSO3 lookup tables.
-        num_omega: Number of discretized rotation angles.
-        num_sigma: Number of discretized sigma levels.
-        schedule: Sigma-schedule shape (`"linear"` or `"exponential"`).
-        truncation_level: Number of power-series terms used in the density evaluation.
-        igso3_schedule: Model-baked IGSO(3) table returned verbatim for the schedule.
-
-    Raises:
-        ValueError: If ``schedule`` is not `"linear"` or `"exponential"`.
     """
 
     def __init__(
@@ -3368,52 +2429,17 @@ class Igso3Diffuser:
 
     @property
     def discrete_sigma(self) -> np.ndarray:
-        r"""The discretized sigma levels of the precomputed IGSO3 tables."""
-
         return self.igso3_vals["discrete_sigma"]
 
     def sigma_idx(self, sigma: np.ndarray | Tensor | float) -> np.ndarray:
-        r"""
-        Return the lookup-table index for each ``sigma`` value.
-
-        Args:
-            sigma: Noise level(s) to locate in the discretized sigma grid; scalar or array-like.
-
-        Returns:
-            The zero-based table index (via `numpy.digitize`) for each ``sigma``.
-        """
-
         return np.digitize(np.asarray(sigma), self.discrete_sigma) - 1
 
     def t_to_idx(self, t: int | np.ndarray | Tensor) -> np.ndarray:
-        r"""
-        Map a timestep (or array of timesteps) to the IGSO3 sigma-table index via the sigma schedule.
-
-        Args:
-            t: Timestep(s), normalized internally by ``num_timesteps`` before evaluating the sigma schedule.
-
-        Returns:
-            The IGSO3 table index for each timestep.
-        """
-
         return self.sigma_idx(
             self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).detach().cpu().numpy()
         )
 
     def sigma(self, t: Tensor | float) -> Tensor:
-        r"""
-        Return the IGSO3 noise sigma at normalized time ``t`` in ``[0, 1]``.
-
-        Args:
-            t: Normalized time in ``[0, 1]``.
-
-        Returns:
-            The noise sigma at ``t``.
-
-        Raises:
-            ValueError: If ``t`` falls outside ``[0, 1]``.
-        """
-
         t_tensor = torch.as_tensor(t, dtype=torch.float32)
         if torch.any(t_tensor < 0) or torch.any(t_tensor > 1):
             raise ValueError(f"invalid IGSO3 time {t}")
@@ -3423,16 +2449,6 @@ class Igso3Diffuser:
         return self.min_sigma + t_tensor * self.min_b + 0.5 * (t_tensor**2) * (self.max_b - self.min_b)
 
     def diffusion_coefficient(self, t: float | Tensor) -> Tensor:
-        r"""
-        Return the SDE diffusion coefficient (sqrt of d/dt of sigma-squared) at normalized time ``t``.
-
-        Args:
-            t: Normalized time in ``[0, 1]`` at which to evaluate the diffusion coefficient.
-
-        Returns:
-            The scalar diffusion coefficient `sqrt(d(sigma^2)/dt)` at ``t``.
-        """
-
         with torch.inference_mode(False), torch.enable_grad():
             t_tensor = torch.as_tensor(t, dtype=torch.float32).requires_grad_(True)
             sigma_sq = self.sigma(t_tensor) ** 2
@@ -3446,20 +2462,6 @@ class Igso3Diffuser:
         n_samples: int = 1,
         generator: torch.Generator | None = None,
     ) -> np.ndarray:
-        r"""
-        Inverse-CDF sample IGSO3 rotation angles at the given timesteps.
-
-        Args:
-            ts: One-indexed timesteps to sample at.
-            n_samples: Number of angle samples per timestep.
-
-        Returns:
-            Sampled rotation angles `[len(ts), n_samples]`.
-
-        Raises:
-            ValueError: If any timestep is zero (timesteps must be one-indexed).
-        """
-
         if np.any(ts == 0):
             raise ValueError("IGSO3 sample expects one-indexed timesteps")
         all_samples = []
@@ -3478,34 +2480,12 @@ class Igso3Diffuser:
         n_samples: int = 1,
         generator: torch.Generator | None = None,
     ) -> np.ndarray:
-        r"""
-        Sample IGSO3 rotation vectors (random axis times sampled angle) at the given timesteps.
-
-        Args:
-            ts: One-indexed timesteps to sample at.
-            n_samples: Number of rotation vectors per timestep.
-
-        Returns:
-            Rotation vectors `[len(ts), n_samples, 3]` (unit axis scaled by the sampled angle).
-        """
-
         rng_device = torch.device("cpu") if generator is None else generator.device
         axes = torch.randn((len(ts), n_samples, 3), device=rng_device, generator=generator).cpu().numpy()
         axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
         return axes * self.sample(ts, n_samples=n_samples, generator=generator)[..., None]
 
     def score_norm(self, t: int, omega: np.ndarray) -> np.ndarray:
-        r"""
-        Return the IGSO3 score-function magnitude at rotation angles ``omega`` for timestep ``t``.
-
-        Args:
-            t: One-indexed timestep whose sigma level selects the score-norm table.
-            omega: Rotation angles (in radians) at which to interpolate the score magnitude.
-
-        Returns:
-            The interpolated score-function magnitude at each angle in ``omega``.
-        """
-
         sigma_idx = int(np.asarray(self.t_to_idx(t)).item())
         return np.interp(omega, self.igso3_vals["discrete_omega"], self.igso3_vals["score_norm"][sigma_idx])
 
@@ -3517,18 +2497,6 @@ class Igso3Diffuser:
         diffusion_mask: np.ndarray | Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        r"""
-        Noise residue frames with IGSO3 rotations across timesteps.
-
-        Args:
-            coords: Backbone coords `[L, A, 3]` (tensor or array).
-            t_list: Optional one-indexed timesteps to return; all timesteps otherwise.
-            diffusion_mask: Per-residue mask; masked residues keep their frame.
-
-        Returns:
-            A tuple ``(perturbed_coords, perturbed_rotations)`` with the residue axis first.
-        """
-
         if torch.is_tensor(coords):
             coords_np = coords.detach().cpu().numpy()
         else:
@@ -3538,7 +2506,7 @@ class Igso3Diffuser:
         N = torch.from_numpy(coords_np[None, :, 0])
         Ca = torch.from_numpy(coords_np[None, :, 1])
         C = torch.from_numpy(coords_np[None, :, 2])
-        R_true, Ca_true = rigid_from_3_points(N, Ca, C)
+        R_true, Ca_true = _rigid_from_three_points(N, Ca, C)
         R_true_np = R_true[0].detach().cpu().numpy()
         Ca_np = Ca_true[0].detach().cpu().numpy()
         sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
@@ -3563,21 +2531,6 @@ class Igso3Diffuser:
         return_perturb: bool = False,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        r"""
-        Take one reverse IGSO3 step toward the predicted clean rotations.
-
-        Args:
-            rotations_t: Current noisy rotations `[..., 3, 3]`.
-            rotations_0: Predicted clean rotations `[..., 3, 3]`.
-            t: Current timestep.
-            noise_level: Scale on the injected reverse noise.
-            mask: Per-element mask; masked frames are not perturbed.
-            return_perturb: If `True`, return the perturbation rotation instead of the updated rotation.
-
-        Returns:
-            The updated rotations, or the perturbation rotation when ``return_perturb`` is set.
-        """
-
         R_t_t = torch.as_tensor(rotations_t, dtype=torch.float32)
         R_0_t = torch.as_tensor(rotations_0, dtype=torch.float32, device=R_t_t.device)
         R_0t = torch.einsum("...ij,...kj->...ik", R_t_t, R_0_t)
@@ -3600,14 +2553,12 @@ class Igso3Diffuser:
         perturb_tangent = delta_r + rot_g * math.sqrt(self.step_size) * z
         if mask is not None:
             perturb_tangent = perturb_tangent * (1 - mask.long()).to(device=perturb_tangent.device)[:, None]
-        perturb = exp_map(perturb_tangent)
+        perturb = _exponential_map(perturb_tangent)
         if return_perturb:
             return perturb
         return torch.einsum("...ij,...jk->...ik", perturb, R_t_t)
 
     def _calc_igso3_vals(self) -> dict[str, np.ndarray]:
-        r"""Return the model-baked IGSO3 table for the schedule, else load/compute a cache."""
-
         if (
             self.igso3_schedule is not None
             and self.num_timesteps == 50
@@ -3624,7 +2575,7 @@ class Igso3Diffuser:
         if cache_file is not None and cache_file.exists():
             with cache_file.open("rb") as handle:
                 return cast(dict[str, np.ndarray], pickle.load(handle))
-        values = calculate_igso3(
+        values = _calculate_igso3(
             num_sigma=self.num_sigma,
             min_sigma=self.min_sigma,
             max_sigma=self.max_sigma,
@@ -3632,12 +2583,10 @@ class Igso3Diffuser:
             num_terms=self.truncation_level,
         )
         if cache_file is not None:
-            write_pickle(cache_file, values)
+            _write_pickle(cache_file, values)
         return values
 
     def _cache_file(self) -> Path | None:
-        r"""Return the cache-file path encoding the IGSO3 schedule parameters."""
-
         def fmt(value: object) -> str:
             r"""
             Format a schedule value for use in the cache-file name (dots replaced with underscores).
@@ -3666,36 +2615,9 @@ class Igso3Diffuser:
         return None if self.cache_dir is None else self.cache_dir / ("_".join(parts) + ".pkl")
 
 
-class Diffuser:
+class RfDiffusionDiffuser:
     r"""
     RFdiffusion forward pose diffuser coupling translation and rotation noise.
-
-    Combines a [`EuclideanDiffuser`][ofoldx.models.rfdiffusion.model.EuclideanDiffuser] for CA
-    translations and an [`Igso3Diffuser`][ofoldx.models.rfdiffusion.model.Igso3Diffuser] for backbone
-    frames to noise a full pose forward.
-
-    Args:
-        num_timesteps: Total number of diffusion timesteps.
-        beta_initial: Initial translation-noise beta.
-        beta_final: Final translation-noise beta.
-        min_sigma: Minimum IGSO3 sigma.
-        max_sigma: Maximum IGSO3 sigma.
-        min_b: Minimum IGSO3 drift coefficient.
-        max_b: Maximum IGSO3 drift coefficient.
-        schedule_type: Translation beta-schedule shape.
-        so3_schedule_type: IGSO3 sigma-schedule shape.
-        so3_type: Rotation diffuser type; only `"igso3"` is supported.
-        crd_scale: Coordinate-scaling factor applied before noising.
-        var_scale: Multiplier on the translation-noise variance.
-        cache_dir: Directory for the IGSO3 lookup tables.
-        partial_timesteps: Number of steps for partial diffusion, or `None` for full diffusion.
-        truncation_level: Number of IGSO3 series terms.
-        igso3_num_omega: Number of IGSO3 discretized angles.
-        igso3_num_sigma: Number of IGSO3 discretized sigma levels.
-        igso3_schedule: Model-baked IGSO(3) table used verbatim for the schedule.
-
-    Raises:
-        ValueError: If ``so3_type`` is not `"igso3"` or ``partial_timesteps`` is out of range.
     """
 
     def __init__(
@@ -3731,7 +2653,7 @@ class Diffuser:
         self.crd_scale = float(crd_scale)
         self.var_scale = float(var_scale)
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
-        self.so3_diffuser = Igso3Diffuser(
+        self.so3_diffuser = RfDiffusionIgso3Diffuser(
             num_timesteps=self.num_timesteps,
             min_sigma=self.min_sigma,
             max_sigma=self.max_sigma,
@@ -3744,7 +2666,7 @@ class Diffuser:
             num_sigma=igso3_num_sigma,
             igso3_schedule=igso3_schedule,
         )
-        self.eucl_diffuser = EuclideanDiffuser(
+        self.eucl_diffuser = RfDiffusionTranslationDiffuser(
             self.num_timesteps,
             beta_initial,
             beta_final,
@@ -3761,26 +2683,6 @@ class Diffuser:
         t_list: np.ndarray | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Noise a full pose forward across the diffusion schedule.
-
-        Centers on the motif (or global) centroid, noises translations and frames, recombines them, and
-        optionally copies motif sidechains through.
-
-        Args:
-            coords: Backbone coords `[L, 27, 3]` to noise.
-            atom_mask: Atom mask used when preserving fixed motif sidechains.
-            include_motif_sidechains: Whether to preserve fixed-motif sidechain coords.
-            diffusion_mask: Per-residue mask; masked (motif) residues stay fixed.
-            t_list: Optional one-indexed timesteps to return; all timesteps otherwise.
-            generator: Optional RNG for reproducible noise.
-
-        Returns:
-            A tuple ``(diffused_fullatom, true_coords)`` of the noised atom27 trajectory and the centered
-            clean coords.
-
-        """
-
         if diffusion_mask is None:
             diffusion_mask = torch.zeros(len(coords.squeeze()), dtype=torch.bool, device=coords.device)
         diffusion_mask = diffusion_mask.to(device=coords.device).bool()
@@ -3835,24 +2737,6 @@ class Diffuser:
 class RfDiffusionSampler:
     r"""
     PyTorch reverse-diffusion loop over one canonical RFdiffusion input.
-
-    Args:
-        config: Model architecture and diffusion process.
-        denoiser: The RoseTTAFold denoiser called at each reverse step.
-        all_atom_reconstruction: Atom-coordinate reconstruction module.
-        igso3_schedule: The model-baked IGSO(3) lookup table used verbatim for the schedule.
-        final_step: Last reverse timestep.
-        partial_steps: Optional partial-diffusion starting timestep.
-        noise_scale_ca: Initial CA-translation noise scale at the first reverse step.
-        final_noise_scale_ca: Optional CA-translation interpolation endpoint for a linear schedule.
-        ca_noise_schedule: CA noise schedule, ``"constant"`` or ``"linear"``.
-        noise_scale_frame: Initial backbone-frame noise scale at the first reverse step.
-        final_noise_scale_frame: Optional backbone-frame interpolation endpoint for a linear schedule.
-        frame_noise_schedule: Frame noise schedule, ``"constant"`` or ``"linear"``.
-        align_motif: Whether to align each predicted clean structure onto a fixed motif.
-        symmetry_recenter: Whether octahedral units are individually recentered and placed on a radius.
-        symmetry_radius_angstrom: Octahedral placement radius.
-        schedule_directory: Local IGSO(3) table cache.
     """
 
     def __init__(
@@ -3922,7 +2806,7 @@ class RfDiffusionSampler:
         self.igso3_truncation_level = 2000
         self.igso3_num_omega = 1000
         self.igso3_num_sigma = 500
-        self.diffuser: Diffuser | None = None
+        self.diffuser: RfDiffusionDiffuser | None = None
 
     def sample(
         self,
@@ -3933,28 +2817,6 @@ class RfDiffusionSampler:
         generator: torch.Generator | None = None,
         return_trajectory: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Run one RFdiffusion reverse-diffusion trajectory end to end.
-
-        Initializes the noised structure, then steps from the starting timestep down to ``final_step``, calling
-        the denoiser and reverse sampler step each iteration and accumulating the coord trajectory.
-
-        Args:
-            input: One canonical RFdiffusion tensor input.
-            num_sampling_steps: Number of timesteps in the active translation, rotation, and time-feature schedules.
-            final_step: Last (smallest) timestep to denoise to; defaults to the constructor value.
-            generator: Optional RNG for reproducible sampling.
-            return_trajectory: Whether to retain every reverse step on CPU.
-
-        Returns:
-            Final denoised coordinates and sequence tokens followed by timesteps,
-            pLDDT, denoised coordinates, and next-step coordinates. The final tensors have a
-            length-one timestep axis unless full CPU trajectories were requested.
-
-        Examples:
-            >>> result = sampler.sample(input)  # doctest: +SKIP
-        """
-
         active_steps = (
             self.config.diffuser.num_timesteps if num_sampling_steps is None else integer_index(num_sampling_steps)
         )
@@ -3974,9 +2836,9 @@ class RfDiffusionSampler:
         mask_structure = input.fixed_structure_mask
         diffusion_mask = mask_structure.squeeze(0)
         diffuser = self._make_diffuser(active_steps)
-        length = input.noisy_coords.shape[1]
-        coords27 = input.noisy_coords.new_full((length, 27, 3), float("nan"))
-        coords27[:, :14] = input.noisy_coords[0]
+        length = input.noisy_coordinates.shape[1]
+        coords27 = input.noisy_coordinates.new_full((length, 27, 3), float("nan"))
+        coords27[:, :14] = input.noisy_coordinates[0]
         atom_mask = torch.isfinite(coords27).all(dim=-1)
         original_sequence = input.sequence[0].argmax(dim=-1)
         if bool(diffusion_mask.any()):
@@ -4000,7 +2862,7 @@ class RfDiffusionSampler:
                         )
             initial_coords = coords27
         else:
-            initial_coords = get_init_coords(coords27[None, None]).squeeze(0).squeeze(0)
+            initial_coords = _initial_coordinates(coords27[None, None]).squeeze(0).squeeze(0)
 
         trajectory_steps = active_steps
         if self.partial_steps is not None:
@@ -4011,8 +2873,8 @@ class RfDiffusionSampler:
         if not 1 <= stop_t <= start_t:
             raise ValueError("final_step must be between 1 and the starting timestep")
         sequence = original_sequence.clone()
-        sequence[~mask_sequence.squeeze(0)] = MASK_TOKEN
-        sequence = one_hot_sequence(sequence)
+        sequence[~mask_sequence.squeeze(0)] = RFDIFFUSION_MASK_TOKEN_ID
+        sequence = _one_hot_sequence(sequence)
         diffused, _clean = diffuser.diffuse_pose(
             initial_coords,
             atom_mask,
@@ -4168,30 +3030,12 @@ class RfDiffusionSampler:
         timestep: int,
         *,
         fixed_structure_mask: Tensor,
-        diffuser: Diffuser,
+        diffuser: RfDiffusionDiffuser,
         previous_prediction: Tensor | None,
         secondary_structure: Tensor,
         block_adjacency: Tensor,
         hotspot_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""
-        Assemble the RoseTTAFold denoiser input tensors for one timestep.
-
-        Builds latent/full MSA features, template features and coordinates, and torsion features. Optional hotspot,
-        scaffold, and self-conditioning features are incorporated here.
-
-        Args:
-            sequence: Current one-hot sequence features `[L, 22]`.
-            template_coordinates: Current template backbone coordinates `[L, A, 3]`.
-            timestep: Current diffusion timestep.
-            fixed_structure_mask: Residues whose structure remains fixed.
-            diffuser: Forward diffusion process defining the timestep schedule.
-            previous_prediction: Optional self-conditioning backbone coordinates.
-            secondary_structure: Per-residue secondary-structure features.
-            block_adjacency: Pairwise scaffold adjacency features.
-            hotspot_mask: Residues used as binding hotspots.
-        """
-
         length = sequence.shape[0]
         latent_msa_features = sequence.new_zeros((1, 1, length, 48))
         latent_msa_features[:, :, :, :22] = sequence[None, None]
@@ -4204,9 +3048,9 @@ class RfDiffusionSampler:
         full_msa_features[:, :, -1, 24] = 1.0
         template_single_features = sequence.new_zeros((1, 1, length, 21))
         visible_sequence = sequence.clone()
-        mask_token_positions = visible_sequence[:, MASK_TOKEN] == 1
+        mask_token_positions = visible_sequence[:, RFDIFFUSION_MASK_TOKEN_ID] == 1
         visible_sequence[mask_token_positions, 20] = 1
-        visible_sequence[mask_token_positions, MASK_TOKEN] = 0
+        visible_sequence[mask_token_positions, RFDIFFUSION_MASK_TOKEN_ID] = 0
         template_single_features[:, :, :, :21] = visible_sequence[None, None, :, :21]
         time_feature = sequence.new_zeros((length,))
         time_feature[fixed_structure_mask.squeeze(0)] = 1
@@ -4229,9 +3073,9 @@ class RfDiffusionSampler:
             dim=3,
         )
         noisy_coordinates_input = template_coordinates.squeeze(0)
-        template_pair_features = template_pair_features_from_coordinates(template_coordinates)
+        template_pair_features = _template_pair_features(template_coordinates)
         template_sequence = template_single_features[..., :-1].argmax(dim=-1).reshape(1, length)
-        template_torsion_features = build_template_torsion_features(template_coordinates, template_sequence)
+        template_torsion_features = _template_torsion_features(template_coordinates, template_sequence)
         if self.config.preprocess.structure_self_conditioning:
             if previous_prediction is not None and (
                 timestep < diffuser.num_timesteps and timestep != self.partial_steps
@@ -4239,7 +3083,7 @@ class RfDiffusionSampler:
                 previous_coordinates = previous_prediction[:, :3][None, None]
                 zeros = previous_coordinates.new_zeros((1, 1, length, 24, 3))
                 template_coordinates = torch.cat((previous_coordinates, zeros), dim=-2)
-                template_pair_features[..., :44] = template_pair_features_from_coordinates(template_coordinates)
+                template_pair_features[..., :44] = _template_pair_features(template_coordinates)
             else:
                 template_pair_features[..., :44] = 0
                 template_coordinates = torch.zeros_like(template_coordinates)
@@ -4273,13 +3117,11 @@ class RfDiffusionSampler:
             template_torsion_features,
         )
 
-    def _make_diffuser(self, num_timesteps: int) -> Diffuser:
-        r"""Construct the forward [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser] from config."""
-
+    def _make_diffuser(self, num_timesteps: int) -> RfDiffusionDiffuser:
         if self.diffuser is not None and self.diffuser.num_timesteps == num_timesteps:
             return self.diffuser
         config = self.config.diffuser
-        diffuser = Diffuser(
+        diffuser = RfDiffusionDiffuser(
             num_timesteps=num_timesteps,
             beta_initial=config.beta_initial,
             beta_final=config.beta_final,
@@ -4305,11 +3147,9 @@ class RfDiffusionSampler:
         self,
         length: int,
         *,
-        diffuser: Diffuser,
+        diffuser: RfDiffusionDiffuser,
         guidance: RfDiffusionGuidance | None,
     ) -> RfDiffusionSamplerStep:
-        r"""Construct one reverse-diffusion sampler step from config."""
-
         config = self.config.diffuser
         return RfDiffusionSamplerStep(
             num_timesteps=diffuser.num_timesteps,
@@ -4336,39 +3176,13 @@ class RfDiffusionSampler:
 class RfDiffusionSamplerStep:
     r"""
     Reverse RFdiffusion pose updater stepping ``x_t`` toward ``x_{t-1}``.
-
-    Combines the CA-translation posterior sample and the IGSO3 frame reverse step, optionally aligns the
-    prediction onto the fixed motif.
-
-    Args:
-        num_timesteps: Total number of diffusion timesteps.
-        truncation_level: IGSO3 series truncation (also the design length here).
-        diffuser: The forward [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser].
-        beta_initial: Initial translation beta.
-        beta_final: Final translation beta.
-        schedule_type: Translation beta-schedule shape.
-        so3_type: Rotation diffuser type; only `"igso3"` is supported.
-        noise_scale_ca: Initial CA-translation noise scale.
-        final_noise_scale_ca: Optional CA-translation endpoint for a linear schedule.
-        ca_noise_schedule: CA noise-schedule shape.
-        noise_scale_frame: Initial frame (rotation) noise scale.
-        final_noise_scale_frame: Optional frame endpoint for a linear schedule.
-        frame_noise_schedule: Frame noise-schedule shape.
-        crd_scale: Coordinate-scaling factor.
-        partial_timesteps: Number of steps for partial diffusion, or `None`.
-        guidance: Canonical soft geometric Conditions lowered to a differentiable scalar.
-        guidance_scale: Overall gradient scale.
-        guidance_decay: Constant, linear, quadratic, or cubic decay over reverse time.
-
-    Raises:
-        ValueError: If ``partial_timesteps`` is out of range.
     """
 
     def __init__(
         self,
         num_timesteps: int,
         truncation_level: int,
-        diffuser: Diffuser,
+        diffuser: RfDiffusionDiffuser,
         *,
         beta_initial: float = 0.001,
         beta_final: float = 0.1,
@@ -4420,19 +3234,19 @@ class RfDiffusionSamplerStep:
         self.guidance = guidance
         self.guidance_scale = guidance_scale
         self.guidance_decay = guidance_decay
-        self.schedule, _, self.alphabar_schedule = get_beta_schedule(
+        self.schedule, _, self.alphabar_schedule = _beta_schedule(
             self.num_timesteps,
             self.beta_initial,
             self.beta_final,
             self.schedule_type,
         )
-        self.noise_schedule_ca = get_noise_schedule(
+        self.noise_schedule_ca = _noise_schedule(
             self.num_timesteps,
             self.noise_scale_ca,
             self.final_noise_scale_ca,
             self.ca_noise_schedule,
         )
-        self.noise_schedule_frame = get_noise_schedule(
+        self.noise_schedule_frame = _noise_schedule(
             self.num_timesteps,
             self.noise_scale_frame,
             self.final_noise_scale_frame,
@@ -4441,18 +3255,6 @@ class RfDiffusionSamplerStep:
 
     @staticmethod
     def align_prediction_to_noisy_motif(pred_coords: Tensor, final_coords: Tensor, diffusion_mask: Tensor) -> Tensor:
-        r"""
-        Kabsch-align predicted coords onto the fixed motif residues in ``final_coords``.
-
-        Args:
-            pred_coords: Predicted coords `[L, A, 3]` to align.
-            final_coords: Reference (noised) coords `[L, A, 3]` holding the fixed motif.
-            diffusion_mask: Per-residue mask selecting the motif residues to align on.
-
-        Returns:
-            The aligned predicted coords `[L, A, 3]`.
-
-        """
         output_dtype = pred_coords.dtype
         atom_mask = ~torch.isnan(pred_coords)
         working_coords = pred_coords.float()
@@ -4487,29 +3289,12 @@ class RfDiffusionSamplerStep:
         include_motif_sidechains: bool = True,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Step the pose from ``x_t`` to ``x_{t-1}``.
-
-        Args:
-            noisy_coords: Current noised coords `[L, 14 or 27, 3]`.
-            pred_coords: Predicted clean coords `[L, 14 or 27, 3]`.
-            t: Current timestep.
-            diffusion_mask: Per-residue mask; masked (motif) residues stay fixed.
-            align_motif: Whether to Kabsch-align the prediction onto the motif first.
-            include_motif_sidechains: Whether to preserve motif sidechain coords.
-            generator: Optional RNG for reproducible denoising.
-
-        Returns:
-            A tuple ``(next_coords, pred_coords)`` of the atom14 next pose and the (possibly aligned)
-            prediction.
-
-        """
         diffusion_mask = diffusion_mask.to(device=noisy_coords.device).bool()
         if align_motif and diffusion_mask.any():
             pred_coords = self.align_prediction_to_noisy_motif(pred_coords, noisy_coords, diffusion_mask)
         pred_coords = pred_coords.to(device=noisy_coords.device, dtype=noisy_coords.dtype)
         noise_scale_ca = self.noise_schedule_ca(t)
-        _out, ca_deltas = get_next_ca(
+        _out, ca_deltas = _next_alpha_carbon(
             noisy_coords,
             pred_coords,
             t,
@@ -4521,7 +3306,7 @@ class RfDiffusionSamplerStep:
             generator=generator,
         )
         noise_scale_frame = self.noise_schedule_frame(t)
-        frames_next = get_next_frames(
+        frames_next = _next_frames(
             noisy_coords,
             pred_coords,
             t,
@@ -4554,7 +3339,9 @@ class RfDiffusionSamplerStep:
 
 
 class RfDiffusionSymmetry:
-    r"""Project declared RfDiffusionPointGroupSymmetry units onto one exact rotation group."""
+    r"""
+    Project declared RfDiffusionPointGroupSymmetry units onto one exact rotation group.
+    """
 
     def __init__(self, condition: RfDiffusionPointGroupSymmetry, layout: RfDiffusionLayout) -> None:
         row_by_reference = {reference: row for row, reference in enumerate(layout.output_residues)}
@@ -4590,8 +3377,6 @@ class RfDiffusionSymmetry:
 
     @staticmethod
     def rotation_matrices(kind: str, order: int | None) -> tuple[Tensor, ...]:
-        r"""Return RFdiffusion point-group matrices in the order."""
-
         if kind == "cyclic":
             angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
             matrices = np.stack(
@@ -4606,7 +3391,7 @@ class RfDiffusionSymmetry:
                     for angle in angles
                 ]
             )
-        elif kind == "dihedral":
+        elif kind == "_dihedral_angle":
             angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
             flip = np.diag((1.0, -1.0, -1.0))
             matrices = []
@@ -4709,8 +3494,6 @@ class RfDiffusionSymmetry:
         recenter: bool,
         radius_angstrom: float,
     ) -> tuple[Tensor, Tensor]:
-        r"""Project coordinates and sequence from the first declared unit."""
-
         projected_coords = coords.clone()
         projected_sequence = sequence.clone()
         base_index = torch.tensor(self.units[0], device=coords.device)
@@ -4728,8 +3511,6 @@ class RfDiffusionSymmetry:
         return projected_coords, projected_sequence
 
     def chain_broken_residue_index(self, residue_index: Tensor) -> Tensor:
-        r"""Add the full-design-length unit breaks to residue indices."""
-
         result = residue_index.clone()
         offset = result.shape[-1]
         for unit_index, rows in enumerate(self.units):
@@ -4738,7 +3519,9 @@ class RfDiffusionSymmetry:
 
 
 class RfDiffusionGuidance:
-    r"""Differentiate canonical soft geometric Conditions during reverse diffusion."""
+    r"""
+    Differentiate canonical soft geometric Conditions during reverse diffusion.
+    """
 
     def __init__(
         self,
@@ -4924,7 +3707,7 @@ class RfDiffusionGuidance:
             entity = self.layout.system.entities[self.layout.system.instances[reference[0]]]
             if entity.components[reference[1]].component_id == "GLY":
                 return coords[row, 1]
-        return generate_cbeta(coords[row, 0], coords[row, 1], coords[row, 2])
+        return _beta_carbon(coords[row, 0], coords[row, 1], coords[row, 2])
 
     def _atom(self, reference: AtomSite | SymbolicAtomSite, coords: Tensor) -> Tensor:
         if isinstance(reference, SymbolicAtomSite):
@@ -4938,7 +3721,7 @@ class RfDiffusionGuidance:
             system = cast(MolecularSystem, self.layout.system)
             entity = system.entities[system.instances[atom_site.instance_id]]
             component_id = entity.components[atom_site.component_index].component_id
-            protein_atom_names = ATOM14_NAMES[residue_token(component_id)]
+            protein_atom_names = RFDIFFUSION_ATOM14_NAMES[rfdiffusion_residue_token_id(component_id)]
             return coords[row, protein_atom_names.index(atom_site.atom_id)]
         source_index = self.structure_index[atom_site]
         value = torch.tensor(
@@ -4960,12 +3743,12 @@ class RfDiffusionGuidance:
             torch.tensor(self.anchor_rows, device=coords.device),
             torch.tensor(self.anchor_atoms, device=coords.device),
         ]
-        source_rotation, source_calpha = rigid_from_3_points(
+        source_rotation, source_calpha = _rigid_from_three_points(
             source_anchors[0],
             source_anchors[1],
             source_anchors[2],
         )
-        target_rotation, target_calpha = rigid_from_3_points(
+        target_rotation, target_calpha = _rigid_from_three_points(
             target_anchors[0],
             target_anchors[1],
             target_anchors[2],
@@ -4983,7 +3766,8 @@ _LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def _torch_se3_basis(relative_pos: Tensor, max_degree: int) -> dict[str, Tensor]:
-    r"""Build the unpadded real SE(3) basis used by RFdiffusion.
+    r"""
+    Build the unpadded real SE(3) basis used by RFdiffusion.
 
     Args:
         relative_pos: Floating edge displacement tensor ``[E, 3]``. Zero
@@ -5089,7 +3873,8 @@ def _torch_segment_sum_csr(
     *,
     num_segments: int | None = None,
 ) -> Tensor:
-    r"""Sum edge-leading ``values`` inside destination-sorted CSR segments.
+    r"""
+    Sum edge-leading ``values`` inside destination-sorted CSR segments.
 
     ``values`` has shape ``[E, ...]`` and ``row_offsets`` has shape ``[N+1]``.
     Offsets are int32/int64 on the same device, start at zero, are monotonically
@@ -5112,7 +3897,8 @@ def _torch_segment_sum_csr(
 
 
 def _torch_segment_softmax_csr(logits: Tensor, row_offsets: Tensor) -> Tensor:
-    r"""Apply a numerically stable softmax within each CSR segment.
+    r"""
+    Apply a numerically stable softmax within each CSR segment.
 
     ``logits`` has shape ``[E, ...]`` and uses the same offset contract as
     [`_torch_segment_sum_csr`][]. Softmax is taken over the edge axis independently
@@ -5140,7 +3926,8 @@ def _torch_segment_softmax_csr(logits: Tensor, row_offsets: Tensor) -> Tensor:
 
 
 def _torch_weighted_tensor_product(features: Tensor, basis: Tensor, radial_weights: Tensor) -> Tensor:
-    r"""Apply the RFdiffusion edge-wise basis and radial channel mixing.
+    r"""
+    Apply the RFdiffusion edge-wise basis and radial channel mixing.
 
     Args:
         features: Floating tensor ``[E, C_in, D_in]``.
@@ -5205,7 +3992,9 @@ def _se3_basis(
     *,
     operator_backend: str = "auto",
 ) -> dict[str, Tensor]:
-    r"""Dispatch the exact RFdiffusion SE(3)-basis contract."""
+    r"""
+    Dispatch the exact RFdiffusion SE(3)-basis contract.
+    """
 
     selected = resolve_tensor_operator_backend(
         operator_backend,
@@ -5233,7 +4022,9 @@ def _segment_sum_csr(
     num_segments: int | None = None,
     operator_backend: str = "auto",
 ) -> Tensor:
-    r"""Dispatch the exact RFdiffusion CSR-sum contract."""
+    r"""
+    Dispatch the exact RFdiffusion CSR-sum contract.
+    """
 
     selected = resolve_tensor_operator_backend(
         operator_backend,
@@ -5259,7 +4050,9 @@ def _segment_softmax_csr(
     *,
     operator_backend: str = "auto",
 ) -> Tensor:
-    r"""Dispatch the exact RFdiffusion CSR-softmax contract."""
+    r"""
+    Dispatch the exact RFdiffusion CSR-softmax contract.
+    """
 
     selected = resolve_tensor_operator_backend(
         operator_backend,
@@ -5279,7 +4072,9 @@ def _weighted_tensor_product(
     *,
     operator_backend: str = "auto",
 ) -> Tensor:
-    r"""Dispatch the exact RFdiffusion weighted tensor-product contract."""
+    r"""
+    Dispatch the exact RFdiffusion weighted tensor-product contract.
+    """
 
     selected = resolve_tensor_operator_backend(
         operator_backend,
@@ -5299,11 +4094,26 @@ def _weighted_tensor_product(
     )
 
 
-def terminal_cyclization_instance(
+def rfdiffusion_terminal_cyclization_instance(
     condition: SymbolicBond,
     row_by_reference: Mapping[ComponentReference | SymbolicResidueSite, int],
     output_instances: tuple[str, ...],
 ) -> str:
+    r"""
+    Resolve an intrachain terminal peptide bond to its output instance.
+
+    Args:
+        condition: Requested symbolic bond between the terminal nitrogen and carbon.
+        row_by_reference: Output-row lookup for concrete and symbolic residues.
+        output_instances: Output instance identifier for each residue row.
+
+    Returns:
+        The instance identifier of the cyclic protein chain.
+
+    Raises:
+        ValueError: If the bond is not an intrachain terminal peptide cyclization.
+    """
+
     endpoints: list[tuple[int, str]] = []
     for site in (condition.site_a, condition.site_b):
         if isinstance(site, SymbolicAtomSite):
@@ -5331,7 +4141,9 @@ def terminal_cyclization_instance(
 
 
 def rfdiffusion_secondary_structure(calpha: Tensor) -> Tensor:
-    r"""Assign the helper's P-SEA helix/strand/loop labels."""
+    r"""
+    Assign the helper's P-SEA helix/strand/loop labels.
+    """
 
     length = calpha.shape[0]
     labels = torch.full((length,), 2, dtype=torch.int64, device=calpha.device)
@@ -5421,12 +4233,13 @@ def rfdiffusion_secondary_structure(calpha: Tensor) -> Tensor:
     return labels
 
 
-def materialize_placement_map(
+def _materialize_placement_map(
     placement: RfDiffusionPlacements,
     output_residues: Sequence[ComponentReference | SymbolicResidueSite],
     residue_map: Mapping[ComponentReference | SymbolicResidueSite, ComponentReference],
 ) -> tuple[PlacementMap, dict[str, str]]:
-    r"""Lift the sampled flat surface into the shared ``placement_map``.
+    r"""
+    Lift the sampled flat surface into the shared ``placement_map``.
 
     ``placement`` is the declared [`RfDiffusionPlacements`][] condition; ``output_residues``
     is the post-sample flat identity tuple (each entry a source ``ComponentReference`` for an
@@ -5474,7 +4287,9 @@ def _check_exhaustive(
     output_residues: Sequence[ComponentReference | SymbolicResidueSite],
     residue_map: Mapping[ComponentReference | SymbolicResidueSite, ComponentReference],
 ) -> None:
-    r"""Require ``placement_map`` to partition the materialized output exactly once."""
+    r"""
+    Require ``placement_map`` to partition the materialized output exactly once.
+    """
 
     addressed = [
         reference for group in placement_map.values() for occurrences in group.values() for reference in occurrences
@@ -5494,7 +4309,9 @@ def _check_exhaustive(
 
 
 def _plddt_expectation(logits: Tensor) -> Tensor:
-    r"""Convert per-bin pLDDT logits `[B, num_bins, L]` into the expected pLDDT value `[B, L]`."""
+    r"""
+    Convert per-bin pLDDT logits `[B, num_bins, L]` into the expected pLDDT value `[B, L]`.
+    """
 
     num_bins = logits.shape[1]
     bins = torch.linspace(1.0 / num_bins, 1.0, num_bins, dtype=logits.dtype, device=logits.device)
@@ -5502,14 +4319,18 @@ def _plddt_expectation(logits: Tensor) -> Tensor:
 
 
 def _chain_indices(residue_index: torch.Tensor, threshold: int = 35) -> torch.Tensor:
-    r"""Assign a chain id per residue by detecting large jumps (> ``threshold``) in the residue index."""
+    r"""
+    Assign a chain id per residue by detecting large jumps (> ``threshold``) in the residue index.
+    """
 
     starts = (residue_index[:, 1:] - residue_index[:, :-1] > threshold).to(torch.int64)
     return torch.cat((torch.zeros_like(residue_index[:, :1]), starts), dim=1).cumsum(dim=1)
 
 
 def _cyclic_mask(cyclize: torch.Tensor | None, residue_index: torch.Tensor) -> torch.Tensor | None:
-    r"""Broadcast a cyclic-residue mask to `[B, L]` on ``residue_index``'s device, or return `None` when unset."""
+    r"""
+    Broadcast a cyclic-residue mask to `[B, L]` on ``residue_index``'s device, or return `None` when unset.
+    """
 
     if cyclize is None:
         return None
@@ -5520,13 +4341,17 @@ def _cyclic_mask(cyclize: torch.Tensor | None, residue_index: torch.Tensor) -> t
 
 
 def _one_hot_lookup(one_hot: torch.Tensor, embedding: nn.Embedding) -> torch.Tensor:
-    r"""Look up embedding rows via a one-hot matmul, so soft (non-integer) sequence inputs are supported."""
+    r"""
+    Look up embedding rows via a one-hot matmul, so soft (non-integer) sequence inputs are supported.
+    """
 
     return torch.matmul(one_hot, embedding.weight)
 
 
 def _zero_bias(linear: nn.Linear) -> None:
-    r"""Zero the bias of a linear layer in place."""
+    r"""
+    Zero the bias of a linear layer in place.
+    """
 
     nn.init.zeros_(linear.bias)
 
@@ -5539,32 +4364,42 @@ _DEFAULT_SE3_CONFIG = {
 
 
 def _se3_config(params: Mapping[str, int] | None) -> dict[str, int]:
-    r"""Return a copy of ``params`` (or the default SE(3) sizing) as a plain mutable dict."""
+    r"""
+    Return a copy of ``params`` (or the default SE(3) sizing) as a plain mutable dict.
+    """
 
     return dict(_DEFAULT_SE3_CONFIG if params is None else params)
 
 
 def _query_state_update(msa: Tensor, state: Tensor) -> Tensor:
-    r"""Add the projected node ``state`` into the query (row 0) slot of ``msa``."""
+    r"""
+    Add the projected node ``state`` into the query (row 0) slot of ``msa``.
+    """
 
     query_index = torch.zeros(1, dtype=torch.long, device=state.device)
     return msa.index_add(1, query_index, state)
 
 
 def _backbone_ca_distogram(coords: Tensor) -> Tensor:
-    r"""Return the radial-basis distogram of the backbone CA-CA distances from coords `[B, L, A, 3]`."""
+    r"""
+    Return the radial-basis distogram of the backbone CA-CA distances from coords `[B, L, A, 3]`.
+    """
 
-    return rbf(torch.cdist(coords[:, :, 1], coords[:, :, 1]))
+    return _radial_basis(torch.cdist(coords[:, :, 1], coords[:, :, 1]))
 
 
 def _apply_frames(rotations: Tensor, translations: Tensor, local_coords: Tensor) -> Tensor:
-    r"""Apply per-residue frames ``(rotations, translations)`` to ``local_coords`` `[B, L, A, 3]`."""
+    r"""
+    Apply per-residue frames ``(rotations, translations)`` to ``local_coords`` `[B, L, A, 3]`.
+    """
 
     return einsum("bnij,bnaj->bnai", rotations, local_coords) + translations.unsqueeze(-2)
 
 
 def _initial_frames(coords: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    r"""Build identity rotations, CA translations, and CA-centered local coords from backbone coords."""
+    r"""
+    Build identity rotations, CA translations, and CA-centered local coords from backbone coords.
+    """
 
     batch_size, length = coords.shape[:2]
     rotations = torch.eye(3, device=coords.device).reshape(1, 1, 3, 3).expand(batch_size, length, -1, -1)
@@ -5574,7 +4409,9 @@ def _initial_frames(coords: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
 
 def _quaternion_update_matrix(rotation_vector: Tensor, *, device: torch.device) -> Tensor:
-    r"""Convert a per-residue rotation vector `[B, L, 3]` into a rotation matrix `[B, L, 3, 3]` via a quaternion."""
+    r"""
+    Convert a per-residue rotation vector `[B, L, 3]` into a rotation matrix `[B, L, 3, 3]` via a quaternion.
+    """
 
     norm = torch.sqrt(1 + torch.sum(rotation_vector * rotation_vector, dim=-1))
     q_a = 1 / norm
@@ -5609,7 +4446,7 @@ def _quaternion_update_matrix(rotation_vector: Tensor, *, device: torch.device) 
     return torch.stack((row0, row1, row2), dim=-2).to(device=device)
 
 
-def degree_to_dim(degree: int) -> int:
+def _degree_to_dimension(degree: int) -> int:
     r"""
     Return the dimension ``2*degree + 1`` of a spherical-harmonic feature of the given degree.
 
@@ -5618,47 +4455,33 @@ def degree_to_dim(degree: int) -> int:
 
     Returns:
         The number of components a single feature of that degree occupies.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import degree_to_dim
-        >>> [degree_to_dim(d) for d in (0, 1, 2)]
-        [1, 3, 5]
     """
 
     return 2 * degree + 1
 
 
-def unfuse_features(features: Tensor, degrees: Iterable[int]) -> dict[str, Tensor]:
+def _unfuse_features(features: Tensor, degrees: Iterable[int]) -> dict[str, Tensor]:
     r"""
     Split a fused feature tensor into a per-degree dict.
 
     Args:
-        features: Fused features `[..., sum(degree_to_dim(d) for d in degrees)]`.
+        features: Fused features `[..., sum(_degree_to_dimension(d) for d in degrees)]`.
         degrees: Degrees present, in the order they are packed along the last axis.
 
     Returns:
         A dict keyed by string degree, each holding the slice for that degree.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import unfuse_features
-        >>> out = unfuse_features(torch.arange(4.0).reshape(1, 4), [0, 1])
-        >>> {k: v.tolist() for k, v in out.items()}
-        {'0': [[0.0]], '1': [[1.0, 2.0, 3.0]]}
     """
 
     degree_list = list(degrees)
     return dict(
         zip(
             [str(degree) for degree in degree_list],
-            features.split([degree_to_dim(degree) for degree in degree_list], dim=-1),
+            features.split([_degree_to_dimension(degree) for degree in degree_list], dim=-1),
         )
     )
 
 
-def get_populated_edge_features(
-    relative_pos: Tensor, edge_features: dict[str, Tensor] | None = None
-) -> dict[str, Tensor]:
+def _populated_edge_features(relative_pos: Tensor, edge_features: dict[str, Tensor] | None = None) -> dict[str, Tensor]:
     r"""
     Append the edge length as an invariant (degree-0) feature to the edge feature dict.
 
@@ -5679,26 +4502,30 @@ def get_populated_edge_features(
     return edge_features
 
 
-DIST_BINS = 37
-OMEGA_BINS = 37
-THETA_BINS = 37
-PHI_BINS = 19
+_DISTANCE_BINS = 37
+_OMEGA_BINS = 37
+_THETA_BINS = 37
+_PHI_BINS = 19
 
 
 def _zero_init(linear: nn.Linear) -> None:
-    r"""Zero both the weight and bias of a linear head in place."""
+    r"""
+    Zero both the weight and bias of a linear head in place.
+    """
 
     nn.init.zeros_(linear.weight)
     nn.init.zeros_(linear.bias)
 
 
 def _channel_first(logits: torch.Tensor) -> torch.Tensor:
-    r"""Move the last (channel) axis of ``logits`` to position 1, matching the channel-first head convention."""
+    r"""
+    Move the last (channel) axis of ``logits`` to position 1, matching the channel-first head convention.
+    """
 
     return logits.movedim(-1, 1)
 
 
-def init_lecun_normal(module: nn.Module) -> nn.Module:
+def _initialize_lecun_normal(module: nn.Module) -> nn.Module:
     r"""
     Re-initialize a layer's weight in place with the truncated Lecun-normal scheme, returning the layer.
 
@@ -5709,11 +4536,11 @@ def init_lecun_normal(module: nn.Module) -> nn.Module:
         The same ``module`` with its weight replaced.
     """
 
-    module.weight = nn.Parameter(init_lecun_normal_param(module.weight))
+    module.weight = nn.Parameter(_lecun_normal_tensor(module.weight))
     return module
 
 
-def init_lecun_normal_param(weight: torch.Tensor) -> torch.Tensor:
+def _lecun_normal_tensor(weight: torch.Tensor) -> torch.Tensor:
     r"""
     Draw a truncated Lecun-normal initialization tensor shaped like ``weight``.
 
@@ -5722,13 +4549,6 @@ def init_lecun_normal_param(weight: torch.Tensor) -> torch.Tensor:
 
     Returns:
         A new tensor of the same shape, drawn from the truncated Lecun-normal distribution.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import init_lecun_normal_param
-        >>> _ = torch.manual_seed(0)
-        >>> init_lecun_normal_param(torch.zeros(2, 3)).shape
-        torch.Size([2, 3])
     """
 
     if weight.is_meta:
@@ -5767,7 +4587,7 @@ def init_lecun_normal_param(weight: torch.Tensor) -> torch.Tensor:
     return stddev * truncated_normal(torch.rand(weight.shape, device=weight.device, dtype=weight.dtype))
 
 
-def rbf(distances: torch.Tensor) -> torch.Tensor:
+def _radial_basis(distances: torch.Tensor) -> torch.Tensor:
     r"""
     Expand pairwise ``distances`` into 36 Gaussian radial-basis features over 0-20 Angstrom.
 
@@ -5776,12 +4596,6 @@ def rbf(distances: torch.Tensor) -> torch.Tensor:
 
     Returns:
         Radial-basis features `[..., 36]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import rbf
-        >>> rbf(torch.tensor([[0.0, 5.0]])).shape
-        torch.Size([1, 2, 36])
     """
 
     d_min, d_max, d_count = 0.0, 20.0, 36
@@ -5790,7 +4604,7 @@ def rbf(distances: torch.Tensor) -> torch.Tensor:
     return torch.exp(-(((distances.unsqueeze(-1) - d_mu) / d_sigma) ** 2))
 
 
-def get_seqsep(residue_index: torch.Tensor, cyclic: torch.Tensor | None = None) -> torch.Tensor:
+def _sequence_separation(residue_index: torch.Tensor, cyclic: torch.Tensor | None = None) -> torch.Tensor:
     r"""
     Build the signed sequence-neighbor edge feature (+/-1 for adjacent residues, 0 otherwise).
 
@@ -5829,7 +4643,7 @@ def get_seqsep(residue_index: torch.Tensor, cyclic: torch.Tensor | None = None) 
     return neigh.unsqueeze(-1)
 
 
-def make_full_graph(
+def _full_graph(
     coords: torch.Tensor,
     pair: torch.Tensor,
     residue_index: torch.Tensor,
@@ -5866,7 +4680,7 @@ def make_full_graph(
     return graph, graph.edge_features
 
 
-def make_topk_graph(
+def _top_k_graph(
     coords: torch.Tensor,
     pair: torch.Tensor,
     residue_index: torch.Tensor,
@@ -5936,7 +4750,7 @@ def make_topk_graph(
     return graph, graph.edge_features
 
 
-def get_beta_schedule(
+def _beta_schedule(
     num_timesteps: int,
     beta_initial: float,
     beta_final: float,
@@ -5956,12 +4770,6 @@ def get_beta_schedule(
 
     Raises:
         ValueError: If ``schedule_type`` is not `"linear"` or ``num_timesteps`` is below 15.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import get_beta_schedule
-        >>> beta, alpha, alpha_bar = get_beta_schedule(50, 1e-2, 7e-2, "linear")
-        >>> beta.shape
-        torch.Size([50])
     """
 
     if schedule_type != "linear":
@@ -5976,11 +4784,11 @@ def get_beta_schedule(
     return beta, alpha, alpha_bar
 
 
-def get_next_frames(
+def _next_frames(
     noisy_coords: Tensor,
     pred_coords: Tensor,
     t: int,
-    diffuser: Diffuser,
+    diffuser: RfDiffusionDiffuser,
     so3_type: str,
     diffusion_mask: Tensor,
     *,
@@ -5994,7 +4802,7 @@ def get_next_frames(
         noisy_coords: Current noised backbone coords `[L, A, 3]`.
         pred_coords: Predicted clean backbone coords `[L, A, 3]`.
         t: Current timestep.
-        diffuser: The forward [`Diffuser`][ofoldx.models.rfdiffusion.model.Diffuser] whose IGSO3 reverse
+        diffuser: The forward [`RfDiffusionDiffuser`][ofoldx.models.rfdiffusion.model.RfDiffusionDiffuser] whose IGSO3 reverse
             sampler is used.
         so3_type: Rotation diffuser type; only `"igso3"` is supported.
         diffusion_mask: Per-residue mask; masked (motif) frames stay fixed.
@@ -6007,8 +4815,10 @@ def get_next_frames(
         ValueError: If ``so3_type`` is not `"igso3"`.
     """
 
-    rotations_0, _Ca_0 = rigid_from_3_points(pred_coords[None, :, 0], pred_coords[None, :, 1], pred_coords[None, :, 2])
-    rotations_t, Ca_t = rigid_from_3_points(
+    rotations_0, _Ca_0 = _rigid_from_three_points(
+        pred_coords[None, :, 0], pred_coords[None, :, 1], pred_coords[None, :, 2]
+    )
+    rotations_t, Ca_t = _rigid_from_three_points(
         noisy_coords[None, :, 0], noisy_coords[None, :, 1], noisy_coords[None, :, 2]
     )
     R_0_np = Rotation.from_matrix(rotations_0.squeeze(0).detach().cpu().numpy()).as_matrix()
@@ -6043,7 +4853,7 @@ def get_next_frames(
     return torch.as_tensor(next_coords, dtype=noisy_coords.dtype, device=noisy_coords.device)
 
 
-def get_posterior_mean(
+def _posterior_mean(
     noisy_coords: Tensor,
     pred_coords: Tensor,
     t: int,
@@ -6087,7 +4897,7 @@ def get_posterior_mean(
     return a + b, sigma
 
 
-def get_next_ca(
+def _next_alpha_carbon(
     noisy_coords: Tensor,
     pred_coords: Tensor,
     t: int,
@@ -6119,7 +4929,7 @@ def get_next_ca(
 
     pred_coords_scaled = pred_coords * crd_scale
     noisy_coords_scaled = noisy_coords * crd_scale
-    mu, sigma = get_posterior_mean(
+    mu, sigma = _posterior_mean(
         noisy_coords_scaled, pred_coords_scaled, t, beta_schedule=beta_schedule, alphabar_schedule=alphabar_schedule
     )
     sampled = mu + torch.randn(mu.shape, dtype=mu.dtype, device=mu.device, generator=generator) * torch.sqrt(
@@ -6131,7 +4941,7 @@ def get_next_ca(
     return out / crd_scale, delta / crd_scale
 
 
-def get_noise_schedule(
+def _noise_schedule(
     num_timesteps: int,
     initial_noise: float,
     final_noise: float,
@@ -6151,12 +4961,6 @@ def get_noise_schedule(
 
     Raises:
         ValueError: If ``schedule_type`` is not `"constant"` or `"linear"`.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import get_noise_schedule
-        >>> schedule = get_noise_schedule(50, 1.0, 1.0, "constant")
-        >>> schedule(10)
-        1.0
     """
 
     schedules = {
@@ -6170,12 +4974,12 @@ def get_noise_schedule(
     return schedules[schedule_type]
 
 
-PAIR_MIN_DISTANCE = 2.0
-PAIR_MAX_DISTANCE = 20.0
-PAIR_DISTANCE_BINS = 36
+_PAIR_MIN_DISTANCE = 2.0
+_PAIR_MAX_DISTANCE = 20.0
+_PAIR_DISTANCE_BINS = 36
 
 
-def one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
+def _one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
     r"""
     Return one-hot RFdiffusion sequence features.
 
@@ -6185,18 +4989,12 @@ def one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
 
     Returns:
         One-hot sequence features `[L, num_classes]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import one_hot_sequence
-        >>> one_hot_sequence(torch.tensor([0, 1])).shape
-        torch.Size([2, 22])
     """
 
     return F.one_hot(seq.long(), num_classes=num_classes).float()
 
 
-def generate_cbeta(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
+def _beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
     r"""
     Reconstruct C-beta coords from backbone N/CA/C coords.
 
@@ -6207,15 +5005,6 @@ def generate_cbeta(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Te
 
     Returns:
         The reconstructed C-beta coords `[..., 3]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import generate_cbeta
-        >>> n = torch.tensor([[0.0, 0.0, 0.0]])
-        >>> ca = torch.tensor([[1.0, 0.0, 0.0]])
-        >>> c = torch.tensor([[1.0, 1.0, 0.0]])
-        >>> generate_cbeta(n, ca, c).shape
-        torch.Size([1, 3])
     """
 
     b = alpha_carbon - nitrogen
@@ -6224,7 +5013,7 @@ def generate_cbeta(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Te
     return -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + alpha_carbon
 
 
-def rigid_from_3_points(
+def _rigid_from_three_points(
     nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor, *, eps: float = 1e-8
 ) -> tuple[Tensor, Tensor]:
     r"""
@@ -6239,16 +5028,6 @@ def rigid_from_3_points(
     Returns:
         A tuple ``(rotations, translations)`` of the per-residue rotation matrices `[..., 3, 3]` and CA
         translations `[..., 3]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import rigid_from_3_points
-        >>> n = torch.tensor([[[0.0, 0.0, 0.0]]])
-        >>> ca = torch.tensor([[[1.0, 0.0, 0.0]]])
-        >>> c = torch.tensor([[[1.0, 1.0, 0.0]]])
-        >>> rotations, translations = rigid_from_3_points(n, ca, c)
-        >>> rotations.shape
-        torch.Size([1, 1, 3, 3])
     """
 
     v1 = carbon - alpha_carbon
@@ -6260,7 +5039,7 @@ def rigid_from_3_points(
     return torch.stack((e1, e2, e3), dim=-1), alpha_carbon
 
 
-def pair_dist(a: Tensor, b: Tensor) -> Tensor:
+def _pair_distance(a: Tensor, b: Tensor) -> Tensor:
     r"""
     Return the pairwise Euclidean distance matrix between point sets ``a`` and ``b``.
 
@@ -6275,7 +5054,7 @@ def pair_dist(a: Tensor, b: Tensor) -> Tensor:
     return torch.cdist(a, b, p=2)
 
 
-def planar_angle(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+def _planar_angle(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     r"""
     Return the angle at vertex ``b`` of the triples ``(a, b, c)`` in radians.
 
@@ -6295,9 +5074,9 @@ def planar_angle(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     return torch.acos(torch.sum(v * w, dim=-1))
 
 
-def dihedral(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
+def _dihedral_angle(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
     r"""
-    Return the signed dihedral angle of the four-point sequence ``(a, b, c, d)`` in radians.
+    Return the signed _dihedral_angle angle of the four-point sequence ``(a, b, c, d)`` in radians.
 
     Args:
         a: First point(s) `[..., 3]`.
@@ -6306,7 +5085,7 @@ def dihedral(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
         d: Fourth point(s) `[..., 3]`.
 
     Returns:
-        The signed dihedral angle `[...]` in radians, in ``(-pi, pi]``.
+        The signed _dihedral_angle angle `[...]` in radians, in ``(-pi, pi]``.
     """
 
     beta_initial = a - b
@@ -6320,10 +5099,10 @@ def dihedral(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
     return torch.atan2(y, x)
 
 
-def backbone_pair_geometry(
+def _backbone_pair_geometry(
     coordinates: Tensor,
     *,
-    max_distance: float = PAIR_MAX_DISTANCE,
+    max_distance: float = _PAIR_MAX_DISTANCE,
 ) -> tuple[Tensor, Tensor]:
     r"""
     Convert backbone coordinates into distance and orientation pair features.
@@ -6338,11 +5117,11 @@ def backbone_pair_geometry(
 
     batch_size, num_residues = coordinates.shape[:2]
     nitrogen, alpha_carbon, carbon = coordinates[:, :, 0], coordinates[:, :, 1], coordinates[:, :, 2]
-    beta_carbon = generate_cbeta(nitrogen, alpha_carbon, carbon)
+    beta_carbon = _beta_carbon(nitrogen, alpha_carbon, carbon)
     pair_geometry = torch.zeros(
         (batch_size, num_residues, num_residues, 4), dtype=coordinates.dtype, device=coordinates.device
     )
-    distance = pair_dist(beta_carbon, beta_carbon)
+    distance = _pair_distance(beta_carbon, beta_carbon)
     distance = torch.where(torch.isnan(distance), 999.9, distance)
     pair_geometry[..., 0] = distance + 999.9 * torch.eye(num_residues, device=coordinates.device)[None]
     valid = pair_geometry[..., 0] < max_distance
@@ -6352,29 +5131,29 @@ def backbone_pair_geometry(
     right_ca = alpha_carbon[:, None, :]
     pair_geometry[..., 1] = torch.where(
         valid,
-        dihedral(left_ca, left_cb, right_cb, right_ca),
+        _dihedral_angle(left_ca, left_cb, right_cb, right_ca),
         0,
     )
     pair_geometry[..., 2] = torch.where(
         valid,
-        dihedral(nitrogen[:, :, None], left_ca, left_cb, right_cb),
+        _dihedral_angle(nitrogen[:, :, None], left_ca, left_cb, right_cb),
         0,
     )
     pair_geometry[..., 3] = torch.where(
         valid,
-        planar_angle(left_ca, left_cb, right_cb),
+        _planar_angle(left_ca, left_cb, right_cb),
         0,
     )
     pair_geometry[..., 0] = torch.where(valid, pair_geometry[..., 0], 999.9)
     return pair_geometry, valid.to(dtype=coordinates.dtype)
 
 
-def distance_one_hot(
+def _distance_one_hot(
     distance: Tensor,
     *,
-    min_distance: float = PAIR_MIN_DISTANCE,
-    max_distance: float = PAIR_MAX_DISTANCE,
-    num_bins: int = PAIR_DISTANCE_BINS,
+    min_distance: float = _PAIR_MIN_DISTANCE,
+    max_distance: float = _PAIR_MAX_DISTANCE,
+    num_bins: int = _PAIR_DISTANCE_BINS,
 ) -> Tensor:
     r"""
     Bin a distance map into one-hot distance features (with one extra out-of-range bin).
@@ -6387,13 +5166,6 @@ def distance_one_hot(
 
     Returns:
         One-hot distance features `[..., num_bins + 1]`; the final bin catches out-of-range distances.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import distance_one_hot
-        >>> dist = torch.tensor([[0.0, 999.9]])
-        >>> distance_one_hot(dist).shape
-        torch.Size([1, 2, 37])
     """
 
     distance = torch.nan_to_num(distance, nan=999.9)
@@ -6409,12 +5181,12 @@ def distance_one_hot(
     return F.one_hot(bins, num_classes=num_bins + 1).float()
 
 
-def template_pair_features_from_coordinates(
+def _template_pair_features(
     template_coordinates: Tensor,
     *,
-    min_distance: float = PAIR_MIN_DISTANCE,
-    max_distance: float = PAIR_MAX_DISTANCE,
-    num_bins: int = PAIR_DISTANCE_BINS,
+    min_distance: float = _PAIR_MIN_DISTANCE,
+    max_distance: float = _PAIR_MAX_DISTANCE,
+    num_bins: int = _PAIR_DISTANCE_BINS,
 ) -> Tensor:
     r"""
     Convert template backbone coords into the RFdiffusion ``template_pair_features`` pair features.
@@ -6429,23 +5201,16 @@ def template_pair_features_from_coordinates(
 
     Returns:
         The ``template_pair_features`` features `[B, T, L, L, C]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import template_pair_features_from_coordinates
-        >>> coords = torch.zeros(1, 1, 2, 3, 3)
-        >>> template_pair_features_from_coordinates(coords).shape[:4]
-        torch.Size([1, 1, 2, 2])
     """
 
     batch_size, template_count, length = template_coordinates.shape[:3]
-    pair_geometry, mask = backbone_pair_geometry(
+    pair_geometry, mask = _backbone_pair_geometry(
         template_coordinates[:, :, :, :3].reshape(batch_size * template_count, length, 3, 3),
         max_distance=max_distance,
     )
     pair_geometry = pair_geometry.reshape(batch_size, template_count, length, length, 4)
     mask = mask.reshape(batch_size, template_count, length, length, 1)
-    distance = distance_one_hot(
+    distance = _distance_one_hot(
         pair_geometry[..., 0], min_distance=min_distance, max_distance=max_distance, num_bins=num_bins
     )
     orientation = torch.cat((torch.sin(pair_geometry[..., 1:]), torch.cos(pair_geometry[..., 1:])), dim=-1) * mask
@@ -6454,7 +5219,7 @@ def template_pair_features_from_coordinates(
     return torch.nan_to_num(template_pair_features, nan=0.0)
 
 
-def get_init_coords(template_coordinates: Tensor) -> Tensor:
+def _initial_coordinates(template_coordinates: Tensor) -> Tensor:
     r"""
     Fill missing template coords with the RFdiffusion ideal residue frame placed near the nearest known CA.
 
@@ -6467,7 +5232,7 @@ def get_init_coords(template_coordinates: Tensor) -> Tensor:
 
     B, T, length = template_coordinates.shape[:3]
     init = (
-        INIT_CRDS.to(device=template_coordinates.device, dtype=template_coordinates.dtype)
+        _INITIAL_COORDINATES.to(device=template_coordinates.device, dtype=template_coordinates.dtype)
         .reshape(1, 1, 1, 27, 3)
         .repeat(B, T, length, 1, 1)
     )
@@ -6491,7 +5256,7 @@ def get_init_coords(template_coordinates: Tensor) -> Tensor:
     return torch.where(missing.reshape(B, T, length, 1, 1), init, centered_coords)
 
 
-def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
+def _torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
     r"""
     Compute the RFdiffusion alpha torsion features and their validity masks.
 
@@ -6530,7 +5295,7 @@ def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
     B, L = coords.shape[:2]
     seq = seq.long().reshape(B, L)
     coords = coords.clone()
-    rotation, translation = rigid_from_3_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
+    rotation, translation = _rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
     ideal_nitrogen = coords.new_tensor((-0.5272, 1.3593, 0.0))
     ideal_carbon = coords.new_tensor((1.5233, 0.0, 0.0))
     coords[..., 0, :] = torch.einsum("...ij,j->...i", rotation, ideal_nitrogen) + translation
@@ -6548,9 +5313,9 @@ def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
     features[:, :, 2] = -dihedral_pair(coords[:, :, 0], coords[:, :, 1], coords[:, :, 2], coords[:, :, 3])
 
     mask[:, :, 3:7] = False
-    for aa_idx, chi_defs in enumerate(CHI_ATOM_NAMES):
+    for aa_idx, chi_defs in enumerate(_CHI_ATOM_NAMES):
         aa_positions = seq == aa_idx
-        atom_names = ATOM14_NAMES[aa_idx]
+        atom_names = RFDIFFUSION_ATOM14_NAMES[aa_idx]
         for chi_idx, chi_atoms in enumerate(chi_defs):
             if chi_atoms is None:
                 continue
@@ -6559,19 +5324,19 @@ def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
             features[:, :, 3 + chi_idx] = torch.where(aa_positions[..., None], chi, features[:, :, 3 + chi_idx])
             mask[:, :, 3 + chi_idx] |= aa_positions
     for aa_idx, chi_idx, atom_indices in (
-        (residue_token("CYS"), 1, (1, 4, 5, 18)),
-        (residue_token("HIS"), 2, (7, 8, 19, 9)),
-        (residue_token("PRO"), 2, (4, 5, 6, 19)),
-        (residue_token("SER"), 1, (1, 4, 5, 15)),
-        (residue_token("THR"), 1, (1, 4, 5, 15)),
-        (residue_token("TYR"), 2, (8, 10, 11, 22)),
+        (rfdiffusion_residue_token_id("CYS"), 1, (1, 4, 5, 18)),
+        (rfdiffusion_residue_token_id("HIS"), 2, (7, 8, 19, 9)),
+        (rfdiffusion_residue_token_id("PRO"), 2, (4, 5, 6, 19)),
+        (rfdiffusion_residue_token_id("SER"), 1, (1, 4, 5, 15)),
+        (rfdiffusion_residue_token_id("THR"), 1, (1, 4, 5, 15)),
+        (rfdiffusion_residue_token_id("TYR"), 2, (8, 10, 11, 22)),
     ):
         aa_positions = seq == aa_idx
         chi = dihedral_pair(*(coords[:, :, atom_index] for atom_index in atom_indices))
         features[:, :, 3 + chi_idx] = torch.where(aa_positions[..., None], chi, features[:, :, 3 + chi_idx])
         mask[:, :, 3 + chi_idx] |= aa_positions
 
-    _, _, reference_coords = rf_all_atom_kinematics()
+    _, _, reference_coords = _all_atom_kinematics()
     reference_coords = reference_coords.to(device=coords.device, dtype=coords.dtype)
     reference_nc = 0.5 * (reference_coords[:, 0, :3] + reference_coords[:, 2, :3])
     reference_ca = reference_coords[:, 1, :3]
@@ -6611,18 +5376,21 @@ def torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
             dim=-1,
         )
 
-    glycine = residue_token("GLY")
+    glycine = rfdiffusion_residue_token_id("GLY")
     mask[:, :, 7] = seq != glycine
     mask[:, :, 8] = seq != glycine
     mask[:, :, 9] = (
-        (seq != glycine) & (seq != residue_token("ALA")) & (seq != residue_token("UNK")) & (seq != MASK_TOKEN)
+        (seq != glycine)
+        & (seq != rfdiffusion_residue_token_id("ALA"))
+        & (seq != rfdiffusion_residue_token_id("UNK"))
+        & (seq != RFDIFFUSION_MASK_TOKEN_ID)
     )
     features[..., 0] = torch.nan_to_num(features[..., 0], nan=1.0)
     features[..., 1] = torch.nan_to_num(features[..., 1], nan=0.0)
     return features, mask
 
 
-def build_template_torsion_features(template_coordinates: Tensor, seq: Tensor) -> Tensor:
+def _template_torsion_features(template_coordinates: Tensor, seq: Tensor) -> Tensor:
     r"""
     Build the flattened ``template_torsion_features`` torsion tensor expected by RFdiffusion inference.
 
@@ -6636,7 +5404,7 @@ def build_template_torsion_features(template_coordinates: Tensor, seq: Tensor) -
 
     B, T, length = template_coordinates.shape[:3]
     seq_flat = seq.reshape(B * T, length) if seq.ndim == 3 else seq.reshape(B, length).repeat_interleave(T, dim=0)
-    alpha, alpha_mask = torsion_features(
+    alpha, alpha_mask = _torsion_features(
         template_coordinates.reshape(B * T, length, template_coordinates.shape[-2], 3), seq_flat
     )
     alpha = alpha.reshape(B, T, length, 10, 2)
@@ -6644,10 +5412,10 @@ def build_template_torsion_features(template_coordinates: Tensor, seq: Tensor) -
     return torch.cat((alpha, alpha_mask), dim=-1).reshape(B, T, length, 30)
 
 
-L_DEFAULT = 2000
+_IGSO3_DEFAULT_NUM_TERMS = 2000
 
 
-def exp_map(rotation_vector: Tensor) -> Tensor:
+def _exponential_map(rotation_vector: Tensor) -> Tensor:
     r"""
     Map rotation vectors to rotation matrices via the SO(3) exponential map.
 
@@ -6656,12 +5424,6 @@ def exp_map(rotation_vector: Tensor) -> Tensor:
 
     Returns:
         The corresponding rotation matrices `[..., 3, 3]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import exp_map
-        >>> exp_map(torch.zeros(1, 3)).shape
-        torch.Size([1, 3, 3])
     """
 
     angle = torch.linalg.vector_norm(rotation_vector, dim=-1, keepdim=True)
@@ -6674,7 +5436,7 @@ def exp_map(rotation_vector: Tensor) -> Tensor:
     return identity + scale[..., None] * skew + second_order_scale[..., None] * (skew @ skew)
 
 
-def f_igso3(omega_value: Tensor, t: float | Tensor, num_terms: int = L_DEFAULT) -> Tensor:
+def _igso3_expansion(omega_value: Tensor, t: float | Tensor, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> Tensor:
     r"""
     Evaluate the truncated IGSO3 density power series at rotation angle ``omega``.
 
@@ -6685,12 +5447,6 @@ def f_igso3(omega_value: Tensor, t: float | Tensor, num_terms: int = L_DEFAULT) 
 
     Returns:
         The IGSO3 density values `[...]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import f_igso3
-        >>> f_igso3(torch.tensor([0.1, 0.2]), 0.5, num_terms=50).shape
-        torch.Size([2])
     """
 
     omega_value = omega_value.float()
@@ -6702,7 +5458,7 @@ def f_igso3(omega_value: Tensor, t: float | Tensor, num_terms: int = L_DEFAULT) 
     return (terms * torch.sin(angles * (ell + 0.5)) / denom).sum(dim=-1)
 
 
-def d_logf_d_omega(omega_value: np.ndarray, t: float, num_terms: int = L_DEFAULT) -> np.ndarray:
+def _igso3_log_derivative(omega_value: np.ndarray, t: float, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> np.ndarray:
     r"""
     Return the derivative of the log IGSO3 density with respect to the rotation angle (the score).
 
@@ -6713,21 +5469,15 @@ def d_logf_d_omega(omega_value: np.ndarray, t: float, num_terms: int = L_DEFAULT
 
     Returns:
         The score ``d/d_omega log f`` evaluated at each ``omega_value``, same shape as the input.
-
-    Examples:
-        >>> import numpy as np
-        >>> from ofoldx.models.rfdiffusion.model import d_logf_d_omega
-        >>> d_logf_d_omega(np.array([0.5, 1.0]), 0.5).shape
-        (2,)
     """
 
     with torch.inference_mode(False), torch.enable_grad():
         omega_t = torch.tensor(omega_value, dtype=torch.float32, requires_grad=True)
-        log_f = torch.log(f_igso3(omega_t, t, num_terms=num_terms).clamp_min(1e-30))
+        log_f = torch.log(_igso3_expansion(omega_t, t, num_terms=num_terms).clamp_min(1e-30))
         return torch.autograd.grad(log_f.sum(), omega_t)[0].detach().cpu().numpy()
 
 
-def igso3_density_angle(omega_value: np.ndarray, t: float, num_terms: int = L_DEFAULT) -> np.ndarray:
+def _igso3_angle_density(omega_value: np.ndarray, t: float, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> np.ndarray:
     r"""
     Return the IGSO3 angular density (density times the SO(3) angle Haar factor) at ``omega``.
 
@@ -6738,26 +5488,20 @@ def igso3_density_angle(omega_value: np.ndarray, t: float, num_terms: int = L_DE
 
     Returns:
         The angular density evaluated at each ``omega_value``, same shape as the input.
-
-    Examples:
-        >>> import numpy as np
-        >>> from ofoldx.models.rfdiffusion.model import igso3_density_angle
-        >>> igso3_density_angle(np.array([0.5, 1.0]), 0.5).shape
-        (2,)
     """
 
     omega_t = torch.tensor(omega_value, dtype=torch.float32)
-    density = f_igso3(omega_t, t, num_terms=num_terms).detach().cpu().numpy()
+    density = _igso3_expansion(omega_t, t, num_terms=num_terms).detach().cpu().numpy()
     return density * (1 - np.cos(omega_value)) / np.pi
 
 
-def calculate_igso3(
+def _calculate_igso3(
     *,
     num_sigma: int,
     num_omega: int,
     min_sigma: float,
     max_sigma: float,
-    num_terms: int = L_DEFAULT,
+    num_terms: int = _IGSO3_DEFAULT_NUM_TERMS,
 ) -> dict[str, np.ndarray]:
     r"""
     Precompute IGSO3 CDFs and score norms over a sigma/angle grid for inverse-CDF sampling.
@@ -6776,11 +5520,11 @@ def calculate_igso3(
     discrete_omega = np.linspace(0, np.pi, num_omega + 1, dtype=np.float64)[1:]
     discrete_sigma = 10 ** np.linspace(np.log10(min_sigma), np.log10(max_sigma), num_sigma + 1, dtype=np.float64)[1:]
     pdf_vals = np.asarray(
-        [igso3_density_angle(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
+        [_igso3_angle_density(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
     )
     cdf_vals = np.asarray([pdf.cumsum() / num_omega * np.pi for pdf in pdf_vals])
     score_norm = np.asarray(
-        [d_logf_d_omega(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
+        [_igso3_log_derivative(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
     )
     score_moment = np.sum(score_norm**2 * pdf_vals, axis=1) / np.sum(pdf_vals, axis=1)
     exp_score_norms = np.sqrt(np.clip(score_moment, a_min=0.0, a_max=None))
@@ -6793,17 +5537,13 @@ def calculate_igso3(
     }
 
 
-def write_pickle(path: str | Path, value: object) -> None:
+def _write_pickle(path: str | Path, value: object) -> None:
     r"""
     Pickle ``value`` to ``path``, creating parent directories as needed.
 
     Args:
         path: Destination file path; missing parent directories are created.
         value: The object to serialize.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import write_pickle
-        >>> write_pickle("igso3_cache.pkl", {"cdf": 0.0})  # doctest: +SKIP
     """
 
     path = Path(path)
@@ -6812,7 +5552,7 @@ def write_pickle(path: str | Path, value: object) -> None:
         pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def make_rotation_x(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _rotation_x(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     r"""
     Build 4x4 homogeneous rotation matrices about the x-axis from ``(cos, sin)`` angle pairs `[B, L, 2]`.
 
@@ -6822,12 +5562,6 @@ def make_rotation_x(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
     Returns:
         Homogeneous rotation matrices `[B, L, 4, 4]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import make_rotation_x
-        >>> make_rotation_x(torch.ones(1, 2, 2)).shape
-        torch.Size([1, 2, 4, 4])
     """
 
     batch_size, length = angs.shape[:2]
@@ -6840,7 +5574,7 @@ def make_rotation_x(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return rotations
 
 
-def make_rotation_z(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _rotation_z(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     r"""
     Build 4x4 homogeneous rotation matrices about the z-axis from ``(cos, sin)`` angle pairs `[B, L, 2]`.
 
@@ -6850,12 +5584,6 @@ def make_rotation_z(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
     Returns:
         Homogeneous rotation matrices `[B, L, 4, 4]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import make_rotation_z
-        >>> make_rotation_z(torch.ones(1, 2, 2)).shape
-        torch.Size([1, 2, 4, 4])
     """
 
     batch_size, length = angs.shape[:2]
@@ -6868,7 +5596,7 @@ def make_rotation_z(angs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return rotations
 
 
-def make_rot_axis(angs: torch.Tensor, axis: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _rotation_about_axis(angs: torch.Tensor, axis: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     r"""
     Build 4x4 homogeneous rotations about an arbitrary ``axis`` from ``(cos, sin)`` angle pairs (Rodrigues).
 
@@ -6879,13 +5607,6 @@ def make_rot_axis(angs: torch.Tensor, axis: torch.Tensor, eps: float = 1e-6) -> 
 
     Returns:
         Homogeneous rotation matrices `[B, L, 4, 4]`.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.models.rfdiffusion.model import make_rot_axis
-        >>> axis = torch.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]])
-        >>> make_rot_axis(torch.ones(1, 2, 2), axis).shape
-        torch.Size([1, 2, 4, 4])
     """
 
     batch_size, length = angs.shape[:2]
@@ -7088,10 +5809,10 @@ def _sample_variable_lengths(
 
     old_index = {reference: index for index, reference in enumerate(input.layout.output_residues)}
     length = len(realized_references)
-    coords = input.noisy_coords.new_empty((1, length, 14, 3))
+    coords = input.noisy_coordinates.new_empty((1, length, 14, 3))
     sequence = input.sequence.new_zeros((1, length, 22))
-    sequence[..., MASK_TOKEN] = 1
-    fixed_structure = torch.zeros((1, length), dtype=torch.bool, device=input.noisy_coords.device)
+    sequence[..., RFDIFFUSION_MASK_TOKEN_ID] = 1
+    fixed_structure = torch.zeros((1, length), dtype=torch.bool, device=input.noisy_coordinates.device)
     fixed_sequence = torch.zeros_like(fixed_structure)
     hotspots = torch.zeros_like(fixed_structure)
     for row, reference in enumerate(realized_references):
@@ -7099,7 +5820,7 @@ def _sample_variable_lengths(
         if previous is None:
             coords[0, row] = float("nan")
             continue
-        coords[0, row] = input.noisy_coords[0, previous]
+        coords[0, row] = input.noisy_coordinates[0, previous]
         sequence[0, row] = input.sequence[0, previous]
         fixed_structure[0, row] = input.fixed_structure_mask[0, previous]
         fixed_sequence[0, row] = input.fixed_sequence_mask[0, previous]
@@ -7107,7 +5828,7 @@ def _sample_variable_lengths(
     for row, reference in enumerate(realized_references):
         if isinstance(reference, SymbolicResidueSite):
             sequence[0, row].zero_()
-            sequence[0, row, MASK_TOKEN] = 1
+            sequence[0, row, RFDIFFUSION_MASK_TOKEN_ID] = 1
             fixed_sequence[0, row] = False
     residue_indices: list[int] = []
     previous_instance = None
@@ -7130,7 +5851,7 @@ def _sample_variable_lengths(
         if not isinstance(condition, AllowedResidueIdentities):
             continue
         identity_condition = cast(AllowedResidueIdentities, condition)
-        token = residue_token(next(iter(identity_condition.component_ids)))
+        token = rfdiffusion_residue_token_id(next(iter(identity_condition.component_ids)))
         identity_rows: list[int] = []
         for target in identity_condition.positions:
             if isinstance(target, str):
@@ -7172,7 +5893,7 @@ def _sample_variable_lengths(
         if not isinstance(condition, SymbolicBond):
             continue
         bond = cast(SymbolicBond, condition)
-        instance_id = terminal_cyclization_instance(
+        instance_id = rfdiffusion_terminal_cyclization_instance(
             bond,
             row_by_reference_for_cyclization,
             instances,
@@ -7182,7 +5903,7 @@ def _sample_variable_lengths(
             device=coords.device,
         )
     return RfDiffusionInput(
-        noisy_coords=coords,
+        noisy_coordinates=coords,
         sequence=sequence,
         residue_index=torch.tensor(residue_indices, dtype=torch.int64, device=coords.device)[None],
         fixed_structure_mask=fixed_structure,
@@ -7212,7 +5933,9 @@ def _sample_variable_lengths(
 
 
 def _resolved_placement_condition(layout: RfDiffusionLayout) -> RfDiffusionPlacements | None:
-    r"""Return the topology retained by the Processor for placement-map materialization."""
+    r"""
+    Return the topology retained by the Processor for placement-map materialization.
+    """
 
     return layout.placement
 
@@ -7232,7 +5955,7 @@ def _decode_design(
         coordinates = raw_coordinates.clone()
         fixed = input.fixed_structure_mask[0].to(device=coordinates.device, dtype=torch.bool)
         if bool(fixed.any()):
-            reference = input.noisy_coords[0].to(device=coordinates.device, dtype=coordinates.dtype)
+            reference = input.noisy_coordinates[0].to(device=coordinates.device, dtype=coordinates.dtype)
             if align_motif:
                 coordinates = RfDiffusionSamplerStep.align_prediction_to_noisy_motif(coordinates, reference, fixed)
             coordinates[fixed] = reference[fixed]
@@ -7255,13 +5978,13 @@ def _decode_design(
         plddt_axis = tuple(residue_map[reference] for reference in layout.output_residues)
         # Use the shared grouped placement_map as the per-candidate output identity. It is
         # reconstructed losslessly from output_residues and residue_map, with
-        # exhaustive coverage enforced inside materialize_placement_map). The realized ids in
+        # exhaustive coverage enforced inside _materialize_placement_map). The realized ids in
         # its ComponentReference[0] values are this candidate's Structure.system instance ids.
         placement_condition = _resolved_placement_condition(layout)
         placement_map = (
             {}
             if placement_condition is None
-            else materialize_placement_map(placement_condition, layout.output_residues, residue_map)[0]
+            else _materialize_placement_map(placement_condition, layout.output_residues, residue_map)[0]
         )
         candidates.append(
             RfDiffusionDesignCandidate(
@@ -7337,7 +6060,9 @@ def _decode_structure(
                 entity = source_system.entities[source_system.instances[component_reference[0]]]
                 residue_components.append(entity.components[component_reference[1]])
             else:
-                residue_components.append(get_component("UNK" if token == MASK_TOKEN else NUM2AA[token]))
+                residue_components.append(
+                    get_component("UNK" if token == RFDIFFUSION_MASK_TOKEN_ID else RFDIFFUSION_RESIDUE_TYPES[token])
+                )
             residue_map[reference] = (instance_id, component_index)
         output_sequences[instance_id] = tuple(residue_components)
 
@@ -7883,7 +6608,7 @@ def _residue_contact_coordinate(
     return -0.58273431 * np.cross(b, c) + 0.56802827 * b - 0.54067466 * c + calpha
 
 
-NUM2AA = (
+RFDIFFUSION_RESIDUE_TYPES = (
     "ALA",
     "ARG",
     "ASN",
@@ -7907,11 +6632,11 @@ NUM2AA = (
     "UNK",
     "MAS",
 )
-AA2NUM = {name: index for index, name in enumerate(NUM2AA)}
-UNKNOWN_TOKEN = AA2NUM["UNK"]
-MASK_TOKEN = AA2NUM["MAS"]
+RFDIFFUSION_RESIDUE_TYPE_INDEX = {name: index for index, name in enumerate(RFDIFFUSION_RESIDUE_TYPES)}
+RFDIFFUSION_UNKNOWN_TOKEN_ID = RFDIFFUSION_RESIDUE_TYPE_INDEX["UNK"]
+RFDIFFUSION_MASK_TOKEN_ID = RFDIFFUSION_RESIDUE_TYPE_INDEX["MAS"]
 
-ATOM14_NAMES = (
+RFDIFFUSION_ATOM14_NAMES = (
     ("N", "CA", "C", "O", "CB", None, None, None, None, None, None, None, None, None),
     ("N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2", None, None, None),
     ("N", "CA", "C", "O", "CB", "CG", "OD1", "ND2", None, None, None, None, None, None),
@@ -7936,7 +6661,7 @@ ATOM14_NAMES = (
     ("N", "CA", "C", "O", "CB", None, None, None, None, None, None, None, None, None),
 )
 
-CHI_ATOM_NAMES: tuple[tuple[tuple[str, str, str, str] | None, ...], ...] = (
+_CHI_ATOM_NAMES: tuple[tuple[tuple[str, str, str, str] | None, ...], ...] = (
     (None, None, None, None),
     (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "NE"), ("CG", "CD", "NE", "CZ")),
     (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1"), None, None),
@@ -7961,15 +6686,15 @@ CHI_ATOM_NAMES: tuple[tuple[tuple[str, str, str, str] | None, ...], ...] = (
     (None, None, None, None),
 )
 
-INIT_CRDS = torch.full((27, 3), float("nan"))
-INIT_CRDS[0] = torch.tensor([-0.5272, 1.3593, 0.0000])
-INIT_CRDS[1] = torch.tensor([0.0000, 0.0000, 0.0000])
-INIT_CRDS[2] = torch.tensor([1.5233, 0.0000, 0.0000])
-INIT_CRDS[3] = torch.tensor([2.0505, 1.3593, 0.0000])
-INIT_CRDS[4] = torch.tensor([-0.5291, -0.7749, -1.2056])
+_INITIAL_COORDINATES = torch.full((27, 3), float("nan"))
+_INITIAL_COORDINATES[0] = torch.tensor([-0.5272, 1.3593, 0.0000])
+_INITIAL_COORDINATES[1] = torch.tensor([0.0000, 0.0000, 0.0000])
+_INITIAL_COORDINATES[2] = torch.tensor([1.5233, 0.0000, 0.0000])
+_INITIAL_COORDINATES[3] = torch.tensor([2.0505, 1.3593, 0.0000])
+_INITIAL_COORDINATES[4] = torch.tensor([-0.5291, -0.7749, -1.2056])
 
 
-def residue_token(residue_name: str) -> int:
+def rfdiffusion_residue_token_id(residue_name: str) -> int:
     r"""
     Map a three-letter residue name to its RFdiffusion integer id.
 
@@ -7980,18 +6705,11 @@ def residue_token(residue_name: str) -> int:
         residue_name: Three-letter residue name (e.g. `"ALA"`); case is ignored.
 
     Returns:
-        The residue id from [`AA2NUM`][ofoldx.models.rfdiffusion.model.AA2NUM], or ``UNKNOWN_TOKEN``
+        The residue id from [`RFDIFFUSION_RESIDUE_TYPE_INDEX`][ofoldx.models.rfdiffusion.model.RFDIFFUSION_RESIDUE_TYPE_INDEX], or ``RFDIFFUSION_UNKNOWN_TOKEN_ID``
         for an unrecognized name.
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import residue_token, UNKNOWN_TOKEN
-        >>> residue_token("gly")
-        7
-        >>> residue_token("XYZ") == UNKNOWN_TOKEN
-        True
     """
 
-    return AA2NUM.get(residue_name.upper(), UNKNOWN_TOKEN)
+    return RFDIFFUSION_RESIDUE_TYPE_INDEX.get(residue_name.upper(), RFDIFFUSION_UNKNOWN_TOKEN_ID)
 
 
 _RF_ALL_ATOM_KINEMATICS = (
@@ -8062,7 +6780,7 @@ _RF_ALL_ATOM_KINEMATICS = (
 _RF_ALL_ATOM_CACHE: tuple[Tensor, Tensor, Tensor] | None = None
 
 
-def rf_all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
+def _all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
     r"""
     Return the RFdiffusion residue-frame kinematics constants for atom14 reconstruction.
 
@@ -8075,14 +6793,6 @@ def rf_all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
         A tuple ``(frame_indices, base_frame_transforms, base_frame_coordinates)``: the per-atom frame indices
         (``long``), the rigid transforms per torsion group (``float``), and the reference atom coords in each
         base frame (``float``).
-
-    Examples:
-        >>> from ofoldx.models.rfdiffusion.model import rf_all_atom_kinematics
-        >>> frame_indices, base_frame_transforms, base_frame_coordinates = (  # doctest: +SKIP
-        ...     rf_all_atom_kinematics()
-        ... )
-        >>> frame_indices.dtype  # doctest: +SKIP
-        torch.int64
     """
 
     global _RF_ALL_ATOM_CACHE
@@ -8104,13 +6814,19 @@ def rf_all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
 
 @dataclass(frozen=True)
 class RfDiffusionLayout:
-    r"""Canonical identities required to realize denoised tensor rows.
+    r"""
+    Molecular identities aligned to RFdiffusion residue rows.
 
-    ``output_residues[i]`` identifies row ``i`` as either an existing canonical
-    residue or one symbolic residue declared by the input placement.  Chain and
-    instance rows are explicit because RFdiffusion's internal residue numbers are
-    not canonical identities.  This is the only non-tensor leaf of
-    [`RfDiffusionInput`][] and is deliberately ignored by the denoiser graph.
+    Args:
+        system: Optional input molecular system.
+        structure: Optional input structure carrying observed coordinates.
+        templates: Structural templates supplied with the input.
+        placement: Optional generated and retained output segments.
+        conditions: Spatial and sequence conditions applied to the design.
+        output_residues: Existing or symbolic residue reference for each output row.
+        output_instance_ids: Molecular instance ID for each output row.
+        combined_length: Optional lower and upper bound for the total generated
+            length.
     """
 
     system: MolecularSystem | None
@@ -8132,23 +6848,37 @@ class RfDiffusionLayout:
     ]
     output_residues: tuple[ComponentReference | SymbolicResidueSite, ...]
     output_instance_ids: tuple[str, ...]
-    # RFdiffusion ContigMap.length topology argument: the combined
-    # generated length bounds across all inpaint chains, excluding receptor ExistingSpan
-    # rows. It defaults to None so the denoiser graph, which ignores this non-tensor leaf,
-    # is unaffected when the bound is absent.
+    # Combined generated-length bounds across all generated segments, excluding
+    # retained existing spans. The denoiser ignores this result-decoding metadata.
     combined_length: tuple[int, int] | None = None
 
 
 @dataclass(kw_only=True, eq=False)
 class RfDiffusionInput:
-    r"""One compile-friendly RFdiffusion denoiser input.
+    r"""
+    Tensor and molecular-layout input for RFdiffusion.
 
-    Every optional condition channel has a neutral tensor value instead
-    of changing the object schema: all-false hotspots, class-3 (masked) secondary
-    structure, and class-2 (masked) block adjacency.
+    ``B`` is batch size, ``N`` residue count, and ``A`` atom slots per residue.
+
+    Args:
+        noisy_coordinates: Noisy atom coordinates with shape ``(B, N, A, 3)`` in
+            angstroms.
+        sequence: One-hot residue types with shape ``(B, N, 22)``.
+        residue_index: Chain-aware residue indices with shape ``(B, N)``.
+        fixed_structure_mask: Residues whose coordinates remain fixed, with shape
+            ``(B, N)``.
+        fixed_sequence_mask: Residues whose identities remain fixed, with shape
+            ``(B, N)``.
+        hotspot_mask: Interaction-hotspot mask with shape ``(B, N)``.
+        cyclic_mask: Cyclic-chain mask with shape ``(B, N)``.
+        secondary_structure: Secondary-structure condition features with shape
+            ``(B, N, 4)``.
+        block_adjacency: Block-contact condition features with shape ``(B, N, N, 3)``.
+        timestep: Diffusion timestep with shape ``(B,)``.
+        layout: Molecular identities and conditions aligned to residue rows.
     """
 
-    noisy_coords: Tensor
+    noisy_coordinates: Tensor
     sequence: Tensor
     residue_index: Tensor
     fixed_structure_mask: Tensor
@@ -8163,11 +6893,34 @@ class RfDiffusionInput:
 
 @dataclass(eq=False)
 class RfDiffusionOutput:
-    r"""All RoseTTAFold denoising and training-head outputs."""
+    r"""
+    Predictions and intermediate representations from RFdiffusion.
+
+    ``B`` is batch size, ``N`` is residue count, and ``T`` is the number of
+    structure-update blocks.
+
+    Args:
+        single: Per-residue representation with shape ``(B, N, C_single)``.
+        pair: Pair representation with shape ``(B, N, N, C_pair)``.
+        backbone_coordinates: Predicted ``(N, CA, C)`` coordinates with shape
+            ``(B, N, 3, 3)`` in angstroms.
+        state: Final structure-state representation with shape ``(B, N, C_state)``.
+        torsion_angles: Ten normalized ``(cos, sin)`` torsion pairs with shape
+            ``(B, N, 10, 2)``.
+        sequence_logits: Per-residue amino-acid logits with shape ``(B, N, V)``.
+        plddt: Expected per-residue pLDDT with shape ``(B, N)`` on the 0--1 scale.
+        distance_logits: Distance, omega, theta, and phi logits; each tensor has
+            shape ``(B, D_i, N, N)``.
+        plddt_logits: Per-residue pLDDT-bin logits with shape ``(B, D_plddt, N)``.
+        resolved_logits: Per-residue resolved-state logits with shape ``(B, N)``.
+        backbone_trajectory: Backbone coordinates with shape
+            ``(T, B, N, 3, 3)`` in angstroms.
+        torsion_trajectory: Torsion pairs with shape ``(T, B, N, 10, 2)``.
+    """
 
     single: Tensor
     pair: Tensor
-    backbone_coords: Tensor
+    backbone_coordinates: Tensor
     state: Tensor
     torsion_angles: Tensor
     sequence_logits: Tensor
@@ -8181,7 +6934,16 @@ class RfDiffusionOutput:
 
 @dataclass(frozen=True)
 class RfDiffusionConditionEvaluation:
-    r"""One post-design evaluation aligned to an input RFdiffusion condition."""
+    r"""
+    Evaluation of one RFdiffusion design condition.
+
+    Args:
+        condition_index: Zero-based position of the condition in the input sequence.
+        condition_type: Public condition class name.
+        satisfied: Whether the condition passed, or ``None`` when not evaluable.
+        value: Measured value when available.
+        unit: Unit of ``value`` when available.
+    """
 
     condition_index: int
     condition_type: str
@@ -8192,22 +6954,15 @@ class RfDiffusionConditionEvaluation:
 
 @dataclass(eq=False)
 class RfDiffusionDesignCandidate:
-    r"""One coordinate-producing RFdiffusion generation sample and its aligned values.
+    r"""
+    One RFdiffusion sample and its aligned scientific values.
 
-    Each candidate contains the complete decoded backbone ``Structure`` and its
-    ``MolecularSystem`` via ``Structure.system``. Generated residue identity is CCD ``UNK``;
-    the Structure contains only the backbone sites RFdiffusion produced. The variable placement
-    length across candidates is the coordinate-producing, variable-topology property that
-    requires a result record whose topology is resolved per candidate.
-
-    ``placement_map`` is the realized output surface for this sample
-    (``declaration_group -> placement_id -> realized output occurrences``): after
-    the variable generated lengths are sampled, the grouped ``placement_map`` becomes the
-    per-candidate output identity rather than the flat pre-sample ``output_residues`` layout. It is
-    losslessly reconstructed from that flat layout at decode time and exhaustively partitions
-    every realized backbone residue; ``ComponentReference[0]`` values are this candidate's
-    ``Structure.system`` instance ids. Empty only when there is no placement (no molecular
-    input and no ``RfDiffusionPlacements``).
+    Args:
+        structure: Designed backbone structure.
+        placement_map: Realized component occurrences for every placement.
+        condition_evaluations: Evaluations aligned to input conditions.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
     """
 
     structure: Structure
@@ -8219,21 +6974,24 @@ class RfDiffusionDesignCandidate:
 
 @dataclass(eq=False)
 class RfDiffusionDesignResult:
-    r"""One generation-ordered collection of coordinate-producing RFdiffusion designs.
+    r"""
+    A generation-ordered collection of RFdiffusion designs.
 
-    Tuple position is sample identity for one generation context; there is no auxiliary index
-    field, and no input/context/placement-map/provenance field is carried.
+    Args:
+        candidates: Designed backbones in generation order.
     """
 
     candidates: tuple[RfDiffusionDesignCandidate, ...]
 
     def best(self, score: str) -> RfDiffusionDesignCandidate:
-        r"""Return the earliest best candidate under one explicit score.
+        r"""
+        Return the earliest best candidate under a named score.
 
-        Mirrors ``FoldResult.best`` / ``ESMFold2DesignResult.best`` exactly: the score's
-        ``preferred`` direction must be consistently ``"higher"`` or ``"lower"``; unit and scope
-        must match across every candidate; a NaN value or an undefined direction raises at
-        ranking time; infinity is rankable; and the earliest candidate wins a tie.
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
         """
 
         return best(self.candidates, score)
@@ -8246,13 +7004,12 @@ class RfDiffusionDesignResult:
 
 @dataclass(frozen=True)
 class RfDiffusionPlacements:
-    r"""One RFdiffusion generation topology: the shared placement mapping plus its lengths.
+    r"""
+    Declare generated and retained segments for RFdiffusion output chains.
 
-    ``placements`` is the shared ``PlacementSpec`` mapping
-    (``declaration_group -> placement_id -> PlacementValue``); its inner ``placement_id``
-    keys are globally unique and carry identity. ``chain_lengths`` is the RFdiffusion
-    per-group combined-length argument aligned to the declaration-group order of
-    ``placements``.
+    Args:
+        placements: Ordered placement declaration.
+        chain_lengths: Optional generated-length bound for each declaration group.
     """
 
     placements: PlacementMapping
@@ -8266,7 +7023,13 @@ class RfDiffusionPlacements:
 
 @dataclass(frozen=True)
 class RfDiffusionReferenceCoordinates:
-    r"""Fixed backbone coordinates for a set of existing atoms (consumed as ``hard``)."""
+    r"""
+    Fix selected existing atoms to their observed coordinates.
+
+    Args:
+        sites: Existing atom occurrences to fix during sampling.
+        tolerance_angstrom: Accepted coordinate deviation in angstroms.
+    """
 
     sites: tuple[AtomSite, ...]
     tolerance_angstrom: float
@@ -8274,7 +7037,17 @@ class RfDiffusionReferenceCoordinates:
 
 @dataclass(frozen=True)
 class RfDiffusionCoordination:
-    r"""A smooth ``1 / (1 + x**6)`` coordination-number potential between two sides."""
+    r"""
+    Apply a smooth coordination-number potential between endpoint sets.
+
+    Args:
+        side_a: Endpoints on the first side of the potential.
+        side_b: Endpoints on the second side of the potential.
+        center_angstrom: Midpoint of the distance transition in angstroms.
+        scale_angstrom: Width of the distance transition in angstroms.
+        direction: Whether to maximize or minimize coordination.
+        weight: Optional potential weight.
+    """
 
     side_a: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
     side_b: tuple[ComponentReference | str | SymbolicResidueSite | AtomSite | SymbolicAtomSite, ...]
@@ -8286,7 +7059,17 @@ class RfDiffusionCoordination:
 
 @dataclass(frozen=True)
 class RfDiffusionDistance:
-    r"""A tolerance-padded ``[lower, upper]`` distance interval between two atoms."""
+    r"""
+    Constrain the distance between two atoms to an interval.
+
+    Args:
+        site_a: First atom occurrence.
+        site_b: Second atom occurrence.
+        lower_angstrom: Lower distance bound in angstroms.
+        upper_angstrom: Upper distance bound in angstroms.
+        tolerance_angstrom: Additional accepted distance outside the interval.
+        weight: Optional potential weight.
+    """
 
     site_a: AtomSite | SymbolicAtomSite
     site_b: AtomSite | SymbolicAtomSite
@@ -8298,7 +7081,14 @@ class RfDiffusionDistance:
 
 @dataclass(frozen=True)
 class RfDiffusionRadiusOfGyration:
-    r"""A compactness potential over a set of residue centroids."""
+    r"""
+    Constrain the compactness of a set of residues.
+
+    Args:
+        targets: Residues included in the radius-of-gyration calculation.
+        upper_angstrom: Preferred upper radius of gyration in angstroms.
+        weight: Optional potential weight.
+    """
 
     targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
     upper_angstrom: float
@@ -8307,11 +7097,18 @@ class RfDiffusionRadiusOfGyration:
 
 @dataclass(frozen=True)
 class RfDiffusionSubstrateInteraction:
-    r"""The nearest-substrate attraction and clearance potential.
+    r"""
+    Apply attraction and short-range repulsion to substrate atoms.
 
-    ``repulsion_cutoff_angstrom`` is the ``rep_r_0`` clearance radius; the
-    non-default ``rep_r_min=0`` all-pairs branch is a separate control (see the RFdiffusion
-    README) and is not represented by this default meaning.
+    Args:
+        residues: Designed residues participating in the interaction.
+        substrate_atoms: Substrate atom occurrences.
+        center_angstrom: Midpoint of the attractive distance transition.
+        scale_angstrom: Width of the attractive distance transition.
+        attraction_strength: Attractive-potential multiplier.
+        repulsion_slope: Slope of the short-range repulsion.
+        repulsion_cutoff_angstrom: Repulsion cutoff distance in angstroms.
+        weight: Optional overall potential weight.
     """
 
     residues: tuple[ComponentReference | str | SymbolicResidueSite, ...]
@@ -8326,7 +7123,15 @@ class RfDiffusionSubstrateInteraction:
 
 @dataclass(frozen=True)
 class RfDiffusionPointGroupSymmetry:
-    r"""A point-group symmetry over equal-length residue units (consumed as ``hard``)."""
+    r"""
+    Apply point-group symmetry to equal-length residue units.
+
+    Args:
+        units: Residue groups representing symmetric copies.
+        kind: Point-group kind, such as cyclic or _dihedral_angle.
+        order: Symmetry order when required by ``kind``.
+        tolerance_angstrom: Accepted symmetry deviation in angstroms.
+    """
 
     units: tuple[tuple[ComponentReference | str | SymbolicResidueSite, ...], ...]
     kind: str
@@ -8336,7 +7141,13 @@ class RfDiffusionPointGroupSymmetry:
 
 @dataclass(frozen=True)
 class RfDiffusionSecondaryStructure:
-    r"""A per-target secondary-structure label for a fold-conditioned configuration."""
+    r"""
+    Assign one secondary-structure label to selected residues.
+
+    Args:
+        targets: Residues receiving the condition.
+        kind: Secondary-structure label.
+    """
 
     targets: tuple[ComponentReference | str | SymbolicResidueSite, ...]
     kind: str

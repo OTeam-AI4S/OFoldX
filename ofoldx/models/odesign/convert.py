@@ -1,4 +1,6 @@
-r"""Convert released ODesign checkpoints into paired OFoldX repositories."""
+r"""
+Convert released ODesign checkpoints into paired OFoldX repositories.
+"""
 
 from __future__ import annotations
 
@@ -125,14 +127,18 @@ def load_reference_state(
     *,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Tensor]:
-    r"""Load tensor weights from a released ODesign checkpoint without executing pickle code."""
+    r"""
+    Load tensor weights from a released ODesign checkpoint without executing pickle code.
+    """
 
     state = torch.load(checkpoint_path, map_location=map_location, weights_only=True)["model"]
     return {key.removeprefix("module."): value for key, value in state.items()}
 
 
 def translate_odesign_state(model: nn.Module, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    r"""Translate every parameter of one ODesign graph from released key names."""
+    r"""
+    Translate every parameter of one ODesign graph from released key names.
+    """
 
     used_reference_keys: set[str] = set()
     for model_key in model.state_dict():
@@ -150,7 +156,8 @@ def translate_odesign_state(model: nn.Module, reference_state: Mapping[str, Tens
 
 
 def _infer_receptor_mode(checkpoint_path: str | Path) -> Literal["rigid", "flex"]:
-    r"""Infer the released receptor mode from a ``*_flex`` / ``*_rigid`` checkpoint filename.
+    r"""
+    Infer the released receptor mode from a ``*_flex`` / ``*_rigid`` checkpoint filename.
 
     The two protein archives ``odesign_base_prot_flex.pt`` and
     ``odesign_base_prot_rigid.pt`` share one graph and state-dict contract; they
@@ -176,7 +183,9 @@ def convert_odesign_model(
     dtype: torch.dtype | None = None,
     config: ODesignConfig | None = None,
 ) -> ODesignModel:
-    r"""Strict-load one released ODesign backbone checkpoint into a native [`ODesignModel`][]."""
+    r"""
+    Strict-load one released ODesign backbone checkpoint into a native [`ODesignModel`][].
+    """
 
     model = ODesignModel(ODesignConfig() if config is None else config)
     if dtype is not None:
@@ -199,7 +208,8 @@ def convert_odesign_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert the ODesign backbone checkpoint and write the aggregate composite repository.
+    r"""
+    Convert the ODesign backbone checkpoint and write the aggregate composite repository.
 
     The ODesign protein repository contains a multi-pair [`ODesignPipeline`][]: the ODesign
     backbone pair owns the runnable root, and the OInvFold sequence step uses the
@@ -267,7 +277,9 @@ def _constraint_embeddings_key(key: str) -> str:
 
 
 def odesign_reference_key(model_key: str) -> _ReferenceKey:
-    r"""Return the released-checkpoint key for one OFoldX ODesign state key."""
+    r"""
+    Return the released-checkpoint key for one OFoldX ODesign state key.
+    """
 
     return _reference_key(
         model_key,
@@ -276,7 +288,9 @@ def odesign_reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _reference_key(model_key: str, *, model_rules: tuple[Callable[[str], str], ...] = ()) -> _ReferenceKey:
-    r"""Return the released ODesign checkpoint key for an OFoldX model key."""
+    r"""
+    Return the released ODesign checkpoint key for an OFoldX model key.
+    """
 
     key = _replace_top_level(model_key)
     for rule in model_rules:
@@ -293,7 +307,9 @@ def _reference_key(model_key: str, *, model_rules: tuple[Callable[[str], str], .
 
 
 def _lookup_reference_value(reference_state: Mapping[str, Tensor], _reference_key: _ReferenceKey) -> _ReferenceValue:
-    r"""Read the source tensor or tensors named by one target key."""
+    r"""
+    Read the source tensor or tensors named by one target key.
+    """
 
     if isinstance(_reference_key, tuple):
         return tuple(reference_state[key] for key in _reference_key)
@@ -301,7 +317,9 @@ def _lookup_reference_value(reference_state: Mapping[str, Tensor], _reference_ke
 
 
 def _transform_reference_value(model_key: str, reference_value: _ReferenceValue) -> Tensor:
-    r"""Apply tensor transforms required by the released ODesign format."""
+    r"""
+    Apply tensor transforms required by the released ODesign format.
+    """
 
     if isinstance(reference_value, tuple):
         if model_key.endswith(".conditioning_projection.weight"):
@@ -318,7 +336,9 @@ def _translate_reference_state(
     reference_state: Mapping[str, Tensor],
     key_fn: Callable[[str], _ReferenceKey],
 ) -> dict[str, Tensor]:
-    r"""Translate source names and values for one target state dict."""
+    r"""
+    Translate source names and values for one target state dict.
+    """
 
     translated = {}
     for model_key in model.state_dict():
@@ -329,7 +349,9 @@ def _translate_reference_state(
 
 
 def _remap_token_transformer_blocks(key: str) -> str:
-    r"""Map a consolidated token transformer onto Protenix block names."""
+    r"""
+    Map a consolidated token transformer onto Protenix block names.
+    """
 
     rules = [
         (r"\.pair_norms\.(\d+)\.", r".blocks.\1.attention_pair_bias.layernorm_z."),
@@ -605,6 +627,10 @@ def _replace_many(key: str, replacements: Mapping[str, str]) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run odesign checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "checkpoint",

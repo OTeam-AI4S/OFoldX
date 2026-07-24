@@ -33,16 +33,6 @@ class TriangleAttention(nn.Module):
         operator_backend: Operator provider; see [ofoldx.modules.backend][]. A bias-free
             module on the ``oops`` backend uses the
             dedicated OOps-owned ``triangle_attention`` implementation.
-
-    Examples:
-        >>> import torch
-        >>> attention = TriangleAttention(
-        ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="torch"
-        ... )
-        >>> _ = torch.manual_seed(0)
-        >>> pair = torch.randn(1, 3, 3, 8)
-        >>> attention(pair).shape
-        torch.Size([1, 3, 3, 8])
     """
 
     def __init__(
@@ -88,17 +78,6 @@ class TriangleAttention(nn.Module):
 
         Returns:
             Additive attention update `[..., N, N, pair_size]`; the caller owns the outer residual.
-
-        Examples:
-            >>> import torch
-            >>> attention = TriangleAttention(
-            ...     pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="torch"
-            ... )
-            >>> _ = torch.manual_seed(0)
-            >>> pair = torch.randn(1, 3, 3, 8)
-            >>> mask = torch.ones(1, 3, 3, dtype=torch.bool)
-            >>> attention(pair, mask).shape
-            torch.Size([1, 3, 3, 8])
         """
 
         normalized = self.pair_norm(pair)
@@ -133,16 +112,6 @@ class TriangleMultiplication(nn.Module):
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
         operator_backend: Operator provider; see [ofoldx.modules.backend][].
-
-    Examples:
-        >>> import torch
-        >>> update = TriangleMultiplication(
-        ...     pair_size=8, hidden_size=8, outgoing=True, operator_backend="torch"
-        ... )
-        >>> _ = torch.manual_seed(0)
-        >>> pair = torch.randn(1, 3, 3, 8)
-        >>> update(pair).shape
-        torch.Size([1, 3, 3, 8])
     """
 
     def __init__(
@@ -187,17 +156,6 @@ class TriangleMultiplication(nn.Module):
 
         Returns:
             Additive triangle update `[..., N, N, pair_size]`; the caller owns the outer residual.
-
-        Examples:
-            >>> import torch
-            >>> update = TriangleMultiplication(
-            ...     pair_size=8, hidden_size=8, outgoing=False, operator_backend="torch"
-            ... )
-            >>> _ = torch.manual_seed(0)
-            >>> pair = torch.randn(1, 3, 3, 8)
-            >>> mask = torch.ones(1, 3, 3, dtype=torch.bool)
-            >>> update(pair, mask).shape
-            torch.Size([1, 3, 3, 8])
         """
 
         return dispatch_triangle_multiplication(

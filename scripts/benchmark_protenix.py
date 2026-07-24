@@ -1,4 +1,5 @@
-"""Benchmark the Protenix core workload across precision and compile modes.
+"""
+Benchmark the Protenix core workload across precision and compile modes.
 
 This script is intended for comparing GPUs without assuming the GPU model in
 advance. It records device metadata, timing, memory, optional Dynamo graph-break
@@ -52,7 +53,9 @@ from scripts.profile_protenix import (  # noqa: E402
 
 @dataclass(frozen=True)
 class Variant:
-    """A benchmark variant parsed from strings like ``compiled-bf16``."""
+    """
+    A benchmark variant parsed from strings like ``compiled-bf16``.
+    """
 
     mode: str
     precision: str
@@ -63,7 +66,9 @@ class Variant:
 
 
 class AutocastWorkload(nn.Module):
-    """Wrap a workload in CUDA autocast."""
+    """
+    Wrap a workload in CUDA autocast.
+    """
 
     def __init__(self, module: nn.Module, dtype: torch.dtype) -> None:
         super().__init__()
@@ -241,7 +246,9 @@ def query_nvidia_smi(index: int) -> dict[str, str] | None:
 
 
 def git_metadata() -> dict[str, Any]:
-    """Return lightweight repository state for reproducibility."""
+    """
+    Return lightweight repository state for reproducibility.
+    """
 
     def run_git(*args: str) -> str | None:
         try:

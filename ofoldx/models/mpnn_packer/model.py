@@ -1,4 +1,6 @@
-r"""MpnnPacker side-chain packing model."""
+r"""
+MpnnPacker side-chain packing model.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from ...modules.mpnn import (
     MpnnRelativePositionEncoding,
     cat_neighbors_nodes,
     gather_nodes,
+    local_backbone_frame_features,
     periodic_group_period,
     radial_basis,
     virtual_beta_carbon,
@@ -35,17 +38,13 @@ _ATOM14 = 14
 
 class MpnnPackerModel(Model):
     r"""
-    Predicts side-chain chi angles as a Von Mises mixture and denoises them into atom coordinates.
+    Pack protein side chains with MPNN Packer.
 
-    Encodes the backbone graph and ligand context, then decodes a mixture-of-Von-Mises
-    distribution over the four side-chain chi angles per residue.
-    [`pack`][ofoldx.models.mpnn_packer.model.MpnnPackerModel.pack] runs the iterative sampler and returns
-    canonical packed structures.
+    Accepts [`MpnnPackerInput`][ofoldx.models.mpnn_packer.model.MpnnPackerInput] and returns
+    [`MpnnPackerOutput`][ofoldx.models.mpnn_packer.model.MpnnPackerOutput].
 
     Args:
-        config: Side-chain packer configuration; a default
-            [`MpnnPackerConfig`][ofoldx.models.mpnn_packer.config.MpnnPackerConfig] is used
-            when ``None``.
+        config: Model architecture and inference configuration.
     """
 
     config_class = MpnnPackerConfig
@@ -200,7 +199,7 @@ class MpnnPackerModel(Model):
 
     def initialize_parameters(self) -> None:
         r"""
-        Re-initialize MpnnPacker weights to match the LigandMPNN scheme.
+        Initialize matrix parameters with Xavier-uniform values.
         """
 
         for parameter in self.parameters():
@@ -213,7 +212,17 @@ class MpnnPackerModel(Model):
         *,
         atom14_coordinates: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Encode one explicit atom14 state into residue and edge representations."""
+        r"""
+        Encode an atom14 state as residue graph representations.
+
+        Args:
+            input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
+            atom14_coordinates: Current atom14 coordinates with shape ``(B, L, 14, 3)``.
+
+        Returns:
+            Node states with shape ``(B, L, H)``, edge states with shape
+            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+        """
 
         residue_mask = input.residue_mask
         node_features, edges, neighbor_indices, atom_nodes, atom_edges, context_nodes, context_mask = (
@@ -273,7 +282,20 @@ class MpnnPackerModel(Model):
         edge_states: Tensor,
         neighbor_indices: Tensor,
     ) -> MpnnPackerOutput:
-        r"""Decode torsion mixtures from an explicit atom14 state and encoded graph."""
+        r"""
+        Predict side-chain torsion mixtures from encoded graph states.
+
+        Args:
+            input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
+            atom14_coordinates: Current atom14 coordinates with shape ``(B, L, 14, 3)``.
+            atom14_mask: Valid-atom mask with shape ``(B, L, 14)``.
+            node_states: Encoded residue states with shape ``(B, L, H)``.
+            edge_states: Encoded edge states with shape ``(B, L, K, H)``.
+            neighbor_indices: Neighbor indices with shape ``(B, L, K)``.
+
+        Returns:
+            Four torsion-mixture distributions per residue.
+        """
 
         residue_mask = input.residue_mask
         sidechain_nodes, decode_edges = self.feature_encoder.decode(
@@ -312,7 +334,18 @@ class MpnnPackerModel(Model):
         atom14_coordinates: Tensor,
         atom14_mask: Tensor,
     ) -> MpnnPackerOutput:
-        r"""Predict four per-residue torsion mixtures for one explicit atom14 state."""
+        r"""
+        Predict side-chain torsion mixtures for an atom14 state.
+
+        Args:
+            input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
+            atom14_coordinates: Current atom14 coordinates with shape ``(B, L, 14, 3)``.
+            atom14_mask: Valid-atom mask with shape ``(B, L, 14)``.
+
+        Returns:
+            Mixture means, concentrations, and logits with shape
+            ``(B, L, 4, num_mixtures)``.
+        """
 
         node_states, edge_states, neighbor_indices = self.encode(input, atom14_coordinates=atom14_coordinates)
         return self.decode(
@@ -333,7 +366,19 @@ class MpnnPackerModel(Model):
         num_torsion_samples: int = 16,
         generator: torch.Generator | None = None,
     ) -> MpnnPackerSamplingOutput:
-        r"""Generate one final atom14 sample with the iterative sampler."""
+        r"""
+        Sample one packed atom14 state for each input batch item.
+
+        Args:
+            input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
+            num_denoising_steps: Number of iterative side-chain updates.
+            num_torsion_samples: Number of torsion proposals evaluated per update.
+            generator: Random generator used for torsion sampling.
+
+        Returns:
+            Packed atom14 coordinates and masks, sampled chi angles, their log
+            densities, and the final torsion-mixture parameters.
+        """
 
         if num_denoising_steps <= 0:
             raise ValueError("num_denoising_steps must be positive")
@@ -362,7 +407,7 @@ class MpnnPackerModel(Model):
         default_frames = self.amino_acid_rigid_group_default_frame[amino_acid_index]
         atom14_to_rigid_group = self.amino_acid_atom14_to_rigid_group[amino_acid_index]
         atom14_rigid_group_positions = self.amino_acid_atom14_rigid_group_positions[amino_acid_index]
-        torsion_sin_cos, _ = atom37_to_torsion_angles(
+        torsion_sin_cos, _ = _atom37_to_torsion_angles(
             backbone_atom37_coordinates,
             atom37_exists,
             chi_atom_indices=chi_atom_indices,
@@ -375,7 +420,7 @@ class MpnnPackerModel(Model):
             eps=1e-9,
         )
 
-        input_torsion_sin_cos, _ = atom37_to_torsion_angles(
+        input_torsion_sin_cos, _ = _atom37_to_torsion_angles(
             input.atom37_coordinates,
             input.atom37_mask,
             chi_atom_indices=chi_atom_indices,
@@ -402,12 +447,12 @@ class MpnnPackerModel(Model):
         torsion_sin_cos = torsion_sin_cos.clone()
         torsion_sin_cos[:, :, 3:] = torch.where(pack_positions, random_sin_cos, input_chi_sin_cos)
 
-        frames = torsion_angles_to_frames(
+        frames = _torsion_angles_to_frames(
             backbone_frames,
             torsion_sin_cos,
             default_frames=default_frames,
         )
-        atom14_coordinates = frames_and_literature_positions_to_atom14_pos(
+        atom14_coordinates = _frames_and_literature_positions_to_atom14_pos(
             frames,
             atom14_to_rigid_group=atom14_to_rigid_group,
             atom14_rigid_group_positions=atom14_rigid_group_positions,
@@ -477,12 +522,12 @@ class MpnnPackerModel(Model):
                 dim=-1,
             )
             torsion_sin_cos[:, :, 3:] = torch.where(pack_positions, sampled_chi_sin_cos, input_chi_sin_cos)
-            frames = torsion_angles_to_frames(
+            frames = _torsion_angles_to_frames(
                 backbone_frames,
                 torsion_sin_cos,
                 default_frames=default_frames,
             )
-            atom14_coordinates = frames_and_literature_positions_to_atom14_pos(
+            atom14_coordinates = _frames_and_literature_positions_to_atom14_pos(
                 frames,
                 atom14_to_rigid_group=atom14_to_rigid_group,
                 atom14_rigid_group_positions=atom14_rigid_group_positions,
@@ -516,7 +561,19 @@ class MpnnPackerModel(Model):
         num_torsion_samples: int = 16,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        r"""Generate independent packed Structures with the iterative sampler."""
+        r"""
+        Generate independently packed structures for one processed target.
+
+        Args:
+            input: One processed side-chain packing target.
+            num_samples: Number of packed structures to generate.
+            num_denoising_steps: Number of iterative side-chain updates per sample.
+            num_torsion_samples: Number of torsion proposals evaluated per update.
+            generator: Random generator used for torsion sampling.
+
+        Returns:
+            Packed structure predictions in sampling order.
+        """
 
         if input.sequence_tokens.shape[0] != 1:
             raise ValueError("pack requires batch size one")
@@ -530,7 +587,7 @@ class MpnnPackerModel(Model):
             return PackResult(predictions=tuple(PackPrediction(input.structure) for _ in range(num_samples)))
 
         predictions = tuple(
-            pack_candidate(
+            _pack_candidate(
                 input,
                 self.sample(
                     input,
@@ -546,11 +603,7 @@ class MpnnPackerModel(Model):
 
 class MpnnPackerFeatures(nn.Module):
     r"""
-    Turns backbone coordinates and ligand context into the graph and distance features the MpnnPacker consumes.
-
-    Builds the backbone graph, ligand-context, and side-chain atom-distance features used by the
-    MpnnPacker encoder and decoder. Mirrors the reference LigandMPNN ``ProteinFeatures`` used by the
-    MpnnPacker (note: distinct from the sequence-model feature encoder).
+    Build residue-graph and atom-context features for MPNN Packer.
 
     Args:
         node_size: Width of the per-node features.
@@ -617,12 +670,16 @@ class MpnnPackerFeatures(nn.Module):
         self.register_buffer("periodic_period", period, persistent=False)
 
     def _context_rbf(self, distances: Tensor) -> Tensor:
-        r"""RBF-expand distances over the configured ``[lower_bound, upper_bound]`` range."""
+        r"""
+        RBF-expand distances over the configured ``[lower_bound, upper_bound]`` range.
+        """
 
         return radial_basis(distances, self.num_rbf, self.lower_bound, self.upper_bound)
 
     def _element_features(self, atomic_numbers: Tensor, *, dtype: torch.dtype) -> Tensor:
-        r"""One-hot-encode atoms by element, periodic group, and period `[..., 147]`."""
+        r"""
+        One-hot-encode atoms by element, periodic group, and period `[..., 147]`.
+        """
 
         atomic_numbers = atomic_numbers.long()
         group = self.periodic_group[atomic_numbers]
@@ -644,7 +701,7 @@ class MpnnPackerFeatures(nn.Module):
         context_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
-        Build the encoder inputs: backbone-graph edges, sequence nodes, and ligand-context features.
+        Build residue-graph and atom-context encoder features.
 
         Args:
             atom14_coordinates: Current atom14 coordinates ``[B, L, 14, 3]``.
@@ -657,7 +714,10 @@ class MpnnPackerFeatures(nn.Module):
             context_mask: Valid-context mask ``[B, L, A]``.
 
         Returns:
-            Tuple ``(nodes, edges, neighbor_idx, atom_nodes, atom_edges, context_nodes, context_mask)``.
+            Residue nodes ``(B, L, H)``, residue edges ``(B, L, K, H)``,
+            neighbor indices ``(B, L, K)``, atom nodes ``(B, L, A, H)``, atom
+            edges ``(B, L, A, A, H)``, residue-to-context features
+            ``(B, L, A, H)``, and context mask ``(B, L, A)``.
         """
 
         coordinates = atom14_coordinates
@@ -706,7 +766,7 @@ class MpnnPackerFeatures(nn.Module):
             + 1e-6
         )
         context_features = self._context_rbf(context_distances.movedim(2, 3)).flatten(start_dim=-2)
-        angle_features = _local_angle_features(n, ca, c, context_coordinates)
+        angle_features = local_backbone_frame_features(n, ca, c, context_coordinates)
         context = torch.cat([context_features, element_projection, angle_features], dim=-1)
         context_nodes = self.context_node_norm(self.context_node_projection(context))
 
@@ -734,7 +794,7 @@ class MpnnPackerFeatures(nn.Module):
         context_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
         r"""
-        Build the decoder inputs: explicit atom14-atom and atom14-ligand distance features.
+        Build atom14-aware decoder features.
 
         Args:
             atom14_coordinates: Current atom14 coordinates ``[B, L, 14, 3]``.
@@ -747,8 +807,8 @@ class MpnnPackerFeatures(nn.Module):
             context_mask: Valid-context mask ``[B, L, A]``.
 
         Returns:
-            Tuple ``(sidechain_nodes, decode_edges)`` of per-residue side-chain node features and the
-            decoder edge context.
+            Side-chain node features with shape ``(B, L, H)`` and decoder edge
+            features with shape ``(B, L, K, H)``.
         """
 
         coordinates = atom14_coordinates
@@ -801,44 +861,9 @@ class MpnnPackerFeatures(nn.Module):
         return sidechain_nodes, decode_edges
 
 
-def _local_angle_features(n: Tensor, ca: Tensor, c: Tensor, points: Tensor) -> Tensor:
-    r"""Direction features of ``points`` expressed in each residue's local backbone frame.
-
-    Builds a per-residue orthonormal frame from N/CA/C, projects the context points into it, and returns
-    scale-invariant planar/spatial direction cosines (the LigandMPNN local-angle context features).
-
-    Args:
-        n: Nitrogen coordinates `[B, L, 3]`.
-        ca: Alpha-carbon coordinates `[B, L, 3]`.
-        c: Carbon coordinates `[B, L, 3]`.
-        points: Context atom coordinates `[B, L, A, 3]`.
-
-    Returns:
-        Direction features `[B, L, A, 4]`.
-    """
-
-    first_axis = F.normalize(n - ca, dim=-1)
-    c_vector = c - ca
-    projected = torch.einsum("bli,bli->bl", first_axis, c_vector)[..., None]
-    second_axis = F.normalize(c_vector - first_axis * projected, dim=-1)
-    third_axis = torch.cross(first_axis, second_axis, dim=-1)
-    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
-    local = torch.einsum("blqp,blyq->blyp", frame, points - ca[:, :, None])
-    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
-    spatial_radius = torch.norm(local, dim=-1) + 1e-8
-    return torch.stack(
-        (
-            local[..., 0] / planar_radius,
-            local[..., 1] / planar_radius,
-            planar_radius / spatial_radius,
-            local[..., 2] / spatial_radius,
-        ),
-        dim=-1,
-    )
-
-
 def _knn(points: Tensor, mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""Find the ``num_neighbors`` nearest residues by CA distance, after every valid pair.
+    r"""
+    Find the ``num_neighbors`` nearest residues by CA distance, after every valid pair.
 
     Args:
         points: Reference (CA) coordinates `[B, L, 3]`.
@@ -857,7 +882,8 @@ def _knn(points: Tensor, mask: Tensor, num_neighbors: int, eps: float = 1e-6) ->
 
 
 def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""Compute every ordered atom-pair distance along the residue neighbor graph.
+    r"""
+    Compute every ordered atom-pair distance along the residue neighbor graph.
 
     Args:
         atoms: Per-residue atom coordinates `[B, L, A, 3]`.
@@ -881,7 +907,9 @@ def _sample_von_mises_mixture(
     num_samples: int,
     generator: torch.Generator | None,
 ) -> Tensor:
-    r"""Match PyTorch's mixture/Von-Mises sampling while accepting a Generator."""
+    r"""
+    Match PyTorch's mixture/Von-Mises sampling while accepting a Generator.
+    """
 
     probabilities = mix_logits.softmax(dim=-1).reshape(-1, mix_logits.shape[-1])
     mixture_indices = torch.multinomial(
@@ -913,11 +941,20 @@ def _sample_von_mises_mixture(
     return torch.gather(component_samples, -1, mixture_indices.unsqueeze(-1)).squeeze(-1)
 
 
-def pack_candidate(
+def _pack_candidate(
     input: MpnnPackerInput,
     packed: MpnnPackerSamplingOutput,
 ) -> PackPrediction:
-    r"""Realize one sampled atom14 state without materializing unselected atoms."""
+    r"""
+    Decode one sampled atom14 state into a packed structure.
+
+    Args:
+        input: Processor output describing the source structure and selected residues.
+        packed: Sampled atom14 coordinates, masks, and torsions.
+
+    Returns:
+        A packed structure containing sampled atoms only at selected residues.
+    """
 
     structure = input.structure
     source_index = {site: index for index, site in enumerate(structure.sites)}
@@ -1023,20 +1060,13 @@ def pack_candidate(
 
 class MpnnPackerFrame:
     r"""
-    Rigid frame stored as a rotation matrix and a translation.
+    Rigid frame stored as a rotation matrix and translation.
 
-    A minimal rotation-matrix analogue of the OpenFold ``Rigid`` transform, exposing only the
-    operations the MpnnPacker needs. Batched over any number of leading dimensions.
+    Any number of leading batch dimensions is supported.
 
     Args:
         rotation: Rotation matrices with shape ``(*, 3, 3)``.
         translation: Translations with shape ``(*, 3)``.
-
-    Examples:
-        >>> import torch
-        >>> frame = MpnnPackerFrame(torch.eye(3), torch.tensor([1.0, 2.0, 3.0]))
-        >>> frame.apply(torch.zeros(3)).tolist()
-        [1.0, 2.0, 3.0]
     """
 
     def __init__(self, rotation: Tensor, translation: Tensor) -> None:
@@ -1045,13 +1075,13 @@ class MpnnPackerFrame:
 
     def compose(self, other: MpnnPackerFrame) -> MpnnPackerFrame:
         r"""
-        Compose two frames, applying ``other`` in ``self``'s local frame.
+        Compose ``self`` with a frame expressed in its local coordinates.
 
         Args:
-            other: MpnnPackerFrame to apply after ``self``.
+            other: Frame expressed in ``self``'s local coordinates.
 
         Returns:
-            The composed frame ``self ∘ other``.
+            The composed transform ``self(other(points))``.
         """
 
         rotation = self.rotation @ other.rotation
@@ -1060,20 +1090,20 @@ class MpnnPackerFrame:
 
     def apply(self, points: Tensor) -> Tensor:
         r"""
-        Map local points into the global frame (rotate then translate).
+        Map local points into the global frame.
 
         Args:
             points: Local coordinates with shape ``(*, 3)``.
 
         Returns:
-            Global coordinates with shape ``(*, 3)``.
+            Rotated and translated coordinates with shape ``(*, 3)``.
         """
 
         return _rotate(self.rotation, points) + self.translation
 
     def invert_apply(self, points: Tensor) -> Tensor:
         r"""
-        Map global points back into the local frame (inverse of `apply`).
+        Map global points back into the local frame.
 
         Args:
             points: Global coordinates with shape ``(*, 3)``.
@@ -1088,13 +1118,13 @@ class MpnnPackerFrame:
 
     def unsqueeze(self, dim: int) -> MpnnPackerFrame:
         r"""
-        Insert a size-one dimension into the shared leading axes.
+        Insert a size-one dimension into the leading axes.
 
         Args:
-            dim: Position of the new axis among the leading (batch) dimensions.
+            dim: Position of the new leading axis.
 
         Returns:
-            A frame with the extra leading axis inserted into both rotation and translation.
+            A frame with the axis inserted into both rotation and translation.
         """
 
         rotation_dim = dim - 2 if dim < 0 else dim
@@ -1102,7 +1132,9 @@ class MpnnPackerFrame:
         return MpnnPackerFrame(self.rotation.unsqueeze(rotation_dim), self.translation.unsqueeze(translation_dim))
 
     def __getitem__(self, index) -> MpnnPackerFrame:
-        r"""Index the shared leading (batch) axes, returning the sub-frame at ``index``."""
+        r"""
+        Index the shared leading (batch) axes, returning the sub-frame at ``index``.
+        """
 
         if not isinstance(index, tuple):
             index = (index,)
@@ -1114,13 +1146,14 @@ class MpnnPackerFrame:
     @staticmethod
     def from_tensor_4x4(transform: Tensor) -> MpnnPackerFrame:
         r"""
-        Build a frame from a homogeneous 4x4 transform.
+        Build a frame from homogeneous transforms.
 
         Args:
             transform: Homogeneous transforms with shape ``(*, 4, 4)``.
 
         Returns:
-            A frame taking the rotation from the top-left 3x3 block and translation from the last column.
+            Frames with rotation from ``transform[..., :3, :3]`` and translation
+            from ``transform[..., :3, 3]``.
         """
 
         return MpnnPackerFrame(transform[..., :3, :3], transform[..., :3, 3])
@@ -1133,7 +1166,7 @@ class MpnnPackerFrame:
         eps: float = 1e-8,
     ) -> MpnnPackerFrame:
         r"""
-        Gram-Schmidt frame from three points (AF2 algorithm 21).
+        Construct right-handed frames from three points with Gram-Schmidt.
 
         Args:
             neg_x_axis: Point defining the negative x-axis direction, shape ``(*, 3)``.
@@ -1176,7 +1209,7 @@ class MpnnPackerFrame:
         eps: float = 1e-20,
     ) -> MpnnPackerFrame:
         r"""
-        Backbone frame from N/CA/C coordinates (AF2 reference-frame construction).
+        Construct backbone frames from N, C-alpha, and C coordinates.
 
         Args:
             n_xyz: Nitrogen coordinates, shape ``(*, 3)``.
@@ -1213,13 +1246,17 @@ class MpnnPackerFrame:
 
 
 def _rotate(rotation: Tensor, points: Tensor) -> Tensor:
-    r"""Apply rotation matrices ``(*, 3, 3)`` to points ``(*, 3)``."""
+    r"""
+    Apply rotation matrices ``(*, 3, 3)`` to points ``(*, 3)``.
+    """
 
     return torch.matmul(rotation, points.unsqueeze(-1)).squeeze(-1)
 
 
 def _stack_rot(rows: list[list], like: Tensor) -> Tensor:
-    r"""Assemble a batched ``(*, 3, 3)`` rotation from per-entry tensors/scalars/``None``."""
+    r"""
+    Assemble a batched ``(*, 3, 3)`` rotation from per-entry tensors/scalars/``None``.
+    """
 
     zeros = torch.zeros_like(like)
     filled = [
@@ -1229,7 +1266,7 @@ def _stack_rot(rows: list[list], like: Tensor) -> Tensor:
     return torch.stack([torch.stack(row, dim=-1) for row in filled], dim=-2)
 
 
-def atom37_to_torsion_angles(
+def _atom37_to_torsion_angles(
     all_atom_positions: Tensor,
     all_atom_mask: Tensor,
     *,
@@ -1239,8 +1276,8 @@ def atom37_to_torsion_angles(
     r"""
     Compute the seven backbone/side-chain torsion angles as sin/cos pairs.
 
-    Compact reimplementation of OpenFold ``atom37_to_torsion_angles`` restricted to what the
-    MpnnPacker consumes: the sin/cos torsion tensor and its validity mask.
+    The packing model consumes only normalized sine/cosine torsions and their
+    validity mask, so this routine returns that bounded representation directly.
 
     Args:
         all_atom_positions: Atom37 coordinates with shape ``(B, L, 37, 3)``.
@@ -1252,14 +1289,6 @@ def atom37_to_torsion_angles(
     Returns:
         Tuple ``(torsion_sin_cos, torsion_mask)`` with shapes ``(B, L, 7, 2)``
         and ``(B, L, 7)``.
-
-    Examples:
-        >>> torsions, torsion_mask = atom37_to_torsion_angles(  # doctest: +SKIP
-        ...     all_atom_positions,
-        ...     all_atom_mask,
-        ...     chi_atom_indices=chi_atom_indices,
-        ...     chi_angles_mask=chi_angles_mask,
-        ... )
     """
 
     pad = all_atom_positions.new_zeros([*all_atom_positions.shape[:-3], 1, 37, 3])
@@ -1301,7 +1330,7 @@ def atom37_to_torsion_angles(
     return torsion_angles_sin_cos, torsion_angles_mask
 
 
-def torsion_angles_to_frames(
+def _torsion_angles_to_frames(
     backbone_frames: MpnnPackerFrame,
     torsions: Tensor,
     *,
@@ -1317,11 +1346,6 @@ def torsion_angles_to_frames(
 
     Returns:
         Eight global rigid-group frames with batch shape ``(B, L, 8)``.
-
-    Examples:
-        >>> frames = torsion_angles_to_frames(  # doctest: +SKIP
-        ...     backbone_frames, torsions, default_frames=default_frames
-        ... )
     """
 
     default = MpnnPackerFrame.from_tensor_4x4(default_frames)
@@ -1346,7 +1370,7 @@ def torsion_angles_to_frames(
     return backbone_frames.unsqueeze(-1).compose(frames_to_bb)
 
 
-def frames_and_literature_positions_to_atom14_pos(
+def _frames_and_literature_positions_to_atom14_pos(
     frames: MpnnPackerFrame,
     *,
     atom14_to_rigid_group: Tensor,
@@ -1364,14 +1388,6 @@ def frames_and_literature_positions_to_atom14_pos(
 
     Returns:
         Atom14 coordinates with shape ``(B, L, 14, 3)``.
-
-    Examples:
-        >>> coords = frames_and_literature_positions_to_atom14_pos(  # doctest: +SKIP
-        ...     frames,
-        ...     atom14_to_rigid_group=atom14_to_rigid_group,
-        ...     atom14_rigid_group_positions=atom14_rigid_group_positions,
-        ...     atom14_mask=atom14_mask,
-        ... )
     """
 
     group_mask = torch.nn.functional.one_hot(atom14_to_rigid_group, num_classes=8).to(frames.rotation.dtype)
@@ -1384,7 +1400,9 @@ def frames_and_literature_positions_to_atom14_pos(
 
 
 def _frame_cat(frames: list[MpnnPackerFrame]) -> MpnnPackerFrame:
-    r"""Concatenate frames along their last shared dimension."""
+    r"""
+    Concatenate frames along their last shared dimension.
+    """
 
     rotation = torch.cat([frame.rotation for frame in frames], dim=-3)
     translation = torch.cat([frame.translation for frame in frames], dim=-2)
@@ -1398,7 +1416,31 @@ def _frame_cat(frames: list[MpnnPackerFrame]) -> MpnnPackerFrame:
 
 @dataclass(eq=False)
 class MpnnPackerInput:
-    r"""Complete tensor input and canonical decode mapping for side-chain packing."""
+    r"""
+    Inputs for side-chain packing.
+
+    Args:
+        backbone_coordinates: N, CA, C, and O coordinates with shape
+            ``(batch_size, num_residues, 4, 3)``.
+        sequence_tokens: Residue token IDs with shape ``(batch_size, num_residues)``.
+        residue_mask: Valid-residue mask with shape ``(batch_size, num_residues)``.
+        residue_index: Residue indices with shape ``(batch_size, num_residues)``.
+        chain_index: Chain indices with shape ``(batch_size, num_residues)``.
+        context_coordinates: Nearby context-atom coordinates with shape
+            ``(batch_size, num_residues, num_context_atoms, 3)``.
+        context_atomic_numbers: Context atomic numbers with shape
+            ``(batch_size, num_residues, num_context_atoms)``.
+        context_mask: Context-atom mask with shape
+            ``(batch_size, num_residues, num_context_atoms)``.
+        atom37_coordinates: Observed atom37 coordinates with shape
+            ``(batch_size, num_residues, 37, 3)``.
+        atom37_mask: Observed atom37 mask with shape
+            ``(batch_size, num_residues, 37)``.
+        pack_positions: Residues selected for packing with shape
+            ``(batch_size, num_residues)``.
+        structure: Source structure.
+        component_references: Component occurrences aligned to residue rows.
+    """
 
     backbone_coordinates: Tensor
     sequence_tokens: Tensor
@@ -1417,7 +1459,15 @@ class MpnnPackerInput:
 
 @dataclass(eq=False)
 class MpnnPackerOutput:
-    r"""Von Mises mixture parameters predicted for four side-chain torsions."""
+    r"""
+    Predicted side-chain torsion mixtures.
+
+    Args:
+        mean: Von Mises means with shape
+            ``(batch_size, num_residues, 4, num_mixtures)``.
+        concentration: Positive concentrations with the same shape as ``mean``.
+        mix_logits: Mixture logits with the same shape as ``mean``.
+    """
 
     mean: Tensor
     concentration: Tensor
@@ -1426,7 +1476,25 @@ class MpnnPackerOutput:
 
 @dataclass(eq=False)
 class MpnnPackerSamplingOutput:
-    r"""Final tensors from one iterative side-chain sample."""
+    r"""
+    Outputs from iterative side-chain sampling.
+
+    Args:
+        atom14_coordinates: Packed atom14 coordinates with shape
+            ``(batch_size, num_residues, 14, 3)``.
+        atom14_mask: Packed atom14 mask with shape
+            ``(batch_size, num_residues, 14)``.
+        sampled_chi_angles: Selected chi angles with shape
+            ``(batch_size, num_residues, 4)``.
+        chi_log_densities: Selected-angle log densities with shape
+            ``(batch_size, num_residues, 4)``.
+        mean: Final von Mises means with shape
+            ``(batch_size, num_residues, 4, num_mixtures)``.
+        concentration: Final von Mises concentrations with the same shape as ``mean``.
+        mix_logits: Final mixture logits with the same shape as ``mean``.
+        input_chi_sin_cos: Input chi-angle sine and cosine values with shape
+            ``(batch_size, num_residues, 4, 2)``.
+    """
 
     atom14_coordinates: Tensor
     atom14_mask: Tensor

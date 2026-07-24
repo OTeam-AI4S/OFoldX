@@ -1,4 +1,6 @@
-r"""Boltz-2 architecture and inference configuration."""
+r"""
+Boltz-2 architecture and inference configuration.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class Boltz2InputEmbeddingsConfig(Config):
-    r"""Configure the independent Boltz-2 atom input encoder and token conditioning.
+    r"""
+    Configure the independent Boltz-2 atom input encoder and token conditioning.
 
     Args:
         num_atom_encoder_blocks: Number of atom-attention encoder blocks.
@@ -34,7 +37,8 @@ class Boltz2InputEmbeddingsConfig(Config):
 
 
 class Boltz2TrunkConfig(Config):
-    r"""Configure the Boltz-2 Pairformer and MSA representation trunk.
+    r"""
+    Configure the Boltz-2 Pairformer and MSA representation trunk.
 
     Args:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk stack.
@@ -69,7 +73,8 @@ class Boltz2TrunkConfig(Config):
 
 
 class Boltz2TemplateConfig(Config):
-    r"""Configure Boltz-2 on-the-fly template distance and unit-vector embedding.
+    r"""
+    Configure Boltz-2 on-the-fly template distance and unit-vector embedding.
 
     Args:
         hidden_size: Width of the template pair hidden channel.
@@ -95,7 +100,8 @@ class Boltz2TemplateConfig(Config):
 
 
 class Boltz2DenoiserConfig(Config):
-    r"""Configure the Boltz-2 learned coordinate denoiser.
+    r"""
+    Configure the Boltz-2 learned coordinate denoiser.
 
     Args:
         num_token_transformer_blocks: Number of conditioned token-transformer blocks in the score model.
@@ -127,7 +133,8 @@ class Boltz2DenoiserConfig(Config):
 
 
 class Boltz2SamplerConfig(Config):
-    r"""Configure Boltz-2 Euler sampling with in-loop weighted rigid alignment.
+    r"""
+    Configure Boltz-2 Euler sampling with in-loop weighted rigid alignment.
 
     Args:
         num_sampling_steps: Number of EDM sampling steps.
@@ -149,7 +156,8 @@ class Boltz2SamplerConfig(Config):
 
 
 class Boltz2ConfidenceConfig(Config):
-    r"""Configure token-level Boltz-2 confidence with separate intra/inter PAE and PDE.
+    r"""
+    Configure token-level Boltz-2 confidence with separate intra/inter PAE and PDE.
 
     Args:
         num_pairformer_blocks: Number of Pairformer blocks in the confidence head.
@@ -171,7 +179,8 @@ class Boltz2ConfidenceConfig(Config):
 
 
 class Boltz2AffinityHeadConfig(Config):
-    r"""Configure one Boltz-2 masked-pair affinity head and its pair-only Pairformer.
+    r"""
+    Configure one Boltz-2 masked-pair affinity head and its pair-only Pairformer.
 
     Args:
         num_pairformer_blocks: Number of pair-only Pairformer blocks in the affinity head.
@@ -195,7 +204,8 @@ class Boltz2AffinityHeadConfig(Config):
 
 
 class Boltz2Config(Config):
-    r"""Configure the Boltz-2 folding and confidence architecture.
+    r"""
+    Configure the Boltz-2 folding and confidence architecture.
 
     Args:
         single_size: Width of the token (single) representation.
@@ -245,7 +255,8 @@ class Boltz2Config(Config):
 
 
 class Boltz2AffinityConfig(Boltz2Config):
-    r"""Configure affinity prediction by overriding the inherited Boltz-2 graph and adding two fixed heads.
+    r"""
+    Configure affinity prediction by overriding the inherited Boltz-2 graph and adding two fixed heads.
 
     Args:
         use_templates: Whether to run the inherited template embedder; fixed to ``False`` for affinity.

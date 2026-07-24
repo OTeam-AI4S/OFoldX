@@ -1,4 +1,6 @@
-r"""The reusable Pipeline for sequence design."""
+r"""
+The reusable Pipeline for sequence design.
+"""
 
 from __future__ import annotations
 
@@ -47,7 +49,9 @@ class DesignPipeline(
     PairedPipeline[_DesignModel[_ModelInputT], _DesignProcessor[_ModelInputT]],
     Generic[_ModelInputT],
 ):
-    r"""Reusable binding of one design Model and its paired Processor."""
+    r"""
+    Molecular design pipeline for one model-processor pair.
+    """
 
     def design(
         self,
@@ -60,7 +64,8 @@ class DesignPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design fixed-length sequences with the paired Processor and Model.
+        r"""
+        Design fixed-length sequences with the paired Processor and Model.
 
         Args:
             input: Molecular system, structure, or path to process.

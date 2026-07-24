@@ -1,7 +1,5 @@
-r"""Protenix folding Pipelines.
-
-The default and constraint variants expose separate task boundaries. The constraint
-Pipeline additionally accepts atom contacts, token contacts, and pocket inputs.
+r"""
+Protenix structure-prediction pipelines.
 """
 
 from __future__ import annotations
@@ -27,7 +25,9 @@ from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
 
 class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
-    r"""Bind the default Protenix Model and Processor."""
+    r"""
+    Structure prediction pipeline for Protenix.
+    """
 
     def fold(
         self,
@@ -41,22 +41,26 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one assembly and run Protenix folding.
+        r"""
+        Predict structures for one molecular assembly with Protenix.
 
         Args:
             input: Inline sequence, FASTA or structure path, polymer sequence collection,
                 molecular system, or structure topology.
             msa: Optional MSA value, collection, or alignment path.
             templates: Reserved template evidence; this architecture requires an empty sequence.
-            num_samples: Number of structure predictions. ``None`` uses the Model configuration.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            num_samples: Number of structure predictions. ``None`` uses five.
+            seed: Optional seed for preprocessing, MSA subsampling, and
+                coordinate diffusion. Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by preprocessing and folding.
+                Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Structure, PAE, PDE, and gPDE
+            values are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
@@ -76,7 +80,9 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
 
 
 class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, ProtenixConstraintProcessor]):
-    r"""Bind the Protenix constraint Model--Processor pair and own the constraint ``fold`` verb."""
+    r"""
+    Constrained structure prediction pipeline for Protenix.
+    """
 
     def fold(
         self,
@@ -93,7 +99,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one assembly and run constraint-conditioned Protenix folding.
+        r"""
+        Predict constrained structures for one molecular assembly with Protenix.
 
         Args:
             input: Inline sequence, FASTA or structure path, polymer sequence collection,
@@ -103,16 +110,18 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             pocket: Optional directed binder-to-residue pocket constraint.
             msa: Optional MSA value, collection, or alignment path.
             templates: Reserved template evidence; this architecture requires an empty sequence.
-            num_samples: Number of structure predictions. ``None`` uses the Model configuration.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional RNG shared by preprocessing and folding; mutually exclusive with
-                ``seed``.
+            num_samples: Number of structure predictions. ``None`` uses five.
+            seed: Optional seed for preprocessing, MSA subsampling, and
+                coordinate diffusion. Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by constraint preprocessing and
+                folding. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Structure, PAE, PDE, and gPDE
+            values are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)

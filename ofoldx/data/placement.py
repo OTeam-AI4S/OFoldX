@@ -1,9 +1,5 @@
-r"""Placement declarations and symbolic references.
-
-A `PlacementSpec` maps declaration groups to globally unique placement IDs.
-References target placement IDs, while groups determine output grouping and order.
-A `PlacementMap` maps each placement to ordered realized component references;
-symbolic offsets use standard Python indexing, including negative offsets.
+r"""
+Declarations and symbolic references for generated molecular placements.
 """
 
 from __future__ import annotations
@@ -16,10 +12,15 @@ from .molecular import ComponentReference, PolymerType
 
 @dataclass(frozen=True)
 class GeneratedSegment:
-    r"""One de novo polymer interval to be realized.
+    r"""
+    One de novo polymer interval to be realized.
 
-    ``min_length == max_length`` fixes the length, and ``min_length == 0`` is valid.
-    The containing `PlacementSpec` key supplies its identity.
+    ``min_length == max_length`` fixes the length, and zero-length segments are valid.
+
+    Args:
+        polymer_type: Chemistry of the generated polymer.
+        min_length: Minimum number of generated components.
+        max_length: Maximum number of generated components.
     """
 
     polymer_type: PolymerType
@@ -29,9 +30,13 @@ class GeneratedSegment:
 
 @dataclass(frozen=True)
 class ExistingSpan:
-    r"""A half-open ``[start, stop)`` interval of an existing input instance.
+    r"""
+    A half-open ``[start, stop)`` interval of an existing input instance.
 
-    ``instance_id`` names the source instance.
+    Args:
+        instance_id: Source molecular instance.
+        start: Zero-based index of the first included component.
+        stop: Zero-based index after the last included component.
     """
 
     instance_id: str
@@ -53,10 +58,13 @@ PlacementMap: TypeAlias = dict[str, dict[str, tuple[ComponentReference, ...]]]
 
 @dataclass(frozen=True)
 class SymbolicResidueSite:
-    r"""A pre-realization reference to one placement residue.
+    r"""
+    A pre-realization reference to one placement residue.
 
-    ``placement_id`` is globally unique. ``offset`` uses Python indexing over the
-    realized occurrence tuple, so negative values count from the end.
+    Args:
+        placement_id: Globally unique placement identifier.
+        offset: Python-style index into the realized component occurrences. Negative
+            values count from the end.
     """
 
     placement_id: str
@@ -65,7 +73,13 @@ class SymbolicResidueSite:
 
 @dataclass(frozen=True)
 class SymbolicAtomSite:
-    r"""One named atom of a pre-realization placement residue."""
+    r"""
+    One named atom of a pre-realization placement residue.
+
+    Args:
+        residue: Symbolic residue containing the atom.
+        atom_id: Atom identifier within the residue.
+    """
 
     residue: SymbolicResidueSite
     atom_id: str
@@ -74,7 +88,15 @@ class SymbolicAtomSite:
 def symbolic_residue_aliases(
     references: tuple[ComponentReference | SymbolicResidueSite, ...],
 ) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
-    r"""Map negative placement offsets to their concrete positive symbolic identities."""
+    r"""
+    Map negative placement offsets to equivalent non-negative references.
+
+    Args:
+        references: Existing and symbolic residue references in realization order.
+
+    Returns:
+        A mapping from each valid negative symbolic offset to its non-negative form.
+    """
 
     placements: dict[str, list[SymbolicResidueSite]] = {}
     for reference in references:
@@ -88,7 +110,18 @@ def symbolic_residue_aliases(
 
 
 def realized_instance_id(index: int) -> str:
-    r"""Return the 0-based realized instance ID ``chain_{index}``."""
+    r"""
+    Return a realized instance ID for a zero-based index.
+
+    Args:
+        index: Non-negative instance index.
+
+    Returns:
+        The identifier `chain_{index}`.
+
+    Raises:
+        ValueError: If `index` is negative.
+    """
 
     if index < 0:
         raise ValueError(f"realized instance index must be >= 0, got {index}")
@@ -96,7 +129,9 @@ def realized_instance_id(index: int) -> str:
 
 
 class InstanceIdAllocator:
-    r"""Allocate realized instance IDs in declaration order."""
+    r"""
+    Allocate ``chain_{n}`` instance IDs in declaration order.
+    """
 
     __slots__ = ("_next",)
 
@@ -104,7 +139,12 @@ class InstanceIdAllocator:
         self._next = 0
 
     def allocate(self) -> str:
-        r"""Return the next ``chain_{n}`` and advance the counter."""
+        r"""
+        Return the next realized instance ID and advance the allocator.
+
+        Returns:
+            The next `chain_{n}` identifier.
+        """
 
         instance_id = realized_instance_id(self._next)
         self._next += 1
@@ -112,9 +152,17 @@ class InstanceIdAllocator:
 
 
 def instance_of(placement: PlacementSpec) -> dict[str, str]:
-    r"""Build a ``placement_id -> declaration_group`` index.
+    r"""
+    Build an index from placement IDs to declaration groups.
 
-    Duplicate placement IDs raise [`ValueError`][].
+    Args:
+        placement: Placement declaration to index.
+
+    Returns:
+        The declaration group for every placement ID.
+
+    Raises:
+        ValueError: If a placement ID occurs in more than one declaration group.
     """
 
     index: dict[str, str] = {}
@@ -132,7 +180,15 @@ def instance_of(placement: PlacementSpec) -> dict[str, str]:
 
 
 def validate_placement(placement: PlacementSpec) -> None:
-    r"""Raise when a `PlacementSpec` contains duplicate placement IDs."""
+    r"""
+    Validate that placement IDs are globally unique.
+
+    Args:
+        placement: Placement declaration to validate.
+
+    Raises:
+        ValueError: If a placement ID occurs in more than one declaration group.
+    """
 
     instance_of(placement)
 
@@ -142,9 +198,17 @@ def resolve(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> ComponentReference:
-    r"""Resolve a symbolic site to its realized `ComponentReference`.
+    r"""
+    Resolve a symbolic residue against a realized placement map.
 
-    ``site.offset`` is applied directly to the placement's occurrence tuple.
+    Args:
+        site: Symbolic placement residue to resolve.
+        placement_map: Realized component occurrences grouped by declaration and
+            placement ID.
+        instance_of: Mapping from placement IDs to declaration groups.
+
+    Returns:
+        The selected realized component occurrence.
     """
 
     occurrences = placement_map[instance_of[site.placement_id]][site.placement_id]

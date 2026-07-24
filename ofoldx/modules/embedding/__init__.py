@@ -1,12 +1,5 @@
 r"""
-Embedding modules that turn model inputs into learned representations.
-
-This package groups reusable input-side embedders: frozen
-random Fourier features
-([`FrozenFourierEmbedding`][ofoldx.modules.embedding.fourier.FrozenFourierEmbedding]), relative-position encoding
-([`RelativePositionEmbedder`][ofoldx.modules.embedding.position.RelativePositionEmbedder]),
-and template embedding
-([`TemplateEmbedder`][ofoldx.modules.embedding.template.TemplateEmbedder]).
+Reusable input-embedding components.
 """
 
 from __future__ import annotations

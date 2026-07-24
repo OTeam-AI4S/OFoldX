@@ -1,4 +1,6 @@
-r"""Lower monomer protein identity, MSA evidence, and templates to AlphaFold 2."""
+r"""
+Prepare monomer protein, MSA, and template features for AlphaFold 2.
+"""
 
 from __future__ import annotations
 
@@ -72,7 +74,8 @@ _CHI_PI_PERIODIC = (
 
 
 class AlphaFold2Processor(Processor):
-    r"""Build monomer AlphaFold 2 input features.
+    r"""
+    Convert supported protein inputs into `AlphaFold2Input`.
 
     Args:
         config: Feature limits and preprocessing options. Defaults to
@@ -98,7 +101,8 @@ class AlphaFold2Processor(Processor):
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold2Input:
-        r"""Lower one protein monomer and its explicit evidence.
+        r"""
+        Prepare model features for one protein monomer.
 
         Args:
             input: Inline sequence, FASTA path, protein sequence, molecular system, or structure
@@ -107,7 +111,8 @@ class AlphaFold2Processor(Processor):
             templates: Template structures with explicit target alignments.
 
         Returns:
-            An ``AlphaFold2Input`` with aligned target, MSA, template, and layout values.
+            Batched target, MSA, and template tensors. Atom coordinates in template
+            features are in angstroms. This method performs no random sampling.
         """
 
         if isinstance(input, str | PathLike):
@@ -123,18 +128,18 @@ class AlphaFold2Processor(Processor):
                     "input.system, or templates="
                 )
         topology = input.system if isinstance(input, Structure) else input
-        system = topology if isinstance(topology, MolecularSystem) else molecular_system(topology)
-        target, instance_id = protein_monomer(system)
+        system = topology if isinstance(topology, MolecularSystem) else _molecular_system(topology)
+        target, instance_id = _protein_monomer(system)
         target_entity_id = system.instances[instance_id]
-        normalized_msa = normalize_msa(msa, system, target)
-        normalized_templates = normalize_templates(
+        normalized_msa = _normalize_msa(msa, system, target)
+        normalized_templates = _normalize_templates(
             templates,
             target=target,
             target_entity_id=target_entity_id,
             target_instance_id=instance_id,
             max_templates=self.config.max_templates,
         )
-        return prepare_alphafold2_features(
+        return _prepare_alphafold2_features(
             system,
             target=target,
             instance_id=instance_id,
@@ -146,10 +151,12 @@ class AlphaFold2Processor(Processor):
         )
 
 
-def molecular_system(
+def _molecular_system(
     input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
 ) -> MolecularSystem:
-    r"""Construct the one-polymer convenience input accepted by monomer AlphaFold 2."""
+    r"""
+    Construct the one-polymer convenience input accepted by monomer AlphaFold 2.
+    """
 
     if isinstance(input, str | PathLike):
         classified = classify_reference(input)
@@ -174,8 +181,10 @@ def molecular_system(
     )
 
 
-def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
-    r"""Return the single protein target and its instance id."""
+def _protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
+    r"""
+    Return the single protein target and its instance id.
+    """
 
     if len(system.instances) != 1 or len(system.entities) != 1:
         raise ValueError("AlphaFold 2 monomer requires one protein instance")
@@ -190,12 +199,13 @@ def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
     return entity, instance_id
 
 
-def normalize_msa(
+def _normalize_msa(
     msa: MSA | MSACollection | str | PathLike[str] | None,
     system: MolecularSystem,
     target: PolymerSequence,
 ) -> MSA | None:
-    r"""Bind one monomer alignment to the exact target sequence.
+    r"""
+    Bind one monomer alignment to the exact target sequence.
 
     An [`MSA`][] names its entity by ``entity_id``; the Processor resolves that
     entity against ``system`` and verifies the query width. Path inputs are
@@ -220,7 +230,7 @@ def normalize_msa(
     return parsed
 
 
-def normalize_templates(
+def _normalize_templates(
     templates: Sequence[Template],
     *,
     target: PolymerSequence,
@@ -228,7 +238,9 @@ def normalize_templates(
     target_instance_id: str,
     max_templates: int,
 ) -> tuple[Template, ...]:
-    r"""Bind explicit canonical template alignments to the AlphaFold 2 target."""
+    r"""
+    Bind explicit template alignments to the AlphaFold 2 target.
+    """
 
     if len(templates) > max_templates:
         raise ValueError(f"AlphaFold 2 accepts at most {max_templates} templates")
@@ -236,7 +248,7 @@ def normalize_templates(
     for template in templates:
         if not isinstance(template, Template):
             raise TypeError("AlphaFold 2 templates must be explicit Template values with canonical alignments")
-        select_template_alignment(
+        _select_template_alignment(
             template,
             target_length=len(target),
             target_entity_id=target_entity_id,
@@ -246,14 +258,15 @@ def normalize_templates(
     return tuple(normalized)
 
 
-def select_template_alignment(
+def _select_template_alignment(
     template: Template,
     *,
     target_length: int,
     target_entity_id: str,
     target_instance_id: str,
 ) -> TemplateAlignment:
-    r"""Return the one Template alignment that binds to the single AlphaFold 2 target.
+    r"""
+    Return the one Template alignment that binds to the single AlphaFold 2 target.
 
     AlphaFold 2 folds one monomer target, so exactly one of a Template's
     [`TemplateAlignment`][] values may name that target entity and, when it
@@ -276,7 +289,7 @@ def select_template_alignment(
     return alignment
 
 
-def prepare_alphafold2_features(
+def _prepare_alphafold2_features(
     system: MolecularSystem,
     *,
     target: PolymerSequence,
@@ -287,13 +300,12 @@ def prepare_alphafold2_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> AlphaFold2Input:
-    r"""Build the monomer AlphaFold 2 raw MSA pool, profile, and semantic axes.
+    r"""
+    Build the monomer AlphaFold 2 raw MSA pool, profile, and semantic axes.
 
-    The stochastic ``sample_msa`` / ``make_masked_msa`` / clustering / crop draw is
-    the Model's job (once per recycle, off its per-sample generator), so this
-    lowers only the deterministic inputs to that draw: the full query-projected
-    alignment pool, its per-cell deletion counts, and the full-pool HHblits
-    profile.
+    The Model samples and masks MSA rows for each prediction. This function
+    preserves the full query-projected alignment pool, per-cell deletion counts,
+    and full-pool HHblits profile.
     """
 
     residue_type = torch.tensor(
@@ -306,8 +318,8 @@ def prepare_alphafold2_features(
         ],
         dim=-1,
     ).to(torch.float32)
-    msa_tokens, msa_deletions, msa_profile = msa_pool_features(target, msa)
-    template_values = template_features(
+    msa_tokens, msa_deletions, msa_profile = _msa_pool_features(target, msa)
+    template_values = _template_features(
         templates,
         target_length=len(target),
         target_entity_id=target_entity_id,
@@ -346,11 +358,12 @@ def prepare_alphafold2_features(
     )
 
 
-def msa_pool_features(
+def _msa_pool_features(
     target: PolymerSequence,
     msa: MSA | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    r"""Lower the raw query-projected alignment pool and its HHblits profile.
+    r"""
+    Build the query-projected alignment pool and its HHblits profile.
 
     Returns ``msa_tokens [M, N]`` (long residue-type indices, row 0 is the query),
     ``msa_deletions [M, N]`` (float per-cell insertion counts), and
@@ -380,14 +393,16 @@ def msa_pool_features(
     return tokens, deletion_counts, msa_profile
 
 
-def template_features(
+def _template_features(
     templates: tuple[Template, ...],
     *,
     target_length: int,
     target_entity_id: str,
     target_instance_id: str,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    r"""Project canonical aligned template coordinates into atom37 and torsion features."""
+    r"""
+    Project aligned template coordinates into atom37 and torsion features.
+    """
 
     if not templates:
         return (
@@ -403,7 +418,7 @@ def template_features(
     template_positions: list[Tensor] = []
     template_masks: list[Tensor] = []
     for template in templates:
-        alignment = select_template_alignment(
+        alignment = _select_template_alignment(
             template,
             target_length=target_length,
             target_entity_id=target_entity_id,
@@ -434,7 +449,7 @@ def template_features(
     residue_type = torch.stack(template_residue_types)
     positions = torch.stack(template_positions)
     masks = torch.stack(template_masks)
-    torsion, alternative_torsion, torsion_mask = atom37_to_torsion_angles(
+    torsion, alternative_torsion, torsion_mask = _atom37_to_torsion_angles(
         residue_type,
         positions,
         masks,
@@ -450,12 +465,14 @@ def template_features(
     )
 
 
-def atom37_to_torsion_angles(
+def _atom37_to_torsion_angles(
     residue_type: Tensor,
     positions: Tensor,
     atom_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    r"""Compute pre-omega, phi, psi, and chi sin/cos values from atom37 coordinates."""
+    r"""
+    Compute pre-omega, phi, psi, and chi sin/cos values from atom37 coordinates.
+    """
 
     previous_positions = torch.cat([torch.zeros_like(positions[..., :1, :, :]), positions[..., :-1, :, :]], dim=-3)
     previous_mask = torch.cat([torch.zeros_like(atom_mask[..., :1, :]), atom_mask[..., :-1, :]], dim=-2)

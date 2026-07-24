@@ -1,4 +1,6 @@
-r"""Strict translation of the official PxDesign v0.1 checkpoint."""
+r"""
+Strict translation of the official PxDesign v0.1 checkpoint.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +35,9 @@ def translate_pxdesign_state(
     *,
     dtype: torch.dtype | None = None,
 ) -> dict[str, Tensor]:
-    r"""Translate every official tensor to one exact native model tensor."""
+    r"""
+    Translate every official tensor to one exact native model tensor.
+    """
 
     if dtype is not None and not dtype.is_floating_point:
         raise TypeError("dtype must be a floating-point torch dtype")
@@ -62,7 +66,9 @@ def convert_pxdesign_checkpoint(
     map_location: str | torch.device = "cpu",
     dtype: torch.dtype | None = None,
 ) -> PxDesignModel:
-    r"""Build a PxDesign model and strict-load the complete official checkpoint."""
+    r"""
+    Build a PxDesign model and strict-load the complete official checkpoint.
+    """
 
     checkpoint = torch.load(Path(checkpoint_path), map_location=map_location, weights_only=True)
     config = PxDesignConfig()
@@ -84,7 +90,8 @@ def save_pxdesign_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert a PxDesign checkpoint and write a routable OFoldX repository.
+    r"""
+    Convert a PxDesign checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
@@ -115,6 +122,10 @@ def save_pxdesign_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run pxdesign checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="released PxDesign checkpoint (e.g. pxdesign_v0.1.0.pt)")
     parser.add_argument("output_dir", type=Path)
@@ -174,7 +185,9 @@ def _pxdesign_reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _reference_key(model_key: str) -> _ReferenceKey:
-    r"""Return the released PxDesign checkpoint key for an OFoldX model key."""
+    r"""
+    Return the released PxDesign checkpoint key for an OFoldX model key.
+    """
 
     key = _replace_top_level(model_key)
     key = _replace_token_stack_key(key)
@@ -188,7 +201,9 @@ def _reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _lookup_reference_value(reference_state: Mapping[str, Tensor], reference_key: _ReferenceKey) -> _ReferenceValue:
-    r"""Read the source tensor or tensors named by one target key."""
+    r"""
+    Read the source tensor or tensors named by one target key.
+    """
 
     if isinstance(reference_key, tuple):
         return tuple(reference_state[key] for key in reference_key)
@@ -196,7 +211,9 @@ def _lookup_reference_value(reference_state: Mapping[str, Tensor], reference_key
 
 
 def _transform_reference_value(model_key: str, reference_value: _ReferenceValue) -> Tensor:
-    r"""Apply tensor transforms required by the released PxDesign format."""
+    r"""
+    Apply tensor transforms required by the released PxDesign format.
+    """
 
     if isinstance(reference_value, tuple):
         if model_key.endswith(".conditioning_projection.weight"):
@@ -213,7 +230,9 @@ def _translate_reference_state(
     reference_state: Mapping[str, Tensor],
     key_fn: Callable[[str], _ReferenceKey],
 ) -> dict[str, Tensor]:
-    r"""Translate source names and values for one target state dict."""
+    r"""
+    Translate source names and values for one target state dict.
+    """
 
     translated = {}
     for model_key in model.state_dict():
@@ -224,7 +243,9 @@ def _translate_reference_state(
 
 
 def _remap_token_transformer_blocks(key: str) -> str:
-    r"""Map a consolidated token transformer onto Protenix block names."""
+    r"""
+    Map a consolidated token transformer onto Protenix block names.
+    """
 
     rules = [
         (r"\.pair_norms\.(\d+)\.", r".blocks.\1.attention_pair_bias.layernorm_z."),

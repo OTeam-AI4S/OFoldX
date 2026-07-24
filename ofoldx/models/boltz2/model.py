@@ -1,12 +1,5 @@
 r"""
 Boltz-2 model.
-
-The file owns the Boltz-2 input contract, trunk wiring, diffusion path, and confidence heads. Shared
-OFoldX modules provide generic neural-network blocks; model-specific choices stay here so the public API has one
-place to inspect the model.
-
-The structure and affinity model variants expose typed low-level tensor inputs. The
-two-stage affinity operation is assembled by ``Boltz2AffinityPipeline``.
 """
 
 from __future__ import annotations
@@ -50,16 +43,13 @@ from .config import Boltz2AffinityConfig, Boltz2AffinityHeadConfig, Boltz2Config
 
 class Boltz2Model(Model):
     r"""
-    Boltz-2-shaped folding model composed from shared OFoldX modules.
+    Predict biomolecular complex structures with Boltz 2.
 
-    The model runs the standard Boltz-2 pipeline: an atom-conditioned input embedder builds the initial
-    single/pair representations, a recycled trunk (template + MSA + Pairformer) refines them, an EDM diffusion
-    sampler draws atom coords, and a token-level confidence head scores the sample. Subsystems are assembled
-    from shared ``ofoldx.modules`` blocks so the public API has one place to inspect the wiring.
+    Accepts [`Boltz2Input`][ofoldx.models.boltz2.model.Boltz2Input] and returns
+    [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output].
 
     Args:
-        config: Boltz-2 model config selecting widths, block counts, and architecture flags.
-
+        config: Model architecture and inference configuration.
     """
 
     config_class = Boltz2Config
@@ -235,25 +225,21 @@ class Boltz2Model(Model):
         generator: torch.Generator | None = None,
     ) -> Boltz2Output:
         r"""
-        Training path: run the trunk, then a single EDM diffusion denoising step against ``target_positions``.
-
-        ``forward`` is the structure-training graph in both ``train()`` and ``eval()`` modes; those modes only
-        control ordinary stochastic layers such as dropout. It mirrors the Boltz-2 training diffusion step
-        (``DiffusionModule.forward``): sample a per-example noise level, corrupt the (centred) target coords, and
-        denoise them through the score model conditioned on the trunk. Multi-step reverse diffusion is the
-        separate inference path exposed by [`fold`][].
+        Denoise randomly corrupted target coordinates for diffusion training.
 
         Args:
-            input: Typed model input; training requires ``input.target_positions``.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
-            num_samples: Number of noised copies drawn per batch element.
-            generator: Optional PyTorch random generator for the diffusion noise.
+            input: Features with ``target_positions`` shaped ``(B, A, 3)`` in
+                angstroms.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_samples: Number ``S`` of independently corrupted copies per input.
+            generator: Optional generator for log-normal noise levels and Gaussian
+                coordinate noise.
 
         Returns:
-            Structure-prediction output carrying ``coordinates``, ``augmented_target_coordinates``, and
-            ``noise_level``
-            for the diffusion loss alongside the distogram logits.
-
+            Denoised and centered target coordinates with shape ``(B, S, A, 3)``,
+            flattened noise levels with shape ``(B*S,)`` in angstroms, and
+            distogram logits with shape ``(B, N, N, D)``.
         """
 
         representations = self._trunk(input, recycling_steps=recycling_steps)
@@ -288,29 +274,27 @@ class Boltz2Model(Model):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Run Boltz-2 folding and decode a self-contained canonical ``FoldResult``.
-
-        Runs the recycling trunk, draws ``num_samples`` reverse-diffusion samples, scores each with the
-        confidence head, and wraps the raw
-        [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output] into a
-        [`FoldResult`][ofoldx.results.FoldResult]: one generation-ordered
-        [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample, carrying the sampled ``Structure``,
-        per-token ``metrics`` (``plddt``, ``resolved_probability``), token-pair ``pair_metrics``
-        (``pae``, ``pde``), and per-sample ``scores`` (``plddt``, ``ptm``, ``iptm``, ``ligand_iptm``,
-        ``protein_iptm``, ``confidence_score``). It mirrors
-        [`Boltz1Model.fold`][ofoldx.models.boltz1.model.Boltz1Model.fold].
+        r"""
+        Predict structures for one molecular system with Boltz 2.
 
         Args:
-            input: One lowered Boltz-2 input carrying the canonical
-                [`Boltz2Layout`][ofoldx.models.boltz2.model.Boltz2Layout] produced by ``Boltz2Processor``.
-            num_samples: Number of reverse-diffusion samples to draw.
-            generator: Optional RNG for reproducible sampling noise; resolved once at the Pipeline boundary.
-            recycling_steps: Total number of trunk passes; defaults to the configured value.
-            num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
+            input: Processor output for one system, with batch size ``B = 1`` and
+                molecular identities aligned to its atom and token axes.
+            num_samples: Number of coordinate samples.
+            generator: Optional generator for initial coordinates, churn noise, and
+                per-step rigid augmentations.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
+                configured value.
 
         Returns:
-            A [`FoldResult`][ofoldx.results.FoldResult] with one prediction per requested sample.
+            One generation-ordered prediction per sample. Structure, PAE, and PDE
+            values are in angstroms; pLDDT is on the ``0--100`` scale.
 
+        Raises:
+            ValueError: If ``num_samples`` is not positive, the batch contains
+                more than one system, or molecular identities are absent.
         """
 
         num_samples = operator.index(num_samples)
@@ -591,15 +575,10 @@ class Boltz2Model(Model):
 
 class Boltz2AffinityModel(Boltz2Model):
     r"""
-    Extend the Boltz-2 folder with a pair-only head that scores protein-ligand binding affinity.
-
-    The model reuses the Boltz-2 trunk and diffusion path and adds a two-head pair-only affinity ensemble.
-    ``score`` returns a self-contained canonical result for one ``Boltz2Input`` produced by
-    ``Boltz2AffinityProcessor``.
+    Predict protein-ligand binding affinity with Boltz 2.
 
     Args:
-        config: Boltz-2 affinity model config for the two-head architecture.
-
+        config: Model architecture and inference configuration.
     """
 
     config_class = Boltz2AffinityConfig
@@ -647,14 +626,32 @@ class Boltz2AffinityModel(Boltz2Model):
         num_sampling_steps: int | None = None,
         molecular_weight_correction: bool = False,
     ) -> ScoreResult:
-        r"""Run one Boltz-2 affinity scoring pass and return canonical scores.
+        r"""
+        Score protein-ligand affinity for one prepared complex.
 
-        This low-level call expects one second-pass batch from
-        ``Boltz2AffinityProcessor``. It samples candidate complex structures,
-        ranks them by iPTM, and applies the affinity ensemble only to the
-        highest-iPTM sample. The affinity value is an IC50-like
-        ``log10(measurement / µM)`` score (lower is stronger); the second output
-        is a binder probability in ``[0, 1]``. This method does not perform a separate fold-and-rank pass.
+        Candidate structures are sampled and ranked by iPTM before the affinity
+        heads score the highest-ranked sample.
+
+        Args:
+            input: Affinity Processor output for one complex and one selected
+                ligand, with batch size ``B = 1``.
+            num_samples: Number of candidate coordinate samples.
+            generator: Optional generator for coordinate diffusion.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
+                configured value.
+            molecular_weight_correction: Whether to apply molecular-weight
+                calibration to the ensemble affinity value.
+
+        Returns:
+            The selected structure and six scalar scores. Affinity values use
+            ``log10(IC50 / micromolar)`` units, where lower is stronger; binder
+            probabilities lie in ``[0, 1]``.
+
+        Raises:
+            ValueError: If a count is not positive, the input contains more than
+                one system, or no affinity ligand is identified.
         """
 
         num_samples = operator.index(num_samples)
@@ -948,28 +945,6 @@ class Boltz2AffinityModel(Boltz2Model):
 class Boltz2InputEmbeddings(nn.Module):
     r"""
     Compose atom-derived token states with token-level encodings and conditioning embeddings.
-
-    Runs the windowed atom encoder + atom-attention encoder to pool atoms into a per-token single
-    representation, then adds residue-type, MSA-profile, and the enabled ``add_*`` conditioning terms.
-
-    Args:
-        single_size: Width of the produced token single representation.
-        atom_hidden_size: Width of the atom single channel.
-        atom_pair_hidden_size: Width of the atom pair channel.
-        atom_feature_size: Width of the per-atom reference feature vector.
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        vocab_size: Residue-type vocabulary size for the residue-type projection.
-        msa_profile_size: Width of the MSA-profile feature.
-        num_method_types: Number of experimental-method ids for method conditioning.
-        num_molecule_types: Number of molecule types for molecule-type conditioning.
-        add_method_conditioning: Whether to add the experimental-method embedding.
-        add_modified_flag: Whether to add the modified-residue embedding.
-        add_cyclic_flag: Whether to add the cyclic-position projection.
-        add_mol_type_feat: Whether to add the molecule-type embedding.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1050,28 +1025,6 @@ class Boltz2InputEmbeddings(nn.Module):
         cyclic_period: Tensor | None = None,
         molecule_type: Tensor | None = None,
     ) -> Tensor:
-        r"""
-        Pool atoms into per-token single states and add the token-level encodings and conditioning terms.
-
-        Args:
-            atom_features: Per-atom reference features ``(B, M, atom_feature_size)``.
-            reference_positions: Centered reference-conformer atom coords ``(B, M, 3)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            reference_space_id: Reference-conformer group id per atom ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``.
-            residue_type: Query residue-type one-hot ``(B, N, vocab_size)``.
-            msa_profile: Single-sequence MSA profile ``(B, N, vocab_size)``.
-            deletion_mean: Per-token deletion mean ``(B, N)``.
-            method_feature: Optional experimental-method ids ``(B, N)``.
-            modified: Optional modified-residue flags ``(B, N)``.
-            cyclic_period: Optional cyclic-position periods ``(B, N)``.
-            molecule_type: Optional molecule-type ids ``(B, N)``; required when molecule-type conditioning is on.
-
-        Returns:
-            Token single representation ``(B, N, single_size)``.
-
-        """
-
         atom_query, atom_conditioning, atom_pair = self.atom_encoder(
             atom_features, reference_positions, atom_mask, reference_space_id
         )
@@ -1101,20 +1054,6 @@ class Boltz2InputEmbeddings(nn.Module):
 class Boltz2AtomEncoder(nn.Module):
     r"""
     Build atom single states and windowed atom-pair states from reference geometry.
-
-    Projects atom features to atom single states and encodes windowed atom-pair states from reference
-    distance vectors, inverse distances, and a same-space-id validity mask. When ``structure_prediction`` is
-    set, trunk single/pair representations are additionally injected (the diffusion atom encoder path).
-
-    Args:
-        atom_feature_size: Width of the per-atom reference feature vector.
-        atom_hidden_size: Width of the atom single channel.
-        atom_pair_hidden_size: Width of the atom pair channel.
-        single_size: Width of the trunk single channel (used only when ``structure_prediction`` is set).
-        pair_size: Width of the trunk pair channel (used only when ``structure_prediction`` is set).
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        structure_prediction: Whether to inject trunk single/pair states (diffusion atom encoder path).
     """
 
     def __init__(
@@ -1173,24 +1112,6 @@ class Boltz2AtomEncoder(nn.Module):
         single_trunk: Tensor | None = None,
         pair_trunk: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Return atom query states, atom conditioning states, and windowed atom-pair states.
-
-        Args:
-            atom_features: Per-atom reference features ``(B, M, atom_feature_size)``.
-            reference_positions: Centered reference-conformer atom coords ``(B, M, 3)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            reference_space_id: Reference-conformer group id per atom ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``; required when ``structure_prediction`` is set.
-            single_trunk: Trunk single ``(B, N, single_size)``; injected when ``structure_prediction`` is set.
-            pair_trunk: Trunk pair ``(B, N, N, pair_size)``; injected when ``structure_prediction`` is set.
-
-        Returns:
-            Tuple ``(atom_query, atom_conditioning, atom_pair)`` of atom single states ``(B, M, atom_hidden_size)``,
-            atom conditioning states ``(B, M, atom_hidden_size)``, and windowed atom-pair states
-            ``(B, W, Q, K, atom_pair_hidden_size)``.
-        """
-
         atom_query = self.atom_feature_projection(atom_features)
         atom_single = atom_query
 
@@ -1265,20 +1186,6 @@ class Boltz2AtomEncoder(nn.Module):
 class Boltz2AtomAttentionEncoder(nn.Module):
     r"""
     Windowed atom attention encoder and atom-to-token mean pool.
-
-    Runs a packed windowed atom transformer over the atom single states, then mean-pools atoms into tokens.
-    When ``structure_prediction`` is set it also adds a noisy-position projection and returns the atom skip
-    states consumed by the diffusion decoder.
-
-    Args:
-        atom_hidden_size: Width of the atom single channel.
-        single_size: Width of the produced token representation.
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        num_atom_encoder_blocks: Number of atom transformer blocks.
-        num_atom_encoder_attention_heads: Head count for the atom transformer.
-        structure_prediction: Whether to project noisy positions and emit diffusion skip states.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1321,25 +1228,6 @@ class Boltz2AtomAttentionEncoder(nn.Module):
         noisy_positions: Tensor | None = None,
         multiplicity: int = 1,
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Return token representations, and diffusion skip states when structure prediction is enabled.
-
-        Args:
-            atom_single: Atom single states ``(B, M, atom_hidden_size)``.
-            atom_conditioning: Atom conditioning states ``(B, M, atom_hidden_size)``.
-            atom_pair_bias: Windowed atom-pair attention bias ``(B, W, Q, K, heads)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``.
-            num_tokens: Number of tokens ``N`` to scatter atoms into.
-            noisy_positions: Noised atom coords ``(B*multiplicity, M, 3)``; required when structure prediction is on.
-            multiplicity: Number of diffusion samples per batch element folded into the leading axis.
-
-        Returns:
-            Token representation ``(B, N, single_size)`` when structure prediction is off; otherwise the tuple
-            ``(token_repr, atom_query, conditioning)`` where ``token_repr`` is ``(B*multiplicity, N, 2*single_size)``
-            and the atom skip states are ``(B*multiplicity, M, atom_hidden_size)``.
-        """
-
         query = atom_single
         conditioning = atom_conditioning
         mask = atom_mask
@@ -1368,18 +1256,6 @@ class Boltz2AtomAttentionEncoder(nn.Module):
 class Boltz2AtomAttentionDecoder(nn.Module):
     r"""
     Broadcast token activations back to atoms and predict a per-atom position update.
-
-    Scatters the token representation to atoms, adds the encoder atom skip states, runs a windowed atom
-    transformer, and projects to a per-atom coordinate update.
-
-    Args:
-        atom_hidden_size: Width of the atom single channel.
-        single_size: Width of the token representation broadcast to atoms (input width is ``2*single_size``).
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        num_atom_decoder_blocks: Number of atom transformer blocks.
-        num_atom_decoder_attention_heads: Head count for the atom transformer.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1419,22 +1295,6 @@ class Boltz2AtomAttentionDecoder(nn.Module):
         atom_to_token: Tensor,
         multiplicity: int = 1,
     ) -> Tensor:
-        r"""
-        Return atom-coordinate updates.
-
-        Args:
-            token_repr: Token representation ``(B*multiplicity, N, 2*single_size)``.
-            atom_skip: Encoder atom skip states ``(B*multiplicity, M, atom_hidden_size)``.
-            conditioning_skip: Encoder atom conditioning skip states ``(B*multiplicity, M, atom_hidden_size)``.
-            atom_pair_bias: Windowed atom-pair attention bias ``(B, W, Q, K, heads)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``.
-            multiplicity: Number of diffusion samples per batch element folded into the leading axis.
-
-        Returns:
-            Per-atom position update ``(B*multiplicity, M, 3)``.
-        """
-
         mask = atom_mask.repeat_interleave(multiplicity, 0).bool()
         token_index = atom_to_token.repeat_interleave(multiplicity, 0)
         token_proj = self.token_projection(token_repr)
@@ -1450,7 +1310,7 @@ class Boltz2AtomAttentionDecoder(nn.Module):
         return self.position_update(atom_query)
 
 
-CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
+_CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
     "UNSPECIFIED",
     "UNSELECTED",
     "POCKET>BINDER",
@@ -1462,44 +1322,6 @@ CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
 class Boltz2TemplateEmbedder(nn.Module):
     r"""
     Boltz-2 template embedder with on-the-fly distogram / unit-vector featurization.
-
-    Unlike [`TemplateEmbedder`][ofoldx.modules.embedding.template.TemplateEmbedder] (which consumes pre-packed
-    features), this computes the template distogram and per-frame unit vectors inside ``forward`` from raw
-    alpha/beta-carbon positions and frames, masks pairs by visibility group, and folds templates into the batch through
-    a shared pair-only pairformer with an outer residual, and aggregates by a template-count-weighted mean.
-
-    Feature order fed to ``template_projection`` is load-bearing: ``[distogram, beta_carbon_mask, unit_vector,
-    frame_mask, residue_type_i, residue_type_j]`` (= 2*vocab_size + num_bins + 5 channels).
-
-    Args:
-        pair_size: Width of the trunk pair representation this update is added into.
-        hidden_size: Width of the internal template pair channel.
-        num_blocks: Number of pair-only triangle update blocks in the shared pairformer.
-        vocab_size: Residue-type vocabulary size (one block per side of the pair).
-        num_bins: Number of distogram bins computed from CB distances.
-        min_distance: Lower edge of the distogram binning range, in angstroms.
-        max_distance: Upper edge of the distogram binning range, in angstroms.
-        expansion: Transition expansion factor inside each triangle update block.
-        triangle_attention_hidden_size: Per-head dimension of the triangle attention.
-        num_triangle_attention_heads: Number of triangle attention heads.
-        dropout: Dropout probability inside each triangle update block.
-        operator_backend: Operator backend selector forwarded to the triangle update blocks.
-
-    Examples:
-        >>> from ofoldx.models.boltz2.model import Boltz2TemplateEmbedder  # doctest: +SKIP
-        >>> embedder = Boltz2TemplateEmbedder(pair_size=128, hidden_size=64).cuda()  # doctest: +SKIP
-        >>> update = embedder(  # doctest: +SKIP
-        ...     pair,
-        ...     residue_type=residue_type,
-        ...     frame_rotations=frame_rotations,
-        ...     frame_translations=frame_translations,
-        ...     frame_mask=frame_mask,
-        ...     beta_carbon_positions=beta_carbon_positions,
-        ...     alpha_carbon_positions=alpha_carbon_positions,
-        ...     beta_carbon_mask=beta_carbon_mask,
-        ...     visibility_index=visibility_index,
-        ...     template_mask=template_mask,
-        ... )
     """
 
     def __init__(
@@ -1554,27 +1376,6 @@ class Boltz2TemplateEmbedder(nn.Module):
         beta_carbon_mask: Tensor,
         visibility_index: Tensor,
     ) -> Tensor:
-        r"""
-        Build the packed per-template pair feature tensor from raw coordinates and frames.
-
-        Computes the beta-carbon distance distogram and per-frame alpha-carbon unit vectors,
-        masks pairs to the same visibility group, and concatenates the geometry with the broadcast per-side residue
-        types in the load-bearing channel order.
-
-        Args:
-            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
-            frame_rotations: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
-            frame_translations: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
-            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
-            beta_carbon_positions: ``[batch, num_templates, N_token, 3]`` beta-carbon positions.
-            alpha_carbon_positions: ``[batch, num_templates, N_token, 3]`` alpha-carbon positions.
-            beta_carbon_mask: ``[batch, num_templates, N_token]`` beta-carbon validity mask.
-            visibility_index: ``[batch, num_templates, N_token]`` visibility-group indices; only same-group
-                pairs keep their geometry.
-
-        Returns:
-            ``[batch, num_templates, N_token, N_token, 2 * vocab_size + num_bins + 5]`` packed features.
-        """
         num_tokens = residue_type.shape[2]
         pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
         pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
@@ -1622,41 +1423,6 @@ class Boltz2TemplateEmbedder(nn.Module):
         template_mask: Tensor,
         pair_mask: Tensor | None = None,
     ) -> Tensor:
-        r"""
-        Return the template pair update ``u`` (added into the trunk pair representation).
-
-        Templates are folded into the batch dim (``reshape(batch * num_templates, ...)``) and run through the
-        template pairformer in one batched pass, then aggregated by a template-count-weighted mean over the
-        per-template mask.
-
-        Args:
-            pair: ``[batch, N_token, N_token, pair_size]`` trunk pair representation.
-            residue_type: ``[batch, num_templates, N_token, vocab_size]`` per-token residue features.
-            frame_rotations: ``[batch, num_templates, N_token, 3, 3]`` backbone frame rotations.
-            frame_translations: ``[batch, num_templates, N_token, 3]`` backbone frame translations.
-            frame_mask: ``[batch, num_templates, N_token]`` backbone frame validity mask.
-            beta_carbon_positions: ``[batch, num_templates, N_token, 3]`` beta-carbon positions.
-            alpha_carbon_positions: ``[batch, num_templates, N_token, 3]`` alpha-carbon positions.
-            beta_carbon_mask: ``[batch, num_templates, N_token]`` beta-carbon validity mask.
-            visibility_index: ``[batch, num_templates, N_token]`` visibility-group indices.
-            template_mask: ``[batch, num_templates, N_token]`` per-token template validity mask; a template
-                counts as present when any token is valid.
-            pair_mask: Optional ``[batch, N_token, N_token]`` pair validity mask forwarded to the blocks.
-
-        Returns:
-            ``[batch, N_token, N_token, pair_size]`` template pair update to add into ``pair``.
-
-        Examples:
-            >>> embedder = Boltz2TemplateEmbedder().cuda()  # doctest: +SKIP
-            >>> update = embedder(pair, residue_type=residue_type, frame_rotations=frame_rotations,
-            ...                   frame_translations=frame_translations, frame_mask=frame_mask,
-            ...                   beta_carbon_positions=beta_carbon_positions,
-            ...                   alpha_carbon_positions=alpha_carbon_positions,
-            ...                   beta_carbon_mask=beta_carbon_mask,
-            ...                   visibility_index=visibility_index,
-            ...                   template_mask=template_mask)  # doctest: +SKIP
-        """
-
         batch, num_templates = residue_type.shape[:2]
         present = template_mask.any(dim=2).to(pair.dtype)
         template_count = present.sum(dim=1).clamp(min=1)
@@ -1693,16 +1459,6 @@ class Boltz2TemplateEmbedder(nn.Module):
 class Boltz2ContactConditioning(nn.Module):
     r"""
     Additive pair bias encoding Boltz-2 pocket and contact constraints.
-
-    Encodes the active contact-class one-hot together with a Fourier-embedded normalized threshold into a
-    pairwise bias, gated so that the ``UNSPECIFIED`` / ``UNSELECTED`` classes contribute their own learned bias.
-
-    Args:
-        pair_size: Width of the produced pair bias.
-        cutoff_min: Lower distance cutoff used to normalize the contact threshold, in angstroms.
-        cutoff_max: Upper distance cutoff used to normalize the contact threshold, in angstroms.
-        num_classes: Number of contact-conditioning classes; defaults to
-            ``len(CONTACT_CONDITIONING_CLASSES)``.
     """
 
     def __init__(
@@ -1714,7 +1470,7 @@ class Boltz2ContactConditioning(nn.Module):
         num_classes: int | None = None,
     ) -> None:
         super().__init__()
-        num_classes = len(CONTACT_CONDITIONING_CLASSES) if num_classes is None else num_classes
+        num_classes = len(_CONTACT_CONDITIONING_CLASSES) if num_classes is None else num_classes
         self.cutoff_min = cutoff_min
         self.cutoff_max = cutoff_max
         self.num_classes = num_classes
@@ -1724,18 +1480,6 @@ class Boltz2ContactConditioning(nn.Module):
         self.unselected_bias = nn.Parameter(torch.zeros(pair_size))
 
     def forward(self, contact_conditioning: Tensor, contact_threshold: Tensor) -> Tensor:
-        r"""
-        Encode constraints into a pairwise bias.
-
-        Args:
-            contact_conditioning: Contact-class one-hot ``(B, N, N, num_classes)``; the leading two columns are
-                the ``UNSPECIFIED`` / ``UNSELECTED`` gates and the rest are the active constraint classes.
-            contact_threshold: Pairwise contact thresholds ``(B, N, N)``, in angstroms.
-
-        Returns:
-            Additive pair bias ``(B, N, N, pair_size)``.
-        """
-
         active = contact_conditioning[..., 2:]
         threshold_normalized = (contact_threshold - self.cutoff_min) / (self.cutoff_max - self.cutoff_min)
         threshold_fourier = self.threshold_fourier(threshold_normalized)
@@ -1757,27 +1501,6 @@ class Boltz2ContactConditioning(nn.Module):
 class Boltz2DenoiserConditioning(nn.Module):
     r"""
     Precompute the diffusion conditioning shared across denoiser calls (Boltz DiffusionConditioning).
-
-    Conditions the trunk pair with the relative-position encoding, runs the (structure-prediction) atom encoder,
-    and projects the atom-pair / token-pair states to per-block attention biases. The result is invariant across
-    reverse-diffusion steps, so it is computed once and reused.
-
-    Args:
-        single_size: Width of the trunk single channel injected into the atom encoder.
-        pair_size: Width of the trunk pair channel.
-        atom_hidden_size: Width of the atom single channel.
-        atom_pair_hidden_size: Width of the atom pair channel.
-        atom_feature_size: Width of the per-atom reference feature vector.
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        num_atom_encoder_blocks: Number of atom-encoder blocks whose biases are precomputed.
-        num_atom_encoder_attention_heads: Head count for the atom-encoder biases.
-        num_atom_decoder_blocks: Number of atom-decoder blocks whose biases are precomputed.
-        num_atom_decoder_attention_heads: Head count for the atom-decoder biases.
-        num_token_transformer_blocks: Number of token-transformer blocks whose biases are precomputed.
-        num_token_transformer_heads: Head count for the token-transformer biases.
-        num_conditioning_transitions: Number of transitions in the pairwise conditioner.
-        operator_backend: Public backend request forwarded to the pairwise conditioner.
     """
 
     def __init__(
@@ -1849,28 +1572,6 @@ class Boltz2DenoiserConditioning(nn.Module):
         reference_space_id: Tensor,
         atom_to_token: Tensor,
     ) -> dict[str, Tensor]:
-        r"""
-        Precompute the per-call-invariant diffusion conditioning from the trunk representations.
-
-        The trunk pair ``(B, N, N, pair_size)`` is conditioned with the relative-position encoding, then the
-        atom encoder builds atom single/pair states injected with trunk single/pair; the atom-pair and token-pair
-        states are projected to per-block attention biases (concatenated over blocks along the last axis).
-
-        Args:
-            single_trunk: Trunk refined single ``(B, N, single_size)``.
-            pair_trunk: Trunk pair ``(B, N, N, pair_size)``.
-            relative_position_encoding: Relative-position pair features ``(B, N, N, pair_size)``.
-            atom_features: Per-atom reference features ``(B, M, atom_feature_size)``.
-            reference_positions: Centered reference-conformer atom coords ``(B, M, 3)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            reference_space_id: Reference-conformer group id per atom ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``.
-
-        Returns:
-            Mapping with atom query and conditioning states plus packed encoder, decoder, and
-            token-transformer attention biases. Bias channels are ordered by block, then head.
-        """
-
         pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
         atom_query, atom_conditioning, atom_pair = self.atom_encoder(
             atom_features,
@@ -1896,21 +1597,6 @@ class Boltz2DenoiserConditioning(nn.Module):
 class Boltz2Denoiser(nn.Module):
     r"""
     EDM score network: ``(noisy positions, noise level, trunk, conditioning) -> position update``.
-
-    Args:
-        single_size: Width of the trunk single channel (the token channel is ``2*single_size``).
-        atom_hidden_size: Width of the atom single channel.
-        fourier_embedding_size: Width of the Fourier noise-level embedding.
-        num_query_atoms: Query-window size for windowed atom attention.
-        num_key_atoms: Key-window size for windowed atom attention.
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        num_token_transformer_blocks: Number of conditioned token-transformer blocks.
-        num_token_transformer_heads: Head count for the token transformer.
-        num_atom_decoder_blocks: Number of atom-attention decoder blocks.
-        num_atom_decoder_attention_heads: Head count for the atom-attention decoder.
-        num_conditioning_transitions: Number of transitions in the single conditioner.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1981,26 +1667,6 @@ class Boltz2Denoiser(nn.Module):
         token_mask: Tensor,
         multiplicity: int = 1,
     ) -> Tensor:
-        r"""
-        Denoise atom coords: encode noisy atoms to tokens, run the conditioned token transformer, decode to a
-        per-atom update.
-
-        Args:
-            single_inputs: Trunk input single ``(B, N, single_size)``.
-            single_trunk: Trunk refined single ``(B, N, single_size)``.
-            noisy_positions: Noised atom coords ``(B*multiplicity, M, 3)``.
-            noise_level: Per-sample noise level ``(B*multiplicity,)`` (EDM ``c_noise(sigma)``).
-            conditioning: Output dict of
-                [`DiffusionConditioning`][ofoldx.models.boltz2.model.DiffusionConditioning].
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            atom_to_token: Token index per atom ``(B, M)``.
-            token_mask: Boolean token validity mask ``(B, N)``.
-            multiplicity: Number of diffusion samples per batch element folded into the leading axis.
-
-        Returns:
-            Per-atom position update ``(B*multiplicity, M, 3)``.
-        """
-
         single, _ = self.single_conditioner(
             noise_level,
             single_trunk.repeat_interleave(multiplicity, 0),
@@ -2041,13 +1707,6 @@ class Boltz2Denoiser(nn.Module):
 class Boltz2SingleConditioning(nn.Module):
     r"""
     Condition the (concatenated trunk+input) single representation on the diffusion noise level.
-
-    Args:
-        single_size: Width of each single channel; the concatenated token channel is ``2*single_size``.
-        fourier_embedding_size: Width of the Fourier noise-level embedding.
-        num_conditioning_transitions: Number of transitions refining the conditioned single.
-        expansion: Transition expansion factor.
-        operator_backend: Public backend request forwarded to every transition.
     """
 
     def __init__(
@@ -2071,20 +1730,6 @@ class Boltz2SingleConditioning(nn.Module):
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Concatenate ``single_trunk`` and ``single_inputs``, normalize/project, add the Fourier-embedded
-        ``noise_level``, and refine with the transition stack.
-
-        Args:
-            noise_level: Per-sample EDM noise level ``(B*multiplicity,)``.
-            single_trunk: Trunk refined single ``(B*multiplicity, N, single_size)``.
-            single_inputs: Trunk input single ``(B*multiplicity, N, single_size)``.
-
-        Returns:
-            Tuple of the conditioned single ``(B*multiplicity, N, 2*single_size)`` and the normalized noise
-            embedding ``(B*multiplicity, fourier_embedding_size)``.
-        """
-
         return condition_single(
             single_trunk,
             single_inputs,
@@ -2102,22 +1747,6 @@ class Boltz2SingleConditioning(nn.Module):
 class Boltz2CoordinateDiffusion(nn.Module):
     r"""
     EDM sampler around a [`Boltz2Denoiser`][ofoldx.models.boltz2.model.Boltz2Denoiser].
-
-    Wraps the score model with EDM preconditioning and a Karras noise schedule, and runs reverse diffusion
-    with optional in-loop weighted rigid alignment and stochastic churn.
-
-    Args:
-        denoiser: The learned coordinate network to precondition and iterate.
-        sigma_data: EDM data standard deviation used for preconditioning and to scale the schedule.
-        min_noise_level: Lowest non-zero sigma before the trailing zero.
-        max_noise_level: Highest sigma at the start of the schedule.
-        rho: Exponent of the Karras noise schedule.
-        churn_rate: Stochastic churn added per step above ``min_churn_noise_level``.
-        min_churn_noise_level: Sigma threshold above which churn is applied.
-        noise_scale: Multiplier on the injected churn noise.
-        step_scale: Scale on the Euler update step.
-        num_sampling_steps: Default number of sampling steps.
-        alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step.
     """
 
     def __init__(
@@ -2156,33 +1785,10 @@ class Boltz2CoordinateDiffusion(nn.Module):
     def noise_distribution(
         self, batch_size: int, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None = None
     ) -> Tensor:
-        r"""
-        Draw per-example EDM training noise levels ``sigma = sigma_data * exp(P_mean + P_std * N(0, 1))``.
-
-        Args:
-            batch_size: Number of noise levels to draw (``B*multiplicity``).
-            device: Device for the sampled tensor.
-            dtype: Dtype for the sampled tensor.
-            generator: Optional PyTorch random generator.
-
-        Returns:
-            Noise levels ``(batch_size,)``.
-        """
-
         normal = torch.randn(batch_size, device=device, dtype=dtype, generator=generator)
         return self.sigma_data * torch.exp(self.noise_log_mean + self.noise_log_std * normal)
 
     def loss_weight(self, sigma: Tensor) -> Tensor:
-        r"""
-        EDM per-example loss weight ``(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2``.
-
-        Args:
-            sigma: Per-example noise levels ``(batch_size,)``.
-
-        Returns:
-            Loss weights ``(batch_size,)``.
-        """
-
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2 + 1e-8)
 
     def denoise(
@@ -2194,25 +1800,6 @@ class Boltz2CoordinateDiffusion(nn.Module):
         generator: torch.Generator | None = None,
         **conditioning: object,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        One training denoising step: centre the target, corrupt it, and denoise through the score model.
-
-        Applies EDM noising followed by one preconditioned denoising pass. This tensor-only path omits coordinate
-        augmentation and target alignment so it remains graph-break-free under ``torch.compile``.
-
-        Args:
-            target_coords: Experimental target atom coords ``(B, M, 3)``.
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            multiplicity: Number of noised copies drawn per batch element.
-            generator: Optional PyTorch random generator for the diffusion noise.
-            **conditioning: Score-model conditioning tensors (``single_inputs``, ``single_trunk``,
-                ``conditioning``, ``atom_to_token``, ``token_mask``).
-
-        Returns:
-            Tuple ``(denoised, sigmas, true_coords)`` of denoised coords ``(B*multiplicity, M, 3)``, sampled noise
-            levels ``(B*multiplicity,)``, and the centred target coords ``(B*multiplicity, M, 3)``.
-        """
-
         coords = target_coords.repeat_interleave(multiplicity, 0)
         mask = atom_mask.repeat_interleave(multiplicity, 0).unsqueeze(-1).to(coords.dtype)
         center = (coords * mask).sum(dim=-2, keepdim=True) / (mask.sum(dim=-2, keepdim=True) + 1e-8)
@@ -2229,20 +1816,6 @@ class Boltz2CoordinateDiffusion(nn.Module):
     def preconditioned_network_forward(
         self, noised_coords: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
     ) -> Tensor:
-        r"""
-        One EDM-preconditioned denoising step: noisy coords -> denoised coords.
-
-        Args:
-            noised_coords: Noised atom coords ``(B*multiplicity, M, 3)``.
-            sigma: Noise level, either a scalar or a per-sample tensor ``(B*multiplicity,)``.
-            multiplicity: Number of diffusion samples per batch element folded into the leading axis.
-            **conditioning: Score-model conditioning tensors (``single_inputs``, ``single_trunk``,
-                ``conditioning``, ``atom_mask``, ``atom_to_token``, ``token_mask``).
-
-        Returns:
-            Denoised atom coords ``(B*multiplicity, M, 3)``.
-        """
-
         batch = noised_coords.shape[0]
         sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
         padded = sigma.reshape(batch, 1, 1)
@@ -2255,19 +1828,6 @@ class Boltz2CoordinateDiffusion(nn.Module):
         return self.preconditioner.c_skip(padded) * noised_coords + self.preconditioner.c_out(padded) * update
 
     def sample_schedule(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        r"""
-        Build the EDM (Karras rho-power) noise schedule scaled by ``sigma_data``.
-
-        The schedule decreases from ``max_noise_level`` to ``min_noise_level`` with a trailing zero.
-
-        Args:
-            num_sampling_steps: Number of sampling steps; defaults to ``self.num_sampling_steps``.
-            device: Device on which to build the schedule tensor.
-
-        Returns:
-            Sigma schedule ``(steps + 1,)`` ending in a zero.
-        """
-
         steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         inv_rho = 1 / self.rho
         # `steps` is the number of sampling steps (transitions); the trailing pad adds the final sigma=0.
@@ -2290,21 +1850,6 @@ class Boltz2CoordinateDiffusion(nn.Module):
         generator: torch.Generator | None = None,
         **conditioning: object,
     ) -> Tensor:
-        r"""
-        Run reverse diffusion (the N-step inference sampler) and return sampled atom coords.
-
-        Args:
-            atom_mask: Boolean atom validity mask ``(B, M)``.
-            num_sampling_steps: Number of sampling steps; defaults to ``self.num_sampling_steps``.
-            multiplicity: Number of independent samples to draw per batch element.
-            generator: Optional PyTorch random generator for the diffusion noise.
-            **conditioning: Score-model conditioning tensors (``single_inputs``, ``single_trunk``,
-                ``conditioning``, ``atom_to_token``, ``token_mask``).
-
-        Returns:
-            Sampled atom coords ``(B*multiplicity, M, 3)``.
-        """
-
         device = atom_mask.device
         base_atom_mask = atom_mask
         expanded_atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
@@ -2313,21 +1858,16 @@ class Boltz2CoordinateDiffusion(nn.Module):
         gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
 
         def randn() -> Tensor:
-            r"""Draw standard-normal noise of shape ``(B*multiplicity, M, 3)`` on ``device`` from ``generator``."""
+            r"""
+            Draw standard-normal noise of shape ``(B*multiplicity, M, 3)`` on ``device`` from ``generator``.
+            """
 
             return torch.randn(shape, device=device, generator=generator)
 
         coords = sigmas[0] * randn()
         denoised = None
-        # The EDM step math matches ``CoordinateEdmSampler``: churn, Euler update, and the optional
-        # ``alignment_reverse_diff`` mid-step weighted rigid alignment. The loop remains local because
-        # Boltz-2 differs in three RNG-sensitive conventions: (1) the
-        # Karras schedule uses the ``steps - 1`` divisor + trailing-zero pad, not EdmScheduler's ``steps``
-        # divisor; (2) coordinate augmentation multiplies on the right (einsum "bmd,bds->bms", i.e. R^T @ x),
-        # whereas the shared sampler's ``_rot_vec_mul`` is R @ x; and (3) noise is drawn with
-        # ``torch.randn`` at model-module scope rather than the shared sampler's ``Tensor.normal_`` calls.
-        # `sigmas`/`gammas` are kept as 0-dim tensors (no ``.item()``): the Python loop still drives the fixed
-        # number of steps, but every per-step scalar stays a tensor so the per-step denoiser is compile-clean.
+        # Keep schedule values as scalar tensors while Python controls the fixed
+        # number of sampling transitions.
         for index in range(len(sigmas) - 1):
             sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
             rotation = uniform_random_rotation(
@@ -2341,11 +1881,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
                 )
 
             sigma_hat = sigma_current * (1 + gamma)
-            # Dtype-transparent EDM churn/Euler update (no forced ``.double()``): the churn/step scalars stay in
-            # the working dtype, matching the BoltzGen sampler and keeping the loop honest about its precision.
-            # At high sigma an fp32 ``sigma_hat**2 - sigma_current**2`` loses a few ULPs versus fp64, which only
-            # bites at unrealistically low step counts (n_step=5); at realistic step counts (n_step>=200) the
-            # per-step sigma gap is small and the fp32 result tracks to ~1e-6 (see sampler_parity).
+            # Churn and Euler updates use the coordinate tensor's working dtype.
             noise_var = self.noise_scale**2 * (sigma_hat**2 - sigma_current**2)
             noisy = coords + torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
             denoised = self.preconditioned_network_forward(
@@ -2363,23 +1899,6 @@ class Boltz2CoordinateDiffusion(nn.Module):
 class Boltz2AffinityHead(nn.Module):
     r"""
     Predict scalar binding affinity and a binder-class from trunk features and predicted atom geometry.
-
-    Rebuilds a pair representation from the trunk single/pair features and a distogram of representative-atom
-    distances, refines it with a pair-only Pairformer stack over the receptor/ligand pair mask, and projects to
-    scalar affinity value and binder-class logits.
-
-    Args:
-        single_size: Width of the trunk single channel injected into the pair.
-        pair_size: Width of the pair representation.
-        num_blocks: Number of pair-only Pairformer blocks.
-        num_distogram_bins: Number of distogram bins used to condition the pair.
-        max_distance: Upper edge of the distogram binning range, in angstroms.
-        num_conditioning_transitions: Number of transitions in the pairwise conditioner.
-        expansion: Transition expansion factor in the pairwise conditioner.
-        triangle_attention_hidden_size: Per-head width of the triangle attention.
-        num_triangle_attention_heads: Triangle-attention head count.
-        dropout: Dropout applied in the Pairformer stack.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -2434,24 +1953,6 @@ class Boltz2AffinityHead(nn.Module):
         receptor_mask: Tensor,
         multiplicity: int = 1,
     ) -> dict[str, Tensor]:
-        r"""
-        Score affinity from trunk pair features and predicted atom coords.
-
-        Args:
-            single_inputs: Trunk input single ``(B, N, single_size)``.
-            pair: Trunk pair ``(B, N, N, pair_size)``.
-            coordinates: Predicted atom coordinates ``(B*multiplicity, M, 3)``.
-            token_to_rep_atom: Representative atom index per token ``(B, N)``.
-            token_mask: Boolean token validity mask ``(B, N)``.
-            ligand_mask: Boolean mask selecting ligand tokens ``(B, N)``.
-            receptor_mask: Boolean mask selecting receptor tokens ``(B, N)``.
-            multiplicity: Number of samples per batch element folded into the leading axis.
-
-        Returns:
-            Dict with ``affinity_pred_value`` ``(B*multiplicity, 1)`` and ``affinity_logits_binary``
-            ``(B*multiplicity, 1)``.
-        """
-
         pair = self.pair_projection(self.pair_norm(pair))
         pair = pair + self.single_to_pair_product_left(single_inputs).unsqueeze(-2)
         pair = pair + self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
@@ -2481,10 +1982,6 @@ class Boltz2AffinityHead(nn.Module):
 class Boltz2AffinityOutputHead(nn.Module):
     r"""
     Project pooled affinity pair features to value and binder-class logits.
-
-    Args:
-        pair_size: Width of the affinity pair representation being pooled.
-        single_size: Hidden width of the affinity value / score MLPs.
     """
 
     def __init__(self, pair_size: int = 128, single_size: int = 384) -> None:
@@ -2512,18 +2009,6 @@ class Boltz2AffinityOutputHead(nn.Module):
         self.binder_logit_projection = nn.Linear(1, 1)
 
     def forward(self, pair: Tensor, affinity_pair_mask: Tensor) -> dict[str, Tensor]:
-        r"""
-        Mean-pool receptor/ligand and ligand/ligand pair states, excluding the diagonal.
-
-        Args:
-            pair: Refined affinity pair representation ``(B*multiplicity, N, N, pair_size)``.
-            affinity_pair_mask: Boolean receptor/ligand pair mask ``(B*multiplicity, N, N)``.
-
-        Returns:
-            Dict with ``affinity_pred_value`` ``(B*multiplicity, 1)`` and ``affinity_logits_binary``
-            ``(B*multiplicity, 1)``.
-        """
-
         num_tokens = affinity_pair_mask.shape[-1]
         non_diagonal = ~torch.eye(num_tokens, device=affinity_pair_mask.device, dtype=torch.bool).unsqueeze(0)
         pool_mask = (affinity_pair_mask.bool() & non_diagonal).to(dtype=pair.dtype).unsqueeze(-1)
@@ -2541,25 +2026,6 @@ class Boltz2AffinityOutputHead(nn.Module):
 class Boltz2ConfidenceHead(nn.Module):
     r"""
     Score predicted structures with per-token pLDDT / resolved / PAE / PDE confidence logits.
-
-    Rebuilds the pair representation from relative-position, bond, contact, and distogram features, injects the
-    trunk single, refines with a Pairformer stack, and projects to pLDDT / resolved / PAE / PDE logits.
-
-    Args:
-        single_size: Width of the trunk single channel.
-        pair_size: Width of the pair representation.
-        num_blocks: Number of Pairformer blocks in the head.
-        num_pair_attention_heads: Head count for the pair-biased attention.
-        num_distogram_bins: Number of distogram bins used to bin representative-atom distances.
-        max_distance: Upper edge of the distogram binning range, in angstroms.
-        relative_position_size: Width of the relative-position feature vector.
-        num_bond_types: Bond-type vocabulary size.
-        conditioning_cutoff_min: Lower distance cutoff for contact conditioning, in angstroms.
-        conditioning_cutoff_max: Upper distance cutoff for contact conditioning, in angstroms.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of predicted-aligned-error output bins.
-        num_pde_bins: Number of predicted-distance-error output bins.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -2632,32 +2098,6 @@ class Boltz2ConfidenceHead(nn.Module):
         cyclic_period: Tensor | None = None,
         multiplicity: int = 1,
     ) -> dict[str, Tensor]:
-        r"""
-        Score predicted coords: rebuild the pair representation (relative-position, bonds, contact, and a
-        binned distogram of representative-atom distances), refine with a Pairformer stack, and project to logits.
-
-        Args:
-            single_inputs: Trunk input single ``(B, N, single_size)``.
-            single: Trunk refined single ``(B, N, single_size)``.
-            pair: Trunk pair ``(B, N, N, pair_size)``.
-            coordinates: Sampled atom coordinates ``(B*multiplicity, M, 3)``.
-            residue_index, chain_index, entity_index, symmetry_index, token_index:
-                Relative-position features, each ``(B, N)``.
-            token_bonds: Token covalent adjacency ``(B, N, N)``.
-            type_bonds: Token bond-type ids ``(B, N, N)``.
-            contact_conditioning: Contact-class one-hot ``(B, N, N, num_classes)``.
-            contact_threshold: Contact thresholds ``(B, N, N)``.
-            token_to_rep_atom: Representative atom index per token ``(B, N)``.
-            token_mask: Boolean token validity mask ``(B, N)``.
-            cyclic_period: Optional cyclic-position periods ``(B, N)``.
-            multiplicity: Number of samples per batch element; trunk tensors are interleaved to ``B*multiplicity``.
-
-        Returns:
-            Logit dict from [`Boltz2ConfidenceOutputHead`][ofoldx.models.boltz2.model.Boltz2ConfidenceOutputHead]:
-            ``pae_logits``,
-            ``pde_logits``, ``plddt_logits``, ``resolved_logits``.
-        """
-
         single_inputs = self.input_single_norm(single_inputs)
         single = self.single_norm(single)
         single = single + self.input_single_projection(single_inputs)
@@ -2706,13 +2146,6 @@ class Boltz2ConfidenceHead(nn.Module):
 class Boltz2ConfidenceOutputHead(nn.Module):
     r"""
     Project the confidence single/pair representations to pLDDT / resolved / PAE / PDE logits.
-
-    Args:
-        single_size: Width of the confidence single channel.
-        pair_size: Width of the confidence pair channel.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of predicted-aligned-error output bins.
-        num_pde_bins: Number of predicted-distance-error output bins.
     """
 
     def __init__(
@@ -2727,20 +2160,6 @@ class Boltz2ConfidenceOutputHead(nn.Module):
         self.resolved_projection = nn.Linear(single_size, 2, bias=False)
 
     def forward(self, single: Tensor, pair: Tensor, chain_index: Tensor) -> dict[str, Tensor]:
-        r"""
-        Project the confidence single and pair representations to error logits, selecting intra- vs inter-chain
-        projections per token pair via ``chain_index``. PDE uses the symmetrized pair.
-
-        Args:
-            single: Confidence single representation ``(B, N, single_size)``.
-            pair: Confidence pair representation ``(B, N, N, pair_size)``.
-            chain_index: Chain ids per token ``(B, N)``, used to pick intra- vs inter-chain projections.
-
-        Returns:
-            Mapping containing PAE and PDE pair logits, per-token pLDDT logits, and per-token
-            resolved-state logits.
-        """
-
         same_chain = (chain_index.unsqueeze(-1) == chain_index.unsqueeze(-2)).float().unsqueeze(-1)
         different_chain = 1.0 - same_chain
         pae_logits = self.pae_intra_projection(pair) * same_chain + self.pae_inter_projection(pair) * different_chain
@@ -2759,10 +2178,6 @@ class Boltz2ConfidenceOutputHead(nn.Module):
 class Boltz2BFactorHead(nn.Module):
     r"""
     Predict per-token B-factor logits from the trunk single representation.
-
-    Args:
-        single_size: Width of the trunk single channel.
-        num_bins: Number of B-factor output bins.
     """
 
     def __init__(self, single_size: int = 384, num_bins: int = 64) -> None:
@@ -2770,25 +2185,16 @@ class Boltz2BFactorHead(nn.Module):
         self.projection = nn.Linear(single_size, num_bins)
 
     def forward(self, single: Tensor) -> Tensor:
-        r"""
-        Project the trunk single to per-token B-factor logits.
-
-        Args:
-            single: Trunk single representation ``(B, N, single_size)``.
-
-        Returns:
-            Per-token B-factor logits ``(B, N, num_bins)``.
-        """
-
         return self.projection(single)
 
 
 def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> FoldResult:
-    r"""Decode one raw [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output] into a ``FoldResult``.
+    r"""
+    Decode one raw [`Boltz2Output`][ofoldx.models.boltz2.model.Boltz2Output] into a ``FoldResult``.
 
     Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
     sample, and lifts the confidence head's per-token pLDDT/resolved metrics, token-pair PAE/PDE, and the
-    per-sample pTM/ipTM ranking scores onto the canonical value carriers aligned to the layout's token axis.
+    per-sample pTM/ipTM ranking scores onto values aligned to the layout's token axis.
     """
 
     layout = cast(Boltz2Layout, input.layout)
@@ -2803,7 +2209,7 @@ def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> Fold
     num_samples = coordinates.shape[0]
     # Each polymer token_site is already a ``ComponentReference`` (``(instance_id, monomer_index)``) and each
     # atomized-ligand token_site is an ``AtomSite`` -- both are valid ``MetricReference`` values, so the token
-    # axis is the layout's token_sites verbatim (mirrors the Boltz-1 fold decoder).
+    # The metric axis follows layout.token_sites.
     token_axis = layout.token_sites
 
     # Per-token pLDDT fraction (0-1) and resolved probability aligned to the token axis.
@@ -2883,7 +2289,9 @@ def _decode_boltz2_fold_result(output: Boltz2Output, input: Boltz2Input) -> Fold
 
 
 def _boltz2_expected_angstrom(logits: Tensor) -> Tensor:
-    r"""Softmax-expected error in angstrom over half-bin centers spanning ``0--32``."""
+    r"""
+    Softmax-expected error in angstrom over half-bin centers spanning ``0--32``.
+    """
 
     num_bins = logits.shape[-1]
     bin_width = 32.0 / num_bins
@@ -2898,7 +2306,9 @@ def _boltz2_ptm_scores(
     input: Boltz2Input,
     multiplicity: int,
 ) -> dict[str, Tensor]:
-    r"""Derive the pTM and interface-pTM scores from PAE logits."""
+    r"""
+    Derive the pTM and interface-pTM scores from PAE logits.
+    """
 
     token_mask = input.token_mask.repeat_interleave(multiplicity, 0).float()
     frame_mask = _boltz2_predicted_frame_mask(
@@ -2948,7 +2358,9 @@ def _boltz2_predicted_frame_mask(
     input: Boltz2Input,
     multiplicity: int,
 ) -> Tensor:
-    r"""Return the exact predicted-frame validity mask used by Boltz-2 pTM."""
+    r"""
+    Return the exact predicted-frame validity mask used by Boltz-2 pTM.
+    """
 
     if input.frame_atom_index is None:
         raise ValueError("Boltz-2 confidence requires token frame atom indices")
@@ -3019,13 +2431,15 @@ def _unflatten_sample_axis(tensor: Tensor, batch_size: int, num_samples: int) ->
 #
 # This section anchors the Boltz-2 tensor boundary in one place, matching the
 # AlphaFold 2, AlphaFold 3, and Boltz-1 verticals: the pure-tensor
-# input, the raw output, and the canonical identity layout.
+# input, output, and molecular-identity layout.
 # =====================================================================================================
 
 
 @dataclass(frozen=True)
 class Boltz2Layout:
-    r"""Canonical molecular identities aligned to one Boltz-2 tensor layout."""
+    r"""
+    Molecular identities aligned to one Boltz-2 tensor layout.
+    """
 
     system: MolecularSystem
     atom_sites: tuple[AtomSite, ...]
@@ -3036,7 +2450,7 @@ class Boltz2Layout:
 @dataclass(kw_only=True)
 class Boltz2Input:
     r"""
-    Input tensors consumed by Boltz2Model.
+    Input tensors consumed by [`Boltz2Model`][].
 
     Args:
         token_mask: Boolean token validity mask with shape ``(B, N_token)``.
@@ -3086,7 +2500,7 @@ class Boltz2Input:
         affinity_mw: Optional molecular weight for the selected ligand, used only when affinity MW correction is on.
         affinity_msa_profile: Optional single-sequence profile used by the affinity heads.
         affinity_deletion_mean: Optional deletion mean used by the affinity heads.
-        layout: Canonical molecular identity aligned to the atom and token tensors.
+        layout: Molecular identities aligned to the atom and token tensors.
     """
 
     token_mask: Tensor
@@ -3143,13 +2557,6 @@ class Boltz2Input:
 class _Boltz2TrunkState:
     r"""
     Trunk outputs consumed by the diffusion / confidence heads.
-
-    Args:
-        single_inputs: Initial token single representations.
-        single: Final token single representation.
-        pair: Final token pair representation.
-        distogram_logits: Trunk distogram logits.
-        relative_position_encoding: Relative-position pair features.
     """
 
     single_inputs: Tensor
@@ -3161,7 +2568,28 @@ class _Boltz2TrunkState:
 
 @dataclass(eq=False)
 class Boltz2Output:
-    r"""Tensor output of one Boltz-2 forward or sampling pass."""
+    r"""
+    Predictions from one Boltz-2 forward or sampling pass.
+
+    Args:
+        coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        plddt_logits: Optional per-atom confidence logits with shape
+            ``(B, S, A, D_plddt)``.
+        pae_logits: Optional token-pair aligned-error logits with shape
+            ``(B, S, N, N, D_pae)``.
+        pde_logits: Optional token-pair distance-error logits with shape
+            ``(B, S, N, N, D_pde)``.
+        resolved_logits: Optional per-atom resolved-state logits with shape
+            ``(B, S, A, D_resolved)``.
+        bfactor_logits: Optional per-atom B-factor logits with shape
+            ``(B, S, A, D_bfactor)``.
+        augmented_target_coordinates: Optional training target coordinates after
+            rigid augmentation, with shape ``(B, S, A, 3)`` in angstroms.
+        noise_level: Optional training noise standard deviations with shape
+            ``(B*S,)`` in angstroms.
+    """
 
     coordinates: Tensor
     distogram_logits: Tensor
@@ -3175,10 +2603,14 @@ class Boltz2Output:
 
     @property
     def plddt(self) -> Tensor:
-        r"""Expected pLDDT on the conventional 0--100 scale.
+        r"""
+        Return expected per-atom pLDDT.
 
-        The Boltz-2 confidence head bins pLDDT on the ``0--1`` fraction; the softmax-expected bin
-        value is rescaled by ``100`` to the shared ``0--100`` convention.
+        Returns:
+            Confidence values with shape ``(B, S, A)`` on the ``0--100`` scale.
+
+        Raises:
+            ValueError: If this output does not contain confidence logits.
         """
 
         if self.plddt_logits is None:

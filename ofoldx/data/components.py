@@ -1,4 +1,6 @@
-r"""Built-in chemical components."""
+r"""
+Built-in chemical components.
+"""
 
 from __future__ import annotations
 
@@ -26,11 +28,23 @@ def component_from_rows(
     previous_attachment: PolymerAttachment | None,
     next_attachment: PolymerAttachment | None,
 ) -> ChemicalComponent:
-    r"""Build a `ChemicalComponent` from atom and bond rows.
+    r"""
+    Build a [`ChemicalComponent`][] from atom and bond rows.
 
-    Atom rows use ``(atom_id, element, formal_charge, aromatic, stereo)`` and bond
-    rows use ``(atom_a, atom_b, order, aromatic[, stereo])``. The constructor fills
-    the shared atom defaults and aligns source-specific coordinates and attachments.
+    Atom rows use `(atom_id, element, formal_charge, aromatic, stereo)` and bond
+    rows use `(atom_a, atom_b, order, aromatic[, stereo])`.
+
+    Args:
+        component_id: Chemical component identifier.
+        atom_rows: Atom identity and chemistry rows.
+        bond_rows: Bond endpoint and chemistry rows.
+        reference_coordinates: Reference coordinate for each atom, or `None` where
+            no coordinate is available.
+        previous_attachment: Attachment used to connect the preceding polymer component.
+        next_attachment: Attachment used to connect the following polymer component.
+
+    Returns:
+        The assembled chemical component.
     """
 
     atoms = tuple(
@@ -127,7 +141,16 @@ _NUCLEIC_COMPONENT_IDS = frozenset(_nucleic_components.COMPONENT_ROWS)
 
 
 def get_builtin_component_polymer_type(component_id: str) -> PolymerType | None:
-    r"""Return the polymer type of a built-in component ID, if it is polymeric."""
+    r"""
+    Return the polymer type of a built-in component ID.
+
+    Args:
+        component_id: Exact component identifier.
+
+    Returns:
+        The component's polymer type, or `None` when it is not a built-in polymer
+        component.
+    """
 
     if component_id in _PROTEIN_COMPONENT_IDS:
         return "protein"
@@ -137,9 +160,17 @@ def get_builtin_component_polymer_type(component_id: str) -> PolymerType | None:
 
 
 def get_component(component_id: str) -> ChemicalComponent:
-    r"""Return the built-in component with this exact ID.
+    r"""
+    Return a built-in chemical component by ID.
 
-    Unknown component IDs raise ``KeyError``.
+    Args:
+        component_id: Exact component identifier.
+
+    Returns:
+        The matching built-in component.
+
+    Raises:
+        KeyError: If no built-in component has ``component_id``.
     """
 
     return _BUILTIN_COMPONENTS[component_id]

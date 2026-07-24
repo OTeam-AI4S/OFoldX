@@ -1,4 +1,6 @@
-r"""Input processing for Boltz-2 folding and affinity scoring."""
+r"""
+Input processing for Boltz-2 folding and affinity scoring.
+"""
 
 from __future__ import annotations
 
@@ -97,7 +99,9 @@ _DNA_MSA_RESTYPE = {
 
 
 def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
-    r"""Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-2 token."""
+    r"""
+    Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-2 token.
+    """
 
     if symbol == "-":
         return _MSA_GAP
@@ -115,11 +119,8 @@ _CROP_NEIGHBORHOOD = 10
 
 
 class Boltz2AffinityProcessor(Processor):
-    r"""Lower one canonical protein/small-molecule system to ``Boltz2Input``.
-
-    ``ligand`` names the canonical ``Molecule`` instance scored by the affinity
-    heads. It may be omitted only when the system contains exactly one eligible
-    molecule instance.
+    r"""
+    Convert protein-ligand systems into `Boltz2Input` for affinity scoring.
 
     Args:
         device: Device for produced tensors.
@@ -142,21 +143,20 @@ class Boltz2AffinityProcessor(Processor):
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
-        r"""Lower one affinity-pass input and its selected ligand.
-
-        Molecular weight is computed from the selected canonical graph. Raw SMILES
-        affinity ligands must therefore be standardized before constructing the input
-        system.
+        r"""
+        Prepare affinity features for one protein-ligand system.
 
         Args:
-            input: Canonical molecular system, structure, or local structure path.
+            input: Molecular system, structure, or local structure path.
             ligand: Molecule instance scored by the affinity head. May be omitted for a system
                 containing exactly one molecule instance.
             msa: Optional MSA value, collection, or alignment path.
-            generator: Optional RNG for reference-conformer augmentation and cropping.
+            generator: Optional generator for independent rigid transforms of reference
+                conformers.
 
         Returns:
-            A ligand-centered ``Boltz2Input`` for affinity scoring.
+            Ligand-centered token, atom, MSA, and affinity tensors. Reference
+            coordinates are in angstroms; tensor axes align to ``layout``.
         """
 
         if isinstance(input, str | PathLike):
@@ -210,11 +210,8 @@ class Boltz2AffinityProcessor(Processor):
 
 
 class Boltz2Processor(Processor):
-    r"""Lower one canonical molecular system to a whole-system folding ``Boltz2Input``.
-
-    Uses the same token, atom, bond, and MSA construction as the affinity Processor
-    without ligand-centered cropping or affinity tensors. The layout records
-    ``affinity_instance_id = None``.
+    r"""
+    Convert supported biomolecular inputs into `Boltz2Input`.
 
     Args:
         device: Device for produced tensors.
@@ -236,15 +233,18 @@ class Boltz2Processor(Processor):
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
-        r"""Lower one whole-system folding input and its optional MSA evidence.
+        r"""
+        Prepare folding features for one molecular system.
 
         Args:
-            input: Canonical molecular system, structure, or local structure path.
+            input: Molecular system, structure, or local structure path.
             msa: Optional MSA value, collection, or alignment path.
-            generator: Optional RNG for reference-conformer augmentation.
+            generator: Optional generator for independent rigid transforms of reference
+                conformers.
 
         Returns:
-            A whole-system ``Boltz2Input`` for structure prediction.
+            Batched token, atom, and MSA tensors. Reference coordinates are in
+            angstroms; tensor axes align to ``layout``.
         """
 
         if isinstance(input, str | PathLike):
@@ -283,7 +283,9 @@ def _prepare_boltz2_affinity_features(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz2Input:
-    r"""Build the affinity token, atom, MSA, and identity layout."""
+    r"""
+    Build the affinity token, atom, MSA, and identity layout.
+    """
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
@@ -555,9 +557,10 @@ def _prepare_boltz2_structure_features(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz2Input:
-    r"""Build the whole-system folding token, atom, MSA, and identity layout.
+    r"""
+    Build the whole-system folding token, atom, MSA, and identity layout.
 
-    Shares the token/atom/bond/MSA construction with the affinity Processor but lowers the *whole* system:
+    Shares the token/atom/bond/MSA construction with the affinity Processor for the *whole* system:
     no ligand-centered crop and no affinity tensors. Reuses the module-level feature helpers directly.
     """
 
@@ -1058,7 +1061,8 @@ def _augment_reference_positions(
     *,
     generator: torch.Generator | None = None,
 ) -> None:
-    r"""Randomly rotate and translate each resolved reference conformer.
+    r"""
+    Randomly rotate and translate each resolved reference conformer.
 
     Random values are drawn from ``generator``; ``None`` uses the ambient PyTorch
     RNG.
@@ -1122,7 +1126,9 @@ def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> l
 
 
 def _affinity_ligand_properties(molecule: Molecule) -> tuple[int, float]:
-    r"""Return direct canonical-graph atom count and molecular weight."""
+    r"""
+    Return graph atom count and molecular weight.
+    """
 
     from rdkit.Chem import Descriptors
 
@@ -1131,7 +1137,9 @@ def _affinity_ligand_properties(molecule: Molecule) -> tuple[int, float]:
 
 
 def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
-    r"""Materialize canonical molecule data as RDKit chemistry."""
+    r"""
+    Materialize molecule data as an RDKit graph.
+    """
 
     from rdkit import Chem
 

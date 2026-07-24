@@ -1,4 +1,5 @@
-"""Self-contained machine benchmark for OFoldX synthetic workloads.
+"""
+Self-contained machine benchmark for OFoldX synthetic workloads.
 
 This script does not import tests, reference code, checkpoints, or benchmark data.
 It can either run a random AlphaFold3-shaped OFoldX workload or a pure
@@ -45,7 +46,9 @@ if str(REPO) not in sys.path:
 
 @dataclass(frozen=True)
 class Preset:
-    """Model/input size preset."""
+    """
+    Model/input size preset.
+    """
 
     batch_size: int
     n_tokens: int
@@ -102,7 +105,9 @@ PRESETS: dict[str, Preset] = {
 
 
 class AlphaFold3SyntheticWorkload(nn.Module):
-    """A synthetic end-to-end workload around AlphaFold3Model."""
+    """
+    A synthetic end-to-end workload around AlphaFold3Model.
+    """
 
     def __init__(
         self,
@@ -138,7 +143,9 @@ class AlphaFold3SyntheticWorkload(nn.Module):
 
 
 class GpuTransformerBlock(nn.Module):
-    """Self-contained transformer block for hardware-only GPU benchmarking."""
+    """
+    Self-contained transformer block for hardware-only GPU benchmarking.
+    """
 
     def __init__(self, hidden_size: int, num_heads: int, ffn_size: int) -> None:
         super().__init__()
@@ -173,7 +180,9 @@ class GpuTransformerBlock(nn.Module):
 
 
 class GpuSyntheticModel(nn.Module):
-    """Hardware-only transformer model with no OFoldX imports."""
+    """
+    Hardware-only transformer model with no OFoldX imports.
+    """
 
     def __init__(
         self,
@@ -202,7 +211,9 @@ class GpuSyntheticModel(nn.Module):
 
 
 class GpuSyntheticWorkload(nn.Module):
-    """Hardware-only forward/backward workload with no OFoldX imports."""
+    """
+    Hardware-only forward/backward workload with no OFoldX imports.
+    """
 
     def __init__(
         self,
@@ -231,7 +242,9 @@ class GpuSyntheticWorkload(nn.Module):
 
 
 class MatmulWorkload(nn.Module):
-    """Dense GEMM-only workload for the most stable hardware baseline."""
+    """
+    Dense GEMM-only workload for the most stable hardware baseline.
+    """
 
     def __init__(
         self,
@@ -268,7 +281,9 @@ class MatmulWorkload(nn.Module):
 
 
 class CommWorkload(nn.Module):
-    """Distributed all-reduce workload for multi-GPU communication benchmarking."""
+    """
+    Distributed all-reduce workload for multi-GPU communication benchmarking.
+    """
 
     def __init__(self, *, size_mib: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()

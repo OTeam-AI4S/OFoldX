@@ -1,8 +1,5 @@
-r"""Input processing for BoltzGen structure design and inverse folding.
-
-``BoltzGenProcessor`` materializes generated placements and design conditioning.
-``BoltzGenInverseFoldingProcessor`` lowers a fixed backbone and inverse-fold constraints.
-This module owns their token, atom, MSA, template, and conditioning features.
+r"""
+Input processing for BoltzGen structure design and inverse folding.
 """
 
 from __future__ import annotations
@@ -72,10 +69,427 @@ _SS_UNSPECIFIED = 3  # num_ss_types == 4; class 3 taken as the masked/unspecifie
 _SS_LABEL_TO_ID = {"H": 0, "E": 1, "L": 2}
 
 
+class BoltzGenProcessor(Processor):
+    r"""
+    Convert supported structure-design inputs into `BoltzGenInput`.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
+
+    def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
+        super().__init__(device=device, dtype=dtype)
+
+    def __call__(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str] | None,
+        *,
+        placement: BoltzGenPlacements | None = None,
+        total_len: int | None = None,
+        conditions: Sequence[BoltzGenSchema] = (),
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenInput:
+        r"""
+        Build model inputs for one structure-design request.
+
+        Args:
+            input: Optional target or context system, structure, or path. ``None`` means
+                a fully generated assembly defined by ``placement`` and ``total_len``.
+            placement: Optional topology of existing and generated molecular segments.
+            total_len: Total token budget used to realize generated segments. With an
+                existing input and no generated placement, appends one generated protein
+                chain of this length.
+            conditions: BoltzGen conditioning records.
+            msa: Optional MSA evidence or alignment path.
+            templates: Optional structural templates.
+            generator: Random generator used for reference-conformer augmentation.
+
+        Returns:
+            A [`BoltzGenInput`][] with batch size one and token, atom, evidence,
+            condition, and molecular-layout axes aligned.
+        """
+
+        condition_values = tuple(conditions)
+        covalent_bonds = tuple(
+            condition for condition in condition_values if isinstance(condition, BoltzGenCovalentBond)
+        )
+        spatial_conditions = tuple(
+            condition for condition in condition_values if not isinstance(condition, BoltzGenCovalentBond)
+        )
+        system, structure = _normalize_structure_input(input)
+
+        placement_map: PlacementMap = {}
+        instance_of: dict[str, str] = {}
+        generated_residues: frozenset[ComponentReference] = frozenset()
+        if system is None:
+            # A fully generated assembly uses explicit placements or one default chain.
+            if placement is None and total_len is None:
+                raise ValueError("a fully-generated BoltzGen assembly requires placement or a total_len length budget")
+            assembly_placements = placement.placements if placement is not None else _default_assembly(total_len)
+            system, placement_map, instance_of = _materialize_assembly(assembly_placements, total_len)
+            generated_residues = frozenset(
+                reference
+                for group in placement_map.values()
+                for occurrences in group.values()
+                for reference in occurrences
+            )
+            structure = None
+        elif placement is not None or total_len is not None:
+            # Existing instances retain their identities and coordinates; generated
+            # chains are appended with zero coordinates before global centering.
+            extension_placements = None if placement is None else placement.placements
+            system, placement_map, instance_of, generated_residues = _materialize_extension(
+                system, extension_placements, total_len
+            )
+        # With no placement or length budget, the input system is used unchanged.
+        template_values = tuple(templates)
+        if not system.instances:
+            raise ValueError("BoltzGen requires at least one molecular instance")
+
+        if covalent_bonds:
+            system = _materialize_covalent_bonds(system, covalent_bonds, placement_map, instance_of)
+
+        normalized_msa = _normalize_msa(msa, system)
+        return self._prepare(
+            system,
+            structure=structure,
+            msa=normalized_msa,
+            conditions=spatial_conditions,
+            placement_map=placement_map,
+            instance_of=instance_of,
+            generated_residues=generated_residues,
+            templates=template_values,
+            generator=generator,
+        )
+
+    def _prepare(
+        self,
+        system: MolecularSystem,
+        *,
+        structure: Structure | None,
+        msa: MSA | MSACollection | None,
+        conditions: tuple[BoltzGenSchema, ...],
+        placement_map: PlacementMap | None = None,
+        instance_of: dict[str, str] | None = None,
+        generated_residues: frozenset[ComponentReference] = frozenset(),
+        templates: tuple[Template, ...] = (),
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenInput:
+
+        # Generated protein placeholders use backbone-only GLY reference coordinates.
+        tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
+        token_count = len(tokens)
+        (
+            atom_features,
+            reference_positions,
+            reference_space_id,
+            atom_mask,
+            atom_to_token,
+            atom_token_index,
+            atom_coordinates,
+            resolved,
+            center_coordinates,
+            site_to_atom,
+        ) = _build_atom_features(
+            system,
+            tokens,
+            atom_sites,
+            structure,
+            generated_residues=generated_residues,
+            generator=generator,
+        )
+        site_to_token = {
+            site: token_index
+            for token_index, token in enumerate(tokens)
+            for site in cast(tuple[AtomSite, ...], token["atom_sites"])
+        }
+        token_index_by_residue = {
+            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
+            for token_index, token in enumerate(tokens)
+            if token["monomer_index"] is not None
+        }
+
+        token_to_rep_atom = torch.tensor(
+            [site_to_atom[cast(AtomSite, token["distogram_site"])] for token in tokens], dtype=torch.long
+        )
+        representative_atom_mask = torch.zeros(atom_features.shape[0], dtype=torch.bool)
+        representative_atom_mask[token_to_rep_atom] = True
+        token_bonds = _token_bond_indicator(system, site_to_token, token_count)
+        msa_values = _msa_features(msa, tokens, system)
+        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
+        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
+        cyclic_period = torch.tensor(
+            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
+        )
+
+        # token_to_bb4_atoms (N, CA, C, O), used by the token-distance embedder.
+        token_to_bb4 = torch.stack(
+            [
+                torch.tensor(
+                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])], dtype=torch.long
+                )
+                for token in tokens
+            ]
+        )
+        # BoltzGen conditioning channels realized from the request records.
+        contact_conditioning, contact_threshold = _contact_channels(
+            conditions,
+            token_index_by_residue,
+            site_to_token,
+            placement_map or {},
+            instance_of or {},
+            token_count,
+        )
+        design_mask = _design_mask(conditions, token_index_by_residue, token_count, generated_residues)
+        binding_type = _binding_ids(
+            conditions,
+            token_index_by_residue,
+            site_to_token,
+            placement_map or {},
+            instance_of or {},
+            token_count,
+        )
+        ss_type = _ss_ids(conditions, token_index_by_residue, token_count)
+        symmetry_index = _symmetry_index(conditions, token_index_by_residue, tokens)
+        # Structure groups affect pairwise geometry through ``token_distance_mask``;
+        # atom reference-space ids remain per-residue.
+        structure_group = _structure_group_ids(conditions, token_index_by_residue, token_count, design_mask)
+        token_distance_mask = _token_distance_mask(structure_group)
+        # ``None`` leaves template fields unset so the trunk skips the template embedder.
+        template_values = _template_channels(templates, tokens, token_count)
+
+        tensor_values: dict[str, Tensor] = {
+            "token_mask": torch.ones(token_count, dtype=torch.bool),
+            "residue_index": torch.tensor([cast(int, token["residue_index"]) for token in tokens]),
+            "chain_index": torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
+            "entity_index": torch.tensor([cast(int, token["entity_index"]) for token in tokens]),
+            "symmetry_index": symmetry_index,
+            "token_index": torch.arange(token_count),
+            "atom_features": atom_features,
+            "atom_to_token": atom_to_token,
+            "atom_mask": atom_mask,
+            "reference_positions": reference_positions,
+            "reference_space_id": reference_space_id,
+            "representative_atom_mask": representative_atom_mask,
+            "atom_token_index": atom_token_index,
+            "token_to_rep_atom": token_to_rep_atom,
+            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "msa_profile": msa_values.pop("msa_profile"),
+            "deletion_mean": msa_values.pop("deletion_mean"),
+            "token_bonds": token_bonds,
+            "type_bonds": torch.zeros(token_count, token_count, dtype=torch.long),
+            "contact_conditioning": contact_conditioning,
+            "contact_threshold": contact_threshold,
+            "center_coordinates": center_coordinates,
+            "token_to_bb4_atoms": token_to_bb4,
+            "atom_coordinates": atom_coordinates,
+            "token_distance_mask": token_distance_mask,
+            "target_positions": atom_coordinates.clone(),
+            "target_mask": resolved,
+            "molecule_type": molecule_types,
+            "cyclic_period": cyclic_period,
+            "method_feature": torch.zeros(token_count, dtype=torch.long),
+            "modified": torch.zeros(token_count, dtype=torch.long),
+            "binding_type": binding_type,
+            "design_mask": design_mask,
+            "ss_type": ss_type,
+            **msa_values,
+            **(template_values or {}),
+        }
+        placed = {
+            name: (
+                value.to(device=self.device, dtype=self.dtype)
+                if value.is_floating_point()
+                else value.to(device=self.device)
+            )
+            for name, value in tensor_values.items()
+        }
+        layout = BoltzGenLayout(
+            system=system,
+            atom_sites=atom_sites,
+            token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
+            output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
+            output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
+            placement_map=placement_map if placement_map is not None else {},
+            instance_of=instance_of if instance_of is not None else {},
+        )
+        return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
+
+
+class BoltzGenInverseFoldingProcessor(Processor):
+    r"""
+    Convert supported inverse-folding inputs into `BoltzGenInverseFoldingInput`.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
+
+    def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
+        super().__init__(device=device, dtype=dtype)
+
+    def __call__(
+        self,
+        input: Structure | str | PathLike[str],
+        *,
+        design: Sequence[ComponentReference] = (),
+        aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
+        symmetry: Sequence[Sequence[ComponentReference]] = (),
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+    ) -> BoltzGenInverseFoldingInput:
+        r"""
+        Build inverse-folding inputs for one fixed structure.
+
+        Args:
+            input: Fixed structure or local structure path.
+            design: Residue occurrences whose identities may change.
+            aa_constraints: Per-residue amino-acid constraints.
+            symmetry: Residue groups sharing one sequence identity.
+            msa: Optional MSA evidence or alignment path.
+
+        Returns:
+            A [`BoltzGenInverseFoldingInput`][] with batch size one and aligned
+            token, atom, design-mask, amino-acid-constraint, and symmetry axes.
+        """
+
+        if isinstance(input, str | PathLike):
+            input = read_structure(Path(input).expanduser())
+        if not isinstance(input, Structure):
+            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure or structure path")
+        system = input.system
+        if not system.instances:
+            raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
+
+        normalized_msa = _normalize_msa(msa, system)
+        return self._prepare(
+            input,
+            msa=normalized_msa,
+            design=tuple(design),
+            aa_constraints=tuple(aa_constraints),
+            symmetry=tuple(tuple(unit) for unit in symmetry),
+        )
+
+    def _prepare(
+        self,
+        structure: Structure,
+        *,
+        msa: MSA | MSACollection | None,
+        design: tuple[ComponentReference, ...],
+        aa_constraints: tuple[BoltzGenResidueConstraint, ...],
+        symmetry: tuple[tuple[ComponentReference, ...], ...],
+    ) -> BoltzGenInverseFoldingInput:
+        system = structure.system
+        # Generated ``UNK`` protein residues use backbone-only GLY reference coordinates.
+        generated_residues = _generated_placeholder_residues(system)
+        tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
+        token_count = len(tokens)
+        (
+            atom_features,
+            reference_positions,
+            reference_space_id,
+            atom_mask,
+            atom_to_token,
+            atom_token_index,
+            atom_coordinates,
+            _,
+            center_coordinates,
+            site_to_atom,
+        ) = _build_atom_features(
+            system,
+            tokens,
+            atom_sites,
+            structure,
+            generated_residues=generated_residues,
+        )
+        site_to_token = {
+            site: token_index
+            for token_index, token in enumerate(tokens)
+            for site in cast(tuple[AtomSite, ...], token["atom_sites"])
+        }
+        token_index_by_residue = {
+            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
+            for token_index, token in enumerate(tokens)
+            if token["monomer_index"] is not None
+        }
+
+        token_bonds = _token_bond_indicator(system, site_to_token, token_count)
+        msa_values = _msa_features(msa, tokens, system)
+        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
+        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
+        cyclic_period = torch.tensor(
+            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
+        )
+        token_to_bb4 = torch.stack(
+            [
+                torch.tensor(
+                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])], dtype=torch.long
+                )
+                for token in tokens
+            ]
+        )
+        design_mask = _design_mask_from_positions(design, token_index_by_residue, token_count)
+        aa_constraint_mask = _aa_constraint_mask(aa_constraints, token_index_by_residue, token_count)
+        symmetric_group = _symmetry_index(
+            (BoltzGenSymmetry(units=symmetry),) if symmetry else (), token_index_by_residue, tokens
+        )
+
+        tensor_values: dict[str, Tensor] = {
+            "token_mask": torch.ones(token_count, dtype=torch.bool),
+            "residue_index": torch.tensor([cast(int, token["residue_index"]) for token in tokens]),
+            "chain_index": torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
+            "atom_features": atom_features,
+            "atom_to_token": atom_to_token,
+            "atom_mask": atom_mask,
+            "reference_positions": reference_positions,
+            "reference_space_id": reference_space_id,
+            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "msa_profile": msa_values["msa_profile"],
+            "deletion_mean": msa_values["deletion_mean"],
+            "token_bonds": token_bonds,
+            "type_bonds": torch.zeros(token_count, token_count, dtype=torch.long),
+            "molecule_type": molecule_types,
+            "center_coordinates": center_coordinates,
+            "token_to_bb4_atoms": token_to_bb4,
+            "atom_coordinates": atom_coordinates,
+            "cyclic_period": cyclic_period,
+            "method_feature": torch.zeros(token_count, dtype=torch.long),
+            "modified": torch.zeros(token_count, dtype=torch.long),
+            "design_mask": design_mask,
+            "aa_constraint_mask": aa_constraint_mask,
+            "symmetric_group": symmetric_group,
+        }
+        placed = {
+            name: (
+                value.to(device=self.device, dtype=self.dtype)
+                if value.is_floating_point()
+                else value.to(device=self.device)
+            )
+            for name, value in tensor_values.items()
+        }
+        layout = BoltzGenInverseFoldingLayout(
+            system=system,
+            atom_sites=atom_sites,
+            token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
+            output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
+            output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
+        )
+        return BoltzGenInverseFoldingInput(
+            **{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout
+        )
+
+
+# BoltzGen processor implementation helpers.
+
+
 def _normalize_structure_input(
     input: MolecularSystem | Structure | str | PathLike[str] | None,
 ) -> tuple[MolecularSystem | None, Structure | None]:
-    r"""Resolve an input into (system, optional Structure)."""
+    r"""
+    Resolve an input into (system, optional Structure).
+    """
 
     if input is None:
         return None, None
@@ -92,7 +506,9 @@ def _component_reference_to_token(
     reference: ComponentReference,
     token_index: dict[tuple[str, int], int],
 ) -> int:
-    r"""Resolve one ``(instance_id, component_index)`` reference to its token row."""
+    r"""
+    Resolve one ``(instance_id, component_index)`` reference to its token row.
+    """
 
     key = (reference[0], reference[1])
     if key not in token_index:
@@ -104,13 +520,13 @@ def _component_reference_to_token(
 # Whole-assembly ``total_len`` realization.
 # --------------------------------------------------------------------------------------
 
-# Placeholder generated component per polymer type (mirrors ODesign's generated-residue
-# component ids): the realized backbone identity the diffusion designer overwrites.
+# Placeholder component identities used for generated polymer residues.
 _GENERATED_COMPONENT = {"protein": "UNK", "rna": "N", "dna": "DN"}
 
 
 def _default_assembly(total_len: int | None) -> PlacementSpec:
-    r"""The degenerate whole-assembly PlacementSpec when only a ``total_len`` budget is given.
+    r"""
+    The degenerate whole-assembly PlacementSpec when only a ``total_len`` budget is given.
 
     One declaration group ``"assembly"`` with one generated protein placement ``"chain_A"``
     spanning the whole ``total_len`` budget.
@@ -122,7 +538,8 @@ def _default_assembly(total_len: int | None) -> PlacementSpec:
 
 
 def _resolve_generated_lengths(placements: PlacementSpec, total_len: int | None) -> dict[str, int]:
-    r"""Resolve each generated placement within the ``total_len`` budget.
+    r"""
+    Resolve each generated placement within the ``total_len`` budget.
 
     ``total_len`` constrains the sum of generated lengths. Every placement starts
     at ``min_length`` and receives remaining capacity in declaration order up to
@@ -162,7 +579,8 @@ def _materialize_assembly(
     placements: PlacementSpec,
     total_len: int | None,
 ) -> tuple[MolecularSystem, PlacementMap, dict[str, str]]:
-    r"""Realize a fully generated placement specification.
+    r"""
+    Realize a fully generated placement specification.
 
     Every value must be a [`GeneratedSegment`][]. Non-empty segments mint one
     ``chain_{n}`` instance in declaration order; zero-length segments map to an
@@ -212,7 +630,8 @@ def _materialize_assembly(
 
 
 def _default_extension(total_len: int | None) -> PlacementSpec:
-    r"""Build the default extension for a ``total_len`` budget.
+    r"""
+    Build the default extension for a ``total_len`` budget.
 
     The input system is retained and one generated protein chain of length
     ``total_len`` is appended.
@@ -228,7 +647,8 @@ def _materialize_extension(
     placements: PlacementSpec | None,
     total_len: int | None,
 ) -> tuple[MolecularSystem, PlacementMap, dict[str, str], frozenset[ComponentReference]]:
-    r"""Extend an existing input system with generated rows.
+    r"""
+    Extend an existing input system with generated rows.
 
     Existing instances retain their ids, entities, coordinates, and bonds.
     [`ExistingSpan`][] occurrences address those source rows directly.
@@ -332,7 +752,8 @@ def _materialize_covalent_bonds(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> MolecularSystem:
-    r"""Resolve requested [`SymbolicBond`][] links and inject them into ``system.bonds``.
+    r"""
+    Resolve requested [`SymbolicBond`][] links and inject them into ``system.bonds``.
 
     Each [`BoltzGenCovalentBond`][ofoldx.models.boltzgen.model.BoltzGenCovalentBond] wraps a
     [`SymbolicBond`][ofoldx.data.bonds.SymbolicBond] whose endpoints are lowered to realized
@@ -358,7 +779,8 @@ def _materialize_covalent_bonds(
 
 
 def _generated_placeholder_residues(system: MolecularSystem) -> frozenset[ComponentReference]:
-    r"""Return polymer residues carrying a generated placeholder identity.
+    r"""
+    Return polymer residues carrying a generated placeholder identity.
 
     Protein ``UNK`` placeholders have no reference conformer and therefore use the
     GLY backbone template during inverse folding. Fixed-context residues are excluded.
@@ -383,7 +805,8 @@ def _generated_reference_coordinates(
     atom_sites: tuple[AtomSite, ...],
     generated_residues: frozenset[ComponentReference],
 ) -> list[tuple[float, float, float]]:
-    r"""Reference coordinates for an assembly containing generated placement residues.
+    r"""
+    Reference coordinates for an assembly containing generated placement residues.
 
     Generated protein backbones use GLY template coordinates. Other residues use
     their component conformer; molecule components without one use an RDKit conformer.
@@ -424,440 +847,12 @@ def _generated_reference_coordinates(
     return coordinates
 
 
-class BoltzGenProcessor(Processor):
-    r"""Lower one BoltzGen structure-design request to ``BoltzGenInput``.
-
-    Supports whole-assembly topology (``total_len``) and spatial conditioning
-    (``conditions``). The neutral
-    conditioning channels the trunk always consumes (contact conditioning, token
-    distance, binding/design/secondary-structure ids) are written for every token so
-    the graph receives a complete set of conditioning inputs.
-
-    Args:
-        device: Device for produced tensors.
-        dtype: Floating-point dtype for produced tensors.
-    """
-
-    def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
-        super().__init__(device=device, dtype=dtype)
-
-    def __call__(
-        self,
-        input: MolecularSystem | Structure | str | PathLike[str] | None,
-        *,
-        placement: BoltzGenPlacements | None = None,
-        total_len: int | None = None,
-        conditions: Sequence[BoltzGenSchema] = (),
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template] = (),
-        generator: torch.Generator | None = None,
-    ) -> BoltzGenInput:
-        r"""Validate and lower one design request.
-
-        Args:
-            input: Optional target/context system, structure, or path. ``None`` means a
-                fully-generated whole-assembly determined by the ``BoltzGenPlacements`` topology
-                and the whole-assembly ``total_len`` budget.
-            placement: Optional whole-assembly generation topology.
-            total_len: Whole-assembly token budget. When
-                ``input`` is ``None`` it drives per-placement length realization; otherwise it
-                extends the input system by one generated protein chain of length ``total_len``.
-            conditions: BoltzGen conditioning records.
-            msa: Optional MSA evidence for the input polymer chains.
-            templates: Optional template evidence (structure-design template channel).
-            generator: RNG for reference-conformer augmentation.
-
-        Returns:
-            The lowered ``BoltzGenInput`` with its ``layout`` populated.
-        """
-
-        condition_values = tuple(conditions)
-        covalent_bonds = tuple(
-            condition for condition in condition_values if isinstance(condition, BoltzGenCovalentBond)
-        )
-        spatial_conditions = tuple(
-            condition for condition in condition_values if not isinstance(condition, BoltzGenCovalentBond)
-        )
-        system, structure = _normalize_structure_input(input)
-
-        placement_map: PlacementMap = {}
-        instance_of: dict[str, str] = {}
-        generated_residues: frozenset[ComponentReference] = frozenset()
-        if system is None:
-            # A fully generated assembly uses explicit placements or one default chain.
-            if placement is None and total_len is None:
-                raise ValueError("a fully-generated BoltzGen assembly requires placement or a total_len length budget")
-            assembly_placements = placement.placements if placement is not None else _default_assembly(total_len)
-            system, placement_map, instance_of = _materialize_assembly(assembly_placements, total_len)
-            generated_residues = frozenset(
-                reference
-                for group in placement_map.values()
-                for occurrences in group.values()
-                for reference in occurrences
-            )
-            structure = None
-        elif placement is not None or total_len is not None:
-            # Existing instances retain their identities and coordinates; generated
-            # chains are appended with zero coordinates before global centering.
-            extension_placements = None if placement is None else placement.placements
-            system, placement_map, instance_of, generated_residues = _materialize_extension(
-                system, extension_placements, total_len
-            )
-        # With no placement or length budget, the input system is used unchanged.
-        template_values = tuple(templates)
-        if not system.instances:
-            raise ValueError("BoltzGen requires at least one molecular instance")
-
-        if covalent_bonds:
-            system = _materialize_covalent_bonds(system, covalent_bonds, placement_map, instance_of)
-
-        normalized_msa = _normalize_msa(msa, system)
-        return self._prepare(
-            system,
-            structure=structure,
-            msa=normalized_msa,
-            conditions=spatial_conditions,
-            placement_map=placement_map,
-            instance_of=instance_of,
-            generated_residues=generated_residues,
-            templates=template_values,
-            generator=generator,
-        )
-
-    def _prepare(
-        self,
-        system: MolecularSystem,
-        *,
-        structure: Structure | None,
-        msa: MSA | MSACollection | None,
-        conditions: tuple[BoltzGenSchema, ...],
-        placement_map: PlacementMap | None = None,
-        instance_of: dict[str, str] | None = None,
-        generated_residues: frozenset[ComponentReference] = frozenset(),
-        templates: tuple[Template, ...] = (),
-        generator: torch.Generator | None = None,
-    ) -> BoltzGenInput:
-        r"""Lower a realized design system to model tensors and BoltzGen conditioning channels.
-
-        ``generated_residues`` contains occurrences created from
-        [`GeneratedSegment`][ofoldx.data.placement.GeneratedSegment]; existing spans are context.
-        The set controls GLY-template backbone features and the automatic design mask.
-        """
-
-        # Generated protein placeholders use backbone-only GLY reference coordinates.
-        tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
-        token_count = len(tokens)
-        (
-            atom_features,
-            reference_positions,
-            reference_space_id,
-            atom_mask,
-            atom_to_token,
-            atom_token_index,
-            coords,
-            resolved,
-            center_coords,
-            site_to_atom,
-        ) = _build_atom_features(
-            system,
-            tokens,
-            atom_sites,
-            structure,
-            generated_residues=generated_residues,
-            generator=generator,
-        )
-        site_to_token = {
-            site: token_index
-            for token_index, token in enumerate(tokens)
-            for site in cast(tuple[AtomSite, ...], token["atom_sites"])
-        }
-        token_index_by_residue = {
-            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
-            for token_index, token in enumerate(tokens)
-            if token["monomer_index"] is not None
-        }
-
-        token_to_rep_atom = torch.tensor(
-            [site_to_atom[cast(AtomSite, token["distogram_site"])] for token in tokens], dtype=torch.long
-        )
-        representative_atom_mask = torch.zeros(atom_features.shape[0], dtype=torch.bool)
-        representative_atom_mask[token_to_rep_atom] = True
-        token_bonds = _token_bond_indicator(system, site_to_token, token_count)
-        msa_values = _msa_features(msa, tokens, system)
-        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
-        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
-        cyclic_period = torch.tensor(
-            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
-        )
-
-        # token_to_bb4_atoms (N, CA, C, O), used by the token-distance embedder.
-        token_to_bb4 = torch.stack(
-            [
-                torch.tensor(
-                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])], dtype=torch.long
-                )
-                for token in tokens
-            ]
-        )
-        # BoltzGen conditioning channels realized from the request records.
-        contact_conditioning, contact_threshold = _contact_channels(
-            conditions,
-            token_index_by_residue,
-            site_to_token,
-            placement_map or {},
-            instance_of or {},
-            token_count,
-        )
-        design_mask = _design_mask(conditions, token_index_by_residue, token_count, generated_residues)
-        binding_type = _binding_ids(
-            conditions,
-            token_index_by_residue,
-            site_to_token,
-            placement_map or {},
-            instance_of or {},
-            token_count,
-        )
-        ss_type = _ss_ids(conditions, token_index_by_residue, token_count)
-        symmetry_index = _symmetry_index(conditions, token_index_by_residue, tokens)
-        # Structure groups affect pairwise geometry through ``token_distance_mask``;
-        # atom reference-space ids remain per-residue.
-        structure_group = _structure_group_ids(conditions, token_index_by_residue, token_count, design_mask)
-        token_distance_mask = _token_distance_mask(structure_group)
-        # ``None`` leaves template fields unset so the trunk skips the template embedder.
-        template_values = _template_channels(templates, tokens, token_count)
-
-        tensor_values: dict[str, Tensor] = {
-            "token_mask": torch.ones(token_count, dtype=torch.bool),
-            "residue_index": torch.tensor([cast(int, token["residue_index"]) for token in tokens]),
-            "chain_index": torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
-            "entity_index": torch.tensor([cast(int, token["entity_index"]) for token in tokens]),
-            "symmetry_index": symmetry_index,
-            "token_index": torch.arange(token_count),
-            "atom_features": atom_features,
-            "atom_to_token": atom_to_token,
-            "atom_mask": atom_mask,
-            "reference_positions": reference_positions,
-            "reference_space_id": reference_space_id,
-            "representative_atom_mask": representative_atom_mask,
-            "atom_token_index": atom_token_index,
-            "token_to_rep_atom": token_to_rep_atom,
-            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
-            "msa_profile": msa_values.pop("msa_profile"),
-            "deletion_mean": msa_values.pop("deletion_mean"),
-            "token_bonds": token_bonds,
-            "type_bonds": torch.zeros(token_count, token_count, dtype=torch.long),
-            "contact_conditioning": contact_conditioning,
-            "contact_threshold": contact_threshold,
-            "center_coords": center_coords,
-            "token_to_bb4_atoms": token_to_bb4,
-            "coords": coords,
-            "token_distance_mask": token_distance_mask,
-            "target_positions": coords.clone(),
-            "target_mask": resolved,
-            "molecule_type": molecule_types,
-            "cyclic_period": cyclic_period,
-            "method_feature": torch.zeros(token_count, dtype=torch.long),
-            "modified": torch.zeros(token_count, dtype=torch.long),
-            "binding_type": binding_type,
-            "design_mask": design_mask,
-            "ss_type": ss_type,
-            **msa_values,
-            **(template_values or {}),
-        }
-        placed = {
-            name: (
-                value.to(device=self.device, dtype=self.dtype)
-                if value.is_floating_point()
-                else value.to(device=self.device)
-            )
-            for name, value in tensor_values.items()
-        }
-        layout = BoltzGenLayout(
-            system=system,
-            atom_sites=atom_sites,
-            token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
-            output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
-            output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
-            placement_map=placement_map if placement_map is not None else {},
-            instance_of=instance_of if instance_of is not None else {},
-        )
-        return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
-
-
-class BoltzGenInverseFoldingProcessor(Processor):
-    r"""Lower one fixed backbone and its inverse-fold constraints to ``BoltzGenInverseFoldingInput``.
-
-    Supported constraints are ``design`` positions (``design_mask``), per-residue
-    amino-acid constraints (``aa_constraints`` → ``aa_constraint_mask``), and symmetric
-    groups (``symmetry`` → ``symmetric_group``). These lower directly to the BoltzGen
-    inverse-fold input vocabulary.
-
-    Args:
-        device: Device for produced tensors.
-        dtype: Floating-point dtype for produced tensors.
-    """
-
-    def __init__(self, *, device: torch.device | str | None = None, dtype: torch.dtype | None = None) -> None:
-        super().__init__(device=device, dtype=dtype)
-
-    def __call__(
-        self,
-        input: Structure | str | PathLike[str],
-        *,
-        design: Sequence[ComponentReference] = (),
-        aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
-        symmetry: Sequence[Sequence[ComponentReference]] = (),
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
-    ) -> BoltzGenInverseFoldingInput:
-        r"""Validate and lower one fixed backbone to inverse-fold input.
-
-        Args:
-            input: Canonical fixed-backbone structure or local structure path.
-            design: Residue occurrences whose identities may change.
-            aa_constraints: Per-residue amino-acid constraints.
-            symmetry: Residue groups sharing one sequence identity.
-            msa: Optional MSA value, collection, or alignment path.
-
-        Returns:
-            A ``BoltzGenInverseFoldingInput`` with aligned backbone, design, and constraint axes.
-        """
-
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
-        if not isinstance(input, Structure):
-            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure or structure path")
-        system = input.system
-        if not system.instances:
-            raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
-
-        normalized_msa = _normalize_msa(msa, system)
-        return self._prepare(
-            input,
-            msa=normalized_msa,
-            design=tuple(design),
-            aa_constraints=tuple(aa_constraints),
-            symmetry=tuple(tuple(unit) for unit in symmetry),
-        )
-
-    def _prepare(
-        self,
-        structure: Structure,
-        *,
-        msa: MSA | MSACollection | None,
-        design: tuple[ComponentReference, ...],
-        aa_constraints: tuple[BoltzGenResidueConstraint, ...],
-        symmetry: tuple[tuple[ComponentReference, ...], ...],
-    ) -> BoltzGenInverseFoldingInput:
-        r"""Lower a fixed or generated backbone to inverse-folding tensors and constraint masks."""
-
-        system = structure.system
-        # Generated ``UNK`` protein residues use backbone-only GLY reference coordinates.
-        generated_residues = _generated_placeholder_residues(system)
-        tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
-        token_count = len(tokens)
-        (
-            atom_features,
-            reference_positions,
-            reference_space_id,
-            atom_mask,
-            atom_to_token,
-            atom_token_index,
-            coords,
-            _,
-            center_coords,
-            site_to_atom,
-        ) = _build_atom_features(
-            system,
-            tokens,
-            atom_sites,
-            structure,
-            generated_residues=generated_residues,
-        )
-        site_to_token = {
-            site: token_index
-            for token_index, token in enumerate(tokens)
-            for site in cast(tuple[AtomSite, ...], token["atom_sites"])
-        }
-        token_index_by_residue = {
-            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
-            for token_index, token in enumerate(tokens)
-            if token["monomer_index"] is not None
-        }
-
-        token_bonds = _token_bond_indicator(system, site_to_token, token_count)
-        msa_values = _msa_features(msa, tokens, system)
-        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
-        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
-        cyclic_period = torch.tensor(
-            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
-        )
-        token_to_bb4 = torch.stack(
-            [
-                torch.tensor(
-                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])], dtype=torch.long
-                )
-                for token in tokens
-            ]
-        )
-        design_mask = _design_mask_from_positions(design, token_index_by_residue, token_count)
-        aa_constraint_mask = _aa_constraint_mask(aa_constraints, token_index_by_residue, token_count)
-        symmetric_group = _symmetry_index(
-            (BoltzGenSymmetry(units=symmetry),) if symmetry else (), token_index_by_residue, tokens
-        )
-
-        tensor_values: dict[str, Tensor] = {
-            "token_mask": torch.ones(token_count, dtype=torch.bool),
-            "residue_index": torch.tensor([cast(int, token["residue_index"]) for token in tokens]),
-            "chain_index": torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
-            "atom_features": atom_features,
-            "atom_to_token": atom_to_token,
-            "atom_mask": atom_mask,
-            "reference_positions": reference_positions,
-            "reference_space_id": reference_space_id,
-            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
-            "msa_profile": msa_values["msa_profile"],
-            "deletion_mean": msa_values["deletion_mean"],
-            "token_bonds": token_bonds,
-            "type_bonds": torch.zeros(token_count, token_count, dtype=torch.long),
-            "molecule_type": molecule_types,
-            "center_coords": center_coords,
-            "token_to_bb4_atoms": token_to_bb4,
-            "coords": coords,
-            "cyclic_period": cyclic_period,
-            "method_feature": torch.zeros(token_count, dtype=torch.long),
-            "modified": torch.zeros(token_count, dtype=torch.long),
-            "design_mask": design_mask,
-            "aa_constraint_mask": aa_constraint_mask,
-            "symmetric_group": symmetric_group,
-        }
-        placed = {
-            name: (
-                value.to(device=self.device, dtype=self.dtype)
-                if value.is_floating_point()
-                else value.to(device=self.device)
-            )
-            for name, value in tensor_values.items()
-        }
-        layout = BoltzGenInverseFoldingLayout(
-            system=system,
-            atom_sites=atom_sites,
-            token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
-            output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
-            output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
-        )
-        return BoltzGenInverseFoldingInput(
-            **{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout
-        )
-
-
-# Shared BoltzGen featurization helpers.
-
-
 def _build_tokens(
     system: MolecularSystem,
     generated_residues: frozenset[ComponentReference] = frozenset(),
 ) -> tuple[list[dict[str, object]], tuple[AtomSite, ...]]:
-    r"""Build per-token records and the flat model atom order.
+    r"""
+    Build per-token records and the flat model atom order.
 
     Polymer residues each occupy one token; non-polymer atoms each occupy one token, matching the
     Boltz tokenization scheme.
@@ -979,7 +974,8 @@ def _build_atom_features(
     generated_residues: frozenset[ComponentReference] = frozenset(),
     generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, dict[AtomSite, int]]:
-    r"""Build the 388-wide BoltzGen/Boltz-2 atom reference feature vector and index maps.
+    r"""
+    Build the 388-wide BoltzGen/Boltz-2 atom reference feature vector and index maps.
 
     The 388-wide layout contains positions (3), charge (1), element (128), and
     atom-name characters (4x64), with no atom-mask channel.
@@ -1009,7 +1005,7 @@ def _build_atom_features(
         reference_space_by_residue.setdefault((site.instance_id, site.component_index), len(reference_space_by_residue))
         for site in atom_sites
     ]
-    raw_coords = torch.zeros(padded_atom_count, 3)
+    raw_atom_coordinates = torch.zeros(padded_atom_count, 3)
     resolved = torch.zeros(padded_atom_count, dtype=torch.bool)
     coordinate_index: dict[AtomSite, int] = {}
     if structure is not None:
@@ -1018,21 +1014,23 @@ def _build_atom_features(
         source_index = coordinate_index.get(site)
         if source_index is not None:
             assert structure is not None
-            raw_coords[atom_index] = torch.as_tensor(structure.coordinates[source_index], dtype=raw_coords.dtype)
+            raw_atom_coordinates[atom_index] = torch.as_tensor(
+                structure.coordinates[source_index], dtype=raw_atom_coordinates.dtype
+            )
             resolved[atom_index] = bool(structure.coordinate_mask[source_index])
         elif (site.instance_id, site.component_index) in generated_residues:
             # Generated atoms are present with zero coordinates before centering.
             resolved[atom_index] = True
 
-    coords = raw_coords.clone()
+    atom_coordinates = raw_atom_coordinates.clone()
     resolved_atoms = resolved[:atom_count]
-    center = (coords[:atom_count] * resolved_atoms[:, None]).sum(dim=0)
+    center = (atom_coordinates[:atom_count] * resolved_atoms[:, None]).sum(dim=0)
     center = center / resolved_atoms.sum().clamp(min=1)
-    coords[:atom_count] -= center
+    atom_coordinates[:atom_count] -= center
     center_atom_indices = torch.tensor(
         [site_to_atom[cast(AtomSite, token["center_site"])] for token in tokens], dtype=torch.long
     )
-    center_coords = raw_coords[center_atom_indices]
+    center_coordinates = raw_atom_coordinates[center_atom_indices]
 
     reference_positions = torch.zeros(padded_atom_count, 3)
     reference_positions[:atom_count] = torch.tensor(reference_coordinates)
@@ -1081,9 +1079,9 @@ def _build_atom_features(
         atom_mask,
         atom_to_token,
         atom_token_index,
-        coords,
+        atom_coordinates,
         resolved,
-        center_coords,
+        center_coordinates,
         site_to_atom,
     )
 
@@ -1096,7 +1094,9 @@ def _contact_channels(
     instance_of: dict[str, str],
     token_count: int,
 ) -> tuple[Tensor, Tensor]:
-    r"""Realize contact records into the ``[N, N, 5]`` one-hot + ``[N, N]`` threshold."""
+    r"""
+    Realize contact records into the ``[N, N, 5]`` one-hot + ``[N, N]`` threshold.
+    """
 
     selected: list[tuple[BoltzGenContact, tuple[int, ...], tuple[int, ...]]] = []
     for condition in conditions:
@@ -1142,7 +1142,9 @@ def _endpoint_tokens(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> tuple[int, ...]:
-    r"""Resolve contact endpoints to token rows, preserving declaration order."""
+    r"""
+    Resolve contact endpoints to token rows, preserving declaration order.
+    """
 
     rows: list[int] = []
     for endpoint in endpoints:
@@ -1168,7 +1170,9 @@ def _component_tokens(
     token_index_by_residue: dict[tuple[str, int], int],
     site_to_token: dict[AtomSite, int],
 ) -> tuple[int, ...]:
-    r"""Map one polymer residue or ligand component to all token rows it owns."""
+    r"""
+    Map one polymer residue or ligand component to all token rows it owns.
+    """
 
     key = (reference[0], reference[1])
     if key in token_index_by_residue:
@@ -1191,7 +1195,8 @@ def _design_mask(
     token_count: int,
     generated_residues: frozenset[ComponentReference] = frozenset(),
 ) -> Tensor:
-    r"""Realize the ``[N]`` boolean design mask.
+    r"""
+    Realize the ``[N]`` boolean design mask.
 
     Generated placement residues are designable by default. Explicit
     [`BoltzGenDesignMask`][ofoldx.models.boltzgen.model.BoltzGenDesignMask] records add existing
@@ -1211,7 +1216,8 @@ def _structure_group_ids(
     token_count: int,
     design_mask: Tensor,
 ) -> Tensor:
-    r"""Realize ``BoltzGenStructureGroup`` records into the per-token ``[N]`` structure-group ids.
+    r"""
+    Realize ``BoltzGenStructureGroup`` records into the per-token ``[N]`` structure-group ids.
 
     Group ``0`` is free and ungrouped; each record assigns its ``group_id`` to its
     members. Designed residues must remain in group ``0`` because their backbone
@@ -1239,7 +1245,8 @@ def _structure_group_ids(
 
 
 def _token_distance_mask(structure_group: Tensor) -> Tensor:
-    r"""Realize structure groups into the ``[N, N]`` ``token_distance_mask``.
+    r"""
+    Realize structure groups into the ``[N, N]`` ``token_distance_mask``.
 
     The whole matrix is ``1`` when every token shares group ``1``. Otherwise cell ``(i, j)`` is
     ``1`` iff ``structure_group[i] > 0`` and ``structure_group[i] == structure_group[j]`` (distinct
@@ -1278,7 +1285,9 @@ def _binding_ids(
     instance_of: dict[str, str],
     token_count: int,
 ) -> Tensor:
-    r"""Realize ``BoltzGenBinding`` records into the ``[N]`` binding-specification ids."""
+    r"""
+    Realize ``BoltzGenBinding`` records into the ``[N]`` binding-specification ids.
+    """
 
     ids = torch.full((token_count,), _BINDING_UNSPECIFIED, dtype=torch.long)
     for condition in conditions:
@@ -1302,7 +1311,9 @@ def _ss_ids(
     token_index_by_residue: dict[tuple[str, int], int],
     token_count: int,
 ) -> Tensor:
-    r"""Realize ``BoltzGenSecondaryStructure`` records into the ``[N]`` ss ids."""
+    r"""
+    Realize ``BoltzGenSecondaryStructure`` records into the ``[N]`` ss ids.
+    """
 
     ids = torch.full((token_count,), _SS_UNSPECIFIED, dtype=torch.long)
     for condition in conditions:
@@ -1318,7 +1329,8 @@ def _symmetry_index(
     token_index_by_residue: dict[tuple[str, int], int],
     tokens: list[dict[str, object]],
 ) -> Tensor:
-    r"""Realize ``BoltzGenSymmetry`` records into the ``[N]`` symmetry-copy index.
+    r"""
+    Realize ``BoltzGenSymmetry`` records into the ``[N]`` symmetry-copy index.
 
     Defaults to the tokenizer's per-entity symmetry-copy index; an explicit
     ``BoltzGenSymmetry`` overrides matched positions with the unit ordinal.
@@ -1339,7 +1351,8 @@ def _aa_constraint_mask(
     token_index_by_residue: dict[tuple[str, int], int],
     token_count: int,
 ) -> Tensor:
-    r"""Realize per-residue AA constraints into the ``[N, 20]`` canonical-AA block mask.
+    r"""
+    Realize per-residue AA constraints into the ``[N, 20]`` canonical-AA block mask.
 
     The ``[N, 20]`` mask follows ``CANONICAL_TOKENS`` order, where ``0`` is allowed and ``1`` disallowed;
     the default is all-zero (unconstrained). ``BoltzGenInverseFoldingModel._build_constraint_logit_mask``
@@ -1363,7 +1376,8 @@ def _aa_constraint_mask(
 
 
 def _template_frame(nitrogen: np.ndarray, alpha: np.ndarray, carbon: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    r"""Build one residue's backbone frame.
+    r"""
+    Build one residue's backbone frame.
 
     Gram-Schmidt over ``(C - CA, N - CA)``: ``e1`` along ``C - CA``, ``e2`` the ``N - CA``
     component orthogonal to ``e1``, ``e3 = e1 x e2``; the rotation columns are ``[e1, e2, e3]``
@@ -1381,13 +1395,17 @@ def _template_frame(nitrogen: np.ndarray, alpha: np.ndarray, carbon: np.ndarray)
 
 
 def _template_center_atom(polymer_type: str) -> str:
-    r"""Return CA for protein tokens and C1' for nucleic tokens."""
+    r"""
+    Return CA for protein tokens and C1' for nucleic tokens.
+    """
 
     return "CA" if polymer_type == "protein" else "C1'"
 
 
 def _template_disto_atom(component_id: str, polymer_type: str) -> str:
-    r"""Return the token atom used for template distograms."""
+    r"""
+    Return the token atom used for template distograms.
+    """
 
     if polymer_type == "protein":
         return "CA" if component_id == "GLY" else "CB"
@@ -1404,7 +1422,9 @@ def _template_atom(
     component_index: int,
     atom_id: str,
 ) -> tuple[np.ndarray | None, bool]:
-    r"""Look up one template atom's coordinate + presence, or ``(None, False)`` if absent."""
+    r"""
+    Look up one template atom's coordinate + presence, or ``(None, False)`` if absent.
+    """
 
     entry = coordinates.get((instance_id, component_index, atom_id))
     if entry is None:
@@ -1417,7 +1437,8 @@ def _template_channels(
     tokens: list[dict[str, object]],
     token_count: int,
 ) -> dict[str, Tensor] | None:
-    r"""Lower aligned [`Template`][ofoldx.data.evidence.Template] evidence into the BoltzGen template tensors.
+    r"""
+    Lower aligned [`Template`][ofoldx.data.evidence.Template] evidence into the BoltzGen template tensors.
 
     Returns ``None`` when no templates are supplied, so the model skips the template embedder.
     Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by
@@ -1615,7 +1636,9 @@ _DNA_MSA_RESTYPE = {
 
 
 def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
-    r"""Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-1 token."""
+    r"""
+    Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-1 token.
+    """
 
     if symbol == "-":
         return _MSA_GAP
@@ -1631,7 +1654,8 @@ def _token_bond_indicator(
     site_to_token: dict[AtomSite, int],
     token_count: int,
 ) -> Tensor:
-    r"""Build the symmetric inter-token bond indicator ``[N, N, 1]`` consumed by ``token_bond_projection``.
+    r"""
+    Build the symmetric inter-token bond indicator ``[N, N, 1]`` consumed by ``token_bond_projection``.
 
     The trailing singleton feeds ``nn.Linear(1, ...)`` in the design trunk; inverse
     folding indexes ``token_bonds[..., 0]``.
@@ -1791,7 +1815,8 @@ def _augment_reference_positions(
     *,
     generator: torch.Generator | None = None,
 ) -> None:
-    r"""Randomly rotate and translate each resolved reference conformer.
+    r"""
+    Randomly rotate and translate each resolved reference conformer.
 
     Random values are drawn from ``generator``; ``None`` uses the ambient PyTorch
     RNG.
@@ -1855,7 +1880,9 @@ def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> l
 
 
 def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
-    r"""Materialize a canonical molecular graph as RDKit chemistry."""
+    r"""
+    Materialize a canonical molecular graph as RDKit chemistry.
+    """
 
     from rdkit import Chem
 

@@ -1,4 +1,6 @@
-r"""Configuration for MPNN Packer."""
+r"""
+Configuration for MPNN Packer.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class MpnnPackerConfig(Config):
-    r"""Configure the MPNN Packer architecture.
+    r"""
+    Configure the MPNN Packer architecture.
 
     Args:
         hidden_size: Width of graph hidden states.
@@ -40,7 +43,8 @@ class MpnnPackerConfig(Config):
 
 
 class MpnnPackerProcessorConfig(Config):
-    r"""Configure tensor shapes for canonical Structure lowering.
+    r"""
+    Configure MPNN Packer input processing.
 
     Args:
         num_context_atoms: Number of nearby context atoms emitted per residue.

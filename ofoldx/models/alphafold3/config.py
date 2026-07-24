@@ -17,7 +17,8 @@ from ..config import (
 
 
 class AlphaFold3Config(Config):
-    r"""Configure the [`AlphaFold3Model`][ofoldx.models.alphafold3.AlphaFold3Model] graph.
+    r"""
+    Configure the [`AlphaFold3Model`][ofoldx.models.alphafold3.AlphaFold3Model] graph.
 
     Args:
         token_feature_size: Width of raw token features.
@@ -57,7 +58,8 @@ class AlphaFold3Config(Config):
 
 
 class AlphaFold3ProcessorConfig(Config):
-    r"""Configure AlphaFold 3 input lowering.
+    r"""
+    Configure AlphaFold 3 input preprocessing.
 
     Args:
         max_msa_rows: Maximum assembled depth of paired and unpaired MSA rows.

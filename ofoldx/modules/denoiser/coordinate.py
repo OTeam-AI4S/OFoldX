@@ -1,9 +1,5 @@
 r"""
-Coordinate denoising networks.
-
-The coordinate denoiser is the diffusion-model score network: given noisy atom coords and an
-EDM ``noise_level``, it conditions the token single/pair representations, refines them through an
-atom-encoder/token-refiner/atom-decoder stack, and returns denoised coords.
+Coordinate-denoising networks.
 """
 
 from __future__ import annotations
@@ -32,17 +28,7 @@ from ..transition import Transition
 
 class CoordinateDenoiser(nn.Module):
     r"""
-    EDM coordinate denoiser with atom-level encoder/decoder blocks.
-
-    Runs the full diffusion score network for one denoising step: an
-    [`EdmPreconditioner`][ofoldx.modules.diffusion.edm.EdmPreconditioner] scales the noisy
-    coords, a [`DenoisingConditioner`][ofoldx.modules.denoiser.coordinate.DenoisingConditioner]
-    conditions the token single/pair on the noise level, a
-    [`CoordinateAtomToTokenEncoder`][ofoldx.modules.atom.CoordinateAtomToTokenEncoder] lifts
-    atoms to tokens, a [`DenoisingTokenRefiner`][ofoldx.modules.denoiser.coordinate.DenoisingTokenRefiner]
-    refines the token states, and a
-    [`TokenToAtomDecoder`][ofoldx.modules.atom.TokenToAtomDecoder] projects back to a
-    per-atom coordinate update that the preconditioner combines into the denoised coords.
+    Predict denoised atom coordinates with EDM preconditioning.
 
     Args:
         num_encoder_blocks: Number of token-refiner attention blocks.
@@ -65,15 +51,6 @@ class CoordinateDenoiser(nn.Module):
         operator_backend: Backend selector passed to the attention/transition operators.
         cross_attention_key_source: Whether atom key/value normalization starts from the raw hidden state
             or the query-normalized state.
-
-    Examples:
-        >>> denoiser = CoordinateDenoiser(
-        ...     num_encoder_blocks=1,
-        ...     num_atom_encoder_blocks=1,
-        ...     num_atom_decoder_blocks=1,
-        ... )
-        >>> isinstance(denoiser.preconditioner, EdmPreconditioner)
-        True
     """
 
     def __init__(
@@ -150,26 +127,14 @@ class CoordinateDenoiser(nn.Module):
         r"""
         Build local atom-pair geometry using the denoising atom-encoder window layout.
 
-        Delegates to the atom encoder so the geometry (window offsets, pair features) matches the
-        layout the encoder will attend over. Precompute it once and pass it through the input
-        bundle's ``local_geometry`` to enable windowed local attention.
-
         Args:
-            reference_positions: Centered reference-conformer atom coords, shape `[..., num_atoms, 3]`.
-            reference_space_id: Per-atom conformer/space identifier used to gate cross-window pairs,
-                shape `[..., num_atoms]`.
+            reference_positions: Centered reference coordinates with shape
+                ``[..., N_atom, 3]``.
+            reference_space_id: Reference-space index with shape ``[..., N_atom]``.
             num_valid_atoms: Number of real atoms; enables clamped key windows containing only real atoms.
 
         Returns:
-            A [`LocalAtomGeometry`][ofoldx.modules.atom.LocalAtomGeometry] describing the local
-            atom-pair layout.
-
-        Examples:
-            >>> import torch  # doctest: +SKIP
-            >>> denoiser = CoordinateDenoiser(num_encoder_blocks=1)  # doctest: +SKIP
-            >>> geom = denoiser.build_local_geometry(  # doctest: +SKIP
-            ...     torch.zeros(1, 8, 3), torch.zeros(1, 8, dtype=torch.long)
-            ... )
+            Geometry and masks aligned to the atom encoder's local windows.
         """
 
         return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
@@ -178,21 +143,12 @@ class CoordinateDenoiser(nn.Module):
         r"""
         Predict the raw per-atom coordinate update, before EDM output preconditioning.
 
-        Conditions the token single/pair on the noise level, refines the atom-encoded token states,
-        and decodes them back to a per-atom update. `forward` scales the inputs and combines
-        this update through the preconditioner; call this directly only when you need the
-        un-preconditioned update.
-
         Args:
-            inputs: Typed coordinate-denoising bundle. ``noisy_coords`` must carry a leading sample
-                axis whose length matches the last dimension of ``noise_level``.
+            inputs: Denoising input whose coordinate and noise tensors share a
+                sample axis.
 
         Returns:
-            Per-atom coordinate update, shape `[..., num_samples, num_atoms, 3]`.
-
-        Examples:
-            >>> denoiser = CoordinateDenoiser(num_encoder_blocks=1)  # doctest: +SKIP
-            >>> update = denoiser.predict_coordinate_update(inputs)  # doctest: +SKIP
+            Coordinate update with shape ``[..., N_sample, N_atom, 3]``.
         """
 
         denoising_single, denoising_pair = self.conditioner(
@@ -233,25 +189,14 @@ class CoordinateDenoiser(nn.Module):
 
     def forward(self, inputs: CoordinateDenoisingInput) -> Tensor:
         r"""
-        Denoise atom coords from a typed coordinate-denoising input bundle.
-
-        Applies EDM input scaling to the noisy coords, predicts the raw coordinate update, and
-        combines it back through the preconditioner to yield the denoised coords. A missing sample
-        axis (``noisy_coords.dim() == atom_features.dim()``) is inserted for the forward pass and
-        squeezed back out on return.
+        Denoise atom coordinates.
 
         Args:
-            inputs: Typed coordinate-denoising bundle carrying atom features, token
-                single/pair representations, the EDM ``noise_level``, and the ``noisy_coords`` to
-                denoise.
+            inputs: Atom, token, noise-level, and noisy-coordinate inputs.
 
         Returns:
-            Denoised atom coords, shape `[..., num_atoms, 3]` (or with a
-            `[..., num_samples, num_atoms, 3]` sample axis when the input carried one).
-
-        Examples:
-            >>> denoiser = CoordinateDenoiser(num_encoder_blocks=1)  # doctest: +SKIP
-            >>> denoised = denoiser(inputs)  # doctest: +SKIP
+            Denoised coordinates with shape ``[..., N_atom, 3]`` or
+            ``[..., N_sample, N_atom, 3]``, matching the input's sample-axis layout.
         """
 
         dtype = inputs.atom_features.dtype
@@ -290,12 +235,6 @@ class DenoisingConditioner(nn.Module):
     r"""
     Condition the token single and pair representations for one coordinate-denoising step.
 
-    Augments the pair representation with relative-position embeddings and fuses the
-    Fourier-embedded EDM log-noise into the single representation, so downstream refinement is
-    aware of both sequence geometry and the current noise level. Each branch is a
-    norm/projection followed by two [`Transition`][ofoldx.modules.transition.Transition]
-    updates.
-
     Args:
         relative_position_size: Width of the relative-position feature bucket embedding input.
         pair_input_size: Width of the incoming (concatenated) pair representation.
@@ -306,11 +245,6 @@ class DenoisingConditioner(nn.Module):
         sigma_data: EDM data-scale hyperparameter used to normalise the log-noise.
         embed_relative_position: Whether to project relative-position buckets before pair conditioning.
         operator_backend: Public backend request forwarded to the pair and single transitions.
-
-    Examples:
-        >>> conditioner = DenoisingConditioner(pair_size=128, single_size=384)
-        >>> conditioner.sigma_data
-        16.0
     """
 
     def __init__(
@@ -361,28 +295,18 @@ class DenoisingConditioner(nn.Module):
         r"""
         Condition the token single and pair on the noise level and token embedding.
 
-        The pair branch adds relative-position embeddings to the incoming pair; the single branch
-        fuses the Fourier-embedded log-noise (``log(noise_level / sigma_data) / 4``) into the single
-        update and broadcasts a per-sample axis.
-
         Args:
-            noise_level: Per-sample EDM noise level, shape `[..., num_samples]`.
-            token_embedding: Token embedding before trunk updates, shape `[..., num_tokens, *]`.
-            single: Token single representation, shape `[..., num_tokens, single_size]`.
-            pair: Token pair representation, shape `[..., num_tokens, num_tokens, pair_input_size]`.
+            noise_level: Noise levels with shape ``[..., N_sample]``.
+            token_embedding: Token embeddings with shape ``[..., N_token, C_token]``.
+            single: Single representation with shape ``[..., N_token, single_size]``.
+            pair: Pair representation with shape
+                ``[..., N_token, N_token, pair_input_size]``.
             relative_features: Relative-position feature bundle indexing the pair embedding.
 
         Returns:
-            ``(denoising_single, denoising_pair)`` with shapes
-            `[..., num_samples, num_tokens, single_size]` and
-            `[..., num_tokens, num_tokens, pair_size]`.
-
-        Examples:
-            >>> conditioner = DenoisingConditioner()  # doctest: +SKIP
-            >>> cond = conditioner(  # doctest: +SKIP
-            ...     noise_level, token_embedding=token_embedding, single=single,
-            ...     pair=pair, relative_features=relative_features,
-            ... )
+            Conditioned single and pair representations with shapes
+            ``[..., N_sample, N_token, single_size]`` and
+            ``[..., N_token, N_token, pair_size]``.
         """
 
         relative_position_conditioning = (
@@ -432,12 +356,6 @@ class DenoisingTokenRefiner(nn.Module):
     r"""
     Refine atom-encoded token states with denoising single and pair conditioning.
 
-    Adds the projected, normed single conditioning into the atom-encoder token hidden states, runs
-    them through a [`DenoisingTokenEncoder`][ofoldx.modules.attention.DenoisingTokenEncoder]
-    stack biased by the pair conditioning, and returns the refined states together with the atom
-    encoder output and the decoder atom mask. Handles both the dense (samples flattened into the
-    batch) and local-windowed (samples carried structurally) atom regimes.
-
     Args:
         num_blocks: Number of token-encoder attention blocks.
         token_hidden_size: Width of the token hidden channel.
@@ -445,12 +363,6 @@ class DenoisingTokenRefiner(nn.Module):
         pair_size: Width of the pair conditioning representation.
         num_attention_heads: Number of attention heads per token-encoder block.
         operator_backend: Backend selector passed to the attention operators.
-
-    Examples:
-        >>> refiner = DenoisingTokenRefiner(num_blocks=1)
-        >>> from ofoldx.modules.attention import DenoisingTokenEncoder
-        >>> isinstance(refiner.token_encoder, DenoisingTokenEncoder)
-        True
     """
 
     def __init__(
@@ -494,15 +406,6 @@ class DenoisingTokenRefiner(nn.Module):
         r"""
         Encode atoms, refine the token states, and return the decoder inputs.
 
-        Two atom regimes share one token-refinement tail. With dense full attention
-        (``local_geometry is None``) the sample axis is broadcast and flattened into the
-        batch so every sample is an independent atom graph, and the flattened reference
-        mask is handed back for the dense decoder. With local windowed attention the
-        atoms stay structured and shared across samples -- the windowed encoder carries
-        the sample axis through ``noisy_coords`` -- so nothing is broadcast, the refined
-        states are reshaped back to `[..., num_tokens, hidden]`, and the decoder rebuilds
-        its own mask (``None`` here).
-
         Args:
             atom_encoder: The atom-to-token encoder to run.
             atom_features: Per-atom input features.
@@ -516,22 +419,13 @@ class DenoisingTokenRefiner(nn.Module):
             atom_mask: Boolean atom validity mask.
             noisy_coords: Noisy atom coordinates to refine.
             local_geometry: Optional local atom-pair geometry.
-        Returns:
-            A tuple of the atom-encoder output, the refined token hidden states of shape
-            `[..., num_tokens, token_hidden_size]`, and the decoder atom mask (a flattened mask in
-            the dense regime, ``None`` in the local regime).
 
-        Examples:
-            >>> refiner = DenoisingTokenRefiner(num_blocks=1)  # doctest: +SKIP
-            >>> atom_output, token_hidden, atom_mask = refiner(  # doctest: +SKIP
-            ...     atom_encoder, atom_features=atom_features, atom_to_token=atom_to_token,
-            ...     single=single, denoising_single=denoising_single,
-            ...     denoising_pair=denoising_pair, reference_positions=reference_positions,
-            ...     reference_charges=reference_charges, reference_mask=reference_mask,
-            ...     atom_mask=atom_mask,
-            ...     noisy_coords=noisy_coords, local_geometry=None,
-            ... )
+        Returns:
+            The atom-encoder output, refined token states with trailing shape
+            ``(N_token, token_hidden_size)``, and the decoder atom mask. The mask
+            is ``None`` for local-window attention.
         """
+
         target_prefix = tuple(denoising_single.shape[:-2])
         num_tokens = denoising_single.shape[-2]
         flat_denoising_single = _flatten_prefix(denoising_single, tail_dims=2)
@@ -598,12 +492,6 @@ def _broadcast_prefix(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims:
 
     Returns:
         A view of ``tensor`` with shape ``(*target_prefix, *tail_shape)``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.denoiser.coordinate import _broadcast_prefix
-        >>> _broadcast_prefix(torch.zeros(3, 4), (5, 2), tail_dims=2).shape
-        torch.Size([5, 2, 3, 4])
     """
 
     tail_shape = tuple(tensor.shape[-tail_dims:])
@@ -628,12 +516,6 @@ def _flatten_prefix(tensor: Tensor, tail_dims: int) -> Tensor:
 
     Returns:
         A view of shape ``(-1, *tail_shape)``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.denoiser.coordinate import _flatten_prefix
-        >>> _flatten_prefix(torch.zeros(2, 3, 4, 5), tail_dims=2).shape
-        torch.Size([6, 4, 5])
     """
 
     return tensor.reshape(-1, *tensor.shape[-tail_dims:])
@@ -653,12 +535,6 @@ def _flatten_broadcast(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims
 
     Returns:
         A view of shape ``(prod(target_prefix), *tail_shape)``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.denoiser.coordinate import _flatten_broadcast
-        >>> _flatten_broadcast(torch.zeros(3, 4), (5, 2), tail_dims=2).shape
-        torch.Size([10, 3, 4])
     """
 
     return _flatten_prefix(_broadcast_prefix(tensor, target_prefix, tail_dims), tail_dims)

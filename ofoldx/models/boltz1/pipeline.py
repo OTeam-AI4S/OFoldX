@@ -1,4 +1,6 @@
-r"""Boltz-1 folding Pipeline."""
+r"""
+Boltz-1 folding Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -17,11 +19,8 @@ from .processor import Boltz1Processor
 
 
 class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
-    r"""Bind one Boltz-1 Model and Processor for folding.
-
-    Runs one Processor call followed by one ``Boltz1Model.fold`` invocation, exposing
-    Boltz-1 pocket conditioning and Boltz-1x steering controls. The decoded output is the
-    shared ``FoldResult`` unchanged.
+    r"""
+    Structure prediction pipeline for Boltz 1.
     """
 
     def fold(
@@ -38,15 +37,18 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
     ) -> FoldResult:
-        r"""Lower one molecular input and run Boltz-1 folding.
+        r"""
+        Predict structures for one molecular system with Boltz 1.
 
         Args:
-            input: Canonical molecular system, structure, or local structure path.
+            input: Molecular system, structure, or local structure path.
             msa: Optional MSA value, collection, or alignment path.
             pocket: Optional binder and pocket-residue specification.
             num_samples: Number of structure predictions to generate.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            seed: Optional seed for reference-conformer augmentation and
+                coordinate sampling. Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by preprocessing and coordinate
+                sampling. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
@@ -54,7 +56,8 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
             steering_args: Optional potential-guidance controls.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Structure, PAE, and PDE values
+            are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)

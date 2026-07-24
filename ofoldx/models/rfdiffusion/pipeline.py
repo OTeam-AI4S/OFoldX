@@ -1,10 +1,5 @@
-r"""RFdiffusion generation and design pipeline.
-
-``design`` lowers one generation input through [`RfDiffusionProcessor`][], runs the
-reverse-diffusion sampler via [`RfDiffusionModel.design`][], and returns the coordinate-producing
-[`RfDiffusionDesignResult`][ofoldx.models.rfdiffusion.model.RfDiffusionDesignResult]. A single caller-controlled
-``seed`` or ``generator`` supplies the random stream for every requested candidate without
-unintended reseeding.
+r"""
+Protein backbone design operations for RFdiffusion.
 """
 
 from __future__ import annotations
@@ -19,13 +14,12 @@ import torch
 from ...data.bonds import SymbolicBond
 
 # AllowedResidueIdentities is shared by sequence-design pipelines.
-from ...data.conditions import AllowedResidueIdentities
+from ...data.conditions import AllowedResidueIdentities, Hotspot
 from ...data.evidence import Template
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline, resolve_generator
 from .model import (
-    Hotspot,
     RfDiffusionCoordination,
     RfDiffusionDesignResult,
     RfDiffusionDistance,
@@ -41,7 +35,9 @@ from .processor import RfDiffusionProcessor
 
 
 class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]):
-    r"""Bind one RFdiffusion Model and Processor for coordinate-producing design."""
+    r"""
+    Protein backbone design pipeline for RFdiffusion.
+    """
 
     def design(
         self,
@@ -83,47 +79,50 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> RfDiffusionDesignResult:
-        r"""Generate RFdiffusion backbones and return an ``RfDiffusionDesignResult``.
+        r"""
+        Generate protein-backbone structures.
 
         Args:
-            input: Optional target or context system, structure, or structure path.
-            placement: Generation topology for existing spans and generated protein segments.
-            templates: Up to one fold-conditioning template.
-            conditions: Residue, geometry, symmetry, and interaction conditions consumed by
-                RFdiffusion.
-            inpaint_sequence: Existing residue occurrences whose sequence identities are masked.
-            length: Inclusive bounds for the combined generated length across inpaint chains,
-                excluding receptor spans.
-            timestep: Positive diffusion timestep stored on the lowered ``RfDiffusionInput``.
-            num_candidates: Number of backbone candidates to generate.
-            num_sampling_steps: Active reverse-diffusion schedule length. ``None`` uses the
-                checkpoint schedule.
-            final_step: Last reverse timestep to execute.
-            partial_steps: Optional starting timestep for partial diffusion.
-            noise_scale_ca: Initial CA-translation noise scale.
-            final_noise_scale_ca: Final CA-translation noise scale. A differing value requires a
-                linear schedule.
-            ca_noise_schedule: CA-translation noise schedule.
-            noise_scale_frame: Initial backbone-frame noise scale.
-            final_noise_scale_frame: Final backbone-frame noise scale. A differing value requires
-                a linear schedule.
-            frame_noise_schedule: Backbone-frame noise schedule.
-            align_motif: Whether to align predictions to fixed motif coordinates.
-            return_trajectory: Whether to retain every reverse step during sampling.
+            input: Optional context system, observed structure, or local structure path.
+            placement: Topology containing existing spans and generated protein segments.
+            templates: Zero or one structural template.
+            conditions: Residue-identity, hotspot, geometry, symmetry, bond, and
+                interaction conditions.
+            inpaint_sequence: Existing residue occurrences whose identities are masked.
+            length: Inclusive lower and upper bounds for total generated length across
+                generated segments, excluding retained receptor spans.
+            timestep: Diffusion timestep stored in the processed input. This value applies
+                to direct ``forward`` calls; reverse sampling is controlled by
+                ``num_sampling_steps`` and ``partial_steps``.
+            num_candidates: Number of independently sampled backbone candidates.
+            num_sampling_steps: Number of active reverse-diffusion timesteps. ``None``
+                uses the model configuration.
+            final_step: Last reverse-diffusion timestep to execute, inclusive.
+            partial_steps: Starting timestep for partial diffusion from observed
+                coordinates. ``None`` starts from the active schedule maximum.
+            noise_scale_ca: Initial multiplier for C-alpha translation noise.
+            final_noise_scale_ca: Final translation-noise multiplier for a linear
+                schedule. ``None`` uses ``noise_scale_ca``.
+            ca_noise_schedule: Translation-noise schedule, ``"constant"`` or ``"linear"``.
+            noise_scale_frame: Initial multiplier for backbone-frame rotation noise.
+            final_noise_scale_frame: Final frame-noise multiplier for a linear schedule.
+                ``None`` uses ``noise_scale_frame``.
+            frame_noise_schedule: Frame-noise schedule, ``"constant"`` or ``"linear"``.
+            align_motif: Whether to align each sampled structure to fixed motif residues.
+            return_trajectory: Whether to retain all reverse steps internally during
+                sampling. Trajectories are not included in the returned result.
             symmetry_recenter: Whether to recenter symmetry units before radial placement.
-            symmetry_radius_angstrom: Radial placement distance for recentered symmetry units.
-            guidance_scale: Overall scale for differentiable condition guidance.
-            guidance_decay: Guidance schedule: ``"constant"``, ``"linear"``, ``"quadratic"``,
-                or ``"cubic"``.
-            seed: Optional integer seed.
-            generator: Optional PyTorch random generator.
+            symmetry_radius_angstrom: Radial placement distance in angstroms.
+            guidance_scale: Multiplier for differentiable geometric-condition guidance.
+            guidance_decay: Guidance schedule: ``"constant"``, ``"linear"``,
+                ``"quadratic"``, or ``"cubic"``.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
 
         Returns:
-            An ``RfDiffusionDesignResult`` containing one coordinate-bearing candidate per sample.
-
-        Notes:
-            ``seed`` and ``generator`` are mutually exclusive. Candidate order is sampling order;
-            each ``plddt`` metric axis follows that candidate's realized output residues.
+            An [`RfDiffusionDesignResult`][] containing structures in sampling order.
+            Coordinates are in angstroms; each candidate's pLDDT metric uses a 0--100
+            scale.
         """
 
         batch = self.processor(
@@ -135,7 +134,7 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             length=length,
             timestep=timestep,
         )
-        generator = resolve_generator(seed, generator, device=batch.noisy_coords.device)
+        generator = resolve_generator(seed, generator, device=batch.noisy_coordinates.device)
         return self.model.design(
             batch,
             num_candidates=num_candidates,

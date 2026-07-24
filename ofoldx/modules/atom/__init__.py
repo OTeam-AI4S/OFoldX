@@ -1,5 +1,5 @@
 r"""
-Shared atom-level building blocks (windowing, pair encoding, transfer ops, contexts).
+Reusable atom-level encoding and transfer components.
 """
 
 from __future__ import annotations

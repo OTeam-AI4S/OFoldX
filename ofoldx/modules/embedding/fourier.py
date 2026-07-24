@@ -21,15 +21,6 @@ class FrozenFourierEmbedding(nn.Module):
 
     Args:
         dim: Number of Fourier feature channels.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> embedding = FrozenFourierEmbedding(4)
-        >>> embedding(torch.tensor([0.0, 1.0])).shape
-        torch.Size([2, 4])
-        >>> sum(p.numel() for p in embedding.parameters() if p.requires_grad)
-        0
     """
 
     def __init__(self, dim: int) -> None:
@@ -41,15 +32,8 @@ class FrozenFourierEmbedding(nn.Module):
     def reset_parameters(self) -> None:
         r"""
         Re-draw the frozen projection weight and bias from a standard normal distribution.
-
-        Examples:
-            >>> import torch
-            >>> embedding = FrozenFourierEmbedding(4)
-            >>> _ = torch.manual_seed(0)
-            >>> embedding.reset_parameters()
-            >>> embedding.projection.weight.shape
-            torch.Size([4, 1])
         """
+
         nn.init.normal_(self.projection.weight, mean=0.0, std=1.0)
         nn.init.normal_(self.projection.bias, mean=0.0, std=1.0)
 
@@ -63,16 +47,6 @@ class FrozenFourierEmbedding(nn.Module):
 
         Returns:
             ``[..., dim]`` Fourier features ``cos(2*pi * projection(times))``.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> embedding = FrozenFourierEmbedding(4)
-            >>> features = embedding(torch.tensor([0.0, 1.0, 2.0]))
-            >>> features.shape
-            torch.Size([3, 4])
-            >>> bool(features.abs().le(1.0).all())
-            True
         """
 
         projected = self.projection(times.unsqueeze(-1))

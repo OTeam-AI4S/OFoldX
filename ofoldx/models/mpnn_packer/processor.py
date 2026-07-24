@@ -1,4 +1,6 @@
-r"""Canonical structure lowering for MPNN Packer."""
+r"""
+MPNN Packer input processing.
+"""
 
 from __future__ import annotations
 
@@ -33,11 +35,11 @@ from .model import MpnnPackerInput
 
 
 class MpnnPackerProcessor(Processor):
-    r"""Lower one canonical structure for MPNN Packer.
+    r"""
+    Prepare structures and target sequences for side-chain packing.
 
     Args:
-        config: Side-chain packing context options. Defaults to
-            ``MpnnPackerProcessorConfig()``.
+        config: Side-chain context options. Defaults to ``MpnnPackerProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -61,10 +63,11 @@ class MpnnPackerProcessor(Processor):
         use_atom_context: bool = True,
         filter_by_occupancy: bool = True,
     ) -> MpnnPackerInput:
-        r"""Lower fixed identities, selected residues, coordinates, and atom context.
+        r"""
+        Prepare a structure and optional target sequence for side-chain packing.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             sequence: Optional replacement protein sequence. A bare string requires one protein
                 instance; a mapping addresses instances explicitly.
             pack_positions: Residue occurrences to repack. ``None`` selects every eligible

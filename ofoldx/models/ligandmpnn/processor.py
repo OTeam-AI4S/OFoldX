@@ -1,4 +1,6 @@
-r"""Canonical Structure lowering for LigandMPNN."""
+r"""
+LigandMPNN input processing.
+"""
 
 from __future__ import annotations
 
@@ -89,7 +91,8 @@ _LoweredRows = tuple[
 
 
 class LigandMpnnProcessor(Processor):
-    r"""Lower one canonical protein/context structure to LigandMPNN tensors.
+    r"""
+    Prepare protein-ligand structures and sequence constraints for LigandMPNN.
 
     Args:
         config: LigandMPNN context options. Defaults to ``LigandMpnnProcessorConfig()``.
@@ -124,10 +127,11 @@ class LigandMpnnProcessor(Processor):
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Lower a PDB path or canonical ``Structure`` to ``LigandMpnnInput``.
+        r"""
+        Prepare a PDB file or ``Structure`` for LigandMPNN.
 
         Args:
-            input: Coordinate-bearing canonical ``Structure`` or local PDB path.
+            input: A coordinate-bearing ``Structure`` or local PDB path.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -139,12 +143,11 @@ class LigandMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``LigandMpnnInput`` carrying aligned tensors, source structure, and
-            component references.
+            A single-example ``LigandMpnnInput`` whose residue axes align with
+            ``component_references``.
 
         Notes:
-            PDB paths are parsed first and then use the same observed-CA row mapping as canonical
-            ``Structure`` inputs.
+            PDB paths and ``Structure`` inputs both follow observed C-alpha sites.
         """
 
         if isinstance(input, (str, PathLike)):
@@ -186,7 +189,8 @@ class LigandMpnnProcessor(Processor):
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Read and lower a PDB path to ``LigandMpnnInput``.
+        r"""
+        Read a PDB file and prepare it for LigandMPNN.
 
         Args:
             path: Local PDB path parsed by ``read_mpnn_pdb``.
@@ -201,7 +205,7 @@ class LigandMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``LigandMpnnInput`` lowered from the parsed PDB structure.
+            A single-example ``LigandMpnnInput`` for the parsed PDB structure.
 
         Notes:
             Protein rows and nearest-context axes are identical to ``process_structure`` because
@@ -233,7 +237,8 @@ class LigandMpnnProcessor(Processor):
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
     ) -> LigandMpnnInput:
-        r"""Lower a canonical ``Structure`` to ``LigandMpnnInput``.
+        r"""
+        Prepare a ``Structure`` for LigandMPNN.
 
         Args:
             structure: Coordinate-bearing protein and context structure.
@@ -248,7 +253,7 @@ class LigandMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``LigandMpnnInput`` lowered from the canonical structure.
+            A single-example ``LigandMpnnInput`` for ``structure``.
 
         Notes:
             Protein rows follow observed CA sites in ``structure.sites`` order, and
@@ -290,7 +295,9 @@ class LigandMpnnProcessor(Processor):
         system: MolecularSystem,
         observed: np.ndarray,
     ) -> _LoweredRows:
-        r"""Build rows: observed-CA protein occurrences in CA-site order, cumulative positions."""
+        r"""
+        Build rows: observed-CA protein occurrences in CA-site order, cumulative positions.
+        """
 
         coordinate_index = {site: index for index, site in enumerate(structure.sites)}
 
@@ -380,7 +387,9 @@ class LigandMpnnProcessor(Processor):
         system: MolecularSystem,
         observed: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        r"""Collect observed nonprotein, nonwater, nonhydrogen atoms as ordinary context."""
+        r"""
+        Collect observed nonprotein, nonwater, nonhydrogen atoms as ordinary context.
+        """
 
         context_coordinates: list[np.ndarray] = []
         context_atomic_numbers: list[int] = []
@@ -415,7 +424,9 @@ class LigandMpnnProcessor(Processor):
         use_atom_context: bool,
         ligand_interface_cutoff: float,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        r"""Select the nearest padded context atoms per residue and the interface mask."""
+        r"""
+        Select the nearest padded context atoms per residue and the interface mask.
+        """
 
         num_context_atoms = operator.index(self.config.num_context_atoms)
         length = backbone.shape[0]
@@ -466,7 +477,9 @@ class LigandMpnnProcessor(Processor):
         use_atom_context: bool,
         ligand_interface_cutoff: float,
     ) -> LigandMpnnInput:
-        r"""Apply selection, shared conditions, tie closure, and context to build the input."""
+        r"""
+        Apply selection, shared conditions, tie closure, and context to build the input.
+        """
 
         (
             row_references,
@@ -544,7 +557,9 @@ class LigandMpnnProcessor(Processor):
         row_valid: list[bool],
         design_positions: Sequence[ComponentReference] | None,
     ) -> list[bool]:
-        r"""Resolve the designable rows from the shared ``positions`` selection meaning."""
+        r"""
+        Resolve the designable rows from the shared ``positions`` selection meaning.
+        """
 
         valid_by_reference = dict(zip(row_references, row_valid))
         if design_positions is None:
@@ -564,7 +579,9 @@ class LigandMpnnProcessor(Processor):
         row_by_reference: Mapping[ComponentReference, int],
         length: int,
     ) -> tuple[list[int], tuple[tuple[int, ...], ...], dict[int, set[str]]]:
-        r"""Close transitive ties once and collect explicit allowed-identity restrictions."""
+        r"""
+        Close transitive ties once and collect explicit allowed-identity restrictions.
+        """
 
         parent = list(range(length))
 
@@ -618,7 +635,9 @@ class LigandMpnnProcessor(Processor):
         reference: ComponentReference,
         row_by_reference: Mapping[ComponentReference, int],
     ) -> int:
-        r"""Map one condition reference to its Model row or fail with a clear message."""
+        r"""
+        Map one condition reference to its Model row or fail with a clear message.
+        """
 
         try:
             return row_by_reference[reference]
@@ -634,7 +653,8 @@ class LigandMpnnProcessor(Processor):
         row_design: list[bool],
         row_component_ids: list[str],
     ) -> Tensor | None:
-        r"""Intersect explicit allowed identities and fixed anchors into a support mask.
+        r"""
+        Intersect explicit allowed identities and fixed anchors into a support mask.
 
         Restrictions come only from explicit ``AllowedResidueIdentities`` on those
         rows; a designable tied member without an explicit restriction inherits none.
@@ -689,7 +709,8 @@ class LigandMpnnProcessor(Processor):
         length: int,
         tied_groups: tuple[tuple[int, ...], ...],
     ) -> Tensor | None:
-        r"""Sum the broadcast global vector and sparse per-residue additions once.
+        r"""
+        Sum the broadcast global vector and sparse per-residue additions once.
 
         The public bias axis carries only the twenty generatable identities; the
         inert unknown slot stays zero. The aligned per-member bias must be identical
@@ -724,7 +745,9 @@ class LigandMpnnProcessor(Processor):
         row_by_reference: Mapping[ComponentReference, int],
         tied_groups: tuple[tuple[int, ...], ...],
     ) -> Tensor | None:
-        r"""Lower final signed tie coefficients; missing members default to one."""
+        r"""
+        Lower final signed tie coefficients; missing members default to one.
+        """
 
         if tied_weights is None:
             return None

@@ -1,4 +1,5 @@
-r"""PDB visualization writer for MpnnPacker predictions.
+r"""
+PDB visualization writer for MpnnPacker predictions.
 
 [`write_pdb`][] serializes one complete [`PackPrediction`][ofoldx.results.PackPrediction]
 using the packed-structure conventions produced by MpnnPacker. The output is
@@ -24,7 +25,17 @@ def write_pdb(
     prediction: PackPrediction,
     path: str | PathLike[str],
 ) -> None:
-    r"""Write one packed prediction as its canonical PDB visualization."""
+    r"""
+    Write a packed structure prediction in PDB format.
+
+    Args:
+        prediction: Packed structure and optional per-residue chi metrics.
+        path: Destination file path.
+
+    Raises:
+        ValueError: If the prediction contains identifiers or coordinates that
+            cannot be represented in PDB format.
+    """
 
     structure = prediction.structure
     system = structure.system

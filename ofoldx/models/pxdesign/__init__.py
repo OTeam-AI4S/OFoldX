@@ -1,9 +1,11 @@
-r"""PxDesign protein-structure design implementation."""
+r"""
+PxDesign protein-structure design implementation.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import (
     PxDesignConditionEmbeddingsConfig,
     PxDesignConfig,
@@ -22,15 +24,14 @@ from .model import (
 from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
-# Coordinate-bearing results require the concrete design pipeline.
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.pxdesign",
     model=PxDesignModel,
     processor=PxDesignProcessor,
     processor_config=PxDesignProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.pxdesign",
     pipeline=PxDesignPipeline,
     tasks=("design",),

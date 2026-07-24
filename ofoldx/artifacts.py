@@ -1,4 +1,6 @@
-r"""Write standard OFoldX model repositories."""
+r"""
+Write standard OFoldX model repositories.
+"""
 
 from __future__ import annotations
 
@@ -16,25 +18,65 @@ from .processor import Processor
 
 
 class SaveableModel(Protocol):
-    r"""Structural model surface used only to compose task-specific Protocols."""
+    r"""
+    Structural model surface used only to compose task-specific Protocols.
+    """
 
     @property
-    def config(self) -> Mapping[str, object]: ...
+    def config(self) -> Mapping[str, object]:
+        r"""
+        Return the serializable model configuration.
 
-    def state_dict(self) -> dict[str, torch.Tensor]: ...
+        Returns:
+            Configuration values written to the model repository.
+        """
+
+        ...
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        r"""
+        Return the model state dictionary.
+
+        Returns:
+            Model tensors keyed by state-dictionary name.
+        """
+
+        ...
 
     def to(
         self,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> object: ...
+    ) -> object:
+        r"""
+        Move or cast the model.
+
+        Args:
+            device: Destination device, or `None` to preserve the current device.
+            dtype: Destination dtype, or `None` to preserve the current dtype.
+
+        Returns:
+            The moved or cast model.
+        """
+
+        ...
 
 
 class SaveableProcessor(Protocol):
-    r"""Configured Processor state written to ``processor.json``."""
+    r"""
+    Configured Processor state written to ``processor.json``.
+    """
 
     @property
-    def config(self) -> Mapping[str, object]: ...
+    def config(self) -> Mapping[str, object]:
+        r"""
+        Return the serializable processor configuration.
+
+        Returns:
+            Configuration values written to the model repository.
+        """
+
+        ...
 
 
 def _config_json(config: Mapping[str, object], *, architecture: str | None = None) -> str:
@@ -57,12 +99,22 @@ def save_model(
     private: bool = False,
     commit_message: str | None = None,
 ) -> None:
-    r"""Write one registered Model/Processor repository, and optionally publish it.
+    r"""
+    Save a registered model and processor as an OFoldX repository.
 
-    Saving is local-only by default. When ``repo_id`` is given, the fully written and
-    validated repository is uploaded to that Hugging Face Hub repo. Nothing is published
-    unless a caller passes an explicit ``repo_id``; ``token`` (or the ambient Hugging Face
-    credential) supplies authentication. No organization or token is assumed.
+    Args:
+        directory: Local model repository to create or update.
+        model: Registered model whose config and state dictionary are saved.
+        processor: Processor registered with ``model``.
+        max_shard_size: Maximum safetensors shard size.
+        repo_id: Optional Hugging Face Hub repository ID to upload after saving.
+        token: Hugging Face access token used for publication.
+        private: Whether a newly created Hub repository is private.
+        commit_message: Optional Hub commit message.
+
+    Raises:
+        RuntimeError: If safetensors serialization does not preserve the complete state
+            dictionary.
     """
 
     from huggingface_hub import save_torch_state_dict

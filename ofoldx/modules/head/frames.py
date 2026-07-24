@@ -24,15 +24,6 @@ def insert_sample_axis(index: Tensor, num_samples: int, *, dim: int = -2) -> Ten
 
     Returns:
         Expanded index tensor with a materialized sample axis of size ``num_samples``.
-
-    Examples:
-        >>> import torch
-        >>> index = torch.tensor([[0, 1, 2]])
-        >>> insert_sample_axis(index, 4).shape
-        torch.Size([1, 4, 3])
-        >>> frame_index = torch.tensor([[[0, 1, 2]]])
-        >>> insert_sample_axis(frame_index, 4, dim=-3).shape
-        torch.Size([1, 4, 1, 3])
     """
 
     expanded = index.unsqueeze(dim)
@@ -55,13 +46,6 @@ def gather_atoms_by_index(coords: Tensor, atom_index: Tensor) -> Tensor:
 
     Returns:
         `[..., M, C]` coords gathered at the requested indices.
-
-    Examples:
-        >>> import torch
-        >>> coords = torch.arange(12.0).reshape(1, 4, 3)
-        >>> atom_index = torch.tensor([[0, 2]])
-        >>> gather_atoms_by_index(coords, atom_index).tolist()
-        [[[0.0, 1.0, 2.0], [6.0, 7.0, 8.0]]]
     """
 
     index = atom_index[..., None].expand(*([-1] * atom_index.dim()), coords.shape[-1])

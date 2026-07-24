@@ -1,4 +1,6 @@
-r"""OFoldX's public model, task, Pipeline, and Result API."""
+r"""
+Public models, processors, task pipelines, and scientific results.
+"""
 
 from __future__ import annotations
 
@@ -32,13 +34,6 @@ from .results import (
 
 
 def __getattr__(name: str):
-    r"""Lazily expose the training ``Runner``.
-
-    ``Runner`` pulls the training stack (danling -> torchmetrics, several seconds), which the
-    ``fold``/``design``/``score``/``pack`` inference surface never needs; importing it lazily keeps
-    ``import ofoldx`` cheap for inference users. ``ofoldx.Runner`` still resolves on first access.
-    """
-
     if name == "Runner":
         from .runners import Runner
 

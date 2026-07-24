@@ -1,9 +1,5 @@
 r"""
-Backend dispatch for the MSA pair-weighted-averaging operator.
-
-The dispatcher owns backend selection, availability, and calling-convention
-adaptation. Modules pass the ordinary tensor arguments without a second
-validation layer.
+Backend-dispatched MSA pair-weighted averaging.
 """
 
 from __future__ import annotations
@@ -63,34 +59,6 @@ def pair_weighted_average(
 
     Returns:
         ``(B, S, N, msa_size)`` MSA update, matching the shape of ``msa``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.pair_weighted_average import pair_weighted_average
-        >>> _ = torch.manual_seed(0)
-        >>> num_heads, head_dim = 2, 3
-        >>> msa = torch.randn(1, 2, 3, 4)
-        >>> pair = torch.randn(1, 3, 3, 6)
-        >>> out = pair_weighted_average(
-        ...     msa,
-        ...     pair,
-        ...     None,
-        ...     msa_norm_weight=torch.ones(4),
-        ...     msa_norm_bias=torch.zeros(4),
-        ...     pair_norm_weight=torch.ones(6),
-        ...     pair_norm_bias=torch.zeros(6),
-        ...     value_weight=torch.randn(num_heads * head_dim, 4),
-        ...     gate_weight=torch.randn(num_heads * head_dim, 4),
-        ...     pair_logits_weight=torch.randn(num_heads, 6),
-        ...     output_weight=torch.randn(4, num_heads * head_dim),
-        ...     num_heads=num_heads,
-        ...     head_dim=head_dim,
-        ...     msa_norm_eps=1e-5,
-        ...     pair_norm_eps=1e-5,
-        ...     operator_backend="torch",
-        ... )
-        >>> out.shape
-        torch.Size([1, 2, 3, 4])
     """
 
     backend = resolve_tensor_operator_backend(

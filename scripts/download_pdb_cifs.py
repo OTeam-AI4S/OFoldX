@@ -1,4 +1,6 @@
-"""Download a small mmCIF debug set from the RCSB PDB."""
+"""
+Download a small mmCIF debug set from the RCSB PDB.
+"""
 
 from __future__ import annotations
 

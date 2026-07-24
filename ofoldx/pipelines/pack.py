@@ -1,4 +1,6 @@
-r"""The explicit protein side-chain packing Pipeline."""
+r"""
+The explicit protein side-chain packing Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -44,7 +46,9 @@ class PackPipeline(
     PairedPipeline[_PackModel[_ModelInputT], _PackProcessor[_ModelInputT]],
     Generic[_ModelInputT],
 ):
-    r"""Bind one side-chain packing Model to its paired Processor."""
+    r"""
+    Side-chain packing pipeline for one model-processor pair.
+    """
 
     def pack(
         self,
@@ -56,7 +60,8 @@ class PackPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        r"""Pack protein side chains with the paired Processor and Model.
+        r"""
+        Pack protein side chains with the paired Processor and Model.
 
         Args:
             input: Structure or path to process.

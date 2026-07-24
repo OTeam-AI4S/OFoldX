@@ -23,17 +23,6 @@ class PairBiasedSelfAttention(nn.Module):
         pair_size: Width of the pair-representation channel used to derive the bias.
         num_attention_heads: Number of attention heads.
         operator_backend: Operator provider; see [ofoldx.modules.backend][].
-
-    Examples:
-        >>> import torch
-        >>> attention = PairBiasedSelfAttention(
-        ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="torch"
-        ... )
-        >>> _ = torch.manual_seed(0)
-        >>> hidden = torch.randn(1, 3, 8)
-        >>> pair = torch.randn(1, 3, 3, 4)
-        >>> attention(hidden, pair).shape
-        torch.Size([1, 3, 8])
     """
 
     def __init__(
@@ -75,17 +64,6 @@ class PairBiasedSelfAttention(nn.Module):
 
         Returns:
             Additive attention update `[..., N, hidden_size]`; the caller owns the outer residual.
-
-        Examples:
-            >>> import torch
-            >>> attention = PairBiasedSelfAttention(
-            ...     hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="torch"
-            ... )
-            >>> _ = torch.manual_seed(0)
-            >>> hidden = torch.randn(1, 3, 8)
-            >>> pair = torch.randn(1, 3, 3, 4)
-            >>> attention(hidden, pair).shape
-            torch.Size([1, 3, 8])
         """
 
         normalized = self.hidden_norm(hidden)

@@ -26,17 +26,6 @@ def weighted_rigid_align(*, source: Tensor, target: Tensor, weight: Tensor, eps:
 
     Returns:
         Aligned ``source`` of shape `[..., N, 3]`, detached from autograd.
-
-    Examples:
-        >>> import torch
-        >>> src = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        >>> out = weighted_rigid_align(source=src, target=src, weight=torch.ones(3))
-        >>> out.shape
-        torch.Size([3, 3])
-        >>> torch.allclose(out, src, atol=1e-5)
-        True
-        >>> out.requires_grad
-        False
     """
 
     with torch.no_grad(), torch.autocast(device_type=source.device.type, enabled=False):
@@ -85,17 +74,6 @@ def uniform_random_rotation(
 
     Returns:
         Rotation matrices of shape `[num_samples, 3, 3]`, each orthonormal with determinant ``+1``.
-
-    Examples:
-        >>> import torch
-        >>> rotations = uniform_random_rotation(2, generator=torch.Generator().manual_seed(0))
-        >>> rotations.shape
-        torch.Size([2, 3, 3])
-        >>> identity = torch.eye(3).expand(2, 3, 3)
-        >>> torch.allclose(rotations @ rotations.transpose(-1, -2), identity, atol=1e-5)
-        True
-        >>> torch.linalg.det(rotations).round(decimals=4).tolist()
-        [1.0, 1.0]
     """
 
     random = torch.rand(num_samples, 3, device=device, dtype=dtype, generator=generator)

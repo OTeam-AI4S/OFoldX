@@ -1,4 +1,6 @@
-r"""Concrete Pipeline registration."""
+r"""
+Concrete Pipeline registration.
+"""
 
 from __future__ import annotations
 
@@ -35,7 +37,9 @@ _BUILTIN_PIPELINE_MODULES = {
 
 
 class RepositoryLoader(Protocol):
-    r"""Load a pipeline with a class-defined repository layout."""
+    r"""
+    Load a pipeline with a class-defined repository layout.
+    """
 
     def __call__(
         self,
@@ -48,7 +52,8 @@ class RepositoryLoader(Protocol):
 
 
 class PipelineRegistration(NamedTuple):
-    r"""One concrete pipeline registration.
+    r"""
+    One concrete pipeline registration.
 
     Attributes:
         id: Stable pipeline identifier stored in repository metadata.
@@ -66,10 +71,8 @@ class PipelineRegistration(NamedTuple):
 
 
 class PipelineRegistry(chanfig.Registry):
-    r"""Registry of concrete pipelines keyed by pipeline ID.
-
-    Each registration binds a class, tasks, architectures, and an optional repository
-    loader.
+    r"""
+    Registry of concrete task pipelines.
     """
 
     ids: dict[type[object], str]
@@ -90,7 +93,8 @@ class PipelineRegistry(chanfig.Registry):
         architectures: Collection[str] = (),
         repository_loader: RepositoryLoader | None = None,
     ) -> None:
-        r"""Register a concrete pipeline and its architecture routes.
+        r"""
+        Register a concrete pipeline and its architecture routes.
 
         Args:
             id: Stable pipeline identifier.
@@ -134,26 +138,59 @@ class PipelineRegistry(chanfig.Registry):
             import_module(module)
 
     def lookup_registration(self, id: str) -> PipelineRegistration:
-        r"""Resolve a registration, importing its built-in module on demand."""
+        r"""
+        Return the registration for a pipeline ID.
+
+        Args:
+            id: Registered pipeline ID.
+
+        Returns:
+            The matching pipeline registration.
+        """
 
         self._import_builtin(id)
         return cast(PipelineRegistration, super().lookup(id))
 
     def lookup_pipeline(self, id: str) -> type[object]:
-        r"""Resolve one registered Pipeline class, importing a built-in owner on demand."""
+        r"""
+        Return the concrete class registered for a pipeline ID.
+
+        Args:
+            id: Registered pipeline ID.
+
+        Returns:
+            The matching pipeline class.
+        """
 
         return self.lookup_registration(id).pipeline
 
     def id_for(self, pipeline: type[object]) -> str | None:
-        r"""Return a registered pipeline class's ID, or ``None``."""
+        r"""
+        Return a pipeline class's registered ID.
+
+        Args:
+            pipeline: Concrete pipeline class.
+
+        Returns:
+            Its registered ID, or ``None`` when unregistered.
+        """
 
         return self.ids.get(pipeline)
 
     def for_architecture(self, architecture: str) -> PipelineRegistration | None:
-        r"""Return the registration for a markerless model architecture."""
+        r"""
+        Return the default pipeline for a model architecture.
+
+        Args:
+            architecture: Registered model architecture ID.
+
+        Returns:
+            The default pipeline registration, or ``None`` when no route exists.
+        """
 
         self._import_builtin(architecture)
         return self.by_architecture.get(architecture)
 
 
+#: Global registry of OFoldX task pipelines.
 PIPELINES = PipelineRegistry()

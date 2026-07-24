@@ -1,4 +1,6 @@
-r"""Convert released NA-MPNN checkpoints to native OFoldX repositories."""
+r"""
+Convert released NA-MPNN checkpoints to native OFoldX repositories.
+"""
 
 from __future__ import annotations
 
@@ -68,7 +70,8 @@ def convert_nampnn_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert one released NA-MPNN checkpoint and save its paired Pipeline.
+    r"""
+    Convert one released NA-MPNN checkpoint and save its paired Pipeline.
 
     Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
     uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed
@@ -104,13 +107,17 @@ def convert_nampnn_checkpoint(
 
 
 def convert_nampnn_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    r"""Translate every released NA-MPNN tensor name to its native OFoldX name."""
+    r"""
+    Translate every released NA-MPNN tensor name to its native OFoldX name.
+    """
 
     return {_convert_key(key): value for key, value in state_dict.items()}
 
 
 def _convert_key(key: str) -> str:
-    r"""Translate one released NA-MPNN tensor name to the folded native name."""
+    r"""
+    Translate one released NA-MPNN tensor name to the folded native name.
+    """
 
     top_level = {
         "features.embeddings.linear.weight": "feature_encoder.relative_position.projection.weight",
@@ -141,7 +148,9 @@ def _convert_key(key: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    r"""Convert one released NA-MPNN checkpoint from the command line."""
+    r"""
+    Convert one released NA-MPNN checkpoint from the command line.
+    """
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)

@@ -1,4 +1,6 @@
-r"""Lower canonical molecular inputs and Conditions for RFdiffusion."""
+r"""
+Input processing for RFdiffusion backbone design.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +15,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 # AllowedResidueIdentities is shared by sequence-design pipelines.
-from ...data.conditions import AllowedResidueIdentities
+from ...data.bonds import SymbolicBond
+from ...data.conditions import AllowedResidueIdentities, Hotspot
 from ...data.evidence import Template
 from ...data.molecular import (
     AtomSite,
@@ -23,9 +26,13 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.placement import (
+    ExistingSpan,
+    GeneratedSegment,
     InstanceIdAllocator,
     PlacementSpec,
     PlacementValue,
+    SymbolicAtomSite,
+    SymbolicResidueSite,
 )
 from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import symbolic_residue_aliases, validate_placement
@@ -37,12 +44,9 @@ from .config import RfDiffusionProcessorConfig
 # RFdiffusion spatial controls are defined with the model. Topology is a separate
 # ``placement`` argument rather than a condition.
 from .model import (
-    ATOM14_NAMES,
-    MASK_TOKEN,
-    NUM2AA,
-    ExistingSpan,
-    GeneratedSegment,
-    Hotspot,
+    RFDIFFUSION_ATOM14_NAMES,
+    RFDIFFUSION_MASK_TOKEN_ID,
+    RFDIFFUSION_RESIDUE_TYPES,
     RfDiffusionCoordination,
     RfDiffusionDistance,
     RfDiffusionInput,
@@ -53,20 +57,18 @@ from .model import (
     RfDiffusionReferenceCoordinates,
     RfDiffusionSecondaryStructure,
     RfDiffusionSubstrateInteraction,
-    SymbolicAtomSite,
-    SymbolicBond,
-    SymbolicResidueSite,
-    residue_token,
+    rfdiffusion_residue_token_id,
     rfdiffusion_secondary_structure,
-    terminal_cyclization_instance,
+    rfdiffusion_terminal_cyclization_instance,
 )
 
 
 class RfDiffusionProcessor(Processor):
-    r"""Lower one canonical design problem to RFdiffusion tensors.
+    r"""
+    Convert supported backbone-design inputs into `RfDiffusionInput`.
 
     Args:
-        config: Diffusion preprocessing options. Defaults to
+        config: RFdiffusion input-processing options. Defaults to
             ``RfDiffusionProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
@@ -105,19 +107,24 @@ class RfDiffusionProcessor(Processor):
         length: tuple[int, int] | None = None,
         timestep: int = 50,
     ) -> RfDiffusionInput:
-        r"""Lower base, complex, inpainting, active-site, or fold conditioning.
+        r"""
+        Build model inputs for one backbone-design problem.
 
         Args:
-            input: Optional context system, structure, or local structure path.
-            placement: Output topology containing existing spans and generated protein segments.
-            templates: Up to one fold-conditioning template.
-            conditions: Sequence, hotspot, geometry, symmetry, and interaction conditions.
+            input: Optional context system, observed structure, or local structure path.
+            placement: Topology containing existing spans and generated protein segments.
+            templates: Zero or one structural template.
+            conditions: Residue-identity, hotspot, geometry, symmetry, bond, and
+                interaction conditions.
             inpaint_sequence: Existing residue occurrences whose identities are masked.
-            length: Inclusive bounds for total generated length across all generated segments.
-            timestep: Positive diffusion timestep stored on the lowered input.
+            length: Inclusive lower and upper bounds for total generated length across
+                generated segments, excluding retained receptor spans.
+            timestep: Positive diffusion timestep stored in the returned input for direct
+                calls to [`RfDiffusionModel.forward`][].
 
         Returns:
-            An ``RfDiffusionInput`` with aligned target, output, template, and condition axes.
+            An [`RfDiffusionInput`][] with batch size one and aligned residue, coordinate,
+            template, condition, placement, and molecular-layout axes.
         """
 
         if length is not None:
@@ -158,7 +165,7 @@ class RfDiffusionProcessor(Processor):
                         "unknown residue, not a set of alternative identities"
                     )
                 component_id = next(iter(condition.component_ids))
-                if component_id not in NUM2AA[:MASK_TOKEN]:
+                if component_id not in RFDIFFUSION_RESIDUE_TYPES[:RFDIFFUSION_MASK_TOKEN_ID]:
                     raise ValueError("RFdiffusion AllowedResidueIdentities must name one residue in its alphabet")
 
         if isinstance(input, Structure):
@@ -219,7 +226,7 @@ class RfDiffusionProcessor(Processor):
         for condition in condition_values:
             if not isinstance(condition, SymbolicBond):
                 continue
-            instance_id = terminal_cyclization_instance(
+            instance_id = rfdiffusion_terminal_cyclization_instance(
                 condition,
                 output_index,
                 output_instances,
@@ -294,7 +301,8 @@ class RfDiffusionProcessor(Processor):
                 continue
             if row is not None:
                 entity = source_system.entities[source_system.instances[atom_site.instance_id]]
-                atom_names = ATOM14_NAMES[residue_token(entity.components[atom_site.component_index].component_id)]
+                component_id = entity.components[atom_site.component_index].component_id
+                atom_names = RFDIFFUSION_ATOM14_NAMES[rfdiffusion_residue_token_id(component_id)]
                 if atom_site.atom_id not in atom_names or not bool(fixed_structure[row]):
                     raise ValueError("RFdiffusion guidance supports sidechain/O atoms only on fixed protein residues")
             source = structure_index.get(atom_site)
@@ -321,17 +329,17 @@ class RfDiffusionProcessor(Processor):
             [isinstance(reference, tuple) and reference not in inpainted_residues for reference in output_residues],
             dtype=torch.bool,
         )
-        tokens = torch.full((output_length,), MASK_TOKEN, dtype=torch.int64)
+        tokens = torch.full((output_length,), RFDIFFUSION_MASK_TOKEN_ID, dtype=torch.int64)
         for row, reference in enumerate(output_residues):
             if fixed_sequence[row]:
                 component_reference = cast(tuple[str, int], reference)
-                tokens[row] = residue_token(target_rows[target_index[component_reference]][1])
+                tokens[row] = rfdiffusion_residue_token_id(target_rows[target_index[component_reference]][1])
         conditioned_tokens: dict[int, int] = {}
         for condition in condition_values:
             if not isinstance(condition, AllowedResidueIdentities):
                 continue
             component_id = next(iter(condition.component_ids))
-            token = residue_token(component_id)
+            token = rfdiffusion_residue_token_id(component_id)
             identity_rows: list[int] = []
             for target in condition.positions:
                 if isinstance(target, str):
@@ -381,7 +389,7 @@ class RfDiffusionProcessor(Processor):
                     for site in reference_sites
                     if site.instance_id == reference[0] and site.component_index == reference[1]
                 }
-                atom_names = ATOM14_NAMES[residue_token(target_rows[target_row][1])]
+                atom_names = RFDIFFUSION_ATOM14_NAMES[rfdiffusion_residue_token_id(target_rows[target_row][1])]
                 present = present & torch.tensor(
                     [atom_name in selected_atoms for atom_name in atom_names],
                     dtype=torch.bool,
@@ -450,7 +458,7 @@ class RfDiffusionProcessor(Processor):
             residue_indices.append(200 * chain_index + row - chain_start)
         residue_index = torch.tensor(residue_indices, dtype=torch.int64)
         return RfDiffusionInput(
-            noisy_coords=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            noisy_coordinates=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             sequence=F.one_hot(tokens, num_classes=22).to(device=self.device, dtype=self.dtype).unsqueeze(0),
             residue_index=residue_index.to(self.device).unsqueeze(0),
             fixed_structure_mask=fixed_structure.to(self.device).unsqueeze(0),
@@ -498,7 +506,7 @@ def _atom14_target(
     source_index = {site: index for index, site in enumerate(structure.sites)}
     source_coordinates = torch.tensor(structure.coordinates, dtype=torch.float32)
     for row_index, (residue, component_id) in enumerate(rows):
-        atom_names = ATOM14_NAMES[residue_token(component_id)]
+        atom_names = RFDIFFUSION_ATOM14_NAMES[rfdiffusion_residue_token_id(component_id)]
         for atom_index, atom_name in enumerate(atom_names):
             if atom_name is None:
                 continue
@@ -685,7 +693,8 @@ def from_contig_string(
     *,
     source_instances: Mapping[str, int] | None = None,
 ) -> tuple[PlacementSpec, tuple[int, int] | None]:
-    r"""Parse an RFdiffusion ``ContigMap.contigs`` string into a core ``PlacementSpec``.
+    r"""
+    Parse an RFdiffusion contig string into a core ``PlacementSpec``.
 
     ``contigs`` is the space/``/``-delimited DSL, e.g. ``"10-40/A163-181/10-40 B1-100/0"``.
     Each space-separated block becomes one declaration group (``chain_1``, ``chain_2``,
@@ -697,8 +706,8 @@ def from_contig_string(
     * ``10-40`` → ``GeneratedSegment("protein", 10, 40)``; ``10`` → ``min == max == 10``;
       ``0`` → ``min == max == 0`` (chain break / receptor terminator).
 
-    Returns ``(PlacementSpec, combined_length)``. ``combined_length`` is the RFdiffusion
-    ``ContigMap.length`` argument: the combined generated-length bounds ``(Σ min, Σ max)``
+    Returns ``(PlacementSpec, combined_length)``. ``combined_length`` contains
+    the combined generated-length bounds ``(Σ min, Σ max)``
     across every generated subcon, excluding ``ExistingSpan`` rows. It is stored on
     [`RfDiffusionLayout.combined_length`][] and is ``None`` when the string generates
     nothing. ``source_instances`` (source chain-letter →
@@ -707,6 +716,16 @@ def from_contig_string(
     Lossless into ``(PlacementSpec, combined_length)``
     (the precise reference/output permutation, when needed, projects to ordered length-1
     spans).
+
+    Args:
+        contigs: Space- and slash-delimited RFdiffusion contig expression.
+        source_instances: Optional source-chain lengths used to resolve bare chain references.
+
+    Returns:
+        The placement specification and optional combined generated-length bounds.
+
+    Raises:
+        ValueError: If a contig is malformed or a bare chain has no supplied length.
     """
 
     placement: PlacementSpec = {}
@@ -772,7 +791,8 @@ def from_contig_string(
 def to_contig_string(
     placement: PlacementSpec,
 ) -> str:
-    r"""Re-emit an RFdiffusion ``contigs`` string from a core ``PlacementSpec``.
+    r"""
+    Re-emit an RFdiffusion ``contigs`` string from a core ``PlacementSpec``.
 
     Each declaration group → one space-separated block; each placement → one ``/``-subcon
     (``ExistingSpan("A", 163, 182)`` → ``A163-181`` half-open → inclusive;
@@ -781,6 +801,12 @@ def to_contig_string(
     the ``contigs`` grammar. The re-emission is lossless for TOPOLOGY (fixed vs
     generated, order, lengths) and lossy for RF-index spacing and receptor-vs-inpaint role,
     which the contig string does not encode.
+
+    Args:
+        placement: Core placement specification to encode.
+
+    Returns:
+        The equivalent RFdiffusion contig expression.
     """
 
     blocks: list[str] = []

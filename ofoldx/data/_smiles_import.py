@@ -1,4 +1,6 @@
-r"""Private lossless SMILES import for the canonical molecular graph."""
+r"""
+Private lossless SMILES import for the canonical molecular graph.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +47,9 @@ def molecule_from_smiles(
     *,
     atom_ids: tuple[str, ...] | None,
 ) -> Molecule:
-    r"""Build a canonical Molecule from the exactly representable SMILES subset."""
+    r"""
+    Build a canonical Molecule from the exactly representable SMILES subset.
+    """
 
     _validate_bracket_atom_numbers(smiles)
 
@@ -195,7 +199,9 @@ def molecule_from_smiles(
 
 
 def _validate_bracket_atom_numbers(smiles: str) -> None:
-    r"""Reject bracket fields that RDKit would narrow before exposing them."""
+    r"""
+    Reject bracket fields that RDKit would narrow before exposing them.
+    """
 
     for bracket in _BRACKET_ATOM.finditer(smiles):
         contents = bracket.group(1)
@@ -239,7 +245,9 @@ def _validate_bracket_atom_numbers(smiles: str) -> None:
 
 
 def _direction_is_encoded(molecule: _RdkitMolecule, directed_bond: _RdkitBond) -> bool:
-    r"""Return whether a directional RDKit bond is captured by stored E/Z stereo."""
+    r"""
+    Return whether a directional RDKit bond is captured by stored E/Z stereo.
+    """
 
     from rdkit import Chem
 

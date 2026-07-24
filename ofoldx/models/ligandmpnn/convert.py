@@ -56,9 +56,6 @@ def convert_ligandmpnn_checkpoint(
         repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
         token: Optional Hugging Face token authenticating the ``repo_id`` upload.
         private: Create the ``repo_id`` repository as private when it does not yet exist.
-
-    Examples:
-        >>> convert_ligandmpnn_checkpoint("ligandmpnn_v_32_010_25.pt", "ligandmpnn")  # doctest: +SKIP
     """
 
     from .pipeline import LigandMpnnPipeline
@@ -86,7 +83,9 @@ def load_ligandmpnn_checkpoint(
     *,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any]:
-    r"""Load one released LigandMPNN checkpoint with PyTorch's restricted loader."""
+    r"""
+    Load one released LigandMPNN checkpoint with PyTorch's restricted loader.
+    """
 
     return torch.load(checkpoint_path, map_location=map_location, weights_only=True, mmap=True)
 
@@ -127,13 +126,6 @@ def convert_original_state_dict_key(key: str) -> str:
 
     Raises:
         KeyError: If the key does not match any known feature, top-level, or per-layer pattern.
-
-    Examples:
-        >>> from ofoldx.models.ligandmpnn.convert import convert_original_state_dict_key
-        >>> convert_original_state_dict_key("W_e.weight")
-        'edge_embedding.weight'
-        >>> convert_original_state_dict_key("encoder_layers.0.W1.weight")
-        'encoder_blocks.0.node_message.input_projection.weight'
     """
 
     feature_replacements = {
@@ -189,7 +181,9 @@ def convert_original_state_dict_key(key: str) -> str:
 
 
 def _convert_encoder_key(key: str) -> str:
-    r"""Translate one official ``encoder_layers.<i>.*`` tensor name to its native name."""
+    r"""
+    Translate one official ``encoder_layers.<i>.*`` tensor name to its native name.
+    """
 
     parts = key.split(".")
     if len(parts) < 4:
@@ -226,7 +220,8 @@ def _convert_encoder_key(key: str) -> str:
 
 
 def _convert_decoder_key(key: str, target_prefix: str) -> str:
-    r"""Translate one official decoder-style ``*_layers.<i>.*`` tensor name to its native name.
+    r"""
+    Translate one official decoder-style ``*_layers.<i>.*`` tensor name to its native name.
 
     Shared by the decoder, context-encoder, and atom-context-encoder groups, which use the same sublayer
     layout under different native prefixes.
@@ -259,7 +254,8 @@ def _convert_decoder_key(key: str, target_prefix: str) -> str:
 
 
 def ligandmpnn_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> LigandMpnnConfig:
-    r"""Derive the executable LigandMPNN architecture from a released checkpoint.
+    r"""
+    Derive the executable LigandMPNN architecture from a released checkpoint.
 
     The one live width comes from the token embedding, the encoder/decoder depths from the distinct layer
     indices present in the state, and the neighbor count from checkpoint metadata. Training coordinate-noise
@@ -276,7 +272,9 @@ def ligandmpnn_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> LigandMp
 
 
 def _block_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:
-    r"""Count the distinct layer indices under one released ``<prefix>.<i>.*`` group."""
+    r"""
+    Count the distinct layer indices under one released ``<prefix>.<i>.*`` group.
+    """
 
     return len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith(prefix)})
 
@@ -284,13 +282,17 @@ def _block_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:
 def ligandmpnn_processor_config_from_checkpoint(
     checkpoint: Mapping[str, Any],
 ) -> LigandMpnnProcessorConfig:
-    r"""Read the padded nearest-context extent into the Processor config."""
+    r"""
+    Read the padded nearest-context extent into the Processor config.
+    """
 
     return LigandMpnnProcessorConfig(num_context_atoms=checkpoint["atom_context_num"])
 
 
 def main(argv: list[str] | None = None) -> None:
-    r"""Convert one released LigandMPNN checkpoint from the command line."""
+    r"""
+    Convert one released LigandMPNN checkpoint from the command line.
+    """
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)

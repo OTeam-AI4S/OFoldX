@@ -1,5 +1,5 @@
 r"""
-Distogram head.
+Pairwise distance prediction.
 """
 
 from __future__ import annotations
@@ -9,11 +9,7 @@ from torch import Tensor, nn
 
 class DistogramHead(nn.Module):
     r"""
-    Project pair representations to distance-bin logits.
-
-    The pair representation is symmetrised across the two token axes. ``symmetrize_before_projection``
-    selects where: ``False`` projects then adds the transpose, while ``True`` symmetrises the pair first and
-    projects once. The two choices place the linear bias differently.
+    Project pair representations to symmetric distance-bin logits.
 
     Args:
         pair_size: Pair representation width.
@@ -38,19 +34,10 @@ class DistogramHead(nn.Module):
         Return pairwise distance-bin logits.
 
         Args:
-            pair: `[..., N_token, N_token, pair_size]` pair representation.
+            pair: ``[..., N_token, N_token, pair_size]`` pair representation.
 
         Returns:
-            `[..., N_token, N_token, num_bins]` symmetric distogram logits.
-
-        Examples:
-            >>> import torch
-            >>> torch.manual_seed(0)  # doctest: +ELLIPSIS
-            <torch._C.Generator object at ...>
-            >>> head = DistogramHead(pair_size=8, num_bins=4)
-            >>> pair = torch.randn(1, 2, 2, 8)
-            >>> head(pair).shape
-            torch.Size([1, 2, 2, 4])
+            ``[..., N_token, N_token, num_bins]`` symmetric distogram logits.
         """
 
         if self.symmetrize_before_projection:

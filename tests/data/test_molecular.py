@@ -26,7 +26,9 @@ from ofoldx.data.molecular import (
 
 
 def _residue(component_id: str, *, side_chain: str | None = None) -> ChemicalComponent:
-    r"""A minimal protein-like residue with an N-terminal and C-terminal leaving atom."""
+    r"""
+    A minimal protein-like residue with an N-terminal and C-terminal leaving atom.
+    """
 
     atoms = [
         ChemicalAtom("N", "N"),

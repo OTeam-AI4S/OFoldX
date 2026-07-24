@@ -1,4 +1,5 @@
-r"""Project BoltzGen residue design masks to and from placement records.
+r"""
+Project BoltzGen residue design masks to and from placement records.
 
 ``from_design_mask`` collapses a per-residue mask into maximal generated-polymer segments
 and contiguous spans of existing components in a
@@ -25,15 +26,17 @@ from ...data.placement import (
 
 @dataclass(frozen=True)
 class DesignMaskResidue:
-    r"""One per-output-residue cell of a design-mask surface (``from_design_mask`` input unit).
+    r"""
+    Describe one generated or retained residue in a design mask.
 
-    Exactly one of the two modes must hold:
+    Args:
+        designed: Whether the output residue is generated rather than copied.
+        polymer_type: Polymer chemistry for a generated residue.
+        source: Source component occurrence for a retained residue.
 
-    * a DESIGNED (generated) residue — ``designed=True``, ``polymer_type`` set, ``source=None``;
-    * a FIXED (source/context) residue — ``designed=False``, ``source=(instance_id, index)`` set.
-
-    ``designed=True`` with ``polymer_type=None`` represents a generated non-polymer and is
-    rejected by [`from_design_mask`][] because [`PlacementValue`][] cannot encode it.
+    Raises:
+        ValueError: When converted if the fields do not describe exactly one of a
+            generated polymer residue or retained source residue.
     """
 
     designed: bool
@@ -42,7 +45,8 @@ class DesignMaskResidue:
 
 
 def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> PlacementValue:
-    r"""Collapse one maximal same-``placement_id`` run of residues into one core value.
+    r"""
+    Collapse one maximal same-``placement_id`` run of residues into one core value.
 
     A designed run → one [`GeneratedSegment`][] (one polymer type, exact length); a fixed
     run → one [`ExistingSpan`][] (one contiguous half-open source interval). Mixing, a
@@ -94,22 +98,22 @@ def from_design_mask(
     group_of: Callable[[int], str],
     placement_id_of: Callable[[int], str],
 ) -> PlacementSpec:
-    r"""Project a per-output-residue design mask onto a [`PlacementSpec`][].
+    r"""
+    Convert residue design specifications to placements.
 
     Args:
-        residues: The per-output-residue mask cells, in output order (see [`DesignMaskResidue`][]).
-        group_of: Maps a residue index to its declaration group (chain) label — the outer
-            [`PlacementSpec`][ofoldx.data.placement.PlacementSpec] key.
-        placement_id_of: Maps a residue index to its ``placement_id`` — the globally-unique inner
-            key. Consecutive residues sharing one ``placement_id`` form one placement; the
-            ``placement_id`` must be contiguous (a value may not reappear after a different one).
+        residues: Residue specifications in output order.
+        group_of: Function returning the placement group for each residue index.
+        placement_id_of: Function returning the placement identifier for each residue
+            index. Each identifier must occupy one contiguous run.
 
     Returns:
-        The realized [`PlacementSpec`][ofoldx.data.placement.PlacementSpec]: maximal designed runs →
-        [`GeneratedSegment`][] (exact length), maximal fixed runs → [`ExistingSpan`][].
-        Interleaving is preserved as ordered placements within each group. The projection
-        preserves the information expressible by [`GeneratedSegment`][] and
-        [`ExistingSpan`][]; see the module docstring for its representational limits.
+        Placements containing exact-length generated segments for designed runs and
+        existing spans for fixed runs.
+
+    Raises:
+        ValueError: If a placement identifier is noncontiguous or a fixed run does not
+            describe one contiguous source span.
     """
 
     placement: PlacementSpec = {}
@@ -149,19 +153,16 @@ def to_design_mask(
     placement: PlacementSpec,
     placement_map: PlacementMap,
 ) -> tuple[list[bool], list[str]]:
-    r"""Project realized placements back onto a per-realized-row design mask.
+    r"""
+    Convert realized placements to a residue design mask.
 
-    Walks ``placement`` in declaration order (outer group, then inner placement) and, for
-    each placement, emits one row per realized occurrence in ``placement_map``: ``True`` for a
-    [`GeneratedSegment`][] occurrence, ``False`` for an [`ExistingSpan`][] occurrence, with
-    the declaration-group label carried per row. Symmetry/copy expansion (a placement whose
-    occurrences span more than one realized instance id) yields one row per occurrence, so the
-    result covers the realized rows in ``placement_map`` occurrence order.
+    Args:
+        placement: Declared generated segments and existing spans.
+        placement_map: Realized residue references for each placement.
 
     Returns:
-        ``(res_design_mask, per_row_group)`` — a per-realized-row designed-ness flag and the
-        owning declaration-group label. ``placement_map`` supplies the realized expansion;
-        per-residue pinned identity is carried separately, as described in the module docstring.
+        A pair containing the designed-status flag and declaration-group label for
+        each realized residue, in placement declaration order.
     """
 
     res_design_mask: list[bool] = []

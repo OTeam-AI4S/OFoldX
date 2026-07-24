@@ -1,4 +1,6 @@
-r"""Convert Biohub ESMFold2 and MultiMolecule ESMC into one OFoldX repository."""
+r"""
+Convert Biohub ESMFold2 and MultiMolecule ESMC into one OFoldX repository.
+"""
 
 from __future__ import annotations
 
@@ -62,7 +64,8 @@ def convert_esmfold2_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Write a self-contained ``model.json``/``processor.json``/safetensors repository.
+    r"""
+    Write a self-contained ``model.json``/``processor.json``/safetensors repository.
 
     Local-only by default. When ``repo_id`` is given, the converted repository is also
     uploaded to that Hub repo via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model];
@@ -133,7 +136,9 @@ def resolve_esmfold2_source(
     local_files_only: bool = False,
     token: str | None = None,
 ) -> tuple[Path, Path]:
-    r"""Resolve the upstream folding-head checkpoint and its source config."""
+    r"""
+    Resolve the upstream folding-head checkpoint and its source config.
+    """
 
     classified = classify_reference(checkpoint_or_repo)
     if isinstance(classified, Path):
@@ -178,7 +183,9 @@ def resolve_esmfold2_source(
 
 
 def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, Tensor]:
-    r"""Load and strictly translate one Biohub folding-head state dictionary."""
+    r"""
+    Load and strictly translate one Biohub folding-head state dictionary.
+    """
 
     source_state = load_file(str(checkpoint_path), device="cpu")
     translated: dict[str, Tensor] = {}
@@ -539,7 +546,8 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2ExperimentalConfig:
-    r"""Build an [`EsmFold2ExperimentalConfig`][ofoldx.models.esmfold2.EsmFold2ExperimentalConfig]
+    r"""
+    Build an [`EsmFold2ExperimentalConfig`][ofoldx.models.esmfold2.EsmFold2ExperimentalConfig]
     from a ``type="experimental"`` recurrent-graph checkpoint ``config.json``.
 
     Every graph dimension is read from the checkpoint (the Fast inversion model ships 24
@@ -641,7 +649,8 @@ def load_experimental_esmfold2(
     local_files_only: bool = False,
     token: str | None = None,
 ) -> EsmFold2ExperimentalModel:
-    r"""Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
+    r"""
+    Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
 
     The MultiMolecule ESMC child is loaded separately (the head safetensors does not carry
     it): the head strict-loads first with ``esmc=None`` and the optional ``esmc`` is attached
@@ -678,7 +687,8 @@ def save_experimental_esmfold2_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert an experimental (binder-inversion) ESMFold2 head and write a routable repository.
+    r"""
+    Convert an experimental (binder-inversion) ESMFold2 head and write a routable repository.
 
     Strict-loads the ``type="experimental"`` recurrent head via
     [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
@@ -734,6 +744,10 @@ def save_experimental_esmfold2_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run esmfold2 checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint_or_repo", help="Head checkpoint or Hub repo, e.g. biohub/ESMFold2")
     parser.add_argument("output_dir", type=Path)

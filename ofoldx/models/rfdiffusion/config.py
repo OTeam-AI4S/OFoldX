@@ -1,4 +1,6 @@
-r"""Persistent RFdiffusion model and processor configuration."""
+r"""
+RFdiffusion model and processor configuration.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class RfDiffusionSe3Config(Config):
-    r"""Configure one SE(3)-Transformer stack.
+    r"""
+    Configure one SE(3)-Transformer stack.
 
     Args:
         num_blocks: Number of SE(3)-Transformer blocks.
@@ -34,7 +37,8 @@ class RfDiffusionSe3Config(Config):
 
 
 class RfDiffusionDenoiserConfig(Config):
-    r"""Configure the RoseTTAFold denoiser architecture.
+    r"""
+    Configure the RoseTTAFold denoiser architecture.
 
     Args:
         vocab_size: Number of sequence token types.
@@ -82,7 +86,8 @@ class RfDiffusionDenoiserConfig(Config):
 
 
 class RfDiffusionDiffuserConfig(Config):
-    r"""Configure the RFdiffusion forward-diffusion process.
+    r"""
+    Configure the RFdiffusion forward-diffusion process.
 
     Args:
         num_timesteps: Number of discrete diffusion timesteps.
@@ -112,7 +117,8 @@ class RfDiffusionDiffuserConfig(Config):
 
 
 class RfDiffusionPreprocessConfig(Config):
-    r"""Configure the denoiser input feature schema.
+    r"""
+    Configure the denoiser input feature schema.
 
     Args:
         sidechain_input: Whether to include general sidechain coordinates.
@@ -130,7 +136,8 @@ class RfDiffusionPreprocessConfig(Config):
 
 
 class RfDiffusionConfig(Config):
-    r"""Configure one persistent RFdiffusion denoiser architecture.
+    r"""
+    Configure an RFdiffusion denoiser architecture.
 
     Args:
         denoiser: RoseTTAFold denoiser architecture.
@@ -147,6 +154,13 @@ class RfDiffusionConfig(Config):
         self.validate()
 
     def validate(self) -> None:
+        r"""
+        Validate the supported diffusion schedule and feature dimensions.
+
+        Raises:
+            ValueError: If a schedule type or feature width is unsupported.
+        """
+
         super().validate()
         if self.diffuser.schedule_type != "linear":
             raise ValueError("RFdiffusion supports the linear translation schedule")
@@ -159,4 +173,6 @@ class RfDiffusionConfig(Config):
 
 
 class RfDiffusionProcessorConfig(Config):
-    r"""RFdiffusion lowering has no persistent options."""
+    r"""
+    Configuration for the RFdiffusion processor.
+    """

@@ -1,4 +1,6 @@
-r"""Canonical neutral-element symbols and their 1-based atomic numbers."""
+r"""
+Canonical neutral-element symbols and their 1-based atomic numbers.
+"""
 
 from __future__ import annotations
 
@@ -12,4 +14,5 @@ _ELEMENTS = tuple(
     ).split()
 )
 
+#: Neutral element symbols mapped to their one-based atomic numbers.
 ATOMIC_NUMBER_BY_ELEMENT = {element: index for index, element in enumerate(_ELEMENTS, start=1)}

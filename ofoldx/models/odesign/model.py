@@ -1,4 +1,6 @@
-r"""The ODesign core graph and its canonical task methods."""
+r"""
+ODesign structure-generation model and tensor interfaces.
+"""
 
 from __future__ import annotations
 
@@ -51,7 +53,15 @@ from .config import ODesignConfig
 
 
 class ODesignModel(Model):
-    r"""All-atom ODesign coordinate-design model."""
+    r"""
+    Generate all-atom biomolecular structures with ODesign.
+
+    Accepts [`ODesignInput`][ofoldx.models.odesign.model.ODesignInput] and returns
+    [`ODesignOutput`][ofoldx.models.odesign.model.ODesignOutput].
+
+    Args:
+        config: Model architecture and inference configuration.
+    """
 
     config_class = ODesignConfig
     config: ODesignConfig
@@ -140,7 +150,25 @@ class ODesignModel(Model):
         noise_level: Tensor,
         recycling_steps: int | None = None,
     ) -> ODesignOutput:
-        r"""Denoise caller-supplied coordinates at one caller-supplied EDM noise level."""
+        r"""
+        Denoise atom coordinates at specified EDM noise levels.
+
+        ``B`` is batch size, ``S`` is the coordinate-sample axis, ``N`` is token
+        count, and ``A`` is atom count.
+
+        Args:
+            input: Processed structure-design input.
+            noisy_coordinates: Noisy atom coordinates with shape ``(B, S, A, 3)`` in
+                angstroms.
+            noise_level: Diffusion noise levels with shape ``(B, S)``.
+            recycling_steps: Number of trunk recycling passes. ``None`` uses the
+                configured value.
+
+        Returns:
+            An [`ODesignOutput`][] with denoised ``coordinates`` of shape
+            ``(B, S, A, 3)``, ``distogram_logits`` of shape ``(B, N, N, D)``, and
+            ``token_bond_type_logits`` of shape ``(B, N, N, D_b)``.
+        """
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
@@ -190,11 +218,23 @@ class ODesignModel(Model):
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
     ) -> ODesignDesignResult:
-        r"""Generate coordinate-bearing canonical Structure design candidates.
+        r"""
+        Generate decoded structure candidates for one processed design problem.
 
-        The caller-supplied ``generator`` is resolved once at the Pipeline boundary and is the
-        sole random stream for one ``design`` call; per-sample
-        diffusion sampling remains model-intrinsic.
+        Args:
+            input: Processed design input with batch size one and a realized fixed-length
+                layout.
+            num_candidates: Number of backbone candidates.
+            generator: Random generator used by coordinate sampling.
+            recycling_steps: Number of trunk recycling passes. ``None`` uses the
+                configured value.
+            num_sampling_steps: Number of coordinate-diffusion steps.
+            partial_diffusion_snr: Signal-to-noise ratio for partial diffusion from
+                ``input.observed_positions``. ``None`` starts from noise.
+
+        Returns:
+            An [`ODesignDesignResult`][] containing ``num_candidates`` structures in
+            sampling order. Coordinates are in angstroms.
         """
 
         output = self.sample(
@@ -212,15 +252,7 @@ class ODesignModel(Model):
         )
         for structure in structures:
             _require_hard_conditions(structure, input)
-        # ODesign candidates own the decoded Structure and per-sample metrics. Raw
-        # distogram/token-bond logits stay on ODesignOutput; run provenance and
-        # generated-identity maps are not duplicated on each candidate.
-        # One Model.design call produces one seed's M backbones (num_model_seeds=1). The
-        # ODesignDesignResult carries these coordinate-bearing candidates.
-        # This is the backbone-only stage, so
-        # ``scores`` is empty and ``num_sequences=0``; the OInvFold sequence step (K axis) is
-        # composed downstream by ODesignPipeline. ``backbone_index`` tags the M axis here;
-        # ``seed_index`` stays 0 (the S loop is owned by the Pipeline, one seed per Model.design).
+        # Sequence assignment and candidate scoring are added by ODesignPipeline.
         candidates = tuple(
             ODesignDesignCandidate(
                 structure=structure,
@@ -247,7 +279,29 @@ class ODesignModel(Model):
         partial_diffusion_snr: float | None = None,
         generator: torch.Generator | None = None,
     ) -> ODesignOutput:
-        r"""Run the multi-seed sampler without discarding its pairwise heads."""
+        r"""
+        Sample coordinates while retaining the model's pairwise predictions.
+
+        ``K`` is ``num_model_seeds``, ``B`` is batch size, ``S`` is ``num_samples``,
+        ``N`` is token count, and ``A`` is atom count.
+
+        Args:
+            input: Processed design input.
+            num_samples: Number of coordinate samples per model seed.
+            recycling_steps: Number of trunk recycling passes. ``None`` uses the
+                configured value.
+            num_sampling_steps: Number of coordinate-diffusion steps.
+            num_model_seeds: Number of independent trunk evaluations.
+            partial_diffusion_snr: Signal-to-noise ratio for partial diffusion from
+                ``input.observed_positions``. ``None`` starts from noise.
+            generator: Random generator used by coordinate sampling.
+
+        Returns:
+            An [`ODesignOutput`][] with ``coordinates`` of shape
+            ``(K, B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
+            ``(K, B, N, N, D)``, and ``token_bond_type_logits`` of shape
+            ``(K, B, N, N, D_b)``.
+        """
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
@@ -380,7 +434,9 @@ class ODesignModel(Model):
 
 
 class ODesignInputEmbeddings(nn.Module):
-    r"""Aggregate reference atoms and append ODesign token features."""
+    r"""
+    Aggregate reference atoms and append ODesign token features.
+    """
 
     def __init__(
         self,
@@ -430,7 +486,9 @@ class ODesignInputEmbeddings(nn.Module):
 
 
 class ODesignConstraintEmbeddings(nn.Module):
-    r"""Embed pairwise target distances into the ODesign pair representation."""
+    r"""
+    Embed pairwise target distances into the ODesign pair representation.
+    """
 
     def __init__(
         self,
@@ -478,7 +536,9 @@ class ODesignConstraintEmbeddings(nn.Module):
 
 
 class ODesignTokenBondTypeHead(nn.Module):
-    r"""Predict whether each ODesign token pair is covalently connected."""
+    r"""
+    Predict whether each ODesign token pair is covalently connected.
+    """
 
     def __init__(self, *, pair_size: int = 128, hidden_size: int = 128, num_bond_types: int = 2) -> None:
         super().__init__()
@@ -510,7 +570,9 @@ def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> S
 
 
 def _require_hard_conditions(structure: Structure, input: ODesignInput) -> None:
-    r"""Raise when a candidate violates fixed-coordinate evidence."""
+    r"""
+    Raise when a candidate violates fixed-coordinate evidence.
+    """
 
     source_residues = input.layout.source_residue_map
     placement_map = input.layout.placement_map
@@ -570,7 +632,9 @@ def _resolve_atom(reference, source_residues, placement_map, instance_of, source
 
 @dataclass
 class _ODesignTrunkOutput:
-    r"""Named representations produced by the ODesign trunk."""
+    r"""
+    Named representations produced by the ODesign trunk.
+    """
 
     token_embedding: Tensor
     single: Tensor
@@ -580,16 +644,15 @@ class _ODesignTrunkOutput:
 
 @dataclass(frozen=True)
 class ODesignPlacements:
-    r"""One ODesign generation-topology request over the shared PlacementSpec.
+    r"""
+    Declare the generated and retained segments of an ODesign output.
 
-    ``placements`` is the [`PlacementSpec`][ofoldx.data.placement.PlacementSpec] mapping
-    ``declaration_group -> placement_id -> value``; the inner ``placement_id`` is globally
-    unique across the whole mapping and is the SOLE pre-realization reference target
-    (validated at construction). Each declaration group is one ODesign output chain and its
-    declared order is the chain layout order.
+    Each declaration group represents one output chain.
 
-    ``chain_lengths`` is a per-chain exact-length field aligned with
-    ``placements`` group order.
+    Args:
+        placements: Ordered placement declaration. Placement IDs must be globally
+            unique.
+        chain_lengths: Optional exact output length for each declaration group.
     """
 
     placements: PlacementSpec
@@ -602,10 +665,14 @@ class ODesignPlacements:
 
 @dataclass(frozen=True)
 class ODesignReferenceCoordinates:
-    r"""Fixed or constrained coordinates for a set of existing input atoms.
+    r"""
+    Fixed or constrained coordinates for a set of existing input atoms.
 
-    ``intent == "hard"`` fixes the coordinates during EDM sampling; both modes feed the
-    learned constraint distogram.
+    Args:
+        sites: Existing atom occurrences carrying the reference coordinates.
+        tolerance_angstrom: Accepted coordinate deviation in angstroms.
+        intent: ``"hard"`` fixes selected atoms during sampling; ``"soft"`` only
+            supplies geometric conditioning.
     """
 
     sites: tuple[AtomSite, ...]
@@ -615,10 +682,11 @@ class ODesignReferenceCoordinates:
 
 @dataclass(frozen=True)
 class ODesignDesignedResidue:
-    r"""One realized output residue generated de novo — a ``design_mask`` ``True`` row.
+    r"""
+    Describe one generated polymer residue in an ODesign mask.
 
-    Carries only its ``polymer_type``; consecutive designed residues of one polymer type in
-    one declaration group run-length-collapse into a single [`GeneratedSegment`][].
+    Args:
+        polymer_type: Chemistry of the generated polymer.
     """
 
     polymer_type: PolymerType
@@ -626,30 +694,26 @@ class ODesignDesignedResidue:
 
 @dataclass(frozen=True)
 class ODesignFixedResidue:
-    r"""One realized output residue copied verbatim from a source residue — a ``design_mask``
-    ``False`` row.
+    r"""
+    Describe one output residue copied from an input structure.
 
-    ``(instance_id, source_index)`` names the SOURCE input residue; consecutive fixed
-    residues drawn contiguously (increasing ``source_index``) from one source instance
-    run-length-collapse into a single half-open [`ExistingSpan`][].
+    Args:
+        instance_id: Source molecular instance.
+        source_index: Zero-based component index within the source instance.
     """
 
     instance_id: str
     source_index: int
 
 
+#: One designed or fixed residue in an ODesign residue mask.
 ODesignResidueSpec = ODesignDesignedResidue | ODesignFixedResidue
 
 
 @dataclass
 class ODesignLayout:
-    r"""Canonical identity needed to turn ODesign coordinates into Results.
-
-    ``placement_map`` is the realized output surface for generated placements
-    (``declaration_group -> placement_id -> ordered ComponentReference occurrences``); it is
-    resolved together with ``instance_of`` (``placement_id -> declaration_group``, derived
-    once from the PlacementSpec) via ``ofoldx.data.placement.resolve``. There is exactly one canonical
-    realized map and one resolution helper — no parallel positive/negative alias table.
+    r"""
+    Molecular identities and conditions aligned to ODesign tensor axes.
     """
 
     system: MolecularSystem
@@ -665,15 +729,38 @@ class ODesignLayout:
 
 @dataclass(kw_only=True)
 class ODesignInput:
-    r"""Compute tensors plus canonical semantic layout for the ODesign core graph.
+    r"""
+    Tensor and molecular-layout input for ODesign.
 
-    ``B`` is batch size, ``T`` token count, ``A`` model-atom count, and ``R`` MSA
-    row count. Index and mask tensors use ``int64`` and ``bool`` respectively.
-    ``token_features`` is ``[B, T, 453]``; ``token_bonds`` is ``[B, T, T]``;
-    ``atom_features`` is ``[B, A, 386]``; atom positions are ``[B, A, 3]``;
-    charges are ``[B, A, 1]``; ``constraint_distogram`` is ``[B, T, T, 39]``;
-    and MSA features/mask are ``[B, R, T, 34]`` and ``[B, R, T]``. All floating
-    tensors use the Processor's requested dtype and device.
+    ``B`` is batch size, ``N`` token count, ``A`` atom count, and ``M`` MSA depth.
+
+    Args:
+        token_mask: Valid-token mask with shape ``(B, N)``.
+        residue_index: Chain-local residue indices with shape ``(B, N)``.
+        chain_index: Molecular-instance indices with shape ``(B, N)``.
+        entity_index: Molecular-entity indices with shape ``(B, N)``.
+        symmetry_index: Copy indices within each entity with shape ``(B, N)``.
+        token_index: Token indices within each residue with shape ``(B, N)``.
+        cyclic_period: Optional cyclic-position periods with shape ``(B, N)``.
+        token_features: Per-token input features with shape ``(B, N, 453)``.
+        token_bonds: Token-level bond adjacency with shape ``(B, N, N)``.
+        atom_features: Reference atom features with shape ``(B, A, 386)``.
+        atom_to_token: Token index for each atom with shape ``(B, A)``.
+        atom_mask: Valid-atom mask with shape ``(B, A)``.
+        reference_positions: Reference conformer coordinates with shape
+            ``(B, A, 3)`` in angstroms.
+        reference_space_id: Reference conformer group IDs with shape ``(B, A)``.
+        reference_mask: Reference-coordinate validity mask with shape ``(B, A)``.
+        reference_charges: Reference formal charges with shape ``(B, A, 1)``.
+        observed_positions: Observed atom coordinates with shape ``(B, A, 3)`` in
+            angstroms.
+        observed_mask: Observed-coordinate validity mask with shape ``(B, A)``.
+        fixed_coordinate_mask: Atoms fixed during sampling with shape ``(B, A)``.
+        constraint_distogram: Geometric condition features with shape
+            ``(B, N, N, 39)``.
+        msa_features: MSA features with shape ``(B, M, N, 34)``.
+        msa_mask: MSA validity mask with shape ``(B, M, N)``.
+        layout: Molecular identities and conditions aligned to the token and atom axes.
     """
 
     token_mask: Tensor
@@ -703,11 +790,18 @@ class ODesignInput:
 
 @dataclass
 class ODesignOutput:
-    r"""The three predictions computed by the core graph.
+    r"""
+    Predictions from one ODesign denoising or sampling call.
 
-    A one-step forward returns coordinates ``[B, S, A, 3]``, distogram logits
-    ``[B, T, T, 64]``, and token-bond logits ``[B, T, T, 2]``. Sampling adds a
-    leading model-seed axis to all three tensors.
+    Args:
+        coordinates: Denoised atom coordinates in angstroms. ``forward`` returns
+            shape ``(B, S, A, 3)``; ``sample`` returns ``(K, B, S, A, 3)`` with a
+            leading model-seed axis.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``
+            for ``forward`` or ``(K, B, N, N, D)`` for ``sample``.
+        token_bond_type_logits: Token-pair bond-type logits with shape
+            ``(B, N, N, D_b)`` for ``forward`` or ``(K, B, N, N, D_b)`` for
+            ``sample``.
     """
 
     coordinates: Tensor
@@ -717,12 +811,16 @@ class ODesignOutput:
 
 @dataclass
 class ODesignDesignCandidate:
-    r"""One coordinate-bearing ODesign design sample.
+    r"""
+    One ODesign sample and its aligned scientific values.
 
-    The decoded [`Structure`][ofoldx.data.structure.Structure] is the single owner of
-    molecular identity and coordinates. The core exposes no per-sample
-    confidence head, so ``metrics`` is empty today; distogram and token-bond logits
-    stay on [`ODesignOutput`][].
+    Args:
+        structure: Designed molecular structure.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+        seed_index: Zero-based generation-seed index.
+        backbone_index: Zero-based backbone index within the seed.
+        sequence_index: Zero-based sequence index within the backbone.
     """
 
     structure: Structure
@@ -735,16 +833,15 @@ class ODesignDesignCandidate:
 
 @dataclass(eq=False)
 class ODesignDesignResult:
-    r"""The ODesign Result for the M×S×K design grid.
+    r"""
+    The seed-by-backbone-by-sequence ODesign result.
 
-    ODesign is coordinate-producing, so this result carries its coordinate-bearing candidate
-    shape rather than the coordinate-free [`DesignResult`][ofoldx.results.DesignResult].
-    ``candidates`` is generation-ordered
-    (seed → backbone → sequence); ``num_seeds`` (S), ``num_backbones`` (M, per-seed
-    diffusion samples), and ``num_sequences`` (K, OInvFold top-k per backbone) record the
-    loop structure. The ``K`` sequence variants of a given ``(seed, backbone)``
-    share one backbone coordinate set. A backbone-only ``design`` call sets
-    ``num_sequences=0``.
+    Args:
+        candidates: Candidates ordered by seed, backbone, then sequence.
+        num_seeds: Number of generation seeds.
+        num_backbones: Number of sampled backbones per seed.
+        num_sequences: Number of sequence variants per backbone. Zero denotes a
+            backbone-only result.
     """
 
     candidates: tuple[ODesignDesignCandidate, ...]
@@ -753,12 +850,14 @@ class ODesignDesignResult:
     num_sequences: int
 
     def best(self, score: str) -> ODesignDesignCandidate:
-        r"""Return the earliest best candidate under one explicit score.
+        r"""
+        Return the earliest best candidate under a named score.
 
-        Applies the shared ranking semantics: explicit ``preferred``
-        direction, one identical unit, one identical ``frozenset`` scope, NaN rejection,
-        earliest tie), mirroring [`ofoldx.results.DesignResult.best`][]. There is no
-        shared ranking abstraction and no default score.
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
         """
 
         return best(self.candidates, score)

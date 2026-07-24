@@ -37,16 +37,8 @@ def scatter_mean_to_tokens(
 
     Returns:
         ``[..., N_token, C]`` token features; tokens with no atoms stay zero.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.transfer import scatter_mean_to_tokens
-        >>> atom_hidden = torch.tensor([[[1.0], [3.0], [5.0], [7.0]]])
-        >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-        >>> out = scatter_mean_to_tokens(atom_hidden, atom_to_token, num_tokens=2)
-        >>> out.squeeze(-1).tolist()
-        [[2.0, 6.0]]
     """
+
     atom_to_token = _expand_atom_axis(atom_to_token, tuple(atom_hidden.shape[:-2]))
     if atom_mask is not None:
         atom_mask = _expand_atom_axis(atom_mask, tuple(atom_hidden.shape[:-2]))
@@ -74,6 +66,16 @@ def dense_mean_to_tokens(
     Forms a dense atom-to-token one-hot matrix, normalizes it by per-token counts plus
     ``count_eps``, and applies ``torch.bmm``. This path provides a deterministic dense
     reduction order distinct from scatter pooling.
+
+    Args:
+        atom_hidden: ``[..., N_atom, C]`` atom features.
+        atom_to_token: ``[..., N_atom]`` token index for each atom.
+        num_tokens: Number of output tokens.
+        atom_mask: Optional ``[..., N_atom]`` valid-atom mask.
+        count_eps: Additive denominator epsilon for empty and sparse tokens.
+
+    Returns:
+        ``[..., N_token, C]`` token features.
     """
 
     prefix = tuple(atom_hidden.shape[:-2])
@@ -100,15 +102,6 @@ class TokenToAtomBroadcast(nn.Module):
 
     Args:
         operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.transfer import TokenToAtomBroadcast
-        >>> module = TokenToAtomBroadcast()
-        >>> token_hidden = torch.tensor([[[10.0], [20.0]]])
-        >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-        >>> module(token_hidden, atom_to_token).squeeze(-1).tolist()
-        [[10.0, 10.0, 20.0, 20.0]]
     """
 
     def __init__(self, operator_backend: str = "auto") -> None:
@@ -127,15 +120,6 @@ class TokenToAtomBroadcast(nn.Module):
 
         Returns:
             ``[..., N_atom, C]`` atom features.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.transfer import TokenToAtomBroadcast
-            >>> module = TokenToAtomBroadcast()
-            >>> token_hidden = torch.tensor([[[10.0], [20.0]]])
-            >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-            >>> module(token_hidden, atom_to_token).shape
-            torch.Size([1, 4, 1])
         """
 
         atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_hidden.shape[:-2]))
@@ -150,15 +134,6 @@ class TokenPairToAtomPairBroadcast(nn.Module):
     token-level pair representation conditions dense atom attention. Materialises the full
     ``N_atom x N_atom`` grid; for the windowed variant see
     [`TokenPairToLocalAtomPairBroadcast`][ofoldx.modules.atom.transfer.TokenPairToLocalAtomPairBroadcast].
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.transfer import TokenPairToAtomPairBroadcast
-        >>> module = TokenPairToAtomPairBroadcast()
-        >>> token_pair = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2, 1)
-        >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-        >>> module(token_pair, atom_to_token).squeeze(-1).tolist()
-        [[[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], [2.0, 2.0, 3.0, 3.0], [2.0, 2.0, 3.0, 3.0]]]
     """
 
     def forward(self, token_pair: Tensor, atom_to_token: Tensor) -> Tensor:
@@ -171,15 +146,6 @@ class TokenPairToAtomPairBroadcast(nn.Module):
 
         Returns:
             ``[..., N_atom, N_atom, C]`` atom-pair features.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.transfer import TokenPairToAtomPairBroadcast
-            >>> module = TokenPairToAtomPairBroadcast()
-            >>> token_pair = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2, 1)
-            >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-            >>> module(token_pair, atom_to_token).shape
-            torch.Size([1, 4, 4, 1])
         """
 
         atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_pair.shape[:-3]))
@@ -212,15 +178,6 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.transfer import TokenPairToLocalAtomPairBroadcast
-        >>> module = TokenPairToLocalAtomPairBroadcast(num_query_atoms=2, num_key_atoms=4)
-        >>> token_pair = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2, 1)
-        >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-        >>> module(token_pair, atom_to_token).shape
-        torch.Size([1, 2, 2, 4, 1])
     """
 
     def __init__(self, num_query_atoms: int = 32, num_key_atoms: int = 128, operator_backend: str = "auto") -> None:
@@ -242,15 +199,6 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
 
         Returns:
             ``[..., N_window, num_query_atoms, num_key_atoms, C]`` local atom-pair features.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.transfer import TokenPairToLocalAtomPairBroadcast
-            >>> module = TokenPairToLocalAtomPairBroadcast(num_query_atoms=2, num_key_atoms=4)
-            >>> token_pair = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2, 1)
-            >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-            >>> module(token_pair, atom_to_token).shape
-            torch.Size([1, 2, 2, 4, 1])
         """
 
         atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_pair.shape[:-3]))
@@ -275,6 +223,7 @@ def _expand_atom_axis(tensor: Tensor, target_prefix: tuple[int, ...]) -> Tensor:
     Returns:
         ``tensor`` broadcast to ``(*target_prefix, N_atom)``.
     """
+
     num_atoms = tensor.shape[-1]
     target_shape = (*target_prefix, num_atoms)
     if tuple(tensor.shape) == target_shape:

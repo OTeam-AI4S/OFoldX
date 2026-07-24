@@ -1,21 +1,11 @@
 r"""
 LigandMpnn context-aware sequence-design model.
-
-The OFoldX-native reimplementation of LigandMPNN: a message-passing graph model that designs protein
-sequences conditioned on backbone geometry and nearby ligand/context atoms. The public surface is
-[`LigandMpnnModel`][ofoldx.models.ligandmpnn.model.LigandMpnnModel] and its typed input
-[`LigandMpnnInput`][ofoldx.models.ligandmpnn.model.LigandMpnnInput]. Raw forward and sampling return
-the model-local [`LigandMpnnOutput`][ofoldx.models.ligandmpnn.model.LigandMpnnOutput] and
-[`LigandMpnnSamplingOutput`][ofoldx.models.ligandmpnn.model.LigandMpnnSamplingOutput]. The four probability
-operations return the shared [`MpnnProbabilityResult`][ofoldx.results.MpnnProbabilityResult], and ``design``
-returns the shared [`DesignResult`][ofoldx.results.DesignResult].
 """
 
 from __future__ import annotations
 
 import itertools
 import math
-import operator
 from dataclasses import dataclass
 
 import torch
@@ -36,10 +26,12 @@ from ...modules.mpnn import (
     cat_neighbors_nodes,
     decoding_order_to_ranks,
     gather_nodes,
+    local_backbone_frame_features,
     nll_loss,
     periodic_group_period,
     radial_basis,
     tied_groups_from_ids,
+    validate_positive_integer,
     virtual_beta_carbon,
 )
 from ...results import DesignCandidate, DesignResult, MpnnProbabilityResult, Score
@@ -51,17 +43,13 @@ _GENERATABLE = len(AMINO_ACID_COMPONENT_IDS)
 
 class LigandMpnnModel(Model):
     r"""
-    Message-passing model that designs protein sequences for a protein-ligand complex.
+    Design protein sequences in protein-ligand contexts with LigandMPNN.
 
-    ``forward`` is the ordinary differentiable sequence-conditioned teacher-forced graph. ``sample`` and
-    the four probability operations expose the tensor protocols through model-local output records,
-    and ``design`` returns self-contained canonical candidates. ``coordinate_noise``,
-    ``use_sidechain_context``, and the stochastic controls are per-operation arguments rather than
-    persistent configuration.
+    Accepts [`LigandMpnnInput`][ofoldx.models.ligandmpnn.model.LigandMpnnInput] and returns
+    [`LigandMpnnOutput`][ofoldx.models.ligandmpnn.model.LigandMpnnOutput].
 
     Args:
-        config: Model configuration; a default
-            [`LigandMpnnConfig`][ofoldx.models.ligandmpnn.config.LigandMpnnConfig] is used when ``None``.
+        config: Model architecture and inference configuration.
     """
 
     config_class = LigandMpnnConfig
@@ -102,7 +90,9 @@ class LigandMpnnModel(Model):
         self.post_init()
 
     def initialize_parameters(self) -> None:
-        r"""Apply the Xavier-uniform initialization to every matrix parameter."""
+        r"""
+        Apply the Xavier-uniform initialization to every matrix parameter.
+        """
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -112,7 +102,9 @@ class LigandMpnnModel(Model):
 
     @staticmethod
     def _validate_coordinate_noise(coordinate_noise: float) -> float:
-        r"""Coerce and validate the inference-time coordinate perturbation."""
+        r"""
+        Coerce and validate the inference-time coordinate perturbation.
+        """
 
         coordinate_noise = float(coordinate_noise)
         if not math.isfinite(coordinate_noise) or coordinate_noise < 0:
@@ -121,20 +113,26 @@ class LigandMpnnModel(Model):
 
     @staticmethod
     def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""Validate the independent decoding-order evaluation count."""
+        r"""
+        Validate the independent decoding-order evaluation count.
+        """
 
-        return _positive_integer(num_decoding_orders, "num_decoding_orders")
+        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
 
     @staticmethod
     def _require_single_target(input: LigandMpnnInput) -> None:
-        r"""Reject an execution-batch axis on one-target biological operations."""
+        r"""
+        Reject an execution-batch axis on one-target biological operations.
+        """
 
         if input.backbone_coordinates.shape[0] != 1:
             raise ValueError("this LigandMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
     def _repeat_input(input: LigandMpnnInput, count: int) -> LigandMpnnInput:
-        r"""Repeat one biological input into ``count`` aligned evaluation rows."""
+        r"""
+        Repeat one biological input into ``count`` aligned evaluation rows.
+        """
 
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
@@ -166,7 +164,9 @@ class LigandMpnnModel(Model):
         logits: Tensor,
         decoding_ranks: Tensor,
     ) -> MpnnProbabilityResult:
-        r"""Wrap aligned per-evaluation logits with the one target's canonical identity."""
+        r"""
+        Wrap aligned per-evaluation logits with the one target's canonical identity.
+        """
 
         return MpnnProbabilityResult(
             target=input.structure,
@@ -186,7 +186,8 @@ class LigandMpnnModel(Model):
         design_positions: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw the fixed-first decoding orders directly from aligned masks.
+        r"""
+        Draw the fixed-first decoding orders directly from aligned masks.
 
         Fixed rows receive a near-zero weight and therefore decode before every designed row; each row
         of the returned ``[B, L]`` permutation is an independent order.
@@ -197,7 +198,9 @@ class LigandMpnnModel(Model):
         return torch.argsort((chain_mask + 0.0001) * randn.abs(), dim=-1)
 
     def _generate_ranks(self, input: LigandMpnnInput, generator: torch.Generator | None) -> Tensor:
-        r"""Draw fixed-first causal ranks, collapsing every tied group to one consecutive unit."""
+        r"""
+        Draw fixed-first causal ranks, collapsing every tied group to one consecutive unit.
+        """
 
         decode_order = self._draw_decode_orders(input.residue_mask, input.design_positions, generator)
         tied_groups = tied_groups_from_ids(input.tied_group_ids)[0]
@@ -216,7 +219,8 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the coordinate/context encoder shared by every operation.
+        r"""
+        Run the coordinate/context encoder shared by every operation.
 
         Coordinate noise perturbs the backbone coordinates and the already selected nonprotein context
         coordinates before residue-neighbor and atom-context features; fixed side-chain coordinates are
@@ -278,7 +282,9 @@ class LigandMpnnModel(Model):
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
-        r"""Return raw teacher-forced sequence-conditioned logits for one exact causal ranking."""
+        r"""
+        Return raw teacher-forced sequence-conditioned logits for one exact causal ranking.
+        """
 
         mask = residue_mask.to(dtype=node_states.dtype)
         token_states = self.token_embedding(sequence_tokens)
@@ -300,7 +306,9 @@ class LigandMpnnModel(Model):
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
-        r"""Return raw order-dependent sequence-free logits under one causal ranking."""
+        r"""
+        Return raw order-dependent sequence-free logits under one causal ranking.
+        """
 
         mask = residue_mask.to(dtype=node_states.dtype)
         token_states = torch.zeros_like(node_states)
@@ -323,7 +331,19 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Return the shared node states, edge states, and neighbor indices."""
+        r"""
+        Encode a batch of protein-ligand inputs as residue graph states.
+
+        Args:
+            input: LigandMPNN tensors with batch and residue axes.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for coordinate noise.
+
+        Returns:
+            Node states with shape ``(B, L, H)``, edge states with shape
+            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+        """
 
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         return self._encode(
@@ -342,7 +362,20 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> LigandMpnnOutput:
-        r"""Return the single teacher-forced differentiable sequence-conditioned pass."""
+        r"""
+        Predict residue logits conditioned on the input sequence and decoding order.
+
+        Args:
+            input: LigandMPNN tensors with batch size ``B`` and ``L`` residue rows.
+            decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
+                decode earlier. A fixed-first random order is drawn when omitted.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for the order and coordinate noise.
+
+        Returns:
+            Vocabulary logits and the decoding ranks used for the forward pass.
+        """
 
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         node_states, edge_states, neighbor_indices = self._encode(
@@ -375,7 +408,21 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return native-sequence-conditioned autoregressive probabilities over decoding orders."""
+        r"""
+        Evaluate sequence-conditioned probabilities over decoding orders.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits and ranks whose leading axis enumerates decoding orders.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -408,7 +455,22 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return order-dependent sequence-free autoregressive probabilities over decoding orders."""
+        r"""
+        Evaluate sequence-free probabilities over decoding orders.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Sequence-free logits and ranks whose leading axis enumerates decoding
+            orders.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -441,7 +503,9 @@ class LigandMpnnModel(Model):
         generator: torch.Generator | None,
         move_last: bool,
     ) -> MpnnProbabilityResult:
-        r"""Evaluate every target moved exactly last or first under one base decoding order."""
+        r"""
+        Evaluate every target moved exactly last or first under one base decoding order.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -505,7 +569,23 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-last conditional probabilities for every row."""
+        r"""
+        Evaluate each residue after all other residues in the decoding order.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_decoding_orders: Number of base decoding orders to evaluate.
+            base_decoding_ranks: Optional base ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and effective ranks with shape
+            ``(num_decoding_orders, num_residues, num_residues)``.
+        """
 
         return self._single_residue_probabilities(
             input,
@@ -527,7 +607,23 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-first unconditional probabilities for every row."""
+        r"""
+        Evaluate each residue before all other residues in the decoding order.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_decoding_orders: Number of base decoding orders to evaluate.
+            base_decoding_ranks: Optional base ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and effective ranks with shape
+            ``(num_decoding_orders, num_residues, num_residues)``.
+        """
 
         return self._single_residue_probabilities(
             input,
@@ -543,7 +639,9 @@ class LigandMpnnModel(Model):
 
     @staticmethod
     def _sampling_bias(input: LigandMpnnInput) -> Tensor:
-        r"""Return the aligned soft logit bias."""
+        r"""
+        Return the aligned soft logit bias.
+        """
 
         if input.residue_logit_bias is None:
             bias = torch.zeros(
@@ -564,7 +662,9 @@ class LigandMpnnModel(Model):
         allowed_token_mask: Tensor | None,
         temperature: float,
     ) -> Tensor:
-        r"""Apply soft bias first and hard token support last."""
+        r"""
+        Apply soft bias first and hard token support last.
+        """
 
         adjusted = logits + bias
         if allowed_token_mask is not None:
@@ -584,10 +684,25 @@ class LigandMpnnModel(Model):
         decoding_ranks: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> LigandMpnnSamplingOutput:
-        r"""Run the complete autoregressive tensor sampler."""
+        r"""
+        Sample protein sequences under the processed design constraints.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_samples: Number of sequences to sample.
+            temperature: Positive sampling temperature.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``.
+            generator: Random generator used for orders, noise, and token sampling.
+
+        Returns:
+            Sampled token IDs, model log probabilities, sampling probabilities,
+            and decoding ranks, each with a leading ``num_samples`` axis.
+        """
 
         self._require_single_target(input)
-        num_samples = _positive_integer(num_samples, "num_samples")
+        num_samples = validate_positive_integer(num_samples, "num_samples")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
@@ -667,7 +782,9 @@ class LigandMpnnModel(Model):
         decode_order: Tensor,
         generator: torch.Generator | None,
     ) -> dict[str, Tensor]:
-        r"""Sample tokens position-by-position with no tied constraints."""
+        r"""
+        Sample tokens position-by-position with no tied constraints.
+        """
 
         num_samples, length = sequence_true.shape
         device = sequence_true.device
@@ -788,7 +905,8 @@ class LigandMpnnModel(Model):
         tied_weights: Tensor,
         generator: torch.Generator | None,
     ) -> dict[str, Tensor]:
-        r"""Sample tokens with each tied group drawn as one weighted decision.
+        r"""
+        Sample tokens with each tied group drawn as one weighted decision.
 
         Neural logits combine as ``sum(tied_weight[i] * logits[i])`` with a default coefficient of one;
         the aligned bias applies once at the shared group value and hard support intersects across
@@ -862,7 +980,9 @@ class LigandMpnnModel(Model):
         sampled_tokens: list[int],
         design_positions: list[bool],
     ) -> MolecularSystem:
-        r"""Realize one candidate while preserving entity and bond identity."""
+        r"""
+        Realize one candidate while preserving entity and bond identity.
+        """
 
         replacements = {
             reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
@@ -882,10 +1002,24 @@ class LigandMpnnModel(Model):
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Autoregressively design complete canonical candidates and score each in-pass."""
+        r"""
+        Design protein sequence candidates in a protein-ligand context.
+
+        Args:
+            input: One processed protein-ligand target.
+            num_candidates: Number of sequence candidates to sample.
+            temperature: Positive sampling temperature.
+            coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
+            use_sidechain_context: Whether fixed protein side chains contribute context atoms.
+            generator: Random generator used for orders, noise, and token sampling.
+
+        Returns:
+            Designed molecular systems and per-candidate confidence scores in
+            sampling order.
+        """
 
         self._require_single_target(input)
-        num_candidates = _positive_integer(num_candidates, "num_candidates")
+        num_candidates = validate_positive_integer(num_candidates, "num_candidates")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
@@ -957,22 +1091,9 @@ class LigandMpnnModel(Model):
         return DesignResult(candidates=candidates)
 
 
-def _positive_integer(value: int, name: str) -> int:
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
-
-
 class LigandMpnnFeatures(MpnnProteinFeatures):
     r"""
-    Input featurizer for the LigandMPNN backbone graph and ligand/side-chain context.
-
-    Derives the virtual Cβ atom, builds the k-nearest-neighbor residue graph and pairwise edge features
-    (through the shared full-protein edge graph), and in parallel featurizes the nonprotein context atoms
-    (per-atom RBF distances to backbone atoms, periodic-table element one-hots, and local-frame angle
-    features). When ``use_sidechain_context`` is set at call time, the observed side-chain atoms of the
-    nearest fixed residues are folded into that context and the nearest atoms are reselected.
+    Build residue-graph and atom-context features for LigandMPNN.
 
     Args:
         hidden_size: Width of the per-residue edge features and per-atom context node features.
@@ -1010,7 +1131,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         self.register_buffer("periodic_period", period, persistent=False)
         self.register_buffer(
             "sidechain_atom_types",
-            sidechain_atom_types(device=buffer_device),
+            _sidechain_atom_types(device=buffer_device),
             persistent=False,
         )
 
@@ -1029,15 +1150,28 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         *,
         use_sidechain_context: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""Featurize backbone geometry and context atoms into graph inputs.
+        r"""
+        Build residue-graph and context-atom features.
 
-        Coordinate noise, when requested, is already applied by the caller to ``backbone_coordinates`` and
-        ``context_coordinates``; the fixed side-chain coordinates are never perturbed.
+        Args:
+            backbone_coordinates: N, C-alpha, C, and O coordinates with shape
+                ``(B, L, 4, 3)``.
+            residue_mask: Valid-residue mask with shape ``(B, L)``.
+            residue_index: Residue indices with shape ``(B, L)``.
+            chain_index: Chain indices with shape ``(B, L)``.
+            context_coordinates: Context coordinates with shape ``(B, L, A, 3)``.
+            context_atomic_numbers: Context atomic numbers with shape ``(B, L, A)``.
+            context_mask: Context-atom mask with shape ``(B, L, A)``.
+            residue_context_coordinates: Side-chain coordinates with shape
+                ``(B, L, 32, 3)``.
+            residue_context_mask: Side-chain atom mask with shape ``(B, L, 32)``.
+            design_positions: Design-position mask with shape ``(B, L)``.
+            use_sidechain_context: Whether fixed side chains are added to atom context.
 
         Returns:
-            Tuple ``(atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask)``:
-            per-residue context node features, residue-graph edges and neighbor indices, and the
-            context-atom node/edge features and validity mask.
+            Context features ``(B, L, A, H)``, residue edges ``(B, L, K, H)``,
+            neighbor indices ``(B, L, K)``, context nodes ``(B, L, A, H)``,
+            context edges ``(B, L, A, A, H)``, and context mask ``(B, L, A)``.
         """
 
         num_context_atoms = context_coordinates.shape[2]
@@ -1078,7 +1212,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
             (
                 atom_context_features,
                 element_projection,
-                _local_angle_features(atoms["N"], atoms["CA"], atoms["C"], context_coordinates),
+                local_backbone_frame_features(atoms["N"], atoms["CA"], atoms["C"], context_coordinates),
             ),
             dim=-1,
         )
@@ -1107,7 +1241,8 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         neighbor_indices: Tensor,
         num_context_atoms: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Append the observed side-chain atoms of the nearest fixed residues, then reselect atoms.
+        r"""
+        Append the observed side-chain atoms of the nearest fixed residues, then reselect atoms.
 
         Only source-fixed rows contribute side-chain atoms; the first sixteen residue KNN neighbors
         supply their observed 32-slot side chains, which are concatenated with the nonprotein context
@@ -1143,7 +1278,9 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         return context_coordinates, context_atomic_numbers, context_mask
 
     def _element_features(self, atomic_numbers: Tensor) -> Tensor:
-        r"""One-hot-encode each context atom by element, periodic group, and period."""
+        r"""
+        One-hot-encode each context atom by element, periodic group, and period.
+        """
 
         group = self.periodic_group[atomic_numbers]
         period = self.periodic_period[atomic_numbers]
@@ -1157,8 +1294,16 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         )
 
 
-def sidechain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
-    r"""Build LigandMPNN's 32-slot side-chain element lookup for atom37 slots ``5:37``."""
+def _sidechain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
+    r"""
+    Return atomic numbers for the atom37 side-chain slots.
+
+    Args:
+        device: Device on which to create the lookup tensor.
+
+    Returns:
+        Atomic numbers for atom37 slots ``5:37`` with shape ``(32,)``.
+    """
 
     return torch.tensor(
         [6, 6, 6, 8, 8, 16, 6, 6, 6, 7, 7, 8, 8, 16, 6, 6, 6, 6, 7, 7, 7, 8, 8, 6, 7, 7, 8, 6, 6, 6, 7, 8],
@@ -1168,7 +1313,9 @@ def sidechain_atom_types(*, device: torch.device | str | None = None) -> Tensor:
 
 
 def _backbone_atoms(coordinates: Tensor) -> dict[str, Tensor]:
-    r"""Split N/CA/C/O coordinates and add the idealized virtual Cβ atom."""
+    r"""
+    Split N/CA/C/O coordinates and add the idealized virtual Cβ atom.
+    """
 
     nitrogen = coordinates[:, :, 0]
     alpha_carbon = coordinates[:, :, 1]
@@ -1178,36 +1325,10 @@ def _backbone_atoms(coordinates: Tensor) -> dict[str, Tensor]:
     return {"N": nitrogen, "CA": alpha_carbon, "C": carbon, "O": oxygen, "CB": beta_carbon}
 
 
-def _local_angle_features(
-    nitrogen: Tensor,
-    alpha_carbon: Tensor,
-    carbon: Tensor,
-    points: Tensor,
-) -> Tensor:
-    r"""Direction features of ``points`` expressed in each residue's local backbone frame."""
-
-    first_axis = F.normalize(nitrogen - alpha_carbon, dim=-1)
-    carbon_vector = carbon - alpha_carbon
-    projected = torch.einsum("bli,bli->bl", first_axis, carbon_vector)[..., None]
-    second_axis = F.normalize(carbon_vector - first_axis * projected, dim=-1)
-    third_axis = torch.cross(first_axis, second_axis, dim=-1)
-    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
-    local = torch.einsum("blqp,blyq->blyp", frame, points - alpha_carbon[:, :, None])
-    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
-    spatial_radius = torch.norm(local, dim=-1) + 1e-8
-    return torch.stack(
-        (
-            local[..., 0] / planar_radius,
-            local[..., 1] / planar_radius,
-            planar_radius / spatial_radius,
-            local[..., 2] / spatial_radius,
-        ),
-        dim=-1,
-    )
-
-
 def _decode_groups(decode_order: Tensor, tied_groups: list[list[int]]) -> list[list[int]]:
-    r"""Order tied groups by the first time any member appears in the decode order."""
+    r"""
+    Order tied groups by the first time any member appears in the decode order.
+    """
 
     ordered: list[list[int]] = []
     seen: set[int] = set()
@@ -1226,7 +1347,9 @@ def _collapse_tied_order(
     decode_order_row: Tensor,
     tied_groups: tuple[tuple[int, ...], ...],
 ) -> Tensor:
-    r"""Collapse a drawn order so every tied group decodes consecutively from its first member."""
+    r"""
+    Collapse a drawn order so every tied group decodes consecutively from its first member.
+    """
 
     ordered = _decode_groups(decode_order_row, [list(group) for group in tied_groups])
     return torch.tensor(
@@ -1243,19 +1366,38 @@ def _collapse_tied_order(
 
 @dataclass(eq=False)
 class LigandMpnnInput:
-    r"""Tensors and canonical identities consumed by LigandMPNN operations.
+    r"""
+    Inputs for LigandMPNN sequence design and scoring.
 
-    The Processor emits one Structure per input, so the tensor batch size is one.
-    ``backbone_coordinates`` is ``[1, L, 4, 3]`` in N/CA/C/O order. The
-    ``context_*`` tensors are ``[1, L, A, ...]`` for the padded nearest-context
-    extent ``A``. The ``residue_context_*`` tensors are the ``[1, L, 32]``
-    side-chain slots at atom37 indices ``5:37`` (CG through OXT, deliberately
-    excluding CB), which the Model consumes directly instead of a redundant full
-    atom37 array. ``tied_group_ids`` is aligned ``long [1, L]`` dense causal-unit
-    identity in first-row order; every untied row receives its own identity. ``tied_weights``
-    is aligned ``[1, L]`` when present, and ``None`` selects coefficient one.
-    Optional evidence remains ``None`` on the common path rather than allocating
-    neutral per-position masks or bias tensors.
+    Args:
+        backbone_coordinates: N, CA, C, and O coordinates with shape
+            ``(batch_size, num_residues, 4, 3)``.
+        sequence_tokens: Residue token IDs with shape ``(batch_size, num_residues)``.
+        residue_mask: Valid-residue mask with shape ``(batch_size, num_residues)``.
+        residue_index: Residue indices with shape ``(batch_size, num_residues)``.
+        chain_index: Chain indices with shape ``(batch_size, num_residues)``.
+        context_coordinates: Nearby context-atom coordinates with shape
+            ``(batch_size, num_residues, num_context_atoms, 3)``.
+        context_atomic_numbers: Context atomic numbers with shape
+            ``(batch_size, num_residues, num_context_atoms)``.
+        context_mask: Context-atom mask with shape
+            ``(batch_size, num_residues, num_context_atoms)``.
+        residue_context_coordinates: Side-chain context coordinates with shape
+            ``(batch_size, num_residues, 32, 3)``.
+        residue_context_mask: Side-chain context mask with shape
+            ``(batch_size, num_residues, 32)``.
+        design_positions: Positions eligible for design with shape
+            ``(batch_size, num_residues)``.
+        ligand_interface_mask: Residues at the ligand interface with shape
+            ``(batch_size, num_residues)``.
+        structure: Source structure.
+        component_references: Component occurrences aligned to residue rows.
+        tied_group_ids: Autoregressive unit ID for each residue row.
+        tied_weights: Optional tied-group weights with shape ``(batch_size, num_residues)``.
+        allowed_token_mask: Optional token mask with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        residue_logit_bias: Optional additive bias with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
     """
 
     backbone_coordinates: Tensor
@@ -1280,27 +1422,57 @@ class LigandMpnnInput:
 
 @dataclass(eq=False)
 class LigandMpnnOutput:
-    r"""Raw logits and exact causal ranks from a LigandMPNN sequence graph."""
+    r"""
+    Outputs from one LigandMPNN forward pass.
+
+    Args:
+        logits: Vocabulary logits with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(batch_size, num_residues)``.
+    """
 
     logits: Tensor
     decoding_ranks: Tensor
 
     @property
     def log_probabilities(self) -> Tensor:
-        r"""Return vocabulary log probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary log probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.log_softmax(dim=-1)
 
     @property
     def probabilities(self) -> Tensor:
-        r"""Return vocabulary probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.softmax(dim=-1)
 
 
 @dataclass(eq=False)
 class LigandMpnnSamplingOutput:
-    r"""Complete aligned tensor output from the LigandMPNN sequence sampler."""
+    r"""
+    Outputs from LigandMPNN autoregressive sampling.
+
+    Args:
+        sequence_tokens: Sampled token IDs with shape
+            ``(num_samples, num_residues)``.
+        log_probabilities: Model log probabilities with shape
+            ``(num_samples, num_residues, vocabulary_size)``.
+        sampling_probabilities: Sampling distribution over the 20 generatable amino
+            acids with shape ``(num_samples, num_residues, 20)``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(num_samples, num_residues)``.
+    """
 
     sequence_tokens: Tensor
     log_probabilities: Tensor

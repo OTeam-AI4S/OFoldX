@@ -1,4 +1,6 @@
-r"""Lower multi-chain assemblies, paired MSA evidence, and templates to AlphaFold-Multimer."""
+r"""
+Prepare assembly, paired-MSA, and template features for AlphaFold-Multimer.
+"""
 
 from __future__ import annotations
 
@@ -19,17 +21,20 @@ from .processor import (
     RESIDUE_TYPE_INDEX_BY_COMPONENT,
     RESIDUE_TYPE_INDEX_BY_SYMBOL,
     UNKNOWN_RESIDUE_TYPE_INDEX,
-    select_template_alignment,
+    _select_template_alignment,
 )
-
-# AlphaFold-Multimer Processor.
-#
-# Lowers multi-chain assemblies, paired MSA evidence, and templates. It derives
-# chain, entity, and symmetry indices and emits the 22-class paired MSA pool.
 
 
 class AlphaFold2MultimerProcessor(Processor):
-    r"""Build AlphaFold-Multimer input features."""
+    r"""
+    Convert supported protein assemblies into `AlphaFold2MultimerInput`.
+
+    Args:
+        config: MSA and template feature limits. Defaults to
+            ``AlphaFold2MultimerProcessorConfig()``.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
 
     def __init__(
         self,
@@ -48,7 +53,20 @@ class AlphaFold2MultimerProcessor(Processor):
         msa: MSACollection | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold2MultimerInput:
-        r"""Lower one multi-chain assembly and its explicit paired evidence."""
+        r"""
+        Prepare model features for one protein assembly.
+
+        Args:
+            input: Molecular system or named/ordered protein sequences forming one
+                assembly.
+            msa: Optional paired and unpaired MSA evidence.
+            templates: Template structures with explicit target alignments.
+
+        Returns:
+            Batched target, paired-MSA, and template tensors. Atom coordinates in
+            template features are in angstroms. This method performs no random
+            sampling.
+        """
 
         system = input if isinstance(input, MolecularSystem) else multimer_system(input)
         chains = multimer_chains(system)
@@ -67,7 +85,9 @@ class AlphaFold2MultimerProcessor(Processor):
 
 
 class MultimerChain:
-    r"""One resolved chain: its instance, entity identity indices, and token range."""
+    r"""
+    One resolved chain: its instance, entity identity indices, and token range.
+    """
 
     __slots__ = (
         "instance_id",
@@ -105,7 +125,8 @@ class MultimerChain:
 def multimer_system(
     input: Sequence[PolymerSequence] | Mapping[str, PolymerSequence],
 ) -> MolecularSystem:
-    r"""Lift a named/ordered ``PolymerSequence`` collection into one MolecularSystem.
+    r"""
+    Lift a named/ordered ``PolymerSequence`` collection into one MolecularSystem.
 
     Distinct sequences become distinct entities; repeated identical sequences share
     one entity, so the symmetry-copy structure is preserved.
@@ -138,7 +159,9 @@ def multimer_system(
 
 
 def multimer_chains(system: MolecularSystem) -> tuple[MultimerChain, ...]:
-    r"""Resolve chain identity and reject monomer/unsupported molecular meaning."""
+    r"""
+    Resolve chain identity and reject monomer/unsupported molecular meaning.
+    """
 
     if len(system.instances) < 2:
         raise ValueError("AlphaFold-Multimer requires at least two chain instances; use ofoldx.alphafold2 for monomers")
@@ -179,7 +202,9 @@ def normalize_collection(
     msa: MSACollection | None,
     chains: tuple[MultimerChain, ...],
 ) -> MSACollection | None:
-    r"""Validate a paired MSACollection against the assembly, or reject a bare MSA."""
+    r"""
+    Validate a paired MSACollection against the assembly, or reject a bare MSA.
+    """
 
     if msa is None:
         return None
@@ -217,7 +242,9 @@ def prepare_multimer_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> AlphaFold2MultimerInput:
-    r"""Build the concatenated multimer tensor and semantic axes."""
+    r"""
+    Build the concatenated multimer tensor and semantic axes.
+    """
 
     total_length = chains[-1].stop
     residue_type = torch.tensor(
@@ -291,7 +318,8 @@ def materialize_collection(
     total_length: int,
     query_tokens: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    r"""Expand the paired MSACollection row plan onto the concatenated token axis.
+    r"""
+    Expand the paired MSACollection row plan onto the concatenated token axis.
 
     Each plan row is materialized into one full-width token row: every chain's
     token range receives the symbols selected for its entity's column (paired or
@@ -355,7 +383,8 @@ def multimer_template_features(
     chains: tuple[MultimerChain, ...],
     total_length: int,
 ) -> dict[str, Tensor]:
-    r"""Project canonical aligned template coordinates onto the concatenated axis.
+    r"""
+    Project aligned template coordinates onto the concatenated residue axis.
 
     Produces atom37 positions/masks plus the multimer pseudo-beta and backbone-frame
     projections. The model recomputes template geometry from atom37; the derived
@@ -394,7 +423,7 @@ def multimer_template_features(
                 else entity_to_chains.get(alignment.target_entity_id, [])
             )
             for chain in target_chains:
-                select_template_alignment(
+                _select_template_alignment(
                     template,
                     target_length=chain.stop - chain.start,
                     target_entity_id=chain.entity_id,
@@ -466,7 +495,8 @@ def _template_pseudo_beta(residue_type: Tensor, positions: Tensor, masks: Tensor
 
 
 def _template_backbone_frame(positions: Tensor, masks: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Construct the N/CA/C backbone rigid with Gram-Schmidt orthogonalization.
+    r"""
+    Construct the N/CA/C backbone rigid with Gram-Schmidt orthogonalization.
 
     The rotation is formed from ``C - CA`` and ``N - CA`` with translation ``CA``.
     ``from_two_vectors(e0_raw, e1_raw)`` sets the x-axis ``e0 = normalize(C - CA)``, makes

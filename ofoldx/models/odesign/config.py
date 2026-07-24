@@ -1,4 +1,6 @@
-r"""Persistent configuration for the ODesign architecture and its Processor."""
+r"""
+Persistent configuration for the ODesign architecture and its Processor.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class ODesignConstraintEmbeddingsConfig(Config):
-    r"""Configure the observed condition-geometry embedder.
+    r"""
+    Configure the observed condition-geometry embedder.
 
     Args:
         num_blocks: Number of condition embedding blocks.
@@ -26,7 +29,8 @@ class ODesignConstraintEmbeddingsConfig(Config):
 
 
 class ODesignTrunkConfig(Config):
-    r"""Configure the Pairformer and MSA trunk.
+    r"""
+    Configure the Pairformer and MSA trunk.
 
     Args:
         num_pairformer_blocks: Number of Pairformer blocks.
@@ -44,7 +48,8 @@ class ODesignTrunkConfig(Config):
 
 
 class ODesignDenoiserConfig(Config):
-    r"""Configure the all-atom EDM denoiser.
+    r"""
+    Configure the all-atom EDM denoiser.
 
     Args:
         sigma_data: Data noise scale used by EDM preconditioning.
@@ -76,7 +81,8 @@ class ODesignDenoiserConfig(Config):
 
 
 class ODesignPairwiseConfig(Config):
-    r"""Configure distogram and bond-reconstruction heads.
+    r"""
+    Configure distogram and bond-reconstruction heads.
 
     Args:
         num_distogram_bins: Number of distogram output bins.
@@ -90,7 +96,8 @@ class ODesignPairwiseConfig(Config):
 
 
 class ODesignConfig(Config):
-    r"""Configure the core graph shared by rigid and flexible ODesign models.
+    r"""
+    Configure the core graph shared by rigid and flexible ODesign models.
 
     Args:
         token_feature_size: Width of raw token features.
@@ -118,11 +125,12 @@ class ODesignConfig(Config):
 
 
 class ODesignProcessorConfig(Config):
-    r"""Configure canonical ODesign input lowering for rigid or flexible receptors.
+    r"""
+    Configure ODesign receptor processing.
 
     Args:
-        receptor_mode: ``"rigid"`` fixes existing receptor heavy atoms; ``"flex"`` regenerates them except for
-            explicitly fixed reference coordinates.
+        receptor_mode: ``"rigid"`` fixes existing receptor heavy atoms; ``"flex"``
+            regenerates them except where reference-coordinate conditions fix atoms.
     """
 
     receptor_mode: str = "flex"  # "rigid" | "flex" (str, not Literal: chanfig validates fields via isinstance)

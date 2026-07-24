@@ -107,6 +107,8 @@ def _dummy_model_input(
 
 @pytest.fixture
 def dummy_model_input():
-    r"""Factory for cheap synthetic ``AlphaFold3Input`` objects."""
+    r"""
+    Factory for cheap synthetic ``AlphaFold3Input`` objects.
+    """
 
     return _dummy_model_input

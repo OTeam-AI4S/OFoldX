@@ -1,4 +1,6 @@
-r"""Tests for the frozen Section 5 scientific result carriers in values.py."""
+r"""
+Tests for the frozen Section 5 scientific result carriers in values.py.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +36,9 @@ RESIDUE_B = ("chain_b", 0)
 
 
 def _system() -> MolecularSystem:
-    r"""A minimal two-chain, one-ligand coordinate-free system."""
+    r"""
+    A minimal two-chain, one-ligand coordinate-free system.
+    """
 
     alanine = ChemicalComponent("ALA", atoms=(ChemicalAtom("CA", "C"),), bonds=None)
     protein = PolymerSequence("protein", (alanine,))
@@ -46,7 +50,9 @@ def _system() -> MolecularSystem:
 
 
 def _structure(system: MolecularSystem | None = None) -> Structure:
-    r"""A coordinate realization of ``system`` over its realized atoms."""
+    r"""
+    A coordinate realization of ``system`` over its realized atoms.
+    """
 
     system = _system() if system is None else system
     sites = tuple(site for site, _ in system.iter_atoms())

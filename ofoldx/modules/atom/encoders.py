@@ -1,10 +1,5 @@
 r"""
-Atom-to-token encoders and the token-to-atom decoder.
-
-The atom encoder/decoder web contains the conditioning builder, the dense/local atom-pair encoder, the windowed
-self-attention module, and the encoders/decoder that move atom states to/from token states. Each piece delegates the
-heavy attention to the shared [`PackedAtomAttention`][ofoldx.modules.atom.encoders.PackedAtomAttention] and the
-shared pair arithmetic to [`encode_atom_pair`][ofoldx.modules.atom.pair_encoding.encode_atom_pair].
+Atom-to-token encoders and token-to-atom decoders.
 """
 
 from __future__ import annotations
@@ -28,6 +23,7 @@ from .transfer import (
 )
 from .window import LocalAtomGeometry, LocalAtomGeometryBuilder, gather_key_windows
 
+#: Supported atom-attention layouts.
 AttentionLayout = Literal["dense", "local"]
 
 
@@ -55,16 +51,6 @@ class AtomToTokenEncoderBase(nn.Module):
             OOps-owned implementation when available, else the public implementation).
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
-
-    Examples:
-        >>> import torch
-        >>> encoder = AtomToTokenEncoder(
-        ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-        ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-        ...     atom_feature_size=6,
-        ... )
-        >>> isinstance(encoder, AtomToTokenEncoderBase)
-        True
     """
 
     def __init__(
@@ -127,19 +113,6 @@ class AtomToTokenEncoderBase(nn.Module):
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] carrying per-window
             `query - key` displacement vectors, the same-space validity mask, and the window padding metadata.
-
-        Examples:
-            >>> import torch
-            >>> encoder = AtomToTokenEncoder(
-            ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-            ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-            ...     atom_feature_size=6,
-            ... )
-            >>> reference_positions = torch.zeros(1, 4, 3)
-            >>> reference_space_id = torch.zeros(1, 4, dtype=torch.long)
-            >>> geometry = encoder.build_local_geometry(reference_positions, reference_space_id)
-            >>> geometry.distance_vectors.shape
-            torch.Size([1, 2, 2, 4, 3])
         """
 
         return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
@@ -171,24 +144,6 @@ class AtomToTokenEncoderBase(nn.Module):
         Returns:
             An [`AtomToTokenOutput`][ofoldx.modules.atom.context.AtomToTokenOutput] whose
             ``token_hidden`` has shape `[..., num_tokens, token_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.context import AtomContext
-            >>> encoder = AtomToTokenEncoder(
-            ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-            ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-            ...     atom_feature_size=6,
-            ... )
-            >>> atom_query = torch.zeros(1, 4, 8)
-            >>> atom_to_token = torch.tensor([[0, 0, 1, 1]])
-            >>> context = AtomContext(pair=torch.zeros(1, 4, 4, 4), conditioning=torch.zeros(1, 4, 8))
-            >>> output = encoder.aggregate_to_tokens(
-            ...     atom_query, atom_to_token=atom_to_token, num_tokens=2, atom_mask=None,
-            ...     atom_context=context,
-            ... )
-            >>> output.token_hidden.shape
-            torch.Size([1, 2, 8])
         """
 
         token_hidden = self.relu(self.token_projection(atom_query))
@@ -214,16 +169,6 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
 
     Constructor arguments are inherited from
     [`AtomToTokenEncoderBase`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase].
-
-    Examples:
-        >>> import torch
-        >>> encoder = AtomToTokenEncoder(
-        ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-        ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-        ...     atom_feature_size=6,
-        ... )
-        >>> sum(p.numel() for p in encoder.parameters()) > 0
-        True
     """
 
     def forward(
@@ -259,27 +204,6 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
             An [`AtomToTokenOutput`][ofoldx.modules.atom.context.AtomToTokenOutput] with ``token_hidden``
             `[..., num_tokens, token_hidden_size]`, ``atom_query`` `[..., N_atom, atom_hidden_size]`, and the
             [`AtomContext`][ofoldx.modules.atom.context.AtomContext] (pair + conditioning) for the decoder.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> encoder = AtomToTokenEncoder(
-            ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-            ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-            ...     atom_feature_size=6,
-            ... )
-            >>> output = encoder(
-            ...     torch.randn(1, 4, 6),
-            ...     reference_positions=torch.randn(1, 4, 3),
-            ...     reference_charges=torch.randn(1, 4, 1),
-            ...     reference_mask=torch.ones(1, 4),
-            ...     atom_to_token=torch.tensor([[0, 0, 1, 1]]),
-            ...     num_tokens=2,
-            ... )
-            >>> output.token_hidden.shape
-            torch.Size([1, 2, 8])
-            >>> output.atom_query.shape
-            torch.Size([1, 4, 8])
         """
 
         atom_conditioning = self.atom_conditioner(
@@ -334,16 +258,6 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         operator_backend: Backend selector passed down to atom self-attention.
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
-
-    Examples:
-        >>> import torch
-        >>> encoder = CoordinateAtomToTokenEncoder(
-        ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-        ...     single_size=6, pair_size=5, num_blocks=1, num_attention_heads=2,
-        ...     num_query_atoms=2, num_key_atoms=4, atom_feature_size=6,
-        ... )
-        >>> isinstance(encoder, AtomToTokenEncoderBase)
-        True
     """
 
     def __init__(
@@ -425,28 +339,6 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             An [`AtomToTokenOutput`][ofoldx.modules.atom.context.AtomToTokenOutput] with ``token_hidden``
             `[..., num_tokens, token_hidden_size]`, ``atom_query`` `[..., N_atom, atom_hidden_size]`, and the
             [`AtomContext`][ofoldx.modules.atom.context.AtomContext] for the coordinate decoder.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> encoder = CoordinateAtomToTokenEncoder(
-            ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-            ...     single_size=6, pair_size=5, num_blocks=1, num_attention_heads=2,
-            ...     num_query_atoms=2, num_key_atoms=4, atom_feature_size=6,
-            ... )
-            >>> output = encoder(
-            ...     torch.randn(1, 4, 6),
-            ...     reference_positions=torch.randn(1, 4, 3),
-            ...     reference_charges=torch.randn(1, 4, 1),
-            ...     reference_mask=torch.ones(1, 4),
-            ...     single=torch.randn(1, 2, 6),
-            ...     pair=torch.randn(1, 2, 2, 5),
-            ...     noisy_coords=torch.randn(1, 4, 3),
-            ...     atom_to_token=torch.tensor([[0, 0, 1, 1]]),
-            ...     num_tokens=2,
-            ... )
-            >>> output.token_hidden.shape
-            torch.Size([1, 2, 8])
         """
 
         atom_conditioning = self.atom_conditioner(
@@ -550,19 +442,6 @@ class AtomConditioner(nn.Module):
     Args:
         atom_feature_size: Width of the raw reference atom-feature vector.
         atom_hidden_size: Width of the produced conditioning channel.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> conditioner = AtomConditioner(atom_feature_size=6, atom_hidden_size=8)
-        >>> conditioning = conditioner(
-        ...     torch.randn(2, 6),
-        ...     reference_positions=torch.randn(2, 3),
-        ...     reference_charges=torch.randn(2, 1),
-        ...     reference_mask=torch.ones(2),
-        ... )
-        >>> conditioning.shape
-        torch.Size([2, 8])
     """
 
     def __init__(self, atom_feature_size: int = 385, atom_hidden_size: int = 128) -> None:
@@ -593,20 +472,6 @@ class AtomConditioner(nn.Module):
 
         Returns:
             Per-atom conditioning of shape `[..., N_atom, atom_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> conditioner = AtomConditioner(atom_feature_size=6, atom_hidden_size=8)
-            >>> reference_mask = torch.tensor([1.0, 0.0])
-            >>> conditioning = conditioner(
-            ...     torch.randn(2, 6),
-            ...     reference_positions=torch.randn(2, 3),
-            ...     reference_charges=torch.randn(2, 1),
-            ...     reference_mask=reference_mask,
-            ... )
-            >>> conditioning[1].abs().sum().tolist()
-            0.0
         """
 
         conditioning = self.reference_position_projection(reference_positions)
@@ -632,16 +497,6 @@ class AtomPairEncoder(nn.Module):
         atom_pair_hidden_size: Width of the produced atom-pair channel.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> encoder = AtomPairEncoder(
-        ...     atom_hidden_size=8, atom_pair_hidden_size=4, num_query_atoms=2, num_key_atoms=4,
-        ... )
-        >>> pair = encoder(torch.randn(3, 8), reference_positions=torch.randn(3, 3))
-        >>> pair.shape
-        torch.Size([3, 3, 4])
     """
 
     def __init__(
@@ -685,17 +540,6 @@ class AtomPairEncoder(nn.Module):
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] to pass to
             [`encode_local`][ofoldx.modules.atom.encoders.AtomPairEncoder.encode_local].
-
-        Examples:
-            >>> import torch
-            >>> encoder = AtomPairEncoder(
-            ...     atom_hidden_size=8, atom_pair_hidden_size=4, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> geometry = encoder.build_local_geometry(
-            ...     torch.zeros(1, 4, 3), torch.zeros(1, 4, dtype=torch.long)
-            ... )
-            >>> geometry.distance_vectors.shape
-            torch.Size([1, 2, 2, 4, 3])
         """
 
         return self.local_geometry_builder(reference_positions, reference_space_id, num_valid_atoms)
@@ -726,20 +570,6 @@ class AtomPairEncoder(nn.Module):
 
         Raises:
             ValueError: If ``local_geometry`` is ``None`` and ``reference_positions`` is also ``None``.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> encoder = AtomPairEncoder(
-            ...     atom_hidden_size=8, atom_pair_hidden_size=4, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> pair = encoder(torch.randn(3, 8), reference_positions=torch.randn(3, 3))
-            >>> pair.shape
-            torch.Size([3, 3, 4])
-            >>> encoder(torch.randn(3, 8))
-            Traceback (most recent call last):
-                ...
-            ValueError: reference_positions is required for dense atom-pair encoding
         """
 
         if local_geometry is None:
@@ -769,16 +599,6 @@ class AtomPairEncoder(nn.Module):
 
         Returns:
             The dense pair representation of shape `[..., N_atom, N_atom, atom_pair_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> encoder = AtomPairEncoder(
-            ...     atom_hidden_size=8, atom_pair_hidden_size=4, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> pair = encoder.encode_dense(torch.randn(3, 8), reference_positions=torch.randn(3, 3))
-            >>> pair.shape
-            torch.Size([3, 3, 4])
         """
 
         distance_vectors = reference_positions.unsqueeze(-2) - reference_positions.unsqueeze(-3)
@@ -820,18 +640,6 @@ class AtomPairEncoder(nn.Module):
         Returns:
             The local pair representation of shape
             `[..., N_window, num_query_atoms, num_key_atoms, atom_pair_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> encoder = AtomPairEncoder(
-            ...     atom_hidden_size=8, atom_pair_hidden_size=4, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> geometry = encoder.build_local_geometry(
-            ...     torch.zeros(1, 4, 3), torch.zeros(1, 4, dtype=torch.long)
-            ... )
-            >>> encoder.encode_local(torch.randn(1, 4, 8), local_geometry=geometry).shape
-            torch.Size([1, 2, 2, 4, 4])
         """
 
         distance_vectors = local_geometry.distance_vectors
@@ -876,15 +684,6 @@ class PackedAtomAttention(nn.Module):
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
         transition: Transition-block kind used inside each transformer block.
-
-    Examples:
-        >>> import torch
-        >>> attention = PackedAtomAttention(
-        ...     atom_hidden_size=8, conditioning_size=8, num_blocks=1, num_attention_heads=2,
-        ...     num_query_atoms=2, num_key_atoms=4,
-        ... )
-        >>> attention.num_key_atoms
-        4
     """
 
     def __init__(
@@ -947,24 +746,6 @@ class PackedAtomAttention(nn.Module):
 
         Raises:
             ValueError: If ``attention_layout`` is not ``"dense"`` or ``"local"``.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> attention = PackedAtomAttention(
-            ...     atom_hidden_size=8, conditioning_size=8, num_blocks=1, num_attention_heads=2,
-            ...     num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> out = attention(
-            ...     torch.randn(1, 4, 8), torch.randn(1, 4, 8), torch.randn(1, 4, 4, 2),
-            ...     attention_layout="dense",
-            ... )
-            >>> out.shape
-            torch.Size([1, 4, 8])
-            >>> attention(torch.randn(1, 4, 8), torch.randn(1, 4, 8), torch.randn(1, 4, 4, 2), attention_layout="x")
-            Traceback (most recent call last):
-                ...
-            ValueError: unsupported attention_layout: 'x'
         """
 
         if attention_layout not in ("dense", "local"):
@@ -1047,15 +828,6 @@ class AtomSelfAttention(nn.Module):
         operator_backend: Backend selector for the underlying attention/transition implementations.
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
-
-    Examples:
-        >>> import torch
-        >>> attention = AtomSelfAttention(
-        ...     atom_hidden_size=8, conditioning_size=8, pair_size=4, num_blocks=1,
-        ...     num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-        ... )
-        >>> len(attention.bias_projections)
-        1
     """
 
     def __init__(
@@ -1114,20 +886,6 @@ class AtomSelfAttention(nn.Module):
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> attention = AtomSelfAttention(
-            ...     atom_hidden_size=8, conditioning_size=8, pair_size=4, num_blocks=1,
-            ...     num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> out = attention(
-            ...     torch.randn(1, 4, 8), torch.randn(1, 4, 8), torch.randn(1, 4, 4, 4),
-            ...     attention_layout="dense",
-            ... )
-            >>> out.shape
-            torch.Size([1, 4, 8])
         """
 
         packed_bias = torch.cat(
@@ -1163,15 +921,6 @@ class TokenToAtomDecoder(nn.Module):
         operator_backend: Backend selector passed down to atom self-attention.
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
-
-    Examples:
-        >>> import torch
-        >>> decoder = TokenToAtomDecoder(
-        ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-        ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-        ... )
-        >>> isinstance(decoder, TokenToAtomDecoder)
-        True
     """
 
     def __init__(
@@ -1234,24 +983,6 @@ class TokenToAtomDecoder(nn.Module):
 
         Returns:
             Per-atom coordinate updates of shape `[..., N_atom, 3]`.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.context import AtomContext
-            >>> _ = torch.manual_seed(0)
-            >>> decoder = TokenToAtomDecoder(
-            ...     token_hidden_size=8, atom_hidden_size=8, atom_pair_hidden_size=4,
-            ...     num_blocks=1, num_attention_heads=2, num_query_atoms=2, num_key_atoms=4,
-            ... )
-            >>> context = AtomContext(pair=torch.randn(1, 4, 4, 4), conditioning=torch.randn(1, 4, 8))
-            >>> updates = decoder(
-            ...     torch.randn(1, 2, 8),
-            ...     atom_to_token=torch.tensor([[0, 0, 1, 1]]),
-            ...     atom_query=torch.randn(1, 4, 8),
-            ...     atom_context=context,
-            ... )
-            >>> updates.shape
-            torch.Size([1, 4, 3])
         """
 
         atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
@@ -1281,13 +1012,6 @@ def _flatten_batch(tensor: Tensor, prefix: tuple[int, ...], payload_ndim: int) -
 
     Returns:
         The tensor broadcast to ``prefix`` and reshaped to `[prod(prefix), *payload]`.
-
-    Examples:
-        >>> import torch
-        >>> _flatten_batch(torch.zeros(2, 5, 8), (2,), 2).shape
-        torch.Size([2, 5, 8])
-        >>> _flatten_batch(torch.zeros(2, 5, 8), (2, 3), 2).shape
-        torch.Size([6, 5, 8])
     """
     matched = tensor.dim() - payload_ndim
     missing = len(prefix) - matched

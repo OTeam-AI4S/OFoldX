@@ -1,4 +1,6 @@
-r"""NA-MPNN sequence design, scoring, and probability Pipelines."""
+r"""
+NA-MPNN sequence design, scoring, and probability Pipelines.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +20,9 @@ from .processor import NaMpnnProcessor
 
 
 class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
-    r"""Bind one NA-MPNN Model and Processor for mixed-polymer operations."""
+    r"""
+    Protein and nucleic-acid sequence design pipeline for NA-MPNN.
+    """
 
     def design(
         self,
@@ -37,16 +41,17 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> DesignResult:
-        r"""Design mixed-polymer sequences on one fixed backbone.
+        r"""
+        Design mixed-polymer sequences on one fixed backbone.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences allowed to change.
             conditions: Allowed-identity and tied-identity conditions.
             symmetry_groups: Residue groups sharing one decoding position.
             tied_weights: Optional sampling coefficient for each tied residue.
             residue_logit_bias: Per-residue bias vectors over the NA-MPNN vocabulary.
-            pair_bias: Optional pairwise bias tensor aligned to lowered residue rows.
+            pair_bias: Optional adjacent-token bias matrix with shape ``(33, 33)``.
             global_omit_tokens: One-letter residue tokens excluded from generation.
             num_candidates: Number of complete sequences to sample.
             temperature: Positive autoregressive sampling temperature.
@@ -87,10 +92,11 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over decoding orders.
+        r"""
+        Return sequence-conditioned autoregressive probabilities over decoding orders.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             sequence: Optional replacement sequence to evaluate.
             design_positions: Residue occurrences included in the probability evaluation.
             num_decoding_orders: Number of independently sampled decoding orders.
@@ -116,10 +122,11 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-free all-equal-rank probabilities for every row.
+        r"""
+        Return sequence-free all-equal-rank probabilities for every row.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences included in the probability evaluation.
             num_decoding_orders: Number of repeated evaluations to retain.
 
@@ -147,10 +154,11 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Average nucleic-acid base probabilities with protein context fixed.
+        r"""
+        Average nucleic-acid base probabilities with protein context fixed.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             design_positions: Nucleic-acid residue occurrences included in the profile.
             conditions: Allowed-identity and tied-identity conditions.
             symmetry_groups: Residue groups sharing one decoding position.

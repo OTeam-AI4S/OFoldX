@@ -1,4 +1,6 @@
-r"""Model and Processor registration."""
+r"""
+Model and Processor registration.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +13,25 @@ import chanfig
 from ..model import Model
 from ..processor import Processor
 
+#: Standard task name understood by the high-level task API.
 Task = Literal["fold", "design", "score", "pack"]
+#: All standard task names.
 TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
 
 
 class ModelRegistration(NamedTuple):
-    r"""Classes and standard tasks belonging to one model identity."""
+    r"""
+    Classes and tasks registered under one architecture ID.
+
+    Attributes:
+        id: Architecture ID stored in model metadata.
+        model: Registered model class.
+        processor: Registered processor class.
+        processor_config: Processor configuration class, or ``None`` when the
+            processor has no configuration.
+        model_config: Model configuration class.
+        standard_tasks: Standard tasks supported without a custom pipeline.
+    """
 
     id: str
     model: type[Model]
@@ -50,14 +65,8 @@ _BUILTIN_MODEL_MODULES = {
 
 
 class ModelRegistry(chanfig.Registry):
-    r"""Registry of Model/Processor architecture identities, keyed by architecture id.
-
-    ``MODELS.register_model(id, model=..., processor=..., processor_config=...,
-    standard_tasks=...)`` registers one identity. Lookups resolve by id
-    ([`lookup_model`][], lazy-importing the owner of a built-in id), by exact Model
-    config class ([`for_config`][]), or by exact ``(Model, Processor)`` class pair
-    ([`for_pair`][]); the config and pair indexes keep those lookups exact rather than
-    a linear scan.
+    r"""
+    Registry of model architectures and their processors.
     """
 
     by_config: dict[type[chanfig.Config], ModelRegistration]
@@ -78,7 +87,21 @@ class ModelRegistry(chanfig.Registry):
         processor_config: type[chanfig.Config] | None,
         standard_tasks: Collection[str] = (),
     ) -> None:
-        r"""Register one Model/Processor pair."""
+        r"""
+        Register one architecture.
+
+        Args:
+            id: Architecture ID stored in model metadata.
+            model: Model class implementing the architecture.
+            processor: Processor class producing the model's input type.
+            processor_config: Processor configuration class, or ``None`` for a
+                configuration-free processor.
+            standard_tasks: Standard tasks supported without a custom pipeline.
+
+        Raises:
+            ValueError: If a task is unknown or the model, processor, or config is
+                already registered incompatibly.
+        """
 
         self._import_builtin(id)
 
@@ -114,20 +137,46 @@ class ModelRegistry(chanfig.Registry):
             import_module(module)
 
     def lookup_model(self, id: str) -> ModelRegistration:
-        r"""Resolve one registered model identity, importing a built-in owner on demand."""
+        r"""
+        Return the registration for an architecture ID.
+
+        Args:
+            id: Registered architecture ID.
+
+        Returns:
+            The matching model registration.
+        """
 
         self._import_builtin(id)
         return cast(ModelRegistration, super().lookup(id))
 
     def for_config(self, config: chanfig.Config) -> ModelRegistration:
-        r"""Return the registration selected by an exact Model config class."""
+        r"""
+        Return the registration for a model configuration.
+
+        Args:
+            config: Model configuration whose exact class selects the registration.
+
+        Returns:
+            The matching model registration.
+        """
 
         return self.by_config[cast(type[chanfig.Config], type(config))]
 
     def for_pair(self, model: Model, processor: Processor) -> ModelRegistration:
-        r"""Return the registration for an exact Model/Processor class pair."""
+        r"""
+        Return the registration for a model and processor pair.
+
+        Args:
+            model: Registered model instance.
+            processor: Registered processor instance.
+
+        Returns:
+            The registration matching both exact classes.
+        """
 
         return self.by_pair[type(model), type(processor)]
 
 
+#: Global registry of OFoldX model architectures.
 MODELS = ModelRegistry()

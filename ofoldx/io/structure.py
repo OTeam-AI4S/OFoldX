@@ -1,4 +1,6 @@
-r"""Canonical PDB/mmCIF I/O over [`ofoldx.data`][] domain values."""
+r"""
+PDB and mmCIF I/O for OFoldX molecular data types.
+"""
 
 from __future__ import annotations
 
@@ -35,7 +37,13 @@ _ALTLOC_POLICIES = frozenset({"highest_occupancy", "first"})
 
 @dataclass(frozen=True)
 class LossReport:
-    r"""Machine-readable fields lost or rewritten by an exchange writer."""
+    r"""
+    Information changed while writing a lossy exchange format.
+
+    Args:
+        dropped_fields: OFoldX fields omitted from the written file.
+        rewritten_fields: OFoldX fields represented with altered values.
+    """
 
     dropped_fields: tuple[str, ...] = ()
     rewritten_fields: tuple[str, ...] = ()
@@ -50,7 +58,28 @@ def read_structure(
     atom_layout: Literal["observed", "complete_heavy", "complete_all"] = "observed",
     components: Mapping[str, ChemicalComponent] | None = None,
 ) -> Structure:
-    r"""Read one model/assembly with one residue-consistent altloc choice."""
+    r"""
+    Read one structure from PDB or mmCIF.
+
+    Args:
+        path: Input path. The suffix selects PDB or mmCIF parsing.
+        model: One-based model number.
+        assembly_id: Optional biological assembly identifier.
+        altloc: Policy used to choose one alternate location per residue.
+        atom_layout: Atoms included in the returned structure. ``"observed"`` keeps
+            source atoms, ``"complete_heavy"`` adds known heavy atoms, and
+            ``"complete_all"`` also materializes known hydrogens.
+        components: Optional component definitions overriding built-in chemistry by
+            component ID.
+
+    Returns:
+        The selected model and assembly as a
+        [`Structure`][ofoldx.data.structure.Structure].
+
+    Raises:
+        ValueError: If an option is invalid or the requested model or assembly contains
+            no atoms.
+    """
 
     parsed, component_table = _prepare_read(path, model, assembly_id, atom_layout, components)
     if altloc not in _ALTLOC_POLICIES:
@@ -71,7 +100,20 @@ def read_structures(
     atom_layout: Literal["observed", "complete_heavy", "complete_all"] = "observed",
     components: Mapping[str, ChemicalComponent] | None = None,
 ) -> tuple[Structure, ...]:
-    r"""Expand every residue-consistent alternate-location combination."""
+    r"""
+    Read every residue-consistent alternate-location realization.
+
+    Args:
+        path: Input PDB or mmCIF path.
+        model: One-based model number.
+        assembly_id: Optional biological assembly identifier.
+        atom_layout: Atoms included in each returned structure.
+        components: Optional component definitions overriding built-in chemistry by
+            component ID.
+
+    Returns:
+        One structure per valid combination of residue alternate locations.
+    """
 
     parsed, component_table = _prepare_read(path, model, assembly_id, atom_layout, components)
     if parsed.canonical_payload is not None:
@@ -88,7 +130,21 @@ def write_structure(
     *,
     allow_lossy: bool = False,
 ) -> LossReport | None:
-    r"""Write one canonical Structure, refusing unacknowledged format loss."""
+    r"""
+    Write a structure as PDB or mmCIF.
+
+    Args:
+        structure: Structure to write.
+        path: Output path. The suffix selects PDB or mmCIF.
+        allow_lossy: Permit fields that the selected format cannot represent exactly.
+
+    Returns:
+        A loss report when ``allow_lossy`` is true; otherwise ``None``.
+
+    Raises:
+        ValueError: If the path format is unsupported or a lossy PDB write was not
+            acknowledged.
+    """
 
     target, format_name = _structure_path(path)
     if format_name == "mmcif":

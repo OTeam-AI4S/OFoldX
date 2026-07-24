@@ -1,8 +1,5 @@
 r"""
 AlphaFold 2 top-level model.
-
-This source file owns the AF2 public model class, template stack, native
-StructureModule geometry, and structure-prediction contract.
 """
 
 from __future__ import annotations
@@ -39,11 +36,13 @@ from .config import AlphaFold2Config, AlphaFold2EvoformerConfig, AlphaFold2Multi
 
 class AlphaFold2Model(Model):
     r"""
-    AlphaFold 2 structure-prediction model with AF2-shaped module boundaries.
+    Predict monomeric protein structures with AlphaFold 2.
 
-    The trunk is organized as input embedding, recycling embedding, optional
-    template embedding, extra-MSA Evoformer stack, main Evoformer stack, and
-    native AF2 structure/head modules.
+    Accepts [`AlphaFold2Input`][ofoldx.models.alphafold2.model.AlphaFold2Input] and returns
+    [`AlphaFold2Output`][ofoldx.models.alphafold2.model.AlphaFold2Output].
+
+    Args:
+        config: Model architecture and inference configuration.
     """
 
     config_class = AlphaFold2Config
@@ -204,20 +203,28 @@ class AlphaFold2Model(Model):
         recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
     ) -> AlphaFold2Output:
-        r"""Run recycling, structure generation, and every output head.
+        r"""
+        Run one AlphaFold 2 structure-prediction pass.
 
-        Gradients flow through the final recycle. This rule is independent of
-        ``train()``/``eval()``; those modes affect only ordinary dropout.
+        The input tensors use batch and residue axes ``(B, N)``. When
+        ``input.msa_features`` is absent, ``generator`` controls MSA row sampling,
+        masking, clustering, and extra-MSA cropping. Precomputed MSA features do
+        not consume this generator. Dropout follows the module's training mode and
+        uses PyTorch's ambient random state.
 
-        When ``input`` carries the raw alignment pool (``msa_features is None``) the
-        Model realizes ``sample_msa`` / ``make_masked_msa`` / clustering /
-        ``crop_extra_msa`` itself for every representation-ensemble member and
-        recycle, off ``generator``. It averages ``single``, ``pair``, and
-        ``msa_first_row`` before structure prediction; the monomer graph keeps the
-        first member's full MSA representation.
-        When ``input`` already carries realized ``msa_features`` (the precomputed-feature
-        input path) the draw is skipped and the input is consumed verbatim, so
-        that path is bit-identical to the pre-stochastic Model.
+        Args:
+            input: Monomer or multimer features aligned to ``B`` systems and ``N``
+                residues.
+            recycling_steps: Number of recycling iterations. ``None`` uses the
+                configured value.
+            generator: Optional generator for stochastic MSA feature construction.
+
+        Returns:
+            Predictions with atom37 coordinates in angstroms and tensor axes
+            described by [`AlphaFold2Output`][].
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive.
         """
 
         recycling_steps = operator.index(self._recycling_steps if recycling_steps is None else recycling_steps)
@@ -258,22 +265,27 @@ class AlphaFold2Model(Model):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Predict AlphaFold 2 monomer structures and return a ``FoldResult``.
+        r"""
+        Predict AlphaFold 2 monomer structures and return a ``FoldResult``.
 
         Args:
-            input: Single-system ``AlphaFold2Input``. Raw MSA pools are realized per sample and
-                recycle; precomputed ``msa_features`` are consumed unchanged.
+            input: Features for one protein, with batch size ``B = 1``.
             num_samples: Number of stochastic folding predictions to generate.
-            generator: Optional root PyTorch generator. Each sample draws an independent sub-seed
-                used for MSA realization.
+            generator: Optional generator for MSA sampling, masking, and cropping.
+                Each prediction draws an independent sub-generator.
             recycling_steps: Number of recycling iterations. ``None`` uses the configured value.
 
         Returns:
-            A ``FoldResult`` containing one canonical ``FoldPrediction`` per sample.
+            One generation-ordered prediction per sample. Structure coordinates
+            and PAE values are in angstroms; pLDDT is on the ``0--100`` scale.
 
         Notes:
             Predictions follow sample draw order. ``plddt`` and, when present, both ``pae`` axes
             follow ``input.layout.residue_sites``.
+
+        Raises:
+            ValueError: If ``num_samples`` or ``recycling_steps`` is not positive,
+                or if the input batch does not contain exactly one system.
         """
 
         num_samples = operator.index(num_samples)
@@ -291,7 +303,9 @@ class AlphaFold2Model(Model):
         return FoldResult(predictions=tuple(predictions))
 
     def _decode_prediction(self, output: AlphaFold2Output, input: AlphaFold2Input) -> FoldPrediction:
-        r"""Decode one AF2 forward pass into a canonical ``FoldPrediction``."""
+        r"""
+        Decode one monomer output into a structure and confidence values.
+        """
 
         layout = input.layout
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
@@ -324,7 +338,7 @@ class AlphaFold2Model(Model):
             + 0.5
         ) / plddt_logits.shape[-1]
         plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
-        pae = None if output.pae_logits is None else predicted_aligned_error(output.pae_logits[0], self.config)
+        pae = None if output.pae_logits is None else _predicted_aligned_error(output.pae_logits[0], self.config)
         scores = {"mean_plddt": Score(float(plddt.mean()), preferred="higher")}
         metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
         pair_metrics: dict[str, PairMetric] = {}
@@ -393,8 +407,8 @@ class AlphaFold2Model(Model):
         previous_msa_first_row: Tensor,
         previous_pair: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, _AlphaFold2InputT]:
-        # DeepMind monomer keeps the first MSA representation; multimer's scan
-        # overwrites MSA-only outputs and therefore keeps the last.
+        # Monomer aggregation retains the first MSA representation, whereas
+        # multimer aggregation retains the final ensemble representation.
         selected_msa = None
         selected_input = inputs[0]
         single_sum = None
@@ -430,7 +444,8 @@ class AlphaFold2Model(Model):
         )
 
     def _realize_msa(self, input: _AlphaFold2InputT, *, generator: torch.Generator | None) -> _AlphaFold2InputT:
-        r"""Realize one MSA-feature ensemble slice from the raw pool.
+        r"""
+        Realize one MSA-feature ensemble slice from the raw pool.
 
         Runs MSA sampling, masking, nearest-neighbor clustering, cluster
         summarization, extra-MSA cropping, and feature assembly over the raw
@@ -476,7 +491,7 @@ class AlphaFold2Model(Model):
         dtype: torch.dtype,
     ) -> _MsaRealization:
         cfg = self.config.msa
-        return realize_msa_features(
+        return _realize_msa_features(
             msa_tokens,
             msa_deletions,
             msa_profile,
@@ -565,11 +580,13 @@ class AlphaFold2Model(Model):
 
 class AlphaFold2MultimerModel(AlphaFold2Model):
     r"""
-    AlphaFold-Multimer structure-prediction model sharing the AF2 trunk.
+    Predict multimeric protein structures with AlphaFold-Multimer.
 
-    The submodules are constructed under the exact attribute names the inherited
-    ``AlphaFold2Model`` forward/recycling methods reference, so those methods are
-    reused verbatim across the shared trunk.
+    Accepts [`AlphaFold2MultimerInput`][ofoldx.models.alphafold2.model.AlphaFold2MultimerInput] and returns
+    [`AlphaFold2Output`][ofoldx.models.alphafold2.model.AlphaFold2Output].
+
+    Args:
+        config: Model architecture and inference configuration.
     """
 
     config_class = AlphaFold2MultimerConfig
@@ -731,7 +748,8 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         device: torch.device,
         dtype: torch.dtype,
     ) -> _MsaRealization:
-        r"""Realize one multimer MSA-feature ensemble slice from the raw pool.
+        r"""
+        Realize one multimer MSA-feature ensemble slice from the raw pool.
 
         Runs multimer MSA sampling, masking, nearest-neighbor clustering, and feature
         assembly over the raw paired alignment tensors supplied by the shared
@@ -740,7 +758,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         """
 
         cfg = self.config.msa
-        return realize_multimer_msa_features(
+        return _realize_multimer_msa_features(
             msa_tokens,
             msa_deletions,
             msa_profile,
@@ -767,22 +785,27 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Predict AlphaFold-Multimer structures and return a ``FoldResult``.
+        r"""
+        Predict AlphaFold-Multimer structures and return a ``FoldResult``.
 
         Args:
-            input: Single-system ``AlphaFold2MultimerInput``. Raw MSA pools are realized per sample
-                and recycle; precomputed ``msa_features`` are consumed unchanged.
+            input: Features for one assembly, with batch size ``B = 1``.
             num_samples: Number of stochastic folding predictions to generate.
-            generator: Optional root PyTorch generator. Each sample draws an independent sub-seed
-                used for MSA realization.
+            generator: Optional generator for MSA sampling, masking, and cropping.
+                Each prediction draws an independent sub-generator.
             recycling_steps: Number of recycling iterations. ``None`` uses the configured value.
 
         Returns:
-            A ``FoldResult`` containing one canonical ``FoldPrediction`` per sample.
+            One generation-ordered prediction per sample. Structure coordinates
+            and PAE values are in angstroms; pLDDT is on the ``0--100`` scale.
 
         Notes:
             Predictions follow sample draw order. ``plddt`` and both ``pae`` axes follow
             ``input.layout.residue_sites``.
+
+        Raises:
+            ValueError: If ``num_samples`` or ``recycling_steps`` is not positive,
+                or if the input batch does not contain exactly one system.
         """
 
         num_samples = operator.index(num_samples)
@@ -800,12 +823,13 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         return FoldResult(predictions=tuple(predictions))
 
     def _decode_multimer_prediction(self, output: AlphaFold2Output, input: AlphaFold2MultimerInput) -> FoldPrediction:
-        r"""Decode one AF-Multimer forward pass into a canonical ``FoldPrediction``."""
+        r"""
+        Decode one multimer output into a structure and confidence values.
+        """
 
         layout = input.layout
-        # Chain permutation is canonical-ordering only at inference: there is no
-        # ground-truth assembly to permute predicted symmetric copies against, so
-        # residue_sites labels come straight from the Processor's concatenation.
+        # There is no target assembly against which to permute symmetric copies.
+        # Residue labels therefore retain the Processor's concatenation order.
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
@@ -834,9 +858,11 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
 
         pae_logits = output.pae_logits
         assert pae_logits is not None  # the multimer TM head is always constructed
-        pae = predicted_aligned_error(pae_logits[0], self.config)
+        pae = _predicted_aligned_error(pae_logits[0], self.config)
         ptm = alphafold2_predicted_tm_score(pae_logits[0], input.sequence_mask[0], self.config)
-        iptm = predicted_interface_tm_score(pae_logits[0], input.chain_index[0], input.sequence_mask[0], self.config)
+        iptm = alphafold2_predicted_interface_tm_score(
+            pae_logits[0], input.chain_index[0], input.sequence_mask[0], self.config
+        )
         weights = self.config.heads.predicted_aligned_error
         ranking_score = weights.iptm_weight * iptm + weights.ptm_weight * ptm
 
@@ -914,7 +940,7 @@ class AlphaFold2StructureModule(nn.Module):
         initial_act = act
         act = self.input_projection(act)
         pair = self.pair_norm(pair)
-        affine = QuatAffine.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
+        affine = AlphaFold2QuatAffine.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
 
         affines = []
         for _ in range(self.num_blocks):
@@ -933,8 +959,8 @@ class AlphaFold2StructureModule(nn.Module):
             [1.0, 1.0, 1.0, 1.0, self.position_scale, self.position_scale, self.position_scale],
         )
         traj = traj * traj_scale
-        atom14_mask = residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -949,11 +975,8 @@ class AlphaFold2StructureModule(nn.Module):
 
 
 class AlphaFold2MultimerStructureModule(nn.Module):
-    r"""AF-Multimer structure module.
-
-    Same shells as the monomer [`AlphaFold2StructureModule`][] (single/pair layer norms,
-    initial projection, and one shared-weight block run ``num_blocks`` times) but starting
-    from an identity rotation-matrix rigid and using the multimer block.
+    r"""
+    AF-Multimer structure module.
     """
 
     def __init__(
@@ -1002,7 +1025,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         initial_act = act
         act = self.input_projection(act)
         pair = self.pair_norm(pair)
-        rigid = Rigid.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
+        rigid = AlphaFold2Rigid.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
 
         frames = []
         for _ in range(self.num_blocks):
@@ -1020,8 +1043,8 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             )
 
         traj = torch.stack(frames, dim=0)
-        atom14_mask = residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -1036,7 +1059,9 @@ class AlphaFold2MultimerStructureModule(nn.Module):
 
 
 class AlphaFold2TemplateEmbedder(nn.Module):
-    r"""Embed AF2 template pair features."""
+    r"""
+    Embed AF2 template pair features.
+    """
 
     def __init__(
         self,
@@ -1115,13 +1140,8 @@ class AlphaFold2TemplateEmbedder(nn.Module):
 
 
 class AlphaFold2MultimerTemplateEmbedder(nn.Module):
-    r"""AF-Multimer template pair embedder.
-
-    Runs [`AlphaFold2MultimerSingleTemplateEmbedder`][] over every template, averages
-    the per-template pair activations, applies ReLU, and projects to the pair channel.
-    Backbone unit vectors are built from atom37 coordinates in the model graph; the
-    cross-chain ``multichain_mask`` restricts template features to same-chain residue
-    pairs.
+    r"""
+    AF-Multimer template pair embedder.
     """
 
     def __init__(
@@ -1216,7 +1236,7 @@ class AlphaFold2InputEmbeddings(nn.Module):
         pair_left = self.pair_left_projection(token_features)
         pair_right = self.pair_right_projection(token_features)
         pair = pair_left.unsqueeze(-2) + pair_right.unsqueeze(-3)
-        relpos = clipped_relative_position(input.residue_index, self.max_relative_feature).to(
+        relpos = _clipped_relative_position(input.residue_index, self.max_relative_feature).to(
             device=pair.device,
             dtype=pair.dtype,
         )
@@ -1242,13 +1262,7 @@ class AlphaFold2InputEmbeddings(nn.Module):
 
 class AlphaFold2MultimerInputEmbeddings(nn.Module):
     r"""
-    Build initial token/MSA/pair activations with chain-relative positional
-    encoding.
-
-    With ``use_chain_relative`` the relative-position feature is the concatenation of a
-    within-chain clipped offset one-hot (with one extra different-chain bin), a
-    same-entity flag, and a cross-chain asym-difference one-hot (with one extra
-    different-entity bin).
+    Build initial token/MSA/pair activations with chain-relative positional encoding.
     """
 
     def __init__(
@@ -1511,12 +1525,8 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
 
 
 class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
-    r"""Embed one AF-Multimer template into pair space.
-
-    Nine per-feature linear projections sum a masked pseudo-beta distogram, the pair
-    pseudo-beta mask, row/column template residue-type one-hots, backbone-frame unit
-    vector components, the backbone-pair mask, and the layer-normalized query pair
-    embedding. A two-block template pair stack and final layer norm refine the result.
+    r"""
+    Embed one AF-Multimer template into pair space.
     """
 
     def __init__(
@@ -1651,10 +1661,8 @@ class AlphaFold2TemplateMsaEmbedder(nn.Module):
 
 
 class AlphaFold2MultimerTemplateMsaEmbedder(nn.Module):
-    r"""Embed AF-Multimer template chi features as MSA rows.
-
-    Projects per-template chi-angle features (22 residue-type one-hots + sin/cos of the four chi
-    angles + chi mask = 34 channels) to the MSA channel and adds them as extra MSA rows.
+    r"""
+    Embed AF-Multimer template chi features as MSA rows.
     """
 
     def __init__(self, *, msa_size: int, vocab_size: int = 22) -> None:
@@ -1685,7 +1693,9 @@ class AlphaFold2MultimerTemplateMsaEmbedder(nn.Module):
 
 
 class AlphaFold2TemplatePairStack(nn.Module):
-    r"""Homogeneous stack of AF2 template-pair blocks."""
+    r"""
+    Homogeneous stack of AF2 template-pair blocks.
+    """
 
     def __init__(
         self,
@@ -1726,9 +1736,9 @@ class AlphaFold2TemplatePairStack(nn.Module):
 
 class AlphaFold2TemplatePairBlock(nn.Module):
     r"""
-    Triangle update block over the template pair representation: triangle attention (starting and
-    ending node), triangle multiplication (outgoing and incoming), and a transition.
-    ``triangle_multiplication_first`` selects AF-Multimer ordering instead of monomer ordering.
+    Update a template pair representation with triangle operations.
+
+    ``triangle_multiplication_first`` selects the multimer operation order.
     """
 
     def __init__(
@@ -1849,10 +1859,10 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         act: Tensor,
         pair: Tensor,
         mask: Tensor,
-        affine: QuatAffine,
+        affine: AlphaFold2QuatAffine,
         initial_act: Tensor,
         residue_type: Tensor,
-    ) -> tuple[Tensor, QuatAffine, Tensor, Tensor, Tensor, QuatAffine]:
+    ) -> tuple[Tensor, AlphaFold2QuatAffine, Tensor, Tensor, Tensor, AlphaFold2QuatAffine]:
         attn = self.invariant_point_attention(inputs_1d=act, inputs_2d=pair, mask=mask, affine=affine)
         act = self.attention_norm(act + self.dropout(attn))
         act = self.transition_norm(act + self.dropout(self.transition(act)))
@@ -1866,11 +1876,8 @@ class AlphaFold2StructureModuleBlock(nn.Module):
 
 
 class AlphaFold2MultimerStructureModuleBlock(nn.Module):
-    r"""One shared-weight AF-Multimer structure-module iteration.
-
-    Same block topology as the monomer [`AlphaFold2StructureModuleBlock`][] (IPA + attention layer norm,
-    transition + layer norm, backbone update, side-chain resnet) but with the multimer IPA
-    and the [`AlphaFold2MultimerBackboneUpdate`][] backbone update composed onto a rotation-matrix rigid.
+    r"""
+    One shared-weight AF-Multimer structure-module iteration.
     """
 
     def __init__(
@@ -1920,10 +1927,10 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         act: Tensor,
         pair: Tensor,
         mask: Tensor,
-        rigid: Rigid,
+        rigid: AlphaFold2Rigid,
         initial_act: Tensor,
         residue_type: Tensor,
-    ) -> tuple[Tensor, Rigid, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, AlphaFold2Rigid, Tensor, Tensor, Tensor]:
         attn = self.invariant_point_attention(single=act, pair=pair, mask=mask, rigid=rigid)
         act = self.attention_norm(act + self.dropout(attn))
         act = self.transition_norm(act + self.dropout(self.transition(act)))
@@ -1933,7 +1940,7 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
             (act, initial_act),
             residue_type,
         )
-        rigid_next = Rigid(rotation=rigid.rotation.detach(), translation=rigid.translation)
+        rigid_next = AlphaFold2Rigid(rotation=rigid.rotation.detach(), translation=rigid.translation)
         return act, rigid_next, angles, unnormalized_angles, atom14_positions
 
 
@@ -1973,7 +1980,7 @@ class AlphaFold2InvariantPointAttention(nn.Module):
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
-    def forward(self, *, inputs_1d: Tensor, inputs_2d: Tensor, mask: Tensor, affine: QuatAffine) -> Tensor:
+    def forward(self, *, inputs_1d: Tensor, inputs_2d: Tensor, mask: Tensor, affine: AlphaFold2QuatAffine) -> Tensor:
         num_heads = self.num_heads
         q_scalar = self.query_scalar_projection(inputs_1d).unflatten(-1, (num_heads, self.num_scalar_qk))
         kv_scalar = self.key_value_scalar_projection(inputs_1d).unflatten(
@@ -2034,12 +2041,8 @@ class AlphaFold2InvariantPointAttention(nn.Module):
 
 
 class AlphaFold2MultimerInvariantPointAttention(nn.Module):
-    r"""AF-Multimer invariant point attention (Algorithm 22, multimer variant).
-
-    Differs from monomer invariant point attention in three ways: separate bias-free
-    q/k/v scalar projections; per-head point projections in the global frame; and
-    multimer logit normalization with per-term weights, ``1/√3`` scaling of the summed
-    logits, additive ``inf`` masking, and softmax over the key axis.
+    r"""
+    AF-Multimer invariant point attention (Algorithm 22, multimer variant).
     """
 
     def __init__(
@@ -2072,7 +2075,7 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         output_size = num_heads * (pair_size + num_scalar_v + num_point_v * 4)
         self.output_projection = nn.Linear(output_size, hidden_size)
 
-    def forward(self, *, single: Tensor, pair: Tensor, mask: Tensor, rigid: Rigid) -> Tensor:
+    def forward(self, *, single: Tensor, pair: Tensor, mask: Tensor, rigid: AlphaFold2Rigid) -> Tensor:
         num_heads = self.num_heads
 
         point_variance = max(self.num_point_qk, 1) * 9.0 / 2.0
@@ -2130,10 +2133,8 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
 
 
 class AlphaFold2MultimerPointProjection(nn.Module):
-    r"""Project AF-Multimer per-head points into global backbone frames.
-
-    The flat output is read as ``[H, 3, P]`` and reordered to ``[H, P, 3]`` before
-    each residue's rigid transform is applied.
+    r"""
+    Project AF-Multimer per-head points into global backbone frames.
     """
 
     def __init__(self, hidden_size: int, num_points: int, num_heads: int) -> None:
@@ -2142,7 +2143,7 @@ class AlphaFold2MultimerPointProjection(nn.Module):
         self.num_points = num_points
         self.point_projection = nn.Linear(hidden_size, num_heads * 3 * num_points)
 
-    def forward(self, single: Tensor, rigid: Rigid) -> Tensor:
+    def forward(self, single: Tensor, rigid: AlphaFold2Rigid) -> Tensor:
         points_local = self.point_projection(single)
         points_local = points_local.view(*points_local.shape[:-1], self.num_heads, 3, self.num_points)
         points_local = points_local.movedim(-2, -1)
@@ -2150,11 +2151,8 @@ class AlphaFold2MultimerPointProjection(nn.Module):
 
 
 class AlphaFold2MultimerBackboneUpdate(nn.Module):
-    r"""Predict one AF-Multimer backbone rigid update.
-
-    Predicts a per-residue rigid from six values: the first three are the imaginary part of
-    a quaternion (real part fixed to 1, then normalized) giving a rotation; the last
-    three are a translation.
+    r"""
+    Predict one AF-Multimer backbone rigid update.
     """
 
     def __init__(self, hidden_size: int) -> None:
@@ -2163,20 +2161,21 @@ class AlphaFold2MultimerBackboneUpdate(nn.Module):
         nn.init.zeros_(self.projection.weight)
         nn.init.zeros_(self.projection.bias)
 
-    def forward(self, single: Tensor) -> Rigid:
+    def forward(self, single: Tensor) -> AlphaFold2Rigid:
         rigid_flat = self.projection(single)
         qx, qy, qz, tx, ty, tz = rigid_flat.unbind(dim=-1)
         quaternion = torch.stack([torch.ones_like(qx), qx, qy, qz], dim=-1)
         quaternion = F.normalize(quaternion, dim=-1)
-        rotation = quat_to_rot(quaternion)
+        rotation = _quat_to_rot(quaternion)
         translation = torch.stack([tx, ty, tz], dim=-1)
-        return Rigid(rotation=rotation, translation=translation)
+        return AlphaFold2Rigid(rotation=rotation, translation=translation)
 
 
 class AlphaFold2StructureTransition(nn.Module):
     r"""
-    Point-wise transition on the structure-module single representation (ReLU between
-    linear layers, none after the last; the final layer is zero-initialized).
+    Apply a point-wise transition to structure-module single features.
+
+    ReLU separates the projections, and the final projection is zero-initialized.
     """
 
     def __init__(self, *, hidden_size: int, num_projections: int) -> None:
@@ -2216,7 +2215,7 @@ class AlphaFold2Sidechain(nn.Module):
 
     def forward(
         self,
-        affine: QuatAffine,
+        affine: AlphaFold2QuatAffine,
         representations: tuple[Tensor, Tensor],
         residue_type: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -2225,15 +2224,16 @@ class AlphaFold2Sidechain(nn.Module):
             act = block(act)
         unnormalized_angles = self.angle_projection(F.relu(act)).unflatten(-1, (7, 2))
         angles = F.normalize(unnormalized_angles, dim=-1)
-        frames = torsion_angles_to_frames(residue_type, affine.to_rigid(), angles)
-        atom_pos = frames_and_literature_positions_to_atom14_pos(residue_type, frames)
+        frames = _torsion_angles_to_frames(residue_type, affine.to_rigid(), angles)
+        atom_pos = _frames_and_literature_positions_to_atom14_pos(residue_type, frames)
         return angles, unnormalized_angles, atom_pos
 
 
 class AlphaFold2SidechainBlock(nn.Module):
     r"""
-    Two-layer residual block (ReLU pre-activations, zero-initialized final layer) used by
-    [`AlphaFold2Sidechain`][] to refine the side-chain activations.
+    Refine side-chain activations with a two-layer residual block.
+
+    The block uses ReLU pre-activations and a zero-initialized final projection.
     """
 
     def __init__(self, hidden_size: int) -> None:
@@ -2251,7 +2251,7 @@ class AlphaFold2SidechainBlock(nn.Module):
 
 
 @dataclass
-class Rigid:
+class AlphaFold2Rigid:
     r"""
     Batched rigid transform represented by rotation matrices and translations.
     """
@@ -2260,43 +2260,43 @@ class Rigid:
     translation: Tensor
 
     @classmethod
-    def from_tensor4x4(cls, tensor: Tensor) -> Rigid:
+    def from_tensor4x4(cls, tensor: Tensor) -> AlphaFold2Rigid:
         return cls(rotation=tensor[..., :3, :3], translation=tensor[..., :3, 3])
 
     def apply(self, points: Tensor) -> Tensor:
         return torch.matmul(self.rotation, points.unsqueeze(-1)).squeeze(-1) + self.translation
 
-    def compose(self, other: Rigid) -> Rigid:
+    def compose(self, other: AlphaFold2Rigid) -> AlphaFold2Rigid:
         rotation = self.rotation @ other.rotation
         translation = self.apply(other.translation)
-        return Rigid(rotation=rotation, translation=translation)
+        return AlphaFold2Rigid(rotation=rotation, translation=translation)
 
-    def compose_rotation(self, rotation: Tensor) -> Rigid:
-        return Rigid(rotation=self.rotation @ rotation, translation=self.translation)
+    def compose_rotation(self, rotation: Tensor) -> AlphaFold2Rigid:
+        return AlphaFold2Rigid(rotation=self.rotation @ rotation, translation=self.translation)
 
-    def with_group_axis(self) -> Rigid:
-        return Rigid(rotation=self.rotation.unsqueeze(-3), translation=self.translation.unsqueeze(-2))
+    def with_group_axis(self) -> AlphaFold2Rigid:
+        return AlphaFold2Rigid(rotation=self.rotation.unsqueeze(-3), translation=self.translation.unsqueeze(-2))
 
     @classmethod
-    def identity(cls, shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> Rigid:
+    def identity(cls, shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> AlphaFold2Rigid:
         rotation = torch.eye(3, device=device, dtype=dtype).expand(*shape, 3, 3).clone()
         translation = torch.zeros(*shape, 3, device=device, dtype=dtype)
         return cls(rotation=rotation, translation=translation)
 
-    def to_rigid(self) -> Rigid:
+    def to_rigid(self) -> AlphaFold2Rigid:
         # Adapter so [`AlphaFold2Sidechain`][] (which calls ``affine.to_rigid()``) can
         # consume a bare rotation-matrix rigid from the multimer structure module.
         return self
 
-    def scale_translation(self, position_scale: float) -> Rigid:
-        return Rigid(rotation=self.rotation, translation=self.translation * position_scale)
+    def scale_translation(self, position_scale: float) -> AlphaFold2Rigid:
+        return AlphaFold2Rigid(rotation=self.rotation, translation=self.translation * position_scale)
 
-    def detach_rotation(self) -> Rigid:
-        return Rigid(rotation=self.rotation.detach(), translation=self.translation)
+    def detach_rotation(self) -> AlphaFold2Rigid:
+        return AlphaFold2Rigid(rotation=self.rotation.detach(), translation=self.translation)
 
 
 @dataclass
-class QuatAffine:
+class AlphaFold2QuatAffine:
     r"""
     AF2 backbone affine represented by a quaternion, rotation, and translation.
     """
@@ -2306,7 +2306,9 @@ class QuatAffine:
     translation: Tensor
 
     @classmethod
-    def identity(cls, shape: torch.Size | tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> QuatAffine:
+    def identity(
+        cls, shape: torch.Size | tuple[int, ...], *, device: torch.device, dtype: torch.dtype
+    ) -> AlphaFold2QuatAffine:
         quaternion = torch.zeros(*shape, 4, device=device, dtype=dtype)
         quaternion[..., 0] = 1.0
         rotation = torch.eye(3, device=device, dtype=dtype).expand(*shape, 3, 3).clone()
@@ -2314,39 +2316,39 @@ class QuatAffine:
         return cls(quaternion=quaternion, rotation=rotation, translation=translation)
 
     @classmethod
-    def from_tensor(cls, tensor: Tensor, *, normalize: bool = False) -> QuatAffine:
+    def from_tensor(cls, tensor: Tensor, *, normalize: bool = False) -> AlphaFold2QuatAffine:
         quaternion = tensor[..., :4]
         if normalize:
             quaternion = F.normalize(quaternion, dim=-1)
-        return cls(quaternion=quaternion, rotation=quat_to_rot(quaternion), translation=tensor[..., 4:7])
+        return cls(quaternion=quaternion, rotation=_quat_to_rot(quaternion), translation=tensor[..., 4:7])
 
     def to_tensor(self) -> Tensor:
         return torch.cat([self.quaternion, self.translation], dim=-1)
 
-    def to_rigid(self) -> Rigid:
-        return Rigid(rotation=self.rotation, translation=self.translation)
+    def to_rigid(self) -> AlphaFold2Rigid:
+        return AlphaFold2Rigid(rotation=self.rotation, translation=self.translation)
 
-    def scale_translation(self, position_scale: float) -> QuatAffine:
-        return QuatAffine(
+    def scale_translation(self, position_scale: float) -> AlphaFold2QuatAffine:
+        return AlphaFold2QuatAffine(
             quaternion=self.quaternion,
             rotation=self.rotation,
             translation=self.translation * position_scale,
         )
 
-    def detach_rotation(self) -> QuatAffine:
-        return QuatAffine(
+    def detach_rotation(self) -> AlphaFold2QuatAffine:
+        return AlphaFold2QuatAffine(
             quaternion=self.quaternion.detach(),
             rotation=self.rotation.detach(),
             translation=self.translation,
         )
 
-    def pre_compose(self, update: Tensor) -> QuatAffine:
+    def pre_compose(self, update: Tensor) -> AlphaFold2QuatAffine:
         vector_quaternion_update = update[..., :3]
         translation_update = update[..., 3:6]
-        quaternion = self.quaternion + quat_multiply_by_vec(self.quaternion, vector_quaternion_update)
+        quaternion = self.quaternion + _quat_multiply_by_vec(self.quaternion, vector_quaternion_update)
         translation = self.translation + torch.matmul(self.rotation, translation_update.unsqueeze(-1)).squeeze(-1)
         quaternion = F.normalize(quaternion, dim=-1)
-        return QuatAffine(quaternion=quaternion, rotation=quat_to_rot(quaternion), translation=translation)
+        return AlphaFold2QuatAffine(quaternion=quaternion, rotation=_quat_to_rot(quaternion), translation=translation)
 
     def apply_to_point(self, point: Tensor, *, extra_dims: int = 0) -> Tensor:
         rotation = self.rotation
@@ -2368,8 +2370,7 @@ class QuatAffine:
 
 class AlphaFold2PredictedLddtHead(nn.Module):
     r"""
-    Predict per-residue pLDDT confidence bin logits from the structure-module single
-    representation (layer norm, two ReLU projections, zero-initialized ``num_bins`` logits).
+    Predict per-residue pLDDT confidence-bin logits.
     """
 
     def __init__(self, *, input_size: int, hidden_size: int, num_bins: int) -> None:
@@ -2390,8 +2391,7 @@ class AlphaFold2PredictedLddtHead(nn.Module):
 
 class AlphaFold2PredictedAlignedErrorHead(nn.Module):
     r"""
-    Predict predicted-aligned-error bin logits per residue pair from the pair representation
-    (a single zero-initialized ``num_bins`` linear projection).
+    Predict aligned-error bin logits for each residue pair.
     """
 
     def __init__(self, *, pair_size: int, num_bins: int) -> None:
@@ -2406,8 +2406,7 @@ class AlphaFold2PredictedAlignedErrorHead(nn.Module):
 
 class AlphaFold2ExperimentallyResolvedHead(nn.Module):
     r"""
-    Predict per-atom experimentally-resolved logits from the single representation
-    (one zero-initialized linear projection over ``num_atom_types``).
+    Predict experimentally resolved logits for each atom.
     """
 
     def __init__(self, *, input_size: int, num_atom_types: int) -> None:
@@ -2422,8 +2421,7 @@ class AlphaFold2ExperimentallyResolvedHead(nn.Module):
 
 class AlphaFold2MaskedMsaHead(nn.Module):
     r"""
-    Predict masked-MSA token logits from the MSA representation for the BERT-style reconstruction
-    objective (one zero-initialized linear projection over ``num_output`` token classes).
+    Predict token logits for masked-MSA reconstruction.
     """
 
     def __init__(self, *, msa_size: int, num_output: int) -> None:
@@ -2441,7 +2439,9 @@ class AlphaFold2MaskedMsaHead(nn.Module):
 
 
 class _AlphaFold2RecyclingInput(Protocol):
-    r"""Tensor fields shared by monomer and multimer recycling."""
+    r"""
+    Tensor fields shared by monomer and multimer recycling.
+    """
 
     residue_type: Tensor
     token_features: Tensor
@@ -2462,7 +2462,8 @@ _MsaRealization = tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
 
 def _sample_generator(root: torch.Generator | None, device: torch.device) -> torch.Generator | None:
-    r"""Draw one independent per-sample sub-generator off the root stream.
+    r"""
+    Draw one independent per-sample sub-generator off the root stream.
 
     Returns ``None`` when ``root`` is ``None`` so per-sample draws fall through to
     the ambient default RNG (still stochastic, reproducible only under an explicit
@@ -2477,7 +2478,7 @@ def _sample_generator(root: torch.Generator | None, device: torch.device) -> tor
     return torch.Generator(device=device).manual_seed(sub_seed)
 
 
-def realize_msa_features(
+def _realize_msa_features(
     msa_tokens: Tensor,
     msa_deletions: Tensor,
     msa_profile: Tensor,
@@ -2495,7 +2496,8 @@ def realize_msa_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    r"""Realize one AF2 MSA-feature ensemble slice (unbatched).
+    r"""
+    Realize one AF2 MSA-feature ensemble slice (unbatched).
 
     The per-recycle sequence is MSA row sampling, BERT masking before clustering,
     nearest-neighbor clustering, cluster summarization, extra-MSA cropping, and feature
@@ -2567,7 +2569,9 @@ def _sample_msa(
     max_seq: int,
     generator: torch.Generator | None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Permute MSA rows (query fixed at row 0), keep ``max_seq``, spill the rest."""
+    r"""
+    Permute MSA rows (query fixed at row 0), keep ``max_seq``, spill the rest.
+    """
 
     num_seq = tokens.shape[0]
     device = tokens.device
@@ -2594,7 +2598,9 @@ def _make_masked_msa(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    r"""BERT-corrupt the sampled MSA; emit ``(bert_msa, bert_mask, true_msa)``."""
+    r"""
+    BERT-corrupt the sampled MSA; emit ``(bert_msa, bert_mask, true_msa)``.
+    """
 
     random_aa = torch.tensor([0.05] * 20 + [0.0, 0.0], dtype=dtype, device=device)
     one_hot_msa = F.one_hot(tokens.clamp(max=21), num_classes=22).to(dtype)
@@ -2608,7 +2614,9 @@ def _make_masked_msa(
 
 
 def _shaped_categorical(probs: Tensor, generator: torch.Generator | None, epsilon: float = 1e-10) -> Tensor:
-    r"""Sample one class per cell from ``probs`` using ``generator`` (reproducible)."""
+    r"""
+    Sample one class per cell from ``probs`` using ``generator`` (reproducible).
+    """
 
     shape = probs.shape
     flat = (probs + epsilon).reshape(-1, shape[-1])
@@ -2625,7 +2633,9 @@ def _nearest_neighbor_clusters(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    r"""Assign each extra sequence to its closest cluster by weighted Hamming agreement."""
+    r"""
+    Assign each extra sequence to its closest cluster by weighted Hamming agreement.
+    """
 
     weights = torch.cat(
         [
@@ -2646,7 +2656,9 @@ def _nearest_neighbor_clusters(
 
 
 def _unsorted_segment_sum(data: Tensor, segment_ids: Tensor, num_segments: int) -> Tensor:
-    r"""Sum ``data`` rows into ``num_segments`` bins indexed by ``segment_ids``."""
+    r"""
+    Sum ``data`` rows into ``num_segments`` bins indexed by ``segment_ids``.
+    """
 
     index = segment_ids.reshape(segment_ids.shape[0], *((1,) * (data.dim() - 1))).expand_as(data)
     output = torch.zeros((num_segments, *data.shape[1:]), device=data.device, dtype=data.dtype)
@@ -2663,12 +2675,16 @@ def _summarize_clusters(
     assignment: Tensor,
     dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor]:
-    r"""Average per-cluster profile and deletion mean, including the cluster center."""
+    r"""
+    Average per-cluster profile and deletion mean, including the cluster center.
+    """
 
     num_seq = msa_tokens.shape[0]
 
     def cluster_sum(values: Tensor) -> Tensor:
-        r"""Sum extra-MSA rows into their assigned cluster centers (segment sum over ``assignment``)."""
+        r"""
+        Sum extra-MSA rows into their assigned cluster centers (segment sum over ``assignment``).
+        """
         return _unsorted_segment_sum(values, assignment, num_seq)
 
     mask_counts = 1e-6 + msa_mask + cluster_sum(extra_mask)
@@ -2688,7 +2704,9 @@ def _crop_extra_msa(
     generator: torch.Generator | None,
     device: torch.device,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    r"""Randomly subselect at most ``max_extra_msa`` extra rows."""
+    r"""
+    Randomly subselect at most ``max_extra_msa`` extra rows.
+    """
 
     num_seq = extra_tokens.shape[0]
     if num_seq == 0 or not max_extra_msa:
@@ -2705,7 +2723,9 @@ def _make_msa_features(
     cluster_deletion_mean: Tensor | None,
     dtype: torch.dtype,
 ) -> Tensor:
-    r"""Concatenate the 49-channel clustered MSA feature."""
+    r"""
+    Concatenate the 49-channel clustered MSA feature.
+    """
 
     msa_one_hot = F.one_hot(msa_tokens.clamp(max=22), num_classes=23).to(dtype)
     has_deletion = msa_deletions.clamp(0.0, 1.0).unsqueeze(-1)
@@ -2718,7 +2738,9 @@ def _make_msa_features(
 
 
 def _make_extra_msa_features(extra_tokens: Tensor, extra_deletions: Tensor, dtype: torch.dtype) -> Tensor:
-    r"""Concatenate the 25-channel extra-MSA feature."""
+    r"""
+    Concatenate the 25-channel extra-MSA feature.
+    """
 
     extra_one_hot = F.one_hot(extra_tokens.clamp(max=22), num_classes=23).to(dtype)
     has_deletion = extra_deletions.clamp(0.0, 1.0).unsqueeze(-1)
@@ -2729,28 +2751,26 @@ def _make_extra_msa_features(extra_tokens: Tensor, extra_deletions: Tensor, dtyp
 # ===========================================================================
 # AlphaFold-Multimer stochastic MSA realization.
 #
-# The multimer feature pipeline diverges from the monomer in the MSA
-# draw itself (OpenFold ``data_transforms_multimer``): ``sample_msa`` selects rows
-# by a Gumbel argsort with the query row pinned via ``cluster_bias_mask`` (not a
-# plain permutation) and crops the extra axis in the same step;
-# ``make_masked_msa`` corrupts over a 22-class alphabet with a Gumbel-max draw;
-# ``nearest_neighbor_clusters`` uses a softmax *soft* assignment (not a hard
-# argmax) and folds ``summarize_clusters`` into the same pass. These are genuine
-# monomer/multimer algorithm differences, so dedicated multimer helpers keep the
-# monomer path free of mode-dependent branches.
+# The multimer feature path samples MSA rows by Gumbel argsort while pinning
+# the query row, crops the extra axis in the same operation, corrupts tokens over
+# a 22-class alphabet with a Gumbel-max draw, and uses soft nearest-neighbor
+# cluster assignment. Dedicated helpers keep these multimer semantics out of the
+# monomer path.
 # ===========================================================================
 
 
 def _gumbel_noise(
     shape: tuple[int, ...], generator: torch.Generator | None, device: torch.device, eps: float = 1e-6
 ) -> Tensor:
-    r"""Draw Gumbel(0, 1) noise from ``generator``."""
+    r"""
+    Draw Gumbel(0, 1) noise from ``generator``.
+    """
 
     uniform = torch.rand(shape, dtype=torch.float32, device=device, generator=generator)
     return -torch.log(-torch.log(uniform + eps) + eps)
 
 
-def realize_multimer_msa_features(
+def _realize_multimer_msa_features(
     msa_tokens: Tensor,
     msa_deletions: Tensor,
     msa_profile: Tensor,
@@ -2768,7 +2788,8 @@ def realize_multimer_msa_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    r"""Realize one AF-Multimer MSA-feature ensemble slice (unbatched).
+    r"""
+    Realize one AF-Multimer MSA-feature ensemble slice (unbatched).
 
     The multimer per-recycle sequence is MSA row sampling, 22-class Gumbel-max BERT
     masking before clustering, soft nearest-neighbor assignment with cluster
@@ -2852,7 +2873,8 @@ def _multimer_sample_msa(
     device: torch.device,
     inf: float = 1e6,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    r"""Gumbel-argsort row selection with the query row pinned; crop extra in one step.
+    r"""
+    Gumbel-argsort row selection with the query row pinned; crop extra in one step.
 
     Rows with no valid position are pushed to ``-inf``, the query row (index 0) is
     pinned to ``+inf`` via ``cluster_bias_mask``, and a Gumbel argsort draws the
@@ -2892,7 +2914,8 @@ def _multimer_make_masked_msa(
     dtype: torch.dtype,
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    r"""22-class Gumbel-max BERT corruption; emit ``(bert_msa, bert_mask, true_msa)``.
+    r"""
+    22-class Gumbel-max BERT corruption; emit ``(bert_msa, bert_mask, true_msa)``.
 
     The categorical is a 22-class mix (uniform / full-pool profile / identity) padded
     with the mask class. The row mask gates corruption sites, and replacement uses a
@@ -2924,7 +2947,8 @@ def _multimer_nearest_neighbor_clusters(
     gap_agreement_weight: float,
     dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor]:
-    r"""Softmax soft-assign each extra row to clusters; average profile + deletion mean.
+    r"""
+    Softmax soft-assign each extra row to clusters; average profile + deletion mean.
 
     Uses ``softmax(1e3 * agreement)`` over 23-class one-hots; the corrupted MSA may
     carry the mask token, and each cluster centre contributes to its own ``+1`` count.
@@ -2958,7 +2982,9 @@ def _multimer_make_msa_features(
     cluster_deletion_mean: Tensor,
     dtype: torch.dtype,
 ) -> Tensor:
-    r"""Concatenate the multimer 49-channel clustered MSA feature."""
+    r"""
+    Concatenate the multimer 49-channel clustered MSA feature.
+    """
 
     msa_one_hot = F.one_hot(msa_tokens.clamp(max=22), num_classes=23).to(dtype)
     has_deletion = msa_deletions.clamp(0.0, 1.0).unsqueeze(-1)
@@ -2969,8 +2995,10 @@ def _multimer_make_msa_features(
     )
 
 
-def predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.ndarray:
-    r"""Return expected aligned error in Ångström for one AF2 example."""
+def _predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.ndarray:
+    r"""
+    Return expected aligned error in Ångström for one AF2 example.
+    """
 
     max_error = config.heads.predicted_aligned_error.max_error_bin
     breaks = torch.linspace(0.0, max_error, logits.shape[-1] - 1, device=logits.device)
@@ -2980,7 +3008,17 @@ def predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.ndar
 
 
 def alphafold2_predicted_tm_score(logits: Tensor, sequence_mask: Tensor, config: AlphaFold2Config) -> float:
-    r"""Compute the monomer pTM confidence from PAE logits."""
+    r"""
+    Compute monomer pTM confidence from predicted-aligned-error logits.
+
+    Args:
+        logits: PAE logits for one protein with shape ``(N, N, D)``.
+        sequence_mask: Valid-residue mask with shape ``(N,)``.
+        config: AlphaFold 2 configuration defining the PAE bins.
+
+    Returns:
+        The scalar predicted TM score in ``[0, 1]``.
+    """
 
     breaks = torch.linspace(
         0.0,
@@ -3021,8 +3059,10 @@ def _residue_type_atom37_to_atom14_tables() -> tuple[np.ndarray, np.ndarray]:
 _RESIDUE_TYPE_ATOM37_TO_ATOM14, _RESIDUE_TYPE_ATOM37_MASK = _residue_type_atom37_to_atom14_tables()
 
 
-def quat_to_rot(normalized_quat: Tensor) -> Tensor:
-    r"""Convert a normalized ``(w, x, y, z)`` quaternion to its ``(..., 3, 3)`` rotation matrix."""
+def _quat_to_rot(normalized_quat: Tensor) -> Tensor:
+    r"""
+    Convert a normalized ``(w, x, y, z)`` quaternion to its ``(..., 3, 3)`` rotation matrix.
+    """
 
     w, x, y, z = normalized_quat.unbind(dim=-1)
     return torch.stack(
@@ -3035,8 +3075,10 @@ def quat_to_rot(normalized_quat: Tensor) -> Tensor:
     )
 
 
-def quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
-    r"""Hamilton-multiply a quaternion by the pure quaternion ``(0, vec)``, returning the 4-vector product."""
+def _quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
+    r"""
+    Hamilton-multiply a quaternion by the pure quaternion ``(0, vec)``, returning the 4-vector product.
+    """
 
     r, i, j, k = quat.unbind(dim=-1)
     x, y, z = vec.unbind(dim=-1)
@@ -3051,14 +3093,17 @@ def quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
     )
 
 
-def torsion_angles_to_frames(residue_type: Tensor, backb_to_global: Rigid, torsion_angles_sin_cos: Tensor) -> Rigid:
-    r"""Build the 8 global side-chain rigid-group frames from the backbone frame and per-residue torsions.
+def _torsion_angles_to_frames(
+    residue_type: Tensor, backb_to_global: AlphaFold2Rigid, torsion_angles_sin_cos: Tensor
+) -> AlphaFold2Rigid:
+    r"""
+    Build the 8 global side-chain rigid-group frames from the backbone frame and per-residue torsions.
 
     Rotates each residue type's default rigid groups by the ``(sin, cos)`` torsion angles and chains the
-    dependent chi frames, returning a ``(..., 8)`` [`Rigid`][] in global coordinates.
+    dependent chi frames, returning a ``(..., 8)`` [`AlphaFold2Rigid`][] in global coordinates.
     """
 
-    default_frames = Rigid.from_tensor4x4(
+    default_frames = AlphaFold2Rigid.from_tensor4x4(
         _gather_residue_type(
             residue_constants.AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME,
             residue_type,
@@ -3084,7 +3129,7 @@ def torsion_angles_to_frames(residue_type: Tensor, backb_to_global: Rigid, torsi
     chi2 = chi1.compose(_frame_index(all_frames, 5))
     chi3 = chi2.compose(_frame_index(all_frames, 6))
     chi4 = chi3.compose(_frame_index(all_frames, 7))
-    frames_to_backbone = Rigid(
+    frames_to_backbone = AlphaFold2Rigid(
         rotation=torch.cat(
             [
                 all_frames.rotation[..., :5, :, :],
@@ -3107,8 +3152,11 @@ def torsion_angles_to_frames(residue_type: Tensor, backb_to_global: Rigid, torsi
     return backb_to_global.with_group_axis().compose(frames_to_backbone)
 
 
-def frames_and_literature_positions_to_atom14_pos(residue_type: Tensor, all_frames_to_global: Rigid) -> Tensor:
-    r"""Place each residue's 14 literature atom positions into global coordinates via its rigid-group frames.
+def _frames_and_literature_positions_to_atom14_pos(
+    residue_type: Tensor, all_frames_to_global: AlphaFold2Rigid
+) -> Tensor:
+    r"""
+    Place each residue's 14 literature atom positions into global coordinates via its rigid-group frames.
 
     Applies the per-atom group frame to the reference (literature) atom14 positions and masks nonexistent
     atoms, returning ``(..., 14, 3)`` predicted coordinates.
@@ -3118,7 +3166,7 @@ def frames_and_literature_positions_to_atom14_pos(residue_type: Tensor, all_fram
         residue_constants.AMINO_ACID_ATOM14_TO_RIGID_GROUP, residue_type, dtype=torch.long
     )
     group_mask = F.one_hot(group_index, num_classes=8).to(dtype=all_frames_to_global.rotation.dtype)
-    atom_frames = Rigid(
+    atom_frames = AlphaFold2Rigid(
         rotation=torch.einsum("...nag,...ngij->...naij", group_mask, all_frames_to_global.rotation),
         translation=torch.einsum("...nag,...ngc->...nac", group_mask, all_frames_to_global.translation),
     )
@@ -3128,11 +3176,12 @@ def frames_and_literature_positions_to_atom14_pos(residue_type: Tensor, all_fram
         dtype=all_frames_to_global.rotation.dtype,
     )
     pred_positions = atom_frames.apply(lit_positions)
-    return pred_positions * residue_type_atom14_mask(residue_type, dtype=pred_positions.dtype).unsqueeze(-1)
+    return pred_positions * _residue_type_atom14_mask(residue_type, dtype=pred_positions.dtype).unsqueeze(-1)
 
 
-def atom14_to_atom37(atom14_positions: Tensor, residue_type: Tensor, sequence_mask: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Scatter dense ``atom14`` coordinates into the ``atom37`` layout.
+def _atom14_to_atom37(atom14_positions: Tensor, residue_type: Tensor, sequence_mask: Tensor) -> tuple[Tensor, Tensor]:
+    r"""
+    Scatter dense ``atom14`` coordinates into the ``atom37`` layout.
 
     Returns ``(atom37_positions, atom37_mask)`` where the mask combines the per-residue-type atom37
     existence table with ``sequence_mask``.
@@ -3146,14 +3195,16 @@ def atom14_to_atom37(atom14_positions: Tensor, residue_type: Tensor, sequence_ma
     return atom37_positions * atom37_mask.unsqueeze(-1), atom37_mask
 
 
-def residue_type_atom14_mask(residue_type: Tensor, *, dtype: torch.dtype) -> Tensor:
-    r"""Gather the per-residue ``atom14`` existence mask for each residue type."""
+def _residue_type_atom14_mask(residue_type: Tensor, *, dtype: torch.dtype) -> Tensor:
+    r"""
+    Gather the per-residue ``atom14`` existence mask for each residue type.
+    """
 
     return _gather_residue_type(residue_constants.AMINO_ACID_ATOM14_MASK, residue_type, dtype=dtype)
 
 
-def _frame_index(rigid: Rigid, index: int) -> Rigid:
-    return Rigid(rotation=rigid.rotation[..., index, :, :], translation=rigid.translation[..., index, :])
+def _frame_index(rigid: AlphaFold2Rigid, index: int) -> AlphaFold2Rigid:
+    return AlphaFold2Rigid(rotation=rigid.rotation[..., index, :, :], translation=rigid.translation[..., index, :])
 
 
 def _gather_residue_type(table: np.ndarray, residue_type: Tensor, *, dtype: torch.dtype) -> Tensor:
@@ -3197,9 +3248,11 @@ def _distogram(positions: Tensor, *, min_distance: float, max_distance: float, n
     return ((squared_distances > lower) & (squared_distances < upper)).to(dtype=positions.dtype)
 
 
-def clipped_relative_position(residue_index: Tensor, max_relative_feature: int) -> Tensor:
-    r"""One-hot encode the relative sequence separation of each residue pair, clipped to
-    ``+/- max_relative_feature`` (``2 * max_relative_feature + 1`` bins)."""
+def _clipped_relative_position(residue_index: Tensor, max_relative_feature: int) -> Tensor:
+    r"""
+    One-hot encode the relative sequence separation of each residue pair, clipped to
+    ``+/- max_relative_feature`` (``2 * max_relative_feature + 1`` bins).
+    """
 
     offset = residue_index.unsqueeze(-1) - residue_index.unsqueeze(-2)
     clipped = torch.clamp(offset + max_relative_feature, min=0, max=2 * max_relative_feature)
@@ -3221,7 +3274,8 @@ def _pseudo_beta_from_atom37(atom37_positions: Tensor, input: AlphaFold2Input) -
 
 
 def _template_backbone_unit_vector(input: AlphaFold2MultimerInput) -> tuple[Tensor, Tensor]:
-    r"""Return the pairwise backbone unit vector and per-residue backbone mask per template.
+    r"""
+    Return the pairwise backbone unit vector and per-residue backbone mask per template.
 
     With the per-residue backbone rigid ``Tᵢ`` (rotation ``Rᵢ``, CA translation
     ``tᵢ``), the pairwise unit vector is
@@ -3300,7 +3354,9 @@ def _multimer_normalize_vector(value: Tensor) -> Tensor:
 
 
 def _build_chi_atom37_tables() -> tuple[np.ndarray, np.ndarray]:
-    r"""Return atom37 indices ``(21, 4, 4)`` and validity mask ``(21, 4)`` for the chi angles."""
+    r"""
+    Return atom37 indices ``(21, 4, 4)`` and validity mask ``(21, 4)`` for the chi angles.
+    """
 
     indices = np.zeros((21, 4, 4), dtype=np.int64)
     mask = np.zeros((21, 4), dtype=np.float32)
@@ -3319,7 +3375,8 @@ _CHI_ATOM37_INDICES, _CHI_ANGLE_MASK = _build_chi_atom37_tables()
 
 
 def _template_chi_angles(positions: Tensor, atom_mask: Tensor, residue_type: Tensor) -> tuple[Tensor, Tensor]:
-    r"""Compute the four backbone-independent chi angles per residue from atom37 positions.
+    r"""
+    Compute the four backbone-independent chi angles per residue from atom37 positions.
 
     Returns ``(chi, chi_mask)`` with shapes ``[..., N, 4]``. ``chi`` is the signed dihedral of
     the four defining atoms; ``chi_mask`` is the product of the residue-type chi validity and the
@@ -3356,7 +3413,9 @@ def _template_chi_angles(positions: Tensor, atom_mask: Tensor, residue_type: Ten
 
 
 def _dihedral(p0: Tensor, p1: Tensor, p2: Tensor, p3: Tensor) -> Tensor:
-    r"""Signed dihedral angle (radians) about the ``p1-p2`` axis for four points ``[..., 3]``."""
+    r"""
+    Signed dihedral angle (radians) about the ``p1-p2`` axis for four points ``[..., 3]``.
+    """
 
     b0 = p0 - p1
     b1 = p2 - p1
@@ -3369,32 +3428,44 @@ def _dihedral(p0: Tensor, p1: Tensor, p2: Tensor, p3: Tensor) -> Tensor:
     return torch.atan2(y, x)
 
 
-def _apply_rigid_to_points(rigid: Rigid, points: Tensor) -> Tensor:
-    r"""Map local per-head points ``[*, N, H, P, 3]`` into the global frame of each residue."""
+def _apply_rigid_to_points(rigid: AlphaFold2Rigid, points: Tensor) -> Tensor:
+    r"""
+    Map local per-head points ``[*, N, H, P, 3]`` into the global frame of each residue.
+    """
 
     rotation = rigid.rotation[..., :, None, None, :, :]
     translation = rigid.translation[..., :, None, None, :]
     return torch.einsum("...ij,...j->...i", rotation, points) + translation
 
 
-def _apply_inverse_rigid_to_points(rigid: Rigid, points: Tensor) -> Tensor:
-    r"""Map global points ``[*, N, M, 3]`` back into each residue's local frame (``Rᵀ(p-t)``)."""
+def _apply_inverse_rigid_to_points(rigid: AlphaFold2Rigid, points: Tensor) -> Tensor:
+    r"""
+    Map global points ``[*, N, M, 3]`` back into each residue's local frame (``Rᵀ(p-t)``).
+    """
 
     rotation = rigid.rotation[..., :, None, :, :]
     translation = rigid.translation[..., :, None, :]
     return torch.einsum("...ji,...j->...i", rotation, points - translation)
 
 
-def predicted_interface_tm_score(
+def alphafold2_predicted_interface_tm_score(
     logits: Tensor,
     chain_index: Tensor,
     sequence_mask: Tensor,
     config: AlphaFold2MultimerConfig,
 ) -> float:
-    r"""Compute interface pTM (ipTM) from PAE logits over cross-chain pairs.
+    r"""
+    Compute interface pTM (ipTM) from PAE logits over cross-chain pairs.
 
-    Identical to the pTM expectation except the alignment average is restricted to
-    residue pairs with different ``chain_index`` values.
+    Args:
+        logits: PAE logits for one assembly with shape ``(N, N, D)``.
+        chain_index: Chain index for each residue with shape ``(N,)``.
+        sequence_mask: Valid-residue mask with shape ``(N,)``.
+        config: AlphaFold-Multimer configuration defining the PAE bins.
+
+    Returns:
+        The scalar interface predicted TM score in ``[0, 1]``. Returns ``0`` when
+        no valid cross-chain residue pair exists.
     """
 
     breaks = torch.linspace(
@@ -3427,7 +3498,23 @@ def predicted_interface_tm_score(
 @dataclass
 class AlphaFold2StructureModuleOutput:
     r"""
-    Output tensors from the native AF2 structure module.
+    Output tensors from the AlphaFold 2 structure module.
+
+    Args:
+        final_atom_positions: Atom37 coordinates with shape ``(B, N, 37, 3)`` in
+            angstroms.
+        final_atom_mask: Atom37 validity mask with shape ``(B, N, 37)``.
+        structure_module: Final single representation with shape ``(B, N, C)``.
+        final_atom14_positions: Atom14 coordinates with shape ``(B, N, 14, 3)`` in
+            angstroms.
+        final_atom14_mask: Atom14 validity mask with shape ``(B, N, 14)``.
+        final_affines: Final backbone frames with shape ``(B, N, 7)`` for
+            monomer models or ``(B, N, 12)`` for multimer models.
+        traj: Backbone-frame trajectory with shape ``(K, B, N, 7)`` for
+            monomer models or ``(K, B, N, 12)`` for multimer models.
+        sidechain_angles: Normalized torsion angles with shape ``(B, N, 7, 2)``.
+        sidechain_unnormalized_angles: Unnormalized torsion vectors with shape
+            ``(B, N, 7, 2)``.
     """
 
     final_atom_positions: Tensor
@@ -3443,7 +3530,9 @@ class AlphaFold2StructureModuleOutput:
 
 @dataclass
 class AlphaFold2TemplateBatch:
-    r"""Template tensors shared by the pair and torsion embedding modules."""
+    r"""
+    Template tensors shared by the pair and torsion embedding modules.
+    """
 
     template_residue_type: Tensor
     template_mask: Tensor
@@ -3498,13 +3587,15 @@ class AlphaFold2TemplateBatch:
 
 
 # ===========================================================================
-# Tensor boundary and canonical semantic layout (monomer + multimer contracts).
+# Tensor and molecular-identity records for monomer and multimer inputs.
 # ===========================================================================
 
 
 @dataclass(frozen=True)
 class AlphaFold2Layout:
-    r"""Canonical residue identities aligned to one monomer AF2 token axis."""
+    r"""
+    Residue identities aligned to one monomer AlphaFold 2 token axis.
+    """
 
     system: MolecularSystem
     residue_sites: tuple[tuple[str, int], ...]
@@ -3514,27 +3605,45 @@ class AlphaFold2Layout:
 
 @dataclass(kw_only=True)
 class AlphaFold2Input:
-    r"""Complete compute and semantic input for monomer AlphaFold 2.
+    r"""
+    Tensor and molecular-layout input for monomer AlphaFold 2.
 
-    Under the stochastic-fold contract the Processor lowers only the
-    **raw alignment pool** and the full-MSA amino-acid profile; the Model draws the
-    clustered/extra MSA feature realizations itself, once per configured ensemble
-    member and recycle, off its per-sample generator (see
-    [`AlphaFold2Model.fold`][]). The realized 49- and
-    25-channel tensors are therefore *not* part of the input contract.
+    ``B`` is batch size, ``N`` residue count, ``M`` MSA depth, and ``T`` template
+    count. Row zero of the MSA tensors is the query sequence.
 
-    Tensor shapes: ``residue_type`` and ``residue_index`` are ``[B, N]``;
-    ``token_features`` are ``[B, N, 22]``. The raw pool is ``msa_tokens [B, M, N]``
-    (long residue-type indices in
-    ``0..21`` -- ``20`` unknown, ``21`` gap; row 0 is the query), ``msa_deletions
-    [B, M, N]`` (float per-cell insertion counts), and ``msa_profile [B, N, 22]``
-    (per-column amino-acid frequency of the full pool). Template tensors are always
-    present because their stacks are part of the computation; zero masks
-    represent absent evidence without skipping those stacks.
-
-    ``msa_features`` / ``msa_mask`` / ``extra_msa_features`` / ``extra_msa_mask`` are
-    internal per-recycle realized slots the Model fills on a shallow per-realization
-    input copy; they are ``None`` on Processor output.
+    Args:
+        residue_type: Residue token IDs with shape ``(B, N)``.
+        token_features: Target features with shape ``(B, N, 22)``.
+        residue_index: Chain-local residue indices with shape ``(B, N)``.
+        sequence_mask: Valid-residue mask with shape ``(B, N)``.
+        msa_tokens: Unclustered MSA token IDs with shape ``(B, M, N)``.
+        msa_deletions: MSA deletion counts with shape ``(B, M, N)``.
+        msa_profile: Full-MSA residue frequencies with shape ``(B, N, 22)``.
+        template_mask: Template validity mask with shape ``(B, T)``.
+        template_residue_type: Template residue IDs with shape ``(B, T, N)``.
+        template_all_atom_positions: Template atom37 coordinates with shape
+            ``(B, T, N, 37, 3)`` in angstroms.
+        template_all_atom_mask: Template atom37 validity mask with shape
+            ``(B, T, N, 37)``.
+        template_torsion_angles_sin_cos: Template torsion angles with shape
+            ``(B, T, N, 7, 2)``.
+        template_alternative_torsion_angles_sin_cos: Alternative template torsion
+            angles with shape ``(B, T, N, 7, 2)``.
+        template_torsion_angles_mask: Template torsion validity mask with shape
+            ``(B, T, N, 7)``.
+        layout: Molecular identities and evidence aligned to the residue axis.
+        msa_features: Optional realized clustered-MSA features with shape
+            ``(B, M_clustered, N, 49)``.
+        msa_mask: Optional clustered-MSA validity mask with shape
+            ``(B, M_clustered, N)``.
+        extra_msa_features: Optional extra-MSA features with shape
+            ``(B, M_extra, N, 25)``.
+        extra_msa_mask: Optional extra-MSA validity mask with shape
+            ``(B, M_extra, N)``.
+        bert_mask: Optional masked-MSA objective mask with shape
+            ``(B, M_clustered, N)``.
+        true_msa: Optional uncorrupted clustered-MSA token IDs with shape
+            ``(B, M_clustered, N)``.
     """
 
     residue_type: Tensor
@@ -3562,10 +3671,26 @@ class AlphaFold2Input:
 
 @dataclass
 class AlphaFold2Output:
-    r"""Differentiable predictions and representations from one AF2 forward pass.
+    r"""
+    Differentiable predictions from one AlphaFold 2 forward pass.
 
-    ``distogram_logits`` uses the ``num_bins - 1`` evenly spaced boundaries from
-    ``config.heads.distogram.first_break`` through ``last_break``.
+    Args:
+        single: Per-residue representation with shape ``(B, N, C_single)``.
+        pair: Pair representation with shape ``(B, N, N, C_pair)``.
+        frames: Backbone-frame trajectory with shape ``(K, B, N, 7)`` for
+            monomer models or ``(K, B, N, 12)`` for multimer models.
+        final_atom_positions: Predicted atom37 coordinates with shape
+            ``(B, N, 37, 3)`` in angstroms.
+        final_atom_mask: Predicted atom37 validity mask with shape ``(B, N, 37)``.
+        sidechain_angles: Normalized torsion angles with shape ``(B, N, 7, 2)``.
+        sidechain_unnormalized_angles: Unnormalized torsion vectors with shape
+            ``(B, N, 7, 2)``.
+        distogram_logits: Distance-bin logits with shape ``(B, N, N, D)``.
+        masked_msa_logits: MSA token logits with shape ``(B, M, N, V)``.
+        plddt_logits: Per-residue pLDDT logits with shape ``(B, N, D_plddt)``.
+        pae_logits: Optional predicted-aligned-error logits with shape
+            ``(B, N, N, D_pae)``.
+        resolved_logits: Atom37 resolved-state logits with shape ``(B, N, 37)``.
     """
 
     single: Tensor
@@ -3584,7 +3709,9 @@ class AlphaFold2Output:
 
 @dataclass(frozen=True)
 class AlphaFold2MultimerLayout:
-    r"""Canonical residue identities aligned to one multi-chain AF2 token axis."""
+    r"""
+    Residue identities aligned to one AlphaFold-Multimer token axis.
+    """
 
     system: MolecularSystem
     residue_sites: tuple[tuple[str, int], ...]
@@ -3595,36 +3722,50 @@ class AlphaFold2MultimerLayout:
 
 @dataclass(kw_only=True)
 class AlphaFold2MultimerInput:
-    r"""Complete compute and semantic input for AlphaFold-Multimer.
+    r"""
+    Tensor and molecular-layout input for AlphaFold-Multimer.
 
-    Tensor shapes follow the processed-feature contract over the
-    concatenated multi-chain token axis. ``residue_type`` / ``residue_index`` /
-    ``sequence_mask`` are ``[B, N]``; ``token_features`` is ``[B, N, 21]``; clustered MSA
-    features are ``[B, M, N, 49]`` with paired-block semantics. ``residue_index``
-    restarts per chain, not globally.
-    ``chain_index`` / ``entity_index`` / ``symmetry_index`` are required
-    chain-identity features:
+    ``B`` is batch size, ``N`` is the concatenated residue count, ``M`` is MSA
+    depth, and ``T`` is template count. Residue indices restart at each chain.
 
-    - ``chain_index`` -- distinct copy identity, one per instance;
-    - ``entity_index`` -- sequence identity, one per distinct entity;
-    - ``symmetry_index`` -- copy index within an entity.
-
-    Template tensors carry atom37 positions plus the multimer pseudo-beta and
-    backbone-frame projections (no template torsion MSA row).
-
-    As with the monomer contract, under the stochastic-fold contract the
-    Processor lowers only the **raw paired alignment pool** (``msa_tokens
-    [B, M, N]`` long residue-type indices in ``0..21`` -- ``20`` unknown, ``21`` gap, row 0
-    the concatenated query; ``msa_deletions [B, M, N]`` per-cell insertion counts;
-    ``msa_profile [B, N, 22]`` the full-pool per-column frequency). The Model draws
-    the clustered/extra realization itself, once per configured ensemble member and
-    recycle, off its per-sample generator (see
-    [`AlphaFold2MultimerModel.fold`][]). ``msa_features`` / ``msa_mask``
-    / ``extra_msa_features`` / ``extra_msa_mask`` / ``bert_mask`` / ``true_msa`` are
-    internal per-recycle realized slots the Model fills on a shallow per-realization
-    input copy; they are ``None`` on Processor output. When a
-    realized ``msa_features`` are present (the precomputed-feature input path) the
-    Model consumes the input verbatim and skips the draw.
+    Args:
+        residue_type: Residue token IDs with shape ``(B, N)``.
+        token_features: Target features with shape ``(B, N, 21)``.
+        residue_index: Chain-local residue indices with shape ``(B, N)``.
+        sequence_mask: Valid-residue mask with shape ``(B, N)``.
+        chain_index: Molecular-instance indices with shape ``(B, N)``.
+        entity_index: Shared-sequence entity indices with shape ``(B, N)``.
+        symmetry_index: Copy indices within each entity with shape ``(B, N)``.
+        msa_tokens: Unclustered paired-MSA token IDs with shape ``(B, M, N)``.
+        msa_deletions: MSA deletion counts with shape ``(B, M, N)``.
+        msa_profile: Full-MSA residue frequencies with shape ``(B, N, 22)``.
+        template_mask: Template validity mask with shape ``(B, T)``.
+        template_residue_type: Template residue IDs with shape ``(B, T, N)``.
+        template_all_atom_positions: Template atom37 coordinates with shape
+            ``(B, T, N, 37, 3)`` in angstroms.
+        template_all_atom_mask: Template atom37 validity mask with shape
+            ``(B, T, N, 37)``.
+        template_pseudo_beta: Template pseudo-beta coordinates with shape
+            ``(B, T, N, 3)`` in angstroms.
+        template_pseudo_beta_mask: Template pseudo-beta validity mask with shape
+            ``(B, T, N)``.
+        template_backbone_frame: Template backbone frames with shape
+            ``(B, T, N, 4, 4)``.
+        template_backbone_frame_mask: Template backbone-frame validity mask with
+            shape ``(B, T, N)``.
+        layout: Molecular identities and evidence aligned to the residue axis.
+        msa_features: Optional realized clustered-MSA features with shape
+            ``(B, M_clustered, N, 49)``.
+        msa_mask: Optional clustered-MSA validity mask with shape
+            ``(B, M_clustered, N)``.
+        extra_msa_features: Optional extra-MSA features with shape
+            ``(B, M_extra, N, 25)``.
+        extra_msa_mask: Optional extra-MSA validity mask with shape
+            ``(B, M_extra, N)``.
+        bert_mask: Optional masked-MSA objective mask with shape
+            ``(B, M_clustered, N)``.
+        true_msa: Optional uncorrupted clustered-MSA token IDs with shape
+            ``(B, M_clustered, N)``.
     """
 
     residue_type: Tensor

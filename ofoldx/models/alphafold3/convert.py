@@ -34,7 +34,9 @@ def convert_alphafold3_model(
     model_name: str | None = None,
     dtype: torch.dtype | None = None,
 ) -> AlphaFold3Model:
-    r"""Strict-load official AF3 parameters into an in-memory native Model."""
+    r"""
+    Strict-load official AF3 parameters into an in-memory native Model.
+    """
 
     return cast(
         AlphaFold3Model,
@@ -52,7 +54,8 @@ def convert_alphafold3_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Strict-load official AF3 parameters and write a standard OFoldX repository.
+    r"""
+    Strict-load official AF3 parameters and write a standard OFoldX repository.
 
     Converts the DeepMind AlphaFold 3 parameter archive at ``checkpoint_path`` into a
     native model, pairs it with [`AlphaFold3Processor`][], and writes a
@@ -79,6 +82,10 @@ def convert_alphafold3_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run alphafold3 checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="official AF3 parameter archive (e.g. af3.bin.zst)")
     parser.add_argument("output_dir", type=Path)

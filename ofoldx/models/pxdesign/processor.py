@@ -1,4 +1,6 @@
-r"""Canonical target-and-binder lowering for PXDesign-d."""
+r"""
+Input processing for PXDesign target-binder generation.
+"""
 
 from __future__ import annotations
 
@@ -19,12 +21,13 @@ from ...data import (
     validate_placement,
 )
 from ...data.components import get_component
+from ...data.conditions import Hotspot
 from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
 from ...data.structure import Structure
 from ...io.structure import read_structure
 from ...processor import Processor
 from .config import PxDesignProcessorConfig
-from .model import Hotspot, PxDesignInput, PxDesignLayout
+from .model import PxDesignInput, PxDesignLayout
 
 _RESIDUE_TYPE_INDEX = {
     "ALA": 0,
@@ -64,10 +67,12 @@ _GENERATED_ATOM_IDS = frozenset(atom.atom_id for atom in get_component("GLY").at
 
 
 class PxDesignProcessor(Processor):
-    r"""Lower one target-conditioned binder-design problem to tensors.
+    r"""
+    Convert supported binder-design inputs into `PxDesignInput`.
 
     Args:
-        config: PXDesign preprocessing options. Defaults to ``PxDesignProcessorConfig()``.
+        config: PXDesign input-processing options. Defaults to
+            ``PxDesignProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -89,15 +94,18 @@ class PxDesignProcessor(Processor):
         placement: PlacementSpec,
         conditions: Sequence[Hotspot] = (),
     ) -> PxDesignInput:
-        r"""Encode one fixed-length protein-binder design problem.
+        r"""
+        Build model inputs for one fixed-length target-binder design problem.
 
         Args:
             input: Optional target system, observed structure, or local structure path.
-            placement: Topology containing target spans and one generated binder chain.
+            placement: Topology containing complete target spans and one fixed-length
+                generated protein chain.
             conditions: Target hotspot labels.
 
         Returns:
-            A ``PxDesignInput`` with aligned target, binder, atom, and hotspot values.
+            A [`PxDesignInput`][] with batch size one and aligned target, binder, token,
+            atom, hotspot, and molecular-layout axes.
         """
 
         if isinstance(input, str | PathLike):
@@ -308,7 +316,8 @@ def _canonicalize_modified_polymers(
     source: MolecularSystem | None,
     structure: Structure | None,
 ) -> tuple[MolecularSystem | None, Structure | None]:
-    r"""Canonicalize MSE residues to MET before tokenization.
+    r"""
+    Canonicalize MSE residues to MET before tokenization.
 
     Each ``MSE`` residue becomes ``MET`` and its selenium ``SE`` atom becomes sulfur
     ``SD``. The heavy-atom graph otherwise matches the wwPDB CCD MET component, so the
@@ -555,7 +564,8 @@ def _hotspots(
     selected_residues: frozenset[tuple[str, int]],
     token_residues: tuple[tuple[str, int] | None, ...],
 ) -> frozenset[tuple[str, int]]:
-    r"""Collect per-token hotspot target residues.
+    r"""
+    Collect per-token hotspot target residues.
 
     [`Hotspot`][ofoldx.data.Hotspot] is single-sided and distance-free: ``residues``
     name the EXISTING target residues to condition on and the generated partner is implicit
@@ -697,11 +707,15 @@ def from_binder(
     binder_length: int,
     target: Sequence[TargetChain] = (),
 ) -> PlacementSpec:
-    r"""Project a native target-and-binder problem onto the shared [`PlacementSpec`][].
+    r"""
+    Build a placement declaration for target chains and one protein binder.
 
-    ``binder_length`` fixes the single generated protein binder (``min == max``). Each
-    ``target`` chain becomes a declaration group of ordered [`ExistingSpan`][ofoldx.data.ExistingSpan]
-    values; the binder is appended as the trailing generated group.
+    Args:
+        binder_length: Exact generated binder length.
+        target: Source instance IDs and half-open component intervals to retain.
+
+    Returns:
+        A placement declaration whose final group is the generated binder.
     """
 
     if binder_length < 0:
@@ -738,11 +752,15 @@ def from_binder(
 
 
 def to_binder(placement: PlacementSpec) -> tuple[int, list[TargetChain]]:
-    r"""Recover ``(binder_length, target chains)`` from a [`PlacementSpec`][].
+    r"""
+    Decode a target-and-binder placement declaration.
 
-    The trailing declaration group must be exactly one fixed-length protein
-    [`GeneratedSegment`][ofoldx.data.GeneratedSegment] (the binder); every earlier group must contain
-    only [`ExistingSpan`][ofoldx.data.ExistingSpan] values addressing one source instance.
+    Args:
+        placement: Placement declaration whose final group is one fixed-length
+            generated protein binder.
+
+    Returns:
+        The binder length and retained target intervals.
     """
 
     validate_placement(placement)

@@ -1,9 +1,11 @@
-r"""Protenix v0.5 default and constraint implementations."""
+r"""
+Protenix structure-prediction implementations.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import (
     ProtenixConfig,
     ProtenixConstraintConfig,
@@ -22,27 +24,27 @@ from .model import (
 from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline
 from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.protenix",
     model=ProtenixModel,
     processor=ProtenixProcessor,
     processor_config=ProtenixProcessorConfig,
     standard_tasks=("fold",),
 )
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.protenix_constraint",
     model=ProtenixConstraintModel,
     processor=ProtenixConstraintProcessor,
     processor_config=ProtenixConstraintProcessorConfig,
     standard_tasks=("fold",),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.protenix",
     pipeline=ProtenixPipeline,
     tasks=("fold",),
     architectures=("ofoldx.protenix",),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.protenix_constraint",
     pipeline=ProtenixConstraintPipeline,
     tasks=("fold",),

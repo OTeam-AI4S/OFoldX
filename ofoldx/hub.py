@@ -1,7 +1,5 @@
-r"""Hugging Face Hub repository resolution, publication, and loading.
-
-The Hugging Face Hub supplies snapshots and safetensors mechanics. OFoldX owns the
-repository schema, architecture dispatch, Model/Processor pairing, and construction.
+r"""
+Resolve, publish, and load OFoldX model repositories.
 """
 
 from __future__ import annotations
@@ -36,6 +34,15 @@ MODEL_WEIGHT_METADATA = (
 
 
 class ResolvedRepository(NamedTuple):
+    r"""
+    A local model repository with optional Hub provenance.
+
+    Attributes:
+        path: Local repository or downloaded snapshot path.
+        repository: Hugging Face Hub repository ID, when downloaded from the Hub.
+        commit: Immutable Hub commit that produced ``path``.
+    """
+
     path: Path
     repository: str | None = None
     commit: str | None = None
@@ -62,7 +69,19 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def load_json_object(path: Path) -> dict[str, object]:
-    r"""Load a strict JSON object used to route or construct a repository."""
+    r"""
+    Load a finite, duplicate-free JSON object.
+
+    Args:
+        path: JSON file to read.
+
+    Returns:
+        The decoded object.
+
+    Raises:
+        TypeError: If the document root is not an object.
+        ValueError: If keys are duplicated or numbers are non-finite.
+    """
 
     values = json.loads(
         path.read_text(encoding="utf-8"),
@@ -82,7 +101,18 @@ def resolve_repository(
     allow_patterns: Sequence[str] | None = None,
     token: str | None = None,
 ) -> ResolvedRepository:
-    r"""Resolve local intent or download selected files from one Hub snapshot."""
+    r"""
+    Resolve a local model repository or Hugging Face Hub repository ID.
+
+    Args:
+        reference: Existing or explicitly written local path, or a Hub repository ID.
+        revision: Hub revision to download.
+        allow_patterns: Optional repository file patterns to download.
+        token: Hugging Face access token used for private repositories.
+
+    Returns:
+        The local repository path and, for Hub snapshots, its repository ID and commit.
+    """
 
     classified = classify_reference(reference)
     if isinstance(classified, Path):
@@ -102,7 +132,18 @@ def resolve_hub_repository(
     allow_patterns: Sequence[str] | None = None,
     token: str | None = None,
 ) -> ResolvedRepository:
-    r"""Download selected files from one known Hub repository revision."""
+    r"""
+    Download files from a Hugging Face Hub model repository.
+
+    Args:
+        repo_id: Hugging Face Hub repository ID.
+        revision: Revision to download.
+        allow_patterns: Optional repository file patterns to download.
+        token: Hugging Face access token used for private repositories.
+
+    Returns:
+        The downloaded snapshot path, repository ID, and resolved commit.
+    """
 
     from huggingface_hub import snapshot_download
 
@@ -147,25 +188,23 @@ def upload_repository(
     allow_patterns: Sequence[str] | None = None,
     delete_patterns: Sequence[str] | None = MIRROR_REPOSITORY,
 ) -> CommitInfo:
-    r"""Upload one local model repository to a Hub repo, creating it if absent.
+    r"""
+    Upload a local model repository to the Hugging Face Hub.
 
-    The upload counterpart to [`resolve_hub_repository`][]: a thin wrapper over
-    ``HfApi.create_repo``/``HfApi.upload_folder`` that pushes a fully written repository
-    directory (``model.json``/``processor.json``/``pipeline.json`` and its safetensors) to
-    ``repo_id``. Nothing is uploaded unless a caller passes an explicit ``repo_id``;
-    authentication comes only from the caller's ``token`` or the ambient Hugging Face
-    credential. No organization, repository, or token is assumed here.
+    Args:
+        directory: Local model repository to upload.
+        repo_id: Destination Hub repository ID.
+        token: Hugging Face access token used for publication.
+        private: Whether a newly created repository is private.
+        revision: Destination branch or revision.
+        commit_message: Optional commit message.
+        allow_patterns: Optional local file patterns to upload.
+        delete_patterns: Remote file patterns to delete before upload. By default,
+            repository-managed metadata and weights absent locally are removed while
+            user-owned files such as model cards are retained.
 
-    Re-publishing mirrors repository-managed files by default: ``delete_patterns`` applies to
-    repository-managed files (see `MIRROR_REPOSITORY`) onto ``repo_id`` so a re-publish
-    deletes managed remote files that are absent locally (an orphaned ``pipeline.json``, a stale
-    ``model.safetensors.index.json``, or old weight shards) instead of leaving them to misroute the
-    loader. The mirror is scoped to those managed names, so a remote README / model card that the
-    local ``save`` does not write is never deleted by a clean re-upload. ``upload_folder`` never
-    deletes a remote file that this upload also writes (deletions are deduplicated against the
-    additions) and always preserves ``.gitattributes``. ``allow_patterns`` and
-    ``delete_patterns`` remain independent caller controls. Pass ``delete_patterns=None``
-    to disable deletion entirely, or an explicit pattern sequence to scope it.
+    Returns:
+        Information about the created Hub commit.
     """
 
     from huggingface_hub import HfApi
@@ -192,7 +231,19 @@ def hydrate_weights(
     *,
     token: str | None = None,
 ) -> ResolvedRepository:
-    r"""Hydrate weights from the exact commit that supplied Hub metadata."""
+    r"""
+    Download all weight files from the commit that supplied repository metadata.
+
+    Args:
+        repository: Resolved local repository or Hub metadata snapshot.
+        token: Hugging Face access token used for private repositories.
+
+    Returns:
+        A repository containing one complete safetensors state dictionary.
+
+    Raises:
+        ValueError: If weight metadata is missing or ambiguous.
+    """
 
     hydrated = (
         repository
@@ -226,6 +277,16 @@ def hydrate_weights(
 
 
 def model_values(path: Path) -> tuple[ModelRegistration, dict[str, object]]:
+    r"""
+    Read model metadata and resolve its registered architecture.
+
+    Args:
+        path: Local model repository.
+
+    Returns:
+        The architecture registration and architecture-specific config values.
+    """
+
     values = load_json_object(path / "model.json")
     architecture = values.pop("architecture", None)
     if not isinstance(architecture, str):
@@ -241,6 +302,19 @@ def load_model(
     dtype: torch.dtype | None = None,
     token: str | None = None,
 ) -> Model:
+    r"""
+    Load the model declared by a resolved repository.
+
+    Args:
+        repository: Resolved model repository containing metadata and weights.
+        device: Device onto which model parameters are loaded.
+        dtype: Floating-point dtype applied after loading.
+        token: Hugging Face access token used to hydrate private Hub weights.
+
+    Returns:
+        The registered model in evaluation mode.
+    """
+
     registration, values = model_values(repository.path)
     return load_registered_model(
         hydrate_weights(repository, token=token),
@@ -259,6 +333,20 @@ def load_registered_model(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Model:
+    r"""
+    Instantiate a registered architecture and load its state dictionary.
+
+    Args:
+        repository: Local repository containing complete safetensors weights.
+        registration: Architecture registration to instantiate.
+        config: Architecture configuration.
+        device: Device onto which model parameters are loaded.
+        dtype: Floating-point dtype applied after loading.
+
+    Returns:
+        The model with strictly loaded weights in evaluation mode.
+    """
+
     from safetensors.torch import load_file
 
     single_path = repository.path / "model.safetensors"
@@ -300,6 +388,18 @@ def load_processor(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Processor:
+    r"""
+    Load the processor declared by a resolved repository.
+
+    Args:
+        repository: Resolved model repository containing processor metadata.
+        device: Device used for produced tensors.
+        dtype: Floating-point dtype used for produced tensors.
+
+    Returns:
+        The registered processor.
+    """
+
     registration, _ = model_values(repository.path)
     return load_registered_processor(
         repository,
@@ -316,6 +416,19 @@ def load_registered_processor(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Processor:
+    r"""
+    Instantiate a processor from a registration and repository metadata.
+
+    Args:
+        repository: Resolved model repository containing processor metadata.
+        registration: Model registration that owns the processor type.
+        device: Device used for produced tensors.
+        dtype: Floating-point dtype used for produced tensors.
+
+    Returns:
+        The configured processor.
+    """
+
     processor_config = registration.processor_config
     config_path = repository.path / "processor.json"
     if processor_config is None:
@@ -331,7 +444,9 @@ def load_registered_processor(
 
 
 def _weight_map(path: Path) -> dict[str, str]:
-    r"""Read indexed weight ownership and reject paths outside the repository."""
+    r"""
+    Read indexed weight ownership and reject paths outside the repository.
+    """
 
     index = load_json_object(path)
     raw_weight_map = index.get("weight_map")

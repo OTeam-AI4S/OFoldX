@@ -1,4 +1,6 @@
-r"""Raw-SMILES chemistry for Boltz-2 affinity prediction."""
+r"""
+Raw-SMILES chemistry for Boltz-2 affinity prediction.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +10,19 @@ from ...data.molecular import Molecule
 def standardize_boltz2_affinity_smiles(
     smiles: str,
 ) -> Molecule:
-    r"""Return the ChEMBL-standardized Boltz-2 affinity ligand graph.
+    r"""
+    Standardize a SMILES string for Boltz-2 affinity scoring.
 
-    Boltz-2 applies ChEMBL structure standardization only to raw SMILES affinity
-    ligands. The largest standardized fragment is parsed into the canonical
-    ``Molecule`` returned here, including the atom names used by Boltz-2.
+    Args:
+        smiles: Ligand represented as a SMILES string.
+
+    Returns:
+        The largest ChEMBL-standardized fragment as a ``Molecule`` with heavy-atom
+        names suitable for Boltz-2 features.
+
+    Raises:
+        ValueError: If ChEMBL excludes the molecule, standardization produces an
+            invalid molecule, or an atom name exceeds four characters.
     """
 
     from chembl_structure_pipeline.exclude_flag import exclude_flag

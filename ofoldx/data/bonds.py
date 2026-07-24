@@ -1,4 +1,5 @@
-r"""Covalent links between existing or generated atoms.
+r"""
+Covalent links between existing or generated atoms.
 
 Symbolic bonds resolve generated endpoints through a `PlacementMap`. Endpoint
 identity is unordered, while each leaving-atom set remains associated with its site.
@@ -25,7 +26,18 @@ def resolve_bond_site(
     placement_map: PlacementMap,
     instance_of: dict[str, str],
 ) -> AtomSite:
-    r"""Resolve a symbolic bond site, or return an existing atom site unchanged."""
+    r"""
+    Resolve a symbolic bond site, or return an existing atom site unchanged.
+
+    Args:
+        site: Existing or symbolic atom site to resolve.
+        placement_map: Realized component occurrences grouped by declaration and
+            placement ID.
+        instance_of: Mapping from placement IDs to declaration groups.
+
+    Returns:
+        The corresponding realized atom site.
+    """
 
     if isinstance(site, AtomSite):
         return site
@@ -35,10 +47,23 @@ def resolve_bond_site(
 
 @dataclass(frozen=True, eq=False)
 class SymbolicBond:
-    r"""A covalent bond with existing or symbolic endpoints.
+    r"""
+    A covalent bond with existing or symbolic endpoints.
 
-    Equality and hashing are unordered over ``(site, leaving_atoms)`` pairs. Bond
+    Equality and hashing are unordered over `(site, leaving_atoms)` pairs. Bond
     order, aromaticity, and stereochemistry are preserved by [`resolve`][].
+
+    Args:
+        site_a: First existing or symbolic bond endpoint.
+        site_b: Second existing or symbolic bond endpoint.
+        order: Bond order.
+        aromatic: Whether the bond is aromatic.
+        stereo: Bond stereochemistry, when specified.
+        leaving_a: Atom IDs removed from the first endpoint's component.
+        leaving_b: Atom IDs removed from the second endpoint's component.
+
+    Raises:
+        ValueError: If both endpoints identify the same atom.
     """
 
     site_a: SymbolicBondSite
@@ -55,12 +80,19 @@ class SymbolicBond:
 
     @property
     def endpoints(self) -> frozenset[SymbolicBondSite]:
-        r"""Return both endpoints as an unordered set."""
+        r"""
+        Return both endpoints as an unordered set.
+
+        Returns:
+            The two existing or symbolic atom sites.
+        """
 
         return frozenset((self.site_a, self.site_b))
 
     def _identity(self) -> tuple[object, ...]:
-        r"""Return the unordered equality and hash key."""
+        r"""
+        Return the unordered equality and hash key.
+        """
 
         return (
             frozenset(((self.site_a, self.leaving_a), (self.site_b, self.leaving_b))),
@@ -82,7 +114,17 @@ class SymbolicBond:
         placement_map: PlacementMap,
         instance_of: dict[str, str],
     ) -> SystemBond:
-        r"""Resolve both endpoints to a user-origin [`SystemBond`][]."""
+        r"""
+        Resolve both endpoints to a user-origin [`SystemBond`][].
+
+        Args:
+            placement_map: Realized component occurrences grouped by declaration and
+                placement ID.
+            instance_of: Mapping from placement IDs to declaration groups.
+
+        Returns:
+            The resolved covalent bond.
+        """
 
         return SystemBond(
             site_a=resolve_bond_site(self.site_a, placement_map, instance_of),

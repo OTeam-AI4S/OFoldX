@@ -1,4 +1,6 @@
-r"""Convert official RFdiffusion checkpoints to native OFoldX Models."""
+r"""
+Convert official RFdiffusion checkpoints to native OFoldX Models.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +28,9 @@ _DTYPES = {
 
 
 def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str, np.ndarray]:
-    r"""Load the released IGSO(3) lookup table from an original or safe converted source."""
+    r"""
+    Load the released IGSO(3) lookup table from an original or safe converted source.
+    """
 
     if source is None:
         raise ValueError(
@@ -193,7 +197,9 @@ def load_rfdiffusion_checkpoint(
     *,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, object]:
-    r"""Load one official checkpoint with PyTorch's restricted loader."""
+    r"""
+    Load one official checkpoint with PyTorch's restricted loader.
+    """
 
     value = torch.load(
         checkpoint,
@@ -205,7 +211,9 @@ def load_rfdiffusion_checkpoint(
 
 
 def rfdiffusion_config_from_checkpoint(checkpoint: Mapping[str, object]) -> RfDiffusionConfig:
-    r"""Recover only persistent denoiser/diffusion/preprocess architecture."""
+    r"""
+    Recover only persistent denoiser/diffusion/preprocess architecture.
+    """
 
     source = cast(Mapping[str, object], checkpoint["config_dict"])
     values = {}
@@ -231,7 +239,9 @@ def rfdiffusion_config_from_checkpoint(checkpoint: Mapping[str, object]) -> RfDi
 
 
 def convert_rfdiffusion_state_dict_key(key: str) -> str:
-    r"""Translate one official tensor name to the public Model module tree."""
+    r"""
+    Translate one official tensor name to the public Model module tree.
+    """
 
     key = key.removeprefix("module.")
     source_root, separator, remainder = key.partition(".")
@@ -246,7 +256,9 @@ def convert_rfdiffusion_state_dict_key(key: str) -> str:
 
 
 def _convert_rfdiffusion_se3_key(key: str) -> str:
-    r"""Translate the upstream interleaved SE(3) module list into named blocks and output."""
+    r"""
+    Translate the upstream interleaved SE(3) module list into named blocks and output.
+    """
 
     marker = ".structure_module.transformer.graph_modules."
     prefix, separator, suffix = key.partition(marker)
@@ -268,7 +280,9 @@ def convert_rfdiffusion_state_dict(
     *,
     dtype: torch.dtype | None = None,
 ) -> dict[str, Tensor]:
-    r"""Return a strict-loadable native state dict."""
+    r"""
+    Return a strict-loadable native state dict.
+    """
 
     return {
         convert_rfdiffusion_state_dict_key(key): (
@@ -284,7 +298,8 @@ def convert_rfdiffusion_checkpoint(
     dtype: torch.dtype | None = None,
     schedule_source: str | PathLike[str] | None = None,
 ) -> RfDiffusionModel:
-    r"""Return one native Model loaded strictly from an official checkpoint.
+    r"""
+    Return one native Model loaded strictly from an official checkpoint.
 
     The released IGSO(3) schedule table is copied verbatim from ``schedule_source`` (an ``.npz`` or
     original RFdiffusion ``.pkl``; the untracked ``rfdiffusion_schedule.npz`` beside the module by
@@ -316,7 +331,8 @@ def save_rfdiffusion_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert an RFdiffusion checkpoint and write a routable OFoldX repository.
+    r"""
+    Convert an RFdiffusion checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
@@ -347,6 +363,10 @@ def save_rfdiffusion_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run rfdiffusion checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="official RFdiffusion checkpoint (e.g. Base_ckpt.pt)")
     parser.add_argument("output_dir", type=Path)

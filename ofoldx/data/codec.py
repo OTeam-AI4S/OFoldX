@@ -1,7 +1,5 @@
-r"""Explicit codec for canonical molecular, structure, and evidence values.
-
-This module deliberately contains ordinary known-type encoders and decoders.  It
-does not register classes, import Python paths, or accept arbitrary objects.
+r"""
+JSON-safe codecs for molecular systems, structures, MSAs, and templates.
 """
 
 from __future__ import annotations
@@ -30,10 +28,14 @@ from .structure import ResidueNumber, Structure
 
 
 def encode_system(system: MolecularSystem) -> dict[str, object]:
-    r"""Serialize a [`MolecularSystem`][] to a JSON-safe object (inverse of [`decode_system`][]).
+    r"""
+    Encode a molecular system as a JSON-safe object.
 
-    Entities are emitted in sorted key order and instance declaration order is preserved so the
-    round trip ``decode_system(encode_system(system)) == system`` holds.
+    Args:
+        system: Molecular system to encode.
+
+    Returns:
+        Metadata preserving entity contents and instance declaration order.
     """
     if not isinstance(system, MolecularSystem):
         raise TypeError("system must be a MolecularSystem")
@@ -54,7 +56,15 @@ def encode_system(system: MolecularSystem) -> dict[str, object]:
 
 
 def decode_system(value: object) -> MolecularSystem:
-    r"""Rebuild a [`MolecularSystem`][] from the object produced by [`encode_system`][] (its inverse)."""
+    r"""
+    Decode a molecular system from JSON-safe metadata.
+
+    Args:
+        value: Object produced by [`encode_system`][ofoldx.data.codec.encode_system].
+
+    Returns:
+        The decoded molecular system.
+    """
     data = _expect_object(value, "MolecularSystem")
     _expect_keys(
         data,
@@ -95,11 +105,16 @@ def encode_structure(
     *,
     array_prefix: str,
 ) -> tuple[dict[str, object], dict[str, NDArray]]:
-    r"""Serialize a [`Structure`][] (inverse of [`decode_structure`][]).
+    r"""
+    Encode a structure as JSON-safe metadata and NumPy arrays.
 
-    Returns a ``(metadata, arrays)`` pair: bulk numeric fields (coordinates, mask, optional occupancy)
-    are moved into ``arrays`` under ``array_prefix``-keyed names and referenced by key from the metadata,
-    so ``decode_structure(*encode_structure(structure, array_prefix=p))`` reconstructs the original.
+    Args:
+        structure: Structure to encode.
+        array_prefix: Non-empty prefix for array keys referenced by the metadata.
+
+    Returns:
+        A ``(metadata, arrays)`` pair containing the molecular system, atom sites,
+        coordinate metadata, and aligned numeric arrays.
     """
     if not isinstance(structure, Structure):
         raise TypeError("structure must be a Structure")
@@ -134,10 +149,15 @@ def encode_structure(
 
 
 def decode_structure(value: object, arrays: Mapping[str, NDArray]) -> Structure:
-    r"""Rebuild a [`Structure`][] from [`encode_structure`][]'s metadata and array map (its inverse).
+    r"""
+    Decode a structure from metadata and NumPy arrays.
 
-    Array references in ``value`` are resolved against ``arrays`` to restore coordinates, mask, and
-    optional occupancy.
+    Args:
+        value: Metadata produced by [`encode_structure`][ofoldx.data.codec.encode_structure].
+        arrays: Arrays keyed by the references stored in ``value``.
+
+    Returns:
+        The decoded structure.
     """
     data = _expect_object(value, "Structure")
     _expect_keys(
@@ -520,10 +540,14 @@ def _decode_system_bond(value: object) -> SystemBond:
 
 
 def encode_msa(msa: MSA) -> dict[str, object]:
-    r"""Serialize an [`MSA`][] to a JSON-safe object (inverse of [`decode_msa`][]).
+    r"""
+    Encode an MSA as a JSON-safe object.
 
-    Sequence rows are stored verbatim as strings and deletion-count arrays are widened to nested int
-    lists, so ``decode_msa(encode_msa(msa)) == msa`` round-trips.
+    Args:
+        msa: MSA to encode.
+
+    Returns:
+        Sequence rows and deletion counts represented with JSON-safe values.
     """
     if not isinstance(msa, MSA):
         raise TypeError("msa must be an MSA")
@@ -540,7 +564,15 @@ def encode_msa(msa: MSA) -> dict[str, object]:
 
 
 def decode_msa(value: object) -> MSA:
-    r"""Rebuild an [`MSA`][] from [`encode_msa`][]'s object (its inverse), restoring uint32 deletion arrays."""
+    r"""
+    Decode an MSA from a JSON-safe object.
+
+    Args:
+        value: Object produced by [`encode_msa`][ofoldx.data.codec.encode_msa].
+
+    Returns:
+        The decoded MSA with unsigned deletion-count arrays.
+    """
     data = _expect_object(value, "MSA")
     _expect_keys(
         data,
@@ -565,11 +597,14 @@ def decode_msa(value: object) -> MSA:
 
 
 def encode_msa_collection(collection: MSACollection) -> dict[str, object]:
-    r"""Serialize an [`MSACollection`][] to a JSON-safe object (inverse of [`decode_msa_collection`][]).
+    r"""
+    Encode an MSA collection as a JSON-safe object.
 
-    Each member MSA is encoded via [`encode_msa`][] and the dense pairing plan (``row_pairing``,
-    ``row_is_paired``) is rendered as nested lists, so the collection round-trips through
-    [`decode_msa_collection`][].
+    Args:
+        collection: MSA collection to encode.
+
+    Returns:
+        Encoded MSA columns, row-selection arrays, and optional instance targets.
     """
     if not isinstance(collection, MSACollection):
         raise TypeError("collection must be an MSACollection")
@@ -586,9 +621,15 @@ def encode_msa_collection(collection: MSACollection) -> dict[str, object]:
 
 
 def decode_msa_collection(value: object) -> MSACollection:
-    r"""Rebuild an [`MSACollection`][] from [`encode_msa_collection`][]'s object (its inverse).
+    r"""
+    Decode an MSA collection from a JSON-safe object.
 
-    Restores the member MSAs and the int64/bool pairing-plan matrices.
+    Args:
+        value: Object produced by
+            [`encode_msa_collection`][ofoldx.data.codec.encode_msa_collection].
+
+    Returns:
+        The decoded MSA collection with signed row indices and boolean pool selectors.
     """
     data = _expect_object(value, "MSACollection")
     _expect_keys(
@@ -618,11 +659,15 @@ def encode_template(
     *,
     array_prefix: str,
 ) -> tuple[dict[str, object], dict[str, NDArray]]:
-    r"""Serialize a [`Template`][] (inverse of [`decode_template`][]).
+    r"""
+    Encode a structural template as metadata and NumPy arrays.
 
-    Returns a ``(metadata, arrays)`` pair: the template [`Structure`][] is encoded via
-    [`encode_structure`][] (its arrays keyed by ``array_prefix``) alongside the alignments, so
-    ``decode_template(*encode_template(template, array_prefix=p))`` reconstructs the original.
+    Args:
+        template: Template to encode.
+        array_prefix: Non-empty prefix for the embedded structure arrays.
+
+    Returns:
+        A ``(metadata, arrays)`` pair containing the template structure and alignments.
     """
     if not isinstance(template, Template):
         raise TypeError("template must be a Template")
@@ -637,7 +682,16 @@ def encode_template(
 
 
 def decode_template(value: object, arrays: Mapping[str, NDArray]) -> Template:
-    r"""Rebuild a [`Template`][] from [`encode_template`][]'s metadata and array map (its inverse)."""
+    r"""
+    Decode a structural template from metadata and NumPy arrays.
+
+    Args:
+        value: Metadata produced by [`encode_template`][ofoldx.data.codec.encode_template].
+        arrays: Arrays keyed by the embedded structure metadata.
+
+    Returns:
+        The decoded template.
+    """
     data = _expect_object(value, "Template")
     _expect_keys(
         data,

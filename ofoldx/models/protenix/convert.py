@@ -45,9 +45,6 @@ def load_reference_state(checkpoint_path: str | Any, *, map_location: str | Any 
 
     Returns:
         Mapping from clean checkpoint key to tensor.
-
-    Examples:
-        >>> state = load_reference_state("af3.pt")  # doctest: +SKIP
     """
 
     checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
@@ -68,7 +65,9 @@ def translate_reference_state(
     reference_state: Mapping[str, Tensor],
     key_fn: Callable[[str], _ReferenceKey],
 ) -> dict[str, Tensor]:
-    r"""Translate every target and require every source tensor to participate."""
+    r"""
+    Translate every target and require every source tensor to participate.
+    """
 
     translated: dict[str, Tensor] = {}
     consumed: set[str] = set()
@@ -90,7 +89,9 @@ def translate_reference_state(
 
 
 def translate_protenix_state(model: nn.Module, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
-    r"""Translate every tensor in one released Protenix graph."""
+    r"""
+    Translate every tensor in one released Protenix graph.
+    """
 
     return translate_reference_state(model, reference_state, _protenix_reference_key)
 
@@ -110,9 +111,6 @@ def convert_protenix_checkpoint(
     Returns:
         The converted, strict-loaded `ProtenixModel`. Use `save_protenix_checkpoint` to persist the paired
         model/processor repository locally or on the Hub.
-
-    Examples:
-        >>> model = convert_protenix_checkpoint("protenix_base_default_v0.5.0.pt")  # doctest: +SKIP
     """
 
     from .config import ProtenixConfig, ProtenixConstraintConfig
@@ -139,7 +137,8 @@ def save_protenix_checkpoint(
     token: str | None = None,
     private: bool = False,
 ) -> None:
-    r"""Convert a Protenix checkpoint and write a routable OFoldX repository.
+    r"""
+    Convert a Protenix checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
     [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
@@ -182,6 +181,10 @@ def save_protenix_checkpoint(
 
 
 def main(argv: list[str] | None = None) -> None:
+    r"""
+    Run protenix checkpoint conversion from the command line.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "checkpoint",
@@ -252,7 +255,9 @@ def _protenix_reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _reference_key(model_key: str) -> _ReferenceKey:
-    r"""Return the released Protenix checkpoint key for an OFoldX model key."""
+    r"""
+    Return the released Protenix checkpoint key for an OFoldX model key.
+    """
 
     key = _replace_top_level(model_key)
     key = _replace_template_key(key)
@@ -269,7 +274,9 @@ def _reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _lookup_reference_value(reference_state: Mapping[str, Tensor], reference_key: _ReferenceKey) -> _ReferenceValue:
-    r"""Read the source tensor or tensors named by one target key."""
+    r"""
+    Read the source tensor or tensors named by one target key.
+    """
 
     if isinstance(reference_key, tuple):
         return tuple(reference_state[key] for key in reference_key)
@@ -277,7 +284,9 @@ def _lookup_reference_value(reference_state: Mapping[str, Tensor], reference_key
 
 
 def _transform_reference_value(model_key: str, reference_value: _ReferenceValue) -> Tensor:
-    r"""Apply tensor transforms required by the released Protenix format."""
+    r"""
+    Apply tensor transforms required by the released Protenix format.
+    """
 
     if isinstance(reference_value, tuple):
         if model_key.endswith(".conditioning_projection.weight"):
@@ -300,7 +309,9 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
 
 
 def _remap_token_transformer_blocks(key: str) -> str:
-    r"""Map a consolidated token transformer onto Protenix block names."""
+    r"""
+    Map a consolidated token transformer onto Protenix block names.
+    """
 
     rules = [
         (r"\.pair_norms\.(\d+)\.", r".blocks.\1.attention_pair_bias.layernorm_z."),

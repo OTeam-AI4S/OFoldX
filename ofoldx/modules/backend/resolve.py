@@ -1,15 +1,5 @@
-r"""Operator backend selection.
-
-Public backend requests have one shared meaning:
-
-- ``"auto"``  — OOps when available and suitable, otherwise PyTorch.
-- ``"torch"`` — the operator's canonical PyTorch implementation.
-- ``"sdpa"``, ``"oops"``, ``"cueq"``, ``"apex"``, and ``"deepspeed"`` — use that
-  provider where it implements the operator and the canonical PyTorch implementation elsewhere.
-
-Low-level numerical diagnostics may also request a concrete implementation such as
-``"eager"``. Concrete names are implementation details, not a second public
-configuration axis.
+r"""
+Operator-backend selection and validation.
 """
 
 from __future__ import annotations
@@ -29,10 +19,8 @@ def oops_available() -> bool:
 
     Runtime ``"auto"`` dispatch also considers the participating tensors.
 
-    Examples:
-        >>> from ofoldx.modules.backend.resolve import oops_available
-        >>> isinstance(oops_available(), bool)
-        True
+    Returns:
+        Whether the optional OOps package is available.
     """
 
     return OOPS_AVAILABLE
@@ -48,22 +36,13 @@ def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], publ
     Args:
         requested: The requested public backend or a concrete implementation name.
         supported: The backends this particular operator implements, in preference order.
-        public_default: The operator's canonical PyTorch implementation.
+        public_default: The operator's default PyTorch implementation.
 
     Returns:
         A concrete backend name drawn from ``supported`` (or ``public_default``).
 
     Raises:
         ValueError: If the request is neither a public provider nor a supported concrete implementation.
-
-    Examples:
-        >>> from ofoldx.modules.backend.resolve import resolve_operator_backend
-        >>> resolve_operator_backend("eager", supported=("oops", "eager"), public_default="eager")
-        'eager'
-        >>> resolve_operator_backend("nope", supported=("oops", "eager"), public_default="eager")  # doctest: +ELLIPSIS
-        Traceback (most recent call last):
-            ...
-        ValueError: unsupported operator_backend 'nope'; expected one of: ...torch
     """
 
     if requested == "auto":
@@ -87,15 +66,10 @@ def resolve_config_operator_backend(requested: str, *, supported: tuple[str, ...
     Args:
         requested: The requested public backend or a concrete implementation name.
         supported: The backends this particular operator implements, in preference order.
-        public_default: The operator's canonical PyTorch implementation.
+        public_default: The operator's default PyTorch implementation.
 
     Returns:
         A preserved public request or a validated concrete implementation name.
-
-    Examples:
-        >>> from ofoldx.modules.backend.resolve import resolve_config_operator_backend
-        >>> resolve_config_operator_backend("auto", supported=("oops", "eager"), public_default="eager")
-        'auto'
     """
 
     if requested in PUBLIC_OPERATOR_BACKENDS:
@@ -114,7 +88,7 @@ def resolve_tensor_operator_backend(
     Resolve a backend for concrete tensors.
 
     ``"auto"`` selects OOps only when it is available, supported, and every provided
-    tensor is on CUDA. It otherwise selects the canonical PyTorch implementation.
+    tensor is on CUDA. It otherwise selects the default PyTorch implementation.
     ``"torch"`` always selects that PyTorch implementation. ``None`` values are ignored
     and at least one tensor is required for automatic OOps selection.
 
@@ -123,18 +97,10 @@ def resolve_tensor_operator_backend(
         tensors: Tensors considered by ``"auto"`` backend selection. ``None`` values are ignored so
             optional masks can be passed directly.
         supported: The backends this particular operator implements, in preference order.
-        public_default: The operator's canonical PyTorch implementation.
+        public_default: The operator's default PyTorch implementation.
 
     Returns:
         A concrete backend name drawn from ``supported`` (or ``public_default``).
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.resolve import resolve_tensor_operator_backend
-        >>> resolve_tensor_operator_backend(
-        ...     "auto", tensors=(torch.ones(1),), supported=("oops", "eager"), public_default="eager"
-        ... )
-        'eager'
     """
 
     if requested == "auto":

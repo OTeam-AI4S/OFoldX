@@ -1,4 +1,6 @@
-r"""Generic PDB codec for canonical [`ofoldx.data.Structure`][] values."""
+r"""
+Generic PDB codec for canonical [`ofoldx.data.Structure`][] values.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +27,25 @@ from .records import (
 
 @dataclass(frozen=True, slots=True)
 class PdbAtomRecord:
-    r"""One fully materialized PDB output row."""
+    r"""
+    One fully materialized PDB output row.
+
+    Args:
+        site: Canonical atom site represented by the row.
+        serial: One-based PDB atom serial.
+        group: `ATOM` or `HETATM` record category.
+        atom_name: PDB atom name.
+        altloc_id: Alternate-location identifier.
+        component_id: PDB residue name.
+        chain_id: One-character PDB chain identifier.
+        residue_id: PDB residue number.
+        insertion_code: PDB insertion code.
+        coordinates: Cartesian coordinates in angstroms.
+        occupancy: Atom occupancy.
+        b_factor: Isotropic B factor.
+        element: Chemical element symbol.
+        charge: Formal charge.
+    """
 
     site: AtomSite
     serial: int
@@ -44,7 +64,21 @@ class PdbAtomRecord:
 
 
 def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStructure:
-    r"""Parse one PDB model or assembly into format-neutral atom records."""
+    r"""
+    Parse one PDB model or assembly into format-neutral atom records.
+
+    Args:
+        path: Source PDB path.
+        model: One-based model number to select.
+        assembly_id: Biological assembly identifier, or `None` to read the stored model.
+
+    Returns:
+        Parsed atom records and original PDB lines.
+
+    Raises:
+        ValueError: If the requested model or assembly is unavailable, atom records are
+            duplicated, or the file is not ASCII text.
+    """
 
     from biotite.structure.io.pdb import PDBFile
 
@@ -88,7 +122,21 @@ def read_pdb_bonds(
     selected_rows: tuple[AtomRecord, ...],
     site_by_row_index: dict[int, AtomSite],
 ) -> tuple[SystemBond, ...]:
-    r"""Decode PDB ``CONECT`` declarations against selected canonical sites."""
+    r"""
+    Decode PDB `CONECT` declarations against selected canonical sites.
+
+    Args:
+        parsed: Parsed PDB records and original source lines.
+        selected_rows: Atom rows retained for the selected structure.
+        site_by_row_index: Canonical atom sites indexed by source row.
+
+    Returns:
+        Resolved covalent system bonds.
+
+    Raises:
+        ValueError: If atom serials are ambiguous or missing, or a declared bond
+            multiplicity is unsupported.
+    """
 
     conect_lines = [line for line in parsed.pdb_lines if line.startswith("CONECT")]
     directed_counts: dict[tuple[str, str], int] = {}
@@ -156,7 +204,18 @@ def pdb_loss_fields(
     dropped: set[str],
     rewritten: set[str],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    r"""Return sorted canonical fields dropped or rewritten by PDB output."""
+    r"""
+    Return canonical fields dropped or rewritten by PDB output.
+
+    Args:
+        structure: Source structure being serialized.
+        atoms: Prepared PDB atom rows.
+        dropped: Field tokens already known to be omitted.
+        rewritten: Field tokens already known to be changed.
+
+    Returns:
+        Sorted tuples of dropped and rewritten field tokens.
+    """
 
     # LossReport covers information represented by Structure and MolecularSystem;
     # unrepresented source annotations are outside its scope.
@@ -202,7 +261,19 @@ def pdb_loss_fields(
 
 
 def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], set[str], set[str]]:
-    r"""Materialize PDB rows and collect dropped or rewritten field tokens."""
+    r"""
+    Materialize PDB rows and collect dropped or rewritten field tokens.
+
+    Args:
+        structure: Structure to lower into PDB atom rows.
+
+    Returns:
+        Prepared atom rows, dropped field tokens, and rewritten field tokens.
+
+    Raises:
+        ValueError: If PDB chain, serial, atom-name, coordinate, or occupancy limits
+            cannot represent the structure.
+    """
 
     # Structure has no source-identity, alternate-location, or B-factor fields. The
     # writer derives identity columns, emits one conformer, and writes B factor 0.
@@ -320,7 +391,14 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
 
 
 def write_pdb(structure: Structure, path: Path, atoms: tuple[PdbAtomRecord, ...]) -> None:
-    r"""Write prepared PDB atom records and representable system bonds."""
+    r"""
+    Write prepared PDB atom records and representable system bonds.
+
+    Args:
+        structure: Source structure providing the system bond graph.
+        path: Destination PDB path.
+        atoms: Prepared PDB atom rows.
+    """
 
     lines: list[str] = []
     serial_by_site = {atom.site: atom.serial for atom in atoms}

@@ -1,10 +1,5 @@
-r"""Collate a list of per-structure family Inputs into one batched family Input.
-
-Each dataset item is a family Input dataclass whose tensor fields carry a leading
-singleton batch axis (as the Processors emit). The generic [`collate`][]
-concatenates matching fields along that axis, padding variable-length axes so a
-heterogeneous batch (different sequence / atom counts) becomes one rectangular
-Input.
+r"""
+Collation for typed model-input dataclasses.
 """
 
 from __future__ import annotations
@@ -17,21 +12,23 @@ from torch import Tensor
 
 
 def collate(batch: list[Any]) -> Any:
-    r"""Merge a list of single-structure family Inputs into one batched Input.
+    r"""
+    Collate model-input dataclasses along their leading batch axes.
 
-    Contract:
+    Tensor fields are right-padded on non-batch axes and concatenated on axis zero.
+    Sequence fields are flattened in input order. Optional fields must be present on
+    all items or absent on all items.
 
-    - Every element is the same family Input dataclass with a leading singleton
-      batch axis on its tensor fields.
-    - Tensor fields are concatenated along dim 0, right-padding the ragged axes
-      (sequence length, atom count, ...) to the batch maximum; the pad value is 0
-      except for boolean/validity masks, which pad ``False``.
-    - Tuple/sequence identity fields (``structures``, ``component_references``)
-      are concatenated into a length-``B`` tuple.
-    - ``None`` optional fields collate to ``None`` iff every element is ``None``;
-      a mixed presence is an error.
+    Args:
+        batch: Non-empty list of dataclass instances of one type.
 
-    Returns one family Input dataclass whose tensor fields have leading dim ``B``.
+    Returns:
+        A dataclass whose leading tensor-axis length is the sum of input leading-axis
+        lengths.
+
+    Raises:
+        TypeError: If inputs are not dataclass instances of one type.
+        ValueError: If the batch is empty or aligned fields cannot be collated.
     """
 
     if not batch:
@@ -56,11 +53,8 @@ def collate(batch: list[Any]) -> Any:
 
 
 def _collate_field(name: str, values: list[Any]) -> Any:
-    r"""Merge one field's per-element values by kind (tensor / sequence / identity).
-
-    Optional fields are resolved first: a field collates to ``None`` only when it
-    is ``None`` on every element, and a mixed presence (some ``None``, some a
-    tensor) is rejected rather than silently zero-filled.
+    r"""
+    Collate one aligned dataclass field.
     """
 
     present = [value is not None for value in values]
@@ -81,13 +75,10 @@ def _collate_field(name: str, values: list[Any]) -> Any:
 
 
 def _collate_tensors(name: str, tensors: list[Tensor]) -> Tensor:
-    r"""Right-pad the ragged non-batch axes to the batch maximum, then concatenate.
+    r"""
+    Right-pad non-batch axes and concatenate tensors on axis zero.
 
-    Every tensor shares the leading batch axis and the trailing rank; only the
-    intermediate extents (sequence length, atom count, ...) may differ. Each
-    tensor is copied into a zero-filled tensor sized to the per-axis batch
-    maximum, so the pad value is 0 and a boolean mask pads ``False`` (the boolean
-    zero). Concatenation along dim 0 then yields the leading batch dimension.
+    All tensors must have the same rank. Their leading-axis lengths may differ.
     """
 
     reference = tensors[0]
@@ -115,11 +106,8 @@ def _collate_tensors(name: str, tensors: list[Tensor]) -> Tensor:
 
 
 def _collate_sequences(sequences: list[Any]) -> tuple[Any, ...]:
-    r"""Flatten each element's per-example tuple into one length-``B`` tuple.
-
-    A Processor emits an identity sequence (``structures``, ``component_references``)
-    with a leading batch axis of length one, so flattening the singleton tuples
-    across the batch reproduces the ``B`` per-example identities in order.
+    r"""
+    Flatten aligned sequence fields in input order.
     """
 
     flattened: list[Any] = []
@@ -129,11 +117,8 @@ def _collate_sequences(sequences: list[Any]) -> tuple[Any, ...]:
 
 
 def _collate_identity(name: str, values: list[Any]) -> Any:
-    r"""Keep a scalar / configuration field shared by the whole batch.
-
-    A field that is neither a tensor nor a sequence carries no batch axis, so it
-    must be identical across the batch; the shared value is asserted with ``==``
-    and returned unchanged.
+    r"""
+    Return a non-batched field shared by every input.
     """
 
     reference = values[0]

@@ -1,10 +1,5 @@
 r"""
-Relative-position embedding modules.
-
-Encode the pairwise relationship between tokens (relative residue / token / chain offset and
-whether two tokens share an entity) as integer buckets, then embed those buckets into the pair
-representation. Bucketing is factored out from projection so the embedder can gather rows of its
-weight instead of materialising the dense ``[..., N, N, input_size]`` one-hot.
+Relative-position embeddings.
 """
 
 from __future__ import annotations
@@ -21,11 +16,7 @@ ChainGate = Literal["same_entity", "not_same_chain"]
 @dataclass
 class RelativePositionBuckets:
     r"""
-    The integer relative-position buckets that index the relative-position embedding tables.
-
-    Because ``onehot(b) @ Wᵀ == Wᵀ[b]``, the embedder gathers the relevant rows of its single projection weight
-    instead of materialising the dense ``(..., N, N, input_size)`` one-hot. This carries the buckets, the one-hot
-    block widths needed to slice that weight, and the activation dtype for the gathered output.
+    Integer buckets consumed by [`RelativePositionEmbedder`][].
 
     Args:
         residue_bucket: Relative residue-distance bucket ids.
@@ -41,42 +32,19 @@ class RelativePositionBuckets:
     token_bucket: Tensor
     same_entity: Tensor
     chain_bucket: Tensor
-    residue_size: int  # width of each of the residue & token one-hot blocks: 2 * (max_relative_residue + 1)
-    chain_size: int  # width of the chain one-hot block: 2 * (max_relative_chain + 1)
-    dtype: torch.dtype  # dtype of the embedder output (the buckets themselves stay integer)
+    residue_size: int
+    chain_size: int
+    dtype: torch.dtype
 
 
 class RelativePositionEmbedder(nn.Module):
     r"""
     Project relative-position buckets into pair representations.
 
-    Gathers rows of the single projection weight (one block per bucket type) rather than projecting a dense
-    one-hot — identical result (``onehot(b) @ Wᵀ == Wᵀ[b]``) without the ``(..., N, N, input_size)`` materialisation.
-
     Args:
         input_size: Total width of the conceptual relative-position one-hot feature
             (``2 * residue_size + 1 + chain_size``; ``139`` for the default bucket ranges).
         pair_size: Output pair representation width.
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> index = torch.arange(4).unsqueeze(0)
-        >>> zeros = torch.zeros(1, 4, dtype=torch.long)
-        >>> buckets = generate_relative_position_features(
-        ...     residue_index=index,
-        ...     chain_index=zeros,
-        ...     entity_index=zeros,
-        ...     symmetry_index=zeros,
-        ...     token_index=index,
-        ...     max_relative_residue=2,
-        ...     max_relative_chain=1,
-        ...     dtype=torch.float32,
-        ... )
-        >>> input_size = 2 * buckets.residue_size + 1 + buckets.chain_size
-        >>> embedder = RelativePositionEmbedder(input_size=input_size, pair_size=8)
-        >>> embedder(buckets).shape
-        torch.Size([1, 4, 4, 8])
     """
 
     def __init__(self, input_size: int = 139, pair_size: int = 128) -> None:
@@ -92,26 +60,8 @@ class RelativePositionEmbedder(nn.Module):
                 ``generate_relative_position_features``.
 
         Returns:
-            ``[..., N_token, N_token, pair_size]`` relative-position encoding, cast to ``buckets.dtype``.
-
-        Examples:
-            >>> import torch
-            >>> _ = torch.manual_seed(0)
-            >>> index = torch.arange(3).unsqueeze(0)
-            >>> zeros = torch.zeros(1, 3, dtype=torch.long)
-            >>> buckets = generate_relative_position_features(
-            ...     residue_index=index,
-            ...     chain_index=zeros,
-            ...     entity_index=zeros,
-            ...     symmetry_index=zeros,
-            ...     token_index=index,
-            ...     max_relative_residue=2,
-            ...     max_relative_chain=1,
-            ...     dtype=torch.float32,
-            ... )
-            >>> input_size = 2 * buckets.residue_size + 1 + buckets.chain_size
-            >>> RelativePositionEmbedder(input_size=input_size, pair_size=8)(buckets).shape
-            torch.Size([1, 3, 3, 8])
+            ``[..., N_token, N_token, pair_size]`` relative-position features in
+            ``buckets.dtype``.
         """
 
         weight = self.output_projection.weight  # (pair_size, input_size = 2 * residue_size + 1 + chain_size)
@@ -143,51 +93,32 @@ def generate_relative_position_features(
     dtype: torch.dtype,
 ) -> RelativePositionBuckets:
     r"""
-    Build the pairwise relative-position buckets from token metadata.
+    Build pairwise relative-position buckets from token metadata.
 
-    When ``cyclic_period`` (shape ``(..., N)``) is supplied, positive entries wrap the raw residue
-    offset modulo the period before bucketing. Zero entries leave the linear offset unchanged. Only same-chain
-    pairs survive the chain gate, and a cyclic chain has a constant period, so broadcasting the period over the
-    key axis matches the per-pair period for every pair that counts.
-
-    ``chain_gate`` selects which pairs keep their real ``chain_offset`` bucket (the rest get the out-of-range
-    sentinel): ``"same_entity"`` keeps same-entity pairs, while ``"not_same_chain"`` keeps cross-chain
-    pairs instead.
+    Residue offsets are retained only within a chain. Positive ``cyclic_period``
+    values wrap offsets using the key token's period, broadcast across the query
+    axis. ``chain_gate`` controls which pairs retain chain-offset buckets.
 
     Args:
-        residue_index: ``[..., N_token]`` residue indices.
-        chain_index: ``[..., N_token]`` chain indices.
-        entity_index: ``[..., N_token]`` entity indices.
-        symmetry_index: ``[..., N_token]`` symmetry/copy indices.
-        token_index: ``[..., N_token]`` token indices.
-        cyclic_period: Optional ``[..., N_token]`` cyclic period per token.
-        max_relative_residue: Maximum residue offset bucket.
-        max_relative_chain: Maximum chain offset bucket.
-        chain_gate: Which pairs keep the real chain-offset bucket (see above).
-        dtype: Desired dtype of the eventual embedding output.
+        residue_index: Residue indices with shape ``(..., num_tokens)``.
+        chain_index: Chain indices with shape ``(..., num_tokens)``.
+        entity_index: Entity indices with shape ``(..., num_tokens)``.
+        symmetry_index: Symmetry-copy indices with shape ``(..., num_tokens)``.
+        token_index: Token indices with shape ``(..., num_tokens)``.
+        cyclic_period: Optional per-token cyclic periods with shape
+            ``(..., num_tokens)``; non-positive values leave offsets linear.
+        max_relative_residue: Largest signed residue or token offset represented
+            without clipping.
+        max_relative_chain: Largest signed chain offset represented without clipping.
+        chain_gate: ``"same_entity"`` retains chain offsets within an entity;
+            ``"not_same_chain"`` retains offsets between different chains.
+        dtype: Floating-point dtype recorded for the resulting embedding.
 
     Returns:
-        Relative-position bucket container holding the residue, token, chain, and same-entity buckets
-        plus the one-hot block widths and output dtype.
+        Residue, token, chain, and entity buckets for every token pair.
 
-    Examples:
-        >>> import torch
-        >>> index = torch.arange(4).unsqueeze(0)
-        >>> zeros = torch.zeros(1, 4, dtype=torch.long)
-        >>> buckets = generate_relative_position_features(
-        ...     residue_index=index,
-        ...     chain_index=zeros,
-        ...     entity_index=zeros,
-        ...     symmetry_index=zeros,
-        ...     token_index=index,
-        ...     max_relative_residue=2,
-        ...     max_relative_chain=1,
-        ...     dtype=torch.float32,
-        ... )
-        >>> buckets.residue_bucket.tolist()
-        [[[2, 1, 0, 0], [3, 2, 1, 0], [4, 3, 2, 1], [4, 4, 3, 2]]]
-        >>> buckets.residue_size, buckets.chain_size
-        (6, 4)
+    Raises:
+        ValueError: If ``chain_gate`` is unsupported.
     """
 
     same_chain = chain_index[..., :, None] == chain_index[..., None, :]

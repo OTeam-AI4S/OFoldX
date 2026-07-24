@@ -1,4 +1,6 @@
-r"""ProteinMPNN sequence design, scoring, and probability Pipelines."""
+r"""
+ProteinMPNN sequence design, scoring, and probability Pipelines.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +38,9 @@ _GENERATED_TOKEN_INDEX_BY_LETTER["X"] = AMINO_ACID_UNKNOWN_TOKEN
 
 
 class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]):
-    r"""Bind one ProteinMPNN Model and Processor for biological operations."""
+    r"""
+    Protein sequence design pipeline for ProteinMPNN.
+    """
 
     def design(
         self,
@@ -60,10 +64,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnDesignResult:
-        r"""Design ProteinMPNN sequences on a fixed backbone.
+        r"""
+        Design ProteinMPNN sequences on a fixed backbone.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with the required backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -128,10 +133,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Score a ProteinMPNN sequence over independently drawn decoding orders.
+        r"""
+        Score a ProteinMPNN sequence over independently drawn decoding orders.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             sequence: Optional target sequence as one-letter text or an instance-to-sequence
                 mapping. ``None`` scores the structure's identities.
             design_positions: Residue occurrences included in the designed-sequence score.
@@ -169,10 +175,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute sequence-conditioned autoregressive probabilities.
+        r"""
+        Compute sequence-conditioned autoregressive probabilities.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -209,10 +216,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute sequence-free autoregressive probabilities.
+        r"""
+        Compute sequence-free autoregressive probabilities.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -248,10 +256,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute target-last conditional probabilities for every residue row.
+        r"""
+        Compute target-last conditional probabilities for every residue row.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
@@ -287,10 +296,11 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Compute target-first unconditional probabilities for every residue row.
+        r"""
+        Compute target-first unconditional probabilities for every residue row.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
@@ -318,15 +328,12 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
 
 
 class ProteinMpnnDesignAndPackPipeline:
-    r"""Compose the ProteinMPNN designer with MPNN Packer over one source.
-
-    The Pipeline designs sequences on a fixed backbone and then packs each design. Both stages
-    read one canonical ``Structure`` parsed exactly once, and a supplied random stream is
-    consumed by design first and advanced pack-major across every candidate.
+    r"""
+    Design protein sequences with ProteinMPNN and pack their side chains.
 
     Args:
-        designer: ProteinMPNN sequence-design Pipeline.
-        packer: MPNN Packer Pipeline applied to each designed sequence.
+        designer: ProteinMPNN sequence-design pipeline.
+        packer: Side-chain packing pipeline.
     """
 
     def __init__(
@@ -343,7 +350,16 @@ class ProteinMpnnDesignAndPackPipeline:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Place both children on one device and dtype in place."""
+        r"""
+        Move the designer and packer to a device and dtype.
+
+        Args:
+            device: Destination device. ``None`` preserves the current device.
+            dtype: Destination floating-point dtype. ``None`` preserves the current dtype.
+
+        Returns:
+            This pipeline.
+        """
 
         self.designer.to(device=device, dtype=dtype)
         self.packer.to(device=device, dtype=dtype)
@@ -377,10 +393,11 @@ class ProteinMpnnDesignAndPackPipeline:
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[ProteinMpnnDesignResult, tuple[PackResult, ...]]:
-        r"""Design ProteinMPNN sequences and pack every resulting candidate.
+        r"""
+        Design ProteinMPNN sequences and pack every resulting candidate.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path, parsed once for both stages.
+            input: A ``Structure`` or local PDB path, parsed once for both stages.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with the required backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -470,7 +487,8 @@ def _global_omit_token_mask(
     *,
     device: torch.device,
 ) -> Tensor | None:
-    r"""Lower one-letter omit tokens to a generatable-class support mask.
+    r"""
+    Lower one-letter omit tokens to a generatable-class support mask.
 
     An empty selection carries no omission and enables ProteinMPNN's reachable
     twenty-first generated class. Every token is a generatable one-letter identity;
@@ -495,7 +513,9 @@ def _global_omit_token_mask(
 def _candidate_protein_sequences(
     system: MolecularSystem,
 ) -> dict[str, tuple[str, ...]]:
-    r"""Map each protein instance to its realized component-ID sequence."""
+    r"""
+    Map each protein instance to its realized component-ID sequence.
+    """
 
     sequences: dict[str, tuple[str, ...]] = {}
     for instance_id, entity_id in system.instances.items():

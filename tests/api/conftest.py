@@ -1,4 +1,5 @@
-r"""Fixtures for the public task-API surface (registry, pipelines, repository round-trip).
+r"""
+Fixtures for the public task-API surface (registry, pipelines, repository round-trip).
 
 The registrations these tests exercise live in the registry objects
 (``ofoldx.models.registry.MODELS`` and ``ofoldx.pipelines.registry.PIPELINES``). A test that
@@ -26,7 +27,9 @@ from ofoldx import Model
 
 @pytest.fixture(autouse=True)
 def _isolate_registries():
-    r"""Snapshot and restore the global model/pipeline registries around each test."""
+    r"""
+    Snapshot and restore the global model/pipeline registries around each test.
+    """
 
     from ofoldx.models import registry as model_registry
     from ofoldx.pipelines import registry as pipeline_registry
@@ -49,13 +52,19 @@ def _isolate_registries():
 
 
 def _build_tiny_classes():
-    r"""Create a fresh, uniquely-typed synthetic Model/Processor/Config triple."""
+    r"""
+    Create a fresh, uniquely-typed synthetic Model/Processor/Config triple.
+    """
 
     class TinyConfig(chanfig.Config):
-        r"""A config that is just its own mapping of values."""
+        r"""
+        A config that is just its own mapping of values.
+        """
 
     class TinyProcessor:
-        r"""A config-less Processor that yields a one-tensor carrier."""
+        r"""
+        A config-less Processor that yields a one-tensor carrier.
+        """
 
         def __init__(self, *, device=None, dtype=None):
             self.device = device
@@ -72,7 +81,9 @@ def _build_tiny_classes():
             return self
 
     class TinyModel(Model):
-        r"""A one-parameter Model whose task methods record what the Pipeline forwarded."""
+        r"""
+        A one-parameter Model whose task methods record what the Pipeline forwarded.
+        """
 
         config_class = TinyConfig
         config: TinyConfig
@@ -106,6 +117,8 @@ def _build_tiny_classes():
 
 @pytest.fixture
 def tiny_classes():
-    r"""Factory returning a fresh (TinyConfig, TinyProcessor, TinyModel) triple per call."""
+    r"""
+    Factory returning a fresh (TinyConfig, TinyProcessor, TinyModel) triple per call.
+    """
 
     return _build_tiny_classes

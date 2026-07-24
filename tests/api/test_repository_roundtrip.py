@@ -1,4 +1,5 @@
-r"""Lock the repository save/load round-trip through the public task API.
+r"""
+Lock the repository save/load round-trip through the public task API.
 
 DESIGN §9.2 requires end-to-end coverage of a single Model/Processor pair: classify a local reference,
 write a repository (``model.json`` architecture marker + safetensors weights, and -- when the concrete
@@ -36,7 +37,9 @@ def _register_pair(tiny_classes, *, model_id="test.tiny"):
 
 
 def test_standard_pipeline_round_trip(tmp_path, tiny_classes):
-    r"""A standard FoldPipeline (no marker) saves and reloads via api.pipeline('fold')."""
+    r"""
+    A standard FoldPipeline (no marker) saves and reloads via api.pipeline('fold').
+    """
 
     model, processor, TinyModel, TinyProcessor = _register_pair(tiny_classes)
     FoldPipeline(model=model, processor=processor).save(tmp_path)
@@ -58,12 +61,16 @@ def test_standard_pipeline_round_trip(tmp_path, tiny_classes):
 
 
 def test_registered_pipeline_round_trip_via_marker(tmp_path, tiny_classes):
-    r"""A registered concrete Pipeline writes a pipeline.json marker that the loader honors."""
+    r"""
+    A registered concrete Pipeline writes a pipeline.json marker that the loader honors.
+    """
 
     model, processor, TinyModel, TinyProcessor = _register_pair(tiny_classes)
 
     class MarkerFoldPipeline(FoldPipeline):
-        r"""A concrete, registered Fold pipeline so save() emits a pipeline.json marker."""
+        r"""
+        A concrete, registered Fold pipeline so save() emits a pipeline.json marker.
+        """
 
     PIPELINES.register_pipeline(
         "test.tiny.fold",

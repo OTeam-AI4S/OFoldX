@@ -1,10 +1,5 @@
 r"""
-MSA update modules.
-
-The MSA trunk conditions the pair representation on a multiple-sequence-alignment (MSA) axis. Each
-block averages MSA values with pair-derived weights, projects the MSA into a pair contribution via the
-outer-product mean, and refines the pair representation with the triangle updates. The final block emits
-no MSA update, since only the refined pair representation is consumed downstream.
+Multiple-sequence-alignment trunk blocks.
 """
 
 from __future__ import annotations
@@ -48,18 +43,6 @@ class MsaTrunk(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
-    Examples:
-        >>> import torch
-        >>> trunk = MsaTrunk(
-        ...     msa_size=8, pair_size=4, msa_feature_size=6, token_feature_size=5,
-        ...     num_blocks=2, outer_product_hidden_size=4, num_msa_attention_heads=2,
-        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, expansion=2,
-        ... ).eval()
-        >>> msa, pair = torch.randn(1, 2, 3, 6), torch.randn(1, 3, 3, 4)
-        >>> out_msa, out_pair = trunk(msa, pair, torch.randn(1, 3, 5))
-        >>> out_msa.shape, out_pair.shape
-        (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
     """
 
     def __init__(
@@ -144,19 +127,8 @@ class MsaTrunk(nn.Module):
         Returns:
             Tuple of the projected-and-refined MSA `[B, S, N, msa_size]` and the refined pair
             `[B, N, N, pair_size]`. The final block leaves the MSA untouched.
-
-        Examples:
-            >>> import torch
-            >>> trunk = MsaTrunk(
-            ...     msa_size=8, pair_size=4, msa_feature_size=6, token_feature_size=5,
-            ...     num_blocks=1, outer_product_hidden_size=4, num_msa_attention_heads=2,
-            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2,
-            ... ).eval()
-            >>> out_msa, out_pair = trunk(torch.randn(1, 2, 3, 6), torch.randn(1, 3, 3, 4))
-            >>> out_msa.shape, out_pair.shape
-            (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
         """
+
         msa = self.msa_projection(msa)
         if token_embedding is not None:
             msa = msa + self.token_projection(token_embedding).unsqueeze(-3)
@@ -193,25 +165,6 @@ class CategoricalMsaTrunk(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Feed-forward expansion factor of every transition.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> trunk = CategoricalMsaTrunk(
-        ...     single_size=8, pair_size=4, msa_size=8, msa_feature_size=36, num_blocks=1,
-        ...     vocab_size=33, outer_product_hidden_size=4, num_msa_attention_heads=2,
-        ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
-        ...     expansion=2,
-        ... ).eval()
-        >>> B, S, N = 1, 2, 3
-        >>> zeros = torch.zeros(B, S, N)
-        >>> pair = trunk(
-        ...     torch.randn(B, N, N, 4), torch.randn(B, N, 8),
-        ...     msa=torch.randint(0, 33, (B, S, N)),
-        ...     has_deletion=zeros, deletion_value=zeros, is_paired=zeros,
-        ...     msa_mask=torch.ones(B, S, N), token_mask=torch.ones(B, N),
-        ... )
-        >>> pair.shape
-        torch.Size([1, 3, 3, 4])
     """
 
     def __init__(
@@ -289,26 +242,8 @@ class CategoricalMsaTrunk(nn.Module):
 
         Returns:
             The refined pair representation `[B, N, N, pair_size]`; the internal MSA state is not returned.
-
-        Examples:
-            >>> import torch
-            >>> trunk = CategoricalMsaTrunk(
-            ...     single_size=8, pair_size=4, msa_size=8, msa_feature_size=36, num_blocks=1,
-            ...     vocab_size=33, outer_product_hidden_size=4, num_msa_attention_heads=2,
-            ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
-            ...     expansion=2,
-            ... ).eval()
-            >>> B, S, N = 1, 2, 3
-            >>> zeros = torch.zeros(B, S, N)
-            >>> pair = trunk(
-            ...     torch.randn(B, N, N, 4), torch.randn(B, N, 8),
-            ...     msa=torch.randint(0, 33, (B, S, N)),
-            ...     has_deletion=zeros, deletion_value=zeros, is_paired=zeros,
-            ...     msa_mask=torch.ones(B, S, N), token_mask=torch.ones(B, N),
-            ... )
-            >>> pair.shape
-            torch.Size([1, 3, 3, 4])
         """
+
         features = [
             F.one_hot(msa, num_classes=self.vocab_size).to(pair.dtype),
             has_deletion.unsqueeze(-1).to(pair.dtype),
@@ -346,18 +281,6 @@ class MsaBlock(nn.Module):
         expansion: Feed-forward expansion factor of every transition.
         divide_before_projection: Whether the outer-product mean divides before its projection.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = MsaBlock(
-        ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
-        ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
-        ...     expansion=2,
-        ... ).eval()
-        >>> pair, msa = torch.randn(1, 3, 3, 4), torch.randn(1, 2, 3, 8)
-        >>> out_pair, out_msa = block(pair, msa, torch.ones(1, 3, 3), torch.ones(1, 2, 3))
-        >>> out_pair.shape, out_msa.shape
-        (torch.Size([1, 3, 3, 4]), torch.Size([1, 2, 3, 8]))
     """
 
     def __init__(
@@ -414,21 +337,8 @@ class MsaBlock(nn.Module):
 
         Returns:
             Updated ``(pair, msa)`` of shapes `[B, N, N, pair_size]` and `[B, S, N, msa_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = MsaBlock(
-            ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
-            ...     msa_head_dim=4, triangle_attention_hidden_size=2, num_triangle_attention_heads=2,
-            ...     expansion=2,
-            ... ).eval()
-            >>> out_pair, out_msa = block(
-            ...     torch.randn(1, 3, 3, 4), torch.randn(1, 2, 3, 8),
-            ...     torch.ones(1, 3, 3), torch.ones(1, 2, 3),
-            ... )
-            >>> out_pair.shape, out_msa.shape
-            (torch.Size([1, 3, 3, 4]), torch.Size([1, 2, 3, 8]))
         """
+
         msa = msa + self.msa_dropout(self.pair_weighted_averaging(msa, pair, pair_mask=pair_mask))
         msa = msa + self.msa_transition(msa)
         pair = pair + self.outer_product_mean(msa, msa_mask)
@@ -458,17 +368,6 @@ class MsaPairBlock(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = MsaPairBlock(
-        ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
-        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, expansion=2,
-        ... ).eval()
-        >>> msa, pair = block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4))
-        >>> msa.shape, pair.shape
-        (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
     """
 
     def __init__(
@@ -532,18 +431,8 @@ class MsaPairBlock(nn.Module):
 
         Returns:
             Updated ``(msa, pair)`` of shapes `[B, S, N, msa_size]` and `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = MsaPairBlock(
-            ...     msa_size=8, pair_size=4, outer_product_hidden_size=4, num_msa_attention_heads=2,
-            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2,
-            ... ).eval()
-            >>> msa, pair = block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4))
-            >>> msa.shape, pair.shape
-            (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
         """
+
         pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
         msa = self.msa_update(msa, pair, pair_mask=pair_mask)
         pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
@@ -569,17 +458,6 @@ class FinalMsaPairBlock(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = FinalMsaPairBlock(
-        ...     msa_size=8, pair_size=4, outer_product_hidden_size=4,
-        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, expansion=2,
-        ... ).eval()
-        >>> msa, pair = block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4))
-        >>> msa.shape, pair.shape
-        (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
     """
 
     def __init__(
@@ -635,18 +513,8 @@ class FinalMsaPairBlock(nn.Module):
         Returns:
             Tuple of the unchanged ``msa`` `[B, S, N, msa_size]` and the refined ``pair``
             `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = FinalMsaPairBlock(
-            ...     msa_size=8, pair_size=4, outer_product_hidden_size=4,
-            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2,
-            ... ).eval()
-            >>> msa, pair = block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4))
-            >>> msa.shape, pair.shape
-            (torch.Size([1, 2, 3, 8]), torch.Size([1, 3, 3, 4]))
         """
+
         pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
         pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
         return msa, pair
@@ -663,12 +531,6 @@ class MsaUpdateBlock(nn.Module):
         expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability on the pair-weighted averaging residual.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = MsaUpdateBlock(msa_size=8, pair_size=4, num_attention_heads=2, expansion=2).eval()
-        >>> block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4)).shape
-        torch.Size([1, 2, 3, 8])
     """
 
     def __init__(
@@ -701,13 +563,8 @@ class MsaUpdateBlock(nn.Module):
 
         Returns:
             The updated MSA representation `[B, S, N, msa_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = MsaUpdateBlock(msa_size=8, pair_size=4, num_attention_heads=2, expansion=2).eval()
-            >>> block(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4)).shape
-            torch.Size([1, 2, 3, 8])
         """
+
         msa = msa + self.rowwise_dropout(self.msa_pair_weighted_averaging(msa, pair, pair_mask=pair_mask))
         return msa + self.transition(msa)
 
@@ -729,15 +586,6 @@ class TrianglePairUpdateBlock(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = TrianglePairUpdateBlock(
-        ...     pair_size=4, triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, expansion=2,
-        ... ).eval()
-        >>> block(torch.randn(1, 3, 3, 4)).shape
-        torch.Size([1, 3, 3, 4])
     """
 
     def __init__(
@@ -794,16 +642,8 @@ class TrianglePairUpdateBlock(nn.Module):
 
         Returns:
             The updated pair representation `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = TrianglePairUpdateBlock(
-            ...     pair_size=4, triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2,
-            ... ).eval()
-            >>> block(torch.randn(1, 3, 3, 4)).shape
-            torch.Size([1, 3, 3, 4])
         """
+
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
@@ -836,12 +676,6 @@ class MsaPairWeightedAveraging(nn.Module):
     Raises:
         ValueError: If ``head_dim`` is ``None`` and ``msa_size`` is not divisible by
             ``num_attention_heads``.
-
-    Examples:
-        >>> import torch
-        >>> module = MsaPairWeightedAveraging(msa_size=8, pair_size=4, num_attention_heads=2).eval()
-        >>> module(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4)).shape
-        torch.Size([1, 2, 3, 8])
     """
 
     def __init__(
@@ -890,13 +724,8 @@ class MsaPairWeightedAveraging(nn.Module):
 
         Returns:
             The MSA update `[B, S, N, msa_size]`.
-
-        Examples:
-            >>> import torch
-            >>> module = MsaPairWeightedAveraging(msa_size=8, pair_size=4, num_attention_heads=2).eval()
-            >>> module(torch.randn(1, 2, 3, 8), torch.randn(1, 3, 3, 4)).shape
-            torch.Size([1, 2, 3, 8])
         """
+
         return dispatch_pair_weighted_average(
             msa,
             pair,
@@ -934,12 +763,6 @@ class OuterProductMean(nn.Module):
         eps: Floor added to (or applied via ``clamp`` on) the per-pair sequence count.
         divide_before_projection: Whether to divide by the sequence count before the output projection.
         operator_backend: Operator backend selector; resolves to ``"oops"`` or ``"eager"``.
-
-    Examples:
-        >>> import torch
-        >>> module = OuterProductMean(msa_size=8, hidden_size=4, pair_size=4).eval()
-        >>> module(torch.randn(1, 2, 3, 8)).shape
-        torch.Size([1, 3, 3, 4])
     """
 
     def __init__(
@@ -976,13 +799,8 @@ class OuterProductMean(nn.Module):
 
         Returns:
             The pair contribution `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> module = OuterProductMean(msa_size=8, hidden_size=4, pair_size=4).eval()
-            >>> module(torch.randn(1, 2, 3, 8)).shape
-            torch.Size([1, 3, 3, 4])
         """
+
         return dispatch_outer_product_mean(
             msa,
             msa_mask,

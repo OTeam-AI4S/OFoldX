@@ -1,4 +1,5 @@
-"""Inspect PyTorch checkpoint state dictionaries.
+"""
+Inspect PyTorch checkpoint state dictionaries.
 
 This is a development utility for understanding external checkpoints. It does
 not load weights into OFoldX models.

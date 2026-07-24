@@ -1,4 +1,6 @@
-r"""Configuration values for the ProteinMPNN model and processor."""
+r"""
+Configuration values for the ProteinMPNN model and processor.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class ProteinMpnnConfig(Config):
-    r"""Configure architecture values shared by the ProteinMPNN graphs.
+    r"""
+    Configure architecture values shared by the ProteinMPNN graphs.
 
     Args:
         hidden_size: Width of node, edge, and decoder hidden states.
@@ -26,10 +29,12 @@ class ProteinMpnnConfig(Config):
 
 
 class ProteinMpnnProcessorConfig(Config):
-    r"""Configure persistent ProteinMPNN input lowering.
+    r"""
+    Configure ProteinMPNN input processing.
 
     Args:
-        ca_only: Whether to lower only CA coordinates instead of full backbone coordinates.
+        ca_only: Whether inputs contain only C-alpha coordinates instead of the
+            N, C-alpha, C, and O backbone atoms.
     """
 
     ca_only: bool = False

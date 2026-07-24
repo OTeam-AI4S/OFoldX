@@ -1,12 +1,5 @@
-r"""MPNN-specific PDB reading for ProteinMPNN, LigandMPNN, and MpnnPacker.
-
-``read_mpnn_pdb`` reads the first physical model, retains blank and ``A`` alternate
-locations in source order after optional chain filtering, and decodes hybrid-36
-residue numbers. Standard amino acids reconstruct their non-hydrogen atom14
-vocabulary (excluding ``OXT``) plus retained resolvable atoms from the built-in
-component definitions; ``UNK`` keeps only retained resolvable atoms, while other
-protein and nonprotein occurrences use open components built from retained source
-atoms.
+r"""
+MPNN-compatible PDB input.
 """
 
 from __future__ import annotations
@@ -62,7 +55,19 @@ def read_mpnn_pdb(
     *,
     chains: Sequence[str] | None = None,
 ) -> Structure:
-    r"""Read one PDB through the input policy shared by OFoldX MPNN models."""
+    r"""
+    Read a PDB with the atom-selection policy used by MPNN models.
+
+    The first model is selected. Blank and ``A`` alternate locations are retained,
+    and standard amino acids are expanded to their known non-hydrogen atom14 sites.
+
+    Args:
+        path: PDB or gzip-compressed PDB path.
+        chains: Optional chain identifiers to retain.
+
+    Returns:
+        The parsed molecular system and coordinates.
+    """
 
     source = Path(path).expanduser()
     if source.suffix == ".gz":

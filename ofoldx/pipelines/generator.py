@@ -1,9 +1,5 @@
-r"""The single seed|generator resolution point for every Pipeline.
-
-The public seed is resolved before processing on the Processor's declared output
-device. Generic task Pipelines have deterministic Processor contracts and pass the
-resulting stream only to the Model operation. A concrete Pipeline whose
-preprocessing is stochastic explicitly passes that same stream to its Processor.
+r"""
+Random-generator handling shared by task pipelines.
 """
 
 from __future__ import annotations
@@ -14,11 +10,18 @@ import torch
 
 
 class PipelineProcessor(Protocol):
-    r"""Placement capabilities shared by concrete Pipeline Processors."""
+    r"""
+    Runtime placement required from processors used by task pipelines.
+    """
 
     @property
     def device(self) -> torch.device:
-        r"""Return the device used for lowered tensors."""
+        r"""
+        Device used for tensors produced by this processor.
+
+        Returns:
+            The processor's current tensor device.
+        """
 
         ...
 
@@ -27,7 +30,16 @@ class PipelineProcessor(Protocol):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> object:
-        r"""Move the Processor to a device and floating-point dtype."""
+        r"""
+        Update the processor's tensor device and dtype.
+
+        Args:
+            device: New tensor device. ``None`` preserves the current device.
+            dtype: New floating-point dtype. ``None`` preserves the current dtype.
+
+        Returns:
+            The updated processor.
+        """
 
         ...
 
@@ -38,7 +50,8 @@ def resolve_generator(
     *,
     device: torch.device | str | None = None,
 ) -> torch.Generator | None:
-    r"""Resolve ``seed``/``generator`` to a single generator object once, at the boundary.
+    r"""
+    Resolve mutually exclusive seed and generator arguments.
 
     Args:
         seed: Optional integer seed; mutually exclusive with ``generator``.

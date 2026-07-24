@@ -1,4 +1,6 @@
-r"""Persistence and device transfer for model-processor pipelines."""
+r"""
+Persistence and device transfer for model-processor pipelines.
+"""
 
 from __future__ import annotations
 
@@ -21,11 +23,12 @@ _ProcessorT = TypeVar("_ProcessorT", bound=PipelineProcessor)
 
 
 class PairedPipeline(Generic[_ModelT, _ProcessorT]):
-    r"""Base class for a pipeline owning one Model and Processor.
+    r"""
+    Base class for a pipeline backed by one model and processor.
 
     Args:
-        model: Model that implements the biological operation.
-        processor: Processor that lowers public inputs for ``model``.
+        model: Model that performs the task computation.
+        processor: Processor that converts user inputs into model inputs.
     """
 
     def __init__(self, *, model: _ModelT, processor: _ProcessorT) -> None:
@@ -37,7 +40,8 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Move the bound Model and Processor to one device and dtype.
+        r"""
+        Move the bound model and processor to one device and dtype.
 
         Args:
             device: Destination device. ``None`` preserves the current device.
@@ -61,7 +65,8 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         private: bool = False,
         commit_message: str | None = None,
     ) -> None:
-        r"""Save the pair and optional pipeline marker, then upload when requested.
+        r"""
+        Save the pair and optional pipeline marker, then upload when requested.
 
         Args:
             directory: Local repository directory.

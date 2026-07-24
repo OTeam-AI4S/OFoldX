@@ -1,16 +1,5 @@
-"""ESMFold2 with its MultiMolecule ESMC child and folding head.
-
-Quickstart::
-
-    from ofoldx.models.esmfold2 import EsmFold2Config, EsmFold2Model, EsmFold2Processor
-
-    processor = EsmFold2Processor(device="cuda")
-    batch = processor("MQIFVKTLTGKT...")
-    model = EsmFold2Model(EsmFold2Config()).cuda().eval()
-    result = model.fold(batch, num_samples=1)
-
-``fold`` is the inference verb (ESMC + trunk + diffusion sampler + confidence).
-The bare ``model(batch)`` call is the differentiable single-step denoising path.
+r"""
+ESMFold2 structure-prediction and binder-design models.
 """
 
 from __future__ import annotations
@@ -31,7 +20,7 @@ from torch.utils.checkpoint import checkpoint
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
-from ...model import Model, ModelBackend
+from ...model import Model
 from ...modules.backend import LayerNorm
 from ...modules.backend.atom_window import atom_to_token_mean as dispatch_atom_to_token_mean
 from ...modules.backend.atom_window import token_to_atom_broadcast as dispatch_token_to_atom_broadcast
@@ -46,13 +35,13 @@ from .config import EsmFold2Config, EsmFold2ExperimentalConfig
 
 
 class EsmFold2Model(Model):
-    """Predict all-atom structures with an ESMC-backed ESMFold2 graph.
+    r"""
+    Predict protein structures with ESMFold 2.
 
-    The architecture uses the linear-recurrent ``parcae`` trunk.
-    [`forward`][ofoldx.models.esmfold2.EsmFold2Model.forward] exposes the
-    differentiable single-step diffusion-denoising primitive, while
-    [`fold`][ofoldx.models.esmfold2.EsmFold2Model.fold] runs inference and
-    decodes canonical results.
+    Args:
+        config: Model architecture and inference configuration.
+        esmc: Frozen ESMC language-model trunk. ``None`` initializes one from
+            ``config.esmc``.
     """
 
     config_class = EsmFold2Config
@@ -61,7 +50,7 @@ class EsmFold2Model(Model):
     def __init__(self, config: EsmFold2Config | None = None, *, esmc: EsmCModel | None = None) -> None:
         config = EsmFold2Config() if config is None else config
         super().__init__(config)
-        self.recycling_steps = config.recycling_steps
+        self._recycling_steps = config.recycling_steps
         self.language_model_mask_probability = config.language_model_mask_probability
         self.esmc_bos_token_id = config.esmc.bos_token_id
         self.esmc_eos_token_id = config.esmc.eos_token_id
@@ -69,11 +58,10 @@ class EsmFold2Model(Model):
         self.language_model_dropout = config.language_model_encoder.dropout
         self.per_loop_language_model_dropout = config.language_model_encoder.per_loop_dropout
         self.msa_encoder_overwrite = config.msa_encoder_overwrite
-        self._backends = EsmFold2BackendSettings()
         input_size = config.input_embeddings.input_size
         pair_size = config.pair_size
 
-        self.input_embeddings = EsmFold2InputEmbeddings(config, self._backends)
+        self.input_embeddings = EsmFold2InputEmbeddings(config)
         self.left_pair_projection = nn.Linear(input_size, pair_size, bias=False)
         self.right_pair_projection = nn.Linear(input_size, pair_size, bias=False)
         self.relative_position_embedder = EsmFold2RelativePositionEmbedder(
@@ -97,7 +85,6 @@ class EsmFold2Model(Model):
                 config.language_model_encoder.num_blocks,
                 pair_size,
                 expansion=4,
-                backends=self._backends,
             )
         else:
             self.language_model_encoder = None
@@ -113,7 +100,6 @@ class EsmFold2Model(Model):
                 num_blocks=msa_config.num_blocks,
                 num_msa_attention_heads=msa_config.num_msa_attention_heads,
                 msa_head_width=msa_config.msa_head_dim,
-                backends=self._backends,
             )
 
         folding_trunk_config = config.folding_trunk
@@ -121,7 +107,6 @@ class EsmFold2Model(Model):
             folding_trunk_config.num_blocks,
             pair_size,
             expansion=4,
-            backends=self._backends,
         )
         self.parcae_input_norm = LayerNorm(pair_size)
         self.parcae_log_decay = nn.Parameter(torch.zeros(pair_size))
@@ -141,21 +126,21 @@ class EsmFold2Model(Model):
             config.parcae.num_coda_blocks,
             pair_size,
             expansion=4,
-            backends=self._backends,
         )
 
-        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config, self._backends)
+        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         self.distogram_head = nn.Linear(pair_size, config.diffusion_structure_head.num_distogram_bins, bias=True)
-        self.confidence_head = EsmFold2ConfidenceHead(config, self._backends)
+        self.confidence_head = EsmFold2ConfidenceHead(config)
         self.post_init()
 
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator backend used by the folding head."""
-
-        super()._set_backend(backend)
-        self._backends.configure(backend)
-
     def set_chunk_size(self, chunk_size: int | None) -> None:
+        r"""
+        Set the chunk size for memory-intensive folding operations.
+
+        Args:
+            chunk_size: Number of rows processed per chunk. ``None`` disables chunking.
+        """
+
         self.folding_trunk.set_chunk_size(chunk_size)
         if self.language_model_encoder is not None:
             self.language_model_encoder.set_chunk_size(chunk_size)
@@ -233,7 +218,7 @@ class EsmFold2Model(Model):
             if self.msa_encoder is not None and msa is not None:
                 # Fresh row subsample each iteration (column mask was applied
                 # once in forward, before this loop).
-                sampled_msa, sampled_msa_mask, sampled_has_deletion, sampled_deletion_value = maybe_subsample_msa(
+                sampled_msa, sampled_msa_mask, sampled_has_deletion, sampled_deletion_value = _maybe_subsample_msa(
                     msa,
                     msa_attention_mask,
                     has_deletion,
@@ -245,7 +230,7 @@ class EsmFold2Model(Model):
                 batch_size, msa_depth, sequence_length = sampled_msa.shape
                 msa_residue_features = F.one_hot(
                     sampled_msa.permute(0, 2, 1).long(),
-                    num_classes=NUM_RESIDUE_TYPES,
+                    num_classes=_NUM_RESIDUE_TYPES,
                 ).float()
                 msa_attention = (
                     sampled_msa_mask.permute(0, 2, 1).float()
@@ -301,7 +286,7 @@ class EsmFold2Model(Model):
         reference_elements: Tensor,
         reference_charges: Tensor,
         reference_atom_name_characters: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         atom_mask: Tensor,
         atom_to_token: Tensor,
         deletion_mean: Tensor | None = None,
@@ -322,7 +307,8 @@ class EsmFold2Model(Model):
         msa_subsample_at_inference: bool = True,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
-        r"""Run the shared trunk and emit single/pair representations.
+        r"""
+        Run the shared trunk and emit single/pair representations.
 
         Both the training [`forward`][ofoldx.models.esmfold2.EsmFold2Model.forward] and the inference
         [`fold`][ofoldx.models.esmfold2.EsmFold2Model.fold] verb consume this: it returns the
@@ -330,15 +316,15 @@ class EsmFold2Model(Model):
         teacher-forced distogram logits.
         """
 
-        total_steps = recycling_steps if recycling_steps is not None else self.recycling_steps
+        total_steps = recycling_steps if recycling_steps is not None else self._recycling_steps
         if total_steps <= 0:
             raise ValueError("recycling_steps must be positive")
 
-        residue_type_features = F.one_hot(residue_type.long(), num_classes=NUM_RESIDUE_TYPES).float()
+        residue_type_features = F.one_hot(residue_type.long(), num_classes=_NUM_RESIDUE_TYPES).float()
         residue_type_features = residue_type_features * token_mask.unsqueeze(-1).float()
 
         if msa is not None:
-            msa_residue_features = F.one_hot(msa.long(), num_classes=NUM_RESIDUE_TYPES).float()
+            msa_residue_features = F.one_hot(msa.long(), num_classes=_NUM_RESIDUE_TYPES).float()
             if msa_attention_mask is not None:
                 mask_f = msa_attention_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
@@ -352,9 +338,9 @@ class EsmFold2Model(Model):
         if deletion_mean is None:
             deletion_mean = torch.zeros(residue_type.shape[0], residue_type.shape[1], device=residue_type.device)
 
-        reference_element_features = F.one_hot(reference_elements.long(), num_classes=MAX_ATOMIC_NUMBER).float()
+        reference_element_features = F.one_hot(reference_elements.long(), num_classes=_MAX_ATOMIC_NUMBER).float()
         reference_atom_name_character_features = F.one_hot(
-            reference_atom_name_characters.long(), num_classes=CHAR_VOCAB_SIZE
+            reference_atom_name_characters.long(), num_classes=_CHAR_VOCAB_SIZE
         ).float()
         # Bias-free downstream Linears require zeroed padding.
         atom_mask_f = atom_mask.float()
@@ -370,7 +356,7 @@ class EsmFold2Model(Model):
             deletion_mean=deletion_mean.float(),
             reference_positions=reference_positions,
             atom_mask=atom_mask,
-            reference_space_index=reference_space_index,
+            reference_space_id=reference_space_id,
             reference_charges=reference_charges,
             reference_element_features=reference_element_features,
             reference_atom_name_character_features=reference_atom_name_character_features,
@@ -399,7 +385,7 @@ class EsmFold2Model(Model):
                 or token_has_esmc is None
             ):
                 raise RuntimeError("ESMFold2 requires ESMC inputs or expert-provided esmc_hidden_states")
-            esmc_hidden_states = compute_esmc_hidden_states(
+            esmc_hidden_states = _compute_esmc_hidden_states(
                 self.esmc,
                 language_model_tokens,
                 language_model_mask,
@@ -430,7 +416,7 @@ class EsmFold2Model(Model):
         # (shared across recycling loops); row subsampling is deferred to
         # per-iter inside _run_one_loop (fresh subset per loop).
         if self.msa_encoder is not None and msa is not None:
-            msa_attention_mask = maybe_apply_msa_column_masking(
+            msa_attention_mask = _maybe_apply_msa_column_masking(
                 msa_attention_mask,
                 rate=msa_column_mask_rate,
                 generator=generator,
@@ -491,7 +477,30 @@ class EsmFold2Model(Model):
         msa_subsample_at_inference: bool = True,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""Return token and pair embeddings before structure sampling."""
+        r"""
+        Compute token and pair embeddings before coordinate sampling.
+
+        ``B`` is batch size and ``N`` is token count.
+
+        Args:
+            input: Processed molecular input.
+            recycling_steps: Number of recurrent trunk passes. ``None`` uses the
+                configured value.
+            language_model_mask_probability: Probability of masking each nonspecial
+                language-model token. ``None`` uses the configured value.
+            language_model_dropout: Dropout probability for language-model pair features.
+                ``None`` uses the configured value.
+            msa_max_depth: Maximum number of MSA rows sampled per recurrent pass. ``None``
+                keeps all rows.
+            msa_column_mask_rate: Probability of masking a column in nonquery MSA rows.
+            msa_subsample_at_inference: Whether to resample MSA rows on each recurrent pass
+                during inference.
+            generator: Random generator used for token masking, dropout, and MSA sampling.
+
+        Returns:
+            A tuple ``(token, pair)`` with shapes ``(B, N, C_s)`` and
+            ``(B, N, N, C_z)``.
+        """
 
         token_embeddings, pair_embeddings, _ = self._encode_inputs_and_trunk(
             token_index=input.token_index,
@@ -506,7 +515,7 @@ class EsmFold2Model(Model):
             reference_elements=input.reference_elements,
             reference_charges=input.reference_charges,
             reference_atom_name_characters=input.reference_atom_name_characters,
-            reference_space_index=input.reference_space_index,
+            reference_space_id=input.reference_space_id,
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
             deletion_mean=input.deletion_mean,
@@ -545,7 +554,7 @@ class EsmFold2Model(Model):
         reference_elements: Tensor,
         reference_charges: Tensor,
         reference_atom_name_characters: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         atom_mask: Tensor,
         atom_to_token: Tensor,
         distogram_atom_index: Tensor,
@@ -588,7 +597,7 @@ class EsmFold2Model(Model):
             reference_elements=reference_elements,
             reference_charges=reference_charges,
             reference_atom_name_characters=reference_atom_name_characters,
-            reference_space_index=reference_space_index,
+            reference_space_id=reference_space_id,
             atom_mask=atom_mask,
             atom_to_token=atom_to_token,
             deletion_mean=deletion_mean,
@@ -626,7 +635,7 @@ class EsmFold2Model(Model):
                 atom_mask=atom_mask,
                 reference_element_features=reference_element_features,
                 reference_atom_name_character_features=reference_atom_name_character_features,
-                reference_space_index=reference_space_index,
+                reference_space_id=reference_space_id,
                 atom_to_token=atom_to_token,
                 token_mask=token_mask,
                 num_diffusion_samples=num_samples,
@@ -684,37 +693,38 @@ class EsmFold2Model(Model):
         step_scale: float | None = None,
         denoising_early_exit_rmsd: float | None = None,
     ) -> FoldResult:
-        r"""Fold one processed molecular system into sampled structures and confidence values.
+        r"""
+        Predict sampled structures and confidence values for one processed system.
 
         Args:
-            input: Processor-built ``EsmFold2Input`` for one canonical molecular system.
-            num_samples: Number of diffusion samples and returned predictions.
-            seed: Optional integer seed, mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator, mutually exclusive with ``seed``.
-            recycling_steps: Trunk refinement loops. ``None`` uses the configured value.
-            num_sampling_steps: Karras diffusion schedule steps. ``None`` uses the configured value.
-            language_model_mask_probability: Probability of masking each non-special ESMC token.
+            input: Processed input with batch size one.
+            num_samples: Number of coordinate samples and returned predictions.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
+            recycling_steps: Number of recurrent trunk passes. ``None`` uses the
+                configured value.
+            num_sampling_steps: Number of diffusion sampling steps. ``None`` uses the
+                configured value.
+            language_model_mask_probability: Probability of masking each nonspecial
+                language-model token. ``None`` uses the configured value.
+            language_model_dropout: Dropout probability for language-model pair features.
                 ``None`` uses the configured value.
-            language_model_dropout: Per-loop ESMC pair-feature dropout override. ``None`` uses
-                the configured behavior; ``0`` disables dropout.
-            msa_max_depth: Maximum MSA depth when inference subsampling is enabled. ``None`` keeps
-                all rows.
-            msa_column_mask_rate: Probability of masking a column from non-query MSA rows.
-            msa_subsample_at_inference: Whether to resample MSA rows up to ``msa_max_depth`` in
-                each recycling loop.
-            max_inference_sigma: Maximum inference sigma used to truncate the sampling schedule.
-                ``None`` keeps the full configured schedule.
-            noise_scale: Per-call sampler noise-scale override. ``None`` uses the configured value.
-            step_scale: Per-call sampler step-scale override. ``None`` uses the configured value.
-            denoising_early_exit_rmsd: Optional aligned-RMSD convergence threshold for ending
-                denoising early.
+            msa_max_depth: Maximum number of MSA rows sampled per recurrent pass. ``None``
+                keeps all rows.
+            msa_column_mask_rate: Probability of masking a column in nonquery MSA rows.
+            msa_subsample_at_inference: Whether to resample MSA rows on each recurrent pass
+                during inference.
+            max_inference_sigma: Largest diffusion sigma included in sampling. ``None``
+                keeps the full schedule.
+            noise_scale: Sampler noise multiplier. ``None`` uses the configured value.
+            step_scale: Sampler step-size multiplier. ``None`` uses the configured value.
+            denoising_early_exit_rmsd: Aligned RMSD threshold, in angstroms, for ending
+                denoising early. ``None`` disables early exit.
 
         Returns:
-            A ``FoldResult`` containing one canonical prediction per diffusion sample.
-
-        Notes:
-            All samples share one trunk pass. Sigma truncation and RMSD convergence can reduce
-            the number of denoising updates run for each sample.
+            A [`FoldResult`][ofoldx.results.FoldResult] containing ``num_samples``
+            predictions in sampling order. Coordinates and PAE values are in angstroms;
+            pLDDT metrics use the model's confidence scale.
         """
 
         if num_samples <= 0:
@@ -741,7 +751,7 @@ class EsmFold2Model(Model):
             reference_elements=input.reference_elements,
             reference_charges=input.reference_charges,
             reference_atom_name_characters=input.reference_atom_name_characters,
-            reference_space_index=input.reference_space_index,
+            reference_space_id=input.reference_space_id,
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
             distogram_atom_index=input.distogram_atom_index,
@@ -859,11 +869,31 @@ class EsmFold2Model(Model):
         msa_subsample_at_inference: bool = True,
         generator: torch.Generator | None = None,
     ) -> EsmFold2Output:
-        r"""Denoise explicit noisy coordinates in one differentiable step.
+        r"""
+        Denoise explicit noisy atom coordinates in one differentiable step.
 
-        This tensor primitive performs one denoising step.
-        [`fold`][ofoldx.models.esmfold2.EsmFold2Model.fold] runs the sampler directly
-        and does not call it.
+        ``B`` is batch size, ``N`` is token count, and ``A`` is atom count.
+
+        Args:
+            input: Processed input whose ``noisy_atom_coordinates`` have shape
+                ``(B, A, 3)`` in angstroms and whose ``noise_level`` has shape ``(B,)``.
+            recycling_steps: Number of recurrent trunk passes. ``None`` uses the
+                configured value.
+            language_model_mask_probability: Probability of masking each nonspecial
+                language-model token. ``None`` uses the configured value.
+            language_model_dropout: Dropout probability for language-model pair features.
+                ``None`` uses the configured value.
+            msa_max_depth: Maximum number of MSA rows sampled per recurrent pass. ``None``
+                keeps all rows.
+            msa_column_mask_rate: Probability of masking a column in nonquery MSA rows.
+            msa_subsample_at_inference: Whether to resample MSA rows on each recurrent pass
+                during inference.
+            generator: Random generator used for token masking, dropout, and MSA sampling.
+
+        Returns:
+            An [`EsmFold2Output`][] with ``denoised_coordinates`` of shape
+            ``(B, A, 3)`` in angstroms and ``distogram_logits`` of shape
+            ``(B, N, N, D)``.
         """
 
         if input.noisy_atom_coordinates is None or input.noise_level is None:
@@ -882,7 +912,7 @@ class EsmFold2Model(Model):
             reference_elements=input.reference_elements,
             reference_charges=input.reference_charges,
             reference_atom_name_characters=input.reference_atom_name_characters,
-            reference_space_index=input.reference_space_index,
+            reference_space_id=input.reference_space_id,
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
             deletion_mean=input.deletion_mean,
@@ -913,7 +943,7 @@ class EsmFold2Model(Model):
             atom_mask=input.atom_mask,
             reference_element_features=auxiliary["reference_element_features"],
             reference_atom_name_character_features=auxiliary["reference_atom_name_character_features"],
-            reference_space_index=input.reference_space_index,
+            reference_space_id=input.reference_space_id,
             atom_to_token=atom_to_token,
             single_inputs=single_inputs,
             pair=pair,
@@ -930,19 +960,13 @@ class EsmFold2Model(Model):
 
 
 class EsmFold2ExperimentalModel(Model):
-    r"""Experimental recurrent ESMFold2 graph for binder-design gradient inversion.
+    r"""
+    Evaluate the recurrent ESMFold 2 graph used for binder design.
 
-    Consumes the same ESMFold2 token/atom/ESMC tensors as
-    [`EsmFold2Model`][ofoldx.models.esmfold2.EsmFold2Model] but runs the older explicit
-    recurrent trunk, which combines a fixed initial pair representation with a learned
-    recycling update each loop, and the narrow experimental confidence head.
-
-    Its distinguishing verb is the differentiable soft-sequence path: passing
-    ``residue_type_probabilities`` (a ``[B, L, 33]`` soft one-hot over residue types) makes the returned
-    ``distogram_logits`` differentiable w.r.t. those logits, which the binder-design loop
-    optimises. The ESMC child is not built here; attach the shared MultiMolecule ESMC via
-    [`load_esmc`][ofoldx.models.esmfold2.EsmFold2ExperimentalModel.load_esmc] (or pass
-    ``esmc=`` at construction).
+    Args:
+        config: Model architecture and inference configuration.
+        esmc: Frozen ESMC trunk or masked-language model. The masked-language-model
+            head is required when binder design uses a nonzero language-model weight.
     """
 
     config_class = EsmFold2ExperimentalConfig
@@ -951,7 +975,7 @@ class EsmFold2ExperimentalModel(Model):
     def __init__(self, config: EsmFold2ExperimentalConfig | None = None, *, esmc: EsmCModel | None = None) -> None:
         config = EsmFold2ExperimentalConfig() if config is None else config
         super().__init__(config)
-        self.recycling_steps = config.recycling_steps
+        self._recycling_steps = config.recycling_steps
         self.use_msa_features = config.use_msa_features
         self.language_model_dropout = config.language_model_dropout
         self.force_language_model_dropout = config.force_language_model_dropout
@@ -960,9 +984,8 @@ class EsmFold2ExperimentalModel(Model):
         self.esmc_mask_token_id = config.esmc.mask_token_id
         input_size = config.input_embeddings.input_size
         pair_size = config.pair_size
-        self._backends = EsmFold2BackendSettings()
 
-        self.input_embeddings = EsmFold2InputEmbeddings(config, self._backends)
+        self.input_embeddings = EsmFold2InputEmbeddings(config)
         self.left_pair_projection = nn.Linear(input_size, pair_size, bias=False)
         self.right_pair_projection = nn.Linear(input_size, pair_size, bias=False)
         self.relative_position_embedder = EsmFold2RelativePositionEmbedder(
@@ -993,7 +1016,6 @@ class EsmFold2ExperimentalModel(Model):
                 num_blocks=msa_config.num_blocks,
                 num_msa_attention_heads=msa_config.num_msa_attention_heads,
                 msa_head_width=msa_config.msa_head_dim,
-                backends=self._backends,
             )
 
         folding_trunk_config = config.folding_trunk
@@ -1001,7 +1023,6 @@ class EsmFold2ExperimentalModel(Model):
             folding_trunk_config.num_blocks,
             pair_size,
             expansion=4,
-            backends=self._backends,
         )
 
         # Zero-initialized pair representation carried between recurrent trunk iterations.
@@ -1009,21 +1030,25 @@ class EsmFold2ExperimentalModel(Model):
         self.recycling_projection = nn.Linear(pair_size, pair_size, bias=False)
         nn.init.zeros_(self.recycling_projection.weight)
 
-        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config, self._backends)
+        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         self.distogram_head = nn.Linear(pair_size, config.diffusion_structure_head.num_distogram_bins, bias=True)
         # Distogram-only configurations omit the confidence head.
         self.confidence_head: EsmFold2ExperimentalConfidenceHead | None = (
-            EsmFold2ExperimentalConfidenceHead(config, self._backends) if config.confidence.enabled else None
+            EsmFold2ExperimentalConfidenceHead(config) if config.confidence.enabled else None
         )
-        self.post_init(backend="torch")
+        self.post_init()
 
     def load_esmc(self, esmc: EsmCModel | EsmCForMaskedLM) -> EsmCModel:
-        r"""Attach the shared frozen MultiMolecule ESMC child used for the pair projection.
+        r"""
+        Attach a frozen ESMC model.
 
-        Accepts either a bare ``EsmCModel`` trunk or an ``EsmCForMaskedLM``. For the
-        latter, the model trunk drives the folding pair projection and the LM head
-        supplies the Algorithm 14 pseudo-perplexity regularizer. A bare trunk may fold,
-        but binder design requires an LM head when ``language_model_weight`` is nonzero.
+        Args:
+            esmc: ESMC trunk or masked-language model. For a masked-language model, the
+                trunk supplies folding features and the language-model head remains
+                available to binder-design objectives.
+
+        Returns:
+            The attached ESMC trunk in evaluation mode.
         """
 
         if isinstance(esmc, EsmCForMaskedLM):
@@ -1035,13 +1060,14 @@ class EsmFold2ExperimentalModel(Model):
         self.esmc = esmc.eval()
         return self.esmc
 
-    def _set_backend(self, backend: ModelBackend) -> None:
-        r"""Apply the operator backend; design-gradient operations remain eager."""
-
-        super()._set_backend(backend)
-        self._backends.configure(backend)
-
     def set_chunk_size(self, chunk_size: int | None) -> None:
+        r"""
+        Set the chunk size for memory-intensive folding operations.
+
+        Args:
+            chunk_size: Number of rows processed per chunk. ``None`` disables chunking.
+        """
+
         self.folding_trunk.set_chunk_size(chunk_size)
         if self.confidence_head is not None:
             self.confidence_head.set_chunk_size(chunk_size)
@@ -1049,7 +1075,13 @@ class EsmFold2ExperimentalModel(Model):
             self.msa_encoder.set_chunk_size(chunk_size)
 
     def configure_language_model_dropout(self, dropout: float, *, force_during_inference: bool = True) -> None:
-        r"""Set the ESMC-pair dropout used by the binder-design inversion/critic passes."""
+        r"""
+        Configure dropout on ESMC-derived pair features.
+
+        Args:
+            dropout: Dropout probability used by subsequent calls.
+            force_during_inference: Whether to apply the dropout outside training mode.
+        """
 
         self.language_model_dropout = dropout
         self.force_language_model_dropout = force_during_inference
@@ -1063,12 +1095,14 @@ class EsmFold2ExperimentalModel(Model):
         language_model_mask_probability: float,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
-        r"""Run the recurrent trunk and return single/pair/distogram plus sampler auxiliary."""
+        r"""
+        Run the recurrent trunk and return single/pair/distogram plus sampler auxiliary.
+        """
 
         token_mask = input.token_mask
         atom_mask = input.atom_mask
         residue_type = input.residue_type
-        total_steps = self.recycling_steps if recycling_steps is None else recycling_steps
+        total_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if total_steps <= 0:
             raise ValueError("recycling_steps must be positive")
 
@@ -1078,7 +1112,7 @@ class EsmFold2ExperimentalModel(Model):
         if residue_type_probabilities is not None:
             residue_type_features = residue_type_probabilities.float()
         else:
-            residue_type_features = F.one_hot(residue_type.long(), num_classes=NUM_RESIDUE_TYPES).float()
+            residue_type_features = F.one_hot(residue_type.long(), num_classes=_NUM_RESIDUE_TYPES).float()
             residue_type_features = residue_type_features * token_mask.unsqueeze(-1).float()
 
         deletion_mean = torch.zeros(residue_type.shape[0], residue_type.shape[1], device=residue_type.device)
@@ -1091,7 +1125,7 @@ class EsmFold2ExperimentalModel(Model):
             msa = residue_type_features.unsqueeze(1)
             msa_attention_mask = token_mask.unsqueeze(1)
         elif msa is not None:
-            msa_residue_features = F.one_hot(msa.long(), num_classes=NUM_RESIDUE_TYPES).float()
+            msa_residue_features = F.one_hot(msa.long(), num_classes=_NUM_RESIDUE_TYPES).float()
             if msa_attention_mask is not None:
                 mask_f = msa_attention_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
@@ -1107,9 +1141,9 @@ class EsmFold2ExperimentalModel(Model):
             deletion_mean = torch.zeros_like(deletion_mean)
             msa = None
 
-        reference_element_features = F.one_hot(input.reference_elements.long(), num_classes=MAX_ATOMIC_NUMBER).float()
+        reference_element_features = F.one_hot(input.reference_elements.long(), num_classes=_MAX_ATOMIC_NUMBER).float()
         reference_atom_name_character_features = F.one_hot(
-            input.reference_atom_name_characters.long(), num_classes=CHAR_VOCAB_SIZE
+            input.reference_atom_name_characters.long(), num_classes=_CHAR_VOCAB_SIZE
         ).float()
         atom_mask_f = atom_mask.float()
         reference_element_features = reference_element_features * atom_mask_f.unsqueeze(-1)
@@ -1124,7 +1158,7 @@ class EsmFold2ExperimentalModel(Model):
             deletion_mean=deletion_mean.float(),
             reference_positions=input.reference_positions,
             atom_mask=atom_mask,
-            reference_space_index=input.reference_space_index,
+            reference_space_id=input.reference_space_id,
             reference_charges=input.reference_charges,
             reference_element_features=reference_element_features,
             reference_atom_name_character_features=reference_atom_name_character_features,
@@ -1157,7 +1191,7 @@ class EsmFold2ExperimentalModel(Model):
                     or input.token_to_esmc is None
                 ):
                     raise RuntimeError("ESMFold2 experimental requires ESMC inputs or esmc_hidden_states")
-                esmc_hidden_states = compute_esmc_hidden_states(
+                esmc_hidden_states = _compute_esmc_hidden_states(
                     self.esmc,
                     input.language_model_tokens,
                     input.language_model_mask,
@@ -1186,7 +1220,9 @@ class EsmFold2ExperimentalModel(Model):
                     msa_residue_features = msa.permute(0, 2, 1, 3).float()
                 else:
                     msa_depth = msa.shape[1]
-                    msa_residue_features = F.one_hot(msa.permute(0, 2, 1).long(), num_classes=NUM_RESIDUE_TYPES).float()
+                    msa_residue_features = F.one_hot(
+                        msa.permute(0, 2, 1).long(), num_classes=_NUM_RESIDUE_TYPES
+                    ).float()
                 msa_attention = (
                     msa_attention_mask.permute(0, 2, 1).float()
                     if msa_attention_mask is not None
@@ -1237,12 +1273,39 @@ class EsmFold2ExperimentalModel(Model):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> dict[str, Tensor]:
-        r"""Fold a target|binder batch, optionally through a differentiable soft sequence.
+        r"""
+        Evaluate a processed target-binder system from discrete or soft residue types.
 
-        With ``residue_type_probabilities`` set, ``distogram_logits`` carries gradient back to the
-        per-position soft-sequence logits (the binder-design inversion primitive); the
-        diffusion sampler and confidence head always run without gradient. ``recycling_steps``
-        defaults to ``config.recycling_steps`` (the design loop passes ``recycling_steps=2``).
+        ``B`` is batch size, ``N`` is token count, ``A`` is atom count, and ``S`` is
+        ``num_diffusion_samples``.
+
+        Args:
+            input: Processed target-binder input.
+            residue_type_probabilities: Optional soft residue-type probabilities with
+                shape ``(B, N, 33)``. Gradients from ``distogram_logits`` propagate to
+                this tensor.
+            recycling_steps: Number of recurrent trunk passes. ``None`` uses the
+                configured value.
+            num_diffusion_samples: Number of coordinate samples. ``None`` means one.
+            num_sampling_steps: Number of diffusion sampling steps. ``None`` uses the
+                configured value.
+            calculate_confidence: Whether to compute confidence tensors for sampled
+                coordinates.
+            return_structure: Whether to sample atom coordinates.
+            language_model_mask_probability: Probability of masking each nonspecial
+                language-model token.
+            max_inference_sigma: Largest diffusion sigma included in sampling. ``None``
+                keeps the full schedule.
+            noise_scale: Sampler noise multiplier. ``None`` uses the configured value.
+            step_scale: Sampler step-size multiplier. ``None`` uses the configured value.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
+
+        Returns:
+            A mapping containing ``distogram_logits`` with shape ``(B, N, N, D)``.
+            When structure or confidence output is requested, it also contains
+            ``coordinates`` with shape ``(B * S, A, 3)`` in angstroms and aligned input
+            masks and indices. Confidence requests add per-sample confidence tensors.
         """
 
         num_samples = 1 if num_diffusion_samples is None else num_diffusion_samples
@@ -1277,7 +1340,7 @@ class EsmFold2ExperimentalModel(Model):
                 atom_mask=atom_mask,
                 reference_element_features=auxiliary["reference_element_features"],
                 reference_atom_name_character_features=auxiliary["reference_atom_name_character_features"],
-                reference_space_index=input.reference_space_index,
+                reference_space_id=input.reference_space_id,
                 atom_to_token=auxiliary["atom_to_token"],
                 token_mask=token_mask,
                 num_diffusion_samples=num_samples,
@@ -1320,18 +1383,20 @@ class EsmFold2ExperimentalModel(Model):
 
 
 class EsmFold2InputEmbeddings(nn.Module):
-    """Embeds input features including atom-level encoding via SWA attention."""
+    r"""
+    Embeds input features including atom-level encoding via SWA attention.
+    """
 
     def __init__(
         self,
         config: EsmFold2Config | EsmFold2ExperimentalConfig,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         atom_encoder_config = config.input_embeddings.atom_encoder
 
         self.atom_encoder = EsmFold2AtomEncoder(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=atom_encoder_config.atom_hidden_size,
             token_hidden_size=atom_encoder_config.token_hidden_size,
             num_blocks=atom_encoder_config.num_blocks,
@@ -1352,22 +1417,16 @@ class EsmFold2InputEmbeddings(nn.Module):
         deletion_mean: Tensor,
         reference_positions: Tensor,
         atom_mask: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         reference_charges: Tensor,
         reference_element_features: Tensor,
         reference_atom_name_character_features: Tensor,
         atom_to_token: Tensor,
     ) -> Tensor:
-        """Embed inputs into per-token features.
-
-        Returns:
-            [B, L, input_size] concatenation of atom encoding, residue-type features, MSA profile,
-            and deletion_mean.
-        """
         token_features, _atom_query, _atom_conditioning, _intermediates = self.atom_encoder(
             reference_positions=reference_positions,
             atom_mask=atom_mask,
-            reference_space_index=reference_space_index,
+            reference_space_id=reference_space_id,
             reference_charges=reference_charges,
             reference_element_features=reference_element_features,
             reference_atom_name_character_features=reference_atom_name_character_features,
@@ -1386,7 +1445,9 @@ class EsmFold2InputEmbeddings(nn.Module):
 
 
 class EsmFold2LanguageModelPairEncoder(nn.Module):
-    """Project and combine ESMC layer states into the pair representation."""
+    r"""
+    Project and combine ESMC layer states into the pair representation.
+    """
 
     def __init__(self, pair_size: int = 256, hidden_size: int = 2560, num_hidden_layers: int = 80) -> None:
         super().__init__()
@@ -1398,14 +1459,6 @@ class EsmFold2LanguageModelPairEncoder(nn.Module):
         self.output_norm = LayerNorm(pair_size)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        """Project pre-computed ESMC hidden states to pair representation.
-
-        Args:
-            hidden_states: [B, L, num_hidden_layers+1, hidden_size] from ESMC 6B.
-
-        Returns:
-            [B, L, L, pair_size] pair representation.
-        """
         if not torch.is_autocast_enabled(hidden_states.device.type):
             hidden_states = hidden_states.to(dtype=self.layer_weights.dtype)
         language_model_pair = self.hidden_projection(self.hidden_norm(hidden_states))  # [B, L, 81, pair_size]
@@ -1417,7 +1470,9 @@ class EsmFold2LanguageModelPairEncoder(nn.Module):
 
 
 class EsmFold2RelativePositionEmbedder(nn.Module):
-    """Embed relative residue, token, chain, and entity relationships."""
+    r"""
+    Embed relative residue, token, chain, and entity relationships.
+    """
 
     def __init__(
         self,
@@ -1491,7 +1546,9 @@ class EsmFold2RelativePositionEmbedder(nn.Module):
 
 
 class EsmFold2SingleToPair(nn.Module):
-    """Build pair features from projected single features."""
+    r"""
+    Build pair features from projected single features.
+    """
 
     def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
         super().__init__()
@@ -1510,7 +1567,9 @@ class EsmFold2SingleToPair(nn.Module):
 
 
 class EsmFold2FoldingTrunk(nn.Module):
-    """Pair-only folding trunk composed of repeated folding blocks."""
+    r"""
+    Pair-only folding trunk composed of repeated folding blocks.
+    """
 
     def __init__(
         self,
@@ -1518,12 +1577,15 @@ class EsmFold2FoldingTrunk(nn.Module):
         pair_size: int = 256,
         expansion: int = 4,
         *,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
-            [EsmFold2FoldingBlock(backends, pair_size=pair_size, expansion=expansion) for _ in range(num_blocks)]
+            [
+                EsmFold2FoldingBlock(operator_backend, pair_size=pair_size, expansion=expansion)
+                for _ in range(num_blocks)
+            ]
         )
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
@@ -1541,7 +1603,9 @@ class EsmFold2FoldingTrunk(nn.Module):
 
 
 class EsmFold2MsaEncoder(nn.Module):
-    """Stack of [`EsmFold2MsaEncoderBlock`] modules that conditions the pair on an MSA."""
+    r"""
+    Stack of [`EsmFold2MsaEncoderBlock`] modules that conditions the pair on an MSA.
+    """
 
     def __init__(
         self,
@@ -1552,10 +1616,9 @@ class EsmFold2MsaEncoder(nn.Module):
         num_blocks: int = 4,
         num_msa_attention_heads: int = 8,
         msa_head_width: int = 16,
-        backends: EsmFold2BackendSettings | None = None,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        backends = EsmFold2BackendSettings() if backends is None else backends
         self.num_blocks = num_blocks
         self.msa_projection = nn.Linear(35, msa_size, bias=False)
         self.input_projection = nn.Linear(input_size, msa_size, bias=False)
@@ -1567,7 +1630,7 @@ class EsmFold2MsaEncoder(nn.Module):
                     hidden_size=hidden_size,
                     num_msa_attention_heads=num_msa_attention_heads,
                     msa_head_width=msa_head_width,
-                    backends=backends,
+                    operator_backend=operator_backend,
                     is_final_block=(i == num_blocks - 1),
                 )
                 for i in range(num_blocks)
@@ -1608,11 +1671,8 @@ class EsmFold2MsaEncoder(nn.Module):
 
 
 class EsmFold2ExperimentalMsaEncoder(nn.Module):
-    r"""Experimental MSA encoder: embeds MSA features and updates the pair representation.
-
-    Composed of full ``EsmFold2ExperimentalMsaEncoderBlock`` modules. The whole pair update is
-    gated to zero for samples whose only MSA row is the
-    query (``M == 1`` or no real rows), which is exactly the single-sequence design fold.
+    r"""
+    Experimental MSA encoder: embeds MSA features and updates the pair representation.
     """
 
     def __init__(
@@ -1624,10 +1684,9 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
         num_blocks: int = 4,
         num_msa_attention_heads: int = 8,
         msa_head_width: int = 32,
-        backends: EsmFold2BackendSettings | None = None,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        backends = EsmFold2BackendSettings() if backends is None else backends
         self.num_blocks = num_blocks
         self.msa_projection = nn.Linear(35, msa_size, bias=False)
         self.input_projection = nn.Linear(input_size, msa_size, bias=False)
@@ -1639,7 +1698,7 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
                     hidden_size=hidden_size,
                     num_msa_attention_heads=num_msa_attention_heads,
                     msa_head_width=msa_head_width,
-                    backends=backends,
+                    operator_backend=operator_backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1680,20 +1739,13 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
 
 
 class EsmFold2AtomEncoder(nn.Module):
-    """Encode atom features with a sliding-window atom transformer.
-
-    Args:
-        atom_hidden_size: atom hidden dim
-        token_hidden_size: token dim for atom_to_token aggregation
-        num_blocks, num_attention_heads, sliding_window_size, expansion: transformer params
-        structure_prediction: if True, creates coordinate_projection and uses full token_hidden_size
-        spatial_rope_base_frequency, num_spatial_rope_pairs_per_axis,
-        num_reference_space_rope_pairs, reference_space_rope_base_frequency: 3D RoPE config
+    r"""
+    Encode atom features with a sliding-window atom transformer.
     """
 
     def __init__(
         self,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         atom_hidden_size: int = 128,
         token_hidden_size: int = 768,
         num_blocks: int = 3,
@@ -1708,16 +1760,16 @@ class EsmFold2AtomEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.structure_prediction = structure_prediction
-        self.backends = backends
+        self.operator_backend = operator_backend
 
-        self.atom_projection = nn.Linear(ATOM_FEATURE_DIM, atom_hidden_size, bias=False)
+        self.atom_projection = nn.Linear(_ATOM_FEATURE_DIM, atom_hidden_size, bias=False)
         self.input_norm = LayerNorm(atom_hidden_size)
 
         if structure_prediction:
             self.coordinate_projection = nn.Linear(6, atom_hidden_size, bias=False)
 
         self.transformer = EsmFold2AtomTransformer(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=atom_hidden_size,
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
@@ -1737,15 +1789,13 @@ class EsmFold2AtomEncoder(nn.Module):
         self,
         reference_positions: Tensor,
         atom_mask: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         reference_charges: Tensor,
         reference_element_features: Tensor,
         reference_atom_name_character_features: Tensor,
         atom_to_token: Tensor,
         num_diffusion_samples: int = 1,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        r"""Encode the reference atoms once for one or more diffusion samples."""
-
         batch_size, num_atoms = reference_positions.shape[:2]
         atom_features = torch.cat(
             [
@@ -1753,13 +1803,13 @@ class EsmFold2AtomEncoder(nn.Module):
                 reference_charges.unsqueeze(-1),
                 atom_mask.unsqueeze(-1),
                 reference_element_features,
-                reference_atom_name_character_features.reshape(batch_size, num_atoms, MAX_CHARS * CHAR_VOCAB_SIZE),
+                reference_atom_name_character_features.reshape(batch_size, num_atoms, _MAX_CHARS * _CHAR_VOCAB_SIZE),
             ],
             dim=-1,
         )
         atom_features = atom_features.to(dtype=self.atom_projection.weight.dtype)
         reference_atom_features = self.input_norm(self.atom_projection(atom_features))
-        attention_cos, attention_sin = self.transformer.build_3d_rope(reference_positions, reference_space_index)
+        attention_cos, attention_sin = self.transformer.build_3d_rope(reference_positions, reference_space_id)
         attention_cos = attention_cos.to(dtype=reference_atom_features.dtype)
         attention_sin = attention_sin.to(dtype=reference_atom_features.dtype)
         reference_atom_features = reference_atom_features.repeat_interleave(num_diffusion_samples, 0)
@@ -1786,8 +1836,6 @@ class EsmFold2AtomEncoder(nn.Module):
         noisy_coordinates: Tensor | None = None,
         return_intermediates: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, list[Tensor]]:
-        r"""Run atom attention from explicit reference features."""
-
         atom_query = reference_atom_features
 
         if self.structure_prediction:
@@ -1813,12 +1861,12 @@ class EsmFold2AtomEncoder(nn.Module):
             intermediates = []
 
         atom_to_token_update = F.relu(self.token_projection(atom_query))
-        token_features = scatter_atom_to_token(
+        token_features = _scatter_atom_to_token(
             atom_to_token_update,
             expanded_atom_to_token,
             num_tokens,
             atom_mask=expanded_atom_mask.bool(),
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         )
 
         return token_features, atom_query, reference_atom_features, intermediates
@@ -1827,7 +1875,7 @@ class EsmFold2AtomEncoder(nn.Module):
         self,
         reference_positions: Tensor,
         atom_mask: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         reference_charges: Tensor,
         reference_element_features: Tensor,
         reference_atom_name_character_features: Tensor,
@@ -1837,8 +1885,6 @@ class EsmFold2AtomEncoder(nn.Module):
         num_diffusion_samples: int = 1,
         return_intermediates: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, list[Tensor]]:
-        r"""Encode reference atoms and run atom attention."""
-
         (
             reference_atom_features,
             attention_cos,
@@ -1848,7 +1894,7 @@ class EsmFold2AtomEncoder(nn.Module):
         ) = self.encode_reference(
             reference_positions,
             atom_mask,
-            reference_space_index,
+            reference_space_id,
             reference_charges,
             reference_element_features,
             reference_atom_name_character_features,
@@ -1868,11 +1914,13 @@ class EsmFold2AtomEncoder(nn.Module):
 
 
 class EsmFold2AtomDecoder(nn.Module):
-    """Decode token features into atom-coordinate updates."""
+    r"""
+    Decode token features into atom-coordinate updates.
+    """
 
     def __init__(
         self,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         atom_hidden_size: int = 128,
         token_hidden_size: int = 768,
         num_blocks: int = 3,
@@ -1885,11 +1933,11 @@ class EsmFold2AtomDecoder(nn.Module):
         reference_space_rope_base_frequency: float = 10000.0,
     ) -> None:
         super().__init__()
-        self.backends = backends
+        self.operator_backend = operator_backend
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
 
         self.transformer = EsmFold2AtomTransformer(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=atom_hidden_size,
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
@@ -1902,7 +1950,7 @@ class EsmFold2AtomDecoder(nn.Module):
         )
 
         self.output_norm = LayerNorm(atom_hidden_size)
-        self.coordinate_projection = nn.Linear(atom_hidden_size, XYZ_DIMS, bias=False)
+        self.coordinate_projection = nn.Linear(atom_hidden_size, _XYZ_DIMS, bias=False)
 
     def forward(
         self,
@@ -1915,12 +1963,11 @@ class EsmFold2AtomDecoder(nn.Module):
         expanded_atom_to_token: Tensor,
         return_intermediates: bool = False,
     ) -> tuple[Tensor, list[Tensor]]:
-        """Returns (coordinate_update, intermediates)."""
         token_to_atom_update = self.token_projection(token)
-        token_to_atom_update = gather_token_to_atom(
+        token_to_atom_update = _gather_token_to_atom(
             token_to_atom_update,
             expanded_atom_to_token,
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         )
         atom_query = atom_query + token_to_atom_update
 
@@ -1943,11 +1990,13 @@ class EsmFold2AtomDecoder(nn.Module):
 
 
 class EsmFold2AtomTransformer(nn.Module):
-    """Stack of [`EsmFold2AtomBlock`] modules."""
+    r"""
+    Stack of [`EsmFold2AtomBlock`] modules.
+    """
 
     def __init__(
         self,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         atom_hidden_size: int = 128,
         num_blocks: int = 3,
         num_attention_heads: int = 4,
@@ -1971,7 +2020,7 @@ class EsmFold2AtomTransformer(nn.Module):
                 EsmFold2AtomBlock(
                     atom_hidden_size=atom_hidden_size,
                     num_attention_heads=num_attention_heads,
-                    backends=backends,
+                    operator_backend=operator_backend,
                     half_window=sliding_window_size // 2,
                     expansion=expansion,
                 )
@@ -1979,12 +2028,10 @@ class EsmFold2AtomTransformer(nn.Module):
             ]
         )
 
-    def build_3d_rope(self, reference_positions: Tensor, reference_space_index: Tensor) -> tuple[Tensor, Tensor]:
-        r"""Build the atom transformer's spatial and reference-space rotations."""
-
-        return build_3d_rope(
+    def build_3d_rope(self, reference_positions: Tensor, reference_space_id: Tensor) -> tuple[Tensor, Tensor]:
+        return _build_3d_rope(
             reference_positions=reference_positions,
-            reference_space_index=reference_space_index,
+            reference_space_id=reference_space_id,
             head_dim=self.head_dim,
             num_spatial_pairs_per_axis=self.num_spatial_rope_pairs_per_axis,
             num_reference_space_pairs=self.num_reference_space_rope_pairs,
@@ -2012,11 +2059,13 @@ class EsmFold2AtomTransformer(nn.Module):
 
 
 class EsmFold2Denoiser(nn.Module):
-    """Denoise atom coordinates from conditioned token and pair features."""
+    r"""
+    Denoise atom coordinates from conditioned token and pair features.
+    """
 
     def __init__(
         self,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         atom_hidden_size: int = 128,
         token_hidden_size: int = 768,
         pair_size: int = 256,
@@ -2038,7 +2087,7 @@ class EsmFold2Denoiser(nn.Module):
         self.sigma_data = float(sigma_data)
 
         self.conditioning = EsmFold2DiffusionConditioning(
-            backends=backends,
+            operator_backend=operator_backend,
             pair_size=pair_size,
             single_size=token_hidden_size,  # conditioning s output is token_hidden_size
             input_size=input_size,
@@ -2049,7 +2098,7 @@ class EsmFold2Denoiser(nn.Module):
 
         # Atom encoder (structure_prediction=True, with coordinate_projection)
         self.atom_encoder = EsmFold2AtomEncoder(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=atom_hidden_size,
             token_hidden_size=token_hidden_size,
             num_blocks=num_atom_blocks,
@@ -2064,7 +2113,7 @@ class EsmFold2Denoiser(nn.Module):
         )
 
         atom_decoder = EsmFold2AtomDecoder(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=atom_hidden_size,
             token_hidden_size=token_hidden_size,
             num_blocks=num_atom_blocks,
@@ -2087,6 +2136,7 @@ class EsmFold2Denoiser(nn.Module):
             num_blocks=num_token_blocks,
             conditioning_size=token_hidden_size,
             expansion=expansion,
+            operator_backend=operator_backend,
         )
 
         single_norm = LayerNorm(token_hidden_size)
@@ -2115,8 +2165,6 @@ class EsmFold2Denoiser(nn.Module):
         return_token_representations: bool = False,
         return_atom_representations: bool = False,
     ) -> dict[str, Tensor | None]:
-        r"""Denoise from explicit step-invariant pair and atom tensors."""
-
         noise_level = noise_level.to(dtype=torch.float32, device=noisy_coordinates.device).reshape(-1)
         conditioning = self.conditioning.condition_single(
             noise_level,
@@ -2187,7 +2235,7 @@ class EsmFold2Denoiser(nn.Module):
         atom_mask: Tensor,
         reference_element_features: Tensor,
         reference_atom_name_character_features: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         atom_to_token: Tensor,
         single_inputs: Tensor,
         pair: Tensor,
@@ -2197,8 +2245,6 @@ class EsmFold2Denoiser(nn.Module):
         return_token_representations: bool = False,
         return_atom_representations: bool = False,
     ) -> dict[str, Tensor | None]:
-        r"""Compute step-invariant tensors once, then denoise one noise step."""
-
         conditioned_pair = self.conditioning.condition_pair(
             pair,
             relative_position_encoding,
@@ -2212,7 +2258,7 @@ class EsmFold2Denoiser(nn.Module):
         ) = self.atom_encoder.encode_reference(
             reference_positions,
             atom_mask,
-            reference_space_index,
+            reference_space_id,
             reference_charges,
             reference_element_features,
             reference_atom_name_character_features,
@@ -2237,23 +2283,25 @@ class EsmFold2Denoiser(nn.Module):
 
 
 class EsmFold2FoldingBlock(nn.Module):
-    """Outgoing and incoming triangle multiplication followed by a transition."""
+    r"""
+    Outgoing and incoming triangle multiplication followed by a transition.
+    """
 
-    def __init__(self, backends: EsmFold2BackendSettings, pair_size: int = 256, expansion: int = 4) -> None:
+    def __init__(self, operator_backend: str = "auto", pair_size: int = 256, expansion: int = 4) -> None:
         super().__init__()
         self.triangle_multiplication_outgoing = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
             "outgoing",
-            backends,
+            operator_backend,
         )
         self.triangle_multiplication_incoming = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
             "incoming",
-            backends,
+            operator_backend,
         )
-        self.transition = EsmFold2Transition(pair_size, backends, expansion=expansion)
+        self.transition = EsmFold2Transition(pair_size, operator_backend, expansion=expansion)
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self.triangle_multiplication_outgoing.set_chunk_size(chunk_size)
@@ -2267,7 +2315,9 @@ class EsmFold2FoldingBlock(nn.Module):
 
 
 class EsmFold2MsaEncoderBlock(nn.Module):
-    """One MSA encoder block: OPM into pair, MSA pair-weighted averaging, triangle update."""
+    r"""
+    One MSA encoder block: OPM into pair, MSA pair-weighted averaging, triangle update.
+    """
 
     def __init__(
         self,
@@ -2276,34 +2326,34 @@ class EsmFold2MsaEncoderBlock(nn.Module):
         hidden_size: int,
         num_msa_attention_heads: int,
         msa_head_width: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         is_final_block: bool = False,
     ) -> None:
         super().__init__()
         self.is_final_block = is_final_block
-        self.outer_product_mean = EsmFold2OuterProductMean(msa_size, hidden_size, pair_size, backends)
+        self.outer_product_mean = EsmFold2OuterProductMean(msa_size, hidden_size, pair_size, operator_backend)
         if not is_final_block:
             self.msa_pair_weighted_averaging = EsmFold2MsaPairWeightedAveraging(
                 msa_size,
                 pair_size,
-                backends,
+                operator_backend,
                 num_msa_attention_heads,
                 msa_head_width,
             )
-            self.msa_transition = EsmFold2Transition(msa_size, backends, expansion=4)
+            self.msa_transition = EsmFold2Transition(msa_size, operator_backend, expansion=4)
         self.triangle_multiplication_outgoing = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
             "outgoing",
-            backends,
+            operator_backend,
         )
         self.triangle_multiplication_incoming = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
             "incoming",
-            backends,
+            operator_backend,
         )
-        self.pair_transition = EsmFold2Transition(pair_size, backends, expansion=4)
+        self.pair_transition = EsmFold2Transition(pair_size, operator_backend, expansion=4)
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self.outer_product_mean.set_chunk_size(chunk_size)
@@ -2331,11 +2381,8 @@ class EsmFold2MsaEncoderBlock(nn.Module):
 
 
 class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
-    r"""Run an MSA update followed by outer-product-mean and triangle updates.
-
-    Every block runs the full path. The MSA row update precedes outer-product-mean,
-    which divides before its output projection. ``msa_track_mask`` zeroes the update
-    for samples without non-query MSA rows.
+    r"""
+    Run an MSA update followed by outer-product-mean and triangle updates.
     """
 
     def __init__(
@@ -2345,24 +2392,24 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
         hidden_size: int,
         num_msa_attention_heads: int,
         msa_head_width: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         outer_product_mean = EsmFold2OuterProductMean(
             msa_size,
             hidden_size,
             pair_size,
-            backends,
+            operator_backend,
             divide_before_projection=True,
         )
         msa_pair_weighted_averaging = EsmFold2MsaPairWeightedAveraging(
             msa_size,
             pair_size,
-            backends,
+            operator_backend,
             num_msa_attention_heads,
             msa_head_width,
         )
-        msa_transition = EsmFold2Transition(msa_size, backends, expansion=4)
+        msa_transition = EsmFold2Transition(msa_size, operator_backend, expansion=4)
         self.msa_pair_weighted_averaging = msa_pair_weighted_averaging
         self.msa_transition = msa_transition
         self.outer_product_mean = outer_product_mean
@@ -2370,15 +2417,15 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
             pair_size,
             pair_size,
             "outgoing",
-            backends,
+            operator_backend,
         )
         self.triangle_multiplication_incoming = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
             "incoming",
-            backends,
+            operator_backend,
         )
-        self.pair_transition = EsmFold2Transition(pair_size, backends, expansion=4)
+        self.pair_transition = EsmFold2Transition(pair_size, operator_backend, expansion=4)
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self.msa_transition.set_chunk_size(chunk_size)
@@ -2410,13 +2457,15 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
 
 
 class EsmFold2AtomBlock(nn.Module):
-    """Adaptive RMS normalization, sliding-window attention, and transition updates."""
+    r"""
+    Adaptive RMS normalization, sliding-window attention, and transition updates.
+    """
 
     def __init__(
         self,
         atom_hidden_size: int,
         num_attention_heads: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         half_window: int = 64,
         expansion: int = 2,
     ) -> None:
@@ -2425,7 +2474,7 @@ class EsmFold2AtomBlock(nn.Module):
         self.adaptive_norm_projection = nn.Linear(atom_hidden_size, 6 * atom_hidden_size, bias=False)
         nn.init.zeros_(self.adaptive_norm_projection.weight)
         self.attention = EsmFold2SpatialAtomAttention(
-            atom_hidden_size, num_attention_heads, backends, half_window=half_window
+            atom_hidden_size, num_attention_heads, operator_backend, half_window=half_window
         )
         hidden_size = ((expansion * (atom_hidden_size // 3) * 2) + 255) // 256 * 256
         self.transition = EsmFold2FeedForward(atom_hidden_size, hidden_size)
@@ -2451,7 +2500,9 @@ class EsmFold2AtomBlock(nn.Module):
 
 
 class EsmFold2DiffusionTransformer(nn.Module):
-    """Diffusion denoising transformer with attention pair bias."""
+    r"""
+    Diffusion denoising transformer with attention pair bias.
+    """
 
     def __init__(
         self,
@@ -2461,6 +2512,7 @@ class EsmFold2DiffusionTransformer(nn.Module):
         num_blocks: int,
         conditioning_size: int,
         expansion: int = 2,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -2471,6 +2523,7 @@ class EsmFold2DiffusionTransformer(nn.Module):
                 num_attention_heads=num_attention_heads,
                 conditioning_size=conditioning_size,
                 expansion=expansion,
+                operator_backend=operator_backend,
             )
             for _ in range(num_blocks)
         )
@@ -2499,7 +2552,9 @@ class EsmFold2DiffusionTransformer(nn.Module):
 
 
 class EsmFold2DiffusionTransformerBlock(nn.Module):
-    """One attention and transition residual unit in the diffusion transformer."""
+    r"""
+    One attention and transition residual unit in the diffusion transformer.
+    """
 
     def __init__(
         self,
@@ -2508,6 +2563,7 @@ class EsmFold2DiffusionTransformerBlock(nn.Module):
         num_attention_heads: int,
         conditioning_size: int,
         expansion: int,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.attention = EsmFold2PairBiasAttention(
@@ -2515,6 +2571,7 @@ class EsmFold2DiffusionTransformerBlock(nn.Module):
             pair_size,
             num_attention_heads,
             conditioning_size,
+            operator_backend=operator_backend,
         )
         self.transition = EsmFold2ConditionedTransition(hidden_size, conditioning_size, expansion)
 
@@ -2537,7 +2594,9 @@ class EsmFold2DiffusionTransformerBlock(nn.Module):
 
 
 class EsmFold2ConditionedTransition(nn.Module):
-    """Conditioned SwiGLU transition with adaptive layer norm."""
+    r"""
+    Conditioned SwiGLU transition with adaptive layer norm.
+    """
 
     def __init__(
         self,
@@ -2561,7 +2620,9 @@ _DEFAULT_CHUNK_SIZE = 64
 
 
 class EsmFold2TriangleMultiplication(nn.Module):
-    """Atomic triangle multiplicative transform with gated signal routing."""
+    r"""
+    Atomic triangle multiplicative transform with gated signal routing.
+    """
 
     _FLOW_TO_EINSUM = {"outgoing": "bikd,bjkd->bijd", "incoming": "bkid,bkjd->bijd"}
     _VALID_FLOWS = ("outgoing", "incoming")
@@ -2571,7 +2632,7 @@ class EsmFold2TriangleMultiplication(nn.Module):
         input_channels: int,
         latent_channels: int,
         flow: str,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         if flow not in self._FLOW_TO_EINSUM:
@@ -2580,7 +2641,7 @@ class EsmFold2TriangleMultiplication(nn.Module):
         self.input_channels = input_channels
         self.latent_channels = latent_channels
         self.flow = flow
-        self.backends = backends
+        self.operator_backend = operator_backend
         self._einsum_equation = self._FLOW_TO_EINSUM[flow]
         self.input_norm = LayerNorm(self.input_channels, eps=_EPS)
         self.left_value_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
@@ -2601,7 +2662,6 @@ class EsmFold2TriangleMultiplication(nn.Module):
         return torch.einsum(self._einsum_equation, left_stream, right_stream)
 
     def _triangular_contract_chunked(self, left_stream: Tensor, right_stream: Tensor, chunk_size: int) -> Tensor:
-        """Compute the triangular einsum in chunks along the output i-dimension."""
         L = left_stream.shape[1] if self.flow == "outgoing" else left_stream.shape[2]
         chunks = []
         for start in range(0, L, chunk_size):
@@ -2618,7 +2678,7 @@ class EsmFold2TriangleMultiplication(nn.Module):
             visibility = pair_grid.new_ones(pair_grid.shape[:-1])
 
         resolved = resolve_tensor_operator_backend(
-            self.backends.backend,
+            self.operator_backend,
             tensors=(pair_grid, visibility),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2660,16 +2720,8 @@ class EsmFold2TriangleMultiplication(nn.Module):
 
 
 class EsmFold2OuterProductMean(nn.Module):
-    """Outer-product mean: maps an MSA representation into a pair update.
-
-    The order of the ``/ n_valid`` divide vs. the output projection is
-    selectable via ``divide_before_projection`` because different ESMFold2
-    checkpoints were trained with different orderings:
-
-    * ``False`` (default): ``projection(outer) / n_valid`` — the projection bias
-      is scaled by 1/n_valid alongside the outer product.
-    * ``True``: ``projection(outer / n_valid)`` — the projection bias is added
-      unscaled, post-divide.
+    r"""
+    Outer-product mean: maps an MSA representation into a pair update.
     """
 
     def __init__(
@@ -2677,12 +2729,12 @@ class EsmFold2OuterProductMean(nn.Module):
         msa_size: int,
         hidden_size: int,
         pair_size: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         divide_before_projection: bool = False,
     ) -> None:
         super().__init__()
         self.divide_before_projection = divide_before_projection
-        self.backends = backends
+        self.operator_backend = operator_backend
         self.msa_norm = LayerNorm(msa_size)
         self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
@@ -2695,7 +2747,7 @@ class EsmFold2OuterProductMean(nn.Module):
 
     def forward(self, m: Tensor, msa_attention_mask: Tensor) -> Tensor:
         resolved = resolve_tensor_operator_backend(
-            self.backends.backend,
+            self.operator_backend,
             tensors=(m, msa_attention_mask),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2741,20 +2793,22 @@ class EsmFold2OuterProductMean(nn.Module):
 
 
 class EsmFold2MsaPairWeightedAveraging(nn.Module):
-    """Pair-biased MSA row update (AF3 Supplement Algorithm 10)."""
+    r"""
+    Pair-biased MSA row update (AF3 Supplement Algorithm 10).
+    """
 
     def __init__(
         self,
         msa_size: int,
         pair_size: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         num_attention_heads: int = 8,
         head_width: int = 32,
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
         self.head_width = head_width
-        self.backends = backends
+        self.operator_backend = operator_backend
         self.msa_norm = LayerNorm(msa_size)
         self.pair_norm = LayerNorm(pair_size)
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
@@ -2763,16 +2817,8 @@ class EsmFold2MsaPairWeightedAveraging(nn.Module):
         self.output_projection = nn.Linear(num_attention_heads * head_width, msa_size, bias=False)
 
     def forward(self, msa: Tensor, pair: Tensor, pair_attention_mask: Tensor) -> Tensor:
-        """
-        Args:
-            msa:           [B, L, M, msa_size]
-            pair:          [B, L, L, pair_size]
-            pair_attention_mask:[B, L, L]
-        Returns:
-            [B, L, M, msa_size]
-        """
         resolved = resolve_tensor_operator_backend(
-            self.backends.backend,
+            self.operator_backend,
             tensors=(msa, pair, pair_attention_mask),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2816,19 +2862,21 @@ _NONPOLYMER_ID = 3
 
 
 class EsmFold2Transition(nn.Module):
-    """Normalized transition update branch without an outer residual."""
+    r"""
+    Normalized transition update branch without an outer residual.
+    """
 
     def __init__(
         self,
         hidden_size: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         expansion: int = 4,
         *,
         chunk_size: int | None = _DEFAULT_CHUNK_SIZE,
         eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.backends = backends
+        self.operator_backend = operator_backend
         self.input_norm = LayerNorm(hidden_size, eps=eps)
         self.feed_forward = EsmFold2FeedForward(hidden_size, expansion * hidden_size)
         self._chunk_size = chunk_size
@@ -2838,7 +2886,7 @@ class EsmFold2Transition(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         resolved = resolve_tensor_operator_backend(
-            self.backends.backend,
+            self.operator_backend,
             tensors=(x,),
             supported=("oops", "eager"),
             public_default="eager",
@@ -2865,7 +2913,9 @@ class EsmFold2Transition(nn.Module):
 
 
 class EsmFold2PairBiasAttention(nn.Module):
-    """Gated multi-head attention with pair bias conditioning."""
+    r"""
+    Gated multi-head attention with pair bias conditioning.
+    """
 
     def __init__(
         self,
@@ -2873,8 +2923,10 @@ class EsmFold2PairBiasAttention(nn.Module):
         pair_size: int,
         num_attention_heads: int,
         conditioning_size: int,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.operator_backend = operator_backend
         self.num_attention_heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
         self.scale = self.head_dim**-0.5
@@ -2932,17 +2984,16 @@ class EsmFold2PairBiasAttention(nn.Module):
             self.num_attention_heads,
             self.head_dim,
         )
-        logits = torch.einsum("... i h d, ... j h d -> ... i j h", query, key) * self.scale
-
-        pair_bias = self.pair_bias_projection(self.pair_norm(pair))
-        logits = logits + pair_bias.to(dtype=logits.dtype)
-
-        min_val = torch.finfo(logits.dtype).min
-        mask_bias = torch.where(attention_mask.bool()[:, None, :, None], 0.0, min_val)
-        logits = logits + mask_bias.to(dtype=logits.dtype)
-
-        attention = torch.softmax(logits, dim=-2).to(dtype=value.dtype)
-        context = torch.einsum("... i j h, ... j h d -> ... i h d", attention, value)
+        pair_bias = self.pair_bias_projection(self.pair_norm(pair)).permute(0, 3, 1, 2)
+        context = projected_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            biases=(pair_bias,),
+            attention_mask=attention_mask.bool()[:, None, None, :],
+            operator_backend=self.operator_backend,
+            scale=self.scale,
+        ).transpose(1, 2)
         context = gate * context
         output = self.output_projection(context.reshape(batch_size, num_queries, hidden_size))
 
@@ -2950,17 +3001,19 @@ class EsmFold2PairBiasAttention(nn.Module):
 
 
 class EsmFold2SpatialAtomAttention(nn.Module):
-    """Sliding-window self-attention with three-dimensional RoPE."""
+    r"""
+    Sliding-window self-attention with three-dimensional RoPE.
+    """
 
     def __init__(
         self,
         hidden_size: int,
         num_attention_heads: int,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         half_window: int = 64,
     ) -> None:
         super().__init__()
-        self.backends = backends
+        self.operator_backend = operator_backend
         self.num_attention_heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
         self.scale = self.head_dim**-0.5
@@ -2985,10 +3038,10 @@ class EsmFold2SpatialAtomAttention(nn.Module):
         query = self.query_projection(x).view(batch_size, num_atoms, self.num_attention_heads, self.head_dim)
         key = self.key_projection(x).view(batch_size, num_atoms, self.num_attention_heads, self.head_dim)
         value = self.value_projection(x).view(batch_size, num_atoms, self.num_attention_heads, self.head_dim)
-        query, key = qk_norm(query), qk_norm(key)
+        query, key = _qk_norm(query), _qk_norm(key)
 
-        query = apply_rotary_emb_3d(query, attention_cos, attention_sin)
-        key = apply_rotary_emb_3d(key, attention_cos, attention_sin)
+        query = _apply_rotary_emb_3d(query, attention_cos, attention_sin)
+        key = _apply_rotary_emb_3d(key, attention_cos, attention_sin)
 
         valid = atom_mask
         rank = torch.cumsum(valid, dim=1) - 1
@@ -3000,7 +3053,7 @@ class EsmFold2SpatialAtomAttention(nn.Module):
             key.transpose(1, 2),
             value.transpose(1, 2),
             attention_mask=allowed.unsqueeze(1),
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
             scale=self.scale,
         ).transpose(1, 2)
         output = output * valid.unsqueeze(-1).unsqueeze(-1)
@@ -3011,11 +3064,13 @@ class EsmFold2SpatialAtomAttention(nn.Module):
 
 
 class EsmFold2DiffusionConditioning(nn.Module):
-    """Conditions pair and single representations on noise timestep."""
+    r"""
+    Conditions pair and single representations on noise timestep.
+    """
 
     def __init__(
         self,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
         pair_size: int = 256,
         single_size: int = 768,
         input_size: int = 451,
@@ -3032,7 +3087,7 @@ class EsmFold2DiffusionConditioning(nn.Module):
         self.pair_transitions = nn.ModuleList(
             EsmFold2Transition(
                 pair_size,
-                backends,
+                operator_backend,
                 expansion=expansion,
                 chunk_size=None,
                 eps=layer_norm_eps,
@@ -3048,7 +3103,7 @@ class EsmFold2DiffusionConditioning(nn.Module):
         self.single_transitions = nn.ModuleList(
             EsmFold2Transition(
                 single_size,
-                backends,
+                operator_backend,
                 expansion=expansion,
                 chunk_size=None,
                 eps=layer_norm_eps,
@@ -3061,8 +3116,6 @@ class EsmFold2DiffusionConditioning(nn.Module):
         pair: Tensor,
         relative_position_encoding: Tensor,
     ) -> Tensor:
-        r"""Condition step-invariant pair features."""
-
         dtype = self.pair_projection.weight.dtype
         relative_position_encoding = relative_position_encoding.to(dtype=dtype)
         conditioned_pair = torch.cat([pair.to(dtype=dtype), relative_position_encoding], dim=-1)
@@ -3077,8 +3130,6 @@ class EsmFold2DiffusionConditioning(nn.Module):
         single_inputs: Tensor,
         num_diffusion_samples: int = 1,
     ) -> Tensor:
-        r"""Condition single features on one diffusion noise step."""
-
         expanded_single_inputs = (
             single_inputs if num_diffusion_samples == 1 else single_inputs.repeat_interleave(num_diffusion_samples, 0)
         )
@@ -3104,8 +3155,6 @@ class EsmFold2DiffusionConditioning(nn.Module):
         relative_position_encoding: Tensor,
         num_diffusion_samples: int = 1,
     ) -> tuple[Tensor, Tensor]:
-        r"""Condition single and pair features."""
-
         return (
             self.condition_single(noise_level, single_inputs, num_diffusion_samples),
             self.condition_pair(pair, relative_position_encoding),
@@ -3113,7 +3162,9 @@ class EsmFold2DiffusionConditioning(nn.Module):
 
 
 class EsmFold2RowAttentionPooling(nn.Module):
-    """Pool each pair row into a single representation."""
+    r"""
+    Pool each pair row into a single representation.
+    """
 
     def __init__(self, pair_size: int, single_size: int) -> None:
         super().__init__()
@@ -3134,7 +3185,9 @@ class EsmFold2RowAttentionPooling(nn.Module):
 
 
 class EsmFold2AdaptiveLayerNorm(nn.Module):
-    """Adaptive layer normalization (adaLN-Zero)."""
+    r"""
+    Adaptive layer normalization (adaLN-Zero).
+    """
 
     def __init__(
         self,
@@ -3169,7 +3222,9 @@ class EsmFold2AdaptiveLayerNorm(nn.Module):
 
 
 class EsmFold2FourierEmbedding(nn.Module):
-    """Embed noise levels with learned Fourier frequencies and phases."""
+    r"""
+    Embed noise levels with learned Fourier frequencies and phases.
+    """
 
     frequencies: Tensor
     phases: Tensor
@@ -3185,7 +3240,9 @@ class EsmFold2FourierEmbedding(nn.Module):
 
 
 class EsmFold2FeedForward(nn.Module):
-    """Two-projection SwiGLU feed-forward computation."""
+    r"""
+    Two-projection SwiGLU feed-forward computation.
+    """
 
     def __init__(
         self,
@@ -3205,12 +3262,14 @@ class EsmFold2FeedForward(nn.Module):
 
 
 class EsmFold2DiffusionStructureHead(nn.Module):
-    """Diffusion score network and coordinate sampler."""
+    r"""
+    Diffusion score network and coordinate sampler.
+    """
 
     def __init__(
         self,
         config: EsmFold2Config | EsmFold2ExperimentalConfig,
-        backends: EsmFold2BackendSettings,
+        operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         denoiser_config = config.diffusion_structure_head.denoiser
@@ -3218,7 +3277,7 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         structure_head_config = config.diffusion_structure_head
 
         self.denoiser = EsmFold2Denoiser(
-            backends=backends,
+            operator_backend=operator_backend,
             atom_hidden_size=denoiser_config.atom_hidden_size,
             token_hidden_size=denoiser_config.token_hidden_size,
             pair_size=denoiser_config.pair_size,
@@ -3249,7 +3308,6 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         self.inference_num_steps = structure_head_config.num_sampling_steps
 
     def inference_noise_schedule(self, num_steps: int | None = None, device: torch.device | None = None) -> Tensor:
-        """Karras power-law noise schedule."""
         steps = self.inference_num_steps if num_steps is None else num_steps
         if steps <= 0:
             raise ValueError("num_steps must be positive")
@@ -3302,7 +3360,6 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         second_coordinates: Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor | None]:
-        """Algorithm 19: center + random rotation + translation."""
         batch_size = coordinates.shape[0]
         mask = atom_mask.unsqueeze(-1)  # [B, A, 1]
         denominator = mask.sum(dim=1, keepdim=True).clamp(min=1)
@@ -3329,7 +3386,6 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         weights: Tensor,
         mask: Tensor,
     ) -> Tensor:
-        """Align coordinates to target coordinates with weighted Kabsch."""
         weights = (mask * weights).unsqueeze(-1)  # [B, N, 1]
         denominator = weights.sum(dim=-2, keepdim=True).clamp(min=1e-8)
         center = (coordinates * weights).sum(dim=-2, keepdim=True) / denominator
@@ -3364,7 +3420,7 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         atom_mask: Tensor,
         reference_element_features: Tensor,
         reference_atom_name_character_features: Tensor,
-        reference_space_index: Tensor,
+        reference_space_id: Tensor,
         atom_to_token: Tensor,
         token_mask: Tensor,
         num_diffusion_samples: int = 1,
@@ -3376,14 +3432,6 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         denoising_early_exit_rmsd: float | None = None,
         generator: torch.Generator | None = None,
     ) -> dict[str, Tensor | None]:
-        """Diffusion sampling (Algorithm 18).
-
-        The Karras schedule is built with ``num_sampling_steps`` entries, then
-        clipped to ``max_inference_sigma`` (the high-σ tail above the cap is
-        dropped and the cap prepended). The number of denoising steps actually
-        run is therefore fewer than ``num_sampling_steps`` whenever the schedule
-        extends above the cap.
-        """
         if num_diffusion_samples <= 0:
             raise ValueError("num_diffusion_samples must be positive")
         num_atoms = atom_to_token.shape[1]
@@ -3402,7 +3450,7 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         ) = self.denoiser.atom_encoder.encode_reference(
             reference_positions,
             atom_mask,
-            reference_space_index,
+            reference_space_id,
             reference_charges,
             reference_element_features,
             reference_atom_name_character_features,
@@ -3527,13 +3575,15 @@ class EsmFold2DiffusionStructureHead(nn.Module):
 
 
 class EsmFold2ConfidenceHead(nn.Module):
-    """Predicts pLDDT, PAE, PDE, resolved-atom probability and distogram bins."""
+    r"""
+    Predicts pLDDT, PAE, PDE, resolved-atom probability and distogram bins.
+    """
 
     distance_boundaries: Tensor
 
-    def __init__(self, config: EsmFold2Config, backends: EsmFold2BackendSettings) -> None:
+    def __init__(self, config: EsmFold2Config, operator_backend: str = "auto") -> None:
         super().__init__()
-        self.backends = backends
+        self.operator_backend = operator_backend
         confidence_config = config.confidence
         single_size = config.single_size
         pair_size = config.pair_size
@@ -3561,7 +3611,7 @@ class EsmFold2ConfidenceHead(nn.Module):
             folding_trunk_config.num_blocks,
             pair_size,
             expansion=4,
-            backends=backends,
+            operator_backend=operator_backend,
         )
 
         # Heads.
@@ -3621,7 +3671,7 @@ class EsmFold2ConfidenceHead(nn.Module):
         expanded_token_mask = self._repeat_batch(token_mask, num_diffusion_samples)
         batch_size = pair.shape[0]
 
-        representative_coordinates = gather_representative_atom_coordinates(
+        representative_coordinates = _gather_representative_atom_coordinates(
             coordinates,
             expanded_representative_atom_index,
         )
@@ -3639,10 +3689,10 @@ class EsmFold2ConfidenceHead(nn.Module):
         single = self.row_attention_pooling(pair, expanded_token_mask)
 
         atom_mask_float = expanded_atom_mask.float()
-        atom_single = gather_token_to_atom(
+        atom_single = _gather_token_to_atom(
             single,
             expanded_atom_to_token,
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         )
         normalized_atom_single = self.plddt_norm(atom_single)
 
@@ -3675,10 +3725,10 @@ class EsmFold2ConfidenceHead(nn.Module):
             torch.full_like(interface_per_token, 2.0),
             interface_per_token,
         )
-        iplddt_weight_atoms = gather_token_to_atom(
+        iplddt_weight_atoms = _gather_token_to_atom(
             iplddt_weight.unsqueeze(-1),
             expanded_atom_to_token,
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         ).squeeze(-1)
         atom_iplddt_weight = atom_mask_float * iplddt_weight_atoms
         complex_iplddt = (plddt_per_atom * atom_iplddt_weight).sum(dim=-1) / (
@@ -3763,18 +3813,15 @@ class EsmFold2ConfidenceHead(nn.Module):
 
 
 class EsmFold2ExperimentalConfidenceHead(nn.Module):
-    r"""Narrow confidence head of the experimental recurrent ESMFold2 graph.
-
-    Predicts per-atom pLDDT and pairwise PAE, with pTM and ipTM derived from PAE,
-    over a 128-bin coarse distogram embedding. Three unused single-track modules remain
-    parameterized because they are learned members of the experimental graph.
+    r"""
+    Narrow confidence head of the experimental recurrent ESMFold2 graph.
     """
 
     distance_boundaries: Tensor
 
-    def __init__(self, config: EsmFold2ExperimentalConfig, backends: EsmFold2BackendSettings) -> None:
+    def __init__(self, config: EsmFold2ExperimentalConfig, operator_backend: str = "auto") -> None:
         super().__init__()
-        self.backends = backends
+        self.operator_backend = operator_backend
         confidence_config = config.confidence
         single_size = config.single_size
         pair_size = config.pair_size
@@ -3805,7 +3852,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             folding_trunk_config.num_blocks,
             pair_size,
             expansion=4,
-            backends=backends,
+            operator_backend=operator_backend,
         )
 
         self.plddt_norm = LayerNorm(single_size)
@@ -3856,7 +3903,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         expanded_token_mask = self._repeat_batch(token_mask, num_diffusion_samples)
         batch_size = pair.shape[0]
 
-        representative_coordinates = gather_representative_atom_coordinates(
+        representative_coordinates = _gather_representative_atom_coordinates(
             coordinates,
             expanded_representative_atom_index,
         )
@@ -3874,10 +3921,10 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         single = self.row_attention_pooling(pair, expanded_token_mask)
 
         atom_mask_float = expanded_atom_mask.float()
-        atom_single = gather_token_to_atom(
+        atom_single = _gather_token_to_atom(
             single,
             expanded_atom_to_token,
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         )
         normalized_atom_single = self.plddt_norm(atom_single)
 
@@ -3910,10 +3957,10 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             torch.full_like(interface_per_token, 2.0),
             interface_per_token,
         )
-        iplddt_weight_atoms = gather_token_to_atom(
+        iplddt_weight_atoms = _gather_token_to_atom(
             iplddt_weight.unsqueeze(-1),
             expanded_atom_to_token,
-            operator_backend=self.backends.backend,
+            operator_backend=self.operator_backend,
         ).squeeze(-1)
         atom_iplddt_weight = atom_mask_float * iplddt_weight_atoms
         complex_iplddt = (plddt_per_atom * atom_iplddt_weight).sum(dim=-1) / (
@@ -3983,32 +4030,22 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         }
 
 
-@dataclass
-class EsmFold2BackendSettings:
-    r"""Shared backend request owned by one ESMFold2 model graph."""
-
-    backend: ModelBackend = "auto"
-
-    def configure(self, backend: ModelBackend) -> None:
-        self.backend = backend
-
-
-CHAR_VOCAB_SIZE: int = 64
-MAX_CHARS: int = 4
-XYZ_DIMS: int = 3
-MAX_ATOMIC_NUMBER: int = 128
+_CHAR_VOCAB_SIZE: int = 64
+_MAX_CHARS: int = 4
+_XYZ_DIMS: int = 3
+_MAX_ATOMIC_NUMBER: int = 128
 
 # Input feature dim = 3 + 1 + 1 + 128 + 64*4 = 389
-ATOM_FEATURE_DIM: int = XYZ_DIMS + 1 + 1 + MAX_ATOMIC_NUMBER + CHAR_VOCAB_SIZE * MAX_CHARS
+_ATOM_FEATURE_DIM: int = _XYZ_DIMS + 1 + 1 + _MAX_ATOMIC_NUMBER + _CHAR_VOCAB_SIZE * _MAX_CHARS
 
 
-NUM_RESIDUE_TYPES: int = 33
+_NUM_RESIDUE_TYPES: int = 33
 
 _EPS = 1e-5
 _CONFIDENCE_EPSILON = 1e-6
 
 
-def maybe_subsample_msa(
+def _maybe_subsample_msa(
     msa: Tensor,
     msa_attention_mask: Tensor | None,
     has_deletion: Tensor | None,
@@ -4018,7 +4055,8 @@ def maybe_subsample_msa(
     enabled: bool,
     generator: torch.Generator | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
-    """Randomly subsample the MSA to ``max_depth`` rows, keeping query row 0.
+    r"""
+    Randomly subsample the MSA to ``max_depth`` rows, keeping query row 0.
 
     Accepts encoder-input MSA token tensors shaped ``[B, depth, L]``. No-op when
     disabled, ``max_depth`` is None, or depth <= ``max_depth``.
@@ -4042,12 +4080,13 @@ def maybe_subsample_msa(
     return msa, msa_attention_mask, has_deletion, deletion_value
 
 
-def maybe_apply_msa_column_masking(
+def _maybe_apply_msa_column_masking(
     msa_attention_mask: Tensor | None,
     rate: float,
     generator: torch.Generator | None = None,
 ) -> Tensor | None:
-    """Mask fraction ``rate`` of MSA columns in non-query rows of
+    r"""
+    Mask fraction ``rate`` of MSA columns in non-query rows of
     ``msa_attention_mask``, keeping query row 0. No-op when absent, ``rate <= 0``,
     or depth <= 1.
     """
@@ -4060,13 +4099,14 @@ def maybe_apply_msa_column_masking(
     return masked
 
 
-def gather_token_to_atom(
+def _gather_token_to_atom(
     token_features: Tensor,
     atom_to_token: Tensor,
     *,
     operator_backend: str = "eager",
 ) -> Tensor:
-    """Broadcast per-token features to per-atom features using gather.
+    r"""
+    Broadcast per-token features to per-atom features using gather.
 
     Args:
         token_features: [B, L, d]
@@ -4091,7 +4131,7 @@ def gather_token_to_atom(
     return torch.gather(token_features, 1, gather_index)
 
 
-def scatter_atom_to_token(
+def _scatter_atom_to_token(
     atom_features: Tensor,
     atom_to_token: Tensor,
     n_tokens: int,
@@ -4099,7 +4139,8 @@ def scatter_atom_to_token(
     *,
     operator_backend: str = "eager",
 ) -> Tensor:
-    """Aggregate per-atom features to per-token features (mean).
+    r"""
+    Aggregate per-atom features to per-token features (mean).
 
     Args:
         atom_features: [B, A, d]
@@ -4133,8 +4174,9 @@ def scatter_atom_to_token(
     return out[:, :n_tokens, :]
 
 
-def gather_representative_atom_coordinates(coordinates: Tensor, representative_atom_index: Tensor) -> Tensor:
-    """Gather representative atom coordinates for each token.
+def _gather_representative_atom_coordinates(coordinates: Tensor, representative_atom_index: Tensor) -> Tensor:
+    r"""
+    Gather representative atom coordinates for each token.
 
     Args:
         coordinates: [B, A, 3]
@@ -4148,7 +4190,8 @@ def gather_representative_atom_coordinates(coordinates: Tensor, representative_a
 
 
 def _compute_intra_token_index(atom_to_token: Tensor) -> Tensor:
-    """Compute local atom index within each token (vectorised).
+    r"""
+    Compute local atom index within each token (vectorised).
 
     Atoms belonging to the same token are contiguous, so this computes a
     running count that resets at each token boundary.
@@ -4168,7 +4211,8 @@ def _compute_intra_token_index(atom_to_token: Tensor) -> Tensor:
 
 
 def _categorical_mean(logits: Tensor, start: float, end: float) -> Tensor:
-    """Expected value of a categorical distribution over evenly-spaced bins.
+    r"""
+    Expected value of a categorical distribution over evenly-spaced bins.
 
     Equivalent to ``CategoricalMixture(logits, bins=logits.shape[-1], start, end).mean()``.
 
@@ -4186,8 +4230,9 @@ def _categorical_mean(logits: Tensor, start: float, end: float) -> Tensor:
     return (logits.float().softmax(-1) @ v_bins.unsqueeze(1)).squeeze(-1)
 
 
-def apply_rotary_emb_3d(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Apply RoPE with batch-dependent cos/sin.
+def _apply_rotary_emb_3d(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    r"""
+    Apply RoPE with batch-dependent cos/sin.
 
     Args:
         x: [B, L, H, D]
@@ -4206,16 +4251,18 @@ def apply_rotary_emb_3d(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     )
 
 
-def build_3d_rope(
+def _build_3d_rope(
     reference_positions: Tensor,
-    reference_space_index: Tensor,
+    reference_space_id: Tensor,
     head_dim: int,
     num_spatial_pairs_per_axis: int = 4,
     num_reference_space_pairs: int = 2,
     spatial_base_frequency: float = 10000.0,
     reference_space_base_frequency: float = 10.0,
 ) -> tuple[Tensor, Tensor]:
-    """Build cos/sin for 3D RoPE + reference-space RoPE."""
+    r"""
+    Build cos/sin for 3D RoPE + reference-space RoPE.
+    """
     device = reference_positions.device
     batch_size, num_atoms = reference_positions.shape[:2]
     half_dim = head_dim // 2
@@ -4236,7 +4283,7 @@ def build_3d_rope(
     spatial_frequencies = torch.einsum("bna,k->bnak", float_positions, spatial_inverse_frequency)
     spatial_frequencies = spatial_frequencies.reshape(batch_size, num_atoms, num_spatial_pairs)
 
-    reference_space_values = reference_space_index.float()
+    reference_space_values = reference_space_id.float()
     reference_space_frequencies = torch.einsum(
         "bn,k->bnk",
         reference_space_values,
@@ -4259,11 +4306,11 @@ def build_3d_rope(
     return frequencies.cos(), frequencies.sin()
 
 
-def qk_norm(x: Tensor) -> Tensor:
+def _qk_norm(x: Tensor) -> Tensor:
     return F.rms_norm(x, (x.size(-1),)).to(x.dtype)
 
 
-def compute_esmc_hidden_states(
+def _compute_esmc_hidden_states(
     esmc: nn.Module,
     language_model_tokens: Tensor,
     language_model_mask: Tensor,
@@ -4275,7 +4322,9 @@ def compute_esmc_hidden_states(
     mask_token_id: int = 4,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Run ESMC and gather per-layer states in structure-token order."""
+    r"""
+    Run ESMC and gather per-layer states in structure-token order.
+    """
     esmc_model = cast(Any, esmc)
     if language_model_mask_probability > 0.0:
         special_tokens = (
@@ -4317,22 +4366,12 @@ def compute_esmc_hidden_states(
     return gathered * token_has_esmc[:, :, None, None].to(gathered.dtype)
 
 
-def compute_esmc_masked_lm_logits(
+def _compute_esmc_masked_lm_logits(
     esmc: nn.Module,
     lm_head: nn.Module,
     input_token_probabilities: Tensor,
     language_model_mask: Tensor,
 ) -> Tensor:
-    r"""Differentiable ESMC masked-LM logits for the Algorithm 14 pseudo-perplexity regulariser.
-
-    Mirrors [`compute_esmc_hidden_states`][ofoldx.models.esmfold2.model.compute_esmc_hidden_states]
-    but embeds categorical input probabilities (``input_token_probabilities @ word_embeddings``) and applies the frozen
-    masked-LM head, so gradient flows to ``input_token_probabilities`` through the frozen ESMC trunk.
-    ``input_token_probabilities`` is ``[rows, seq, vocab]`` (a differentiable distribution over the ESMC
-    vocabulary per position) and ``language_model_mask`` is ``[rows, seq]``. Returns ``[rows, seq,
-    vocab]`` masked-LM logits.
-    """
-
     esmc_model = cast(Any, esmc)
     masked_lm_head = cast(Any, lm_head)
     embed_weight = esmc_model.get_input_embeddings().weight
@@ -4376,10 +4415,14 @@ def _dropout(input: Tensor, p: float, generator: torch.Generator | None) -> Tens
 
 @dataclass(eq=False)
 class EsmFold2DesignCandidate:
-    r"""One folded ``target|binder`` complex and its aligned scientific values.
+    r"""
+    One folded target-binder complex and its aligned scientific values.
 
-    Each candidate owns the complete folded ``Structure`` of the target|binder complex.
-    Binder length may vary across candidates.
+    Args:
+        structure: Folded target-binder complex.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+        pair_metrics: Two-axis metrics keyed by stable scientific names.
     """
 
     structure: Structure
@@ -4390,33 +4433,39 @@ class EsmFold2DesignCandidate:
 
 @dataclass(eq=False)
 class EsmFold2DesignResult:
-    r"""One generation-ordered collection of coordinate-producing binder designs.
+    r"""
+    A generation-ordered collection of folded binder designs.
 
-    Tuple position identifies each candidate within one generation context.
+    Args:
+        candidates: Folded target-binder complexes in generation order.
     """
 
     candidates: tuple[EsmFold2DesignCandidate, ...]
 
     def best(self, score: str) -> EsmFold2DesignCandidate:
-        r"""Return the earliest best candidate under one explicit score.
+        r"""
+        Return the earliest best candidate under a named score.
 
-        Mirrors ``FoldResult.best`` exactly: the score's ``preferred`` direction must be
-        consistently ``"higher"`` or ``"lower"``; unit and scope must match across every
-        candidate; a NaN value or an undefined direction raises at ranking time; infinity
-        is rankable; and the earliest candidate wins a tie.
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
         """
 
         return best(self.candidates, score)
 
 
 # ===========================================================================
-# ESMFold2's exact tensor boundary and canonical semantic layout.
+# ESMFold2 tensor boundary and molecular layout.
 # ===========================================================================
 
 
 @dataclass(frozen=True)
 class EsmFold2Layout:
-    r"""Canonical identities aligned to one ESMFold2 token/atom tensor layout."""
+    r"""
+    Molecular identities aligned to ESMFold2 token and atom tensors.
+    """
 
     system: MolecularSystem
     atom_sites: tuple[AtomSite, ...]
@@ -4426,11 +4475,51 @@ class EsmFold2Layout:
 
 @dataclass(kw_only=True)
 class EsmFold2Input:
-    r"""Tensor inputs consumed by the ESMFold2 graph.
+    r"""
+    Tensor and molecular-layout input for ESMFold2.
 
-    ESMC inputs use one batch row per protein chain. ``token_to_esmc`` stores
-    flattened row/position indices that gather those states back to structure-token
-    order.
+    ``B`` is batch size, ``N`` token count, ``A`` atom count, ``M`` MSA depth,
+    ``C`` protein-chain count, and ``L`` padded language-model length.
+
+    Args:
+        token_index: Token indices within each residue with shape ``(B, N)``.
+        residue_index: Chain-local residue indices with shape ``(B, N)``.
+        chain_index: Molecular-instance indices with shape ``(B, N)``.
+        symmetry_index: Copy indices within each entity with shape ``(B, N)``.
+        entity_index: Molecular-entity indices with shape ``(B, N)``.
+        molecule_type: Molecular category IDs with shape ``(B, N)``.
+        residue_type: Residue-type IDs with shape ``(B, N)``.
+        token_bonds: Token-level bond adjacency with shape ``(B, N, N)``.
+        token_mask: Valid-token mask with shape ``(B, N)``.
+        reference_positions: Reference conformer coordinates with shape
+            ``(B, A, 3)`` in angstroms.
+        reference_elements: Atomic numbers with shape ``(B, A)``.
+        reference_charges: Formal charges with shape ``(B, A)``.
+        reference_atom_name_characters: Four encoded atom-name characters with shape
+            ``(B, A, 4)``.
+        reference_space_id: Reference conformer group IDs with shape ``(B, A)``.
+        atom_mask: Valid-atom mask with shape ``(B, A)``.
+        atom_to_token: Token index for each atom with shape ``(B, A)``.
+        distogram_atom_index: Representative atom index for each token with shape
+            ``(B, N)``.
+        token_has_esmc: Mask of tokens backed by language-model states with shape
+            ``(B, N)``.
+        layout: Molecular identities and evidence aligned to the token and atom axes.
+        deletion_mean: Optional per-token mean deletion values with shape ``(B, N)``.
+        msa: Optional MSA token IDs with shape ``(B, M, N)``.
+        has_deletion: Optional MSA deletion flags with shape ``(B, M, N)``.
+        deletion_value: Optional transformed MSA deletion values with shape
+            ``(B, M, N)``.
+        msa_attention_mask: Optional MSA validity mask with shape ``(B, M, N)``.
+        language_model_tokens: Optional language-model token IDs with shape ``(C, L)``.
+        language_model_mask: Optional validity mask with shape ``(C, L)``.
+        token_to_esmc: Optional flattened language-model index for each structure token,
+            with shape ``(B, N)``.
+        esmc_hidden_states: Optional language-model states aligned to structure tokens,
+            with shape ``(B, N, H, C_lm)``.
+        noisy_atom_coordinates: Optional noisy atom coordinates with shape
+            ``(B, A, 3)`` in angstroms for one-step denoising.
+        noise_level: Optional diffusion noise level with shape ``(B,)``.
     """
 
     token_index: Tensor
@@ -4446,7 +4535,7 @@ class EsmFold2Input:
     reference_elements: Tensor
     reference_charges: Tensor
     reference_atom_name_characters: Tensor
-    reference_space_index: Tensor
+    reference_space_id: Tensor
     atom_mask: Tensor
     atom_to_token: Tensor
     distogram_atom_index: Tensor
@@ -4467,7 +4556,14 @@ class EsmFold2Input:
 
 @dataclass
 class EsmFold2Output:
-    r"""Differentiable single-step denoising output returned by ``forward``."""
+    r"""
+    Predictions from one ESMFold2 denoising call.
+
+    Args:
+        denoised_coordinates: Denoised atom coordinates with shape
+            ``(B, A, 3)`` in angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+    """
 
     denoised_coordinates: Tensor
     distogram_logits: Tensor

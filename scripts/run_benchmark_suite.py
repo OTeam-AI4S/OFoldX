@@ -1,4 +1,5 @@
-"""Run the full OFoldX machine benchmark suite.
+"""
+Run the full OFoldX machine benchmark suite.
 
 The suite is meant for procurement-style comparisons. It runs real
 Protenix workloads, operator profiles, multi-GPU communication tests,
@@ -32,7 +33,9 @@ REPO = Path(__file__).resolve().parents[1]
 
 @dataclass
 class TaskResult:
-    """One child benchmark command result."""
+    """
+    One child benchmark command result.
+    """
 
     name: str
     command: list[str]

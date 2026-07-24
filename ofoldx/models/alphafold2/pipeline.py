@@ -1,4 +1,6 @@
-r"""Concrete AlphaFold 2 monomer and multimer folding Pipelines."""
+r"""
+Concrete AlphaFold 2 monomer and multimer folding Pipelines.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +20,9 @@ from .processor import AlphaFold2Processor
 
 
 class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
-    r"""Bind the AlphaFold 2 monomer Model and Processor."""
+    r"""
+    Structure prediction pipeline for AlphaFold 2.
+    """
 
     def fold(
         self,
@@ -31,7 +35,8 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one monomer and fold it with configured representation ensembles.
+        r"""
+        Predict the structure of one protein with AlphaFold 2.
 
         Args:
             input: Inline sequence, FASTA path, protein sequence, molecular system, or structure
@@ -39,13 +44,16 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
             msa: Optional monomer MSA value or alignment path.
             templates: Template structures with explicit target alignments.
             num_samples: Number of structure predictions to generate.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            seed: Optional seed for stochastic MSA feature construction. Mutually
+                exclusive with ``generator``.
+            generator: Optional generator for stochastic MSA feature construction.
+                Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Coordinates and PAE values
+            are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
@@ -59,7 +67,9 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
 
 
 class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFold2MultimerProcessor]):
-    r"""Bind the AlphaFold 2 multimer Model and Processor."""
+    r"""
+    Multimer structure prediction pipeline for AlphaFold-Multimer.
+    """
 
     def fold(
         self,
@@ -72,20 +82,24 @@ class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFo
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one assembly and fold it with configured representation ensembles.
+        r"""
+        Predict the structure of one protein assembly with AlphaFold-Multimer.
 
         Args:
             input: Molecular system or named/ordered protein sequences forming one assembly.
             msa: Optional multimer MSA collection.
             templates: Template structures with explicit target alignments.
             num_samples: Number of structure predictions to generate.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            seed: Optional seed for stochastic MSA feature construction. Mutually
+                exclusive with ``generator``.
+            generator: Optional generator for stochastic MSA feature construction.
+                Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Coordinates and PAE values
+            are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)

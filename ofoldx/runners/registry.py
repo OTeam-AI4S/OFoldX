@@ -1,11 +1,5 @@
-r"""Runner and objective registries.
-
-``RUNNERS`` resolves the Runner class from ``config.runner`` — the extension point
-where a user registers their own ``Runner`` subclass. ``OBJECTIVES`` maps an
-objective name (``"mpnn"``, ``"diffusion"``) to its loss reducer, and
-`ARCHITECTURE_OBJECTIVES` maps each supported architecture id to its default
-objective. An architecture with no grounded, in-repo objective is absent from that
-table, so the Runner raises rather than fabricating a loss (DESIGN Principle 13).
+r"""
+Registries for runners and training objectives.
 """
 
 from __future__ import annotations
@@ -14,16 +8,19 @@ import chanfig
 
 
 class RunnerRegistry(chanfig.ConfigRegistry):
-    r"""Resolve the Runner class from ``config.runner`` — a user extension point."""
+    r"""
+    Resolve a runner class from ``config.runner``.
+    """
 
     key = "runner"
 
 
+#: Runner implementations keyed by their configuration name.
 RUNNERS = RunnerRegistry()
+#: Training objectives keyed by objective name.
 OBJECTIVES: chanfig.Registry = chanfig.Registry()
 
-# Architecture id -> default objective name. Only architectures with a grounded,
-# in-repo objective appear here; others have no training objective yet.
+# Architecture ID to default objective name.
 ARCHITECTURE_OBJECTIVES: dict[str, str] = {
     "ofoldx.proteinmpnn": "mpnn",
     "ofoldx.ligandmpnn": "mpnn",

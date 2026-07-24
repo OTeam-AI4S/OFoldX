@@ -1,4 +1,6 @@
-r"""AlphaFold 2 Evoformer representation refinement."""
+r"""
+AlphaFold 2 Evoformer representation refinement.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +15,8 @@ from .msa import OuterProductMean
 
 
 class EvoformerStack(nn.Module):
-    r"""Refine MSA and pair representations through homogeneous Evoformer blocks.
+    r"""
+    Refine MSA and pair representations through homogeneous Evoformer blocks.
 
     MSA states use ``[..., sequences, residues, msa_size]`` and pair states use
     ``[..., residues, residues, pair_size]``. Each block preserves both layouts.
@@ -87,7 +90,18 @@ class EvoformerStack(nn.Module):
         msa_mask: Tensor | None = None,
         pair_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""Run every block and return refined MSA and pair representations."""
+        r"""
+        Refine MSA and pair representations through every block.
+
+        Args:
+            msa: MSA representation with shape ``(..., M, N, C_msa)``.
+            pair: Pair representation with shape ``(..., N, N, C_pair)``.
+            msa_mask: Optional MSA validity mask with shape ``(..., M, N)``.
+            pair_mask: Optional pair validity mask with shape ``(..., N, N)``.
+
+        Returns:
+            Refined MSA and pair representations with the same shapes as the inputs.
+        """
 
         if not self.blocks:
             return msa, pair
@@ -101,7 +115,8 @@ class EvoformerStack(nn.Module):
 
 
 class EvoformerBlock(nn.Module):
-    r"""Own one ordered Evoformer update of the MSA and pair tracks.
+    r"""
+    Own one ordered Evoformer update of the MSA and pair tracks.
 
     The block places outer-product mean before or after the MSA-track block, then
     applies the pair-track block. Its children own their respective residual order.
@@ -169,7 +184,18 @@ class EvoformerBlock(nn.Module):
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
-        r"""Apply the ordered MSA, outer-product, and pair updates."""
+        r"""
+        Apply the ordered MSA, outer-product, and pair updates.
+
+        Args:
+            msa: MSA representation with shape ``(..., N_msa, N_residue, C_msa)``.
+            pair: Pair representation with shape ``(..., N_residue, N_residue, C_pair)``.
+            msa_mask: MSA validity mask with shape ``(..., N_msa, N_residue)``.
+            pair_mask: Pair validity mask with shape ``(..., N_residue, N_residue)``.
+
+        Returns:
+            Updated MSA and pair representations with unchanged shapes.
+        """
 
         if self.outer_product_first:
             pair = pair + self.outer_product_mean(msa, msa_mask)
@@ -181,7 +207,8 @@ class EvoformerBlock(nn.Module):
 
 
 class EvoformerMsaBlock(nn.Module):
-    r"""MSA-track block owning row, column, and transition residuals.
+    r"""
+    MSA-track block owning row, column, and transition residuals.
 
     Args:
         msa_size: Width of the MSA representation.
@@ -228,7 +255,18 @@ class EvoformerMsaBlock(nn.Module):
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
-        r"""Apply row attention, column attention, and transition residuals in order."""
+        r"""
+        Apply row attention, column attention, and transition residuals in order.
+
+        Args:
+            msa: MSA representation with shape ``(..., N_msa, N_residue, C_msa)``.
+            pair: Pair representation with shape ``(..., N_residue, N_residue, C_pair)``.
+            msa_mask: MSA validity mask with shape ``(..., N_msa, N_residue)``.
+            pair_mask: Pair validity mask with shape ``(..., N_residue, N_residue)``.
+
+        Returns:
+            Updated MSA representation with the same shape as ``msa``.
+        """
 
         msa = msa + self.rowwise_dropout(
             self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask),
@@ -241,7 +279,8 @@ class EvoformerMsaBlock(nn.Module):
 
 
 class EvoformerPairBlock(nn.Module):
-    r"""Pair-track block owning triangle and transition residuals.
+    r"""
+    Pair-track block owning triangle and transition residuals.
 
     Args:
         pair_size: Width of the pair representation.
@@ -293,7 +332,16 @@ class EvoformerPairBlock(nn.Module):
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
-        r"""Apply outgoing, incoming, starting, ending, and transition residuals."""
+        r"""
+        Apply outgoing, incoming, starting, ending, and transition residuals.
+
+        Args:
+            pair: Pair representation with shape ``(..., N_residue, N_residue, C_pair)``.
+            pair_mask: Pair validity mask with shape ``(..., N_residue, N_residue)``.
+
+        Returns:
+            Updated pair representation with the same shape as ``pair``.
+        """
 
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
@@ -308,7 +356,8 @@ class EvoformerPairBlock(nn.Module):
 
 
 class MsaRowAttentionWithPairBias(nn.Module):
-    r"""Attend over residues within each MSA row using pair-derived head biases.
+    r"""
+    Attend over residues within each MSA row using pair-derived head biases.
 
     Args:
         msa_size: Width of the MSA representation.
@@ -340,7 +389,17 @@ class MsaRowAttentionWithPairBias(nn.Module):
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor) -> Tensor:
-        r"""Return an additive MSA row-attention update."""
+        r"""
+        Return an additive MSA row-attention update.
+
+        Args:
+            msa: MSA representation with shape ``(..., N_msa, N_residue, C_msa)``.
+            pair: Pair representation with shape ``(..., N_residue, N_residue, C_pair)``.
+            msa_mask: MSA validity mask with shape ``(..., N_msa, N_residue)``.
+
+        Returns:
+            Row-attention update with the same shape as ``msa``.
+        """
 
         msa = self.query_norm(msa)
         pair = self.pair_norm(pair)
@@ -349,7 +408,8 @@ class MsaRowAttentionWithPairBias(nn.Module):
 
 
 class MsaColumnAttention(nn.Module):
-    r"""Attend over MSA rows independently at each residue position.
+    r"""
+    Attend over MSA rows independently at each residue position.
 
     Args:
         msa_size: Width of the MSA representation.
@@ -371,7 +431,16 @@ class MsaColumnAttention(nn.Module):
         )
 
     def forward(self, msa: Tensor, *, msa_mask: Tensor) -> Tensor:
-        r"""Return an additive MSA column-attention update."""
+        r"""
+        Return an additive MSA column-attention update.
+
+        Args:
+            msa: MSA representation with shape ``(..., N_msa, N_residue, C_msa)``.
+            msa_mask: MSA validity mask with shape ``(..., N_msa, N_residue)``.
+
+        Returns:
+            Column-attention update with the same shape as ``msa``.
+        """
 
         msa = msa.transpose(-3, -2)
         msa_mask = msa_mask.transpose(-2, -1)
@@ -380,7 +449,8 @@ class MsaColumnAttention(nn.Module):
 
 
 class MsaColumnGlobalAttention(nn.Module):
-    r"""Attend over MSA rows from one mask-weighted global query per residue.
+    r"""
+    Attend over MSA rows from one mask-weighted global query per residue.
 
     Args:
         msa_size: Width of the MSA representation.
@@ -399,7 +469,16 @@ class MsaColumnGlobalAttention(nn.Module):
         )
 
     def forward(self, msa: Tensor, *, msa_mask: Tensor) -> Tensor:
-        r"""Return an additive global column-attention update."""
+        r"""
+        Return an additive global column-attention update.
+
+        Args:
+            msa: MSA representation with shape ``(..., N_msa, N_residue, C_msa)``.
+            msa_mask: MSA validity mask with shape ``(..., N_msa, N_residue)``.
+
+        Returns:
+            Global column-attention update with the same shape as ``msa``.
+        """
 
         msa = msa.transpose(-3, -2)
         msa_mask = msa_mask.transpose(-2, -1)
@@ -408,7 +487,8 @@ class MsaColumnGlobalAttention(nn.Module):
 
 
 class GlobalAttention(nn.Module):
-    r"""Apply mask-weighted global-query attention along an input axis.
+    r"""
+    Apply mask-weighted global-query attention along an input axis.
 
     Args:
         hidden_size: Width of input and output states.
@@ -425,13 +505,23 @@ class GlobalAttention(nn.Module):
         )
 
     def forward(self, query: Tensor, mask: Tensor) -> Tensor:
-        r"""Project a mask-weighted global query and return gated attended values."""
+        r"""
+        Project a mask-weighted global query and return gated attended values.
+
+        Args:
+            query: Input states with shape ``(..., N, C)``.
+            mask: Valid-input mask broadcastable to ``(..., N, 1)``.
+
+        Returns:
+            Gated attention updates with the same shape as ``query``.
+        """
 
         return self.projection(query, mask)
 
 
 class GlobalAttentionProjection(nn.Module):
-    r"""Own the query, key, value, gate, and output projections for global attention.
+    r"""
+    Own the query, key, value, gate, and output projections for global attention.
 
     Args:
         hidden_size: Width of input and output states.
@@ -452,7 +542,16 @@ class GlobalAttentionProjection(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, query: Tensor, mask: Tensor) -> Tensor:
-        r"""Attend from the mask-weighted mean query and gate the broadcast result."""
+        r"""
+        Attend from the mask-weighted mean query and gate the broadcast result.
+
+        Args:
+            query: Input states with shape ``(..., N, C)``.
+            mask: Valid-input mask broadcastable to ``(..., N, 1)``.
+
+        Returns:
+            Gated attention updates with the same shape as ``query``.
+        """
 
         mask = mask.to(dtype=query.dtype)
         mask_count = mask.sum(dim=-2).clamp(min=1.0)
@@ -471,7 +570,8 @@ class GlobalAttentionProjection(nn.Module):
 
 
 class EvoformerTransition(nn.Module):
-    r"""Pre-normalized two-projection ReLU transition returning an update.
+    r"""
+    Pre-normalized two-projection ReLU transition returning an update.
 
     Args:
         hidden_size: Width of input and output representations.
@@ -485,7 +585,16 @@ class EvoformerTransition(nn.Module):
         self.output_projection = nn.Linear(hidden_size * expansion, hidden_size)
 
     def forward(self, hidden: Tensor, mask: Tensor | None = None) -> Tensor:
-        r"""Return a masked additive transition update."""
+        r"""
+        Return a masked additive transition update.
+
+        Args:
+            hidden: Hidden representation with ``hidden_size`` channels.
+            mask: Optional validity mask matching ``hidden`` without its channel axis.
+
+        Returns:
+            Transition update with the same shape as ``hidden``.
+        """
 
         output = self.output_projection(F.relu(self.input_projection(self.input_norm(hidden))))
         if mask is None:

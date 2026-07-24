@@ -1,10 +1,5 @@
 r"""
-Pairformer stack modules.
-
-The Pairformer refines a single representation and a pair representation together, with no MSA
-axis. Each block runs the pair triangle updates (multiplication + attention + transition) and,
-when a single channel is present, updates the single representation with pair-biased
-self-attention. Setting ``single_size = 0`` yields a pair-only stack.
+Pairformer blocks and stacks.
 """
 
 from __future__ import annotations
@@ -39,19 +34,6 @@ class PairformerStack(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> stack = PairformerStack(
-        ...     num_blocks=1, single_size=8, pair_size=4,
-        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, num_pair_attention_heads=2,
-        ...     expansion=2, dropout=0.0,
-        ... ).eval()
-        >>> single, pair = torch.randn(1, 3, 8), torch.randn(1, 3, 3, 4)
-        >>> out_single, out_pair = stack(single, pair)
-        >>> out_single.shape, out_pair.shape
-        (torch.Size([1, 3, 8]), torch.Size([1, 3, 3, 4]))
     """
 
     def __init__(
@@ -106,17 +88,6 @@ class PairformerStack(nn.Module):
         Returns:
             Refined ``(single, pair)`` of shapes `[B, N, single_size]` (or ``None``) and
             `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> stack = PairformerStack(
-            ...     num_blocks=1, single_size=0, pair_size=4,
-            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2, dropout=0.0,
-            ... ).eval()
-            >>> single, pair = stack(None, torch.randn(1, 3, 3, 4))
-            >>> single is None, pair.shape
-            (True, torch.Size([1, 3, 3, 4]))
         """
 
         if self.single_size == 0:
@@ -150,18 +121,6 @@ class PairformerBlock(nn.Module):
         ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
             pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to every submodule.
-
-    Examples:
-        >>> import torch
-        >>> block = PairformerBlock(
-        ...     single_size=8, pair_size=4,
-        ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-        ...     num_triangle_attention_heads=2, num_pair_attention_heads=2,
-        ...     expansion=2, dropout=0.0,
-        ... ).eval()
-        >>> single, pair = block(torch.randn(1, 3, 8), torch.randn(1, 3, 3, 4))
-        >>> single.shape, pair.shape
-        (torch.Size([1, 3, 8]), torch.Size([1, 3, 3, 4]))
     """
 
     def __init__(
@@ -239,17 +198,6 @@ class PairformerBlock(nn.Module):
         Returns:
             Updated ``(single, pair)`` of shapes `[B, N, single_size]` (or ``None``) and
             `[B, N, N, pair_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = PairformerBlock(
-            ...     single_size=0, pair_size=4,
-            ...     triangle_multiplication_hidden_size=4, triangle_attention_hidden_size=2,
-            ...     num_triangle_attention_heads=2, expansion=2, dropout=0.0,
-            ... ).eval()
-            >>> single, pair = block(None, torch.randn(1, 3, 3, 4))
-            >>> single is None, pair.shape
-            (True, torch.Size([1, 3, 3, 4]))
         """
 
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))

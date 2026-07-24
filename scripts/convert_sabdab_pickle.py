@@ -1,4 +1,6 @@
-"""Convert Protenix SAbDab pickle samples to plain PDB files."""
+"""
+Convert Protenix SAbDab pickle samples to plain PDB files.
+"""
 
 from __future__ import annotations
 

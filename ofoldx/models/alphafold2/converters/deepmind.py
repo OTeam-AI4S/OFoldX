@@ -277,12 +277,6 @@ def convert_official_tensor(key: str, tensor: Tensor) -> Tensor:
 def normalize_official_param_key(key: str) -> str:
     r"""
     Return the normalized OFoldX-style key for one official AF2 flat Haiku key.
-
-    Examples:
-        >>> normalize_official_param_key("alphafold/alphafold_iteration/evoformer/preprocess_1d//weights")
-        'input_embeddings.token_projection.weight'
-        >>> normalize_official_param_key("alphafold/alphafold_iteration/structure_module/layer_norm//scale")
-        'structure_module.layer_norm.weight'
     """
 
     scope, name = _split_official_param_key(key)

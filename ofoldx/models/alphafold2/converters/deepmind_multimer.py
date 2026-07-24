@@ -44,7 +44,9 @@ def convert_deepmind_multimer_checkpoint(
     model_name: str,
     dtype: torch.dtype | None = None,
 ) -> AlphaFold2Model:
-    r"""Convert official AlphaFold-Multimer parameters into a strict-loaded native model."""
+    r"""
+    Convert official AlphaFold-Multimer parameters into a strict-loaded native model.
+    """
 
     converted = convert_official_multimer_state_dict(params, dtype=dtype)
     model_config = AlphaFold2MultimerConfig(_multimer_config_overrides())
@@ -59,7 +61,9 @@ def convert_official_multimer_state_dict(
     *,
     dtype: torch.dtype | None = None,
 ) -> dict[str, Tensor]:
-    r"""Normalize official flat Haiku AF-Multimer parameter names to native tensor keys."""
+    r"""
+    Normalize official flat Haiku AF-Multimer parameter names to native tensor keys.
+    """
 
     converted: dict[str, Tensor] = {}
     for source_key, tensor in params.items():
@@ -111,7 +115,8 @@ _TRIANGLE_SPLIT_INCOMING = {
 
 
 def _split_multimer_tensor(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
-    r"""Expand one fused AF-Multimer triangle-multiplication tensor into native keys.
+    r"""
+    Expand one fused AF-Multimer triangle-multiplication tensor into native keys.
 
     Non triangle-multiplication tensors and already-native sub-modules pass through
     unchanged. ``projection`` / ``gate`` weights ``(2c, in)`` and biases ``(2c,)`` split
@@ -142,7 +147,8 @@ def _split_multimer_tensor(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]
 
 
 def _convert_multimer_tensor(source_key: str, tensor: Tensor) -> Tensor:
-    r"""Convert one official multimer tensor, handling the multimer IPA projections.
+    r"""
+    Convert one official multimer tensor, handling the multimer IPA projections.
 
     The AF-Multimer invariant-point-attention scalar/point projections store weights as
     ``(c_s, num_heads, out)`` Haiku tensors that flatten to ``(num_heads * out, c_s)`` in the
@@ -168,7 +174,8 @@ def _convert_multimer_tensor(source_key: str, tensor: Tensor) -> Tensor:
 
 
 def normalize_multimer_param_key(key: str) -> str:
-    r"""Return the normalized native key for one official AF-Multimer flat Haiku key.
+    r"""
+    Return the normalized native key for one official AF-Multimer flat Haiku key.
 
     Only the chain-relative input embedder needs multimer-specific handling here;
     every other scope reuses the monomer normalization, which already maps the
@@ -204,7 +211,9 @@ def normalize_multimer_param_key(key: str) -> str:
 
 
 def _multimer_config_overrides() -> dict[str, object]:
-    r"""AF-Multimer v3 always carries templates and the interface-TM head."""
+    r"""
+    AF-Multimer v3 always carries templates and the interface-TM head.
+    """
 
     return {
         "heads": {"predicted_aligned_error": {"enabled": True}},

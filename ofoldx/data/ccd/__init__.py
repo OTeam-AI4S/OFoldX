@@ -1,4 +1,5 @@
-r"""wwPDB Chemical Component Dictionary resolution.
+r"""
+wwPDB Chemical Component Dictionary resolution.
 
 Components are read from a revision-pinned Hub dataset and lowered to canonical
 ``ChemicalComponent`` values at an input boundary.

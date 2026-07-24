@@ -1,8 +1,5 @@
-r"""Lower canonical biomolecular inputs to AlphaFold 3 tensors.
-
-The Processor accepts canonical molecular assemblies with MSA and template evidence. It
-produces atom, token, MSA, and template features while preserving canonical identities in
-the accompanying layout.
+r"""
+Convert biomolecular inputs into AlphaFold 3 features.
 """
 
 from __future__ import annotations
@@ -138,7 +135,9 @@ _TEMPLATE_DISTOGRAM_MAX = 50.75
 
 
 def _residue_type_index(component_id: str, standard: bool) -> int:
-    r"""Target residue-type index; unknown DNA folds onto the shared unknown-nucleic class N."""
+    r"""
+    Target residue-type index; unknown DNA folds onto the shared unknown-nucleic class N.
+    """
 
     if not standard:
         return _UNKNOWN
@@ -148,7 +147,8 @@ def _residue_type_index(component_id: str, standard: bool) -> int:
 
 
 class AlphaFold3Processor(Processor):
-    r"""Build AlphaFold 3 atom, token, MSA, and template tensors.
+    r"""
+    Convert supported biomolecular inputs into `AlphaFold3Input`.
 
     Args:
         config: Feature limits and CCD resolution settings. Defaults to
@@ -176,7 +176,8 @@ class AlphaFold3Processor(Processor):
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold3Input:
-        r"""Lower one canonical assembly and its evidence to ``AlphaFold3Input``.
+        r"""
+        Prepare model features for one molecular assembly.
 
         Args:
             input: Inline protein sequence, FASTA or structure path, one or more
@@ -186,12 +187,10 @@ class AlphaFold3Processor(Processor):
             templates: Template evidence aligned to the target polymers.
 
         Returns:
-            An ``AlphaFold3Input`` containing model tensors and canonical system, atom, and token
-            identities.
-
-        Notes:
-            Atom-aligned tensors follow ``atom_sites``; token-aligned tensors follow
-            ``token_sites``.
+            Batched token, atom, MSA, and template tensors. Reference and
+            template coordinates are in angstroms. Atom-aligned tensors follow
+            ``atom_sites`` and token-aligned tensors follow ``token_sites``. This
+            method performs no random sampling.
         """
 
         system = _normalize_input(input)
@@ -264,22 +263,8 @@ def _sequence_system(named: tuple[tuple[str, PolymerSequence], ...]) -> Molecula
 
 
 def _resolve_components(system: MolecularSystem, *, revision: str) -> MolecularSystem:
-    r"""Embed CCD chemistry for any bare CCD-code component at the Processor boundary.
-
-    Walks every entity's components and, for any component that is a bare CCD-code
-    reference lacking the chemical graph the tokenizer requires (no ``atoms``, or no
-    per-atom ``reference_coordinates`` -- the exact facts checked at
-    ``_reference_features`` / ``_tokenize``), lowers it to a canonical
-    [`ChemicalComponent`][ofoldx.data.molecular.ChemicalComponent] VALUE via the shared
-    ``ofoldx/ccd`` resolver and embeds that value in place. This covers CCD-code
-    ligands, ions, modified residues, and glycan monomers.
-
-    The resolution is boundary-time only: ``_features`` / ``_reference_features`` then
-    read the embedded values, so the tensor-compute path performs no component lookup.
-    A component that is already fully resolved (a built-in standard residue, an inline
-    SMILES-imported molecule, or a structure-parsed ligand carrying atoms and
-    coordinates) is left untouched -- the pass never re-resolves or overrides supplied
-    chemistry. Identical CCD codes resolve once and share the value.
+    r"""
+    Resolve bare CCD component codes needed for feature construction.
     """
 
     cache: dict[str, ChemicalComponent] = {}
@@ -313,7 +298,9 @@ def _resolve_components(system: MolecularSystem, *, revision: str) -> MolecularS
 
 
 def _needs_ccd_resolution(component: ChemicalComponent) -> bool:
-    r"""Whether a component is a bare CCD-code reference missing tokenizer-required facts."""
+    r"""
+    Whether a component is a bare CCD-code reference missing tokenizer-required facts.
+    """
 
     if not component.atoms:
         return True
@@ -703,7 +690,9 @@ def _msa_features(
     *,
     max_rows: int,
 ) -> tuple[Tensor | None, Tensor | None]:
-    r"""Build the AlphaFold 3 ``msa_features`` = one-hot(32) + has_deletion + deletion_value."""
+    r"""
+    Build the AlphaFold 3 ``msa_features`` = one-hot(32) + has_deletion + deletion_value.
+    """
 
     if msa is None:
         return None, None
@@ -721,7 +710,9 @@ def _profile_features(
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> tuple[Tensor, Tensor]:
-    r"""The target-feat MSA profile (31-class) and per-token mean deletion over the unpaired pool."""
+    r"""
+    The target-feat MSA profile (31-class) and per-token mean deletion over the unpaired pool.
+    """
 
     bindings = {} if msa is None else msa_binding_map(msa)
     profile = torch.zeros(len(tokens), _TARGET_VOCAB_SIZE)
@@ -782,7 +773,8 @@ def _template_to(features: TemplateFeatures, *, device: torch.device, dtype: tor
 
 
 def _template_backbone(positions: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Pseudo-beta positions/mask and per-pair unit vectors in each residue's backbone frame.
+    r"""
+    Pseudo-beta positions/mask and per-pair unit vectors in each residue's backbone frame.
 
     ``positions`` / ``mask`` are ``[N, 4, *]`` over the dense backbone atoms (N, CA, C, CB); glycine
     carries no CB so its pseudo-beta falls back to CA (index 1). Each frame places the x-axis along
@@ -951,7 +943,9 @@ def _residue_backbone(
     instance_id: str,
     component_index: int,
 ) -> tuple[Tensor, Tensor]:
-    r"""Return dense (N, CA, C, CB) positions and their validity mask for one template residue."""
+    r"""
+    Return dense (N, CA, C, CB) positions and their validity mask for one template residue.
+    """
 
     positions = torch.zeros(4, 3)
     mask = torch.zeros(4)

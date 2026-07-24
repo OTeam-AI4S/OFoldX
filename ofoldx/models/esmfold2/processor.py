@@ -1,4 +1,6 @@
-r"""Lower canonical molecular systems and MSA evidence to ESMFold2 tensors."""
+r"""
+Input processing for ESMFold2 structure prediction and binder design.
+"""
 
 from __future__ import annotations
 
@@ -74,10 +76,11 @@ _ANTIBODY_CDR_SCHEME = "chothia"
 
 
 class EsmFold2Processor(Processor):
-    r"""Lower complete canonical ESMFold2 inputs without changing their chemistry.
+    r"""
+    Convert supported protein inputs into `EsmFold2Input`.
 
     Args:
-        config: MSA-conditioning options. Defaults to ``EsmFold2ProcessorConfig()``.
+        config: MSA-processing options. Defaults to ``EsmFold2ProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -99,24 +102,26 @@ class EsmFold2Processor(Processor):
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
     ) -> EsmFold2Input:
-        r"""Lower one molecular system and optional MSA evidence.
+        r"""
+        Build model inputs for one molecular system and optional MSA evidence.
 
         Args:
-            input: Inline sequence, FASTA path, one or more polymer sequences, molecular system,
-                or structure topology.
-            msa: Optional MSA value, collection, or alignment path.
+            input: Inline sequence, FASTA path, one or more polymer sequences, molecular
+                system, or structure topology. Coordinates in a ``Structure`` are ignored.
+            msa: Optional MSA evidence or alignment path.
 
         Returns:
-            An ``EsmFold2Input`` with aligned language-model, MSA, atom, and layout values.
+            An [`EsmFold2Input`][] with batch size one and aligned language-model, MSA,
+            token, atom, and molecular-layout axes.
         """
 
         if msa is not None and not self.config.msa_conditioning:
             raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
         if isinstance(input, Structure):
             input = input.system
-        system = input if isinstance(input, MolecularSystem) else molecular_system(input)
-        normalized_msa = normalize_msa(msa, system)
-        return prepare_esmfold2_features(
+        system = input if isinstance(input, MolecularSystem) else _molecular_system(input)
+        normalized_msa = _normalize_msa(msa, system)
+        return _prepare_esmfold2_features(
             system,
             msa=normalized_msa,
             tokenizer=self.tokenizer,
@@ -126,16 +131,11 @@ class EsmFold2Processor(Processor):
 
 
 class EsmFold2ExperimentalProcessor(EsmFold2Processor):
-    r"""Lower target|binder complexes for the experimental recurrent ESMFold2 design graph.
-
-    Paired with [`EsmFold2ExperimentalModel`][ofoldx.models.esmfold2.EsmFold2ExperimentalModel].
-    It uses the same ESMFold2 token/atom lowering, while its independent config
-    records whether the paired checkpoint accepts MSA evidence. The soft residue
-    probabilities consumed by the differentiable trunk are assembled by the
-    binder-design Pipeline because they depend on the per-step optimisation logits.
+    r"""
+    Convert supported binder-design inputs into `EsmFold2Input`.
 
     Args:
-        config: Design-time MSA-conditioning options. Defaults to
+        config: Design-time MSA-processing options. Defaults to
             ``EsmFold2ExperimentalProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
@@ -157,10 +157,12 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
         self.config = config
 
 
-def molecular_system(
+def _molecular_system(
     input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
 ) -> MolecularSystem:
-    r"""Construct the polymer-only convenience input accepted by the fold boundary."""
+    r"""
+    Construct the polymer-only convenience input accepted by the fold boundary.
+    """
 
     named: list[tuple[str, PolymerSequence]]
     if isinstance(input, str | PathLike):
@@ -205,16 +207,20 @@ def molecular_system(
 
 
 def _default_chain_id(index: int) -> str:
-    r"""Assign a default entity and instance key."""
+    r"""
+    Assign a default entity and instance key.
+    """
 
     return chr(ord("A") + index) if index < 26 else f"chain_{index + 1}"
 
 
-def normalize_msa(
+def _normalize_msa(
     msa: MSA | MSACollection | str | PathLike[str] | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
-    r"""Bind MSA evidence to the exact polymer definitions in ``system``."""
+    r"""
+    Bind MSA evidence to the exact polymer definitions in ``system``.
+    """
 
     if msa is None:
         return None
@@ -237,7 +243,7 @@ def normalize_msa(
         raise ValueError("MSA FASTA contains no rows")
     entity_id, _ = proteins[0]
     a3m = ".a3m" in {suffix.lower() for suffix in path.suffixes}
-    parsed = tuple(aligned_protein_row(record.sequence, a3m=a3m) for record in records)
+    parsed = tuple(_aligned_protein_row(record.sequence, a3m=a3m) for record in records)
     aligned_rows = tuple(row for row, _ in parsed)
     deletion_rows = tuple(deletions for _, deletions in parsed)
     width = len(aligned_rows[0])
@@ -252,12 +258,14 @@ def normalize_msa(
     )
 
 
-def aligned_protein_row(
+def _aligned_protein_row(
     sequence: str,
     *,
     a3m: bool = False,
 ) -> tuple[str, tuple[int, ...]]:
-    r"""Convert one aligned FASTA/A3M row to a query-width symbol string plus insertion counts."""
+    r"""
+    Convert one aligned FASTA/A3M row to a query-width symbol string plus insertion counts.
+    """
 
     symbols: list[str] = []
     deletion_counts: list[int] = []
@@ -273,7 +281,9 @@ def aligned_protein_row(
 
 
 def _msa_residue_type(symbol: str) -> int:
-    r"""Map one uppercase MSA symbol or gap to a residue-type index."""
+    r"""
+    Map one uppercase MSA symbol or gap to a residue-type index.
+    """
 
     if symbol == "-":
         return _MSA_GAP
@@ -281,7 +291,7 @@ def _msa_residue_type(symbol: str) -> int:
     return _PROTEIN_RESIDUE_TYPES.get(component_id, _PROTEIN_UNKNOWN)
 
 
-def prepare_esmfold2_features(
+def _prepare_esmfold2_features(
     system: MolecularSystem,
     *,
     msa: MSA | MSACollection | None,
@@ -289,7 +299,9 @@ def prepare_esmfold2_features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> EsmFold2Input:
-    r"""Build the token and atom layout from canonical identity and topology."""
+    r"""
+    Build the token and atom layout from canonical identity and topology.
+    """
 
     token_groups: list[tuple[AtomSite, ...]] = []
     token_sites: list[AtomSite | tuple[str, int]] = []
@@ -307,7 +319,7 @@ def prepare_esmfold2_features(
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
     instance_count_by_entity: dict[str, int] = {}
-    next_reference_space_index = 0
+    next_reference_space_id = 0
 
     for chain_index, (instance_id, entity_key) in enumerate(system.instances.items()):
         entity = system.entities[entity_key]
@@ -352,8 +364,8 @@ def prepare_esmfold2_features(
                     symmetry_indices.append(symmetry_index)
                     molecule_types.append(molecule_type)
                     residue_types.append(residue_type)
-                    reference_space_indices.extend([next_reference_space_index] * len(group))
-                next_reference_space_index += 1
+                    reference_space_indices.extend([next_reference_space_id] * len(group))
+                next_reference_space_id += 1
         else:
             sites = tuple(
                 site
@@ -376,8 +388,8 @@ def prepare_esmfold2_features(
                 symmetry_indices.append(symmetry_index)
                 molecule_types.append(3)
                 residue_types.append(_PROTEIN_UNKNOWN)
-                reference_space_indices.append(next_reference_space_index)
-            next_reference_space_index += 1
+                reference_space_indices.append(next_reference_space_id)
+            next_reference_space_id += 1
 
     atom_sites = tuple(site for group in token_groups for site in group)
     site_to_atom = {site: index for index, site in enumerate(atom_sites)}
@@ -385,11 +397,9 @@ def prepare_esmfold2_features(
     real_atom_count = len(atom_sites)
     padded_atom_count = max(32, math.ceil(real_atom_count / 32) * 32)
 
-    optional_reference_coordinates = [reference_coordinate(system, site) for site in atom_sites]
-    for current_reference_space_index in set(reference_space_indices):
-        indices = [
-            index for index, value in enumerate(reference_space_indices) if value == current_reference_space_index
-        ]
+    optional_reference_coordinates = [_reference_coordinate(system, site) for site in atom_sites]
+    for current_reference_space_id in set(reference_space_indices):
+        indices = [index for index, value in enumerate(reference_space_indices) if value == current_reference_space_id]
         if len(indices) > 1 and any(optional_reference_coordinates[index] is None for index in indices):
             raise ValueError(f"ESMFold2 reference conformer is incomplete for {atom_sites[indices[0]].instance_id!r}")
     reference_coordinates: list[tuple[float, float, float]] = []
@@ -411,11 +421,11 @@ def prepare_esmfold2_features(
             formal_charges.append(0 if atom.formal_charge is None else atom.formal_charge)
             entity = system.entities[system.instances[site.instance_id]]
             atom_name = site.atom_id
-            if isinstance(entity, Molecule) and not valid_atom_name(atom_name):
+            if isinstance(entity, Molecule) and not _valid_atom_name(atom_name):
                 key = (site.instance_id, atom.element.upper())
                 molecule_atom_counts[key] = molecule_atom_counts.get(key, 0) + 1
                 atom_name = f"{atom.element.upper()}{molecule_atom_counts[key]}"
-            if not valid_atom_name(atom_name):
+            if not _valid_atom_name(atom_name):
                 raise ValueError(f"ESMFold2 atom name cannot be encoded in four 6-bit characters: {atom_name!r}")
             encoded_atom_names.append(
                 [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
@@ -425,14 +435,14 @@ def prepare_esmfold2_features(
     reference_elements = torch.zeros(padded_atom_count, dtype=torch.long)
     reference_charges = torch.zeros(padded_atom_count, dtype=torch.int8)
     reference_atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
-    reference_space_index = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     reference_positions[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
     reference_elements[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
     reference_charges[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
     reference_atom_name_characters[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
-    reference_space_index[:real_atom_count] = torch.tensor(reference_space_indices, dtype=torch.long)
+    reference_space_id[:real_atom_count] = torch.tensor(reference_space_indices, dtype=torch.long)
     atom_mask[:real_atom_count] = True
     atom_to_token[:real_atom_count] = torch.tensor(
         [token_index for token_index, group in enumerate(token_groups) for _ in group],
@@ -441,18 +451,18 @@ def prepare_esmfold2_features(
 
     token_count = len(token_groups)
     representative_atoms = [
-        representative_atom(group, molecule_types[index], residue_types[index], site_to_atom)
+        _representative_atom(group, molecule_types[index], residue_types[index], site_to_atom)
         for index, group in enumerate(token_groups)
     ]
-    token_bonds = token_bond_matrix(system, site_to_token, token_count)
-    msa_features = msa_tensors(
+    token_bonds = _token_bond_matrix(system, site_to_token, token_count)
+    msa_features = _msa_tensors(
         msa,
         token_entity_ids=token_entity_ids,
         token_instance_ids=token_instance_ids,
         token_monomer_indices=token_monomer_indices,
         residue_types=residue_types,
     )
-    language_model_tokens, language_model_mask, token_to_esmc, token_has_esmc = esmc_tensors(
+    language_model_tokens, language_model_mask, token_to_esmc, token_has_esmc = _esmc_tensors(
         system,
         token_instance_ids=token_instance_ids,
         token_monomer_indices=token_monomer_indices,
@@ -474,7 +484,7 @@ def prepare_esmfold2_features(
         "reference_elements": reference_elements,
         "reference_charges": reference_charges,
         "reference_atom_name_characters": reference_atom_name_characters,
-        "reference_space_index": reference_space_index,
+        "reference_space_id": reference_space_id,
         "atom_mask": atom_mask,
         "atom_to_token": atom_to_token,
         "distogram_atom_index": torch.tensor(representative_atoms, dtype=torch.long),
@@ -499,11 +509,13 @@ def prepare_esmfold2_features(
     )
 
 
-def reference_coordinate(
+def _reference_coordinate(
     system: MolecularSystem,
     site: AtomSite,
 ) -> tuple[float, float, float] | None:
-    r"""Return the canonical atom-aligned reference coordinate for one site."""
+    r"""
+    Return the canonical atom-aligned reference coordinate for one site.
+    """
 
     entity = system.entities[system.instances[site.instance_id]]
     component = entity.components[site.component_index]
@@ -513,19 +525,23 @@ def reference_coordinate(
     return component.reference_coordinates[index]
 
 
-def valid_atom_name(atom_name: str) -> bool:
-    r"""Return whether the four-character atom encoding is lossless."""
+def _valid_atom_name(atom_name: str) -> bool:
+    r"""
+    Return whether the four-character atom encoding is lossless.
+    """
 
     return len(atom_name) <= 4 and all(32 <= ord(character) < 96 for character in atom_name)
 
 
-def representative_atom(
+def _representative_atom(
     group: tuple[AtomSite, ...],
     molecule_type: int,
     residue_type: int,
     site_to_atom: dict[AtomSite, int],
 ) -> int:
-    r"""Select the representative atom for one structure token."""
+    r"""
+    Select the representative atom for one structure token.
+    """
 
     by_name = {site.atom_id: site_to_atom[site] for site in group}
     fallback = site_to_atom[group[0]]
@@ -540,12 +556,14 @@ def representative_atom(
     return fallback
 
 
-def token_bond_matrix(
+def _token_bond_matrix(
     system: MolecularSystem,
     site_to_token: dict[AtomSite, int],
     token_count: int,
 ) -> torch.Tensor:
-    r"""Project canonical intrinsic, polymer, and assembly bonds onto token pairs."""
+    r"""
+    Project canonical intrinsic, polymer, and assembly bonds onto token pairs.
+    """
 
     edges: set[tuple[int, int]] = set()
 
@@ -576,7 +594,7 @@ def token_bond_matrix(
     return values
 
 
-def msa_tensors(
+def _msa_tensors(
     msa: MSA | MSACollection | None,
     *,
     token_entity_ids: list[str],
@@ -584,7 +602,9 @@ def msa_tensors(
     token_monomer_indices: list[int | None],
     residue_types: list[int],
 ) -> dict[str, torch.Tensor]:
-    r"""Construct paired and unpaired MSA rows over structure tokens."""
+    r"""
+    Construct paired and unpaired MSA rows over structure tokens.
+    """
 
     token_count = len(residue_types)
     if msa is None:
@@ -650,7 +670,7 @@ def msa_tensors(
     }
 
 
-def esmc_tensors(
+def _esmc_tensors(
     system: MolecularSystem,
     *,
     token_instance_ids: list[str],
@@ -658,7 +678,9 @@ def esmc_tensors(
     molecule_types: list[int],
     tokenizer: ProteinTokenizer,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Build one isolated MultiMolecule ESMC row per protein chain."""
+    r"""
+    Build one isolated MultiMolecule ESMC row per protein chain.
+    """
 
     proteins: list[tuple[str, PolymerSequence]] = []
     for instance_id, entity_key in system.instances.items():
@@ -716,11 +738,16 @@ def esmc_tensors(
 
 
 def is_antibody_sequence(sequence: str) -> bool:
-    r"""Return ``True`` when ANARCI recognises ``sequence`` as antibody variable domain(s).
+    r"""
+    Check whether a sequence contains only antibody variable domains.
 
-    Mutable ``#`` marks are substituted with alanine before numbering, and every
-    detected domain must be a heavy
-    (``H``) or light (``K``/``L``) variable domain.
+    Args:
+        sequence: Amino-acid sequence. Mutable ``#`` positions are treated as alanine
+            during numbering.
+
+    Returns:
+        ``True`` when numbering succeeds and every detected domain is a heavy or light
+        antibody variable domain; otherwise ``False``.
     """
 
     from abnumber import Chain, ChainParseError
@@ -741,11 +768,15 @@ def is_antibody_sequence(sequence: str) -> bool:
 
 
 def antibody_cdr_indices(sequence: str) -> list[int]:
-    r"""0-based indices of every Chothia CDR residue (H1/H2/H3, L1/L2/L3) in an Fv ``sequence``.
+    r"""
+    Return the Chothia CDR positions in an antibody Fv sequence.
 
-    ANARCI splits the Fv into variable domains, orders the heavy domain first, and locates
-    each domain's ``cdr1/cdr2/cdr3`` loops in the input sequence. These indices are the
-    CDR-only design positions (framework fixed) and the CDR ipTM-proxy scoring rows.
+    Args:
+        sequence: Antibody Fv amino-acid sequence.
+
+    Returns:
+        Zero-based sequence indices for CDR1, CDR2, and CDR3 of each variable domain,
+        with the heavy domain listed before the light domain when both are present.
     """
 
     from abnumber import Chain
@@ -770,15 +801,15 @@ def antibody_cdr_indices(sequence: str) -> list[int]:
 
 
 def antibody_cdr_prompt(fv_sequence: str) -> str:
-    r"""Build a CDR-only design mask (as a ``binder_prompt``) from a full antibody Fv sequence.
+    r"""
+    Mark the CDR residues of an antibody Fv sequence as designable.
 
-    The antibody input-preparation step: ANARCI annotates the Chothia CDRs and the returned
-    prompt fixes every framework residue to its input amino acid while marking every CDR
-    position with the mutable ``#`` token. The prompt is the per-input design mask;
-    [`EsmFold2DesignPipeline.design`][ofoldx.models.esmfold2.pipeline.EsmFold2DesignPipeline.design] then
-    optimises exactly the marked CDR positions with no antibody-specific branch.
-    Antibody framework design uses ``language_model_weight=0.05``; general binders
-    use the ``0.15`` default.
+    Args:
+        fv_sequence: Antibody Fv amino-acid sequence.
+
+    Returns:
+        A sequence-length prompt with each Chothia CDR residue replaced by ``#`` and
+        each framework residue preserved.
     """
 
     cdr_indices = set(antibody_cdr_indices(fv_sequence))

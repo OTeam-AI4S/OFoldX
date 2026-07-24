@@ -1,4 +1,6 @@
-r"""Canonical scientific results returned by OFoldX tasks."""
+r"""
+Scientific result values returned by OFoldX tasks.
+"""
 
 from __future__ import annotations
 
@@ -12,20 +14,22 @@ import numpy as np
 from ..data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ..data.structure import Structure
 
+#: Molecular entity, component occurrence, or atom occurrence addressed by a metric.
 MetricReference: TypeAlias = str | ComponentReference | AtomSite
 
 
 @dataclass(eq=False)
 class Score:
-    r"""One named scalar value and the canonical subtarget it describes.
+    r"""
+    One named scalar value and the subtarget it describes.
 
     Args:
         value: Scalar score value.
         unit: Physical or statistical unit, or ``None`` for a dimensionless score.
         preferred: Direction used to rank comparable results, or ``None`` when the score is not
             rankable.
-        scope: Canonical components or atoms summarized by the score. ``None`` denotes the whole
-            result.
+        scope: Components or atoms summarized by the score. ``None`` denotes the
+            whole result.
         evaluations: Optional raw values whose aggregate is reported by ``value``. Their leading
             axis preserves evaluation order.
     """
@@ -38,11 +42,18 @@ class Score:
 
 
 class Scored(Protocol):
-    r"""Public structural contract for a result item carrying named scores."""
+    r"""
+    Public structural contract for a result item carrying named scores.
+    """
 
     @property
     def scores(self) -> Mapping[str, Score]:
-        r"""Return scores keyed by their stable scientific names."""
+        r"""
+        Return scores keyed by their stable scientific names.
+
+        Returns:
+            A mapping from stable score names to scalar score records.
+        """
 
         ...
 
@@ -51,18 +62,21 @@ _ScoredT = TypeVar("_ScoredT", bound=Scored)
 
 
 def best(values: Sequence[_ScoredT], score: str) -> _ScoredT:
-    r"""Return the earliest best item under one explicit, comparable score.
+    r"""
+    Return the earliest best item under a named score.
 
     Args:
         values: Candidate values in tie-breaking order.
-        score: Score name present on every candidate.
+        score: Comparable score name present on every candidate.
 
     Returns:
-        The highest- or lowest-valued candidate according to ``Score.preferred``. Ties preserve
-        the order in ``values``.
+        The candidate selected according to ``Score.preferred``. Input order breaks
+        ties.
 
     Raises:
-        ValueError: If direction, unit, or scope differs between candidates, or a value is NaN.
+        KeyError: If a candidate does not contain ``score``.
+        ValueError: If ``values`` is empty, scores are not consistently rankable, units
+            or scopes differ, or a score is NaN.
     """
 
     scores = tuple(value.scores[score] for value in values)
@@ -84,11 +98,14 @@ def best(values: Sequence[_ScoredT], score: str) -> _ScoredT:
 
 @dataclass(eq=False)
 class Metric:
-    r"""One numerical value aligned to one canonical axis.
+    r"""
+    Numerical values aligned to one molecular axis.
+
+    The leading dimension of ``values`` corresponds to ``axis``.
 
     Args:
-        values: Numerical values whose leading axis corresponds to ``axis``.
-        axis: Canonical component or atom reference for each leading-axis value.
+        values: Numerical array with shape ``(len(axis), ...)``.
+        axis: Component or atom reference for each leading-axis value.
         unit: Physical or statistical unit, or ``None`` for dimensionless values.
     """
 
@@ -99,13 +116,17 @@ class Metric:
 
 @dataclass(eq=False)
 class PairMetric:
-    r"""One numerical value aligned to two canonical axes.
+    r"""
+    Numerical values aligned to two molecular axes.
+
+    The first two dimensions of ``values`` correspond to ``row_axis`` and
+    ``column_axis``.
 
     Args:
-        values: Numerical matrix whose first two axes correspond to ``row_axis`` and
-            ``column_axis``.
-        row_axis: Canonical component or atom references for matrix rows.
-        column_axis: Canonical component or atom references for matrix columns.
+        values: Numerical array with shape
+            ``(len(row_axis), len(column_axis), ...)``.
+        row_axis: Component or atom references for rows.
+        column_axis: Component or atom references for columns.
         unit: Physical or statistical unit, or ``None`` for dimensionless values.
     """
 
@@ -117,10 +138,11 @@ class PairMetric:
 
 @dataclass(eq=False)
 class FoldPrediction:
-    r"""One folding prediction and its aligned scientific values.
+    r"""
+    One folding prediction and its aligned scientific values.
 
     Args:
-        structure: Predicted canonical structure.
+        structure: Predicted structure.
         scores: Scalar scores keyed by stable scientific names.
         metrics: One-axis metrics keyed by stable scientific names.
         pair_metrics: Two-axis metrics keyed by stable scientific names.
@@ -134,7 +156,8 @@ class FoldPrediction:
 
 @dataclass(eq=False)
 class FoldResult:
-    r"""One generation-ordered collection of folding predictions.
+    r"""
+    One generation-ordered collection of folding predictions.
 
     Args:
         predictions: Predictions in generation order.
@@ -143,7 +166,8 @@ class FoldResult:
     predictions: tuple[FoldPrediction, ...]
 
     def best(self, score: str) -> FoldPrediction:
-        r"""Return the earliest best prediction under one explicit score.
+        r"""
+        Return the earliest best prediction under one explicit score.
 
         Args:
             score: Comparable score name present on every prediction.
@@ -157,10 +181,11 @@ class FoldResult:
 
 @dataclass(eq=False)
 class DesignCandidate:
-    r"""One coordinate-free fixed-length design and its scientific values.
+    r"""
+    One coordinate-free fixed-length design and its scientific values.
 
     Args:
-        system: Designed canonical molecular system.
+        system: Designed molecular system.
         scores: Scalar scores keyed by stable scientific names.
     """
 
@@ -170,7 +195,8 @@ class DesignCandidate:
 
 @dataclass(eq=False)
 class DesignResult:
-    r"""One generation-ordered collection of fixed-length designs.
+    r"""
+    One generation-ordered collection of fixed-length designs.
 
     Args:
         candidates: Designed systems in generation order.
@@ -179,7 +205,8 @@ class DesignResult:
     candidates: tuple[DesignCandidate, ...]
 
     def best(self, score: str) -> DesignCandidate:
-        r"""Return the earliest best candidate under one explicit score.
+        r"""
+        Return the earliest best candidate under one explicit score.
 
         Args:
             score: Comparable score name present on every candidate.
@@ -193,10 +220,11 @@ class DesignResult:
 
 @dataclass(eq=False)
 class ScoreResult:
-    r"""One coordinate-conditioned target and its scientific values.
+    r"""
+    One coordinate-conditioned target and its scientific values.
 
     Args:
-        target: Canonical structure that was scored.
+        target: Structure that was scored.
         scores: Scalar scores keyed by stable scientific names.
         metrics: One-axis metrics keyed by stable scientific names.
     """
@@ -208,10 +236,11 @@ class ScoreResult:
 
 @dataclass(eq=False)
 class PackPrediction:
-    r"""One packed structure and the metrics produced for that sample.
+    r"""
+    One packed structure and the metrics produced for that sample.
 
     Args:
-        structure: Canonical structure with packed side-chain coordinates.
+        structure: Structure with packed side-chain coordinates.
         metrics: One-axis metrics keyed by stable scientific names.
     """
 
@@ -221,7 +250,8 @@ class PackPrediction:
 
 @dataclass(eq=False)
 class PackResult:
-    r"""One generation-ordered collection of side-chain packing predictions.
+    r"""
+    One generation-ordered collection of side-chain packing predictions.
 
     Args:
         predictions: Packed structures in sampling order.

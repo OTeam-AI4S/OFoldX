@@ -1,4 +1,6 @@
-r"""Canonical coordinate-free molecular values and exact occurrence references."""
+r"""
+Coordinate-free molecular values and exact occurrence references.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +8,11 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
+#: Supported polymer chemistries.
 PolymerType: TypeAlias = Literal["protein", "rna", "dna", "dna_rna_hybrid"]
+#: Molecular-system component occurrence as ``(instance_id, component_index)``.
 ComponentReference: TypeAlias = tuple[str, int]
+#: Provenance category for an assembly-level covalent bond.
 BondOrigin: TypeAlias = Literal[
     "component",
     "molecule",
@@ -64,13 +69,20 @@ def one_letter_to_component(
     *,
     policy: SymbolPolicy = "strict",
 ) -> str:
-    r"""Resolve one polymer one-letter symbol to a component id under an explicit policy.
+    r"""
+    Resolve a polymer one-letter symbol to a component ID.
 
-    ``policy="strict"`` resolves standard residues and the rare-but-unambiguous
-    extensions (protein ``U``->``SEC``/``O``->``PYL``, nucleic inosine, DNA ``U``) and
-    raises ``KeyError`` on any other symbol. ``policy="permissive"`` resolves only the
-    standard core and returns the polymer's unknown-residue placeholder for everything
-    else.
+    Args:
+        symbol: One-letter residue symbol.
+        polymer_type: Polymer alphabet in which to interpret ``symbol``.
+        policy: ``"strict"`` accepts standard and unambiguous extended residues;
+            ``"permissive"`` maps non-standard symbols to the polymer's unknown component.
+
+    Returns:
+        The corresponding component ID.
+
+    Raises:
+        KeyError: If ``polymer_type`` is unknown or strict resolution fails.
     """
 
     standard = _STANDARD_COMPONENTS[polymer_type]
@@ -87,9 +99,7 @@ def one_letter_to_component(
 # Coordinate-free one-letter/component mappings derived from the canonical tables.
 AMINO_ACID_ONE_TO_THREE: dict[str, str] = dict(_STANDARD_COMPONENTS["protein"])
 AMINO_ACID_THREE_TO_ONE: dict[str, str] = {component: letter for letter, component in AMINO_ACID_ONE_TO_THREE.items()}
-# The 20 standard amino-acid component ids as an order-independent membership set, for
-# callers that only need "is this a standard amino acid" (e.g. the PDB reader). This is a
-# general chemistry fact, distinct from any model's token ordering (e.g. the MPNN vocab).
+#: The 20 standard amino-acid component IDs as an order-independent set.
 STANDARD_AMINO_ACID_IDS: frozenset[str] = frozenset(AMINO_ACID_THREE_TO_ONE)
 # ``AMINO_ACID_ONE_TO_THREE`` extended with the unknown-residue letter ``X`` -> ``UNK``. Kept
 # distinct so callers opt in to ``X``.
@@ -126,7 +136,21 @@ HYDROGEN_ELEMENTS: frozenset[str] = frozenset({"H", "D"})
 
 @dataclass(frozen=True)
 class ChemicalAtom:
-    r"""One atom in an exact chemical graph."""
+    r"""
+    An atom in a chemical component.
+
+    Args:
+        atom_id: Component-local atom identifier.
+        element: Chemical element symbol.
+        isotope: Optional isotope mass number.
+        formal_charge: Optional formal charge in elementary-charge units.
+        radical_electrons: Optional number of radical electrons.
+        explicit_hydrogens: Optional explicit hydrogen count.
+        implicit_hydrogens: Optional implicit hydrogen count.
+        implicit_hydrogens_allowed: Whether implicit hydrogens may be inferred.
+        aromatic: Optional aromaticity assignment.
+        stereo: Optional atom stereochemistry descriptor.
+    """
 
     atom_id: str
     element: str
@@ -142,7 +166,17 @@ class ChemicalAtom:
 
 @dataclass(frozen=True)
 class ChemicalBond:
-    r"""One undirected covalent bond in a chemical component."""
+    r"""
+    An undirected covalent bond within a chemical component.
+
+    Args:
+        atom_a: Component-local identifier of the first endpoint.
+        atom_b: Component-local identifier of the second endpoint.
+        order: Bond order.
+        aromatic: Whether the bond is aromatic.
+        stereo: Optional bond stereochemistry descriptor.
+        stereo_atoms: Optional component-local atoms defining bond stereochemistry.
+    """
 
     atom_a: str
     atom_b: str
@@ -154,7 +188,13 @@ class ChemicalBond:
 
 @dataclass(frozen=True)
 class PolymerAttachment:
-    r"""One component-local endpoint for the default linear polymer link."""
+    r"""
+    A component-local endpoint for a linear polymer link.
+
+    Args:
+        atom_id: Atom forming the inter-component bond.
+        leaving_atom_ids: Atoms removed when the link is realized.
+    """
 
     atom_id: str
     leaving_atom_ids: frozenset[str] = frozenset()
@@ -162,7 +202,22 @@ class PolymerAttachment:
 
 @dataclass(frozen=True)
 class ChemicalComponent:
-    r"""One complete chemical graph or open partial atom observation."""
+    r"""
+    A reusable chemical component definition.
+
+    Args:
+        component_id: Chemical component identifier.
+        atoms: Component atoms in their defined order.
+        bonds: Complete bond graph, or ``None`` when connectivity is unknown.
+        previous_attachment: Endpoint connecting to the preceding polymer component.
+        next_attachment: Endpoint connecting to the following polymer component.
+        reference_coordinates: Optional coordinates aligned with ``atoms``; ``None``
+            entries denote atoms without reference coordinates.
+
+    Raises:
+        ValueError: If atom identifiers, bonds, attachments, or reference coordinates
+            are internally inconsistent.
+    """
 
     component_id: str
     atoms: tuple[ChemicalAtom, ...]
@@ -219,7 +274,16 @@ _WATER_COMPONENT_ALIASES = frozenset(
 
 
 def is_water_component(component: ChemicalComponent) -> bool:
-    r"""Return whether one candidate alias declares only water elements."""
+    r"""
+    Return whether a component represents water.
+
+    Args:
+        component: Chemical component to classify.
+
+    Returns:
+        Whether the component has a known water ID and contains only hydrogen and
+        oxygen atoms.
+    """
 
     if component.component_id not in _WATER_COMPONENT_ALIASES:
         return False
@@ -229,7 +293,13 @@ def is_water_component(component: ChemicalComponent) -> bool:
 
 @dataclass(frozen=True)
 class PolymerSequence:
-    r"""One fixed-length polymer as ordered chemical component occurrences."""
+    r"""
+    An ordered sequence of chemical component occurrences.
+
+    Args:
+        polymer_type: Polymer chemistry represented by the sequence.
+        components: Component occurrences in sequence order.
+    """
 
     polymer_type: PolymerType
     components: tuple[ChemicalComponent, ...]
@@ -241,7 +311,20 @@ class PolymerSequence:
         *,
         polymer_type: PolymerType = "protein",
     ) -> PolymerSequence:
-        r"""Resolve an unambiguous one-letter sequence to built-in components."""
+        r"""
+        Construct a polymer sequence from one-letter residue symbols.
+
+        Args:
+            sequence: One-letter polymer sequence.
+            polymer_type: Polymer alphabet in which to interpret the sequence.
+
+        Returns:
+            A sequence of built-in chemical components.
+
+        Raises:
+            ValueError: If the polymer type requires explicit components or a symbol is
+                unsupported or ambiguous.
+        """
 
         if polymer_type == "dna_rna_hybrid":
             raise ValueError("a DNA/RNA hybrid requires explicit component occurrences")
@@ -264,7 +347,19 @@ class PolymerSequence:
 
 @dataclass(frozen=True)
 class MoleculeBond:
-    r"""One bond between two component occurrences in a Molecule."""
+    r"""
+    A covalent bond between component occurrences in a molecule.
+
+    Args:
+        component_a: Index of the first component occurrence.
+        atom_a: Component-local atom identifier for the first endpoint.
+        component_b: Index of the second component occurrence.
+        atom_b: Component-local atom identifier for the second endpoint.
+        order: Bond order.
+        aromatic: Whether the bond is aromatic.
+        stereo: Optional bond stereochemistry descriptor.
+        stereo_atoms: Optional occurrence-local atoms defining bond stereochemistry.
+    """
 
     component_a: int
     atom_a: str
@@ -278,7 +373,17 @@ class MoleculeBond:
 
 @dataclass(frozen=True)
 class Molecule:
-    r"""One ordered non-polymer molecular graph."""
+    r"""
+    An ordered non-polymer molecular graph.
+
+    Args:
+        components: Chemical component occurrences in molecule order.
+        bonds: Bonds between different component occurrences.
+
+    Raises:
+        ValueError: If a bond is duplicated, self-referential, or references an unknown
+            component atom.
+    """
 
     components: tuple[ChemicalComponent, ...]
     bonds: frozenset[MoleculeBond] = frozenset()
@@ -310,7 +415,16 @@ class Molecule:
         *,
         atom_ids: tuple[str, ...] | None = None,
     ) -> Molecule:
-        r"""Parse the exactly representable SMILES chemistry subset with RDKit."""
+        r"""
+        Construct a molecule from SMILES with RDKit.
+
+        Args:
+            smiles: SMILES representation to parse.
+            atom_ids: Optional component-local identifiers in RDKit atom order.
+
+        Returns:
+            The parsed molecular graph.
+        """
 
         from ._smiles_import import molecule_from_smiles
 
@@ -319,7 +433,14 @@ class Molecule:
 
 @dataclass(frozen=True)
 class AtomSite:
-    r"""An exact atom occurrence in a MolecularSystem."""
+    r"""
+    An atom occurrence in a molecular system.
+
+    Args:
+        instance_id: Molecular instance containing the atom.
+        component_index: Zero-based component occurrence within the instance.
+        atom_id: Component-local atom identifier.
+    """
 
     instance_id: str
     component_index: int
@@ -328,7 +449,18 @@ class AtomSite:
 
 @dataclass(frozen=True)
 class SystemBond:
-    r"""One assembly-level bond between exact atom occurrences."""
+    r"""
+    An assembly-level bond between atom occurrences.
+
+    Args:
+        site_a: First atom occurrence.
+        site_b: Second atom occurrence.
+        order: Bond order.
+        aromatic: Whether the bond is aromatic.
+        stereo: Optional bond stereochemistry descriptor.
+        stereo_sites: Optional atom occurrences defining bond stereochemistry.
+        origin: Source of the bond assignment.
+    """
 
     site_a: AtomSite
     site_b: AtomSite
@@ -340,7 +472,21 @@ class SystemBond:
 
 
 class MolecularSystem:
-    r"""A coordinate-free assembly of molecular entities and their instances."""
+    r"""
+    A coordinate-free assembly of molecular entities and instances.
+
+    ``entities`` stores each distinct molecular graph once. ``instances`` maps every
+    realized instance ID to the entity ID it instantiates.
+
+    Args:
+        entities: Molecular entities keyed by entity ID.
+        instances: Entity IDs keyed by molecular instance ID.
+        bonds: Additional assembly-level bonds between atom occurrences.
+
+    Raises:
+        ValueError: If entities and instances do not describe the same entity set.
+        KeyError: If a stored bond references an unknown atom occurrence.
+    """
 
     entities: dict[str, PolymerSequence | Molecule]
     instances: dict[str, str]
@@ -368,7 +514,19 @@ class MolecularSystem:
                 self.atom(stereo_b)
 
     def component(self, reference: ComponentReference) -> ChemicalComponent:
-        r"""Resolve an exact component occurrence."""
+        r"""
+        Return the chemical component at an occurrence reference.
+
+        Args:
+            reference: Molecular instance ID and zero-based component index.
+
+        Returns:
+            The referenced chemical component.
+
+        Raises:
+            KeyError: If the molecular instance does not exist.
+            IndexError: If the component index is outside the instance.
+        """
 
         instance_id, component_index = reference
         if component_index < 0:
@@ -377,7 +535,18 @@ class MolecularSystem:
         return self.entities[entity_id].components[component_index]
 
     def atom(self, site: AtomSite) -> ChemicalAtom:
-        r"""Resolve an exact realized atom occurrence."""
+        r"""
+        Return the chemical atom at an occurrence reference.
+
+        Args:
+            site: Exact atom occurrence to resolve.
+
+        Returns:
+            The referenced chemical atom.
+
+        Raises:
+            KeyError: If the instance, component, or realized atom does not exist.
+        """
 
         entity = self.entities[self.instances[site.instance_id]]
         component = self.component((site.instance_id, site.component_index))
@@ -404,7 +573,12 @@ class MolecularSystem:
         raise KeyError(site)
 
     def iter_atoms(self) -> Iterator[tuple[AtomSite, ChemicalAtom]]:
-        r"""Iterate realized atoms in instance, component, and atom order."""
+        r"""
+        Iterate realized atoms in instance, component, and atom order.
+
+        Yields:
+            Each exact atom occurrence and its chemical definition.
+        """
 
         for instance_id, entity_id in self.instances.items():
             entity = self.entities[entity_id]
@@ -433,7 +607,12 @@ class MolecularSystem:
                     yield AtomSite(instance_id, component_index, atom.atom_id), atom
 
     def iter_bonds(self) -> Iterator[SystemBond]:
-        r"""Materialize the known covalent graph as one SystemBond per stored covalent edge."""
+        r"""
+        Iterate the complete known covalent graph.
+
+        Yields:
+            Component, molecule, polymer, and assembly-level bonds as system bonds.
+        """
 
         realized = {site for site, _ in self.iter_atoms()}
         for instance_id, entity_id in self.instances.items():
@@ -492,11 +671,21 @@ class MolecularSystem:
         self,
         replacements: Mapping[ComponentReference, ChemicalComponent],
     ) -> MolecularSystem:
-        r"""Return a system with selected component occurrences replaced.
+        r"""
+        Return a system with selected component occurrences replaced.
 
         Copies of one entity remain shared when they realize the same component
         sequence and split into distinct entities when they diverge. Stored system
         bonds are retained whenever all of their sites still exist.
+
+        Args:
+            replacements: Replacement components keyed by exact component occurrence.
+
+        Returns:
+            A molecular system containing the requested replacements.
+
+        Raises:
+            KeyError: If a replacement refers to an unknown component occurrence.
         """
 
         if not replacements:
@@ -564,7 +753,9 @@ class MolecularSystem:
         replaced: MolecularSystem,
         changed_references: frozenset[ComponentReference],
     ) -> frozenset[SystemBond]:
-        r"""Drop a stored bond only when component replacement removed one of its sites."""
+        r"""
+        Drop a stored bond only when component replacement removed one of its sites.
+        """
 
         retained = []
         for bond in self.bonds:

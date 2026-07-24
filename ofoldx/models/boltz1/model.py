@@ -1,13 +1,5 @@
 r"""
 Boltz-1 model.
-
-This module implements the native Boltz-1 structure-prediction path: token/atom input embedding, recycling
-trunk, optional MSA update, distogram head, EDM coordinate sampling, and the Boltz-1 confidence and
-ranking heads.
-
-The implementation is registered as ``ofoldx.boltz1``: alongside the differentiable ``forward`` training graph it
-exposes the public ``fold`` task, which runs the reverse-diffusion path and decodes a self-contained
-canonical ``FoldResult`` from the raw ``Boltz1Output`` produced by its ``Boltz1Processor`` lowering.
 """
 
 from __future__ import annotations
@@ -49,17 +41,13 @@ from .config import Boltz1Config
 
 class Boltz1Model(Model):
     r"""
-    Predict all-atom structure from tokenized complex features via the recycling trunk and EDM diffusion sampler.
+    Predict biomolecular complex structures with Boltz 1.
 
-    Runs the full Boltz-1 path: token/atom input embedding, a recycling representation trunk (Pairformer plus
-    an optional MSA trunk), a distogram head, EDM reverse-diffusion coordinate sampling, and the Boltz-1
-    confidence/ranking head. Optional Boltz-1x inference-time steering (Feynman-Kac particles and
-    physical-potential guidance) is available during sampling.
+    Accepts [`Boltz1Input`][ofoldx.models.boltz1.model.Boltz1Input] and returns
+    [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output].
 
     Args:
-        config: The Boltz-1 configuration selecting representation widths, block counts, recycling, the
-            sampler schedule, and which optional heads (MSA, confidence) to build.
-
+        config: Model architecture and inference configuration.
     """
 
     config_class = Boltz1Config
@@ -247,26 +235,21 @@ class Boltz1Model(Model):
         generator: torch.Generator | None = None,
     ) -> Boltz1Output:
         r"""
-        Run the Boltz-1 training path: one single-step diffusion denoise of the noised ground truth.
-
-        ``forward`` is the structure-training graph in both ``train()`` and ``eval()`` modes; those modes only
-        control ordinary stochastic layers such as dropout. It runs the recycling trunk (with gradient), then
-        denoises the noised, augmented ground-truth coordinates in a single EDM step, returning the tensors the
-        EDM-weighted coordinate loss scores (``coordinates`` against ``augmented_target_coordinates`` at
-        ``noise_level``) alongside the trunk distogram logits. The full multi-step reverse-diffusion inference
-        path is exposed separately by the public ``fold`` task.
+        Denoise randomly corrupted target coordinates for diffusion training.
 
         Args:
-            input: The Boltz-1 input batch; training requires ``input.target_positions``.
-            recycling_steps: Total number of trunk passes; defaults to the configured value.
-            num_samples: Number of independently noised training samples to draw per input.
-            generator: Optional RNG for reproducible augmentation and noise.
+            input: Features with ``target_positions`` shaped ``(B, A, 3)`` in
+                angstroms and ``target_mask`` shaped ``(B, A)`` when provided.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_samples: Number ``S`` of independently corrupted copies per input.
+            generator: Optional generator for rigid augmentation, log-normal noise
+                levels, and Gaussian coordinate noise.
 
         Returns:
-            A [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output] carrying ``coordinates``,
-            ``augmented_target_coordinates``, and ``noise_level`` for the diffusion loss
-            alongside the distogram logits.
-
+            Denoised and augmented target coordinates with shape ``(B*S, A, 3)``,
+            noise levels with shape ``(B*S,)`` in angstroms, and distogram logits
+            with shape ``(B, N, N, D)``.
         """
 
         representations = self._trunk(input, recycling_steps=recycling_steps)
@@ -303,29 +286,28 @@ class Boltz1Model(Model):
         steering_args: Mapping[str, object] | None = None,
     ) -> FoldResult:
         r"""
-        Run Boltz-1 folding and decode a self-contained canonical ``FoldResult``.
-
-        Runs the recycling trunk, draws ``num_samples`` reverse-diffusion samples, scores each with the
-        confidence/ranking head, and wraps the raw
-        [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output] into a
-        [`FoldResult`][ofoldx.results.FoldResult]: one generation-ordered
-        [`FoldPrediction`][ofoldx.results.FoldPrediction] per sample, carrying the sampled ``Structure``,
-        per-token ``metrics`` (``plddt``, ``resolved_probability``), token-pair ``pair_metrics``
-        (``pae``, ``pde``), and per-sample ``scores`` (``plddt``, ``ptm``, ``iptm``, ``confidence_score``, ...).
+        Predict structures for one molecular system with Boltz 1.
 
         Args:
-            input: One lowered Boltz-1 input carrying the canonical
-                [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] produced by ``Boltz1Processor``.
-            num_samples: Number of reverse-diffusion samples to draw.
-            generator: Optional RNG for reproducible sampling noise; resolved once at the Pipeline boundary.
-            recycling_steps: Total number of trunk passes; defaults to the configured value.
-            num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
-            use_potentials: Whether to enable Boltz-1x physical-potential steering.
-            steering_args: Optional overrides merged onto the configured steering flags.
+            input: Processor output for one system, with batch size ``B = 1`` and
+                molecular identities aligned to its atom and token axes.
+            num_samples: Number of coordinate samples.
+            generator: Optional generator for initial coordinates, churn noise,
+                rigid augmentations, and potential-guided resampling.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
+                configured value.
+            use_potentials: Whether to enable physical-potential guidance.
+            steering_args: Optional guidance and particle-sampling settings.
 
         Returns:
-            A [`FoldResult`][ofoldx.results.FoldResult] with one prediction per requested sample.
+            One generation-ordered prediction per sample. Structure, PAE, and PDE
+            values are in angstroms; pLDDT is on the ``0--100`` scale.
 
+        Raises:
+            ValueError: If ``num_samples`` is not positive, the batch contains
+                more than one system, or molecular identities are absent.
         """
 
         num_samples = operator.index(num_samples)
@@ -354,22 +336,17 @@ class Boltz1Model(Model):
         recycling_steps: int | None = None,
     ) -> Boltz1Representations:
         r"""
-        Surface the ``--write_embeddings`` trunk representations.
-
-        Runs the same recycling trunk as ``fold`` and returns the raw trunk single ``[B, N, 384]`` and pair
-        ``[B, N, N, 128]`` tensors on the Model's computation device and dtype. Unlike ``fold`` this method is
-        not wrapped in inference mode: it retains autograd when called under grad. The raw representations carry
-        vocabulary/layout axes excluded from canonical ``Metric``/``PairMetric``, so they are deliberately not
-        folded into ``FoldResult``; this typed expert method is the only surface on which they are reachable.
+        Return the final single and pair trunk representations.
 
         Args:
-            input: One lowered Boltz-1 input batch.
-            recycling_steps: Total number of trunk passes; defaults to the configured value.
+            input: Model features with token axis length ``N``.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
 
         Returns:
-            A [`Boltz1Representations`][ofoldx.models.boltz1.model.Boltz1Representations] with the trunk ``single``
-            and ``pair`` representations.
-
+            Single representations with shape ``(B, N, C_single)`` and pair
+            representations with shape ``(B, N, N, C_pair)``. Gradients are
+            retained when autograd is enabled.
         """
 
         representations = self._trunk(input, recycling_steps=recycling_steps)
@@ -649,23 +626,6 @@ class Boltz1Model(Model):
 class Boltz1InputEmbeddings(nn.Module):
     r"""
     Build the Boltz-1 token input embedding from atom-attention outputs and token-level features.
-
-    Runs the atom encoder and atom-attention encoder to pool a per-token representation, then concatenates it
-    with the residue-type one-hot, MSA profile, deletion mean, and pocket one-hot to form the wide
-    ``single_inputs`` vector. When the atom encoder is disabled, its slice is zeroed.
-
-    Args:
-        input_size: Expected width of the concatenated ``single_inputs`` output.
-        single_size: Width of the token-from-atom slice.
-        atom_hidden_size: Width of the atom single representation.
-        atom_pair_hidden_size: Width of the windowed atom-pair representation.
-        atom_feature_size: Expected width of the raw per-atom feature vector.
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        use_atom_encoder: Whether to encode atom features into token states.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -725,25 +685,6 @@ class Boltz1InputEmbeddings(nn.Module):
         deletion_mean: Tensor,
         pocket_feature: Tensor | None = None,
     ) -> Tensor:
-        r"""
-        Assemble the wide ``single_inputs`` token embedding for one batch.
-
-        Args:
-            atom_features: `[B, M, atom_feature_size]` raw per-atom features.
-            reference_positions: `[B, M, 3]` reference (template) atom positions.
-            atom_mask: `[B, M]` atom validity mask.
-            reference_space_id: `[B, M]` per-atom reference-space identifier for window gating.
-            atom_to_token: `[B, M]` atom-to-token index map.
-            residue_type: `[B, N, vocab_size]` residue-type one-hot.
-            msa_profile: `[B, N, vocab_size]` MSA profile feature.
-            deletion_mean: `[B, N]` mean-deletion feature.
-            pocket_feature: Optional `[B, N, pocket_feature_size]` pocket one-hot; defaults to all-``UNSPECIFIED``.
-
-        Returns:
-            The `[B, N, input_size]` concatenated ``single_inputs`` token embedding.
-
-        """
-
         atom_encoder = self.atom_encoder
         atom_pair_bias_projection = self.atom_pair_bias_projection
         atom_attention_encoder = self.atom_attention_encoder
@@ -788,21 +729,6 @@ class Boltz1InputEmbeddings(nn.Module):
 class Boltz1AtomEncoder(nn.Module):
     r"""
     Build atom single states and windowed atom-pair states from reference geometry.
-
-    Projects raw atom features to a single state and encodes windowed atom-pair states from reference
-    inter-atomic distance vectors, inverse distances, and same-reference-space validity. When
-    ``structure_prediction`` is set, it additionally injects trunk single/pair representations gathered per
-    atom so the diffusion atom encoder is conditioned on the folded trunk.
-
-    Args:
-        atom_feature_size: Width of the raw per-atom feature vector.
-        atom_hidden_size: Width of the atom single representation.
-        atom_pair_hidden_size: Width of the windowed atom-pair representation.
-        single_size: Width of the trunk single representation (used when ``structure_prediction``).
-        pair_size: Width of the trunk pair representation (used when ``structure_prediction``).
-        num_query_atoms: Query-window size for the windowed atom-pair encoding.
-        num_key_atoms: Key-window size for the windowed atom-pair encoding.
-        structure_prediction: When ``True``, add the trunk single/pair conditioning projections.
     """
 
     def __init__(
@@ -861,23 +787,6 @@ class Boltz1AtomEncoder(nn.Module):
         single_trunk: Tensor | None = None,
         pair_trunk: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Encode atom single states and windowed atom-pair states from reference geometry.
-
-        Args:
-            atom_features: `[B, M, atom_feature_size]` raw per-atom features.
-            reference_positions: `[B, M, 3]` reference atom positions.
-            atom_mask: `[B, M]` atom validity mask.
-            reference_space_id: `[B, M]` per-atom reference-space identifier for window gating.
-            atom_to_token: `[B, M]` atom-to-token index map; required when ``structure_prediction``.
-            single_trunk: `[B, N, single_size]` trunk single representation; used when ``structure_prediction``.
-            pair_trunk: `[B, N, N, pair_size]` trunk pair representation; used when ``structure_prediction``.
-
-        Returns:
-            Tuple ``(atom_query, atom_conditioning, atom_pair)``: the atom query state, the atom conditioning
-            state, and the windowed atom-pair states `[B, W, Q, K, atom_pair_hidden_size]`.
-        """
-
         atom_query = self.atom_feature_projection(atom_features)
         atom_single = atom_query
 
@@ -953,19 +862,6 @@ class Boltz1AtomEncoder(nn.Module):
 class Boltz1AtomAttentionEncoder(nn.Module):
     r"""
     Run windowed atom attention and mean-pool the result to per-token representations.
-
-    When ``structure_prediction`` is set, the encoder additionally folds in a projection of the noisy atom
-    positions and returns the atom/conditioning skip states used by the diffusion decoder.
-
-    Args:
-        atom_hidden_size: Width of the atom single representation.
-        single_size: Width of the pooled per-token output (doubled when ``structure_prediction``).
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_encoder_blocks: Number of atom-attention blocks.
-        num_atom_encoder_attention_heads: Head count for the atom attention.
-        structure_prediction: When ``True``, add the noisy-position projection and return skip states.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1008,24 +904,6 @@ class Boltz1AtomAttentionEncoder(nn.Module):
         noisy_positions: Tensor | None = None,
         multiplicity: int = 1,
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Attend over windowed atoms and mean-pool to per-token representations.
-
-        Args:
-            atom_single: `[B, M, atom_hidden_size]` atom single states.
-            atom_conditioning: `[B, M, atom_hidden_size]` atom conditioning states.
-            atom_pair_bias: Packed per-block windowed atom-pair attention bias.
-            atom_mask: `[B, M]` atom validity mask.
-            atom_to_token: `[B, M]` atom-to-token index map.
-            num_tokens: Number of tokens to scatter into.
-            noisy_positions: `[B*mult, M, 3]` noisy atom positions; required when ``structure_prediction``.
-            multiplicity: Sample multiplicity to repeat-interleave the atom inputs by.
-
-        Returns:
-            The `[B, num_tokens, single_size]` pooled token representation. When ``structure_prediction`` is
-            set, a tuple ``(token_repr, atom_skip, conditioning_skip)`` for the diffusion decoder.
-        """
-
         query = atom_single
         conditioning = atom_conditioning
         mask = atom_mask
@@ -1054,15 +932,6 @@ class Boltz1AtomAttentionEncoder(nn.Module):
 class Boltz1AtomAttentionDecoder(nn.Module):
     r"""
     Broadcast token activations back to atoms and predict a per-atom position update.
-
-    Args:
-        atom_hidden_size: Width of the atom single representation.
-        single_size: Width of the incoming token representation (token projection reads ``2 * single_size``).
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_decoder_blocks: Number of atom-attention decoder blocks.
-        num_atom_decoder_attention_heads: Head count for the atom attention.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1102,22 +971,6 @@ class Boltz1AtomAttentionDecoder(nn.Module):
         atom_to_token: Tensor,
         multiplicity: int = 1,
     ) -> Tensor:
-        r"""
-        Broadcast token activations to atoms and predict the per-atom coordinate update.
-
-        Args:
-            token_repr: `[B*mult, N, 2*single_size]` token representation to broadcast to atoms.
-            atom_skip: `[B*mult, M, atom_hidden_size]` atom skip state from the encoder.
-            conditioning_skip: `[B*mult, M, atom_hidden_size]` conditioning skip state from the encoder.
-            atom_pair_bias: Packed per-block windowed atom-pair attention bias.
-            atom_mask: `[B, M]` atom validity mask.
-            atom_to_token: `[B, M]` atom-to-token index map.
-            multiplicity: Sample multiplicity to repeat-interleave the atom inputs by.
-
-        Returns:
-            The `[B*mult, M, 3]` per-atom coordinate update.
-        """
-
         token_index = atom_to_token.repeat_interleave(multiplicity, 0)
         token_proj = self.token_projection(token_repr)
         atom_query = atom_skip + token_proj.gather(1, token_index.unsqueeze(-1).expand(-1, -1, token_proj.shape[-1]))
@@ -1135,27 +988,6 @@ class Boltz1AtomAttentionDecoder(nn.Module):
 class Boltz1DenoiserConditioning(nn.Module):
     r"""
     Precompute the diffusion conditioning shared across denoiser calls (Boltz DiffusionConditioning).
-
-    The conditioning depends only on the trunk outputs, so it is computed once per structure and reused across
-    every reverse-diffusion step and every sample: the conditioned pair, the atom single/conditioning states,
-    and the per-block attention biases for the atom encoder, atom decoder, and token transformer.
-
-    Args:
-        single_size: Width of the trunk single representation.
-        pair_size: Width of the trunk pair representation.
-        atom_hidden_size: Width of the atom single representation.
-        atom_pair_hidden_size: Width of the windowed atom-pair representation.
-        atom_feature_size: Width of the raw per-atom feature vector.
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_encoder_blocks: Number of atom-encoder blocks (one bias projection each).
-        num_atom_encoder_attention_heads: Head count for the atom-encoder attention bias.
-        num_atom_decoder_blocks: Number of atom-decoder blocks (one bias projection each).
-        num_atom_decoder_attention_heads: Head count for the atom-decoder attention bias.
-        num_token_transformer_blocks: Number of token-transformer blocks (one bias projection each).
-        num_token_transformer_heads: Head count for the token-transformer attention bias.
-        num_conditioning_transitions: Number of transitions in the pairwise conditioner.
-        operator_backend: Public backend request forwarded to the pairwise conditioner.
     """
 
     def __init__(
@@ -1227,28 +1059,6 @@ class Boltz1DenoiserConditioning(nn.Module):
         reference_space_id: Tensor,
         atom_to_token: Tensor,
     ) -> dict[str, Tensor]:
-        r"""
-        Precompute the per-call-invariant diffusion conditioning from the trunk representations.
-
-        The trunk pair ``(B, N, N, pair_size)`` is conditioned with the relative-position encoding, then the
-        atom encoder builds atom single/pair states injected with trunk single/pair; the atom-pair and token-pair
-        states are projected to per-block attention biases (concatenated over blocks along the last axis).
-
-        Args:
-            single_trunk: `[B, N, single_size]` trunk single representation.
-            pair_trunk: `[B, N, N, pair_size]` trunk pair representation.
-            relative_position_encoding: `[B, N, N, pair_size]` relative-position encoding to condition the pair.
-            atom_features: `[B, M, atom_feature_size]` raw per-atom features.
-            reference_positions: `[B, M, 3]` reference atom positions.
-            atom_mask: `[B, M]` atom validity mask.
-            reference_space_id: `[B, M]` per-atom reference-space identifier for window gating.
-            atom_to_token: `[B, M]` atom-to-token index map.
-
-        Returns:
-            Mapping with atom query and conditioning states plus packed encoder, decoder, and
-            token-transformer attention biases. Bias channels are ordered by block, then head.
-        """
-
         pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
         atom_query, atom_conditioning, atom_pair = self.atom_encoder(
             atom_features,
@@ -1274,11 +1084,6 @@ class Boltz1DenoiserConditioning(nn.Module):
 class Boltz1PerBlockPairBiasProjection(nn.Module):
     r"""
     Project a raw pair representation to one packed per-block/head attention bias tensor.
-
-    Args:
-        pair_size: Width of the input pair representation.
-        num_blocks: Number of per-block bias projections to pack.
-        num_attention_heads: Head count each block projects the pair to.
     """
 
     def __init__(self, *, pair_size: int, num_blocks: int, num_attention_heads: int) -> None:
@@ -1289,42 +1094,12 @@ class Boltz1PerBlockPairBiasProjection(nn.Module):
         )
 
     def forward(self, pair: Tensor) -> Tensor:
-        r"""
-        Project and concatenate the per-block pair biases along the last axis.
-
-        Args:
-            pair: `[..., pair_size]` pair representation.
-
-        Returns:
-            The `[..., num_blocks * num_attention_heads]` packed per-block/head attention bias.
-        """
-
         return torch.cat([projection(pair) for projection in self.bias_projections], dim=-1)
 
 
 class Boltz1Denoiser(nn.Module):
     r"""
     Boltz-1 EDM score network with the wider Boltz-1 ``s_inputs`` conditioning width.
-
-    Given noisy atom positions and a noise level, it noise-conditions the single track, runs the atom-attention
-    encoder, the conditioned token transformer, and the atom-attention decoder to predict a per-atom
-    coordinate update. The precomputed diffusion conditioning is threaded through so no trunk work repeats.
-
-    Args:
-        input_size: Width of the ``single_inputs`` conditioning vector.
-        single_size: Width of the trunk single representation (token hidden is ``2 * single_size``).
-        atom_hidden_size: Width of the atom single representation.
-        fourier_embedding_size: Width of the frozen Fourier noise embedding.
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_encoder_blocks: Number of atom-encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-encoder attention.
-        num_token_transformer_blocks: Number of conditioned token-transformer blocks.
-        num_token_transformer_heads: Head count for the token transformer.
-        num_atom_decoder_blocks: Number of atom-decoder blocks.
-        num_atom_decoder_attention_heads: Head count for the atom-decoder attention.
-        num_conditioning_transitions: Number of transitions in the single conditioner.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -1399,26 +1174,6 @@ class Boltz1Denoiser(nn.Module):
         multiplicity: int = 1,
         return_token_repr: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Predict the per-atom coordinate update for one reverse-diffusion step.
-
-        Args:
-            single_inputs: `[B, N, input_size]` single-input conditioning vector.
-            single_trunk: `[B, N, single_size]` trunk single representation.
-            noisy_positions: `[B*mult, M, 3]` noisy atom positions.
-            noise_level: `[B*mult]` per-sample noise level.
-            conditioning: The precomputed diffusion-conditioning dict (atom states and per-block biases).
-            atom_mask: `[B, M]` atom validity mask.
-            atom_to_token: `[B, M]` atom-to-token index map.
-            token_mask: `[B, N]` token validity mask.
-            multiplicity: Sample multiplicity to repeat-interleave the trunk inputs by.
-            return_token_repr: When ``True``, also return the final token representation.
-
-        Returns:
-            The `[B*mult, M, 3]` coordinate update, or a ``(update, token_repr)`` tuple when
-            ``return_token_repr`` is set.
-        """
-
         single, _ = self.single_conditioner(
             noise_level,
             single_trunk.repeat_interleave(multiplicity, 0),
@@ -1459,14 +1214,6 @@ class Boltz1Denoiser(nn.Module):
 class Boltz1SingleConditioning(nn.Module):
     r"""
     Noise-condition the concatenated trunk-single and single-input representation for Boltz-1.
-
-    Args:
-        input_size: Width of the ``single_inputs`` representation.
-        single_size: Width of the trunk single representation (hidden width is ``2 * single_size``).
-        fourier_embedding_size: Width of the frozen Fourier noise embedding.
-        num_conditioning_transitions: Number of transitions refining the conditioned single.
-        transition_expansion: Inner-width expansion factor of each transition.
-        operator_backend: Public backend request forwarded to every transition.
     """
 
     def __init__(
@@ -1492,18 +1239,6 @@ class Boltz1SingleConditioning(nn.Module):
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
-        r"""
-        Noise-condition the concatenated single representation.
-
-        Args:
-            noise_level: `[B]` per-sample noise level fed to the Fourier embedding.
-            single_trunk: `[B, N, single_size]` trunk single representation.
-            single_inputs: `[B, N, input_size]` single-input representation.
-
-        Returns:
-            A ``(conditioned_single, normalized_single)`` tuple, each `[B, N, 2*single_size]`.
-        """
-
         return condition_single(
             single_trunk,
             single_inputs,
@@ -1521,13 +1256,6 @@ class Boltz1SingleConditioning(nn.Module):
 class Boltz1OutputTokenFeatureUpdate(nn.Module):
     r"""
     Accumulate the diffusion-token representation across reverse-diffusion steps for confidence conditioning.
-
-    At each step, the module noise-conditions the incoming token representation and adds a gated
-    transition update into the running accumulator.
-
-    Args:
-        token_size: Width of the trunk token representation (hidden width is ``2 * token_size``).
-        fourier_embedding_size: Width of the frozen Fourier noise embedding.
     """
 
     def __init__(self, *, token_size: int = 384, fourier_embedding_size: int = 256) -> None:
@@ -1539,18 +1267,6 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
         self.transition = Boltz1TripleProductConditionedTransition(hidden, hidden + fourier_embedding_size)
 
     def forward(self, *, noise_level: Tensor, accumulated: Tensor, next_repr: Tensor) -> Tensor:
-        r"""
-        Fold the current-step token representation into the running accumulator.
-
-        Args:
-            noise_level: `[B]` per-sample noise level for the Fourier conditioning.
-            accumulated: `[B, N, 2*token_size]` running token accumulator.
-            next_repr: `[B, N, 2*token_size]` token representation from the current step.
-
-        Returns:
-            The updated `[B, N, 2*token_size]` accumulator.
-        """
-
         next_repr = self.next_norm(next_repr)
         fourier = self.fourier_norm(self.noise_fourier(noise_level))
         fourier = fourier.unsqueeze(1).expand(-1, next_repr.shape[1], -1)
@@ -1561,14 +1277,6 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
 class Boltz1TripleProductConditionedTransition(nn.Module):
     r"""
     Triple-product conditioned transition used by the output-token accumulator.
-
-    Applies AdaLN conditioning, a SwiGLU expansion, and an output projection gated by a sigmoid of the
-    conditioning.
-
-    Args:
-        hidden_size: Width of the hidden representation.
-        conditioning_size: Width of the conditioning vector driving AdaLN and the output gate.
-        expansion: Inner-width expansion factor of the SwiGLU transition.
     """
 
     def __init__(self, hidden_size: int, conditioning_size: int, expansion: int = 2) -> None:
@@ -1584,17 +1292,6 @@ class Boltz1TripleProductConditionedTransition(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        r"""
-        Apply the conditioned SwiGLU transition.
-
-        Args:
-            hidden: `[..., hidden_size]` hidden representation.
-            conditioning: `[..., conditioning_size]` conditioning vector.
-
-        Returns:
-            The `[..., hidden_size]` gated transition output.
-        """
-
         hidden = self.adaptive_norm(hidden, conditioning)
         gate = self.gate_projection(hidden)
         value = self.value_projection(hidden)
@@ -1605,13 +1302,6 @@ class Boltz1TripleProductConditionedTransition(nn.Module):
 class Boltz1AdaptiveLayerNorm(nn.Module):
     r"""
     Lightweight adaptive layer norm (AdaLN) used by the Boltz conditioned transition.
-
-    Normalizes the hidden state (affine-free), then applies a sigmoid gate and shift both derived from the
-    normalized conditioning vector.
-
-    Args:
-        hidden_size: Width of the hidden representation.
-        conditioning_size: Width of the conditioning vector driving the gate and shift.
     """
 
     def __init__(self, hidden_size: int, conditioning_size: int) -> None:
@@ -1623,17 +1313,6 @@ class Boltz1AdaptiveLayerNorm(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        r"""
-        Adaptively normalize ``hidden`` under the ``conditioning`` gate and shift.
-
-        Args:
-            hidden: `[..., hidden_size]` hidden representation.
-            conditioning: `[..., conditioning_size]` conditioning vector.
-
-        Returns:
-            The `[..., hidden_size]` conditioned representation.
-        """
-
         hidden = self.hidden_norm(hidden)
         conditioning = self.conditioning_norm(conditioning)
         return self.sigmoid(self.gate_projection(conditioning)) * hidden + self.shift_projection(conditioning)
@@ -1642,19 +1321,6 @@ class Boltz1AdaptiveLayerNorm(nn.Module):
 class _Boltz1CoordinateDiffusionBase(nn.Module):
     r"""
     EDM (Karras) reverse-diffusion sampler wrapped around a Boltz diffusion score model.
-
-    Args:
-        denoiser: The learned network that predicts denoised coordinates.
-        sigma_data: EDM data-scale hyperparameter for the preconditioner and schedule.
-        min_noise_level: Lowest non-zero noise level of the schedule, in ``sigma_data`` units.
-        max_noise_level: Highest noise level (start of the schedule), in ``sigma_data`` units.
-        rho: Karras schedule power controlling the sigma spacing.
-        churn_rate: Stochastic-churn factor applied above ``min_churn_noise_level``.
-        min_churn_noise_level: Noise level below which churn is disabled.
-        noise_scale: Multiplier on the churn-injected noise.
-        step_scale: Multiplier on the Euler update step.
-        num_sampling_steps: Default number of reverse-diffusion steps.
-        alignment_reverse_diff: Whether to weighted-rigid-align each step to the denoised coords.
     """
 
     def __init__(
@@ -1697,51 +1363,13 @@ class _Boltz1CoordinateDiffusionBase(nn.Module):
         dtype: torch.dtype,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        r"""
-        Draw ``batch_size`` training noise levels from the EDM log-normal distribution.
-
-        Mirrors the Boltz-1 ``noise_distribution``: ``sigma_data * exp(P_mean + P_std * N(0, 1))``.
-
-        Args:
-            batch_size: Number of noise levels to sample.
-            device: Device for the sampled tensor.
-            dtype: Floating dtype for the sampled tensor.
-            generator: Optional RNG for reproducible noise-level sampling.
-
-        Returns:
-            A ``(batch_size,)`` tensor of positive noise levels.
-        """
-
         normal = torch.empty(batch_size, device=device, dtype=dtype).normal_(generator=generator)
         return self.sigma_data * (self.noise_log_mean + self.noise_log_std * normal).exp()
 
     def loss_weight(self, sigma: Tensor) -> Tensor:
-        r"""
-        Return the EDM per-sample coordinate-loss weight ``(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2``.
-
-        Args:
-            sigma: Noise levels the training samples were noised at.
-
-        Returns:
-            The per-sample loss weight, matching ``sigma``'s shape.
-        """
-
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
 
     def sample_schedule(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        r"""
-        Build the EDM (Karras rho-power) noise schedule scaled by ``sigma_data``.
-
-        The schedule decreases from ``max_noise_level`` to ``min_noise_level`` with a trailing zero.
-
-        Args:
-            num_sampling_steps: Number of steps; defaults to ``self.num_sampling_steps``.
-            device: Device to allocate the schedule on.
-
-        Returns:
-            The ``(steps + 1,)`` sigma schedule (the final entry is ``0``).
-        """
-
         steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         inv_rho = 1 / self.rho
         # `steps` is the number of sampling steps (transitions); the trailing pad adds the final sigma=0.
@@ -1758,27 +1386,6 @@ class _Boltz1CoordinateDiffusionBase(nn.Module):
 class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
     r"""
     Boltz-1 EDM sampler that can accumulate and surface the final diffusion token representation.
-
-    Adds an optional output-token accumulator and the Boltz-1x steering path with Feynman-Kac particle
-    resampling and physical-potential guidance.
-
-    Args:
-        denoiser: The learned network that predicts denoised coordinates.
-        sigma_data: EDM data-scale hyperparameter.
-        min_noise_level: Lowest non-zero noise level in the sampling schedule.
-        max_noise_level: Highest noise level in the sampling schedule.
-        rho: Karras schedule power.
-        churn_rate: Stochastic churn factor.
-        min_churn_noise_level: Noise level below which churn is disabled.
-        noise_scale: Multiplier on churn noise.
-        step_scale: Multiplier on the Euler update.
-        num_sampling_steps: Default number of reverse-diffusion steps.
-        alignment_reverse_diff: Whether to rigid-align each reverse-diffusion step.
-        noise_log_mean: Mean of the EDM training log-noise distribution.
-        noise_log_std: Standard deviation of the EDM training log-noise distribution.
-        accumulate_token_repr: When ``True``, build and run the token-representation accumulator.
-        token_size: Width of the trunk token representation for the accumulator.
-        fourier_embedding_size: Width of the frozen Fourier noise embedding for the accumulator.
     """
 
     def __init__(
@@ -1831,22 +1438,6 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         return_token_repr: bool = False,
         **conditioning: object,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Apply the EDM preconditioning and run the score model to produce denoised coordinates.
-
-        Args:
-            noised_coords: `[B, M, 3]` noised atom coordinates.
-            sigma: The current noise level, as a scalar or `[B]` tensor.
-            multiplicity: Sample multiplicity threaded into the score model.
-            return_token_repr: When ``True``, also return the diffusion token representation.
-            **conditioning: The precomputed conditioning forwarded to the score model.
-
-        Returns:
-            The `[B, M, 3]` denoised coordinates, or a ``(denoised, token_repr)`` tuple when
-            ``return_token_repr`` is set.
-
-        """
-
         batch = noised_coords.shape[0]
         sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
         padded = sigma.reshape(batch, 1, 1)
@@ -1876,31 +1467,6 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         generator: torch.Generator | None = None,
         **conditioning: object,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""
-        Run one EDM training denoise step on the noised, augmented ground-truth coordinates.
-
-        Mirrors the Boltz-1 ``AtomDiffusion`` training forward: the (resolved-atom-centered, randomly
-        rotated/translated) ground truth is repeat-interleaved by ``multiplicity``, noised at an independent
-        per-sample log-normal noise level, and denoised in a single preconditioned score-model pass. The
-        denoiser runs with gradient enabled so the EDM-weighted coordinate loss can backpropagate.
-
-        Args:
-            target_coords: `[B, M, 3]` ground-truth atom coordinates.
-            atom_mask: `[B, M]` atom validity mask forwarded to the score model.
-            target_mask: Optional `[B, M]` resolved-atom mask used to center the augmentation; defaults to
-                ``atom_mask``.
-            multiplicity: Number of independent noised samples to draw per input.
-            generator: Optional RNG for reproducible augmentation and noise.
-            **conditioning: The precomputed conditioning (``single_inputs``, ``single_trunk``,
-                ``conditioning``, ``atom_to_token``, ``token_mask``) forwarded to the score model.
-
-        Returns:
-            ``(denoised_coordinates, augmented_target_coordinates, noise_level)`` with a leading
-            ``B*multiplicity`` axis, for the
-            EDM-weighted coordinate loss.
-
-        """
-
         single_trunk = cast(Tensor, conditioning["single_trunk"])
         dtype, device = single_trunk.dtype, single_trunk.device
         target = cast(Tensor, target_coords).to(dtype=dtype, device=device).repeat_interleave(multiplicity, 0)
@@ -1922,18 +1488,6 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         return cast(Tensor, denoised_coordinates), augmented_target_coordinates, noise_level
 
     def _augment_target(self, coords: Tensor, mask: Tensor, *, generator: torch.Generator | None) -> Tensor:
-        r"""
-        Center on the masked atoms, then apply one random rigid augmentation (rotation plus translation).
-
-        Args:
-            coords: `[B, M, 3]` coordinates to augment.
-            mask: `[B, M]` validity mask; the centroid is computed over masked atoms only.
-            generator: Optional RNG for reproducible rotation/translation.
-
-        Returns:
-            The `[B, M, 3]` augmented coordinates.
-        """
-
         weight = mask[..., None]
         centroid = (coords * weight).sum(-2, keepdim=True) / weight.sum(-2, keepdim=True).clamp_min(1.0)
         coords = coords - centroid
@@ -1957,28 +1511,6 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         steering_args: Mapping[str, object],
         **conditioning: object,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Run the full reverse-diffusion loop and return the sampled atom coordinates.
-
-        Steps the EDM schedule with stochastic churn and per-step random rigid augmentation, optionally
-        applying Boltz-1x Feynman-Kac particle resampling and physical-potential guidance, and (when enabled)
-        accumulating the final token representation used by the Boltz-1 confidence head.
-
-        Args:
-            atom_mask: `[B, M]` atom validity mask.
-            num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
-            multiplicity: Number of samples requested per input.
-            generator: Optional RNG for reproducible sampling noise.
-            return_token_repr: When ``True``, also return the accumulated token representation.
-            steering_args: Boltz-1x steering flags (FK steering / physical guidance); normalized internally.
-            **conditioning: The precomputed conditioning (plus optional ``feats``) forwarded to the score model.
-
-        Returns:
-            The `[B*mult, M, 3]` sampled coordinates, or a ``(coords, token_repr)`` tuple when
-            ``return_token_repr`` is set.
-
-        """
-
         device = atom_mask.device
         feats = cast(dict[str, Tensor] | None, conditioning.pop("feats", None))
         steering = dict(steering_args)
@@ -1997,7 +1529,9 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
 
         def randn() -> Tensor:
-            r"""Draw standard-normal noise of the expanded coordinate ``shape`` on the sampler device/generator."""
+            r"""
+            Draw standard-normal noise of the expanded coordinate ``shape`` on the sampler device/generator.
+            """
 
             return torch.randn(shape, device=device, generator=generator)
 
@@ -2016,10 +1550,8 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         denoised = None
         token_repr = None
         token_a = None
-        # This loop stays separate from the shared CoordinateEdmSampler by design (Frankenstein principle):
-        # Boltz-1 is a strict superset of the plain EDM step -- it interleaves Boltz-1x Feynman-Kac particle
-        # steering (resampling, guidance updates, out_token_feat accumulation) into the reverse diffusion, which
-        # the shared sampler deliberately does not model. Genuine structural divergence, so it is left as-is.
+        # Potential guidance interleaves particle resampling, coordinate updates,
+        # and token-feature accumulation with the reverse-diffusion steps.
         # Keep the schedule scalars as tensors. The Python loop fixes the number of denoising calls, while the
         # per-step tensor math remains free of host synchronizations on the ordinary (unsteered) sampling path.
         for index in range(len(sigmas) - 1):
@@ -2149,55 +1681,6 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
 class Boltz1ConfidenceHead(nn.Module):
     r"""
     Score sampled coordinates into Boltz-1 confidence logits and ranking metrics.
-
-    In the ``imitate_trunk`` configuration this module re-embeds the inputs and runs its own trunk
-    (input embedder, optional MSA module, recycling projections, Pairformer) before injecting the predicted
-    inter-atomic distances and the accumulated diffusion single representation, then projecting to
-    pLDDT/PAE/PDE/resolved logits. The lighter non-``imitate_trunk`` path instead reuses the trunk outputs
-    directly. Derived complex/interface scores and pTM/ipTM ranking metrics are computed from the logits.
-
-    Args:
-        input_size: Width of the ``single_inputs`` representation.
-        single_size: Width of the single representation.
-        pair_size: Width of the pair representation.
-        atom_hidden_size: Width of the atom single representation.
-        atom_pair_hidden_size: Width of the windowed atom-pair representation.
-        atom_feature_size: Width of the raw per-atom feature vector.
-        num_query_atoms: Query-window size for the local atom attention.
-        num_key_atoms: Key-window size for the local atom attention.
-        num_atom_encoder_blocks: Number of atom-attention encoder blocks.
-        num_atom_encoder_attention_heads: Head count for the atom-attention encoder.
-        num_blocks: Number of Pairformer blocks in the confidence head.
-        num_pair_attention_heads: Head count for the confidence pair-biased attention.
-        num_distogram_bins: Number of bins for the distance embedding.
-        max_distance: Upper distance bound (Angstrom) for the distance binning.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of PAE output bins.
-        num_pde_bins: Number of PDE output bins.
-        compute_pae: Whether to emit PAE logits and pTM/ipTM metrics.
-        imitate_trunk: Whether to re-run a full trunk-like stack instead of reusing trunk outputs.
-        add_single_to_pair_product: Whether to add the single-input outer product into the pair track.
-        add_single_input_to_single: Whether to inject the single-input representation into the single track.
-        add_pair_input_to_pair: Whether to inject relative-position and bond features into the pair track.
-        use_single_diffusion: Whether to condition on the accumulated diffusion single representation.
-        ranking_plddt_weight: Weight on complex pLDDT when forming the combined ranking score.
-        ranking_ptm_weight: Weight on pTM/ipTM when forming the combined ranking score.
-        use_atom_encoder: Whether to encode atom features in the re-embedded input.
-        use_msa: Whether to build the confidence head with an MSA trunk.
-        msa_size: Number of MSA sequences retained per token.
-        msa_feature_size: Width of the raw per-MSA feature vector.
-        vocab_size: Residue-type vocabulary size for the MSA module.
-        num_msa_blocks: Number of MSA-module blocks.
-        use_paired_feature: Whether the MSA carries the cross-chain pairing feature.
-        outer_product_hidden_size: Hidden width of the MSA outer-product-mean projection.
-        msa_dropout: Dropout applied inside the MSA module.
-        pair_dropout: Dropout applied to the Pairformer pair track.
-        num_msa_attention_heads: Head count for the MSA pair-weighted-averaging.
-        msa_head_dim: Per-head dimension inside the MSA attention.
-        triangle_attention_hidden_size: Per-head width of the triangle attention.
-        num_triangle_attention_heads: Head count for the triangle attention.
-        relative_position_size: Width of the relative-position feature.
-        operator_backend: Selector for the fused-operator backend.
     """
 
     def __init__(
@@ -2384,25 +1867,6 @@ class Boltz1ConfidenceHead(nn.Module):
         single_diffusion: Tensor | None = None,
         multiplicity: int = 1,
     ) -> dict[str, Tensor]:
-        r"""
-        Score sampled coords and return confidence logits plus derived ranking metrics.
-
-        Args:
-            single_inputs: `[B, N, input_size]` single-input representation.
-            single: `[B, N, single_size]` trunk single representation.
-            pair: `[B, N, N, pair_size]` trunk pair representation.
-            coordinates: `[B*mult, M, 3]` sampled atom coordinates to score.
-            input: The Boltz-1 input batch.
-            pred_distogram_logits: `[B, N, N, num_bins]` trunk distogram logits used for contact probabilities.
-            single_diffusion: Accumulated diffusion single representation; required when ``use_single_diffusion``.
-            multiplicity: Number of samples per input.
-
-        Returns:
-            A dict of confidence logits (``plddt_logits``, ``pde_logits``, ``resolved_logits``, and
-            ``pae_logits`` when enabled) merged with the derived complex/interface and pTM/ipTM ranking scores.
-
-        """
-
         if self.input_embeddings is not None:
             single_inputs = self._imitate_trunk_inputs(input)
             single_init, pair_init = self._confidence_initial_representations(input, single_inputs, single.dtype)
@@ -2498,16 +1962,6 @@ class Boltz1ConfidenceHead(nn.Module):
         return logits
 
     def _imitate_trunk_inputs(self, input: Boltz1Input) -> Tensor:
-        r"""
-        Re-run the confidence head's input embedder to rebuild the ``single_inputs`` representation.
-
-        Args:
-            input: The Boltz-1 input batch.
-
-        Returns:
-            The `[B, N, input_size]` re-embedded single-input representation.
-        """
-
         input_embeddings = cast(Boltz1InputEmbeddings, self.input_embeddings)
         return input_embeddings(
             atom_features=input.atom_features,
@@ -2524,18 +1978,6 @@ class Boltz1ConfidenceHead(nn.Module):
     def _confidence_initial_representations(
         self, input: Boltz1Input, single_inputs: Tensor, dtype: torch.dtype
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Build the pre-recycle single/pair initializations for the ``imitate_trunk`` confidence path.
-
-        Args:
-            input: The Boltz-1 input batch.
-            single_inputs: `[B, N, input_size]` re-embedded single-input representation.
-            dtype: Dtype to build the relative-position features in.
-
-        Returns:
-            Tuple ``(single_init, pair_init)`` mirroring the main trunk initialization.
-        """
-
         single_init = cast(nn.Linear, self.single_init_projection)(single_inputs)
         pair_init = cast(nn.Linear, self.pair_left_projection)(single_inputs).unsqueeze(-2)
         pair_init = pair_init + cast(nn.Linear, self.pair_right_projection)(single_inputs).unsqueeze(-3)
@@ -2559,14 +2001,6 @@ class Boltz1ConfidenceHead(nn.Module):
 class Boltz1ConfidenceOutputHead(nn.Module):
     r"""
     Linear projections from the confidence single/pair representations to the Boltz-1 confidence logits.
-
-    Args:
-        single_size: Width of the confidence single representation.
-        pair_size: Width of the confidence pair representation.
-        num_plddt_bins: Number of pLDDT output bins.
-        num_pae_bins: Number of PAE output bins.
-        num_pde_bins: Number of PDE output bins.
-        compute_pae: Whether to build and emit the PAE projection.
     """
 
     def __init__(
@@ -2588,18 +2022,6 @@ class Boltz1ConfidenceOutputHead(nn.Module):
             self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
 
     def forward(self, single: Tensor, pair: Tensor) -> dict[str, Tensor]:
-        r"""
-        Project the confidence representations to logits.
-
-        Args:
-            single: `[B, N, single_size]` confidence single representation.
-            pair: `[B, N, N, pair_size]` confidence pair representation.
-
-        Returns:
-            A dict with ``pde_logits``, ``plddt_logits``, ``resolved_logits``, and (when ``compute_pae``)
-            ``pae_logits``.
-        """
-
         logits = {
             "pde_logits": self.pde_projection(pair + pair.transpose(-3, -2)),
             "plddt_logits": self.plddt_projection(single),
@@ -2709,36 +2131,15 @@ def _feature_or_empty(
 class Boltz1ParameterSchedule:
     r"""
     Abstract base for a steering-parameter schedule evaluated over normalized sampling time.
-
-    Subclasses implement [`compute`][ofoldx.models.boltz1.model.Boltz1ParameterSchedule.compute] to map a time
-    in ``[0, 1]`` to a scalar parameter value.
     """
 
     def compute(self, time: float) -> float:
-        r"""
-        Evaluate the schedule at a normalized sampling time.
-
-        Args:
-            time: Normalized sampling time in ``[0, 1]``.
-
-        Returns:
-            The scheduled scalar parameter value.
-
-        Raises:
-            NotImplementedError: Always; subclasses override this.
-        """
-
         raise NotImplementedError
 
 
 class Boltz1ExponentialInterpolationSchedule(Boltz1ParameterSchedule):
     r"""
     Interpolate between ``start`` and ``end`` with an exponential curvature ``alpha`` (linear when ``alpha=0``).
-
-    Args:
-        start: Value at ``time == 0``.
-        end: Value at ``time == 1``.
-        alpha: Exponential curvature; ``0`` gives linear interpolation.
     """
 
     def __init__(self, *, start: float, end: float, alpha: float) -> None:
@@ -2747,21 +2148,6 @@ class Boltz1ExponentialInterpolationSchedule(Boltz1ParameterSchedule):
         self.alpha = alpha
 
     def compute(self, time: float) -> float:
-        r"""
-        Evaluate the exponential interpolation at ``time``.
-
-        Args:
-            time: Normalized sampling time in ``[0, 1]``.
-
-        Returns:
-            The interpolated scalar value.
-
-        Examples:
-            >>> schedule = Boltz1ExponentialInterpolationSchedule(start=1.0, end=5.0, alpha=0.0)
-            >>> round(schedule.compute(0.5), 4)
-            3.0
-        """
-
         if self.alpha == 0:
             return self.start + (self.end - self.start) * time
         return self.start + (self.end - self.start) * (math.exp(self.alpha * time) - 1) / (math.exp(self.alpha) - 1)
@@ -2770,10 +2156,6 @@ class Boltz1ExponentialInterpolationSchedule(Boltz1ParameterSchedule):
 class Boltz1PiecewiseStepSchedule(Boltz1ParameterSchedule):
     r"""
     Step schedule that returns the value for the first ``thresholds`` bracket containing ``time``.
-
-    Args:
-        thresholds: Ascending time thresholds; there is one more ``values`` entry than thresholds.
-        values: Per-bracket values, indexed by the number of thresholds ``time`` exceeds.
     """
 
     def __init__(self, *, thresholds: list[float], values: list[float]) -> None:
@@ -2781,23 +2163,6 @@ class Boltz1PiecewiseStepSchedule(Boltz1ParameterSchedule):
         self.values = values
 
     def compute(self, time: float) -> float:
-        r"""
-        Return the step value for the bracket containing ``time``.
-
-        Args:
-            time: Normalized sampling time in ``[0, 1]``.
-
-        Returns:
-            The value for the bracket ``time`` falls into.
-
-        Examples:
-            >>> schedule = Boltz1PiecewiseStepSchedule(thresholds=[0.5], values=[0.1, 0.9])
-            >>> schedule.compute(0.2)
-            0.1
-            >>> schedule.compute(0.8)
-            0.9
-        """
-
         index = 0
         while index < len(self.thresholds) and time > self.thresholds[index]:
             index += 1
@@ -2810,49 +2175,18 @@ _Boltz1PotentialArguments: TypeAlias = tuple[Tensor, Tensor | None, Tensor | Non
 class Boltz1Potential:
     r"""
     Base class for a Boltz-1x physical potential over predicted coordinates.
-
-    A potential exposes a per-time parameter schedule plus three subclass hooks: ``compute_args`` selects the
-    relevant index/bound tensors from the feature dict, ``compute_variable`` turns coordinates into the
-    geometric quantity (distance, dihedral, ...), and ``compute_function`` maps that quantity to an energy
-    (and derivative). The base implements the energy and coordinate-gradient reductions over those hooks.
-
-    Args:
-        parameters: Mapping from parameter name to a constant or a
-            [`Boltz1ParameterSchedule`][ofoldx.models.boltz1.model.Boltz1ParameterSchedule].
     """
 
     def __init__(self, parameters: Mapping[str, float | int | Boltz1ParameterSchedule]) -> None:
         self.parameters = parameters
 
     def compute_parameters(self, time: float) -> dict[str, float | int]:
-        r"""
-        Resolve the schedule-valued parameters to scalars at a given sampling time.
-
-        Args:
-            time: Normalized sampling time in ``[0, 1]``.
-
-        Returns:
-            Mapping from parameter name to its scalar value at ``time``.
-        """
-
         return {
             name: value.compute(time) if isinstance(value, Boltz1ParameterSchedule) else value
             for name, value in self.parameters.items()
         }
 
     def compute(self, coords: Tensor, feats: dict[str, Tensor], parameters: Mapping[str, float | int]) -> Tensor:
-        r"""
-        Evaluate the total potential energy of ``coords`` under the resolved ``parameters``.
-
-        Args:
-            coords: `[..., M, 3]` predicted coordinates.
-            feats: The Boltz-1x steering feature dict.
-            parameters: Resolved scalar parameters for this step.
-
-        Returns:
-            The `[...]` summed potential energy over the selected constraints.
-        """
-
         index, args, com_args = self.compute_args(feats, parameters)
         if index.shape[1] == 0:
             return torch.zeros(coords.shape[:-2], dtype=coords.dtype, device=coords.device)
@@ -2883,18 +2217,6 @@ class Boltz1Potential:
         feats: dict[str, Tensor],
         parameters: Mapping[str, float | int],
     ) -> Tensor:
-        r"""
-        Evaluate the per-atom gradient of the potential energy with respect to ``coords``.
-
-        Args:
-            coords: `[..., M, 3]` predicted coordinates.
-            feats: The Boltz-1x steering feature dict.
-            parameters: Resolved scalar parameters for this step.
-
-        Returns:
-            The `[..., M, 3]` energy gradient, scattered back to per-atom coordinates.
-        """
-
         index, args, com_args = self.compute_args(feats, parameters)
         if index.shape[1] == 0:
             return torch.zeros_like(coords)
@@ -2934,20 +2256,6 @@ class Boltz1Potential:
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, tuple[Tensor, Tensor] | None]:
-        r"""
-        Select the constraint index, energy-function args, and optional center-of-mass args from the features.
-
-        Args:
-            feats: The Boltz-1x steering feature dict.
-            parameters: Resolved scalar parameters for this step.
-
-        Returns:
-            Tuple ``(index, function_args, com_args)`` consumed by the energy and gradient reductions.
-
-        Raises:
-            NotImplementedError: Always; subclasses override this.
-        """
-
         raise NotImplementedError
 
     def compute_function(
@@ -2959,54 +2267,17 @@ class Boltz1Potential:
         *,
         compute_derivative: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Map the geometric quantity to an energy (and optionally its derivative).
-
-        Args:
-            value: The geometric quantity (e.g. distances or dihedral angles).
-            k: Per-constraint energy scale.
-            lower_bounds: Optional lower bound for each constraint.
-            upper_bounds: Optional upper bound for each constraint.
-            compute_derivative: When ``True``, also return the derivative with respect to ``value``.
-
-        Returns:
-            The energy, or an ``(energy, derivative)`` tuple when ``compute_derivative`` is set.
-
-        Raises:
-            NotImplementedError: Always; subclasses override this.
-        """
-
         raise NotImplementedError
 
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Compute the geometric quantity (and optionally its coordinate gradient) from coordinates.
-
-        Args:
-            coords: `[..., M, 3]` (or center-of-mass) coordinates.
-            index: The constraint index tensor selecting the participating atoms.
-            compute_gradient: When ``True``, also return the per-atom gradient of the quantity.
-
-        Returns:
-            The geometric quantity, or a ``(quantity, gradient)`` tuple when ``compute_gradient`` is set.
-
-        Raises:
-            NotImplementedError: Always; subclasses override this.
-        """
-
         raise NotImplementedError
 
 
 class Boltz1FlatBottomPotential(Boltz1Potential):
     r"""
     Flat-bottom energy: zero inside ``[lower_bounds, upper_bounds]`` and linear with slope ``k`` outside.
-
-    Supplies the [`Boltz1Potential`][ofoldx.models.boltz1.model.Boltz1Potential] ``compute_function`` hook
-    with a piecewise-linear well, so concrete potentials only provide the geometric quantity and its bounds. The
-    energy is ``k * (lower_bounds - value)`` below the lower bound, ``k * (value - upper_bounds)`` above the upper
-    bound, and zero in between; the derivative is the matching constant slope.
     """
 
     def compute_function(
@@ -3018,20 +2289,6 @@ class Boltz1FlatBottomPotential(Boltz1Potential):
         *,
         compute_derivative: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Evaluate the flat-bottom energy (and optionally its derivative) at ``value``.
-
-        Args:
-            value: The geometric quantity to penalize.
-            k: Per-constraint linear penalty slope outside the bounds.
-            lower_bounds: Lower bound (treated as ``-inf`` when ``None``).
-            upper_bounds: Upper bound (treated as ``+inf`` when ``None``).
-            compute_derivative: When ``True``, also return the derivative with respect to ``value``.
-
-        Returns:
-            The energy, or an ``(energy, derivative)`` tuple when ``compute_derivative`` is set.
-        """
-
         if lower_bounds is None:
             lower_bounds = torch.full_like(value, float("-inf"))
         if upper_bounds is None:
@@ -3055,27 +2312,11 @@ class Boltz1FlatBottomPotential(Boltz1Potential):
 class Boltz1DistancePotential(Boltz1Potential):
     r"""
     Geometric quantity mixin computing pairwise atom distances from a 2-row index.
-
-    Supplies the [`Boltz1Potential`][ofoldx.models.boltz1.model.Boltz1Potential] ``compute_variable`` hook: it
-    turns a ``[2, P]`` atom-pair index into the ``P`` Euclidean distances (and their per-endpoint coordinate
-    gradient), leaving the energy shape to whichever ``compute_function`` mixin it is combined with.
     """
 
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Compute pairwise distances (and optionally their coordinate gradient) for the indexed atom pairs.
-
-        Args:
-            coords: `[..., M, 3]` coordinates.
-            index: `[2, P]` index selecting the two atoms of each pair.
-            compute_gradient: When ``True``, also return the per-endpoint gradient.
-
-        Returns:
-            The `[..., P]` distances, or a ``(distances, gradient)`` tuple when ``compute_gradient`` is set.
-        """
-
         delta = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
         distance = torch.linalg.norm(delta, dim=-1).clamp_min(1e-8)
         if not compute_gradient:
@@ -3087,28 +2328,11 @@ class Boltz1DistancePotential(Boltz1Potential):
 class Boltz1DihedralPotential(Boltz1Potential):
     r"""
     Geometric quantity mixin computing signed dihedral angles from a 4-row index.
-
-    Supplies the [`Boltz1Potential`][ofoldx.models.boltz1.model.Boltz1Potential] ``compute_variable`` hook: it
-    turns a ``[4, P]`` atom-quad index into the ``P`` signed dihedral angles (and their per-atom coordinate
-    gradient), for use with any energy-function mixin bounding the angle.
     """
 
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Compute signed dihedral angles (and optionally their coordinate gradient) for the indexed atom quads.
-
-        Args:
-            coords: `[..., M, 3]` coordinates.
-            index: `[4, P]` index selecting the four atoms of each dihedral.
-            compute_gradient: When ``True``, also return the per-atom gradient.
-
-        Returns:
-            The `[..., P]` signed dihedral angles, or an ``(angles, gradient)`` tuple when
-            ``compute_gradient`` is set.
-        """
-
         r_ij = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
         r_kj = coords.index_select(-2, index[2]) - coords.index_select(-2, index[1])
         r_kl = coords.index_select(-2, index[2]) - coords.index_select(-2, index[3])
@@ -3134,30 +2358,11 @@ class Boltz1DihedralPotential(Boltz1Potential):
 class Boltz1AbsoluteDihedralPotential(Boltz1DihedralPotential):
     r"""
     Dihedral variant that returns the absolute angle, with the gradient sign flipped where the angle is negative.
-
-    Used by potentials that care about the magnitude of a dihedral rather than its sign (planarity, E/Z stereo):
-    it folds the
-    [`Boltz1DihedralPotential`][ofoldx.models.boltz1.model.Boltz1DihedralPotential]
-    output through ``abs`` and negates the gradient wherever the underlying signed
-    angle was negative, so the chain rule stays consistent.
     """
 
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r"""
-        Compute absolute dihedral angles (and optionally their sign-adjusted gradient).
-
-        Args:
-            coords: `[..., M, 3]` coordinates.
-            index: `[4, P]` index selecting the four atoms of each dihedral.
-            compute_gradient: When ``True``, also return the sign-adjusted per-atom gradient.
-
-        Returns:
-            The `[..., P]` absolute dihedral angles, or an ``(angles, gradient)`` tuple when
-            ``compute_gradient`` is set.
-        """
-
         if not compute_gradient:
             return torch.abs(cast(Tensor, super().compute_variable(coords, index, compute_gradient=False)))
         phi, grad = cast(tuple[Tensor, Tensor], super().compute_variable(coords, index, compute_gradient=True))
@@ -3168,29 +2373,11 @@ class Boltz1AbsoluteDihedralPotential(Boltz1DihedralPotential):
 class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
     r"""
     PoseBusters bond/angle/clash distance potential over the RDKit bounds, with per-category buffers.
-
-    Combines the distance geometry of
-    [`Boltz1DistancePotential`][ofoldx.models.boltz1.model.Boltz1DistancePotential]
-    with the [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` reads the
-    RDKit bounds pairs and widens each pair's lower/upper bound by a per-category buffer (bond, angle, or clash) so
-    predicted geometry that violates the RDKit-derived bounds is penalized.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Select the RDKit bounds pairs and widen their bounds per bond/angle/clash buffer.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (RDKit bounds index/masks and bounds).
-            parameters: Resolved scalar parameters (``bond_buffer``, ``angle_buffer``, ``clash_buffer``).
-
-        Returns:
-            Tuple ``(pair_index, (k, lower_bounds, upper_bounds), None)``.
-        """
-
         pair_index = feats["rdkit_bounds_index"][0]
         lower_bounds = feats["rdkit_lower_bounds"][0].clone()
         upper_bounds = feats["rdkit_upper_bounds"][0].clone()
@@ -3215,29 +2402,11 @@ class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
 class Boltz1ConnectionsPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
     r"""
     Distance potential pulling cross-chain connected atom pairs within a fixed upper-bound buffer.
-
-    Combines the distance geometry of
-    [`Boltz1DistancePotential`][ofoldx.models.boltz1.model.Boltz1DistancePotential]
-    with the [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` selects
-    the explicitly connected atom pairs and sets only an upper bound, so the energy grows once a bonded connection
-    is stretched beyond the buffer distance, keeping covalently linked chains together.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Select the connected atom pairs and set their upper-bound buffer.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (connected atom index).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(pair_index, (k, None, upper_bounds), None)``.
-        """
-
         pair_index = feats["connected_atom_index"][0]
         upper_bounds = torch.full((pair_index.shape[1],), float(parameters["buffer"]), device=pair_index.device)
         return pair_index, (torch.ones_like(upper_bounds), None, upper_bounds), None
@@ -3246,29 +2415,11 @@ class Boltz1ConnectionsPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
 class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
     r"""
     Van-der-Waals clash potential penalizing non-bonded, cross-chain atom pairs closer than their summed radii.
-
-    Combines the distance geometry of
-    [`Boltz1DistancePotential`][ofoldx.models.boltz1.model.Boltz1DistancePotential]
-    with the [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` enumerates
-    non-bonded, cross-chain, multi-atom pairs and sets each pair's lower bound to the buffered sum of the two atoms'
-    Van-der-Waals radii, so overlapping (clashing) atoms are pushed apart.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Enumerate non-bonded atom pairs and set their lower bound to the buffered summed VdW radii.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (atom-to-token, chain indices, atom mask, elements).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(pair_index, (k, lower_bounds, None), None)``; ``pair_index`` is empty when no atoms remain.
-        """
-
         atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[0]
         atom_mask = feats["atom_mask"][0].bool()
         if not torch.any(atom_mask):
@@ -3314,30 +2465,11 @@ class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotenti
 class Boltz1SymmetricChainComPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
     r"""
     Distance potential separating the centers of mass of same-entity symmetric chain pairs.
-
-    Combines the distance geometry of
-    [`Boltz1DistancePotential`][ofoldx.models.boltz1.model.Boltz1DistancePotential]
-    with the [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well, but reduces coordinates to
-    per-chain centers of mass first (via the ``com_args`` returned by ``compute_args``). A lower-bound buffer on the
-    center-of-mass distance keeps symmetric copies of the same entity from collapsing onto each other.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, tuple[Tensor, Tensor] | None]:
-        r"""
-        Select the symmetric-chain pairs and emit the per-chain center-of-mass reduction args.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (atom-to-token, chain ids, pad mask, symmetric pairs).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(pair_index, (k, lower_bounds, None), (atom_chain_index, atom_mask))`` so the base reduces
-            over chain centers of mass.
-        """
-
         atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[0]
         atom_mask = feats["atom_mask"][0].bool()
         pair_index = feats["symmetric_chain_index"][0]
@@ -3357,29 +2489,11 @@ class Boltz1SymmetricChainComPotential(Boltz1DistancePotential, Boltz1FlatBottom
 class Boltz1StereoBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBottomPotential):
     r"""
     Absolute-dihedral potential enforcing E/Z stereo-bond orientations toward 0 or pi.
-
-    Combines the absolute-angle geometry of
-    [`Boltz1AbsoluteDihedralPotential`][ofoldx.models.boltz1.model.Boltz1AbsoluteDihedralPotential] with the
-    [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` reads each
-    stereo bond's target orientation and sets the absolute-angle bounds toward ``pi`` (E) or ``0`` (Z), penalizing
-    predicted double-bond geometry that has the wrong E/Z configuration.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Select the stereo-bond dihedrals and set orientation-dependent absolute-angle bounds.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (stereo-bond index and orientations).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(index, (k, lower_bounds, upper_bounds), None)``.
-        """
-
         index = feats["stereo_bond_index"][0]
         orientation = feats["stereo_bond_orientations"][0].bool()
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
@@ -3394,29 +2508,11 @@ class Boltz1StereoBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBotto
 class Boltz1ChiralAtomPotential(Boltz1DihedralPotential, Boltz1FlatBottomPotential):
     r"""
     Signed-dihedral potential enforcing chiral-center handedness by sign of the improper dihedral.
-
-    Combines the signed-angle geometry of
-    [`Boltz1DihedralPotential`][ofoldx.models.boltz1.model.Boltz1DihedralPotential] with the
-    [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` reads each
-    chiral center's target orientation and sets a one-sided signed-angle bound, so the improper dihedral is driven
-    to the correct sign (R vs S handedness).
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Select the chiral-atom dihedrals and set orientation-dependent signed-angle bounds.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (chiral-atom index and orientations).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(index, (k, lower_bounds, upper_bounds), None)``.
-        """
-
         index = feats["chiral_atom_index"][0]
         orientation = feats["chiral_atom_orientations"][0].bool()
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
@@ -3431,29 +2527,11 @@ class Boltz1ChiralAtomPotential(Boltz1DihedralPotential, Boltz1FlatBottomPotenti
 class Boltz1PlanarBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBottomPotential):
     r"""
     Absolute-dihedral potential enforcing planarity around double bonds via improper dihedrals near zero.
-
-    Combines the absolute-angle geometry of
-    [`Boltz1AbsoluteDihedralPotential`][ofoldx.models.boltz1.model.Boltz1AbsoluteDihedralPotential] with the
-    [`Boltz1FlatBottomPotential`][ofoldx.models.boltz1.model.Boltz1FlatBottomPotential]
-    well: ``compute_args`` builds the
-    improper dihedrals around each planar double bond and sets an upper bound near zero, penalizing out-of-plane
-    geometry at conjugated/double-bond centers.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        r"""
-        Build the improper dihedrals around each planar double bond and set their upper-bound buffer.
-
-        Args:
-            feats: The Boltz-1x steering feature dict (planar-bond index).
-            parameters: Resolved scalar parameters (``buffer``).
-
-        Returns:
-            Tuple ``(improper_index, (k, None, upper_bounds), None)``.
-        """
-
         double_bond_index = feats["planar_bond_index"][0].T
         improper_map = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 3]], device=double_bond_index.device).T
         improper_index = double_bond_index[:, improper_map].swapaxes(0, 1).flatten(start_dim=1)
@@ -3938,11 +3016,11 @@ def _molecule_type_for_confidence(input: Boltz1Input, multiplicity: int, device:
 
 def _decode_boltz1_fold_result(output: Boltz1Output, input: Boltz1Input) -> FoldResult:
     r"""
-    Decode one raw [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output] into a canonical ``FoldResult``.
+    Decode one model output into structures and confidence values.
 
     Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
     sample, and lifts the confidence head's per-token metrics, token-pair PAE/PDE, and per-sample ranking
-    scores onto the canonical value carriers aligned to the layout's token axis.
+    scores onto values aligned to the layout's token axis.
 
     Args:
         output: The raw folding output (sampled coords, confidence logits, derived ranking scores).
@@ -4089,13 +3167,14 @@ def _unflatten_sample_axis(tensor: Tensor, batch_size: int, multiplicity: int) -
 
 # ---------------------------------------------------------------------------
 # Tensor boundary of the Boltz-1 model graph: the pure-tensor input,
-# raw output, canonical identity layout, trunk-representation value, and pocket record.
+# output, molecular-identity layout, trunk representations, and pocket record.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Boltz1Pocket:
-    r"""One Boltz-1 unary pocket conditioning declaration.
+    r"""
+    One Boltz-1 unary pocket conditioning declaration.
 
     The encoding admits a single binder chain and an explicitly declared
     contact-residue list; the 6 A cutoff is the training-time contact definition and
@@ -4103,8 +3182,8 @@ class Boltz1Pocket:
     representable.
 
     Args:
-        binder: The canonical ``instance_id`` of the single binder chain.
-        pocket: Canonical [`ComponentReference`][ofoldx.data.molecular.ComponentReference]
+        binder: The ``instance_id`` of the single binder chain.
+        pocket: [`ComponentReference`][ofoldx.data.molecular.ComponentReference] values
             values naming the pocket contact residues.
     """
 
@@ -4114,13 +3193,8 @@ class Boltz1Pocket:
 
 @dataclass(frozen=True)
 class Boltz1Layout:
-    r"""Canonical molecular identities aligned to one Boltz-1 tensor layout.
-
-    Args:
-        system: The canonical molecular system the tensor batch was lowered from.
-        atom_sites: Model atom order aligned to the atom axis (``M`` heavy atoms, sans padding).
-        token_sites: Model token order aligned to the token axis (``N`` tokens); polymer tokens carry
-            ``(instance_id, monomer_index)`` and ligand-atom tokens carry the single ``AtomSite``.
+    r"""
+    Molecular identities aligned to one Boltz-1 tensor layout.
     """
 
     system: MolecularSystem
@@ -4131,7 +3205,7 @@ class Boltz1Layout:
 @dataclass(kw_only=True)
 class Boltz1Input:
     r"""
-    Input tensors consumed by [`Boltz1Model`][ofoldx.models.boltz1.model.Boltz1Model].
+    Input tensors consumed by [`Boltz1Model`][].
 
     The contract is Boltz-1 specific: residue-token geometry, optional MSA features, molecule/frame fields used
     by confidence ranking, and optional token-level ``pocket_feature`` one-hot with classes ``UNSPECIFIED``,
@@ -4188,7 +3262,7 @@ class Boltz1Input:
         contact_union_index: Optional Boltz-1x contact union index.
         contact_negation_mask: Optional Boltz-1x contact negation mask.
         contact_thresholds: Optional Boltz-1x contact distance thresholds.
-        layout: Optional canonical [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] aligning the
+        layout: Optional [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] aligning the
             tensor axes to molecular identities; populated by ``Boltz1Processor`` and required by ``fold``.
     """
 
@@ -4248,13 +3322,6 @@ class Boltz1Input:
 class _Boltz1TrunkState:
     r"""
     Boltz-1 trunk representations returned by the recycling trunk.
-
-    Args:
-        single_inputs: `[B, N, input_size]` single-input representation.
-        single: Trunk single representation `[B, N, single_size]`.
-        pair: Trunk pair representation `[B, N, N, pair_size]`.
-        distogram_logits: `[B, N, N, num_distogram_bins]` distogram-head logits.
-        relative_position_encoding: `[B, N, N, pair_size]` relative-position encoding for diffusion conditioning.
     """
 
     single_inputs: Tensor
@@ -4267,16 +3334,21 @@ class _Boltz1TrunkState:
 @dataclass(kw_only=True)
 class Boltz1Output:
     r"""
-    Bundle the sampled coordinates, distogram logits, and confidence head outputs of one Boltz-1 forward pass.
+    Predictions from a Boltz-1 training or sampling pass.
 
     Args:
-        coordinates: `[B, num_samples, M, 3]` sampled atom coordinates.
-        distogram_logits: `[B, N, N, num_distogram_bins]` trunk distogram logits.
-        plddt_logits: Optional `[B, num_samples, N, num_plddt_bins]` pLDDT logits.
-        pae_logits: Optional `[B, num_samples, N, N, num_pae_bins]` PAE logits.
-        pde_logits: Optional `[B, num_samples, N, N, num_pde_bins]` PDE logits.
-        resolved_logits: Optional `[B, num_samples, N, 2]` resolved-atom logits.
-        confidence_scores: Optional mapping of derived per-sample confidence/ranking scores.
+        coordinates: Atom coordinates in angstroms. Sampling returns shape
+            ``(B, S, A, 3)``; ``forward`` returns ``(B*S, A, 3)``.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        plddt_logits: Optional confidence logits with shape ``(B, S, N, D_plddt)``.
+        pae_logits: Optional aligned-error logits with shape ``(B, S, N, N, D_pae)``.
+        pde_logits: Optional distance-error logits with shape ``(B, S, N, N, D_pde)``.
+        resolved_logits: Optional resolved-state logits with shape ``(B, S, N, 2)``.
+        confidence_scores: Optional per-sample confidence and ranking tensors.
+        augmented_target_coordinates: Training targets after rigid augmentation,
+            with shape ``(B*S, A, 3)`` in angstroms.
+        noise_level: Training noise standard deviations with shape ``(B*S,)`` in
+            angstroms.
     """
 
     coordinates: Tensor
@@ -4292,10 +3364,8 @@ class Boltz1Output:
 
 @dataclass(kw_only=True)
 class Boltz1Representations:
-    r"""Raw Boltz-1 trunk representations surfaced by ``Boltz1Model.representations``.
-
-    These carry vocabulary/layout axes excluded from canonical ``Metric``/``PairMetric``,
-    so they are surfaced by a typed expert method rather than folded into ``FoldResult``.
+    r"""
+    Raw Boltz-1 trunk representations surfaced by ``Boltz1Model.representations``.
 
     Args:
         single: Trunk single representation `[B, N, single_size]`.

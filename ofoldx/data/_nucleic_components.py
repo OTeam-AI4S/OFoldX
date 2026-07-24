@@ -1,4 +1,5 @@
-r"""Built-in nucleic component graphs and reference coordinates.
+r"""
+Built-in nucleic component graphs and reference coordinates.
 
 The eight standard components are graph and ideal-coordinate facts from the wwPDB
 ``components.v20240608.cif`` snapshot (SHA-256

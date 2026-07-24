@@ -1,9 +1,11 @@
-r"""MPNN side-chain packing implementation."""
+r"""
+MPNN side-chain packing implementation.
+"""
 
 from __future__ import annotations
 
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from . import pdb as _pdb_io
 from .config import MpnnPackerConfig, MpnnPackerProcessorConfig
 from .model import (
@@ -13,21 +15,20 @@ from .model import (
     MpnnPackerModel,
     MpnnPackerOutput,
     MpnnPackerSamplingOutput,
-    pack_candidate,
 )
 from .pipeline import MpnnPackerPipeline
 from .processor import MpnnPackerProcessor
 
 write_pdb = _pdb_io.write_pdb
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.mpnn_packer",
     model=MpnnPackerModel,
     processor=MpnnPackerProcessor,
     processor_config=MpnnPackerProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
     tasks=("pack",),

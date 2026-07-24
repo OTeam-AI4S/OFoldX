@@ -1,4 +1,6 @@
-r"""Input processing for Boltz-1 structure prediction."""
+r"""
+Input processing for Boltz-1 structure prediction.
+"""
 
 from __future__ import annotations
 
@@ -105,7 +107,9 @@ _DNA_MSA_RESTYPE = {
 
 
 def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
-    r"""Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-1 token."""
+    r"""
+    Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-1 token.
+    """
 
     if symbol == "-":
         return _MSA_GAP
@@ -117,15 +121,8 @@ def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
 
 
 class Boltz1Processor(Processor):
-    r"""Lower one canonical molecular system to ``Boltz1Input``.
-
-    Produces residue-token geometry, the 33-token
-    residue/MSA vocabulary, the shared EDM reference-atom feature vector (with the
-    Boltz-1 atom-pad-mask channel), the four-class pocket one-hot (all-``UNSPECIFIED``
-    unless a ``Boltz1Pocket`` is supplied), and the per-token molecule/frame fields
-    consumed by the confidence-ranking head. The optional Boltz-1x
-    physical-potential constraint surface is left empty; the model materializes
-    empty steering features from the absent fields.
+    r"""
+    Convert supported biomolecular inputs into `Boltz1Input`.
 
     Args:
         device: Device for produced tensors.
@@ -148,16 +145,19 @@ class Boltz1Processor(Processor):
         pocket: Boltz1Pocket | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz1Input:
-        r"""Lower one folding input, its optional MSA evidence, and an optional pocket to ``Boltz1Input``.
+        r"""
+        Prepare folding features for one molecular system.
 
         Args:
-            input: Canonical molecular system, structure, or local structure path.
+            input: Molecular system, structure, or local structure path.
             msa: Optional MSA value, collection, or alignment path.
             pocket: Optional binder and pocket-residue specification.
-            generator: Optional RNG for reference-conformer augmentation.
+            generator: Optional generator for independent rigid transforms of reference
+                conformers.
 
         Returns:
-            A ``Boltz1Input`` with aligned token, atom, MSA, pocket, and layout values.
+            Batched token, atom, MSA, and pocket tensors. Reference coordinates
+            are in angstroms; tensor axes align to ``layout``.
         """
 
         if isinstance(input, str | PathLike):
@@ -196,7 +196,9 @@ def _prepare_boltz1_features(
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz1Input:
-    r"""Build the Boltz-1 token, atom, MSA, and identity layout."""
+    r"""
+    Build the Boltz-1 token, atom, MSA, and identity layout.
+    """
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
     entity_index_by_id: dict[str, int] = {}
@@ -445,7 +447,8 @@ def _pocket_feature(
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> Tensor:
-    r"""Lower one optional ``Boltz1Pocket`` to a four-class pocket one-hot ``[N, 4]``.
+    r"""
+    Encode an optional ``Boltz1Pocket`` as a four-class ``(N, 4)`` one-hot.
 
     Every token of the ``binder`` instance becomes ``BINDER``; named pocket
     residues become ``POCKET``; all remaining tokens become ``UNSELECTED``.
@@ -490,7 +493,9 @@ def _token_bond_indicator(
     site_to_token: dict[AtomSite, int],
     token_count: int,
 ) -> Tensor:
-    r"""Build the symmetric inter-token bond indicator ``[N, N]`` consumed by ``token_bond_projection``."""
+    r"""
+    Build the symmetric inter-token bond indicator ``[N, N]`` consumed by ``token_bond_projection``.
+    """
 
     token_bonds = torch.zeros(token_count, token_count)
 
@@ -650,7 +655,8 @@ def _augment_reference_positions(
     *,
     generator: torch.Generator | None = None,
 ) -> None:
-    r"""Randomly rotate and translate each resolved reference conformer.
+    r"""
+    Randomly rotate and translate each resolved reference conformer.
 
     Random values are drawn from ``generator``; ``None`` uses the ambient PyTorch
     RNG.
@@ -714,7 +720,9 @@ def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> l
 
 
 def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
-    r"""Materialize canonical molecule data as RDKit chemistry."""
+    r"""
+    Materialize molecule data as an RDKit graph.
+    """
 
     from rdkit import Chem
 

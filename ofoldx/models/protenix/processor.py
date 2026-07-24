@@ -1,4 +1,6 @@
-r"""Lower canonical biomolecular inputs to Protenix tensors."""
+r"""
+Prepare biomolecular features for Protenix.
+"""
 
 from __future__ import annotations
 
@@ -121,7 +123,8 @@ _FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 
 
 class ProtenixProcessor(Processor):
-    r"""Build atom, token, MSA, and guidance tensors for Protenix folding.
+    r"""
+    Convert supported biomolecular inputs into `ProtenixInput`.
 
     Args:
         config: Feature limits and reference-position options. Defaults to
@@ -150,7 +153,8 @@ class ProtenixProcessor(Processor):
         templates: Sequence[Template | str | PathLike[str]] = (),
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        r"""Lower an unconstrained assembly and its evidence to ``ProtenixInput``.
+        r"""
+        Prepare model features for one molecular assembly.
 
         Args:
             input: Inline protein sequence, FASTA or structure path, one or more
@@ -161,12 +165,9 @@ class ProtenixProcessor(Processor):
             generator: Optional PyTorch generator for reference-position augmentation.
 
         Returns:
-            A default-graph ``ProtenixInput`` containing model tensors and canonical system, atom,
-            and token identities.
-
-        Notes:
-            Atom-aligned tensors follow ``atom_sites``; token-aligned tensors follow
-            ``token_sites``.
+            Batched token, atom, and MSA tensors. Reference coordinates are in
+            angstroms. Atom-aligned tensors follow ``atom_sites`` and token-aligned
+            tensors follow ``token_sites``.
         """
 
         return self._lower(input, msa=msa, templates=templates, generator=generator)
@@ -182,8 +183,6 @@ class ProtenixProcessor(Processor):
         pocket: ProtenixPocket | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        r"""Shared lowering body. Constraint channels are empty unless a subclass supplies them."""
-
         template_values = tuple(templates)
         if template_values:
             raise ValueError("Protenix does not enable template blocks")
@@ -191,8 +190,8 @@ class ProtenixProcessor(Processor):
         token_contact_values = tuple(token_contacts)
         system = _normalize_input(input)
         normalized_msa = _normalize_msa(msa, system)
-        # Only atom contacts force per-atom token expansion (their endpoints must become atom-level
-        # tokens); token contacts and pockets consume whichever tokens the residues already lower to.
+        # Atom contacts require atom-level tokens. Token contacts and pockets use
+        # the tokenization already selected for each residue.
         expanded_residues = _atom_constraint_residues(atom_contact_values, system)
         tokens = _tokenize(system, expanded_residues)
         return _features(
@@ -211,10 +210,8 @@ class ProtenixProcessor(Processor):
 
 
 class ProtenixConstraintProcessor(ProtenixProcessor):
-    r"""Lower atom contacts, token contacts, and one pocket into Protenix constraints.
-
-    Its public call adds constraint arguments that [`ProtenixProcessor`][] deliberately
-    omits.
+    r"""
+    Convert biomolecular inputs and spatial constraints into `ProtenixInput`.
 
     Args:
         config: Constraint feature limits and reference-position options. Defaults to
@@ -247,7 +244,8 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         pocket: ProtenixPocket | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        r"""Lower an assembly, evidence, and constraints to ``ProtenixInput``.
+        r"""
+        Prepare model features and spatial constraints for one assembly.
 
         Args:
             input: Inline protein sequence, FASTA or structure path, one or more
@@ -258,16 +256,13 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
             atom_contacts: Upper-bound constraints between exact atom pairs.
             token_contacts: Upper-bound constraints between token-level endpoints.
             pocket: Optional directed binder-to-residue pocket constraint.
-            generator: Optional PyTorch generator for reference-position augmentation and
-                multi-token constraint selection.
+            generator: Optional generator for reference-position augmentation
+                and random selection among multi-token constraint endpoints.
 
         Returns:
-            A constraint-graph ``ProtenixInput`` containing model tensors and canonical system,
-            atom, and token identities.
-
-        Notes:
-            Atom-aligned tensors follow ``atom_sites``; token-aligned and constraint tensors follow
-            ``token_sites``.
+            Batched token, atom, MSA, and constraint tensors. Reference
+            coordinates and distance bounds are in angstroms. Atom-aligned tensors
+            follow ``atom_sites``; token-aligned tensors follow ``token_sites``.
         """
 
         return self._lower(
@@ -823,7 +818,8 @@ def _constraint_features(
     generator: torch.Generator | None,
     site_to_token: dict[AtomSite, int],
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    r"""Build the four Protenix constraint pair-bias channels.
+    r"""
+    Build the four Protenix constraint pair-bias channels.
 
     The architecture maps atom contacts to channel 0 and token contacts to channel 1:
 

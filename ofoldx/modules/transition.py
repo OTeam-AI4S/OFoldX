@@ -1,4 +1,6 @@
-r"""Transition update branches and row-wise dropout for trunk and atom blocks."""
+r"""
+Transition update branches and row-wise dropout for trunk and atom blocks.
+"""
 
 from __future__ import annotations
 
@@ -23,12 +25,6 @@ class Transition(nn.Module):
         hidden_size: Input and output hidden width.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
         operator_backend: Which operator backend to run; see [ofoldx.modules.backend][].
-
-    Examples:
-        >>> import torch
-        >>> transition = Transition(8, expansion=2, operator_backend="torch")
-        >>> transition(torch.randn(2, 3, 8)).shape
-        torch.Size([2, 3, 8])
     """
 
     def __init__(self, hidden_size: int, expansion: int = 4, operator_backend: str = "auto") -> None:
@@ -67,21 +63,14 @@ class Transition(nn.Module):
 
 class RowwiseDropout(nn.Module):
     r"""
-    Dropout that shares one mask across the row dimension of pair/MSA updates.
+    Apply dropout with a mask shared across the row axis.
 
-    Standard dropout would zero elements independently; this variant draws a single mask along the
-    ``-3`` (row) axis and broadcasts it, so an entire row is dropped together. It is a no-op in
-    eval mode and when ``probability`` is ``0``.
+    For an input shaped ``(..., num_rows, num_columns, hidden_size)``, the sampled
+    mask has shape ``(..., 1, num_columns, hidden_size)`` and is broadcast to every
+    row. Evaluation mode and zero probability are identities.
 
     Args:
-        probability: Dropout probability applied per row.
-
-    Examples:
-        >>> import torch
-        >>> dropout = RowwiseDropout(0.5).eval()
-        >>> hidden = torch.randn(2, 3, 4, 5)
-        >>> torch.equal(dropout(hidden), hidden)
-        True
+        probability: Dropout probability for each element of the broadcast mask.
     """
 
     def __init__(self, probability: float = 0.0) -> None:
@@ -90,14 +79,13 @@ class RowwiseDropout(nn.Module):
 
     def forward(self, hidden: Tensor) -> Tensor:
         r"""
-        Drop whole rows of the update, sharing one mask across the ``-3`` axis.
+        Apply a dropout mask broadcast across the ``-3`` axis.
 
         Args:
-            hidden: Pair/MSA update tensor with the row axis at ``-3``.
+            hidden: Tensor whose row axis is ``-3``.
 
         Returns:
-            Tensor with a dropout mask shared across the row dimension during training, or
-            ``hidden`` unchanged in eval mode or when ``probability`` is ``0``.
+            A tensor with the same shape as ``hidden``.
         """
 
         # Dropout is an identity in eval (and at p=0); short-circuit so we neither waste work nor
@@ -124,14 +112,6 @@ class ConditionedTransition(nn.Module):
         conditioning_size: Conditioning tensor width.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
         operator_backend: Public backend request forwarded to the adaptive norm.
-
-    Examples:
-        >>> import torch
-        >>> transition = ConditionedTransition(8, 4, expansion=2)
-        >>> hidden = torch.randn(2, 3, 8)
-        >>> conditioning = torch.randn(2, 3, 4)
-        >>> transition(hidden, conditioning).shape
-        torch.Size([2, 3, 8])
     """
 
     def __init__(

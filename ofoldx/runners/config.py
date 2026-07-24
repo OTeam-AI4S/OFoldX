@@ -1,12 +1,5 @@
-r"""Config-only training, evaluation, and inference configuration for the Runner.
-
-The [`RunnerConfig`][] extends danling's ``RunnerConfig`` (optimizer,
-scheduler, dataloader, checkpoint, score sections) with the two things the
-OFoldX Runner adds: which Model to build ([`ModelConfig`][]) and which raw
-structures to train/evaluate/infer on ([`DataConfig`][]). Training provenance
-lives here on the Runner config and never leaks into the frozen Model or
-Processor config (DESIGN Principle 10; §10.3): a family Model config carries no
-dataset, optimizer, schedule, or objective state.
+r"""
+Configuration values for the OFoldX runner.
 """
 
 from __future__ import annotations
@@ -18,17 +11,15 @@ import danling as dl
 
 
 class ModelConfig(chanfig.Config):
-    r"""Selects and parameterizes the Model the Runner builds.
+    r"""
+    Select and configure the model built by a runner.
 
-    - ``name`` — a **required** registered architecture id (e.g.
-      ``"ofoldx.proteinmpnn"``); it selects the family the Runner builds.
-    - ``pretrained`` — an **optional** Hub or local repository reference. When
-      set, the Runner loads that repository's weights (fine-tuning / continued
-      training); when unset, the Model is **randomly initialized**.
+    Additional configuration entries override architecture settings when
+    ``pretrained`` is absent.
 
-    Extra keys (anything other than ``name`` / ``pretrained``) are forwarded as
-    typed Model-config overrides on the random-init path; on the ``pretrained``
-    path the architecture and config come from the repository.
+    Attributes:
+        name: Registered architecture ID.
+        pretrained: Optional local model repository or Hugging Face Hub repository ID.
     """
 
     name: str = ""
@@ -41,12 +32,13 @@ class ModelConfig(chanfig.Config):
 
 
 class DatasetConfig(chanfig.Config):
-    r"""One split's raw-structure source plus per-call Processor arguments.
+    r"""
+    Configure one structure-dataset split.
 
-    ``source`` names the raw structures (a directory, glob, or manifest file of
-    mmCIF/PDB paths). Any extra keys become keyword arguments to the family
-    Processor's ``__call__`` (e.g. ``msa=``, ``templates=``) so the same lowering
-    path inference uses drives training.
+    Additional configuration entries are forwarded to the processor for each item.
+
+    Attributes:
+        source: Directory, glob, manifest, structure file, or ``None``.
     """
 
     source: str | None = None
@@ -57,11 +49,8 @@ class DatasetConfig(chanfig.Config):
 
 
 class DataConfig(chanfig.Config):
-    r"""Split-name -> [`DatasetConfig`][].
-
-    Split names match the danling ``train_splits`` / ``evaluate_splits`` and the
-    ``infer`` split (default keys ``train`` / ``validation`` / ``test`` /
-    ``infer``). Each value is coerced to a [`DatasetConfig`][].
+    r"""
+    Map split names to [`DatasetConfig`][ofoldx.runners.config.DatasetConfig] values.
     """
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
@@ -72,21 +61,18 @@ class DataConfig(chanfig.Config):
 
 
 class RunnerConfig(dl.RunnerConfig):
-    r"""Top-level OFoldX Runner configuration.
+    r"""
+    Configure OFoldX training, evaluation, and forward inference.
 
-    Inherits danling's ``optim`` / ``sched`` / ``dataloader`` / ``ckpt`` / ``score``
-    sections and adds `model`, `data`, and `objective`. Accepts a
-    fully constructed instance or any mapping it can be built from (YAML / CLI via
-    the inherited ``parse``).
+    Danling optimizer, scheduler, dataloader, checkpoint, and scoring options are
+    inherited from [`danling.RunnerConfig`][danling.RunnerConfig].
 
     Attributes:
-        runner: Registry key resolved through `ofoldx.runners.registry.RUNNERS`.
-        training: When ``False``, training splits are ignored (evaluate / infer only).
-        model: The Model to build (see [`ModelConfig`][]).
-        data: Split -> dataset spec (see [`DataConfig`][]).
-        objective: Objective key. When ``None`` the Runner derives it from the
-            Model architecture (e.g. the MPNN families -> ``"mpnn"``, the diffusion
-            families -> ``"diffusion"``).
+        runner: Registered runner name.
+        training: Whether training splits are enabled.
+        objective: Training objective name. ``None`` selects the architecture default.
+        model: Model selection and architecture overrides.
+        data: Dataset configuration keyed by split name.
     """
 
     runner: str = "ofoldx"
@@ -108,6 +94,13 @@ class RunnerConfig(dl.RunnerConfig):
             self.data = DataConfig(self.data)
 
     def post(self) -> None:
+        r"""
+        Finalize and validate the runner configuration.
+
+        Raises:
+            ValueError: If no registered model architecture is selected.
+        """
+
         super().post()
         if not self.model.name:
             raise ValueError("`model.name` (a registered architecture id) is required")

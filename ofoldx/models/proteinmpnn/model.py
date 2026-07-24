@@ -1,9 +1,10 @@
-r"""ProteinMPNN fixed-backbone sequence model."""
+r"""
+ProteinMPNN fixed-backbone sequence model.
+"""
 
 from __future__ import annotations
 
 import math
-import operator
 from dataclasses import dataclass
 
 import torch
@@ -29,6 +30,7 @@ from ...modules.mpnn import (
     nll_loss,
     radial_basis,
     tied_groups_from_ids,
+    validate_positive_integer,
 )
 from ...results import (
     DesignCandidate,
@@ -41,7 +43,15 @@ from .config import ProteinMpnnConfig
 
 
 class ProteinMpnnModel(Model):
-    r"""ProteinMPNN full-backbone or Cα-only sequence model."""
+    r"""
+    Design protein sequences for fixed backbones with ProteinMPNN.
+
+    Accepts [`ProteinMpnnInput`][ofoldx.models.proteinmpnn.model.ProteinMpnnInput] and returns
+    [`ProteinMpnnOutput`][ofoldx.models.proteinmpnn.model.ProteinMpnnOutput].
+
+    Args:
+        config: Model architecture and inference configuration.
+    """
 
     config_class = ProteinMpnnConfig
     config: ProteinMpnnConfig
@@ -49,7 +59,7 @@ class ProteinMpnnModel(Model):
     def __init__(self, config: ProteinMpnnConfig | None = None) -> None:
         config = ProteinMpnnConfig() if config is None else config
         super().__init__(config)
-        feature_class = CaProteinMpnnFeatures if self.config.ca_only else MpnnProteinFeatures
+        feature_class = ProteinMpnnCaFeatures if self.config.ca_only else MpnnProteinFeatures
         self.feature_encoder = feature_class(self.config.hidden_size, self.config.num_neighbors)
         self.edge_embedding = nn.Linear(self.config.hidden_size, self.config.hidden_size)
         self.encoder_blocks = nn.ModuleList(
@@ -73,7 +83,9 @@ class ProteinMpnnModel(Model):
         self.post_init()
 
     def initialize_parameters(self) -> None:
-        r"""Apply the Xavier initialization to matrix parameters."""
+        r"""
+        Apply the Xavier initialization to matrix parameters.
+        """
 
         for parameter in self.parameters():
             if parameter.ndim > 1:
@@ -81,7 +93,9 @@ class ProteinMpnnModel(Model):
 
     @staticmethod
     def _validate_backbone_noise(backbone_noise: float) -> float:
-        r"""Coerce and validate the inference-time coordinate perturbation."""
+        r"""
+        Coerce and validate the inference-time coordinate perturbation.
+        """
 
         backbone_noise = float(backbone_noise)
         if not math.isfinite(backbone_noise) or backbone_noise < 0:
@@ -90,20 +104,26 @@ class ProteinMpnnModel(Model):
 
     @staticmethod
     def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""Validate the independent decoding-order evaluation count."""
+        r"""
+        Validate the independent decoding-order evaluation count.
+        """
 
-        return _positive_integer(num_decoding_orders, "num_decoding_orders")
+        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
 
     @staticmethod
     def _require_single_target(input: ProteinMpnnInput) -> None:
-        r"""Reject an execution-batch axis on one-target biological operations."""
+        r"""
+        Reject an execution-batch axis on one-target biological operations.
+        """
 
         if input.backbone_coordinates.shape[0] != 1 or len(input.structures) != 1:
             raise ValueError("this ProteinMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
     def _repeat_input(input: ProteinMpnnInput, count: int) -> ProteinMpnnInput:
-        r"""Repeat one biological input into ``count`` aligned evaluation rows."""
+        r"""
+        Repeat one biological input into ``count`` aligned evaluation rows.
+        """
 
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
@@ -132,7 +152,9 @@ class ProteinMpnnModel(Model):
         logits: Tensor,
         decoding_ranks: Tensor,
     ) -> MpnnProbabilityResult:
-        r"""Wrap aligned per-evaluation logits with the one target's identity."""
+        r"""
+        Wrap aligned per-evaluation logits with the one target's identity.
+        """
 
         return MpnnProbabilityResult(
             target=input.structures[0],
@@ -149,7 +171,9 @@ class ProteinMpnnModel(Model):
         decoding_ranks: Tensor,
         tied_group_ids: Tensor,
     ) -> None:
-        r"""Assert the exact explicit-rank tensor and its causal-unit identity."""
+        r"""
+        Assert the exact explicit-rank tensor and its causal-unit identity.
+        """
 
         if decoding_ranks.shape != tied_group_ids.shape:
             raise ValueError("decoding_ranks has the wrong exact shape")
@@ -187,7 +211,8 @@ class ProteinMpnnModel(Model):
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
-        r"""Draw fixed-first causal ranks directly from aligned causal-unit IDs.
+        r"""
+        Draw fixed-first causal ranks directly from aligned causal-unit IDs.
 
         Every causal unit receives one random priority. Members of a unit share its
         priority through ``tied_group_ids`` and therefore share its rank, while every
@@ -213,7 +238,9 @@ class ProteinMpnnModel(Model):
 
     @staticmethod
     def _representative_positions(tied_group_ids: Tensor) -> Tensor:
-        r"""Return the first-occurrence row of every causal unit for one input."""
+        r"""
+        Return the first-occurrence row of every causal unit for one input.
+        """
 
         device = tied_group_ids.device
         length = tied_group_ids.shape[1]
@@ -233,7 +260,9 @@ class ProteinMpnnModel(Model):
         backbone_noise: float,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Run the one coordinate encoder shared by every operation."""
+        r"""
+        Run the one coordinate encoder shared by every operation.
+        """
 
         if backbone_noise:
             backbone_coordinates = backbone_coordinates + backbone_noise * torch.randn(
@@ -276,7 +305,9 @@ class ProteinMpnnModel(Model):
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
-        r"""Return raw teacher-forced logits for one exact causal ranking."""
+        r"""
+        Return raw teacher-forced logits for one exact causal ranking.
+        """
 
         token_states = self.token_embedding(sequence_tokens)
         sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
@@ -305,7 +336,8 @@ class ProteinMpnnModel(Model):
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
-        r"""Return raw sequence-free logits under one causal ranking.
+        r"""
+        Return raw sequence-free logits under one causal ranking.
 
         Every position attends only its earlier-decoded neighbors through the
         forward encoder context; no decoded identity ever enters the decoder, so the
@@ -330,7 +362,18 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        r"""Return the shared node states, edge states, and neighbor indices."""
+        r"""
+        Encode a batch of protein backbones as residue graph states.
+
+        Args:
+            input: ProteinMPNN tensors with batch and residue axes.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for coordinate noise.
+
+        Returns:
+            Node states with shape ``(B, L, H)``, edge states with shape
+            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+        """
 
         backbone_noise = self._validate_backbone_noise(backbone_noise)
         return self._encode(
@@ -350,7 +393,19 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnOutput:
-        r"""Return the single teacher-forced differentiable sequence-conditioned pass."""
+        r"""
+        Predict residue logits conditioned on the input sequence and decoding order.
+
+        Args:
+            input: ProteinMPNN tensors with batch size ``B`` and ``L`` residue rows.
+            decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
+                decode earlier. A fixed-first random order is drawn when omitted.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for the order and coordinate noise.
+
+        Returns:
+            Vocabulary logits and the decoding ranks used for the forward pass.
+        """
 
         backbone_noise = self._validate_backbone_noise(backbone_noise)
         if decoding_ranks is not None:
@@ -389,7 +444,20 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return sequence-conditioned autoregressive probabilities over orders."""
+        r"""
+        Evaluate sequence-conditioned probabilities over decoding orders.
+
+        Args:
+            input: One processed protein target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits and ranks whose leading axis enumerates decoding orders.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -412,7 +480,21 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return order-dependent sequence-free autoregressive probabilities."""
+        r"""
+        Evaluate sequence-free probabilities over decoding orders.
+
+        Args:
+            input: One processed protein target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Sequence-free logits and ranks whose leading axis enumerates decoding
+            orders.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -454,7 +536,9 @@ class ProteinMpnnModel(Model):
         generator: torch.Generator | None,
         move_last: bool,
     ) -> MpnnProbabilityResult:
-        r"""Evaluate every target moved exactly last or first under one base order."""
+        r"""
+        Evaluate every target moved exactly last or first under one base order.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -536,7 +620,22 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-last conditional probabilities for every row."""
+        r"""
+        Evaluate each residue after all other residues in the decoding order.
+
+        Args:
+            input: One processed protein target.
+            num_decoding_orders: Number of base decoding orders to evaluate.
+            base_decoding_ranks: Optional base ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and effective ranks with shape
+            ``(num_decoding_orders, num_residues, num_residues)``.
+        """
 
         return self._single_residue_probabilities(
             input,
@@ -556,7 +655,22 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
-        r"""Return target-first sequence-free probabilities for every row."""
+        r"""
+        Evaluate each residue before all other residues in the decoding order.
+
+        Args:
+            input: One processed protein target.
+            num_decoding_orders: Number of base decoding orders to evaluate.
+            base_decoding_ranks: Optional base ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Logits with shape ``(num_decoding_orders, num_residues, vocabulary_size)``
+            and effective ranks with shape
+            ``(num_decoding_orders, num_residues, num_residues)``.
+        """
 
         return self._single_residue_probabilities(
             input,
@@ -577,7 +691,20 @@ class ProteinMpnnModel(Model):
         backbone_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Score the input sequence over independently drawn decoding orders."""
+        r"""
+        Score the observed sequence over one or more decoding orders.
+
+        Args:
+            input: One processed protein target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            generator: Random generator used for orders and coordinate noise.
+
+        Returns:
+            Designed-position and whole-sequence negative log-likelihood scores.
+        """
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
@@ -665,7 +792,9 @@ class ProteinMpnnModel(Model):
         pssm_log_odds_threshold: float | None,
         allowed_token_mask: Tensor | None,
     ) -> Tensor:
-        r"""Apply sampling controls in their original order."""
+        r"""
+        Apply sampling controls in their original order.
+        """
 
         scaled_logits = logits / temperature
         if global_logit_bias is not None:
@@ -708,10 +837,29 @@ class ProteinMpnnModel(Model):
         pssm_log_odds_threshold: float | None = None,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnSamplingOutput:
-        r"""Sample sequences, resolving tied and untied groups on one causal path."""
+        r"""
+        Sample protein sequences under the processed design constraints.
+
+        Args:
+            input: One processed protein target.
+            num_samples: Number of sequences to sample.
+            temperature: Positive sampling temperature.
+            decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``.
+            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
+            global_omit_token_mask: Optional exclusion mask with shape
+                ``(vocabulary_size,)``.
+            pssm_mixture: Weight of the per-residue PSSM probabilities.
+            pssm_log_odds_threshold: Optional minimum accepted PSSM log odds.
+            generator: Random generator used for orders, noise, and token sampling.
+
+        Returns:
+            Sampled token IDs, model log probabilities, sampling probabilities,
+            and decoding ranks, each with a leading ``num_samples`` axis.
+        """
 
         self._require_single_target(input)
-        num_samples = _positive_integer(num_samples, "num_samples")
+        num_samples = validate_positive_integer(num_samples, "num_samples")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
@@ -923,7 +1071,9 @@ class ProteinMpnnModel(Model):
         sampled_tokens: Tensor,
         design_positions: Tensor,
     ) -> MolecularSystem:
-        r"""Realize one candidate while preserving entity and bond identity."""
+        r"""
+        Realize one candidate while preserving entity and bond identity.
+        """
 
         replacements = {
             reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
@@ -951,7 +1101,8 @@ class ProteinMpnnModel(Model):
         pssm_log_odds_threshold: float | None = None,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnDesignResult:
-        r"""Design complete sequence candidates and retain each candidate's input score.
+        r"""
+        Design complete sequence candidates and retain each candidate's input score.
 
         Args:
             input: One processed protein backbone and its design constraints.
@@ -970,7 +1121,7 @@ class ProteinMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_candidates = _positive_integer(num_candidates, "num_candidates")
+        num_candidates = validate_positive_integer(num_candidates, "num_candidates")
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
@@ -1082,15 +1233,14 @@ class ProteinMpnnModel(Model):
         return ProteinMpnnDesignResult(candidates=tuple(candidates), input_score=input_score)
 
 
-def _positive_integer(value: int, name: str) -> int:
-    result = operator.index(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return result
+class ProteinMpnnCaFeatures(nn.Module):
+    r"""
+    Encode C-alpha coordinates as a ProteinMPNN edge graph.
 
-
-class CaProteinMpnnFeatures(nn.Module):
-    r"""Build the Cα-only ProteinMPNN edge feature graph."""
+    Args:
+        hidden_size: Width of the returned edge features.
+        num_neighbors: Maximum number of nearest neighbors per residue.
+    """
 
     def __init__(self, hidden_size: int, num_neighbors: int) -> None:
         super().__init__()
@@ -1101,7 +1251,15 @@ class CaProteinMpnnFeatures(nn.Module):
 
     @staticmethod
     def quaternions(rotations: Tensor) -> Tensor:
-        r"""Convert rotation matrices to the quaternion features."""
+        r"""
+        Convert rotation matrices to normalized quaternion features.
+
+        Args:
+            rotations: Rotation matrices with shape ``(..., 3, 3)``.
+
+        Returns:
+            Quaternions in ``(x, y, z, w)`` order with shape ``(..., 4)``.
+        """
 
         diagonal = torch.diagonal(rotations, dim1=-2, dim2=-1)
         xx, yy, zz = diagonal.unbind(-1)
@@ -1138,7 +1296,16 @@ class CaProteinMpnnFeatures(nn.Module):
         alpha_carbons: Tensor,
         neighbor_indices: Tensor,
     ) -> Tensor:
-        r"""Return the live neighbor-orientation features."""
+        r"""
+        Compute relative orientation features for neighboring residues.
+
+        Args:
+            alpha_carbons: C-alpha coordinates with shape ``(B, L, 3)``.
+            neighbor_indices: Neighbor indices with shape ``(B, L, K)``.
+
+        Returns:
+            Local directions and relative quaternions with shape ``(B, L, K, 7)``.
+        """
 
         displacements = alpha_carbons[:, 1:] - alpha_carbons[:, :-1]
         displacement_norms = torch.linalg.vector_norm(displacements, dim=-1)
@@ -1175,7 +1342,19 @@ class CaProteinMpnnFeatures(nn.Module):
         residue_index: Tensor,
         chain_index: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        r"""Build the nine-pair Cα-only neighbor graph."""
+        r"""
+        Build C-alpha-only residue edge features.
+
+        Args:
+            backbone_coordinates: C-alpha coordinates with shape ``(B, L, 3)``.
+            residue_mask: Valid-residue mask with shape ``(B, L)``.
+            residue_index: Residue indices with shape ``(B, L)``.
+            chain_index: Chain indices with shape ``(B, L)``.
+
+        Returns:
+            Edge features with shape ``(B, L, K, H)`` and neighbor indices with
+            shape ``(B, L, K)``.
+        """
 
         neighbor_distances, neighbor_indices = nearest_neighbors(
             backbone_coordinates,
@@ -1216,34 +1395,15 @@ def _pair_radial_basis(
     neighbor_indices: Tensor,
     num_bins: int = 16,
 ) -> Tensor:
-    r"""Encode source-to-neighbor-target distances with radial bases."""
+    r"""
+    Encode source-to-neighbor-target distances with radial bases.
+    """
 
     neighbor_coordinates = gather_nodes(target_coordinates, neighbor_indices)
     neighbor_distances = torch.sqrt(
         torch.sum((source_coordinates.unsqueeze(-2) - neighbor_coordinates) ** 2, dim=-1) + 1e-6
     )
     return radial_basis(neighbor_distances, num_bins)
-
-
-def smoothed_loss(
-    sequence_tokens: Tensor,
-    log_probabilities: Tensor,
-    *,
-    weight: float = 0.1,
-) -> Tensor:
-    r"""Return the per-token label-smoothed cross entropy of the observed tokens.
-
-    Adds ``weight / 21`` to the one-hot target and renormalizes each row before
-    the cross entropy, matching ProteinMPNN's label smoothing. At
-    ``weight=0`` this reduces to [`nll_loss`][]. The result has shape
-    ``sequence_tokens.shape``.
-    """
-
-    num_classes = log_probabilities.shape[-1]
-    target = F.one_hot(sequence_tokens, num_classes).to(log_probabilities.dtype)
-    target = target + weight / num_classes
-    target = target / target.sum(dim=-1, keepdim=True)
-    return -(target * log_probabilities).sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1413,34 @@ def smoothed_loss(
 
 @dataclass(eq=False)
 class ProteinMpnnInput:
-    r"""Tensors and canonical identities consumed by ProteinMPNN operations."""
+    r"""
+    Inputs for ProteinMPNN sequence design and scoring.
+
+    Args:
+        backbone_coordinates: C-alpha coordinates with shape
+            ``(batch_size, num_residues, 3)`` for a C-alpha model, or N, C-alpha,
+            C, and O coordinates with shape ``(batch_size, num_residues, 4, 3)``.
+        sequence_tokens: Residue token IDs with shape ``(batch_size, num_residues)``.
+        residue_mask: Valid-residue mask with shape ``(batch_size, num_residues)``.
+        residue_index: Residue indices with shape ``(batch_size, num_residues)``.
+        chain_index: Chain indices with shape ``(batch_size, num_residues)``.
+        design_positions: Positions eligible for design with shape
+            ``(batch_size, num_residues)``.
+        structures: Source structure for each batch item.
+        component_references: Component occurrence aligned to every residue row.
+        tied_group_ids: Autoregressive unit ID for each residue row.
+        tied_weights: Optional per-residue weights for tied sampling groups.
+        allowed_token_mask: Optional allowed-token mask with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        residue_logit_bias: Optional additive logit bias with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        pssm_coefficients: Optional PSSM mixture coefficients with shape
+            ``(batch_size, num_residues)``.
+        pssm_probabilities: Optional PSSM probabilities with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        pssm_log_odds: Optional PSSM log odds with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+    """
 
     backbone_coordinates: Tensor
     sequence_tokens: Tensor
@@ -1274,27 +1461,57 @@ class ProteinMpnnInput:
 
 @dataclass(eq=False)
 class ProteinMpnnOutput:
-    r"""Raw logits and exact causal ranks from a ProteinMPNN sequence graph."""
+    r"""
+    Outputs from one ProteinMPNN forward pass.
+
+    Args:
+        logits: Vocabulary logits with shape
+            ``(batch_size, num_residues, vocabulary_size)``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(batch_size, num_residues)``.
+    """
 
     logits: Tensor
     decoding_ranks: Tensor
 
     @property
     def log_probabilities(self) -> Tensor:
-        r"""Return vocabulary log probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary log probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.log_softmax(dim=-1)
 
     @property
     def probabilities(self) -> Tensor:
-        r"""Return vocabulary probabilities without storing a duplicate tensor."""
+        r"""
+        Return vocabulary probabilities.
+
+        Returns:
+            A tensor with the same shape as ``logits``.
+        """
 
         return self.logits.softmax(dim=-1)
 
 
 @dataclass(eq=False)
 class ProteinMpnnSamplingOutput:
-    r"""Complete aligned tensor output from the ProteinMPNN sequence sampler."""
+    r"""
+    Outputs from ProteinMPNN autoregressive sampling.
+
+    Args:
+        sequence_tokens: Sampled token IDs with shape
+            ``(num_samples, num_residues)``.
+        log_probabilities: Model log probabilities with shape
+            ``(num_samples, num_residues, vocabulary_size)``.
+        sampling_probabilities: Sampling distribution used at each position, with the
+            same shape as ``log_probabilities``.
+        decoding_ranks: Autoregressive ranks with shape
+            ``(num_samples, num_residues)``.
+    """
 
     sequence_tokens: Tensor
     log_probabilities: Tensor
@@ -1304,6 +1521,13 @@ class ProteinMpnnSamplingOutput:
 
 @dataclass(eq=False)
 class ProteinMpnnDesignResult(DesignResult):
-    r"""ProteinMPNN designs together with the native input-sequence score."""
+    r"""
+    ProteinMPNN designs and the source-sequence score.
+
+    Args:
+        candidates: Designed molecular systems in generation order.
+        input_score: Score of the input sequence under the same structure-conditioned
+            model.
+    """
 
     input_score: ScoreResult

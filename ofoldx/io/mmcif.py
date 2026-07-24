@@ -1,4 +1,6 @@
-r"""Generic mmCIF codec for canonical [`ofoldx.data.Structure`][] values."""
+r"""
+Generic mmCIF codec for canonical [`ofoldx.data.Structure`][] values.
+"""
 
 from __future__ import annotations
 
@@ -65,7 +67,21 @@ def _expect_object(value: object, owner: str) -> dict[str, object]:
 
 
 def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> ParsedStructure:
-    r"""Parse one mmCIF model or assembly into format-neutral atom records."""
+    r"""
+    Parse one mmCIF model or assembly into format-neutral atom records.
+
+    Args:
+        path: Source mmCIF path.
+        model: One-based model number to select.
+        assembly_id: Biological assembly identifier, or `None` to read the asymmetric unit.
+
+    Returns:
+        Parsed atom records, source metadata, and the mmCIF document.
+
+    Raises:
+        ValueError: If the requested model or assembly is unavailable, canonical OFoldX
+            metadata is invalid, atom records are duplicated, or no atom-site category exists.
+    """
 
     from biotite.structure.io import pdbx
 
@@ -153,7 +169,19 @@ def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> ParsedStr
 
 
 def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
-    r"""Decode and verify an OFoldX canonical mmCIF exchange payload."""
+    r"""
+    Decode and verify an OFoldX canonical mmCIF exchange payload.
+
+    Args:
+        parsed: Parsed mmCIF records containing canonical OFoldX metadata.
+
+    Returns:
+        The reconstructed structure.
+
+    Raises:
+        ValueError: If canonical metadata is missing, malformed, or inconsistent with
+            the mmCIF atom-site rows.
+    """
 
     container = parsed.canonical_payload
     if container is None:
@@ -264,7 +292,21 @@ def read_mmcif_branch_entities(
     component_table: Mapping[str, ChemicalComponent],
     selected_rows: tuple[AtomRecord, ...],
 ) -> tuple[dict[str, Molecule], dict[tuple[object, ...], int]]:
-    r"""Decode selected mmCIF branched entities and source component indices."""
+    r"""
+    Decode selected mmCIF branched entities and source component indices.
+
+    Args:
+        parsed: Parsed mmCIF records and source document.
+        component_table: Chemical components available by component ID.
+        selected_rows: Atom rows retained for the selected structure.
+
+    Returns:
+        Branched entities by entity ID and source residue keys mapped to component indices.
+
+    Raises:
+        ValueError: If branch declarations, links, bond orders, component references,
+            or source numbering are invalid.
+    """
 
     cif_file = parsed.mmcif_file
     if cif_file is None:
@@ -444,7 +486,21 @@ def read_mmcif_bonds(
     selected_rows: tuple[AtomRecord, ...],
     site_by_row_index: dict[int, AtomSite],
 ) -> tuple[SystemBond, ...]:
-    r"""Decode selected mmCIF covalent connections into canonical bonds."""
+    r"""
+    Decode selected mmCIF covalent connections into system bonds.
+
+    Args:
+        parsed: Parsed mmCIF records and source document.
+        selected_rows: Atom rows retained for the selected structure.
+        site_by_row_index: Canonical atom sites indexed by source row.
+
+    Returns:
+        Resolved covalent system bonds.
+
+    Raises:
+        ValueError: If a selected covalent connection has invalid endpoints, bond order,
+            stereochemistry, or atom references.
+    """
 
     cif_file = parsed.mmcif_file
     if cif_file is None:
@@ -537,7 +593,16 @@ def read_mmcif_bonds(
 
 
 def write_mmcif(structure: Structure, path: Path) -> None:
-    r"""Write a lossless canonical mmCIF exchange representation."""
+    r"""
+    Write a structure as a canonical OFoldX mmCIF exchange file.
+
+    Args:
+        structure: Structure to serialize.
+        path: Destination mmCIF path.
+
+    Raises:
+        ValueError: If coordinates or occupancy values are not finite.
+    """
 
     from biotite.structure.io.pdbx import CIFBlock, CIFCategory, CIFFile
 

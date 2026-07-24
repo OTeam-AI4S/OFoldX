@@ -1,4 +1,6 @@
-r"""Exact NA-MPNN Model and Processor configuration."""
+r"""
+Configuration values for the NA-MPNN model and processor.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class NaMpnnConfig(Config):
-    r"""Configure the shared NA-MPNN architecture, which has no persistent ``mode`` selector.
+    r"""
+    Configure the NA-MPNN architecture.
 
     Args:
         vocab_size: Number of protein/DNA/RNA residue tokens in the NA-MPNN alphabet.
@@ -38,7 +41,8 @@ class NaMpnnConfig(Config):
 
 
 class NaMpnnProcessorConfig(Config):
-    r"""Configure persistent NA-MPNN tokenization.
+    r"""
+    Configure NA-MPNN input processing.
 
     Args:
         shared_nucleic_tokens: Whether RNA and DNA share nucleic-acid token ids.

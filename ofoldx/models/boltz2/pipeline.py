@@ -1,4 +1,6 @@
-r"""Pipelines for Boltz-2 folding and two-stage affinity scoring."""
+r"""
+Pipelines for Boltz-2 folding and two-stage affinity scoring.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +19,9 @@ from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
 
 class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
-    r"""Bind the Boltz-2 structure Model and Processor."""
+    r"""
+    Structure prediction pipeline for Boltz 2.
+    """
 
     def fold(
         self,
@@ -30,20 +34,24 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> FoldResult:
-        r"""Lower one molecular input and run Boltz-2 folding.
+        r"""
+        Predict structures for one molecular system with Boltz 2.
 
         Args:
-            input: Canonical molecular system, structure, or local structure path.
+            input: Molecular system, structure, or local structure path.
             msa: Optional MSA value, collection, or alignment path.
             num_samples: Number of structure predictions to generate.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            seed: Optional seed for reference-conformer augmentation and
+                coordinate sampling. Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by preprocessing and coordinate
+                sampling. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
 
         Returns:
-            A ``FoldResult`` whose predictions follow generation order.
+            Generation-ordered structure predictions. Structure, PAE, and PDE values
+            are in angstroms; pLDDT is on the ``0--100`` scale.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
@@ -58,22 +66,14 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
 
 
 class Boltz2AffinityPipeline(CompositePipeline):
-    r"""Run Boltz-2 folding followed by affinity scoring.
-
-    The pipeline owns separate folding and affinity Model/Processor pairs. ``score``
-    folds the complete system, ranks predictions by ``confidence_score``, and passes
-    the highest-ranked Structure to the affinity pair. The two passes have independent
-    sampling counts and default recycling settings, share one RNG stream, and both
-    receive the supplied MSA.
-
-    The result preserves the confidence-sorted folding predictions alongside the
-    affinity target, scores, and metrics.
+    r"""
+    Two-pass structure prediction and binding-affinity pipeline for Boltz 2.
 
     Args:
-        model: Affinity-scoring Model.
-        processor: Processor paired with ``model``.
-        structure_model: Structure-prediction Model used by the first stage.
-        structure_processor: Processor paired with ``structure_model``.
+        model: Affinity prediction model.
+        processor: Processor for the affinity pass.
+        structure_model: Structure prediction model.
+        structure_processor: Processor for the structure prediction pass.
     """
 
     model: Boltz2AffinityModel
@@ -115,24 +115,29 @@ class Boltz2AffinityPipeline(CompositePipeline):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz2AffinityResult:
-        r"""Run two-stage Boltz-2 affinity selection and return a flat ``Boltz2AffinityResult``.
+        r"""
+        Predict candidate structures and score protein-ligand affinity.
 
         Args:
-            input: The molecular system, canonical ``Structure``, or path lowered by the structure Processor.
-            ligand: The affinity ligand instance selector consumed by the affinity Processor.
-            msa: MSA evidence routed to both Processors.
-            num_samples: Structure-pass diffusion samples.
-            num_sampling_steps: Structure-pass EDM steps.
-            affinity_num_samples: Affinity-pass diffusion samples.
-            affinity_num_sampling_steps: Affinity-pass EDM steps.
+            input: Molecular system, structure, or local structure path.
+            ligand: Instance ID of the molecule to score. May be omitted when the
+                system contains exactly one molecule.
+            msa: Optional MSA value, collection, or alignment path used by both passes.
+            num_samples: Number of first-pass structure samples.
+            num_sampling_steps: Number of first-pass diffusion transitions.
+            affinity_num_samples: Number of second-pass candidate samples.
+            affinity_num_sampling_steps: Number of second-pass diffusion transitions.
             molecular_weight_correction: Whether to apply molecular-weight calibration.
-            seed: Optional integer seed shared by both passes; mutually exclusive with
+            seed: Optional seed shared by preprocessing and both model passes; mutually exclusive with
                 ``generator``.
-            generator: Optional RNG shared across both passes; mutually exclusive with ``seed``.
+            generator: Optional generator advanced by preprocessing and both model
+                passes; mutually exclusive with ``seed``.
 
         Returns:
-            A ``Boltz2AffinityResult`` containing confidence-sorted structure predictions and
-            affinity outputs for the selected structure.
+            First-pass predictions sorted by descending confidence, the selected
+            structure, and affinity scores. Affinity values use
+            ``log10(IC50 / micromolar)`` units; binder probabilities lie in
+            ``[0, 1]``.
         """
 
         # Reference augmentation and both model passes advance one RNG stream.
@@ -178,7 +183,8 @@ class Boltz2AffinityPipeline(CompositePipeline):
 
 @dataclass(eq=False)
 class Boltz2AffinityResult:
-    r"""One two-stage Boltz-2 affinity result.
+    r"""
+    One two-stage Boltz-2 affinity result.
 
     Contains the selected second-pass ``target``, confidence-sorted first-pass
     ``structure_predictions``, and affinity scores and metrics.

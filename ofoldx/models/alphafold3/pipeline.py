@@ -1,4 +1,6 @@
-r"""AlphaFold 3 folding Pipeline."""
+r"""
+AlphaFold 3 folding Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +18,9 @@ from .processor import AlphaFold3Processor
 
 
 class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
-    r"""Bind the AlphaFold 3 Model and Processor while preserving seed groups."""
+    r"""
+    Structure prediction pipeline for AlphaFold 3.
+    """
 
     def fold(
         self,
@@ -30,23 +34,26 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
     ) -> AlphaFold3FoldResult:
-        r"""Lower one assembly and run one AlphaFold 3 seed group.
+        r"""
+        Predict structures for one molecular assembly with AlphaFold 3.
 
         Args:
             input: Inline sequence, FASTA or structure path, polymer sequence collection,
                 molecular system, or structure topology.
             msa: Optional MSA value, collection, or alignment path.
             templates: Template structures aligned to target polymers.
-            num_samples: Number of diffusion samples. ``None`` uses the Model configuration.
-            seed: Optional integer seed recorded on the returned group; mutually exclusive with
-                ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+            num_samples: Number of diffusion samples. ``None`` uses five.
+            seed: Optional diffusion seed recorded on the returned group.
+                Mutually exclusive with ``generator``.
+            generator: Optional generator for initial coordinates, churn, and rigid
+                augmentations. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
 
         Returns:
-            An ``AlphaFold3FoldResult`` containing one seed group.
+            One seed group containing generation-ordered predictions. Coordinates,
+            PAE, and PDE values are in angstroms; pLDDT is on ``0--100``.
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)

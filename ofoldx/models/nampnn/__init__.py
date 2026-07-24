@@ -1,32 +1,41 @@
-r"""NA-MPNN mixed-polymer inverse-folding implementation."""
+r"""
+NA-MPNN mixed-polymer inverse-folding implementation.
+"""
 
 from __future__ import annotations
 
-from ...modules.mpnn import nll_loss, tied_groups_from_ids
-from ...pipelines.registry import PIPELINES
-from ..registry import MODELS
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
 from .config import NaMpnnConfig, NaMpnnProcessorConfig
 from .model import (
-    MIXED_POLYMER_ATOM_NAMES,
-    MIXED_POLYMER_COMPONENT_IDS,
+    NA_MPNN_ATOM_INDEX,
+    NA_MPNN_ATOM_NAMES,
+    NA_MPNN_COMPONENT_IDS,
+    NA_MPNN_DNA_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_INVALID_GENERATION_TOKEN_IDS,
+    NA_MPNN_PADDING_TOKEN_ID,
+    NA_MPNN_PROTEIN_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS,
+    NA_MPNN_TOKEN_BY_COMPONENT,
     NaMpnnFeatures,
     NaMpnnInput,
     NaMpnnModel,
     NaMpnnOutput,
     NaMpnnSamplingOutput,
-    smoothed_loss,
+    nampnn_polymer_label_smoothed_nll_loss,
 )
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
-MODELS.register_model(
+_MODELS.register_model(
     "ofoldx.nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
     processor_config=NaMpnnProcessorConfig,
     standard_tasks=(),
 )
-PIPELINES.register_pipeline(
+_PIPELINES.register_pipeline(
     "ofoldx.nampnn",
     pipeline=NaMpnnPipeline,
     tasks=("design", "score"),

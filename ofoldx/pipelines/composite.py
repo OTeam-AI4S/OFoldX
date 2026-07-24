@@ -1,4 +1,5 @@
-r"""Persistence for pipelines owning multiple model-processor pairs.
+r"""
+Persistence for pipelines owning multiple model-processor pairs.
 
 ``pair_layout`` assigns one pair to the repository root and additional pairs to fixed
 subdirectories. Only the root carries ``pipeline.json``.
@@ -22,7 +23,8 @@ from .registry import PIPELINES
 
 
 class CompositePair(NamedTuple):
-    r"""One pair in a composite pipeline's repository layout.
+    r"""
+    One pair in a composite pipeline's repository layout.
 
     Attributes:
         subdirectory: Repository-relative location; ``""`` selects the root.
@@ -48,12 +50,16 @@ def _pair_directory(root: Path, subdirectory: str) -> Path:
 
 
 class CompositePipeline:
-    r"""Base class for pipelines with a fixed multi-pair repository layout."""
+    r"""
+    Base class for pipelines with a fixed multi-pair repository layout.
+    """
 
     pair_layout: tuple[CompositePair, ...]
 
     def _composite_pair_source(self, pair: CompositePair) -> tuple[Model, Processor] | None:
-        r"""Return the ``(model, processor)`` a layout slot serializes, or ``None`` when absent."""
+        r"""
+        Return the ``(model, processor)`` a layout slot serializes, or ``None`` when absent.
+        """
 
         bound = getattr(self, pair.model_attribute)
         if pair.wrap is not None:
@@ -73,7 +79,8 @@ class CompositePipeline:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Move every bound Model and Processor to one device and dtype.
+        r"""
+        Move every bound model and processor to one device and dtype.
 
         Args:
             device: Destination device. ``None`` preserves each component's current device.
@@ -102,7 +109,8 @@ class CompositePipeline:
         private: bool = False,
         commit_message: str | None = None,
     ) -> None:
-        r"""Save every pair, write the root marker, and optionally upload the repository.
+        r"""
+        Save every pair, write the root marker, and optionally upload the repository.
 
         Args:
             directory: Local repository directory.
@@ -176,7 +184,8 @@ class CompositePipeline:
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> Self:
-        r"""Load every pair from one resolved repository snapshot.
+        r"""
+        Load every pair from one resolved repository snapshot.
 
         Missing optional pairs are skipped; missing required pairs raise ``ValueError``.
 
@@ -184,8 +193,8 @@ class CompositePipeline:
             directory: Local directory or Hub repository id.
             revision: Optional Hub revision.
             token: Optional Hub authentication token.
-            device: Device for loaded Models and Processors.
-            dtype: Floating-point dtype for loaded Models and Processors.
+            device: Device for loaded models and processors.
+            dtype: Floating-point dtype for loaded models and processors.
 
         Returns:
             A pipeline assembled from the repository's declared pairs.

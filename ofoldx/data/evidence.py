@@ -1,4 +1,6 @@
-r"""Canonical MSA and structural-template evidence."""
+r"""
+Multiple-sequence alignments and structural templates.
+"""
 
 from __future__ import annotations
 
@@ -13,16 +15,24 @@ from .structure import Structure
 
 @dataclass(eq=False)
 class MSA:
-    r"""One entity-named alignment projected to the query axis.
+    r"""
+    Paired and unpaired alignments for one molecular entity.
 
-    The alignment is packed as UPPERCASE one-letter MSA symbols (or the ``-``
-    gap) in query-width rows; row 0 of each pool is the ungapped query. Cells
-    are MSA symbols, not ChemicalComponent IDs, and ambiguity symbols
-    (``B Z U J O X`` and nucleic ambiguity) are preserved as-is -- there is no
-    alphabet field and no normalization here. The MSA holds no
-    [`PolymerSequence`][]; ``entity_id`` closes over the primary
-    ``MolecularSystem`` supplied beside it, and the Processor -- not this value
-    -- resolves the entity and verifies query chemistry and width.
+    Sequences use uppercase one-letter MSA symbols and ``-`` for gaps. Row zero
+    of both pools is the same ungapped query sequence.
+
+    Args:
+        entity_id: Target entity ID in the associated molecular system.
+        unpaired_sequences: Query-width rows in the unpaired MSA pool.
+        unpaired_deletion_counts: Unsigned deletion counts with shape
+            ``(num_unpaired_rows, query_length)``.
+        paired_sequences: Query-width rows in the paired MSA pool.
+        paired_deletion_counts: Unsigned deletion counts with shape
+            ``(num_paired_rows, query_length)``.
+
+    Raises:
+        ValueError: If query rows, row widths, deletion-count shapes, or dtypes are
+            inconsistent.
     """
 
     entity_id: str
@@ -63,15 +73,23 @@ class MSA:
 
 @dataclass(eq=False)
 class MSACollection:
-    r"""A raw pre-cleanup, pre-crop paired and unpaired row assembly plan.
+    r"""
+    A row assembly plan spanning one or more entity MSAs.
 
-    Columns align one-to-one with `msas` (column ``c`` binds ``msas[c]``).
-    `row_pairing` is the complete dense plan: cell ``(r, c)`` with a value
-    ``>= 0`` selects that source row in column ``c``'s pool while ``-1`` supplies
-    a gap. `row_is_paired` chooses the PAIRED pool of ``msas[c]`` where
-    ``True`` and the UNPAIRED pool where ``False`` (also recording paired feature
-    semantics). ``target_instance_ids is None`` broadcasts each column to every
-    instance of its entity; a tuple binds columns to exact target instances.
+    Column ``c`` refers to ``msas[c]``. ``row_pairing[r, c]`` selects a row from
+    that MSA, or ``-1`` for a gap; ``row_is_paired[r, c]`` selects the paired or
+    unpaired row pool.
+
+    Args:
+        msas: MSA columns participating in the assembly.
+        row_pairing: Signed integer array with shape ``(num_rows, num_msas)``.
+        row_is_paired: Boolean array aligned with ``row_pairing``.
+        target_instance_ids: Optional exact target instance for each MSA column.
+            When absent, each column applies to every instance of its entity.
+
+    Raises:
+        ValueError: If arrays, row indices, query rows, entities, or instance targets
+            are inconsistent.
     """
 
     msas: tuple[MSA, ...]
@@ -131,7 +149,16 @@ class MSACollection:
 
 
 def msa_bindings(msa: MSA | MSACollection) -> tuple[tuple[MSA, str | None], ...]:
-    r"""Return each MSA column with its exact instance target, or ``None`` for broadcast."""
+    r"""
+    Return each MSA column with its instance target.
+
+    Args:
+        msa: One MSA or a collection of paired MSA columns.
+
+    Returns:
+        Pairs of MSA columns and exact instance IDs; an instance ID of `None`
+        denotes entity-wide broadcast.
+    """
 
     columns = (msa,) if isinstance(msa, MSA) else msa.msas
     targets = (
@@ -144,7 +171,20 @@ def resolve_msa_bindings(
     msa: MSA | MSACollection,
     system: MolecularSystem,
 ) -> tuple[tuple[MSA, str | None, PolymerSequence], ...]:
-    r"""Close MSA entity/instance references over one molecular system."""
+    r"""
+    Resolve MSA entity and instance references against a molecular system.
+
+    Args:
+        msa: One MSA or a collection of paired MSA columns.
+        system: Molecular system containing the referenced entities and instances.
+
+    Returns:
+        Resolved MSA columns with their optional instance target and polymer entity.
+
+    Raises:
+        ValueError: If a referenced entity or instance is invalid, an instance belongs
+            to another entity, or an MSA width differs from its polymer length.
+    """
 
     resolved: list[tuple[MSA, str | None, PolymerSequence]] = []
     for column, target_instance_id in msa_bindings(msa):
@@ -170,7 +210,15 @@ def resolve_msa_bindings(
 
 
 def msa_binding_map(msa: MSA | MSACollection) -> dict[tuple[str, str | None], MSA]:
-    r"""Index MSA columns by ``(entity_id, exact_instance_or_none)``."""
+    r"""
+    Index MSA columns by entity and optional exact instance.
+
+    Args:
+        msa: One MSA or a collection of paired MSA columns.
+
+    Returns:
+        A mapping from `(entity_id, exact_instance_or_none)` to MSA column.
+    """
 
     return {(column.entity_id, target_instance_id): column for column, target_instance_id in msa_bindings(msa)}
 
@@ -180,7 +228,17 @@ def select_msa_binding(
     entity_id: str,
     instance_id: str,
 ) -> tuple[tuple[str, str | None], MSA] | None:
-    r"""Select an exact-instance MSA column, falling back to entity broadcast."""
+    r"""
+    Select an exact-instance MSA column, then fall back to entity broadcast.
+
+    Args:
+        bindings: MSA columns indexed by entity and optional exact instance.
+        entity_id: Entity identifier to match.
+        instance_id: Exact instance identifier to prefer.
+
+    Returns:
+        The selected binding key and MSA column, or `None` when neither binding exists.
+    """
 
     exact = (entity_id, instance_id)
     if exact in bindings:
@@ -193,13 +251,19 @@ def select_msa_binding(
 
 @dataclass(eq=False)
 class TemplateAlignment:
-    r"""One target-to-template polymer alignment within a Template.
+    r"""
+    A target-to-template polymer alignment.
 
-    ``target_entity_id`` names a target entity in the primary
-    ``MolecularSystem``; this value holds no [`PolymerSequence`][], so the
-    target-side upper bound and query chemistry are the Processor's job.
-    ``residue_pairs`` are increasing zero-based
-    ``(target_component_index, template_component_index)`` pairs.
+    Args:
+        target_entity_id: Target entity ID in the predicted molecular system.
+        target_instance_id: Optional exact target instance; ``None`` broadcasts the
+            alignment to all instances of the target entity.
+        template_instance_id: Polymer instance in the template structure.
+        residue_pairs: Strictly increasing zero-based ``(target, template)`` component
+            index pairs.
+
+    Raises:
+        ValueError: If instance identifiers or residue pairs are invalid.
     """
 
     target_entity_id: str
@@ -228,12 +292,16 @@ class TemplateAlignment:
 
 @dataclass(eq=False)
 class Template:
-    r"""Aligned template evidence sharing one Structure coordinate frame.
+    r"""
+    Structural template evidence in a shared coordinate frame.
 
-    One Template is one coordinate frame; grouping multiple chain alignments
-    under it preserves an interface frame without duplicating the Structure.
-    The template side owns the Structure, so its component-index upper bound is
-    checked here.
+    Args:
+        structure: Template structure containing every referenced template instance.
+        alignments: Target-to-template polymer alignments sharing ``structure``.
+
+    Raises:
+        ValueError: If no alignment is supplied or an alignment references an invalid
+            template polymer component.
     """
 
     structure: Structure

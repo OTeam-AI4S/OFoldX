@@ -1,4 +1,6 @@
-r"""Boltz-1 architecture and inference configuration."""
+r"""
+Boltz-1 architecture and inference configuration.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class Boltz1InputEmbeddingsConfig(Config):
-    r"""Configure the Boltz-1 atom-attention input embedder and token feature widths.
+    r"""
+    Configure the Boltz-1 atom-attention input embedder and token feature widths.
 
     Args:
         num_atom_encoder_blocks: Number of atom-attention encoder blocks.
@@ -24,7 +27,8 @@ class Boltz1InputEmbeddingsConfig(Config):
 
 
 class Boltz1TrunkConfig(Config):
-    r"""Configure the Boltz-1 Pairformer trunk and optional MSA trunk.
+    r"""
+    Configure the Boltz-1 Pairformer trunk and optional MSA trunk.
 
     Args:
         num_pairformer_blocks: Number of Pairformer blocks in the trunk.
@@ -58,7 +62,8 @@ class Boltz1TrunkConfig(Config):
 
 
 class Boltz1DenoiserConfig(Config):
-    r"""Configure the Boltz-1 EDM token transformer and atom encoder-decoder.
+    r"""
+    Configure the Boltz-1 EDM token transformer and atom encoder-decoder.
 
     Args:
         num_token_transformer_blocks: Number of conditioned token-transformer blocks in the score model.
@@ -90,7 +95,8 @@ class Boltz1DenoiserConfig(Config):
 
 
 class Boltz1SamplerConfig(Config):
-    r"""Configure the Boltz-1 EDM reverse-diffusion schedule.
+    r"""
+    Configure the Boltz-1 EDM reverse-diffusion schedule.
 
     Args:
         num_sampling_steps: Number of reverse-diffusion steps.
@@ -114,7 +120,8 @@ class Boltz1SamplerConfig(Config):
 
 
 class Boltz1ConfidenceConfig(Config):
-    r"""Configure the Boltz-1 confidence head and combined ranking score.
+    r"""
+    Configure the Boltz-1 confidence head and combined ranking score.
 
     Args:
         enabled: Whether to build and run the confidence/ranking head at all.
@@ -154,7 +161,8 @@ class Boltz1ConfidenceConfig(Config):
 
 
 class Boltz1Config(Config):
-    r"""Configure the Boltz-1 structure-prediction architecture and inference schedule.
+    r"""
+    Configure the Boltz-1 structure-prediction architecture and inference schedule.
 
     Args:
         single_size: Width of the single (token) representation.

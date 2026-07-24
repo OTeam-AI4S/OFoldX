@@ -1,4 +1,5 @@
-r"""Lower a Hub CCD dataset row to a [`ChemicalComponent`][].
+r"""
+Resolve chemical components from the Hub-hosted CCD dataset.
 
 The dataset stores one component per Parquet row. ``revision`` pins the wwPDB
 snapshot used for resolution.
@@ -14,18 +15,27 @@ from ..molecular import (
     PolymerAttachment,
 )
 
-# Hub dataset repository that distributes the CCD as Parquet rows.
+#: Hub dataset repository containing CCD component rows.
 CCD_DATASET_REPOSITORY = "ofoldx/ccd"
 
 _POLYMER_CHEM_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
 def resolve_ccd_component(component_id: str, *, revision: str) -> ChemicalComponent:
-    r"""Fetch and lower one wwPDB CCD component.
+    r"""
+    Load one wwPDB Chemical Component Dictionary entry.
 
-    ``component_id`` is an exact CCD code and ``revision`` pins the Hub snapshot.
-    Unknown IDs raise ``KeyError``; malformed rows raise ``ValueError`` or
-    ``TypeError``.
+    Args:
+        component_id: Exact CCD component code.
+        revision: Hub dataset revision containing the desired CCD snapshot.
+
+    Returns:
+        The resolved chemical component.
+
+    Raises:
+        KeyError: If the component does not exist at ``revision``.
+        TypeError: If the stored row has an invalid type.
+        ValueError: If the stored row is internally inconsistent.
     """
 
     snapshot = _resolve_ccd_snapshot(revision=revision)
@@ -36,7 +46,9 @@ def resolve_ccd_component(component_id: str, *, revision: str) -> ChemicalCompon
 
 
 def _resolve_ccd_snapshot(*, revision: str) -> Path:
-    r"""Download the pinned CCD dataset's Parquet shards."""
+    r"""
+    Download the pinned CCD dataset's Parquet shards.
+    """
 
     from huggingface_hub import snapshot_download
 
@@ -51,7 +63,9 @@ def _resolve_ccd_snapshot(*, revision: str) -> Path:
 
 
 def _read_component_row(snapshot: Path, component_id: str) -> dict[str, object] | None:
-    r"""Return the unique Parquet row for ``component_id``, or ``None``."""
+    r"""
+    Return the unique Parquet row for ``component_id``, or ``None``.
+    """
 
     import pyarrow.dataset as ds
 
@@ -67,7 +81,9 @@ def _read_component_row(snapshot: Path, component_id: str) -> dict[str, object] 
 
 
 def _lower_row(row: dict[str, object]) -> ChemicalComponent:
-    r"""Lower one CCD Parquet row to a [`ChemicalComponent`][]."""
+    r"""
+    Lower one CCD Parquet row to a [`ChemicalComponent`][].
+    """
 
     component_id = _require_str(row, "component_id")
     atom_ids = _require_str_list(row, "atom_ids")
@@ -113,7 +129,9 @@ def _lower_bond_rows(
     row: dict[str, object],
     component_id: str,
 ) -> list[tuple[str, str, float, bool, str | None]]:
-    r"""Lower the parallel bond arrays to raw ``(a, b, order, aromatic, stereo)`` rows."""
+    r"""
+    Lower the parallel bond arrays to raw ``(a, b, order, aromatic, stereo)`` rows.
+    """
 
     atom_a = _require_str_list(row, "bond_atom_a")
     atom_b = _require_str_list(row, "bond_atom_b")
@@ -148,7 +166,9 @@ def _lower_reference_coordinates(
     component_id: str,
     count: int,
 ) -> tuple[tuple[float, float, float] | None, ...]:
-    r"""Lower reference coordinates to a per-atom coordinate tuple aligned to the atoms."""
+    r"""
+    Lower reference coordinates to a per-atom coordinate tuple aligned to the atoms.
+    """
 
     raw = row.get("reference_coordinates")
     if raw is None:
@@ -170,7 +190,9 @@ def _lower_reference_coordinates(
 
 
 def _lower_attachment(row: dict[str, object], side: str) -> PolymerAttachment | None:
-    r"""Lower one polymer attachment endpoint, or ``None`` when absent."""
+    r"""
+    Lower one polymer attachment endpoint, or ``None`` when absent.
+    """
 
     atom_id = _optional_str(row.get(f"{side}_attachment_atom"))
     if atom_id is None:

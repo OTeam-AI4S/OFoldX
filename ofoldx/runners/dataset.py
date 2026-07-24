@@ -1,9 +1,5 @@
-r"""Structure dataset: raw structures lowered on demand into family Model inputs.
-
-The training-side dataset holds a family Processor (the featurizer) and applies
-it lazily per item, so the exact lowering inference uses drives training too. No
-model-specific logic lives here (DESIGN: no training/model provenance in
-``data/``); the Processor owns featurization and this class owns iteration.
+r"""
+Lazy structure datasets backed by a processor.
 """
 
 from __future__ import annotations
@@ -21,17 +17,14 @@ _GLOB_MAGIC: tuple[str, ...] = ("*", "?", "[")
 
 
 class StructureDataset(Dataset):
-    r"""Iterate raw structures, lowering each to a family Input via a Processor.
+    r"""
+    Process structure files lazily into typed model inputs.
 
     Args:
-        source: The raw structures — a directory, glob, or manifest file of
-            mmCIF / PDB paths. ``None`` is an empty dataset (a configured but
-            unused split).
-        processor: A constructed family Processor. ``processor(item, **kwargs)``
-            returns the typed family Input for one structure (already batched to a
-            leading singleton dimension, as the Processors emit).
-        processor_kwargs: Extra keyword arguments forwarded to every
-            ``processor(...)`` call (e.g. ``msa=``, ``templates=``).
+        source: Directory, glob, manifest, structure file, or ``None`` for an empty
+            dataset.
+        processor: Callable that converts one structure reference into a model input.
+        processor_kwargs: Arguments forwarded to every processor call.
     """
 
     def __init__(
@@ -55,7 +48,8 @@ class StructureDataset(Dataset):
 
 
 def _resolve_records(source: Any) -> list[str]:
-    r"""Resolve a source into a concrete, ordered list of structure-file paths.
+    r"""
+    Resolve a source into a concrete, ordered list of structure-file paths.
 
     ``None`` is an empty dataset. A glob pattern expands (sorted) to its structure
     matches; a directory yields the structure files within its tree (sorted); a
@@ -80,7 +74,8 @@ def _resolve_records(source: Any) -> list[str]:
 
 
 def _read_manifest(path: Path) -> list[str]:
-    r"""Read a manifest of structure paths, one per line, resolved against its dir.
+    r"""
+    Read a manifest of structure paths, one per line, resolved against its dir.
 
     Blank lines and ``#`` comments are skipped; relative entries resolve against the
     manifest's own directory so a manifest is portable alongside its structures.

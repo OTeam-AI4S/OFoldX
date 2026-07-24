@@ -1,4 +1,6 @@
-r"""Canonical Structure lowering for ProteinMPNN."""
+r"""
+ProteinMPNN input processing.
+"""
 
 from __future__ import annotations
 
@@ -47,10 +49,11 @@ class _LoweredRows(NamedTuple):
 
 
 class ProteinMpnnProcessor(Processor):
-    r"""Lower one canonical protein structure to ProteinMPNN tensors.
+    r"""
+    Prepare protein backbones and sequence constraints for ProteinMPNN.
 
     Args:
-        config: ProteinMPNN preprocessing options. Defaults to ``ProteinMpnnProcessorConfig()``.
+        config: ProteinMPNN input options. Defaults to ``ProteinMpnnProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
@@ -78,10 +81,11 @@ class ProteinMpnnProcessor(Processor):
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
     ) -> ProteinMpnnInput:
-        r"""Lower a PDB path or canonical ``Structure`` to ``ProteinMpnnInput``.
+        r"""
+        Prepare a PDB file or ``Structure`` for ProteinMPNN.
 
         Args:
-            input: Canonical ``Structure`` or local PDB path.
+            input: A ``Structure`` or local PDB path.
             sequence: Optional replacement sequence. A bare one-letter string requires one protein
                 instance; a mapping may provide one-letter strings or component-ID sequences by
                 instance.
@@ -96,12 +100,12 @@ class ProteinMpnnProcessor(Processor):
             pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
 
         Returns:
-            A single-example ``ProteinMpnnInput`` carrying aligned tensors, source structure, and
-            component references.
+            A single-example ``ProteinMpnnInput`` whose residue axes align with
+            ``component_references``.
 
         Notes:
-            Paths use ``process_pdb`` fixed-column row mapping; ``Structure`` values use
-            ``process_structure`` observed-CA row mapping.
+            PDB paths preserve integer residue-number gaps; ``Structure`` inputs follow
+            observed C-alpha sites.
         """
 
         if isinstance(input, (str, PathLike)):
@@ -144,7 +148,8 @@ class ProteinMpnnProcessor(Processor):
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
     ) -> ProteinMpnnInput:
-        r"""Lower a PDB path with ProteinMPNN fixed-column semantics.
+        r"""
+        Read a PDB file with ProteinMPNN residue-row semantics.
 
         Args:
             path: Local PDB path.
@@ -163,7 +168,7 @@ class ProteinMpnnProcessor(Processor):
             pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
 
         Returns:
-            A single-example ``ProteinMpnnInput`` lowered from the selected PDB chains.
+            A single-example ``ProteinMpnnInput`` for the selected PDB chains.
 
         Notes:
             Rows order designed chains before remaining chains, with each group sorted by chain
@@ -200,10 +205,11 @@ class ProteinMpnnProcessor(Processor):
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
         filter_by_occupancy: bool = True,
     ) -> ProteinMpnnInput:
-        r"""Lower a canonical ``Structure`` to ``ProteinMpnnInput``.
+        r"""
+        Prepare a ``Structure`` for ProteinMPNN.
 
         Args:
-            structure: Coordinate-bearing canonical protein structure.
+            structure: Coordinate-bearing protein structure.
             sequence: Optional replacement sequence. A bare one-letter string requires one protein
                 instance; a mapping may provide one-letter strings or component-ID sequences by
                 instance.
@@ -219,7 +225,7 @@ class ProteinMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``ProteinMpnnInput`` lowered from the canonical structure.
+            A single-example ``ProteinMpnnInput`` for ``structure``.
 
         Notes:
             Rows follow observed CA sites in ``structure.sites`` order, and
@@ -247,7 +253,9 @@ class ProteinMpnnProcessor(Processor):
         structure: Structure,
         sequence: str | Mapping[str, str | Sequence[str]] | None,
     ) -> tuple[Structure, MolecularSystem]:
-        r"""Apply an optional target sequence, rebuilding chemistry when identities change."""
+        r"""
+        Apply an optional target sequence, rebuilding chemistry when identities change.
+        """
 
         system = structure.system
         protein_instance_list: list[tuple[str, PolymerSequence]] = []
@@ -321,7 +329,9 @@ class ProteinMpnnProcessor(Processor):
         system: MolecularSystem,
         design_positions: Sequence[ComponentReference] | None,
     ) -> _LoweredRows:
-        r"""Build fixed-column rows: designed chains first, numeric gaps, ``100 * c + i`` positions."""
+        r"""
+        Build fixed-column rows: designed chains first, numeric gaps, ``100 * c + i`` positions.
+        """
 
         coordinate_index = {site: index for index, site in enumerate(structure.sites)}
         atom_names = ("CA",) if self.config.ca_only else _BACKBONE_ATOMS
@@ -445,7 +455,9 @@ class ProteinMpnnProcessor(Processor):
         design_positions: Sequence[ComponentReference] | None,
         filter_by_occupancy: bool,
     ) -> _LoweredRows:
-        r"""Build updated rows: observed-CA occurrences in source order, cumulative positions."""
+        r"""
+        Build updated rows: observed-CA occurrences in source order, cumulative positions.
+        """
 
         observed = structure.coordinate_mask
         if filter_by_occupancy and structure.occupancy is not None:
@@ -554,7 +566,9 @@ class ProteinMpnnProcessor(Processor):
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None,
     ) -> ProteinMpnnInput:
-        r"""Apply shared conditions, tie closure, and evidence to build the arm-agnostic input."""
+        r"""
+        Apply shared conditions, tie closure, and evidence to build the arm-agnostic input.
+        """
 
         (
             row_references,
@@ -818,7 +832,9 @@ def _read_proteinmpnn_pdb(
     path: str | PathLike[str],
     chains: Sequence[str] | None = None,
 ) -> Structure:
-    r"""Read the ProteinMPNN fixed-column PDB slice."""
+    r"""
+    Read the ProteinMPNN fixed-column PDB slice.
+    """
 
     residue_keys_by_chain: dict[str, list[tuple[str, int, str]]] = {}
     component_id_by_residue: dict[tuple[str, int, str], str] = {}

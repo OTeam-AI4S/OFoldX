@@ -1,12 +1,10 @@
 r"""
-Graph message passing and feature construction shared by MPNN models.
-
-This module owns reusable message-passing blocks, feature graphs, and tensor
-operations. Model inputs, outputs, sampling, and model-specific feature graphs
-remain with their model families.
+Reusable graph message-passing components for MPNN models.
 """
 
 from __future__ import annotations
+
+import operator
 
 import torch
 import torch.nn.functional as F
@@ -16,14 +14,32 @@ from .backend import LayerNorm
 
 
 def gather_edges(edges: Tensor, neighbor_indices: Tensor) -> Tensor:
-    r"""Gather each residue's selected neighbors from a dense pair tensor."""
+    r"""
+    Gather each residue's selected neighbors from a dense pair tensor.
+
+    Args:
+        edges: Dense pair features with shape ``(B, N, N, C)``.
+        neighbor_indices: Selected neighbor indices with shape ``(B, N, K)``.
+
+    Returns:
+        Neighbor-aligned edge features with shape ``(B, N, K, C)``.
+    """
 
     indices = neighbor_indices.unsqueeze(-1).expand(-1, -1, -1, edges.shape[-1])
     return torch.gather(edges, 2, indices)
 
 
 def gather_nodes(nodes: Tensor, neighbor_indices: Tensor) -> Tensor:
-    r"""Gather node features along every residue's neighbor list."""
+    r"""
+    Gather node features along every residue's neighbor list.
+
+    Args:
+        nodes: Node features with shape ``(B, N, C)``.
+        neighbor_indices: Selected neighbor indices with shape ``(B, N, K)``.
+
+    Returns:
+        Neighbor-aligned node features with shape ``(B, N, K, C)``.
+    """
 
     indices = neighbor_indices.reshape(neighbor_indices.shape[0], -1, 1).expand(
         -1,
@@ -34,7 +50,17 @@ def gather_nodes(nodes: Tensor, neighbor_indices: Tensor) -> Tensor:
 
 
 def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_indices: Tensor) -> Tensor:
-    r"""Concatenate gathered neighbor nodes onto aligned edge or context states."""
+    r"""
+    Concatenate gathered neighbor nodes onto aligned edge or context states.
+
+    Args:
+        node_states: Node features with shape ``(B, N, C_node)``.
+        neighbor_states: Neighbor-aligned features with shape ``(B, N, K, C_neighbor)``.
+        neighbor_indices: Selected neighbor indices with shape ``(B, N, K)``.
+
+    Returns:
+        Concatenated neighbor and node features with shape ``(B, N, K, C_neighbor + C_node)``.
+    """
 
     return torch.cat((neighbor_states, gather_nodes(node_states, neighbor_indices)), dim=-1)
 
@@ -45,7 +71,18 @@ def nearest_neighbors(
     num_neighbors: int,
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor]:
-    r"""Return masked nearest-neighbor distances and indices."""
+    r"""
+    Return masked nearest-neighbor distances and indices.
+
+    Args:
+        coordinates: Residue coordinates with shape ``(B, N, 3)``.
+        residue_mask: Valid-residue mask with shape ``(B, N)``.
+        num_neighbors: Maximum number of neighbors selected per residue.
+        eps: Additive epsilon inside the distance square root.
+
+    Returns:
+        Neighbor distances and indices, each with shape ``(B, N, min(num_neighbors, N))``.
+    """
 
     pair_mask = residue_mask[:, :, None] * residue_mask[:, None, :]
     distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
@@ -66,7 +103,18 @@ def radial_basis(
     lower_bound: float = 2.0,
     upper_bound: float = 22.0,
 ) -> Tensor:
-    r"""Expand distances over evenly spaced Gaussian radial-basis centers."""
+    r"""
+    Expand distances over evenly spaced Gaussian radial-basis centers.
+
+    Args:
+        distances: Input distances of any shape.
+        num_bins: Number of radial-basis centers.
+        lower_bound: First radial-basis center.
+        upper_bound: Last radial-basis center.
+
+    Returns:
+        Radial-basis features with ``num_bins`` appended as the final axis.
+    """
 
     centers = torch.linspace(
         lower_bound,
@@ -81,15 +129,93 @@ def radial_basis(
 
 
 def virtual_beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
-    r"""Reconstruct the idealized protein Cβ coordinate from N, Cα, and C."""
+    r"""
+    Reconstruct the idealized protein Cβ coordinate from N, Cα, and C.
+
+    Args:
+        nitrogen: Backbone nitrogen coordinates with final dimension 3.
+        alpha_carbon: Alpha-carbon coordinates with final dimension 3.
+        carbon: Backbone carbon coordinates with final dimension 3.
+
+    Returns:
+        Virtual beta-carbon coordinates with the same shape as each input.
+    """
 
     b = alpha_carbon - nitrogen
     c = carbon - alpha_carbon
     return -0.58273431 * torch.cross(b, c, dim=-1) + 0.56802827 * b - 0.54067466 * c + alpha_carbon
 
 
+def local_backbone_frame_features(
+    nitrogen: Tensor,
+    alpha_carbon: Tensor,
+    carbon: Tensor,
+    points: Tensor,
+) -> Tensor:
+    r"""
+    Express context-point directions in each residue's local backbone frame.
+
+    Args:
+        nitrogen: Nitrogen coordinates with shape ``(B, L, 3)``.
+        alpha_carbon: Alpha-carbon coordinates with shape ``(B, L, 3)``.
+        carbon: Carbon coordinates with shape ``(B, L, 3)``.
+        points: Context coordinates with shape ``(B, L, A, 3)``.
+
+    Returns:
+        Scale-invariant direction features with shape ``(B, L, A, 4)``.
+    """
+
+    first_axis = F.normalize(nitrogen - alpha_carbon, dim=-1)
+    carbon_vector = carbon - alpha_carbon
+    projected = torch.einsum("bli,bli->bl", first_axis, carbon_vector)[..., None]
+    second_axis = F.normalize(carbon_vector - first_axis * projected, dim=-1)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    frame = torch.stack((first_axis, second_axis, third_axis), dim=-1)
+    local = torch.einsum("blqp,blyq->blyp", frame, points - alpha_carbon[:, :, None])
+    planar_radius = torch.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-8)
+    spatial_radius = torch.norm(local, dim=-1) + 1e-8
+    return torch.stack(
+        (
+            local[..., 0] / planar_radius,
+            local[..., 1] / planar_radius,
+            planar_radius / spatial_radius,
+            local[..., 2] / spatial_radius,
+        ),
+        dim=-1,
+    )
+
+
+def validate_positive_integer(value: int, name: str) -> int:
+    r"""
+    Return an integer-like value after requiring it to be positive.
+
+    Args:
+        value: Integer-like value to validate.
+        name: Parameter name used in the error message.
+
+    Returns:
+        The validated built-in integer.
+
+    Raises:
+        ValueError: If ``value`` is not positive.
+    """
+
+    result = operator.index(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 def decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
-    r"""Convert a residue permutation to aligned lower-is-earlier causal ranks."""
+    r"""
+    Convert a residue permutation to ranks where smaller values decode earlier.
+
+    Args:
+        decoding_order: Residue indices ordered by decoding step with shape ``(..., N)``.
+
+    Returns:
+        Per-residue decoding ranks with the same shape and dtype.
+    """
 
     ranks = torch.empty_like(decoding_order)
     ranks.scatter_(
@@ -103,10 +229,17 @@ def decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
 def tied_groups_from_ids(
     tied_group_ids: Tensor,
 ) -> tuple[tuple[tuple[int, ...], ...], ...]:
-    r"""Reconstruct per-batch tied member groups from dense causal-unit IDs.
+    r"""
+    Reconstruct per-batch tied member groups from dense causal-unit IDs.
 
     Every returned group contains more than one residue and lists members in
     ascending residue order. Untied singleton units are omitted.
+
+    Args:
+        tied_group_ids: Integer group ID for each residue with shape ``(B, N)``.
+
+    Returns:
+        Per-batch tuples of tied residue-index groups.
     """
 
     batches: list[tuple[tuple[int, ...], ...]] = []
@@ -119,9 +252,43 @@ def tied_groups_from_ids(
 
 
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
-    r"""Return unreduced token negative log likelihoods."""
+    r"""
+    Compute unreduced negative log likelihood for sequence tokens.
+
+    Args:
+        sequence_tokens: Target token IDs with shape ``(..., N)``.
+        log_probabilities: Token log probabilities with shape ``(..., N, V)``.
+
+    Returns:
+        Per-position negative log likelihood with shape ``(..., N)``.
+    """
 
     return -log_probabilities.gather(-1, sequence_tokens.unsqueeze(-1)).squeeze(-1)
+
+
+def label_smoothed_nll_loss(
+    sequence_tokens: Tensor,
+    log_probabilities: Tensor,
+    *,
+    weight: float = 0.1,
+) -> Tensor:
+    r"""
+    Compute unreduced uniformly label-smoothed negative log likelihood.
+
+    Args:
+        sequence_tokens: Target token IDs with shape ``(..., N)``.
+        log_probabilities: Token log probabilities with shape ``(..., N, V)``.
+        weight: Nonnegative smoothing weight added uniformly across the vocabulary.
+
+    Returns:
+        Per-position losses with shape ``(..., N)``.
+    """
+
+    num_classes = log_probabilities.shape[-1]
+    target = F.one_hot(sequence_tokens, num_classes).to(log_probabilities.dtype)
+    target = target + weight / num_classes
+    target = target / target.sum(dim=-1, keepdim=True)
+    return -(target * log_probabilities).sum(dim=-1)
 
 
 def autoregressive_masks(
@@ -129,7 +296,17 @@ def autoregressive_masks(
     neighbor_indices: Tensor,
     residue_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    r"""Build backward and forward neighbor masks directly from aligned causal ranks."""
+    r"""
+    Build backward and forward neighbor masks directly from aligned causal ranks.
+
+    Args:
+        decoding_ranks: Per-residue decoding ranks with shape ``(B, N)``.
+        neighbor_indices: Selected neighbor indices with shape ``(B, N, K)``.
+        residue_mask: Valid-residue mask with shape ``(B, N)``.
+
+    Returns:
+        Backward and forward masks with shape ``(B, N, K, 1)``.
+    """
 
     neighbor_ranks = gather_nodes(decoding_ranks.unsqueeze(-1), neighbor_indices).squeeze(-1)
     backward = neighbor_ranks < decoding_ranks.unsqueeze(-1)
@@ -141,7 +318,8 @@ def autoregressive_masks(
 
 
 class MpnnMessage(nn.Module):
-    r"""Compute neighbor messages with a three-projection GELU network.
+    r"""
+    Compute neighbor messages with a three-projection GELU network.
 
     Args:
         input_size: Width of the assembled neighbor context.
@@ -156,7 +334,15 @@ class MpnnMessage(nn.Module):
         self.activation = nn.GELU()
 
     def forward(self, x: Tensor) -> Tensor:
-        r"""Apply the message network to an aligned context tensor."""
+        r"""
+        Apply the message network to an aligned context tensor.
+
+        Args:
+            x: Aligned context features with ``input_size`` channels.
+
+        Returns:
+            Message features with ``hidden_size`` channels.
+        """
 
         hidden = self.activation(self.input_projection(x))
         hidden = self.activation(self.hidden_projection(hidden))
@@ -164,7 +350,8 @@ class MpnnMessage(nn.Module):
 
 
 class MpnnFeedForward(nn.Module):
-    r"""Position-wise projection, GELU activation, and output projection.
+    r"""
+    Position-wise projection, GELU activation, and output projection.
 
     Residual addition, dropout, and normalization belong to the containing block.
 
@@ -180,13 +367,22 @@ class MpnnFeedForward(nn.Module):
         self.activation = nn.GELU()
 
     def forward(self, x: Tensor) -> Tensor:
-        r"""Apply the feed-forward computation."""
+        r"""
+        Apply the feed-forward computation.
+
+        Args:
+            x: Hidden states with ``hidden_size`` channels.
+
+        Returns:
+            Feed-forward updates with the same shape as ``x``.
+        """
 
         return self.output_projection(self.activation(self.input_projection(x)))
 
 
 class MpnnRelativePositionEncoding(nn.Module):
-    r"""Embed signed residue offsets with one distinct inter-chain bucket.
+    r"""
+    Embed signed residue offsets with one distinct inter-chain bucket.
 
     Args:
         num_embeddings: Width of the returned relative-position features.
@@ -199,7 +395,16 @@ class MpnnRelativePositionEncoding(nn.Module):
         self.projection = nn.Linear(2 * max_relative_feature + 2, num_embeddings)
 
     def forward(self, offset: Tensor, same_chain: Tensor) -> Tensor:
-        r"""Project bucketed residue offsets to edge-position features."""
+        r"""
+        Project bucketed residue offsets to edge-position features.
+
+        Args:
+            offset: Signed residue offsets.
+            same_chain: Binary mask with the same shape as ``offset``.
+
+        Returns:
+            Relative-position features with ``num_embeddings`` channels.
+        """
 
         clipped = torch.clamp(offset + self.max_relative_feature, 0, 2 * self.max_relative_feature)
         bucket = clipped * same_chain + (1 - same_chain) * (2 * self.max_relative_feature + 1)
@@ -208,7 +413,8 @@ class MpnnRelativePositionEncoding(nn.Module):
 
 
 class MpnnEncoderBlock(nn.Module):
-    r"""Apply one node-message, transition, and edge-message update.
+    r"""
+    Apply one node-message, transition, and edge-message update.
 
     The block owns residual order, dropout, and post-normalization. Its
     [`MpnnFeedForward`][ofoldx.modules.mpnn.MpnnFeedForward] member computes only
@@ -242,7 +448,8 @@ class MpnnEncoderBlock(nn.Module):
         node_mask: Tensor | None,
         attend_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
-        r"""Update aligned node and edge states from one message-passing round.
+        r"""
+        Update aligned node and edge states from one message-passing round.
 
         Args:
             node_states: Node states ``[batch, residues, hidden_size]``.
@@ -273,7 +480,8 @@ class MpnnEncoderBlock(nn.Module):
 
 
 class MpnnDecoderBlock(nn.Module):
-    r"""Apply one masked neighbor-message update followed by a transition.
+    r"""
+    Apply one masked neighbor-message update followed by a transition.
 
     The block owns both residual paths, dropout, and post-normalization; the
     feed-forward module held as ``transition`` only computes its additive update.
@@ -302,7 +510,8 @@ class MpnnDecoderBlock(nn.Module):
         node_mask: Tensor | None = None,
         attend_mask: Tensor | None = None,
     ) -> Tensor:
-        r"""Update node states from caller-assembled neighbor context.
+        r"""
+        Update node states from caller-assembled neighbor context.
 
         Args:
             node_states: Node states ``[..., residues, hidden_size]``.
@@ -326,7 +535,8 @@ class MpnnDecoderBlock(nn.Module):
 
 
 class MpnnProteinFeatures(nn.Module):
-    r"""Build a 25-distance full-backbone edge graph for MPNN designers.
+    r"""
+    Build a 25-distance full-backbone edge graph for MPNN designers.
 
     Each residue selects nearest neighbors by Cα distance. The edge representation
     combines relative residue position with radial-basis features for 25 ordered
@@ -361,7 +571,8 @@ class MpnnProteinFeatures(nn.Module):
         residue_index: Tensor,
         chain_index: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        r"""Build neighbor-aligned geometric and relative-position edge features.
+        r"""
+        Build neighbor-aligned geometric and relative-position edge features.
 
         Args:
             backbone_coordinates: Backbone coordinates ``[batch, residues, 4, 3]`` in N, Cα, C, O order.
@@ -423,17 +634,11 @@ def periodic_group_period(*, device: torch.device | str | None = None) -> tuple[
     lookup tables indexed by atomic number so ``group[z]`` / ``period[z]`` give the placement of element
     ``z``. Index ``0`` (no atom) and any atomic number past the tabulated main-group elements map to ``0``.
 
+    Args:
+        device: Optional device for the lookup tensors.
+
     Returns:
         Tuple ``(group, period)`` of two `[120]` long tensors indexed by atomic number.
-
-    Examples:
-        >>> group, period = periodic_group_period()
-        >>> group.shape
-        torch.Size([120])
-        >>> (group[6].item(), period[6].item())  # carbon
-        (14, 2)
-        >>> (group[8].item(), period[8].item())  # oxygen
-        (16, 2)
     """
 
     groups = [0] * 120
@@ -456,6 +661,7 @@ def periodic_group_period(*, device: torch.device | str | None = None) -> tuple[
     return torch.tensor(groups, dtype=torch.long, device=device), torch.tensor(periods, dtype=torch.long, device=device)
 
 
+#: Standard amino-acid component IDs in MPNN token order.
 AMINO_ACID_COMPONENT_IDS = (
     "ALA",
     "CYS",
@@ -478,5 +684,7 @@ AMINO_ACID_COMPONENT_IDS = (
     "TRP",
     "TYR",
 )
+#: MPNN token index for each standard amino-acid component ID.
 AMINO_ACID_TOKEN_BY_COMPONENT = {name: index for index, name in enumerate(AMINO_ACID_COMPONENT_IDS)}
+#: MPNN token index reserved for an unknown amino acid.
 AMINO_ACID_UNKNOWN_TOKEN = len(AMINO_ACID_COMPONENT_IDS)

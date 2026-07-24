@@ -36,21 +36,6 @@ class ConditionedTransformer(nn.Module):
         cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
             or the query-normalized state.
         transition: Which conditioned transition each block uses, ``"triple"`` or ``"double"``.
-
-    Examples:
-        >>> import torch
-        >>> transformer = ConditionedTransformer(
-        ...     num_blocks=2,
-        ...     num_attention_heads=2,
-        ...     hidden_size=8,
-        ...     conditioning_size=4,
-        ...     operator_backend="torch",
-        ... )
-        >>> hidden = torch.randn(1, 5, 8)
-        >>> conditioning = torch.randn(1, 5, 4)
-        >>> bias = torch.randn(1, 5, 5, 2 * 2)  # num_blocks * num_attention_heads
-        >>> transformer(hidden, conditioning, bias).shape
-        torch.Size([1, 5, 8])
     """
 
     def __init__(
@@ -91,33 +76,23 @@ class ConditionedTransformer(nn.Module):
         r"""
         Run the block stack, feeding each block its own slice of the packed pair bias.
 
-        ``bias`` of shape `[..., q, k, num_blocks * heads]` is reshaped to
-        `[..., q, k, num_blocks, heads]`, and the ``index``-th head slice is handed to block
+        ``bias`` of shape ``[..., q, k, num_blocks * heads]`` is reshaped to
+        ``[..., q, k, num_blocks, heads]``, and the ``index``-th head slice is handed to block
         ``index``; ``hidden``, ``conditioning``, ``mask``, and ``to_keys`` are forwarded unchanged.
+
         Args:
-            hidden: `[..., q, hidden_size]` token/atom activations.
-            conditioning: `[..., q, conditioning_size]` conditioning activations.
-            bias: `[..., q, k, num_blocks * heads]` precomputed per-head attention bias, packed for
+            hidden: ``[..., q, hidden_size]`` token/atom activations.
+            conditioning: ``[..., q, conditioning_size]`` conditioning activations.
+            bias: ``[..., q, k, num_blocks * heads]`` precomputed per-head attention bias, packed for
                 the whole stack on the last axis.
-            mask: Optional `[..., k]` key-validity mask, forwarded to every block.
+            mask: Optional ``[..., k]`` key-validity mask, forwarded to every block.
             to_keys: Optional windowed-key selector that gathers the key set for local attention;
                 when ``None`` each block self-attends over the full axis.
 
         Returns:
             Updated hidden activations of shape `[..., q, hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> transformer = ConditionedTransformer(
-            ...     num_blocks=2, num_attention_heads=2, hidden_size=8,
-            ...     conditioning_size=4, operator_backend="torch",
-            ... )
-            >>> hidden = torch.randn(1, 5, 8)
-            >>> conditioning = torch.randn(1, 5, 4)
-            >>> bias = torch.randn(1, 5, 5, 4)
-            >>> transformer(hidden, conditioning, bias).shape
-            torch.Size([1, 5, 8])
         """
+
         # The precomputed bias packs (num_blocks * heads) on the last axis; one slice feeds each block.
         *prefix, packed = bias.shape
         num_blocks = len(self.blocks)
@@ -152,15 +127,6 @@ class ConditionedTransformerBlock(nn.Module):
 
     Raises:
         ValueError: If ``transition`` is neither ``"triple"`` nor ``"double"``.
-
-    Examples:
-        >>> import torch
-        >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="torch")
-        >>> hidden = torch.randn(1, 5, 8)
-        >>> conditioning = torch.randn(1, 5, 4)
-        >>> bias = torch.randn(1, 5, 5, 2)  # per-head bias for this block
-        >>> block(hidden, conditioning, bias).shape
-        torch.Size([1, 5, 8])
     """
 
     def __init__(
@@ -241,16 +207,8 @@ class ConditionedTransformerBlock(nn.Module):
 
         Returns:
             Updated hidden activations of shape `[..., q, hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> block = ConditionedTransformerBlock(8, 4, num_attention_heads=2, operator_backend="torch")
-            >>> hidden = torch.randn(1, 5, 8)
-            >>> conditioning = torch.randn(1, 5, 4)
-            >>> bias = torch.randn(1, 5, 5, 2)
-            >>> block(hidden, conditioning, bias).shape
-            torch.Size([1, 5, 8])
         """
+
         normalized = self.conditioned_norm(hidden, conditioning)
         # Cross-attention normalizes the key/value path independently. Normalizing before ``to_keys``
         # lets every gathered key use its own conditioning; ``cross_attention_key_source`` selects
@@ -298,14 +256,6 @@ class TripleProductConditionedTransition(nn.Module):
         conditioning_size: Conditioning tensor width driving the adaptive norm and output gate.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
         operator_backend: Public backend request forwarded to the adaptive norm.
-
-    Examples:
-        >>> import torch
-        >>> transition = TripleProductConditionedTransition(8, 4, expansion=2)
-        >>> hidden = torch.randn(2, 3, 8)
-        >>> conditioning = torch.randn(2, 3, 4)
-        >>> transition(hidden, conditioning).shape
-        torch.Size([2, 3, 8])
     """
 
     def __init__(
@@ -344,15 +294,8 @@ class TripleProductConditionedTransition(nn.Module):
 
         Returns:
             Transition output of shape `[..., hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> transition = TripleProductConditionedTransition(8, 4, expansion=2)
-            >>> hidden = torch.randn(1, 5, 8)
-            >>> conditioning = torch.randn(1, 5, 4)
-            >>> transition(hidden, conditioning).shape
-            torch.Size([1, 5, 8])
         """
+
         normalized = self.conditioned_norm(hidden, conditioning)
         gate = self.gate_projection(normalized)
         value = self.value_projection(normalized)
@@ -377,6 +320,7 @@ def _attention_mask_for_query_keys(mask: Tensor, *, query_length: int, key_lengt
     Raises:
         ValueError: If ``mask`` matches neither the pair shape nor the key shape.
     """
+
     if mask.shape[-2:] == (query_length, key_length):
         return mask
     if mask.shape[-1:] == (key_length,):

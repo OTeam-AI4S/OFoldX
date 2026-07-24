@@ -1,4 +1,6 @@
-r"""Reusable prediction heads for structure-model implementations."""
+r"""
+Reusable prediction heads for structure-model implementations.
+"""
 
 from __future__ import annotations
 

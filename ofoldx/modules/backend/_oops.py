@@ -1,4 +1,5 @@
-r"""Guarded access to optional OOps operators.
+r"""
+Guarded access to optional OOps operators.
 
 Named kernels raise only when called, allowing public PyTorch paths to remain available.
 """
@@ -22,7 +23,9 @@ except ModuleNotFoundError as error:
     OOPS_AVAILABLE = False
 
     class _MissingOOpsUnsupportedError(NotImplementedError):
-        r"""Raised when an OOps kernel is requested but OOps is unavailable."""
+        r"""
+        Raised when an OOps kernel is requested but OOps is unavailable.
+        """
 
     OOpsUnsupportedError = _MissingOOpsUnsupportedError
 
@@ -39,11 +42,6 @@ def oops_kernel(name: str) -> Callable[..., object]:
 
     Returns:
         The OOps-owned implementation callable, or a raising stub when OOps is unavailable.
-
-    Examples:
-        >>> from ofoldx.modules.backend._oops import oops_kernel
-        >>> callable(oops_kernel("transition"))
-        True
     """
 
     if OOPS_AVAILABLE:

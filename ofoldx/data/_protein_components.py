@@ -1,4 +1,5 @@
-r"""Built-in protein component graphs and reference coordinates.
+r"""
+Built-in protein component graphs and reference coordinates.
 
 The data covers the twenty standard amino acids and the wwPDB CCD ``UNK``
 placeholder. Construction and public access live in [`ofoldx.data.components`][].

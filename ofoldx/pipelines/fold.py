@@ -1,4 +1,6 @@
-r"""The explicit folding Pipeline."""
+r"""
+The explicit folding Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +47,9 @@ class FoldPipeline(
     PairedPipeline[_FoldModel[_ModelInputT], _FoldProcessor[_ModelInputT]],
     Generic[_ModelInputT],
 ):
-    r"""Bind one folding Model to its paired Processor."""
+    r"""
+    Structure prediction pipeline for one model-processor pair.
+    """
 
     def fold(
         self,
@@ -57,7 +61,8 @@ class FoldPipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> FoldResult:
-        r"""Fold one biological input with the paired Processor and Model.
+        r"""
+        Fold one biological input with the paired Processor and Model.
 
         Args:
             input: Sequence, molecular system, structure, or path to process.

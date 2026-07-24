@@ -1,4 +1,6 @@
-r"""The explicit molecular scoring Pipeline."""
+r"""
+The explicit molecular scoring Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +41,9 @@ class ScorePipeline(
     PairedPipeline[_ScoreModel[_ModelInputT], _ScoreProcessor[_ModelInputT]],
     Generic[_ModelInputT],
 ):
-    r"""Bind one scoring Model to its paired Processor."""
+    r"""
+    Molecular scoring pipeline for one model-processor pair.
+    """
 
     def score(
         self,
@@ -48,7 +52,8 @@ class ScorePipeline(
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
-        r"""Score one molecular input with the paired Processor and Model.
+        r"""
+        Score one molecular input with the paired Processor and Model.
 
         Args:
             input: Molecular system, structure, or path to process.

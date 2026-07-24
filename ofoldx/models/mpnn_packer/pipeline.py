@@ -1,4 +1,6 @@
-r"""MPNN Packer side-chain packing Pipeline."""
+r"""
+MPNN Packer side-chain packing Pipeline.
+"""
 
 from __future__ import annotations
 
@@ -12,12 +14,14 @@ from ...data.structure import Structure
 from ...io import read_mpnn_pdb
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import PackPrediction, PackResult
-from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, pack_candidate
+from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, _pack_candidate
 from .processor import MpnnPackerProcessor
 
 
 class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
-    r"""Bind the MPNN Packer Model and Processor."""
+    r"""
+    Side-chain packing pipeline for MPNN Packer.
+    """
 
     def pack(
         self,
@@ -33,10 +37,11 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> PackResult:
-        r"""Pack selected side chains with the iterative sampler.
+        r"""
+        Pack selected side chains with the iterative sampler.
 
         Args:
-            input: Canonical structure or local structure path.
+            input: A ``Structure`` or local structure path.
             sequence: Optional replacement protein sequence.
             pack_positions: Residue occurrences to repack. ``None`` selects every eligible
                 protein residue.
@@ -82,10 +87,11 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[PackResult, ...]:
-        r"""Pack several target sequences against one source structure.
+        r"""
+        Pack several target sequences against one source structure.
 
         Args:
-            input: Canonical source structure or local structure path.
+            input: A source ``Structure`` or local structure path.
             sequences: Replacement protein sequences in output order.
             pack_positions: Residue occurrences to repack. ``None`` selects every eligible
                 protein residue.
@@ -128,7 +134,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             raise ValueError("num_samples must be positive")
 
         # Model.sample consumes only the tensor fields. Each singleton input remains
-        # beside the tensor batch to retain its own canonical realization mapping.
+        # beside the tensor batch to retain its own structure realization mapping.
         batched = MpnnPackerInput(
             backbone_coordinates=torch.cat([item.backbone_coordinates for item in inputs]),
             sequence_tokens=torch.cat([item.sequence_tokens for item in inputs]),
@@ -164,6 +170,6 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
                     mix_logits=packed.mix_logits[index : index + 1],
                     input_chi_sin_cos=packed.input_chi_sin_cos[index : index + 1],
                 )
-                predictions[index].append(pack_candidate(item, candidate))
+                predictions[index].append(_pack_candidate(item, candidate))
 
         return tuple(PackResult(predictions=tuple(items)) for items in predictions)

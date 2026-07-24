@@ -1,4 +1,6 @@
-r"""PxDesign architecture and sampler configuration."""
+r"""
+PxDesign architecture and sampler configuration.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class PxDesignConditionEmbeddingsConfig(Config):
-    r"""Configure the design-condition embedder.
+    r"""
+    Configure the design-condition embedder.
 
     Args:
         atom_hidden_size: Width of atom single features.
@@ -36,7 +39,8 @@ class PxDesignConditionEmbeddingsConfig(Config):
 
 
 class PxDesignDenoiserConfig(Config):
-    r"""Configure the coordinate denoiser.
+    r"""
+    Configure the coordinate denoiser.
 
     Args:
         sigma_data: Data noise scale used by EDM preconditioning.
@@ -68,7 +72,8 @@ class PxDesignDenoiserConfig(Config):
 
 
 class PxDesignSamplerConfig(Config):
-    r"""Configure the PxDesign EDM inference schedule.
+    r"""
+    Configure the PxDesign EDM inference schedule.
 
     Args:
         max_noise_level: Highest noise level in the schedule.
@@ -94,7 +99,8 @@ class PxDesignSamplerConfig(Config):
 
 
 class PxDesignConfig(Config):
-    r"""Configure the PxDesign model.
+    r"""
+    Configure the PxDesign model.
 
     Args:
         single_size: Width of the token representation.
@@ -119,4 +125,6 @@ class PxDesignConfig(Config):
 
 
 class PxDesignProcessorConfig(Config):
-    r"""The exact empty persistent configuration for canonical PxDesign lowering."""
+    r"""
+    Configuration for the PxDesign processor.
+    """

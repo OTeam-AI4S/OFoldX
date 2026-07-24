@@ -1,4 +1,6 @@
-r"""Coordinates aligned to exact atom occurrences in a MolecularSystem."""
+r"""
+Coordinates aligned to exact atom occurrences in a MolecularSystem.
+"""
 
 from __future__ import annotations
 
@@ -12,14 +14,41 @@ from .molecular import AtomSite, ComponentReference, MolecularSystem
 
 @dataclass(frozen=True)
 class ResidueNumber:
-    r"""One source residue number and insertion code."""
+    r"""
+    Residue numbering retained from a structure source.
+
+    Args:
+        number: Integer residue number.
+        insertion_code: Optional insertion code.
+    """
 
     number: int
     insertion_code: str = ""
 
 
 class Structure:
-    r"""One coordinate realization of a molecular system."""
+    r"""
+    Coordinates for selected atom occurrences in a molecular system.
+
+    ``sites[i]`` identifies the atom represented by ``coordinates[i]``,
+    ``coordinate_mask[i]``, and, when present, ``occupancy[i]``.
+
+    Args:
+        system: Coordinate-free molecular system containing every referenced atom.
+        sites: Unique atom occurrences in coordinate order.
+        coordinates: Real array with shape ``(num_atoms, 3)``. Entries whose mask is
+            false are not observed.
+        coordinate_mask: Boolean array with shape ``(num_atoms,)`` indicating observed
+            coordinates. At least one coordinate must be observed.
+        occupancy: Optional real array with shape ``(num_atoms,)``.
+        residue_numbers: Optional source numbering keyed by exact component occurrence.
+
+    Raises:
+        ValueError: If aligned arrays have incompatible shapes, sites are duplicated, or
+            no coordinate is observed.
+        TypeError: If an aligned array has an incompatible dtype.
+        KeyError: If a site does not occur in ``system``.
+    """
 
     system: MolecularSystem
     sites: tuple[AtomSite, ...]

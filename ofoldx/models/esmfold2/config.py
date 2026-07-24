@@ -1,4 +1,6 @@
-r"""ESMFold2 architecture configuration."""
+r"""
+ESMFold2 architecture configuration.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class EsmFold2AtomEncoderConfig(Config):
-    r"""Configure sliding-window atom attention with three-dimensional rotary features.
+    r"""
+    Configure sliding-window atom attention with three-dimensional rotary features.
 
     Args:
         atom_hidden_size: Width of atom single features.
@@ -34,7 +37,8 @@ class EsmFold2AtomEncoderConfig(Config):
 
 
 class EsmFold2InputEmbeddingsConfig(Config):
-    r"""Configure ESMFold2 token and atom input embeddings.
+    r"""
+    Configure ESMFold2 token and atom input embeddings.
 
     Args:
         input_size: Width of raw token and atom input features.
@@ -46,7 +50,8 @@ class EsmFold2InputEmbeddingsConfig(Config):
 
 
 class EsmFold2EsmCConfig(Config):
-    r"""Configure the ESMC child module.
+    r"""
+    Configure the ESMC child module.
 
     Args:
         vocab_size: Number of ESMC token types.
@@ -102,7 +107,8 @@ class EsmFold2EsmCConfig(Config):
 
 
 class EsmFold2LanguageModelEncoderConfig(Config):
-    r"""Configure the pair encoder for projected ESMC representations.
+    r"""
+    Configure the pair encoder for projected ESMC representations.
 
     Args:
         enabled: Whether to run the language-model pair encoder.
@@ -118,7 +124,8 @@ class EsmFold2LanguageModelEncoderConfig(Config):
 
 
 class EsmFold2MsaEncoderConfig(Config):
-    r"""Configure the single-sequence or MSA encoder in the folding head.
+    r"""
+    Configure the single-sequence or MSA encoder in the folding head.
 
     Args:
         enabled: Whether to run the MSA encoder.
@@ -138,7 +145,8 @@ class EsmFold2MsaEncoderConfig(Config):
 
 
 class EsmFold2FoldingTrunkConfig(Config):
-    r"""Configure the pair-only folding trunk.
+    r"""
+    Configure the pair-only folding trunk.
 
     Args:
         num_blocks: Number of folding trunk blocks.
@@ -148,7 +156,8 @@ class EsmFold2FoldingTrunkConfig(Config):
 
 
 class EsmFold2ParcaeConfig(Config):
-    r"""Configure the linear-recurrent trunk coda.
+    r"""
+    Configure the linear-recurrent trunk coda.
 
     Args:
         num_coda_blocks: Number of coda blocks applied after recurrent folding.
@@ -158,7 +167,8 @@ class EsmFold2ParcaeConfig(Config):
 
 
 class EsmFold2DenoiserConfig(Config):
-    r"""Configure the ESMFold2 diffusion score network.
+    r"""
+    Configure the ESMFold2 diffusion score network.
 
     Args:
         sigma_data: Data noise scale used by EDM preconditioning.
@@ -188,7 +198,8 @@ class EsmFold2DenoiserConfig(Config):
 
 
 class EsmFold2DiffusionStructureHeadConfig(Config):
-    r"""Configure the diffusion structure head and sampler defaults.
+    r"""
+    Configure the diffusion structure head and sampler defaults.
 
     Args:
         denoiser: Diffusion score-network configuration.
@@ -216,7 +227,8 @@ class EsmFold2DiffusionStructureHeadConfig(Config):
 
 
 class EsmFold2ConfidenceHeadConfig(Config):
-    r"""Configure per-site and pairwise confidence heads.
+    r"""
+    Configure per-site and pairwise confidence heads.
 
     Args:
         num_plddt_bins: Number of pLDDT output bins.
@@ -238,7 +250,8 @@ class EsmFold2ConfidenceHeadConfig(Config):
 
 
 class EsmFold2Config(Config):
-    r"""Configure the complete ESMC and ESMFold2 folding graph.
+    r"""
+    Configure the complete ESMC and ESMFold2 folding graph.
 
     Args:
         single_size: Width of the token representation.
@@ -277,17 +290,19 @@ class EsmFold2Config(Config):
 
 
 class EsmFold2ProcessorConfig(Config):
-    r"""Configure ESMFold2 input lowering.
+    r"""
+    Configure ESMFold2 input processing.
 
     Args:
-        msa_conditioning: Whether the processor accepts and lowers MSA conditioning.
+        msa_conditioning: Whether the processor accepts MSA evidence.
     """
 
     msa_conditioning: bool = True
 
 
 class EsmFold2ExperimentalConfidenceHeadConfig(Config):
-    r"""Configure the narrower pLDDT/PAE head of recurrent experimental ESMFold2 graphs.
+    r"""
+    Configure the narrower pLDDT/PAE head of recurrent experimental ESMFold2 graphs.
 
     Args:
         enabled: Whether to build the confidence head and emit confidence outputs.
@@ -309,7 +324,8 @@ class EsmFold2ExperimentalConfidenceHeadConfig(Config):
 
 
 class EsmFold2ExperimentalConfig(Config):
-    r"""Configure the recurrent ``ESMFold2-Experimental-Fast`` binder-design graph.
+    r"""
+    Configure the recurrent ``ESMFold2-Experimental-Fast`` binder-design graph.
 
     Args:
         single_size: Width of the token representation.
@@ -353,10 +369,11 @@ class EsmFold2ExperimentalConfig(Config):
 
 
 class EsmFold2ExperimentalProcessorConfig(Config):
-    r"""Configure recurrent ESMFold2 binder-design input lowering.
+    r"""
+    Configure input processing for recurrent ESMFold2 binder design.
 
     Args:
-        msa_conditioning: Whether the processor accepts and lowers MSA conditioning.
+        msa_conditioning: Whether the processor accepts MSA evidence.
     """
 
     msa_conditioning: bool = False

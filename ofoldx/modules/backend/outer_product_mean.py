@@ -1,9 +1,5 @@
 r"""
-Backend dispatch for the outer-product-mean operator.
-
-The dispatcher owns backend selection, availability, and calling-convention
-adaptation. Modules pass the ordinary tensor arguments without a second
-validation layer.
+Backend-dispatched outer-product mean.
 """
 
 from __future__ import annotations
@@ -60,28 +56,6 @@ def outer_product_mean(
 
     Returns:
         ``(B, N, N, pair_size)`` pair update, where ``pair_size`` is the row count of ``proj_out_weight``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.backend.outer_product_mean import outer_product_mean
-        >>> _ = torch.manual_seed(0)
-        >>> msa = torch.randn(1, 2, 3, 4)
-        >>> out = outer_product_mean(
-        ...     msa,
-        ...     None,
-        ...     norm_weight=torch.ones(4),
-        ...     norm_bias=torch.zeros(4),
-        ...     proj_left_weight=torch.randn(2, 4),
-        ...     proj_right_weight=torch.randn(2, 4),
-        ...     proj_out_weight=torch.randn(5, 4),
-        ...     proj_out_bias=torch.zeros(5),
-        ...     norm_eps=1e-5,
-        ...     denom_eps=1e-3,
-        ...     divide_before_projection=False,
-        ...     operator_backend="torch",
-        ... )
-        >>> out.shape
-        torch.Size([1, 3, 3, 5])
     """
 
     backend = resolve_tensor_operator_backend(

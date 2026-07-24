@@ -1,10 +1,5 @@
 r"""
-Predicted-TM (pTM / ipTM) inner kernel.
-
-This module owns the length-dependent TM-score normalization ``d0(n)`` and the
-per-bin weight ``1 / (1 + (d / d0)^2)``. Callers own all outer reductions:
-which token pairs enter an average, which token count feeds ``d0``, any interface
-masks, and row- or frame-wise maxima.
+Predicted TM-score kernels.
 """
 
 from __future__ import annotations
@@ -24,17 +19,10 @@ def tm_length_scale(num_tokens: Tensor | float, *, min_tokens: float = _D0_MIN_T
 
     Args:
         num_tokens: Effective token count ``n`` -- a Python scalar or a tensor of counts.
-        min_tokens: Lower clamp on ``n`` before the cube root.
+        min_tokens: Minimum value of ``n`` before the cube root.
 
     Returns:
         ``d0`` with the same kind as ``num_tokens`` (float in, float out; tensor in, tensor out).
-
-    Examples:
-        >>> round(float(tm_length_scale(19)), 5)
-        0.16838
-        >>> import torch
-        >>> tm_length_scale(torch.tensor([19.0, 100.0])).shape
-        torch.Size([2])
     """
 
     if isinstance(num_tokens, Tensor):
@@ -58,11 +46,6 @@ def tm_bin_weights(bin_centers: Tensor, num_tokens: Tensor | float) -> Tensor:
 
     Returns:
         The per-bin TM-score weight, broadcastable to the softmaxed PAE distribution.
-
-    Examples:
-        >>> import torch
-        >>> tm_bin_weights(torch.linspace(0.5, 31.5, 32), 128).shape
-        torch.Size([32])
     """
 
     d0 = tm_length_scale(num_tokens)
@@ -86,12 +69,6 @@ def tm_weight_from_pae(pae_logits: Tensor, num_tokens: Tensor | float, *, bin_ce
 
     Returns:
         ``[...]`` TM-adjusted PAE (the expected per-token-pair TM-score contribution).
-
-    Examples:
-        >>> import torch
-        >>> _ = torch.manual_seed(0)
-        >>> tm_weight_from_pae(torch.randn(2, 3, 3, 32), 128, bin_centers=torch.linspace(0.5, 31.5, 32)).shape
-        torch.Size([2, 3, 3])
     """
 
     probability = pae_logits.softmax(dim=-1)

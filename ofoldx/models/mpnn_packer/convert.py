@@ -1,4 +1,6 @@
-r"""Convert released ``ligandmpnn_sc`` checkpoints to MpnnPacker repositories."""
+r"""
+Convert released ``ligandmpnn_sc`` checkpoints to MpnnPacker repositories.
+"""
 
 from __future__ import annotations
 
@@ -95,11 +97,6 @@ def convert_mpnn_packer_checkpoint(
         repo_id: Optional Hub repo id (e.g. ``owner/name``) to publish to; local-only when omitted.
         token: Optional Hugging Face token authenticating the ``repo_id`` upload.
         private: Create the ``repo_id`` repository as private when it does not yet exist.
-
-    Examples:
-        >>> convert_mpnn_packer_checkpoint(  # doctest: +SKIP
-        ...     "ligandmpnn_sc_v_32_002_16.pt", "mpnn-packer"
-        ... )
     """
 
     from .pipeline import MpnnPackerPipeline
@@ -150,7 +147,8 @@ def convert_mpnn_packer_state_dict(
 
 
 def _convert_packer_key(key: str) -> str:
-    r"""Translate one official MpnnPacker tensor name to the native OFoldX name.
+    r"""
+    Translate one official MpnnPacker tensor name to the native OFoldX name.
 
     Args:
         key: An official ``ligandmpnn_sc`` MpnnPacker tensor name.
@@ -177,7 +175,9 @@ def _convert_packer_key(key: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    r"""Convert one released MPNN Packer checkpoint from the command line."""
+    r"""
+    Convert one released MPNN Packer checkpoint from the command line.
+    """
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)

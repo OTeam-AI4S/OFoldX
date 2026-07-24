@@ -1,4 +1,6 @@
-r"""Configuration for Protenix folding and constraint architectures."""
+r"""
+Configuration for Protenix folding and constraint architectures.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +17,8 @@ from ..config import (
 
 
 class ProtenixConfig(Config):
-    r"""Configure the Protenix base or four-branch constraint graph.
+    r"""
+    Configure the Protenix base or four-branch constraint graph.
 
     Args:
         token_feature_size: Width of raw token features.
@@ -49,7 +52,8 @@ class ProtenixConfig(Config):
 
 
 class ProtenixConstraintConfig(ProtenixConfig):
-    r"""Configure the four-branch Protenix constraint graph.
+    r"""
+    Configure the four-branch Protenix constraint graph.
 
     Args:
         constraints: Whether to build the jointly trained four-branch constraint embedder; fixed to ``True`` here.
@@ -59,12 +63,13 @@ class ProtenixConstraintConfig(ProtenixConfig):
 
 
 class ProtenixProcessorConfig(Config):
-    r"""Configure Protenix input lowering.
+    r"""
+    Configure Protenix input preprocessing.
 
     Args:
         constraints: Whether the paired processor exposes constraint inputs.
-        max_msa_rows: Maximum MSA depth lowered into model inputs.
-        augment_reference_positions: Whether to augment reference coordinates during lowering.
+        max_msa_rows: Maximum MSA depth included in model inputs.
+        augment_reference_positions: Whether to randomly rotate and translate reference coordinates.
     """
 
     constraints: bool = False
@@ -73,7 +78,8 @@ class ProtenixProcessorConfig(Config):
 
 
 class ProtenixConstraintProcessorConfig(ProtenixProcessorConfig):
-    r"""Configure Protenix constraint input lowering.
+    r"""
+    Configure Protenix constraint preprocessing.
 
     Args:
         constraints: Whether constraint inputs are exposed; fixed to ``True`` here.

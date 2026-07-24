@@ -1,4 +1,6 @@
-r"""MSA file input projected to the query axis of a named entity."""
+r"""
+MSA file input projected to the query axis of a named entity.
+"""
 
 from __future__ import annotations
 
@@ -14,19 +16,23 @@ _ANNOTATION_PREFIXES = ("ss_", "sa_", "aa_")
 
 
 def read_msa(path: str | os.PathLike[str], *, entity_id: str) -> MSA:
-    r"""Read aligned FASTA or A3M evidence for the entity named ``entity_id``.
+    r"""
+    Read an A3M or aligned FASTA file as MSA evidence.
 
-    The grammar is chosen by filename suffix (case-insensitive): ``.a3m`` is
-    A3M and the MultiMolecule aligned-FASTA suffixes are aligned FASTA; any
-    other suffix raises. Records are parsed by MultiMolecule's
-    ``read_fasta_records``; HH-suite annotation records are dropped, then the
-    first remaining record becomes the ungapped query. Rows project to the
-    query width by removing insertion columns and counting each removed
-    residue against the next retained query column (leading insertions attach
-    to column 0, trailing insertions are discarded). The paired pool is
-    query-only. ``entity_id`` is recorded but NOT verified here: this reader
-    has no ``MolecularSystem``, so width and chemistry against the entity are
-    the Processor's sole responsibility.
+    The first biological record is the ungapped query. Insertion columns are
+    removed from aligned rows and recorded as deletion counts on the query axis.
+
+    Args:
+        path: MSA path. ``.a3m`` selects A3M parsing; supported FASTA suffixes
+            select aligned FASTA parsing.
+        entity_id: Target entity ID stored with the alignment.
+
+    Returns:
+        An MSA whose unpaired pool contains the projected rows and whose paired
+        pool contains the query row.
+
+    Raises:
+        ValueError: If the suffix, symbols, row widths, or query record are invalid.
     """
 
     path = Path(path)
@@ -74,7 +80,9 @@ def read_msa(path: str | os.PathLike[str], *, entity_id: str) -> MSA:
 
 
 def _project_a3m_row(sequence: str, query: str, *, is_query: bool) -> tuple[str, list[int]]:
-    r"""Project one A3M row: uppercase/``-`` emit, lowercase count, ``.`` drop."""
+    r"""
+    Project one A3M row: uppercase/``-`` emit, lowercase count, ``.`` drop.
+    """
 
     del query  # A3M encodes insertions per row; no query mask is needed.
     aligned: list[str] = []
@@ -99,7 +107,9 @@ def _project_a3m_row(sequence: str, query: str, *, is_query: bool) -> tuple[str,
 
 
 def _project_aligned_fasta_row(sequence: str, query: str, *, is_query: bool) -> tuple[str, list[int]]:
-    r"""Project one aligned-FASTA row against the query mask of retained columns."""
+    r"""
+    Project one aligned-FASTA row against the query mask of retained columns.
+    """
 
     del is_query  # The query mask governs every row identically.
     row = _normalize_aligned_fasta(sequence)
@@ -122,7 +132,9 @@ def _project_aligned_fasta_row(sequence: str, query: str, *, is_query: bool) -> 
 
 
 def _normalize_aligned_fasta(sequence: str) -> str:
-    r"""Uppercase letters and fold ``.`` into ``-``; reject other symbols."""
+    r"""
+    Uppercase letters and fold ``.`` into ``-``; reject other symbols.
+    """
 
     normalized: list[str] = []
     for symbol in sequence:

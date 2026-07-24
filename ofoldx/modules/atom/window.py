@@ -32,6 +32,7 @@ def key_window_starts(
     Returns:
         ``[num_windows]`` integer start offsets, each in ``[0, num_valid_atoms - num_key_atoms]``.
     """
+
     key_padding_left = (num_key_atoms - num_query_atoms) // 2
     base = torch.arange(num_windows, device=device) * num_query_atoms - key_padding_left
     return base.clamp(0, num_valid_atoms - num_key_atoms)
@@ -57,14 +58,8 @@ def gather_key_windows(
 
     Returns:
         ``[..., N_window, num_key_atoms, C]`` key windows.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import gather_key_windows
-        >>> single = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
-        >>> gather_key_windows(single, num_query_atoms=2, num_key_atoms=4).shape
-        torch.Size([1, 3, 4, 1])
     """
+
     num_atoms = single.shape[-2]
     num_windows = (num_atoms + num_query_atoms - 1) // num_query_atoms
     if num_valid_atoms is not None and num_valid_atoms >= num_key_atoms:
@@ -91,13 +86,8 @@ class LocalAtomWindowInfo:
         query_padding: Number of padded query atoms appended to reach a whole number of windows.
         key_padding_left: Number of padded key atoms before the first real atom.
         key_padding_right: Number of padded key atoms after the last real atom.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import LocalAtomWindowInfo
-        >>> info = LocalAtomWindowInfo(torch.ones(1, 3, 2, 4, dtype=torch.bool), 0, 1, 1)
-        >>> info.query_padding, info.key_padding_left, info.key_padding_right
-        (0, 1, 1)
+        num_valid_atoms: Number of contiguous valid atoms at the start of the atom
+            axis, or ``None`` when all atom rows participate in window placement.
     """
 
     attention_mask: Tensor
@@ -116,13 +106,6 @@ class LocalAtomWindows:
         query: `[..., N_window, num_query_atoms, C]` non-overlapping query windows.
         key: `[..., N_window, num_key_atoms, C]` overlapping key neighbourhoods, one per query window.
         info: Padding and mask metadata for the windows.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import LocalAtomWindowing
-        >>> windows = LocalAtomWindowing(num_query_atoms=2, num_key_atoms=4)(torch.zeros(1, 6, 1))
-        >>> windows.query.shape, windows.key.shape
-        (torch.Size([1, 3, 2, 1]), torch.Size([1, 3, 4, 1]))
     """
 
     query: Tensor
@@ -136,19 +119,11 @@ class LocalAtomGeometry:
     Windowed atom-pair geometry (displacements and same-space mask) for atom attention blocks.
 
     Args:
-        distance_vectors: `[..., N_window, num_query_atoms, num_key_atoms, 3]` canonical
+        distance_vectors: `[..., N_window, num_query_atoms, num_key_atoms, 3]`
             query-minus-key displacement vectors.
         distance_mask: `[..., N_window, num_query_atoms, num_key_atoms, 1]` mask that is one where
             the query and key atom share a reference space.
         window_info: Padding and mask metadata for the local windows.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import LocalAtomGeometryBuilder
-        >>> builder = LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)
-        >>> geometry = builder(torch.zeros(1, 6, 3), torch.zeros(1, 6, dtype=torch.long))
-        >>> geometry.distance_vectors.shape
-        torch.Size([1, 3, 2, 4, 3])
     """
 
     distance_vectors: Tensor
@@ -167,14 +142,6 @@ class LocalAtomGeometryBuilder(nn.Module):
     Args:
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import LocalAtomGeometryBuilder
-        >>> builder = LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)
-        >>> geometry = builder(torch.zeros(1, 6, 3), torch.zeros(1, 6, dtype=torch.long))
-        >>> geometry.distance_vectors.shape, geometry.distance_mask.shape
-        (torch.Size([1, 3, 2, 4, 3]), torch.Size([1, 3, 2, 4, 1]))
     """
 
     def __init__(self, num_query_atoms: int = 32, num_key_atoms: int = 128) -> None:
@@ -195,14 +162,6 @@ class LocalAtomGeometryBuilder(nn.Module):
 
         Returns:
             Local atom geometry for atom-pair encoding.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.window import LocalAtomGeometryBuilder
-            >>> builder = LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)
-            >>> geometry = builder(torch.zeros(1, 6, 3), torch.zeros(1, 6, dtype=torch.long))
-            >>> geometry.distance_vectors.shape
-            torch.Size([1, 3, 2, 4, 3])
         """
 
         position_windows = self.windowing(reference_positions, num_valid_atoms)
@@ -233,18 +192,6 @@ class LocalAtomWindowing(nn.Module):
 
     Raises:
         ValueError: If window sizes are odd or ``num_key_atoms < num_query_atoms``.
-
-    Examples:
-        >>> import torch
-        >>> from ofoldx.modules.atom.window import LocalAtomWindowing
-        >>> windowing = LocalAtomWindowing(num_query_atoms=2, num_key_atoms=4)
-        >>> windows = windowing(torch.zeros(1, 6, 1))
-        >>> windows.query.shape, windows.info.attention_mask.shape
-        (torch.Size([1, 3, 2, 1]), torch.Size([1, 3, 2, 4]))
-        >>> LocalAtomWindowing(num_query_atoms=3, num_key_atoms=4)
-        Traceback (most recent call last):
-            ...
-        ValueError: num_key_atoms and num_query_atoms must be even and num_key_atoms >= num_query_atoms
     """
 
     def __init__(self, num_query_atoms: int = 32, num_key_atoms: int = 128) -> None:
@@ -267,14 +214,6 @@ class LocalAtomWindowing(nn.Module):
 
         Returns:
             Local query/key windows and padding metadata.
-
-        Examples:
-            >>> import torch
-            >>> from ofoldx.modules.atom.window import LocalAtomWindowing
-            >>> windowing = LocalAtomWindowing(num_query_atoms=2, num_key_atoms=4)
-            >>> windows = windowing(torch.zeros(1, 6, 1))
-            >>> windows.query.shape, windows.key.shape
-            (torch.Size([1, 3, 2, 1]), torch.Size([1, 3, 4, 1]))
         """
 
         num_atoms = tensor.shape[-2]

@@ -1,4 +1,6 @@
-r"""The four standard biological task APIs."""
+r"""
+The four standard biological task APIs.
+"""
 
 from __future__ import annotations
 

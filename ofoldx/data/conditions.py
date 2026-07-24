@@ -1,8 +1,5 @@
-r"""Shared residue identity, hotspot, and contact conditions.
-
-A [`Hotspot`][] is a one-sided label without a distance. A [`Contact`][]
-is a symmetric two-sided proximity condition with a distance cutoff. Model-specific
-weights and enforcement settings remain in model inputs.
+r"""
+Residue-identity, hotspot, and contact conditions.
 """
 
 from __future__ import annotations
@@ -16,7 +13,13 @@ from .placement import SymbolicAtomSite, SymbolicResidueSite
 
 @dataclass(frozen=True)
 class AllowedResidueIdentities:
-    r"""Chemical-component identities allowed at exact residue positions."""
+    r"""
+    Restrict residue positions to a set of chemical-component identities.
+
+    Args:
+        positions: Residue occurrences to constrain.
+        component_ids: Component IDs allowed at every selected position.
+    """
 
     positions: tuple[ComponentReference, ...]
     component_ids: frozenset[str]
@@ -24,7 +27,12 @@ class AllowedResidueIdentities:
 
 @dataclass(frozen=True)
 class TiedResidueIdentities:
-    r"""Groups of exact residue positions that must share chemical identity."""
+    r"""
+    Tie groups of residue positions to the same chemical identity.
+
+    Args:
+        groups: Position groups whose members must receive the same component ID.
+    """
 
     groups: tuple[tuple[ComponentReference, ...], ...]
 
@@ -41,9 +49,12 @@ Endpoint: TypeAlias = ResidueEndpoint | AtomEndpoint
 
 @dataclass(frozen=True)
 class Hotspot:
-    r"""A one-sided per-residue conditioning label.
+    r"""
+    A one-sided per-residue conditioning label.
 
-    ``residues`` names target endpoints; the generated partner is the whole design.
+    Args:
+        residues: Target endpoints to label as interaction hotspots. The generated
+            partner is the whole design.
     """
 
     residues: tuple[Endpoint, ...]
@@ -51,10 +62,16 @@ class Hotspot:
 
 @dataclass(frozen=True, eq=False)
 class Contact:
-    r"""A pairwise proximity condition between two endpoint sets.
+    r"""
+    A pairwise proximity condition between two endpoint sets.
 
-    Equality and hashing treat ``side_a`` and ``side_b`` as unordered. The cutoff and
-    tolerance are part of identity.
+    Equality and hashing treat ``side_a`` and ``side_b`` as unordered.
+
+    Args:
+        side_a: Endpoints on one side of the requested contact.
+        side_b: Endpoints on the other side of the requested contact.
+        cutoff_angstrom: Maximum contact distance in angstroms.
+        tolerance_angstrom: Additional accepted distance in angstroms.
     """
 
     side_a: tuple[Endpoint, ...]
@@ -63,8 +80,6 @@ class Contact:
     tolerance_angstrom: float = 0.0
 
     def _identity(self) -> tuple[object, ...]:
-        r"""Return the unordered sides and distance values used for identity."""
-
         return (
             frozenset((self.side_a, self.side_b)),
             self.cutoff_angstrom,

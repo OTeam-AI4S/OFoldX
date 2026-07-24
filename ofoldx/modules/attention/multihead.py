@@ -35,15 +35,8 @@ class GatedMultiheadAttention(nn.Module):
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        operator_backend: Operator provider; attention uses SDPA as its canonical PyTorch implementation.
-
-    Examples:
-        >>> import torch
-        >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="torch")
-        >>> _ = torch.manual_seed(0)
-        >>> hidden = torch.randn(1, 3, 8)
-        >>> attention(hidden).shape
-        torch.Size([1, 3, 8])
+        operator_backend: Operator provider; attention uses SDPA as its default
+            PyTorch implementation.
     """
 
     def __init__(
@@ -103,15 +96,6 @@ class GatedMultiheadAttention(nn.Module):
 
         Returns:
             Updated hidden states `[..., q_tokens, hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> attention = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="torch")
-            >>> _ = torch.manual_seed(0)
-            >>> query = torch.randn(1, 3, 8)
-            >>> bias = torch.randn(1, 2, 3, 3)
-            >>> attention(query, biases=(bias,)).shape
-            torch.Size([1, 3, 8])
         """
 
         return gated_multihead_attention(
@@ -150,16 +134,6 @@ class MultiheadAttentionProjection(nn.Module):
     Raises:
         ValueError: If ``head_dim`` is not given and ``hidden_size`` is not divisible by
             ``num_attention_heads``.
-
-    Examples:
-        >>> import torch
-        >>> projection = MultiheadAttentionProjection(hidden_size=8, num_attention_heads=2)
-        >>> projection.head_dim
-        4
-        >>> MultiheadAttentionProjection(hidden_size=8, num_attention_heads=3)
-        Traceback (most recent call last):
-            ...
-        ValueError: hidden_size (8) must be divisible by num_attention_heads (3)
     """
 
     def __init__(
@@ -216,15 +190,6 @@ class MultiheadAttentionProjection(nn.Module):
         Returns:
             The query, key, and value projections, each in `[..., heads, tokens, head_dim]` layout,
             with the query already divided by ``sqrt(head_dim)``.
-
-        Examples:
-            >>> import torch
-            >>> projection = MultiheadAttentionProjection(hidden_size=8, num_attention_heads=2)
-            >>> _ = torch.manual_seed(0)
-            >>> query = torch.randn(1, 3, 8)
-            >>> projected_query, projected_key, projected_value = projection.project(query, query, query)
-            >>> projected_query.shape
-            torch.Size([1, 2, 3, 4])
         """
 
         scale = math.sqrt(self.head_dim)
@@ -251,15 +216,6 @@ class MultiheadAttentionProjection(nn.Module):
         Returns:
             The query, key, and value projections, each in `[..., heads, tokens, head_dim]` layout,
             with no query scaling applied.
-
-        Examples:
-            >>> import torch
-            >>> projection = MultiheadAttentionProjection(hidden_size=8, num_attention_heads=2)
-            >>> _ = torch.manual_seed(0)
-            >>> query = torch.randn(1, 3, 8)
-            >>> projected_query, _, _ = projection.project_unscaled(query, query, query)
-            >>> projected_query.shape
-            torch.Size([1, 2, 3, 4])
         """
 
         query_projection = self.query_projection(query).view(*query.shape[:-1], self.num_attention_heads, self.head_dim)
@@ -282,16 +238,6 @@ class MultiheadAttentionProjection(nn.Module):
 
         Returns:
             Merged hidden states `[..., tokens, hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> projection = MultiheadAttentionProjection(hidden_size=8, num_attention_heads=2)
-            >>> _ = torch.manual_seed(0)
-            >>> query = torch.randn(1, 3, 8)
-            >>> _, _, projected_value = projection.project(query, query, query)
-            >>> output = projected_value.transpose(-2, -3)
-            >>> projection.merge(output, query).shape
-            torch.Size([1, 3, 8])
         """
 
         if self.gating:

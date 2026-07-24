@@ -1,4 +1,6 @@
-r"""Configuration objects for AlphaFold 2 monomer and multimer models."""
+r"""
+Configuration objects for AlphaFold 2 monomer and multimer models.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +8,8 @@ from chanfig import Config
 
 
 class AlphaFold2InputEmbeddingsConfig(Config):
-    r"""Configure AlphaFold 2 monomer input feature embeddings.
+    r"""
+    Configure AlphaFold 2 monomer input feature embeddings.
 
     Args:
         token_feature_size: Width of raw target-token features.
@@ -22,7 +25,8 @@ class AlphaFold2InputEmbeddingsConfig(Config):
 
 
 class AlphaFold2MultimerInputEmbeddingsConfig(Config):
-    r"""Configure chain-relative AlphaFold-Multimer input embeddings.
+    r"""
+    Configure chain-relative AlphaFold-Multimer input embeddings.
 
     Args:
         token_feature_size: Width of raw target-token features.
@@ -42,7 +46,8 @@ class AlphaFold2MultimerInputEmbeddingsConfig(Config):
 
 
 class AlphaFold2PreviousPositionsConfig(Config):
-    r"""Configure distance bins for recycling previous atom positions.
+    r"""
+    Configure distance bins for recycling previous atom positions.
 
     Args:
         min_distance: Lower recycled-distance bound, in angstroms.
@@ -56,7 +61,8 @@ class AlphaFold2PreviousPositionsConfig(Config):
 
 
 class AlphaFold2RecyclingConfig(Config):
-    r"""Configure AlphaFold 2 representation and position recycling.
+    r"""
+    Configure AlphaFold 2 representation and position recycling.
 
     Args:
         recycle_features: Whether to recycle previous MSA and pair representations.
@@ -70,7 +76,8 @@ class AlphaFold2RecyclingConfig(Config):
 
 
 class AlphaFold2MsaRowAttentionWithPairBiasConfig(Config):
-    r"""Configure MSA row attention with pair bias.
+    r"""
+    Configure MSA row attention with pair bias.
 
     Args:
         num_heads: Number of MSA row-attention heads.
@@ -82,7 +89,8 @@ class AlphaFold2MsaRowAttentionWithPairBiasConfig(Config):
 
 
 class AlphaFold2TriangleAttentionConfig(Config):
-    r"""Configure triangle attention over pair representations.
+    r"""
+    Configure triangle attention over pair representations.
 
     Args:
         num_heads: Number of triangle-attention heads.
@@ -96,7 +104,8 @@ class AlphaFold2TriangleAttentionConfig(Config):
 
 
 class AlphaFold2TransitionConfig(Config):
-    r"""Configure a transition feed-forward network.
+    r"""
+    Configure a transition feed-forward network.
 
     Args:
         expansion: Hidden-width expansion factor.
@@ -106,7 +115,8 @@ class AlphaFold2TransitionConfig(Config):
 
 
 class AlphaFold2OuterProductMeanConfig(Config):
-    r"""Configure the Evoformer outer-product-mean update.
+    r"""
+    Configure the Evoformer outer-product-mean update.
 
     Args:
         first: Whether to apply the update before the other Evoformer operations.
@@ -118,7 +128,8 @@ class AlphaFold2OuterProductMeanConfig(Config):
 
 
 class AlphaFold2TriangleMultiplicationConfig(Config):
-    r"""Configure a triangle multiplicative update.
+    r"""
+    Configure a triangle multiplicative update.
 
     Args:
         hidden_size: Width of projected triangle features.
@@ -128,7 +139,8 @@ class AlphaFold2TriangleMultiplicationConfig(Config):
 
 
 class AlphaFold2TemplatePairStackConfig(Config):
-    r"""Configure the AlphaFold 2 template pair stack.
+    r"""
+    Configure the AlphaFold 2 template pair stack.
 
     Args:
         num_blocks: Number of template pair blocks.
@@ -150,7 +162,8 @@ class AlphaFold2TemplatePairStackConfig(Config):
 
 
 class AlphaFold2TemplatePointwiseAttentionConfig(Config):
-    r"""Configure pointwise attention across templates.
+    r"""
+    Configure pointwise attention across templates.
 
     Args:
         num_heads: Number of template pointwise-attention heads.
@@ -160,7 +173,8 @@ class AlphaFold2TemplatePointwiseAttentionConfig(Config):
 
 
 class AlphaFold2TemplateConfig(Config):
-    r"""Configure monomer template embedding.
+    r"""
+    Configure monomer template embedding.
 
     Args:
         enabled: Whether to embed template evidence.
@@ -186,7 +200,8 @@ class AlphaFold2TemplateConfig(Config):
 
 
 class AlphaFold2MultimerTemplateConfig(Config):
-    r"""Configure AlphaFold-Multimer template embedding.
+    r"""
+    Configure AlphaFold-Multimer template embedding.
 
     Args:
         enabled: Whether to embed template evidence.
@@ -212,7 +227,8 @@ class AlphaFold2MultimerTemplateConfig(Config):
 
 
 class AlphaFold2EvoformerBlockConfig(Config):
-    r"""Configure the operations in one AlphaFold 2 Evoformer block.
+    r"""
+    Configure the operations in one AlphaFold 2 Evoformer block.
 
     Args:
         msa_row_attention_with_pair_bias: MSA attention heads and row dropout.
@@ -234,7 +250,8 @@ class AlphaFold2EvoformerBlockConfig(Config):
 
 
 class AlphaFold2EvoformerConfig(Config):
-    r"""Configure the AlphaFold 2 Evoformer stack.
+    r"""
+    Configure the AlphaFold 2 Evoformer stack.
 
     Args:
         num_blocks: Number of main Evoformer blocks.
@@ -256,7 +273,8 @@ class AlphaFold2EvoformerConfig(Config):
 
 
 class AlphaFold2SidechainConfig(Config):
-    r"""Configure the sidechain network in the AlphaFold 2 structure module.
+    r"""
+    Configure the sidechain network in the AlphaFold 2 structure module.
 
     Args:
         hidden_size: Width of sidechain hidden states.
@@ -268,7 +286,8 @@ class AlphaFold2SidechainConfig(Config):
 
 
 class AlphaFold2StructureModuleConfig(Config):
-    r"""Configure the AlphaFold 2 invariant-point-attention structure module.
+    r"""
+    Configure the AlphaFold 2 invariant-point-attention structure module.
 
     Args:
         dropout: Dropout probability in structure-module blocks.
@@ -301,7 +320,8 @@ class AlphaFold2StructureModuleConfig(Config):
 
 
 class AlphaFold2MultimerStructureModuleConfig(AlphaFold2StructureModuleConfig):
-    r"""Configure the AlphaFold-Multimer structure-module override.
+    r"""
+    Configure the AlphaFold-Multimer structure-module override.
 
     Args:
         position_scale: Backbone translation scale, overridden from ``10`` to ``20`` for multimer.
@@ -311,7 +331,8 @@ class AlphaFold2MultimerStructureModuleConfig(AlphaFold2StructureModuleConfig):
 
 
 class AlphaFold2DistogramHeadConfig(Config):
-    r"""Configure the AlphaFold 2 distogram head.
+    r"""
+    Configure the AlphaFold 2 distogram head.
 
     Args:
         first_break: Center of the first distance bin, in angstroms.
@@ -325,7 +346,8 @@ class AlphaFold2DistogramHeadConfig(Config):
 
 
 class AlphaFold2PredictedAlignedErrorHeadConfig(Config):
-    r"""Configure the monomer predicted-aligned-error and pTM head.
+    r"""
+    Configure the monomer predicted-aligned-error and pTM head.
 
     Args:
         enabled: Whether to build and run the predicted-aligned-error head.
@@ -339,7 +361,8 @@ class AlphaFold2PredictedAlignedErrorHeadConfig(Config):
 
 
 class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
-    r"""Configure AlphaFold-Multimer PAE, pTM, ipTM, and ranking outputs.
+    r"""
+    Configure AlphaFold-Multimer PAE, pTM, ipTM, and ranking outputs.
 
     Args:
         enabled: Whether to build and run the predicted-aligned-error head.
@@ -359,7 +382,8 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
 
 
 class AlphaFold2PredictedLddtHeadConfig(Config):
-    r"""Configure the AlphaFold 2 predicted-lDDT head.
+    r"""
+    Configure the AlphaFold 2 predicted-lDDT head.
 
     Args:
         num_bins: Number of predicted-lDDT bins.
@@ -371,7 +395,8 @@ class AlphaFold2PredictedLddtHeadConfig(Config):
 
 
 class AlphaFold2ExperimentallyResolvedHeadConfig(Config):
-    r"""Configure the experimentally-resolved atom head.
+    r"""
+    Configure the experimentally-resolved atom head.
 
     Args:
         num_atom_types: Number of atom37 output types.
@@ -381,7 +406,8 @@ class AlphaFold2ExperimentallyResolvedHeadConfig(Config):
 
 
 class AlphaFold2MaskedMsaHeadConfig(Config):
-    r"""Configure the monomer masked-MSA reconstruction head.
+    r"""
+    Configure the monomer masked-MSA reconstruction head.
 
     Args:
         num_output: Number of reconstructed MSA token classes.
@@ -391,7 +417,8 @@ class AlphaFold2MaskedMsaHeadConfig(Config):
 
 
 class AlphaFold2MultimerMaskedMsaHeadConfig(Config):
-    r"""Configure the 22-class AlphaFold-Multimer masked-MSA head.
+    r"""
+    Configure the 22-class AlphaFold-Multimer masked-MSA head.
 
     Args:
         num_output: Number of reconstructed MSA token classes.
@@ -401,7 +428,8 @@ class AlphaFold2MultimerMaskedMsaHeadConfig(Config):
 
 
 class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
-    r"""Configure the parameterized but inference-inert multimer chain-center head.
+    r"""
+    Configure the parameterized but inference-inert multimer chain-center head.
 
     Args:
         enabled: Whether to instantiate the chain center-of-mass head.
@@ -411,7 +439,8 @@ class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
 
 
 class AlphaFold2HeadsConfig(Config):
-    r"""Configure AlphaFold 2 monomer prediction heads.
+    r"""
+    Configure AlphaFold 2 monomer prediction heads.
 
     Args:
         distogram: Inter-residue distogram head.
@@ -429,7 +458,8 @@ class AlphaFold2HeadsConfig(Config):
 
 
 class AlphaFold2MultimerHeadsConfig(Config):
-    r"""Configure AlphaFold-Multimer prediction heads.
+    r"""
+    Configure AlphaFold-Multimer prediction heads.
 
     Args:
         distogram: Inter-residue distogram head.
@@ -453,7 +483,8 @@ class AlphaFold2MultimerHeadsConfig(Config):
 
 
 class AlphaFold2MsaConfig(Config):
-    r"""Configure stochastic monomer MSA sampling, masking, clustering, and cropping.
+    r"""
+    Configure stochastic monomer MSA sampling, masking, clustering, and cropping.
 
     Args:
         max_msa_clusters: Maximum number of clustered MSA rows.
@@ -481,7 +512,8 @@ class AlphaFold2MsaConfig(Config):
 
 
 class AlphaFold2MultimerMsaConfig(Config):
-    r"""Configure stochastic multimer MSA sampling, masking, clustering, and cropping.
+    r"""
+    Configure stochastic multimer MSA sampling, masking, clustering, and cropping.
 
     Args:
         max_msa_clusters: Maximum number of clustered MSA rows.
@@ -509,7 +541,8 @@ class AlphaFold2MultimerMsaConfig(Config):
 
 
 class AlphaFold2Config(Config):
-    r"""Configure the complete [`AlphaFold2Model`][ofoldx.models.alphafold2.AlphaFold2Model] graph.
+    r"""
+    Configure the complete [`AlphaFold2Model`][ofoldx.models.alphafold2.AlphaFold2Model] graph.
 
     Args:
         input_embeddings: Monomer token, MSA, extra-MSA, and relative-position embeddings.
@@ -536,7 +569,8 @@ class AlphaFold2Config(Config):
 
 
 class AlphaFold2MultimerConfig(Config):
-    r"""Configure the complete AlphaFold-Multimer graph.
+    r"""
+    Configure the complete AlphaFold-Multimer graph.
 
     Args:
         input_embeddings: Multimer token, MSA, extra-MSA, and chain-relative embeddings.
@@ -565,22 +599,24 @@ class AlphaFold2MultimerConfig(Config):
 
 
 class AlphaFold2ProcessorConfig(Config):
-    r"""Configure deterministic monomer template lowering.
+    r"""
+    Configure monomer template preprocessing.
 
     Args:
-        max_templates: Maximum number of templates lowered into model inputs.
+        max_templates: Maximum number of templates included in model inputs.
     """
 
     max_templates: int = 4
 
 
 class AlphaFold2MultimerProcessorConfig(Config):
-    r"""Configure deterministic multimer MSA and template lowering.
+    r"""
+    Configure multimer MSA and template preprocessing.
 
     Args:
-        max_msa_clusters: Maximum clustered MSA depth lowered by the processor.
-        max_extra_msa: Maximum extra-MSA depth lowered by the processor.
-        max_templates: Maximum number of templates lowered into model inputs.
+        max_msa_clusters: Maximum clustered MSA depth.
+        max_extra_msa: Maximum extra-MSA depth.
+        max_templates: Maximum number of templates included in model inputs.
     """
 
     max_msa_clusters: int = 512

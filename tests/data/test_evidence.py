@@ -18,7 +18,9 @@ from ofoldx.data.structure import Structure
 
 
 def _msa(entity_id: str = "a") -> MSA:
-    r"""A width-3 MSA: three unpaired rows (row 0 the ungapped query) + query-only paired pool."""
+    r"""
+    A width-3 MSA: three unpaired rows (row 0 the ungapped query) + query-only paired pool.
+    """
 
     unpaired = ("AGV", "AG-", "A-V")
     return MSA(
@@ -31,7 +33,9 @@ def _msa(entity_id: str = "a") -> MSA:
 
 
 def _plan() -> tuple[np.ndarray, np.ndarray]:
-    r"""A valid two-column plan: first row selects the paired query, later rows the unpaired pool."""
+    r"""
+    A valid two-column plan: first row selects the paired query, later rows the unpaired pool.
+    """
 
     row_pairing = np.array([[0, 0], [1, 2], [2, -1]], dtype=np.int64)
     row_is_paired = np.array([[True, True], [False, False], [False, False]], dtype=np.bool_)
@@ -43,7 +47,9 @@ def _residue(component_id: str) -> ChemicalComponent:
 
 
 def _template_structure(*, instance_id: str = "TMPL", entity_id: str = "tmpl_entity") -> Structure:
-    r"""A minimal two-residue polymer instance, coordinates unobserved-but-present."""
+    r"""
+    A minimal two-residue polymer instance, coordinates unobserved-but-present.
+    """
 
     entity = PolymerSequence("protein", (_residue("R0"), _residue("R1")))
     system = MolecularSystem(entities={entity_id: entity}, instances={instance_id: entity_id})

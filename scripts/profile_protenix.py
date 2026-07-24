@@ -1,4 +1,5 @@
-"""Profile the current Protenix model core workload.
+"""
+Profile the current Protenix model core workload.
 
 The workload mirrors the M1 parity path:
 
@@ -53,7 +54,9 @@ def import_reference_protenix_module(
     *,
     reference_root: Path = DEFAULT_PROTENIX_REFERENCE_PATH,
 ) -> ModuleType:
-    """Import ``module_name`` from the reference Protenix checkout."""
+    """
+    Import ``module_name`` from the reference Protenix checkout.
+    """
 
     reference_root = reference_root.resolve()
     reference_path = str(reference_root)
@@ -91,7 +94,9 @@ def _assert_reference_module(module: ModuleType, reference_root: Path) -> None:
 
 
 def load_protenix_base_checkpoint_state(checkpoint_path: Path = DEFAULT_PROTENIX_BASE_CKPT_PATH) -> dict[str, Tensor]:
-    """Load the v0.5 base checkpoint and strip the DDP prefix."""
+    """
+    Load the v0.5 base checkpoint and strip the DDP prefix.
+    """
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
@@ -179,7 +184,9 @@ def denoiser_kwargs_from_batch(
     diffusion_input: dict[str, Any],
     relative_features: Tensor,
 ) -> dict[str, Any]:
-    """Adapt parity/profiling feature dumps to the explicit OFoldX denoiser API."""
+    """
+    Adapt parity/profiling feature dumps to the explicit OFoldX denoiser API.
+    """
 
     return {
         "atom_features": batch.atom_features[0],
@@ -195,7 +202,9 @@ def denoiser_kwargs_from_batch(
 
 
 class ProtenixProfileWorkload(nn.Module):
-    """Current model core profile workload."""
+    """
+    Current model core profile workload.
+    """
 
     requires_grad = False
 
@@ -237,7 +246,9 @@ class ProtenixProfileWorkload(nn.Module):
 
 
 class ProtenixTrunkWorkload(nn.Module):
-    """Profile input embedding + recycling trunk."""
+    """
+    Profile input embedding + recycling trunk.
+    """
 
     requires_grad = False
 
@@ -252,7 +263,9 @@ class ProtenixTrunkWorkload(nn.Module):
 
 
 class ProtenixDiffusionWorkload(nn.Module):
-    """Profile only the coordinate-update path with real trunk tensors."""
+    """
+    Profile only the coordinate-update path with real trunk tensors.
+    """
 
     requires_grad = False
 
@@ -295,7 +308,9 @@ class ProtenixDiffusionWorkload(nn.Module):
 
 
 class ProtenixConfidenceWorkload(nn.Module):
-    """Profile only the confidence head with real trunk/predicted-coordinate tensors."""
+    """
+    Profile only the confidence head with real trunk/predicted-coordinate tensors.
+    """
 
     requires_grad = False
 
@@ -336,7 +351,9 @@ class ProtenixConfidenceWorkload(nn.Module):
 
 
 class ProtenixForwardWorkload(nn.Module):
-    """Full current ProtenixModel forward workload."""
+    """
+    Full current ProtenixModel forward workload.
+    """
 
     requires_grad = False
 
@@ -369,7 +386,9 @@ class ProtenixForwardWorkload(nn.Module):
 
 
 class ProtenixTrainWorkload(nn.Module):
-    """Full current ProtenixModel forward + backward workload."""
+    """
+    Full current ProtenixModel forward + backward workload.
+    """
 
     requires_grad = True
 
@@ -410,7 +429,9 @@ class ProtenixTrainWorkload(nn.Module):
 
 
 class BackwardWorkload(nn.Module):
-    """Wrap a tuple-output workload with synthetic loss; caller runs backward."""
+    """
+    Wrap a tuple-output workload with synthetic loss; caller runs backward.
+    """
 
     requires_grad = True
 
@@ -466,7 +487,9 @@ def configure_data_paths(*, checkpoint: Path, protenix_root: Path, sample_2orb: 
 
 
 def git_metadata() -> dict[str, Any]:
-    """Return lightweight repository state for reproducibility."""
+    """
+    Return lightweight repository state for reproducibility.
+    """
 
     def run_git(*args: str) -> str | None:
         try:
@@ -609,7 +632,9 @@ def build_2orb_batch(
 
 
 def crop_feature_dict(feature_dict: dict[str, Any], *, max_tokens: int) -> dict[str, Any]:
-    """Crop featurized inputs to the first ``max_tokens`` tokens."""
+    """
+    Crop featurized inputs to the first ``max_tokens`` tokens.
+    """
 
     token_count = int(feature_dict["token_index"].shape[0])
     if max_tokens <= 0:
@@ -770,7 +795,9 @@ def synchronize(device: torch.device) -> None:
 
 
 def workload_metadata(workload: nn.Module) -> dict[str, Any]:
-    """Collect stable workload metadata for benchmark reports."""
+    """
+    Collect stable workload metadata for benchmark reports.
+    """
 
     module = workload
     while hasattr(module, "module") and isinstance(module.module, nn.Module):
@@ -858,7 +885,9 @@ def benchmark(workload: nn.Module, *, warmup: int, iters: int, device: torch.dev
 
 
 class DispatchOperatorProfiler:
-    """Aggregate aten operator timings without using CUDA profiler APIs."""
+    """
+    Aggregate aten operator timings without using CUDA profiler APIs.
+    """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device

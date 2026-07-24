@@ -28,23 +28,6 @@ class DenoisingTokenEncoder(nn.Module):
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per transformer block.
         operator_backend: Operator provider; see [ofoldx.modules.backend][].
-
-    Examples:
-        >>> import torch
-        >>> encoder = DenoisingTokenEncoder(
-        ...     num_blocks=2,
-        ...     token_hidden_size=8,
-        ...     conditioning_size=4,
-        ...     pair_size=4,
-        ...     num_attention_heads=2,
-        ...     operator_backend="torch",
-        ... )
-        >>> _ = torch.manual_seed(0)
-        >>> token_hidden = torch.randn(1, 3, 8)
-        >>> conditioning = torch.randn(1, 3, 4)
-        >>> pair = torch.randn(1, 3, 3, 4)
-        >>> encoder(token_hidden, conditioning, pair).shape
-        torch.Size([1, 3, 8])
     """
 
     def __init__(
@@ -96,24 +79,8 @@ class DenoisingTokenEncoder(nn.Module):
 
         Returns:
             Denoised token features `[..., N_token, token_hidden_size]`.
-
-        Examples:
-            >>> import torch
-            >>> encoder = DenoisingTokenEncoder(
-            ...     num_blocks=2,
-            ...     token_hidden_size=8,
-            ...     conditioning_size=4,
-            ...     pair_size=4,
-            ...     num_attention_heads=2,
-            ...     operator_backend="torch",
-            ... )
-            >>> _ = torch.manual_seed(0)
-            >>> token_hidden = torch.randn(1, 3, 8)
-            >>> conditioning = torch.randn(1, 3, 4)
-            >>> pair = torch.randn(1, 3, 3, 4)
-            >>> encoder(token_hidden, conditioning, pair).shape
-            torch.Size([1, 3, 8])
         """
+
         if not self.pair_norms:  # zero blocks -> identity (matches an empty transformer stack)
             return token_hidden
         bias = torch.cat(
