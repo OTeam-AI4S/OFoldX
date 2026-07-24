@@ -53,7 +53,7 @@ class Boltz2TrunkConfig(Config):
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Triangle-attention head count.
         use_paired_feature: Whether the paired-MSA feature is consumed.
-        dropout: Pair-track dropout for the Pairformer.
+        pair_dropout: Pair-track dropout for the Pairformer.
         msa_dropout: Dropout applied inside the MSA trunk.
     """
 
@@ -68,7 +68,7 @@ class Boltz2TrunkConfig(Config):
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
     use_paired_feature: bool = True
-    dropout: float = 0.25
+    pair_dropout: float = 0.25
     msa_dropout: float = 0.15
 
 

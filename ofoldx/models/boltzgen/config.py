@@ -50,7 +50,7 @@ class BoltzGenTrunkConfig(Config):
         use_paired_feature: Whether to consume paired-MSA features.
         use_miniformer: Whether to replace the full pair trunk with Miniformer blocks.
         msa_miniformer_blocks: Whether the MSA trunk uses Miniformer pair updates.
-        dropout: Dropout probability along the pair trunk.
+        pair_dropout: Dropout probability along the pair trunk.
         msa_dropout: Dropout probability inside the MSA trunk.
     """
 
@@ -67,7 +67,7 @@ class BoltzGenTrunkConfig(Config):
     use_paired_feature: bool = True
     use_miniformer: bool = False
     msa_miniformer_blocks: bool = False
-    dropout: float = 0.25
+    pair_dropout: float = 0.25
     msa_dropout: float = 0.15
 
 

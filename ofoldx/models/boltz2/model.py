@@ -128,7 +128,7 @@ class Boltz2Model(Model):
             use_paired_feature=trunk.use_paired_feature,
             outer_product_hidden_size=trunk.outer_product_hidden_size,
             msa_dropout=trunk.msa_dropout,
-            pair_dropout=trunk.dropout,
+            pair_dropout=trunk.pair_dropout,
             num_msa_attention_heads=trunk.num_msa_attention_heads,
             msa_head_dim=trunk.msa_head_dim,
             triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
@@ -142,7 +142,7 @@ class Boltz2Model(Model):
             triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
             num_triangle_attention_heads=trunk.num_triangle_attention_heads,
             num_pair_attention_heads=trunk.num_pair_attention_heads,
-            dropout=trunk.dropout,
+            dropout=trunk.pair_dropout,
             backend="auto",
         )
         self.distogram_head = PairSymmetrizedDistogramHead(pair_size=pair_size, num_bins=config.num_distogram_bins)
