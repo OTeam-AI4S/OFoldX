@@ -105,11 +105,11 @@ class AlphaFold2Model(Model):
                     template_config.template_pair_stack.triangle_attention_starting_node.head_dim
                 ),
                 num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_heads
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_attention_heads
                 ),
                 transition_expansion=template_config.template_pair_stack.transition.expansion,
                 dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
-                num_attention_heads=template_config.attention.num_heads,
+                num_attention_heads=template_config.attention.num_attention_heads,
                 backend="auto",
             )
             if template_config.embed_torsion_angles:
@@ -132,10 +132,10 @@ class AlphaFold2Model(Model):
             msa_size=evoformer_config.extra_msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
+            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_attention_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
-            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
+            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_attention_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
@@ -147,10 +147,10 @@ class AlphaFold2Model(Model):
             msa_size=evoformer_config.msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
+            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_attention_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
-            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
+            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_attention_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
@@ -164,7 +164,7 @@ class AlphaFold2Model(Model):
             num_blocks=structure_module_config.num_blocks,
             num_transition_projections=structure_module_config.num_transition_projections,
             hidden_size=structure_module_config.hidden_size,
-            num_heads=structure_module_config.num_heads,
+            num_attention_heads=structure_module_config.num_attention_heads,
             num_scalar_qk=structure_module_config.num_scalar_qk,
             num_scalar_v=structure_module_config.num_scalar_v,
             num_point_qk=structure_module_config.num_point_qk,
@@ -652,7 +652,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                     template_config.template_pair_stack.triangle_attention_starting_node.head_dim
                 ),
                 num_triangle_attention_heads=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.num_heads
+                    template_config.template_pair_stack.triangle_attention_starting_node.num_attention_heads
                 ),
                 transition_expansion=template_config.template_pair_stack.transition.expansion,
                 dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
@@ -677,10 +677,10 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             msa_size=evoformer_config.extra_msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
+            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_attention_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
-            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
+            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_attention_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
@@ -692,10 +692,10 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             msa_size=evoformer_config.msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
+            num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_attention_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
-            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
+            num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_attention_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
@@ -709,7 +709,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             num_blocks=structure_module_config.num_blocks,
             num_transition_projections=structure_module_config.num_transition_projections,
             hidden_size=structure_module_config.hidden_size,
-            num_heads=structure_module_config.num_heads,
+            num_attention_heads=structure_module_config.num_attention_heads,
             num_scalar_qk=structure_module_config.num_scalar_qk,
             num_scalar_v=structure_module_config.num_scalar_v,
             num_point_qk=structure_module_config.num_point_qk,
@@ -909,7 +909,7 @@ class AlphaFold2StructureModule(nn.Module):
         num_blocks: int,
         num_transition_projections: int,
         hidden_size: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -929,7 +929,7 @@ class AlphaFold2StructureModule(nn.Module):
             hidden_size=hidden_size,
             pair_size=pair_size,
             num_transition_projections=num_transition_projections,
-            num_heads=num_heads,
+            num_attention_heads=num_attention_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -994,7 +994,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         num_blocks: int,
         num_transition_projections: int,
         hidden_size: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1014,7 +1014,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             hidden_size=hidden_size,
             pair_size=pair_size,
             num_transition_projections=num_transition_projections,
-            num_heads=num_heads,
+            num_attention_heads=num_attention_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -1902,7 +1902,7 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         hidden_size: int,
         pair_size: int,
         num_transition_projections: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1917,7 +1917,7 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         self.invariant_point_attention = AlphaFold2InvariantPointAttention(
             hidden_size=hidden_size,
             pair_size=pair_size,
-            num_heads=num_heads,
+            num_attention_heads=num_attention_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -1972,7 +1972,7 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         hidden_size: int,
         pair_size: int,
         num_transition_projections: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -1987,7 +1987,7 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         self.invariant_point_attention = AlphaFold2MultimerInvariantPointAttention(
             hidden_size=hidden_size,
             pair_size=pair_size,
-            num_heads=num_heads,
+            num_attention_heads=num_attention_heads,
             num_scalar_qk=num_scalar_qk,
             num_scalar_v=num_scalar_v,
             num_point_qk=num_point_qk,
@@ -2040,7 +2040,7 @@ class AlphaFold2InvariantPointAttention(nn.Module):
         *,
         hidden_size: int,
         pair_size: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -2048,40 +2048,46 @@ class AlphaFold2InvariantPointAttention(nn.Module):
         dist_epsilon: float = 1e-8,
     ) -> None:
         super().__init__()
-        self.num_heads = num_heads
+        self.num_attention_heads = num_attention_heads
         self.num_scalar_qk = num_scalar_qk
         self.num_scalar_v = num_scalar_v
         self.num_point_qk = num_point_qk
         self.num_point_v = num_point_v
         self.dist_epsilon = dist_epsilon
-        self.query_scalar_projection = nn.Linear(hidden_size, num_heads * num_scalar_qk)
-        self.key_value_scalar_projection = nn.Linear(hidden_size, num_heads * (num_scalar_v + num_scalar_qk))
-        self.query_point_projection = nn.Linear(hidden_size, num_heads * 3 * num_point_qk)
-        self.key_value_point_projection = nn.Linear(hidden_size, num_heads * 3 * (num_point_qk + num_point_v))
-        self.pair_bias_projection = nn.Linear(pair_size, num_heads)
-        output_size = num_heads * num_scalar_v + 4 * num_heads * num_point_v + num_heads * pair_size
+        self.query_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk)
+        self.key_value_scalar_projection = nn.Linear(hidden_size, num_attention_heads * (num_scalar_v + num_scalar_qk))
+        self.query_point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * num_point_qk)
+        self.key_value_point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * (num_point_qk + num_point_v))
+        self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads)
+        output_size = (
+            num_attention_heads * num_scalar_v
+            + 4 * num_attention_heads * num_point_v
+            + num_attention_heads * pair_size
+        )
         self.output_projection = nn.Linear(output_size, hidden_size)
-        self.trainable_point_weights = nn.Parameter(torch.empty(num_heads))
+        self.trainable_point_weights = nn.Parameter(torch.empty(num_attention_heads))
         nn.init.constant_(self.trainable_point_weights, math.log(math.exp(1.0) - 1.0))
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, *, inputs_1d: Tensor, inputs_2d: Tensor, mask: Tensor, affine: AlphaFold2QuatAffine) -> Tensor:
-        num_heads = self.num_heads
-        q_scalar = self.query_scalar_projection(inputs_1d).unflatten(-1, (num_heads, self.num_scalar_qk))
+        num_attention_heads = self.num_attention_heads
+        q_scalar = self.query_scalar_projection(inputs_1d).unflatten(-1, (num_attention_heads, self.num_scalar_qk))
         kv_scalar = self.key_value_scalar_projection(inputs_1d).unflatten(
             -1,
-            (num_heads, self.num_scalar_v + self.num_scalar_qk),
+            (num_attention_heads, self.num_scalar_v + self.num_scalar_qk),
         )
         k_scalar, v_scalar = kv_scalar.split((self.num_scalar_qk, self.num_scalar_v), dim=-1)
 
         q_point_local = (
-            self.query_point_projection(inputs_1d).unflatten(-1, (3, num_heads, self.num_point_qk)).movedim(-3, -1)
+            self.query_point_projection(inputs_1d)
+            .unflatten(-1, (3, num_attention_heads, self.num_point_qk))
+            .movedim(-3, -1)
         )
         q_point = affine.apply_to_point(q_point_local, extra_dims=2)
         kv_point_local = (
             self.key_value_point_projection(inputs_1d)
-            .unflatten(-1, (3, num_heads, self.num_point_qk + self.num_point_v))
+            .unflatten(-1, (3, num_attention_heads, self.num_point_qk + self.num_point_v))
             .movedim(-3, -1)
         )
         kv_point = affine.apply_to_point(kv_point_local, extra_dims=2)
@@ -2136,7 +2142,7 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         *,
         hidden_size: int,
         pair_size: int,
-        num_heads: int,
+        num_attention_heads: int,
         num_scalar_qk: int,
         num_scalar_v: int,
         num_point_qk: int,
@@ -2144,25 +2150,25 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         inf: float = 1e5,
     ) -> None:
         super().__init__()
-        self.num_heads = num_heads
+        self.num_attention_heads = num_attention_heads
         self.num_scalar_qk = num_scalar_qk
         self.num_scalar_v = num_scalar_v
         self.num_point_qk = num_point_qk
         self.num_point_v = num_point_v
         self.inf = inf
-        self.query_scalar_projection = nn.Linear(hidden_size, num_heads * num_scalar_qk, bias=False)
-        self.key_scalar_projection = nn.Linear(hidden_size, num_heads * num_scalar_qk, bias=False)
-        self.value_scalar_projection = nn.Linear(hidden_size, num_heads * num_scalar_v, bias=False)
-        self.query_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_heads)
-        self.key_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_heads)
-        self.value_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_v, num_heads)
-        self.pair_bias_projection = nn.Linear(pair_size, num_heads)
-        self.trainable_point_weights = nn.Parameter(torch.zeros(num_heads))
-        output_size = num_heads * (pair_size + num_scalar_v + num_point_v * 4)
+        self.query_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
+        self.key_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
+        self.value_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_v, bias=False)
+        self.query_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_attention_heads)
+        self.key_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_attention_heads)
+        self.value_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_v, num_attention_heads)
+        self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads)
+        self.trainable_point_weights = nn.Parameter(torch.zeros(num_attention_heads))
+        output_size = num_attention_heads * (pair_size + num_scalar_v + num_point_v * 4)
         self.output_projection = nn.Linear(output_size, hidden_size)
 
     def forward(self, *, single: Tensor, pair: Tensor, mask: Tensor, rigid: AlphaFold2Rigid) -> Tensor:
-        num_heads = self.num_heads
+        num_attention_heads = self.num_attention_heads
 
         point_variance = max(self.num_point_qk, 1) * 9.0 / 2.0
         point_weights = math.sqrt(1.0 / point_variance)
@@ -2176,8 +2182,12 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         attn_qk_point = -0.5 * (dist2 * point_weights[..., None, :, None]).sum(dim=-1)
 
         scalar_weights = math.sqrt(1.0 / max(self.num_scalar_qk, 1))
-        q_scalar = self.query_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_qk)
-        k_scalar = self.key_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_qk)
+        q_scalar = self.query_scalar_projection(single).view(
+            *single.shape[:-1], num_attention_heads, self.num_scalar_qk
+        )
+        k_scalar = self.key_scalar_projection(single).view(
+            *single.shape[:-1], num_attention_heads, self.num_scalar_qk
+        )
         q_scalar = q_scalar * scalar_weights
         attn_qk_scalar = torch.einsum("...qhc,...khc->...qkh", q_scalar, k_scalar)
 
@@ -2190,19 +2200,19 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         # softmax over the key axis (Nj), which is dim -2 in the [*, Ni, Nj, H] layout.
         attn = torch.softmax(attn_logits, dim=-2)
 
-        v_scalar = self.value_scalar_projection(single).view(*single.shape[:-1], num_heads, self.num_scalar_v)
+        v_scalar = self.value_scalar_projection(single).view(*single.shape[:-1], num_attention_heads, self.num_scalar_v)
         result_scalar = torch.einsum("...qkh,...khc->...qhc", attn, v_scalar)
-        result_scalar = result_scalar.reshape(*result_scalar.shape[:-2], num_heads * self.num_scalar_v)
+        result_scalar = result_scalar.reshape(*result_scalar.shape[:-2], num_attention_heads * self.num_scalar_v)
 
         v_point = self.value_point_projection(single, rigid)
         # [*, Ni, H, P_v, 3]
         result_point = (attn[..., None, None] * v_point.unsqueeze(-5)).sum(dim=-4)
-        result_point = result_point.reshape(*result_point.shape[:-3], num_heads * self.num_point_v, 3)
+        result_point = result_point.reshape(*result_point.shape[:-3], num_attention_heads * self.num_point_v, 3)
         result_point = _apply_inverse_rigid_to_points(rigid, result_point)
         result_point_norm = torch.sqrt(1e-8 + result_point.square().sum(dim=-1))
 
         result_pair = torch.einsum("...qkh,...qkc->...qhc", attn, pair)
-        result_pair = result_pair.reshape(*result_pair.shape[:-2], num_heads * pair.shape[-1])
+        result_pair = result_pair.reshape(*result_pair.shape[:-2], num_attention_heads * pair.shape[-1])
 
         output_features = torch.cat(
             [
@@ -2223,15 +2233,15 @@ class AlphaFold2MultimerPointProjection(nn.Module):
     Project AF-Multimer per-head points into global backbone frames.
     """
 
-    def __init__(self, hidden_size: int, num_points: int, num_heads: int) -> None:
+    def __init__(self, hidden_size: int, num_points: int, num_attention_heads: int) -> None:
         super().__init__()
-        self.num_heads = num_heads
+        self.num_attention_heads = num_attention_heads
         self.num_points = num_points
-        self.point_projection = nn.Linear(hidden_size, num_heads * 3 * num_points)
+        self.point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * num_points)
 
     def forward(self, single: Tensor, rigid: AlphaFold2Rigid) -> Tensor:
         points_local = self.point_projection(single)
-        points_local = points_local.view(*points_local.shape[:-1], self.num_heads, 3, self.num_points)
+        points_local = points_local.view(*points_local.shape[:-1], self.num_attention_heads, 3, self.num_points)
         points_local = points_local.movedim(-2, -1)
         return _apply_rigid_to_points(rigid, points_local)
 

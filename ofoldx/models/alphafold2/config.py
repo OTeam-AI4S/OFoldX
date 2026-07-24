@@ -80,11 +80,11 @@ class AlphaFold2MsaRowAttentionWithPairBiasConfig(Config):
     Configure MSA row attention with pair bias.
 
     Args:
-        num_heads: Number of MSA row-attention heads.
+        num_attention_heads: Number of MSA row-attention heads.
         dropout: Dropout probability along the MSA row path.
     """
 
-    num_heads: int = 8
+    num_attention_heads: int = 8
     dropout: float = 0.15
 
 
@@ -93,12 +93,12 @@ class AlphaFold2TriangleAttentionConfig(Config):
     Configure triangle attention over pair representations.
 
     Args:
-        num_heads: Number of triangle-attention heads.
+        num_attention_heads: Number of triangle-attention heads.
         head_dim: Per-head value width.
         dropout: Dropout probability along the pair path.
     """
 
-    num_heads: int = 4
+    num_attention_heads: int = 4
     head_dim: int = 32
     dropout: float = 0.25
 
@@ -166,10 +166,10 @@ class AlphaFold2TemplatePointwiseAttentionConfig(Config):
     Configure pointwise attention across templates.
 
     Args:
-        num_heads: Number of template pointwise-attention heads.
+        num_attention_heads: Number of template pointwise-attention heads.
     """
 
-    num_heads: int = 4
+    num_attention_heads: int = 4
 
 
 class AlphaFold2TemplateConfig(Config):
@@ -292,7 +292,7 @@ class AlphaFold2StructureModuleConfig(Config):
     Args:
         dropout: Dropout probability in structure-module blocks.
         hidden_size: Width of structure-module single representations.
-        num_heads: Number of invariant-point-attention heads.
+        num_attention_heads: Number of invariant-point-attention heads.
         num_blocks: Number of iterative structure-module blocks.
         num_transition_projections: Number of projections in each structure transition.
         num_point_qk: Number of query/key points per attention head.
@@ -305,7 +305,7 @@ class AlphaFold2StructureModuleConfig(Config):
 
     dropout: float = 0.1
     hidden_size: int = 384
-    num_heads: int = 12
+    num_attention_heads: int = 12
     num_blocks: int = 8
     num_transition_projections: int = 3
     num_point_qk: int = 4

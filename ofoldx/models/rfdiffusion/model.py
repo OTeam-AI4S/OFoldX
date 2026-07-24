@@ -1981,9 +1981,11 @@ class RfDiffusionSe3Attention(nn.Module):
     Multi-head SE(3)-equivariant attention over graph edges.
     """
 
-    def __init__(self, num_heads: int, key_fiber: RfDiffusionSe3Fiber, value_fiber: RfDiffusionSe3Fiber) -> None:
+    def __init__(
+        self, num_attention_heads: int, key_fiber: RfDiffusionSe3Fiber, value_fiber: RfDiffusionSe3Fiber
+    ) -> None:
         super().__init__()
-        self.num_heads = num_heads
+        self.num_attention_heads = num_attention_heads
         self.key_fiber = key_fiber
         self.value_fiber = value_fiber
         self.backend = "auto"
@@ -1995,9 +1997,9 @@ class RfDiffusionSe3Attention(nn.Module):
         query: dict[str, Tensor],
         graph,
     ) -> dict[str, Tensor]:
-        key_heads = key.reshape(key.shape[0], self.num_heads, -1)
+        key_heads = key.reshape(key.shape[0], self.num_attention_heads, -1)
         query_tensor = torch.cat([query[str(degree)] for degree in self.key_fiber.degrees], dim=-1)
-        query_heads = query_tensor.reshape(query_tensor.shape[0], self.num_heads, -1)
+        query_heads = query_tensor.reshape(query_tensor.shape[0], self.num_attention_heads, -1)
 
         edge_weights = (key_heads * query_heads[graph.destination]).sum(dim=-1) / math.sqrt(self.key_fiber.num_features)
         edge_weights = edge_weights.masked_fill(
@@ -2009,7 +2011,7 @@ class RfDiffusionSe3Attention(nn.Module):
             _segment_softmax_csr(edge_weights, graph.row_offsets, backend=self.backend),
         )[..., None, None]
 
-        value_heads = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
+        value_heads = value.view(value.shape[0], self.num_attention_heads, -1, value.shape[-1])
         feat_out = cast(
             Tensor,
             _segment_sum_csr(
@@ -2033,7 +2035,7 @@ class RfDiffusionSe3AttentionBlock(nn.Module):
         fiber_in: RfDiffusionSe3Fiber,
         fiber_out: RfDiffusionSe3Fiber,
         fiber_edge: RfDiffusionSe3Fiber,
-        num_heads: int = 4,
+        num_attention_heads: int = 4,
         channels_div: int = 2,
         use_layer_norm: bool = False,
         max_degree: int = 1,
@@ -2053,7 +2055,7 @@ class RfDiffusionSe3AttentionBlock(nn.Module):
             allow_fused_output=True,
         )
         self.query_projection = RfDiffusionSe3Linear(fiber_in, key_query_fiber)
-        self.attention = RfDiffusionSe3Attention(num_heads, key_query_fiber, value_fiber)
+        self.attention = RfDiffusionSe3Attention(num_attention_heads, key_query_fiber, value_fiber)
         self.output_projection = RfDiffusionSe3Linear(value_fiber + fiber_in, fiber_out)
         self.output_norm = RfDiffusionSe3Norm(fiber_out)
 
@@ -2090,7 +2092,7 @@ class RfDiffusionSe3Transformer(nn.Module):
         fiber_in: RfDiffusionSe3Fiber,
         fiber_hidden: RfDiffusionSe3Fiber,
         fiber_out: RfDiffusionSe3Fiber,
-        num_heads: int,
+        num_attention_heads: int,
         channels_div: int,
         fiber_edge: RfDiffusionSe3Fiber | None = None,
         use_layer_norm: bool = True,
@@ -2099,7 +2101,7 @@ class RfDiffusionSe3Transformer(nn.Module):
         fiber_edge = RfDiffusionSe3Fiber({}) if fiber_edge is None else fiber_edge
         self.num_blocks = num_blocks
         self.fiber_edge = fiber_edge
-        self.num_heads = num_heads
+        self.num_attention_heads = num_attention_heads
         self.channels_div = channels_div
         self.backend = "auto"
         self.max_degree = max(*fiber_in.degrees, *fiber_hidden.degrees, *fiber_out.degrees)
@@ -2110,7 +2112,7 @@ class RfDiffusionSe3Transformer(nn.Module):
                     fiber_in=fiber_in,
                     fiber_out=fiber_hidden,
                     fiber_edge=fiber_edge,
-                    num_heads=num_heads,
+                    num_attention_heads=num_attention_heads,
                     channels_div=channels_div,
                     use_layer_norm=use_layer_norm,
                     max_degree=self.max_degree,
@@ -2177,7 +2179,7 @@ class RfDiffusionSe3StructureModule(nn.Module):
             fiber_in=fiber_in,
             fiber_hidden=fiber_hidden,
             fiber_out=fiber_out,
-            num_heads=num_attention_heads,
+            num_attention_heads=num_attention_heads,
             channels_div=div,
             fiber_edge=fiber_edge,
             use_layer_norm=True,
