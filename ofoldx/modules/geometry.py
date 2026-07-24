@@ -8,6 +8,31 @@ import torch
 from torch import Tensor
 
 
+def rigid_from_three_points(
+    first: Tensor,
+    center: Tensor,
+    third: Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Build a right-handed orthonormal frame from three points.
+
+    The first frame axis points from ``center`` to ``third``; the second is the
+    component from ``center`` to ``first`` orthogonal to that axis.
+    """
+
+    first_axis = third - center
+    second_direction = first - center
+    first_axis = first_axis / (torch.linalg.vector_norm(first_axis, dim=-1, keepdim=True) + eps)
+    second_axis = second_direction - (
+        torch.einsum("...i,...i->...", first_axis, second_direction)[..., None] * first_axis
+    )
+    second_axis = second_axis / (torch.linalg.vector_norm(second_axis, dim=-1, keepdim=True) + eps)
+    third_axis = torch.cross(first_axis, second_axis, dim=-1)
+    return torch.stack((first_axis, second_axis, third_axis), dim=-1), center
+
+
 def weighted_rigid_align(*, source: Tensor, target: Tensor, weight: Tensor, eps: float = 1e-8) -> Tensor:
     r"""
     Rigidly align ``source`` onto ``target`` with a weighted Kabsch fit.

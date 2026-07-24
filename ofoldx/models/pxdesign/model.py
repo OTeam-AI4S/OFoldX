@@ -16,7 +16,7 @@ from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
-from ...modules.atom import AtomToTokenEncoder
+from ...modules.atom import NormalizedKeyAtomToTokenEncoder
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
@@ -62,7 +62,6 @@ class PxDesignModel(Model):
             num_atom_decoder_attention_heads=denoiser.num_atom_decoder_attention_heads,
             num_query_atoms=denoiser.num_query_atoms,
             num_key_atoms=denoiser.num_key_atoms,
-            cross_attention_key_source="normalized",
         )
         self.coordinate_sampler = PxDesignSampler(config)
         self.post_init()
@@ -261,7 +260,7 @@ class PxDesignConditionEmbeddings(nn.Module):
     def __init__(self, config: PxDesignConfig) -> None:
         super().__init__()
         embedder = config.condition_embeddings
-        self.atom_encoder = AtomToTokenEncoder(
+        self.atom_encoder = NormalizedKeyAtomToTokenEncoder(
             token_hidden_size=embedder.token_hidden_size,
             atom_hidden_size=embedder.atom_hidden_size,
             atom_pair_hidden_size=embedder.atom_pair_hidden_size,
@@ -270,7 +269,6 @@ class PxDesignConditionEmbeddings(nn.Module):
             num_query_atoms=embedder.num_query_atoms,
             num_key_atoms=embedder.num_key_atoms,
             atom_feature_size=config.atom_feature_size,
-            cross_attention_key_source="normalized",
         )
         input_size = (
             embedder.token_hidden_size

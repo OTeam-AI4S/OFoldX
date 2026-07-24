@@ -310,7 +310,7 @@ _MSA_STACK_SCOPE = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack"
 # Per-context Haiku scopes for the four Pairformer-block instances enumerated by the shared schema.
 # The DeepMind layout math (splits, transposes, glu chunking) stays entirely inside the leaf helpers.
 _PAIRFORMER_CONTEXTS = {
-    "trunk": ("diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer", True, "pair_transition"),
+    "trunk": ("diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer", True, "transition"),
     "msa_pair": (_MSA_STACK_SCOPE, False, "transition"),
     "template": (
         "diffuser/evoformer/template_embedding/single_template_embedding/"
@@ -321,7 +321,7 @@ _PAIRFORMER_CONTEXTS = {
     "confidence": (
         "diffuser/confidence_head/__layer_stack_no_per_layer/confidence_pairformer",
         True,
-        "pair_transition",
+        "transition",
     ),
 }
 _ATOM_ENCODER_CONTEXTS = {

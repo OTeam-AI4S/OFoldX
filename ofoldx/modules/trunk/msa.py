@@ -41,8 +41,6 @@ class MsaTrunk(nn.Module):
         expansion: Expansion factor of every transition.
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
     """
 
@@ -61,7 +59,6 @@ class MsaTrunk(nn.Module):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -79,7 +76,6 @@ class MsaTrunk(nn.Module):
                 expansion=expansion,
                 msa_dropout=msa_dropout,
                 pair_dropout=pair_dropout,
-                ending_node_transpose_bias=ending_node_transpose_bias,
                 operator_backend=operator_backend,
             )
             for _ in range(num_blocks - 1)
@@ -95,7 +91,6 @@ class MsaTrunk(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     expansion=expansion,
                     pair_dropout=pair_dropout,
-                    ending_node_transpose_bias=ending_node_transpose_bias,
                     operator_backend=operator_backend,
                 )
             )
@@ -366,8 +361,6 @@ class MsaPairBlock(nn.Module):
         expansion: Feed-forward expansion factor of every transition.
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
     """
 
@@ -383,7 +376,6 @@ class MsaPairBlock(nn.Module):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -408,7 +400,6 @@ class MsaPairBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            ending_node_transpose_bias=ending_node_transpose_bias,
             operator_backend=operator_backend,
         )
 
@@ -456,8 +447,6 @@ class FinalMsaPairBlock(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Expansion factor of every transition.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
     """
 
@@ -471,7 +460,6 @@ class FinalMsaPairBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         pair_dropout: float = 0.25,
-        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -488,7 +476,6 @@ class FinalMsaPairBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            ending_node_transpose_bias=ending_node_transpose_bias,
             operator_backend=operator_backend,
         )
 
@@ -570,6 +557,64 @@ class MsaUpdateBlock(nn.Module):
         return msa + self.transition(msa)
 
 
+class TrianglePairUpdateStack(nn.Module):
+    r"""
+    Apply a homogeneous sequence of pair-only triangle update blocks.
+
+    Args:
+        num_blocks: Number of triangle pair-update blocks.
+        pair_size: Width of the pair representation.
+        triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
+        triangle_attention_hidden_size: Per-head width of each triangle-attention update.
+        num_triangle_attention_heads: Number of heads in triangle attention.
+        expansion: Expansion factor of the transition.
+        dropout: Row-wise dropout probability applied to each residual.
+        operator_backend: Operator backend selector forwarded to every block.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            TrianglePairUpdateBlock(
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                operator_backend=operator_backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        r"""
+        Move a pair representation through every homogeneous update block.
+
+        Args:
+            pair: Pair representation `[B, N, N, pair_size]`.
+            pair_mask: Optional pair validity mask `[B, N, N]`.
+
+        Returns:
+            Updated pair representation `[B, N, N, pair_size]`.
+        """
+
+        for block in self.blocks:
+            pair = block(pair, pair_mask=pair_mask)
+        return pair
+
+
 class TrianglePairUpdateBlock(nn.Module):
     r"""
     Pair-only triangle update block: triangle multiplication, triangle attention, then a transition.
@@ -584,8 +629,6 @@ class TrianglePairUpdateBlock(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability applied to each residual.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair.
         operator_backend: Operator backend selector forwarded to every submodule.
     """
 
@@ -597,7 +640,6 @@ class TrianglePairUpdateBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.25,
-        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -623,7 +665,6 @@ class TrianglePairUpdateBlock(nn.Module):
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            transpose_bias=ending_node_transpose_bias,
             operator_backend=operator_backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
@@ -645,6 +686,21 @@ class TrianglePairUpdateBlock(nn.Module):
             The updated pair representation `[B, N, N, pair_size]`.
         """
 
+        pair = self.triangle_update(pair, pair_mask=pair_mask)
+        return pair + self.transition(pair)
+
+    def triangle_update(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        r"""
+        Apply the four triangle residual branches before the final pair transition.
+
+        Args:
+            pair: Pair representation `[B, N, N, pair_size]`.
+            pair_mask: Optional pair validity mask `[B, N, N]`.
+
+        Returns:
+            Pair representation after outgoing/incoming multiplication and starting/ending attention.
+        """
+
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
@@ -655,7 +711,7 @@ class TrianglePairUpdateBlock(nn.Module):
                 -2,
             ),
         )
-        return pair + self.transition(pair)
+        return pair
 
 
 class MsaPairWeightedAveraging(nn.Module):

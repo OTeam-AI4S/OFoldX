@@ -696,7 +696,6 @@ class AlphaFold2TriangleAttention(TriangleAttention):
             pair_size=pair_size,
             head_dim=head_dim,
             num_attention_heads=num_attention_heads,
-            transpose_bias=False,
             output_bias=True,
             gate_bias=True,
             gate_bias_init=1.0,

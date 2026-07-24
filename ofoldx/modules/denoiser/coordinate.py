@@ -6,14 +6,14 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from ..atom import (
     AtomToTokenOutput,
     CoordinateAtomToTokenEncoder,
     LocalAtomGeometry,
     LocalAtomWindowInfo,
-    TokenToAtomDecoder,
+    NormalizedKeyCoordinateAtomToTokenEncoder,
+    NormalizedKeyTokenToAtomDecoder,
 )
 from ..attention import DenoisingTokenEncoder
 from ..backend import LayerNorm
@@ -22,7 +22,6 @@ from ..diffusion.edm import EdmPreconditioner
 from ..diffusion.types import CoordinateDenoisingInput
 from ..embedding.fourier import FrozenFourierEmbedding
 from ..embedding.position import RelativePositionBuckets, RelativePositionEmbedder
-from ..transformer import CrossAttentionKeySource
 from ..transition import Transition
 
 
@@ -41,7 +40,6 @@ class CoordinateDenoiser(nn.Module):
         pair_size: Width of the token pair representation.
         token_feature_size: Width of the raw per-token conditioning features.
         atom_feature_size: Width of the raw per-atom input features.
-        embed_relative_position: Whether to project relative-position buckets before pair conditioning.
         num_atom_encoder_blocks: Number of atom-encoder attention blocks.
         num_atom_encoder_attention_heads: Number of attention heads per atom-encoder block.
         num_atom_decoder_blocks: Number of atom-decoder attention blocks.
@@ -49,8 +47,6 @@ class CoordinateDenoiser(nn.Module):
         num_query_atoms: Query window size for local atom attention.
         num_key_atoms: Key window size for local atom attention.
         operator_backend: Backend selector passed to the attention/transition operators.
-        cross_attention_key_source: Whether atom key/value normalization starts from the raw hidden state
-            or the query-normalized state.
     """
 
     def __init__(
@@ -66,7 +62,6 @@ class CoordinateDenoiser(nn.Module):
         pair_size: int = 128,
         token_feature_size: int = 449,
         atom_feature_size: int = 385,
-        embed_relative_position: bool = True,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
         num_atom_decoder_blocks: int = 3,
@@ -74,20 +69,18 @@ class CoordinateDenoiser(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
         self.conditioner = DenoisingConditioner(
-            pair_input_size=2 * pair_size if embed_relative_position else pair_size + 139,
+            pair_input_size=2 * pair_size,
             pair_size=pair_size,
             single_conditioning_size=single_size + token_feature_size,
             single_size=single_size,
             sigma_data=sigma_data,
-            embed_relative_position=embed_relative_position,
             operator_backend=operator_backend,
         )
-        self.atom_encoder = CoordinateAtomToTokenEncoder(
+        self.atom_encoder = NormalizedKeyCoordinateAtomToTokenEncoder(
             token_hidden_size=token_hidden_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -99,7 +92,6 @@ class CoordinateDenoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
             operator_backend=operator_backend,
-            cross_attention_key_source=cross_attention_key_source,
         )
         self.token_refiner = DenoisingTokenRefiner(
             num_blocks=num_encoder_blocks,
@@ -109,7 +101,7 @@ class CoordinateDenoiser(nn.Module):
             pair_size=pair_size,
             operator_backend=operator_backend,
         )
-        self.atom_decoder = TokenToAtomDecoder(
+        self.atom_decoder = NormalizedKeyTokenToAtomDecoder(
             token_hidden_size=token_hidden_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -118,7 +110,6 @@ class CoordinateDenoiser(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
-            cross_attention_key_source=cross_attention_key_source,
         )
 
     def build_local_geometry(
@@ -243,7 +234,6 @@ class DenoisingConditioner(nn.Module):
         single_size: Width of the conditioned single representation.
         noise_embedding_size: Width of the Fourier noise embedding.
         sigma_data: EDM data-scale hyperparameter used to normalise the log-noise.
-        embed_relative_position: Whether to project relative-position buckets before pair conditioning.
         operator_backend: Public backend request forwarded to the pair and single transitions.
     """
 
@@ -256,16 +246,11 @@ class DenoisingConditioner(nn.Module):
         single_size: int = 384,
         noise_embedding_size: int = 256,
         sigma_data: float = 16.0,
-        embed_relative_position: bool = True,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.sigma_data = sigma_data
-        self.embed_relative_position = embed_relative_position
-
-        self.relative_position_embedder = (
-            RelativePositionEmbedder(relative_position_size, pair_size) if embed_relative_position else None
-        )
+        self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
         self.pair_input_norm = LayerNorm(pair_input_size, bias=False, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
         self.pair_transitions = nn.ModuleList(
@@ -309,11 +294,7 @@ class DenoisingConditioner(nn.Module):
             ``[..., N_token, N_token, pair_size]``.
         """
 
-        relative_position_conditioning = (
-            self.relative_position_embedder(relative_features)
-            if self.relative_position_embedder is not None
-            else _relative_position_one_hot(relative_features)
-        )
+        relative_position_conditioning = self.relative_position_embedder(relative_features)
         denoising_pair = condition_pair(
             pair,
             relative_position_conditioning,
@@ -334,22 +315,6 @@ class DenoisingConditioner(nn.Module):
             sample_axis=True,
         )
         return denoising_single, denoising_pair
-
-
-def _relative_position_one_hot(buckets: RelativePositionBuckets) -> Tensor:
-    r"""
-    Materialize an unprojected relative-position feature vector.
-
-    Concatenates residue offsets, token offsets, same-entity indicators, and chain
-    offsets for conditioners that consume the raw categorical features alongside
-    pair embeddings.
-    """
-
-    residue = F.one_hot(buckets.residue_bucket.long(), num_classes=buckets.residue_size)
-    token = F.one_hot(buckets.token_bucket.long(), num_classes=buckets.residue_size)
-    same_entity = buckets.same_entity.unsqueeze(-1)
-    chain = F.one_hot(buckets.chain_bucket.long(), num_classes=buckets.chain_size)
-    return torch.cat([residue, token, same_entity, chain], dim=-1).to(dtype=buckets.dtype)
 
 
 class DenoisingTokenRefiner(nn.Module):
@@ -389,7 +354,7 @@ class DenoisingTokenRefiner(nn.Module):
 
     def forward(
         self,
-        atom_encoder: CoordinateAtomToTokenEncoder,
+        atom_encoder: CoordinateAtomToTokenEncoder | NormalizedKeyCoordinateAtomToTokenEncoder,
         *,
         atom_features: Tensor,
         atom_to_token: Tensor,

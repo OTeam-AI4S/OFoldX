@@ -261,12 +261,12 @@ PAIRFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
         (r"^attention\.proj_z\.0\.", "pair_attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
-        *_triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
-        *_triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
-        *_triangle_attention_rules("tri_att_start", "triangle_attention_starting_node"),
-        *_triangle_attention_rules("tri_att_end", "triangle_attention_ending_node"),
+        *_triangle_multiplication_rules("tri_mul_out", "pair_update.triangle_multiplication_outgoing"),
+        *_triangle_multiplication_rules("tri_mul_in", "pair_update.triangle_multiplication_incoming"),
+        *_triangle_attention_rules("tri_att_start", "pair_update.triangle_attention_starting_node"),
+        *_triangle_attention_rules("tri_att_end", "pair_update.triangle_attention_ending_node"),
         *_transition_rules("transition_s", "single_transition"),
-        *_transition_rules("transition_z", "pair_transition"),
+        *_transition_rules("transition_z", "pair_update.transition"),
     ]
 )
 
@@ -309,7 +309,7 @@ def _split_fused_projection(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
 def _convert_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     split = _split_fused_projection(key, tensor)
     if split is not None:
-        return split
+        return [(f"pair_update.{new_key}", value) for new_key, value in split]
     new_key = convert_keys(key, PAIRFORMER_LAYER_RULES)
     return [] if new_key is None else [(new_key, tensor)]
 

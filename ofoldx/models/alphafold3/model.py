@@ -9,6 +9,7 @@ from typing import Literal, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.molecular import (
@@ -22,27 +23,46 @@ from ...data.structure import Structure
 from ...model import Model
 from ...modules.atom import (
     AtomToTokenEncoder,
+    CoordinateAtomToTokenEncoder,
     LocalAtomGeometry,
     LocalAtomWindowing,
+    TokenToAtomDecoder,
 )
+from ...modules.attention import PairBiasedSelfAttention, TriangleAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
-from ...modules.denoiser import CoordinateDenoiser
+from ...modules.backend.attention import triangle_attention as dispatch_triangle_attention
+from ...modules.denoiser import CoordinateDenoiser, DenoisingTokenRefiner
 from ...modules.diffusion import (
     CoordinateDenoiseContext,
     CoordinateDenoisingInput,
     CoordinateEdmSampler,
+    EdmPreconditioner,
     EdmScheduler,
 )
+from ...modules.diffusion.conditioning import condition_pair, condition_single
+from ...modules.dropout import RowwiseDropout
 from ...modules.embedding import (
+    FrozenFourierEmbedding,
     RelativePositionBuckets,
     RelativePositionEmbedder,
     TemplateEmbedder,
     TemplateFeatures,
     generate_relative_position_features,
 )
+from ...modules.embedding.factorized import FactorizedPairLinear
 from ...modules.functional import pair_mask_from_token_mask
-from ...modules.head import ConfidenceHead, DistogramHead, expected_plddt, tm_bin_weights
-from ...modules.trunk import MsaTrunk, PairformerStack
+from ...modules.head import (
+    AtomConfidenceProjector,
+    BinnedDistancePairEmbedder,
+    DistogramHead,
+    PostProjectionSymmetricPairConfidenceProjector,
+    expected_plddt,
+    tm_bin_weights,
+)
+from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
+from ...modules.transition import Transition
+from ...modules.trunk.msa import MsaPairBlock, MsaTrunk, MsaUpdateBlock, OuterProductMean, TrianglePairUpdateBlock
+from ...modules.trunk.pairformer import PairformerBlock, PairformerStack
 from ...results import FoldPrediction, Metric, PairMetric, Score, best
 from .config import AlphaFold3Config
 
@@ -78,7 +98,7 @@ class AlphaFold3Model(Model):
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
         self.single_recycle_norm = LayerNorm(config.single_size)
         self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
-        self.template_embedder = TemplateEmbedder(
+        self.template_embedder = AlphaFold3TemplateEmbedder(
             pair_size=config.pair_size,
             hidden_size=config.template.hidden_size,
             num_blocks=config.template.num_blocks,
@@ -88,23 +108,20 @@ class AlphaFold3Model(Model):
             num_triangle_attention_heads=config.template.num_triangle_attention_heads,
             expansion=config.template.expansion,
             dropout=config.template.dropout,
-            ending_node_transpose_bias=True,
         )
-        self.msa_trunk = MsaTrunk(
+        self.msa_trunk = AlphaFold3MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
-            ending_node_transpose_bias=True,
         )
-        self.pairformer_stack = PairformerStack(
+        self.pairformer_stack = AlphaFold3PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
             single_size=config.single_size,
             pair_size=config.pair_size,
             dropout=config.trunk.pairformer_dropout,
-            ending_node_transpose_bias=True,
         )
-        self.coordinate_denoiser = CoordinateDenoiser(
+        self.coordinate_denoiser = AlphaFold3CoordinateDenoiser(
             num_encoder_blocks=config.denoiser.num_token_encoder_blocks,
             num_encoder_attention_heads=config.denoiser.num_token_encoder_attention_heads,
             sigma_data=config.denoiser.sigma_data,
@@ -115,7 +132,6 @@ class AlphaFold3Model(Model):
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
             atom_feature_size=config.atom_feature_size,
-            embed_relative_position=False,
             num_atom_encoder_blocks=config.denoiser.num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=config.denoiser.num_atom_encoder_attention_heads,
             num_atom_decoder_blocks=config.denoiser.num_atom_decoder_blocks,
@@ -139,7 +155,7 @@ class AlphaFold3Model(Model):
         )
         self._num_sampling_steps = config.sampler.num_sampling_steps
         self.distogram_head = DistogramHead(config.pair_size, config.distogram.num_bins, bias=False)
-        self.confidence_head = ConfidenceHead(
+        self.confidence_head = AlphaFold3ConfidenceHead(
             single_size=config.single_size,
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
@@ -158,14 +174,7 @@ class AlphaFold3Model(Model):
             num_triangle_attention_heads=config.confidence.num_triangle_attention_heads,
             expansion=config.confidence.expansion,
             dropout=config.confidence.pairformer_dropout,
-            ending_node_transpose_bias=True,
             single_max_abs=config.confidence.single_max_abs,
-            # This confidence head omits single normalization and raw-distance projection.
-            # PDE logits are symmetrized after projection; distance bins are derived buffers.
-            use_single_norm=False,
-            use_distance_projection=False,
-            symmetrize_pde_before_projection=False,
-            persistent_distance_bins=False,
         )
         # Atom cross-attention adaptively normalizes queries and keys from the raw hidden state.
         self.post_init()
@@ -748,6 +757,244 @@ class AlphaFold3Model(Model):
         return pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
 
 
+class AlphaFold3ConfidenceHead(nn.Module):
+    r"""
+    AlphaFold 3 confidence-prediction composition.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+        num_plddt_bins: int = 50,
+        num_resolved_bins: int = 2,
+        max_atoms_per_token: int = 24,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        num_blocks: int = 4,
+        num_pair_attention_heads: int = 16,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        single_max_abs: float | None = 512.0,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.single_max_abs = single_max_abs
+        self.pair_embedder = BinnedDistancePairEmbedder(
+            pair_size=pair_size,
+            token_feature_size=token_feature_size,
+            distance_bin_start=distance_bin_start,
+            distance_bin_end=distance_bin_end,
+            distance_bin_step=distance_bin_step,
+        )
+        self.pairformer_stack = AlphaFold3PairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            operator_backend=operator_backend,
+        )
+        self.atom_projector = AtomConfidenceProjector(
+            single_size=single_size,
+            num_plddt_bins=num_plddt_bins,
+            num_resolved_bins=num_resolved_bins,
+            max_atoms_per_token=max_atoms_per_token,
+            operator_backend=operator_backend,
+        )
+        self.pair_projector = PostProjectionSymmetricPairConfidenceProjector(
+            pair_size=pair_size,
+            num_pae_bins=num_pae_bins,
+            num_pde_bins=num_pde_bins,
+        )
+
+    def forward(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        token_embedding: Tensor,
+        pred_coords: Tensor,
+        token_to_rep_atom: Tensor,
+        atom_to_token: Tensor,
+        atom_token_index: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if self.single_max_abs is not None:
+            single = torch.clamp(single, min=-self.single_max_abs, max=self.single_max_abs)
+        representative_coords = gather_atoms_by_index(
+            pred_coords,
+            insert_sample_axis(token_to_rep_atom, pred_coords.shape[-3]),
+        )
+
+        outputs = []
+        for representative_coords_sample in representative_coords.unbind(dim=-3):
+            sample_pair = self.pair_embedder(pair, token_embedding, representative_coords_sample)
+            sample_single, sample_pair = self.pairformer_stack(single, sample_pair, pair_mask=pair_mask)
+            sample_plddt, sample_resolved = self.atom_projector(sample_single, atom_to_token, atom_token_index)
+            sample_pae, sample_pde = self.pair_projector(sample_pair)
+            outputs.append((sample_plddt, sample_pae, sample_pde, sample_resolved))
+
+        plddt_logits, pae_logits, pde_logits, resolved_logits = zip(*outputs)
+        return (
+            torch.stack(plddt_logits, dim=-3),
+            torch.stack(pae_logits, dim=-4),
+            torch.stack(pde_logits, dim=-4),
+            torch.stack(resolved_logits, dim=-3),
+        )
+
+
+class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
+    r"""
+    AlphaFold 3 coordinate-denoising composition.
+    """
+
+    def __init__(
+        self,
+        num_encoder_blocks: int = 24,
+        num_encoder_attention_heads: int = 16,
+        *,
+        sigma_data: float = 16.0,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        token_hidden_size: int = 768,
+        single_size: int = 384,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        atom_feature_size: int = 385,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        num_atom_decoder_blocks: int = 3,
+        num_atom_decoder_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.conditioner = AlphaFold3DenoisingConditioner(
+            pair_input_size=pair_size + 139,
+            pair_size=pair_size,
+            single_conditioning_size=single_size + token_feature_size,
+            single_size=single_size,
+            sigma_data=sigma_data,
+            operator_backend=operator_backend,
+        )
+        self.atom_encoder = CoordinateAtomToTokenEncoder(
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            atom_feature_size=atom_feature_size,
+            operator_backend=operator_backend,
+        )
+        self.token_refiner = DenoisingTokenRefiner(
+            num_blocks=num_encoder_blocks,
+            num_attention_heads=num_encoder_attention_heads,
+            token_hidden_size=token_hidden_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            operator_backend=operator_backend,
+        )
+        self.atom_decoder = TokenToAtomDecoder(
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            operator_backend=operator_backend,
+        )
+
+
+class AlphaFold3DenoisingConditioner(nn.Module):
+    r"""
+    Concatenate raw relative-position buckets into AlphaFold 3 denoising pair conditioning.
+    """
+
+    def __init__(
+        self,
+        pair_input_size: int = 267,
+        pair_size: int = 128,
+        single_conditioning_size: int = 833,
+        single_size: int = 384,
+        noise_embedding_size: int = 256,
+        sigma_data: float = 16.0,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.sigma_data = sigma_data
+        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, operator_backend=operator_backend)
+        self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
+        self.pair_transitions = nn.ModuleList(
+            Transition(pair_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
+        )
+        self.single_conditioning_norm = LayerNorm(
+            single_conditioning_size, bias=False, operator_backend=operator_backend
+        )
+        self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
+        self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
+        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, operator_backend=operator_backend)
+        self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
+        self.single_transitions = nn.ModuleList(
+            Transition(single_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
+        )
+
+    def forward(
+        self,
+        noise_level: Tensor,
+        *,
+        token_embedding: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        relative_features: RelativePositionBuckets,
+    ) -> tuple[Tensor, Tensor]:
+        denoising_pair = condition_pair(
+            pair,
+            _relative_position_one_hot(relative_features),
+            norm=self.pair_input_norm,
+            projection=self.pair_projection,
+            transitions=self.pair_transitions,
+        )
+        denoising_single, _ = condition_single(
+            single,
+            token_embedding,
+            torch.log(noise_level / self.sigma_data) / 4,
+            norm=self.single_conditioning_norm,
+            projection=self.single_conditioning_projection,
+            noise_fourier=self.noise_embedding,
+            noise_norm=self.noise_norm,
+            noise_projection=self.noise_projection,
+            transitions=self.single_transitions,
+            sample_axis=True,
+        )
+        return denoising_single, denoising_pair
+
+
+def _relative_position_one_hot(buckets: RelativePositionBuckets) -> Tensor:
+    residue = F.one_hot(buckets.residue_bucket.long(), num_classes=buckets.residue_size)
+    token = F.one_hot(buckets.token_bucket.long(), num_classes=buckets.residue_size)
+    same_entity = buckets.same_entity.unsqueeze(-1)
+    chain = F.one_hot(buckets.chain_bucket.long(), num_classes=buckets.chain_size)
+    return torch.cat([residue, token, same_entity, chain], dim=-1).to(dtype=buckets.dtype)
+
+
 class AlphaFold3InputEmbeddings(nn.Module):
     r"""
     Build token input embeddings by encoding atoms to tokens and appending the token-feature tail.
@@ -818,6 +1065,340 @@ class AlphaFold3InputEmbeddings(nn.Module):
             atom_mask=atom_mask,
             num_tokens=num_tokens,
         )
+
+
+class AlphaFold3TriangleAttention(TriangleAttention):
+    r"""
+    AlphaFold 3 ending-node triangle attention with bias from the pre-transpose pair orientation.
+    """
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        normalized = self.pair_norm(pair)
+        bias_source = normalized.transpose(-3, -2)
+        projected_bias = self.bias_projection(bias_source)
+        triangle_bias = projected_bias.movedim(-1, -3).unsqueeze(-4)
+        return dispatch_triangle_attention(
+            normalized,
+            triangle_bias,
+            pair_mask,
+            projection=self.attention.projection,
+            operator_backend=self.attention.operator_backend,
+        )
+
+
+class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
+    r"""
+    AlphaFold 3 pair update with its exact ending-node triangle-bias equation.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.triangle_multiplication_outgoing = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
+            operator_backend=operator_backend,
+        )
+        self.triangle_multiplication_incoming = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_starting_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_ending_node = AlphaFold3TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+
+
+class AlphaFold3PairformerBlock(PairformerBlock):
+    r"""
+    One AlphaFold 3 Pairformer block with the family-owned triangle-bias equation.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.pair_update = AlphaFold3TrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            operator_backend=operator_backend,
+        )
+        self.pair_attention = PairBiasedSelfAttention(
+            hidden_size=single_size,
+            pair_size=pair_size,
+            num_attention_heads=num_pair_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+
+
+class AlphaFold3PairformerStack(PairformerStack):
+    r"""
+    Homogeneous stack of AlphaFold 3 Pairformer blocks.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            AlphaFold3PairformerBlock(
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                operator_backend=operator_backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+
+class AlphaFold3MsaPairBlock(MsaPairBlock):
+    r"""
+    Joint AlphaFold 3 MSA/pair block with the family-owned triangle-bias equation.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        outer_product_hidden_size: int = 32,
+        num_msa_attention_heads: int = 8,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.outer_product_mean = OuterProductMean(
+            msa_size=msa_size,
+            hidden_size=outer_product_hidden_size,
+            pair_size=pair_size,
+            operator_backend=operator_backend,
+        )
+        self.msa_update = MsaUpdateBlock(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            expansion=expansion,
+            dropout=msa_dropout,
+            operator_backend=operator_backend,
+        )
+        self.triangle_pair_update = AlphaFold3TrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=pair_dropout,
+            operator_backend=operator_backend,
+        )
+
+
+class AlphaFold3FinalMsaPairBlock(nn.Module):
+    r"""
+    Final AlphaFold 3 MSA block that performs only the pair update.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        outer_product_hidden_size: int = 32,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        pair_dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.outer_product_mean = OuterProductMean(
+            msa_size=msa_size,
+            hidden_size=outer_product_hidden_size,
+            pair_size=pair_size,
+            operator_backend=operator_backend,
+        )
+        self.triangle_pair_update = AlphaFold3TrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=pair_dropout,
+            operator_backend=operator_backend,
+        )
+
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        *,
+        msa_mask: Tensor | None = None,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class AlphaFold3MsaTrunk(MsaTrunk):
+    r"""
+    AlphaFold 3 MSA trunk with homogeneous family-owned joint blocks and an explicit final block.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        msa_feature_size: int = 34,
+        token_feature_size: int = 449,
+        num_blocks: int = 4,
+        outer_product_hidden_size: int = 32,
+        num_msa_attention_heads: int = 8,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
+        self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
+        blocks: list[nn.Module] = [
+            AlphaFold3MsaPairBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                num_msa_attention_heads=num_msa_attention_heads,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                operator_backend=operator_backend,
+            )
+            for _ in range(num_blocks - 1)
+        ]
+        if num_blocks:
+            blocks.append(
+                AlphaFold3FinalMsaPairBlock(
+                    msa_size=msa_size,
+                    pair_size=pair_size,
+                    outer_product_hidden_size=outer_product_hidden_size,
+                    triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                    triangle_attention_hidden_size=triangle_attention_hidden_size,
+                    num_triangle_attention_heads=num_triangle_attention_heads,
+                    expansion=expansion,
+                    pair_dropout=pair_dropout,
+                    operator_backend=operator_backend,
+                )
+            )
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(blocks)
+
+
+class AlphaFold3TemplateEmbedder(TemplateEmbedder):
+    r"""
+    AlphaFold 3 template embedder with the family-owned triangle-bias equation.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        hidden_size: int = 64,
+        num_blocks: int = 0,
+        vocab_size: int = 32,
+        num_distogram_bins: int = 39,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 2,
+        dropout: float = 0.25,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.vocab_size = vocab_size
+        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
+        self.template_projection = FactorizedPairLinear(
+            pair_size=num_distogram_bins + 5,
+            token_size=vocab_size,
+            output_size=hidden_size,
+            pair_prefix_size=num_distogram_bins + 1,
+            bias=False,
+            operator_backend=operator_backend,
+        )
+        self.blocks = nn.ModuleList(
+            AlphaFold3TrianglePairUpdateBlock(
+                pair_size=hidden_size,
+                triangle_multiplication_hidden_size=hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                operator_backend=operator_backend,
+            )
+            for _ in range(num_blocks)
+        )
+        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.activation = nn.ReLU()
+        self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 
 
 def _build_alphafold3_local_geometry(

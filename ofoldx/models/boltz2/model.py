@@ -28,13 +28,14 @@ from ...modules.embedding.fourier import FrozenFourierEmbedding
 from ...modules.embedding.position import RelativePositionEmbedder, generate_relative_position_features
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
-from ...modules.head.distogram import DistogramHead
+from ...modules.head.distogram import PairSymmetrizedDistogramHead
 from ...modules.head.tm import tm_weight_from_pae
 from ...modules.transformer import ConditionedTransformer
 from ...modules.transition import Transition
 from ...modules.trunk.msa import (
     CategoricalMsaTrunk,
     TrianglePairUpdateBlock,
+    TrianglePairUpdateStack,
 )
 from ...modules.trunk.pairformer import PairformerStack
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score, ScoreResult
@@ -144,9 +145,7 @@ class Boltz2Model(Model):
             dropout=trunk.dropout,
             operator_backend="auto",
         )
-        self.distogram_head = DistogramHead(
-            pair_size=pair_size, num_bins=config.num_distogram_bins, symmetrize_before_projection=True
-        )
+        self.distogram_head = PairSymmetrizedDistogramHead(pair_size=pair_size, num_bins=config.num_distogram_bins)
 
         denoiser_config = config.denoiser
         self.denoiser_conditioning = Boltz2DenoiserConditioning(
@@ -1196,26 +1195,21 @@ class Boltz2AtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        structure_prediction: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.noisy_position_projection: nn.Linear | None = None
-        if structure_prediction:
-            self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
         self.atom_transformer = PackedAtomAttention(
-            atom_hidden_size=atom_hidden_size,
-            conditioning_size=atom_hidden_size,
-            num_blocks=num_atom_encoder_blocks,
-            num_attention_heads=num_atom_encoder_attention_heads,
+            ConditionedTransformer(
+                num_blocks=num_atom_encoder_blocks,
+                num_attention_heads=num_atom_encoder_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                operator_backend=operator_backend,
+            ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
-            cross_attention_mode=False,
-            transition="triple",
         )
-        token_out = 2 * single_size if structure_prediction else single_size
-        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, token_out, bias=False), nn.ReLU())
+        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, single_size, bias=False), nn.ReLU())
 
     def forward(
         self,
@@ -1225,32 +1219,76 @@ class Boltz2AtomAttentionEncoder(nn.Module):
         atom_mask: Tensor,
         atom_to_token: Tensor,
         num_tokens: int,
-        noisy_positions: Tensor | None = None,
-        multiplicity: int = 1,
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        query = atom_single
-        conditioning = atom_conditioning
-        mask = atom_mask
-        token_index = atom_to_token
-        noisy_position_projection = self.noisy_position_projection
-        if noisy_position_projection is not None:
-            query = query.repeat_interleave(multiplicity, 0) + noisy_position_projection(cast(Tensor, noisy_positions))
-            conditioning = conditioning.repeat_interleave(multiplicity, 0)
-            mask = mask.repeat_interleave(multiplicity, 0)
-            token_index = token_index.repeat_interleave(multiplicity, 0)
-
+    ) -> Tensor:
         atom_query = self.atom_transformer(
-            query,
-            conditioning,
+            atom_single,
+            atom_conditioning,
             atom_pair_bias,
-            atom_mask=mask.bool(),
+            atom_mask=atom_mask.bool(),
             attention_layout="local",
         )
         token_from_atom = self.token_projection(atom_query)
-        token_repr = dense_mean_to_tokens(token_from_atom, token_index, num_tokens, atom_mask=mask, count_eps=1e-6)
-        if noisy_position_projection is not None:
-            return token_repr, atom_query, conditioning
-        return token_repr
+        return dense_mean_to_tokens(token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6)
+
+
+class Boltz2DenoiserAtomAttentionEncoder(nn.Module):
+    r"""
+    Encode noisy atom states and pool them into denoiser token states.
+    """
+
+    def __init__(
+        self,
+        atom_hidden_size: int = 128,
+        single_size: int = 384,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+        self.atom_transformer = PackedAtomAttention(
+            ConditionedTransformer(
+                num_blocks=num_atom_encoder_blocks,
+                num_attention_heads=num_atom_encoder_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                operator_backend=operator_backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, 2 * single_size, bias=False), nn.ReLU())
+
+    def forward(
+        self,
+        atom_single: Tensor,
+        atom_conditioning: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        noisy_positions: Tensor,
+        multiplicity: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = atom_single.repeat_interleave(multiplicity, 0)
+        atom_query = atom_query + self.noisy_position_projection(noisy_positions)
+        conditioning = atom_conditioning.repeat_interleave(multiplicity, 0)
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+        atom_query = self.atom_transformer(
+            atom_query,
+            conditioning,
+            atom_pair_bias,
+            atom_mask=atom_mask.bool(),
+            attention_layout="local",
+        )
+        token_from_atom = self.token_projection(atom_query)
+        token_repr = dense_mean_to_tokens(
+            token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6
+        )
+        return token_repr, atom_query, conditioning
 
 
 class Boltz2AtomAttentionDecoder(nn.Module):
@@ -1271,15 +1309,15 @@ class Boltz2AtomAttentionDecoder(nn.Module):
         super().__init__()
         self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
         self.atom_transformer = PackedAtomAttention(
-            atom_hidden_size=atom_hidden_size,
-            conditioning_size=atom_hidden_size,
-            num_blocks=num_atom_decoder_blocks,
-            num_attention_heads=num_atom_decoder_attention_heads,
+            ConditionedTransformer(
+                num_blocks=num_atom_decoder_blocks,
+                num_attention_heads=num_atom_decoder_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                operator_backend=operator_backend,
+            ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
-            cross_attention_mode=False,
-            transition="triple",
         )
         self.position_update = nn.Sequential(
             LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
@@ -1623,14 +1661,13 @@ class Boltz2Denoiser(nn.Module):
             num_conditioning_transitions=num_conditioning_transitions,
             operator_backend=operator_backend,
         )
-        self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
+        self.atom_attention_encoder = Boltz2DenoiserAtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            structure_prediction=True,
             operator_backend=operator_backend,
         )
         self.single_to_token = nn.Sequential(
@@ -1934,9 +1971,8 @@ class Boltz2AffinityHead(nn.Module):
             expansion=expansion,
             operator_backend=operator_backend,
         )
-        self.pairformer_stack = PairformerStack(
+        self.pair_update_stack = TrianglePairUpdateStack(
             num_blocks=num_blocks,
-            single_size=0,
             pair_size=pair_size,
             triangle_attention_hidden_size=triangle_attention_hidden_size,
             num_triangle_attention_heads=num_triangle_attention_heads,
@@ -1979,7 +2015,7 @@ class Boltz2AffinityHead(nn.Module):
             | receptor_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
             | ligand_mask.unsqueeze(-1) & ligand_mask.unsqueeze(-2)
         )
-        _, pair = self.pairformer_stack(None, pair, pair_mask=affinity_pair_mask)
+        pair = self.pair_update_stack(pair, pair_mask=affinity_pair_mask)
         return self.output_head(pair, affinity_pair_mask)
 
 

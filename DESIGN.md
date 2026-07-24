@@ -164,6 +164,17 @@ consumers are established; activation family, projection depth, bias, dropout, o
 an extra multiplicative branch remain distinct equations rather than constructor
 flags invented only to force sharing.
 
+Source repetition is not evidence for a shared Module. In particular, repeated
+spelling across revisions or descendants of one model family may remain repeated
+family composition. A shared Module represents one independently nameable
+mathematical operation with one exact input/output contract; its consumers reuse
+that operation rather than merely sharing ancestry or checkpoint layout. A
+constructor flag that changes the owned submodule tree, branch equation,
+normalization site, masking equation, or returned scientific value disproves that
+single shared operation. Family adapters compose shared mathematical operations
+with family records and routing, while an operation already expressed exactly by
+ordinary PyTorch uses the ordinary PyTorch Module directly.
+
 The same audit confirms that a `Stack` moves only a homogeneous representation
 through its `blocks`. A final normalization, projection, head, feature construction,
 or scientific routing step belongs to the enclosing `Encoder`, `Decoder`, `Trunk`,

@@ -52,14 +52,7 @@ class ConfidenceHead(nn.Module):
         num_triangle_attention_heads: Number of triangle-attention heads.
         expansion: Feed-forward expansion factor in the Pairformer transitions.
         dropout: Pairformer dropout probability.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair.
         single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
-        use_single_norm: Whether to apply a ``LayerNorm`` to the single before the sample loop.
-        use_distance_projection: Whether the pair embedder adds a raw-distance projection channel.
-        symmetrize_pde_before_projection: Whether the PDE projector symmetrizes the pair state before the
-            norm/projection instead of symmetrizing the projected logits.
-        persistent_distance_bins: Whether the distance-bin buffers are stored in ``state_dict``.
         operator_backend: Public backend request forwarded to the Pairformer and atom projector.
     """
 
@@ -83,25 +76,18 @@ class ConfidenceHead(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.0,
-        ending_node_transpose_bias: bool = False,
         single_max_abs: float | None = 512.0,
-        use_single_norm: bool = False,
-        use_distance_projection: bool = True,
-        symmetrize_pde_before_projection: bool = True,
-        persistent_distance_bins: bool = True,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
-        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend) if use_single_norm else None
+        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
         self.pair_embedder = ConfidencePairEmbedder(
             pair_size=pair_size,
             token_feature_size=token_feature_size,
             distance_bin_start=distance_bin_start,
             distance_bin_end=distance_bin_end,
             distance_bin_step=distance_bin_step,
-            use_distance_projection=use_distance_projection,
-            persistent_distance_bins=persistent_distance_bins,
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=num_blocks,
@@ -113,7 +99,6 @@ class ConfidenceHead(nn.Module):
             num_pair_attention_heads=num_pair_attention_heads,
             expansion=expansion,
             dropout=dropout,
-            ending_node_transpose_bias=ending_node_transpose_bias,
             operator_backend=operator_backend,
         )
         self.atom_projector = AtomConfidenceProjector(
@@ -127,7 +112,6 @@ class ConfidenceHead(nn.Module):
             pair_size=pair_size,
             num_pae_bins=num_pae_bins,
             num_pde_bins=num_pde_bins,
-            symmetrize_before_projection=symmetrize_pde_before_projection,
         )
 
     def forward(
@@ -160,8 +144,7 @@ class ConfidenceHead(nn.Module):
 
         if self.single_max_abs is not None:
             single = torch.clamp(single, min=-self.single_max_abs, max=self.single_max_abs)
-        if self.single_norm is not None:
-            single = self.single_norm(single)
+        single = self.single_norm(single)
         # Select each token's representative-atom coordinate by gathering on the per-token global atom index
         # (replaces a boolean mask over the atom axis; supports batched/sampled leading dims). pred_coords
         # is ``[..., N_sample, N_atom, 3]``; insert the sample axis into the per-token index before gathering.
@@ -202,8 +185,6 @@ class ConfidencePairEmbedder(nn.Module):
         distance_bin_start: Lower edge of the distance one-hot bins in Angstrom.
         distance_bin_end: Upper edge of the distance one-hot bins in Angstrom.
         distance_bin_step: Width of each distance bin in Angstrom.
-        use_distance_projection: Whether to add a raw-distance projection channel.
-        persistent_distance_bins: Whether distance-bin buffers appear in ``state_dict``.
     """
 
     def __init__(
@@ -213,8 +194,6 @@ class ConfidencePairEmbedder(nn.Module):
         distance_bin_start: float = 3.25,
         distance_bin_end: float = 52.0,
         distance_bin_step: float = 1.25,
-        use_distance_projection: bool = True,
-        persistent_distance_bins: bool = True,
     ) -> None:
         super().__init__()
         self.left_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
@@ -232,10 +211,10 @@ class ConfidencePairEmbedder(nn.Module):
         upper_bins = torch.cat([lower_bins[1:], lower_bins.new_tensor([torch.inf])], dim=-1)
         self.lower_bins: Tensor
         self.upper_bins: Tensor
-        self.register_buffer("lower_bins", lower_bins, persistent=persistent_distance_bins)
-        self.register_buffer("upper_bins", upper_bins, persistent=persistent_distance_bins)
+        self.register_buffer("lower_bins", lower_bins)
+        self.register_buffer("upper_bins", upper_bins)
         self.distance_one_hot_projection = nn.Linear(len(lower_bins), pair_size, bias=False)
-        self.distance_projection = nn.Linear(1, pair_size, bias=False) if use_distance_projection else None
+        self.distance_projection = nn.Linear(1, pair_size, bias=False)
 
     def forward(self, pair: Tensor, token_embedding: Tensor, representative_coords: Tensor) -> Tensor:
         r"""
@@ -258,8 +237,7 @@ class ConfidencePairEmbedder(nn.Module):
             pair.dtype
         )
         pair = pair + self.distance_one_hot_projection(distance_bins)
-        if self.distance_projection is not None:
-            pair = pair + self.distance_projection(distance.to(pair.dtype).unsqueeze(-1))
+        pair = pair + self.distance_projection(distance.to(pair.dtype).unsqueeze(-1))
         return pair
 
 
@@ -337,8 +315,6 @@ class PairConfidenceProjector(nn.Module):
         pair_size: Width of the pair representation.
         num_pae_bins: Number of predicted-aligned-error bins.
         num_pde_bins: Number of predicted-distance-error bins.
-        symmetrize_before_projection: Whether to symmetrize the pair state before the PDE norm/projection
-            instead of symmetrizing the projected logits.
     """
 
     def __init__(
@@ -346,10 +322,8 @@ class PairConfidenceProjector(nn.Module):
         pair_size: int = 128,
         num_pae_bins: int = 64,
         num_pde_bins: int = 64,
-        symmetrize_before_projection: bool = True,
     ) -> None:
         super().__init__()
-        self.symmetrize_before_projection = symmetrize_before_projection
         self.pae_norm = LayerNorm(pair_size)
         self.pde_norm = LayerNorm(pair_size)
         self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
@@ -370,11 +344,73 @@ class PairConfidenceProjector(nn.Module):
         pae_pair = pair.to(dtype=self.pae_projection.weight.dtype)
         pde_pair = pair.to(dtype=self.pde_projection.weight.dtype)
         pae_logits = self.pae_projection(self.pae_norm(pae_pair))
-        if self.symmetrize_before_projection:
-            pde_logits = self.pde_projection(self.pde_norm(pde_pair + pde_pair.transpose(-2, -3)))
-        else:
-            # Project the unsymmetrized pair, then add the transposed logits. Because LayerNorm is
-            # non-linear, symmetrizing the pair before normalization would be a different function.
-            left_distance_logits = self.pde_projection(self.pde_norm(pde_pair))
-            pde_logits = left_distance_logits + left_distance_logits.transpose(-2, -3)
+        pde_logits = self.pde_projection(self.pde_norm(pde_pair + pde_pair.transpose(-2, -3)))
         return pae_logits, pde_logits
+
+
+class BinnedDistancePairEmbedder(nn.Module):
+    r"""
+    Add token features and binned representative-atom distances to an AlphaFold 3 pair state.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+    ) -> None:
+        super().__init__()
+        self.left_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        self.right_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        buffer_device = self.left_token_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        lower_bins = torch.arange(
+            distance_bin_start,
+            distance_bin_end,
+            distance_bin_step,
+            device=buffer_device,
+            dtype=self.left_token_projection.weight.dtype,
+        )
+        upper_bins = torch.cat([lower_bins[1:], lower_bins.new_tensor([torch.inf])], dim=-1)
+        self.lower_bins: Tensor
+        self.upper_bins: Tensor
+        self.register_buffer("lower_bins", lower_bins, persistent=False)
+        self.register_buffer("upper_bins", upper_bins, persistent=False)
+        self.distance_one_hot_projection = nn.Linear(len(lower_bins), pair_size, bias=False)
+
+    def forward(self, pair: Tensor, token_embedding: Tensor, representative_coords: Tensor) -> Tensor:
+        pair = pair + self.left_token_projection(token_embedding).unsqueeze(-2)
+        pair = pair + self.right_token_projection(token_embedding).unsqueeze(-3)
+        distance = torch.cdist(representative_coords.to(torch.float32), representative_coords.to(torch.float32))
+        distance_bins = ((distance[..., None] > self.lower_bins) & (distance[..., None] < self.upper_bins)).to(
+            pair.dtype
+        )
+        return pair + self.distance_one_hot_projection(distance_bins)
+
+
+class PostProjectionSymmetricPairConfidenceProjector(nn.Module):
+    r"""
+    Project AlphaFold 3 pair states and symmetrize PDE after nonlinear normalization.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+    ) -> None:
+        super().__init__()
+        self.pae_norm = LayerNorm(pair_size)
+        self.pde_norm = LayerNorm(pair_size)
+        self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+        self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+
+    def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:
+        pae_pair = pair.to(dtype=self.pae_projection.weight.dtype)
+        pde_pair = pair.to(dtype=self.pde_projection.weight.dtype)
+        pae_logits = self.pae_projection(self.pae_norm(pae_pair))
+        left_distance_logits = self.pde_projection(self.pde_norm(pde_pair))
+        return pae_logits, left_distance_logits + left_distance_logits.transpose(-2, -3)

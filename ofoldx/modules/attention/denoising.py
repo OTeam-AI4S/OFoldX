@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from ..backend import LayerNorm
-from ..transformer import ConditionedTransformer
+from ..transformer import DenoisingTransformer
 
 
 class DenoisingTokenEncoder(nn.Module):
@@ -46,13 +46,11 @@ class DenoisingTokenEncoder(nn.Module):
         self.bias_projections = nn.ModuleList(
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
-        self.transformer = ConditionedTransformer(
+        self.transformer = DenoisingTransformer(
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
             hidden_size=token_hidden_size,
             conditioning_size=conditioning_size,
-            cross_attention_mode=False,
-            transition="double",
             operator_backend=operator_backend,
         )
 

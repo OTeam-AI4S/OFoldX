@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ofoldx.modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
+from ofoldx.modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateStack
 
 
 @pytest.mark.parametrize("divide_before_projection", [False, True])
@@ -73,3 +73,21 @@ def test_pair_weighted_average() -> None:
     assert output.shape == (1, 2, 3, 4)
     assert output.abs().max() > 1e-3  # real signal, not the all-zero degenerate case
     torch.testing.assert_close(output, expected)
+
+
+def test_triangle_pair_update_stack() -> None:
+    pair = torch.randn(1, 3, 3, 4)
+    stack = TrianglePairUpdateStack(
+        num_blocks=2,
+        pair_size=4,
+        triangle_multiplication_hidden_size=4,
+        triangle_attention_hidden_size=2,
+        num_triangle_attention_heads=2,
+        dropout=0.0,
+        operator_backend="eager",
+    )
+
+    output = stack(pair)
+
+    assert output.shape == pair.shape
+    assert not torch.equal(output, pair)

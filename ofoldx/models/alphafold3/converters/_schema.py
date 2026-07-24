@@ -54,7 +54,12 @@ def resolve(model_key: str) -> AF3Node | None:
     if model_key.startswith("pairformer_stack."):
         match = _PAIRFORMER_BLOCK.fullmatch(model_key.removeprefix("pairformer_stack."))
         if match is not None:
-            return AF3Node("pairformer", "trunk", match.group(2), int(match.group(1)))
+            return AF3Node(
+                "pairformer",
+                "trunk",
+                match.group(2).removeprefix("pair_update."),
+                int(match.group(1)),
+            )
     if model_key.startswith("msa_trunk."):
         return _resolve_msa(model_key.removeprefix("msa_trunk."))
     if model_key.startswith("template_embedder."):
@@ -65,7 +70,12 @@ def resolve(model_key: str) -> AF3Node | None:
     if model_key.startswith("confidence_head."):
         rest = model_key.removeprefix("confidence_head.")
         if match := re.fullmatch(r"pairformer_stack\.blocks\.(\d+)\.(.+)", rest):
-            return AF3Node("pairformer", "confidence", match.group(2), int(match.group(1)))
+            return AF3Node(
+                "pairformer",
+                "confidence",
+                match.group(2).removeprefix("pair_update."),
+                int(match.group(1)),
+            )
         return AF3Node("confidence", "", rest, None)
     if model_key.startswith("coordinate_denoiser."):
         return _resolve_denoiser(model_key.removeprefix("coordinate_denoiser."))

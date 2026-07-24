@@ -34,8 +34,8 @@ from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.atom import (
-    AtomToTokenEncoder,
     LocalAtomGeometry,
+    NormalizedKeyAtomToTokenEncoder,
 )
 from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
@@ -47,7 +47,7 @@ from ...modules.embedding import (
 )
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
-from ...modules.trunk import MsaTrunk, PairformerStack
+from ...modules.trunk import MsaTrunk, PairformerStack, TrianglePairUpdateStack
 from ...results import Metric, Score, best
 from .config import ODesignConfig
 
@@ -126,7 +126,6 @@ class ODesignModel(Model):
             num_atom_decoder_attention_heads=config.denoiser.num_atom_decoder_attention_heads,
             num_query_atoms=config.denoiser.num_query_atoms,
             num_key_atoms=config.denoiser.num_key_atoms,
-            cross_attention_key_source="normalized",
         )
         self.coordinate_sampler = CoordinateEdmSampler(reverse_augmentation=True)
         self.distogram_head = DistogramHead(config.pair_size, config.pairwise.num_distogram_bins)
@@ -445,10 +444,9 @@ class ODesignInputEmbeddings(nn.Module):
     ) -> None:
         super().__init__()
         self.single_size = single_size
-        self.atom_encoder = AtomToTokenEncoder(
+        self.atom_encoder = NormalizedKeyAtomToTokenEncoder(
             token_hidden_size=single_size,
             atom_feature_size=atom_feature_size,
-            cross_attention_key_source="normalized",
         )
 
     def forward(
@@ -509,9 +507,8 @@ class ODesignConstraintEmbeddings(nn.Module):
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.distogram_projection = nn.Linear(num_bins, hidden_size, bias=False)
-        self.pairformer_stack = PairformerStack(
+        self.pair_update_stack = TrianglePairUpdateStack(
             num_blocks=num_blocks,
-            single_size=0,
             pair_size=hidden_size,
             dropout=dropout,
             operator_backend=operator_backend,
@@ -531,7 +528,7 @@ class ODesignConstraintEmbeddings(nn.Module):
         bins = (distances.to(pair.dtype) > boundaries).sum(dim=-1)
         distogram = F.one_hot(bins, self.num_bins).to(pair.dtype)
         hidden = self.pair_projection(self.pair_norm(pair)) + self.distogram_projection(distogram)
-        _, hidden = self.pairformer_stack(None, hidden, pair_mask=pair_mask)
+        hidden = self.pair_update_stack(hidden, pair_mask=pair_mask)
         return self.output_projection(self.activation(self.hidden_norm(hidden)))
 
 

@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import torch
 
-from ofoldx.modules.transformer import ConditionedTransformerBlock
+from ofoldx.modules.transformer import DenoisingTransformerBlock
 
 
-class TestConditionedTransformerBlock:
+class TestDenoisingTransformerBlock:
     def test_accepts_key_mask(self) -> None:
-        block = ConditionedTransformerBlock(
+        block = DenoisingTransformerBlock(
             hidden_size=4,
             conditioning_size=3,
             num_attention_heads=1,
             operator_backend="eager",
-            transition="double",
         ).eval()
 
         output = block(

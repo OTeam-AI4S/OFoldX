@@ -54,8 +54,6 @@ class TemplateEmbedder(nn.Module):
         num_triangle_attention_heads: Number of template triangle-attention heads.
         expansion: Transition expansion factor inside each triangle update block.
         dropout: Dropout probability inside each triangle update block.
-        ending_node_transpose_bias: Whether ending-node attention derives its pair bias from the
-            pre-transpose pair rather than the oriented attention input.
         operator_backend: Operator backend selector forwarded to the triangle update blocks.
     """
 
@@ -70,7 +68,6 @@ class TemplateEmbedder(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 2,
         dropout: float = 0.25,
-        ending_node_transpose_bias: bool = False,
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -95,7 +92,6 @@ class TemplateEmbedder(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     expansion=expansion,
                     dropout=dropout,
-                    ending_node_transpose_bias=ending_node_transpose_bias,
                     operator_backend=operator_backend,
                 )
                 for _ in range(num_blocks)

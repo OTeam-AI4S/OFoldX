@@ -13,6 +13,9 @@ from .encoders import (
     AtomToTokenEncoderBase,
     AttentionLayout,
     CoordinateAtomToTokenEncoder,
+    NormalizedKeyAtomToTokenEncoder,
+    NormalizedKeyCoordinateAtomToTokenEncoder,
+    NormalizedKeyTokenToAtomDecoder,
     PackedAtomAttention,
     TokenToAtomDecoder,
 )

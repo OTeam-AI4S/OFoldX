@@ -57,7 +57,18 @@ from ...model import Model
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm, _oops
 from ...modules.backend.resolve import resolve_tensor_operator_backend
+from ...modules.diffusion.ddpm import ddpm_forward_step, ddpm_posterior
+from ...modules.diffusion.igso3 import calculate_igso3, so3_exp_map
 from ...modules.dropout import StructuredDropout
+from ...modules.geometry import rigid_from_three_points
+from ...modules.potential import (
+    harmonic_distance_potential,
+    interval_distance_penalty,
+    smooth_coordination_potential,
+    substrate_interaction_potential,
+    upper_bounded_radius_of_gyration,
+)
+from ...modules.symmetry import point_group_rotations
 from ...results import Metric, Score, best
 from .config import RfDiffusionConfig
 
@@ -825,7 +836,7 @@ class RfDiffusionTrunk(nn.Module):
 
         self.extra_blocks = nn.ModuleList(
             [
-                RfDiffusionTrunkBlock(
+                RfDiffusionExtraTrunkBlock(
                     msa_size=full_msa_size,
                     pair_size=pair_size,
                     num_msa_attention_heads=num_msa_attention_heads,
@@ -833,7 +844,6 @@ class RfDiffusionTrunk(nn.Module):
                     msa_hidden_size=8,
                     hidden_size=hidden_size,
                     dropout=dropout,
-                    use_global_attn=True,
                     se3_config=trunk_se3,
                 )
                 for _ in range(num_extra_blocks)
@@ -849,7 +859,6 @@ class RfDiffusionTrunk(nn.Module):
                     num_pair_attention_heads=num_pair_attention_heads,
                     hidden_size=hidden_size,
                     dropout=dropout,
-                    use_global_attn=False,
                     se3_config=trunk_se3,
                 )
                 for _ in range(num_main_blocks)
@@ -966,7 +975,7 @@ class RfDiffusionTrunk(nn.Module):
         )
 
 
-class RfDiffusionTrunkBlock(nn.Module):
+class RfDiffusionExtraTrunkBlock(nn.Module):
     r"""
     One RoseTTAFold iteration block over the MSA, pair, and structure representations.
     """
@@ -977,7 +986,79 @@ class RfDiffusionTrunkBlock(nn.Module):
         pair_size: int = 128,
         num_msa_attention_heads: int = 8,
         num_pair_attention_heads: int = 4,
-        use_global_attn: bool = False,
+        hidden_size: int = 32,
+        msa_hidden_size: int | None = None,
+        dropout: float = 0.15,
+        se3_config: Mapping[str, int] | None = None,
+    ) -> None:
+        super().__init__()
+        se3_config = _se3_config(se3_config)
+        msa_hidden_size = hidden_size if msa_hidden_size is None else msa_hidden_size
+        state_size = se3_config["l0_out_features"]
+
+        self.msa_block = RfDiffusionExtraMsaBlock(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            state_size=state_size,
+            hidden_size=msa_hidden_size,
+            dropout=dropout,
+        )
+        self.outer_product_mean = RfDiffusionOuterProductMean(
+            msa_size=msa_size, pair_size=pair_size, hidden_size=hidden_size // 2
+        )
+        self.pair_block = RfDiffusionPairBlock(
+            pair_size=pair_size, num_attention_heads=num_pair_attention_heads, hidden_size=hidden_size, dropout=dropout
+        )
+        self.structure_update = RfDiffusionStructureUpdate(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            state_size=state_size,
+            se3_config=se3_config,
+        )
+
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        input_rotations: Tensor,
+        input_translations: Tensor,
+        coords: Tensor,
+        state: Tensor,
+        residue_index: Tensor,
+        fixed_structure_mask: Tensor,
+        cyclic_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        radial_features = _backbone_ca_distogram(coords)
+        msa = self.msa_block(msa, pair, radial_features, state)
+        pair = pair + self.outer_product_mean(msa)
+        pair = self.pair_block(pair, radial_features)
+        rotations, translations, state, alpha = self.structure_update(
+            msa,
+            pair,
+            input_rotations,
+            input_translations,
+            coords,
+            state,
+            residue_index,
+            fixed_structure_mask=fixed_structure_mask,
+            cyclic_mask=cyclic_mask,
+            top_k=0,
+        )
+        return msa, pair, rotations, translations, state, alpha
+
+
+class RfDiffusionTrunkBlock(nn.Module):
+    r"""
+    One main RoseTTAFold iteration block over the MSA, pair, and structure representations.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 256,
+        pair_size: int = 128,
+        num_msa_attention_heads: int = 8,
+        num_pair_attention_heads: int = 4,
         hidden_size: int = 32,
         msa_hidden_size: int | None = None,
         dropout: float = 0.15,
@@ -993,7 +1074,6 @@ class RfDiffusionTrunkBlock(nn.Module):
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
             state_size=state_size,
-            use_global_attn=use_global_attn,
             hidden_size=msa_hidden_size,
             dropout=dropout,
         )
@@ -1087,7 +1167,6 @@ class RfDiffusionMsaBlock(nn.Module):
         state_size: int = 16,
         hidden_size: int = 32,
         dropout: float = 0.15,
-        use_global_attn: bool = False,
     ) -> None:
         super().__init__()
         self.pair_norm = LayerNorm(pair_size)
@@ -1098,14 +1177,56 @@ class RfDiffusionMsaBlock(nn.Module):
             msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
         self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
-        self.column_attention = (
-            RfDiffusionMsaColumnGlobalAttention(
-                msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
-            )
-            if use_global_attn
-            else RfDiffusionMsaColumnAttention(
-                msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
-            )
+        self.column_attention = RfDiffusionMsaColumnAttention(
+            msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
+        )
+        self.transition = RfDiffusionTransition(msa_size, 4, dropout=dropout)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.pair_projection = _initialize_lecun_normal(self.pair_projection)
+        self.state_projection = _initialize_lecun_normal(self.state_projection)
+        nn.init.zeros_(self.pair_projection.bias)
+        nn.init.zeros_(self.state_projection.bias)
+
+    def forward(self, msa: Tensor, pair: Tensor, radial_features: Tensor, state: Tensor) -> Tensor:
+        batch_size, _, length = msa.shape[:3]
+        pair_bias = torch.cat((self.pair_norm(pair), radial_features), dim=-1)
+        pair_bias = self.pair_projection(pair_bias)
+
+        query_update = self.state_projection(self.state_norm(state)).reshape(batch_size, 1, length, -1)
+        msa = _query_state_update(msa, query_update)
+
+        msa = msa + self.row_dropout(self.row_attention(msa, pair_bias))
+        msa = msa + self.column_attention(msa)
+        return msa + self.transition(msa)
+
+
+class RfDiffusionExtraMsaBlock(nn.Module):
+    r"""
+    Update an extra-MSA representation with global column attention.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 256,
+        pair_size: int = 128,
+        num_attention_heads: int = 8,
+        state_size: int = 16,
+        hidden_size: int = 32,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        self.pair_norm = LayerNorm(pair_size)
+        self.pair_projection = nn.Linear(pair_size + 36, pair_size)
+        self.state_norm = LayerNorm(state_size)
+        self.state_projection = nn.Linear(state_size, msa_size)
+        self.row_attention = RfDiffusionMsaRowAttentionWithPairBias(
+            msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
+        )
+        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
+        self.column_attention = RfDiffusionMsaColumnGlobalAttention(
+            msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
         self.transition = RfDiffusionTransition(msa_size, 4, dropout=dropout)
         self.reset_parameters()
@@ -2101,7 +2222,7 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
             alphas[..., 0] = 1.0
         alphas = alphas.to(device=coords.device, dtype=coords.dtype)
 
-        rotations, translations = _rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
+        rotations, translations = rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
         rtf0 = torch.eye(4, dtype=coords.dtype, device=coords.device).repeat(batch_size, length, 1, 1)
         rtf0[:, :, :3, :3] = rotations
         rtf0[:, :, :3, 3] = translations
@@ -2354,10 +2475,12 @@ class RfDiffusionTranslationDiffuser:
         t_idx = t - 1
         ca_coords = x[:, 1]
         beta_t = self.beta_schedule.to(device=x.device, dtype=x.dtype)[t_idx]
-        mean = torch.sqrt(1 - beta_t) * ca_coords
-        std = torch.sqrt(torch.ones_like(ca_coords) * beta_t * var_scale)
-        sampled = mean + torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator) * std
-        delta = sampled - ca_coords
+        _, delta = ddpm_forward_step(
+            ca_coords,
+            beta_t,
+            variance_scale=var_scale,
+            generator=generator,
+        )
         if diffusion_mask is not None:
             delta[diffusion_mask.to(device=delta.device).bool()] = 0
         return x + delta[:, None], delta
@@ -2480,7 +2603,7 @@ class RfDiffusionIgso3Diffuser:
         N = torch.from_numpy(coords_np[None, :, 0])
         Ca = torch.from_numpy(coords_np[None, :, 1])
         C = torch.from_numpy(coords_np[None, :, 2])
-        R_true, Ca_true = _rigid_from_three_points(N, Ca, C)
+        R_true, Ca_true = rigid_from_three_points(N, Ca, C)
         R_true_np = R_true[0].detach().cpu().numpy()
         Ca_np = Ca_true[0].detach().cpu().numpy()
         sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
@@ -2527,7 +2650,7 @@ class RfDiffusionIgso3Diffuser:
         perturb_tangent = delta_r + rot_g * math.sqrt(self.step_size) * z
         if mask is not None:
             perturb_tangent = perturb_tangent * (1 - mask.long()).to(device=perturb_tangent.device)[:, None]
-        perturb = _exponential_map(perturb_tangent)
+        perturb = so3_exp_map(perturb_tangent)
         if return_perturb:
             return perturb
         return torch.einsum("...ij,...jk->...ik", perturb, R_t_t)
@@ -2549,7 +2672,7 @@ class RfDiffusionIgso3Diffuser:
         if cache_file is not None and cache_file.exists():
             with cache_file.open("rb") as handle:
                 return cast(dict[str, np.ndarray], pickle.load(handle))
-        values = _calculate_igso3(
+        values = calculate_igso3(
             num_sigma=self.num_sigma,
             min_sigma=self.min_sigma,
             max_sigma=self.max_sigma,
@@ -3347,118 +3470,7 @@ class RfDiffusionSymmetry:
             raise ValueError("RFdiffusion RfDiffusionPointGroupSymmetry must cover every output residue exactly once")
         self.units = tuple(units)
         self.kind = condition.kind
-        self.rotations = self.rotation_matrices(condition.kind, condition.order)
-
-    @staticmethod
-    def rotation_matrices(kind: str, order: int | None) -> tuple[Tensor, ...]:
-        if kind == "cyclic":
-            angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
-            matrices = np.stack(
-                [
-                    np.array(
-                        (
-                            (np.cos(angle), -np.sin(angle), 0.0),
-                            (np.sin(angle), np.cos(angle), 0.0),
-                            (0.0, 0.0, 1.0),
-                        )
-                    )
-                    for angle in angles
-                ]
-            )
-        elif kind == "_dihedral_angle":
-            angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
-            flip = np.diag((1.0, -1.0, -1.0))
-            matrices = []
-            for angle in angles:
-                rotation = np.array(
-                    (
-                        (np.cos(angle), -np.sin(angle), 0.0),
-                        (np.sin(angle), np.cos(angle), 0.0),
-                        (0.0, 0.0, 1.0),
-                    )
-                )
-                matrices.extend((rotation, flip @ rotation))
-            matrices = np.stack(matrices)
-        else:
-            group = {"tetrahedral": "T", "octahedral": "O", "icosahedral": "I"}[kind]
-            matrices = Rotation.create_group(group).as_matrix()
-            if kind == "icosahedral":
-                q = np.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)))
-                matrices = np.einsum("ij,njk,lk->nil", q, matrices, q)
-            rounded = np.round(matrices, decimals=12)
-            canonical_order = sorted(
-                range(len(matrices)),
-                key=lambda index: tuple(rounded[index].reshape(-1)),
-            )
-            matrices = matrices[np.asarray(canonical_order)]
-            permutation = {
-                "tetrahedral": (10, 7, 11, 6, 5, 9, 4, 8, 3, 2, 1, 0),
-                "octahedral": (19, 18, 23, 21, 14, 15, 11, 10, 16, 22, 20, 17, 3, 2, 13, 7, 5, 8, 12, 6, 9, 1, 0, 4),
-                "icosahedral": (
-                    59,
-                    58,
-                    55,
-                    53,
-                    57,
-                    51,
-                    56,
-                    50,
-                    54,
-                    52,
-                    47,
-                    45,
-                    49,
-                    43,
-                    48,
-                    42,
-                    46,
-                    44,
-                    41,
-                    35,
-                    39,
-                    37,
-                    38,
-                    36,
-                    40,
-                    34,
-                    31,
-                    29,
-                    33,
-                    26,
-                    28,
-                    30,
-                    32,
-                    27,
-                    0,
-                    1,
-                    9,
-                    3,
-                    7,
-                    5,
-                    6,
-                    4,
-                    8,
-                    2,
-                    17,
-                    11,
-                    15,
-                    13,
-                    14,
-                    12,
-                    16,
-                    10,
-                    23,
-                    21,
-                    25,
-                    19,
-                    24,
-                    18,
-                    22,
-                    20,
-                ),
-            }[kind]
-            matrices = matrices[np.asarray(permutation)]
-        return tuple(torch.as_tensor(matrix, dtype=torch.float32) for matrix in matrices)
+        self.rotations = point_group_rotations(condition.kind, condition.order)
 
     def apply(
         self,
@@ -3588,10 +3600,11 @@ class RfDiffusionGuidance:
                 weight = 1.0 if coordination_condition.weight is None else coordination_condition.weight
                 left = self._coordinates(coordination_condition.side_a, coords)
                 right = self._coordinates(coordination_condition.side_b, coords)
-                scaled = (
-                    torch.cdist(left, right) - coordination_condition.center_angstrom
-                ) / coordination_condition.scale_angstrom
-                coordination = (1 / (1 + scaled.pow(6))).sum()
+                coordination = smooth_coordination_potential(
+                    torch.cdist(left, right),
+                    coordination_condition.center_angstrom,
+                    coordination_condition.scale_angstrom,
+                )
                 if coordination_condition.direction == "maximize":
                     direction = 1
                 elif coordination_condition.direction == "minimize":
@@ -3610,16 +3623,14 @@ class RfDiffusionGuidance:
                     distance_condition.lower_angstrom - distance_condition.tolerance_angstrom,
                 )
                 upper = distance_condition.upper_angstrom + distance_condition.tolerance_angstrom
-                violation = torch.relu(distance.new_tensor(lower) - distance).square()
-                violation = violation + torch.relu(distance - distance.new_tensor(upper)).square()
+                violation = interval_distance_penalty(distance, lower, upper)
                 potential = potential - weight * violation
             elif isinstance(condition, RfDiffusionRadiusOfGyration):
                 radius_condition = cast(RfDiffusionRadiusOfGyration, condition)
                 weight = 1.0 if radius_condition.weight is None else radius_condition.weight
                 rows = self._residue_rows(radius_condition.targets)
                 calpha = coords[torch.tensor(rows, device=coords.device), 1]
-                distances = torch.linalg.vector_norm(calpha - calpha.mean(dim=0), dim=-1)
-                radius = torch.sqrt(torch.clamp_min(distances, radius_condition.upper_angstrom).square().mean())
+                radius = upper_bounded_radius_of_gyration(calpha, radius_condition.upper_angstrom)
                 potential = potential - weight * radius
             elif isinstance(condition, RfDiffusionSubstrateInteraction):
                 substrate_condition = cast(RfDiffusionSubstrateInteraction, condition)
@@ -3627,20 +3638,20 @@ class RfDiffusionGuidance:
                 rows = self._residue_rows(substrate_condition.residues)
                 residue_coords = coords[torch.tensor(rows, device=coords.device), 1]
                 substrate_coords = self._coordinates(substrate_condition.substrate_atoms, coords)
-                nearest = torch.cdist(residue_coords, substrate_coords).amin(dim=-1)
-                scaled = (nearest - substrate_condition.center_angstrom) / substrate_condition.scale_angstrom
-                attraction = substrate_condition.attraction_strength / (1 + scaled.pow(6))
-                exponent = 1.5
-                repulsion = (
-                    substrate_condition.repulsion_slope**2
-                    * torch.clamp_min(substrate_condition.repulsion_cutoff_angstrom - nearest, 0).pow(exponent)
-                    / (exponent * substrate_condition.repulsion_cutoff_angstrom ** (exponent - 1))
+                interaction = substrate_interaction_potential(
+                    residue_coords,
+                    substrate_coords,
+                    center=substrate_condition.center_angstrom,
+                    scale=substrate_condition.scale_angstrom,
+                    attraction_strength=substrate_condition.attraction_strength,
+                    repulsion_slope=substrate_condition.repulsion_slope,
+                    repulsion_cutoff=substrate_condition.repulsion_cutoff_angstrom,
                 )
-                potential = potential + weight * (attraction - repulsion).sum()
+                potential = potential + weight * interaction
             else:
                 bond = cast(SymbolicBond, condition)
                 distance = torch.linalg.vector_norm(self._atom(bond.site_a, coords) - self._atom(bond.site_b, coords))
-                potential = potential - (distance - 1.33).square()
+                potential = potential + harmonic_distance_potential(distance, 1.33)
         return potential
 
     def _residue_rows(self, references: Iterable[object]) -> tuple[int, ...]:
@@ -3717,12 +3728,12 @@ class RfDiffusionGuidance:
             torch.tensor(self.anchor_rows, device=coords.device),
             torch.tensor(self.anchor_atoms, device=coords.device),
         ]
-        source_rotation, source_calpha = _rigid_from_three_points(
+        source_rotation, source_calpha = rigid_from_three_points(
             source_anchors[0],
             source_anchors[1],
             source_anchors[2],
         )
-        target_rotation, target_calpha = _rigid_from_three_points(
+        target_rotation, target_calpha = rigid_from_three_points(
             target_anchors[0],
             target_anchors[1],
             target_anchors[2],
@@ -4790,10 +4801,10 @@ def _next_frames(
         ValueError: If ``so3_type`` is not `"igso3"`.
     """
 
-    rotations_0, _Ca_0 = _rigid_from_three_points(
+    rotations_0, _Ca_0 = rigid_from_three_points(
         pred_coords[None, :, 0], pred_coords[None, :, 1], pred_coords[None, :, 2]
     )
-    rotations_t, Ca_t = _rigid_from_three_points(
+    rotations_t, Ca_t = rigid_from_three_points(
         noisy_coords[None, :, 0], noisy_coords[None, :, 1], noisy_coords[None, :, 2]
     )
     R_0_np = Rotation.from_matrix(rotations_0.squeeze(0).detach().cpu().numpy()).as_matrix()
@@ -4828,50 +4839,6 @@ def _next_frames(
     return torch.as_tensor(next_coords, dtype=noisy_coords.dtype, device=noisy_coords.device)
 
 
-def _posterior_mean(
-    noisy_coords: Tensor,
-    pred_coords: Tensor,
-    t: int,
-    beta_schedule: Tensor,
-    alphabar_schedule: Tensor,
-    *,
-    eps: float = 1e-6,
-) -> tuple[Tensor, Tensor]:
-    r"""
-    Compute the mean and variance of ``q(x_{t-1} | noisy_coords, x_0)`` for CA translations.
-
-    Args:
-        noisy_coords: Current noised coords `[L, A, 3]`.
-        pred_coords: Predicted clean coords `[L, A, 3]`.
-        t: Current timestep.
-        beta_schedule: The beta schedule `[T]`.
-        alphabar_schedule: The cumulative alpha-bar schedule `[T]`.
-        eps: Numerical floor inside the square roots.
-
-    Returns:
-        A tuple ``(mean, variance)`` of the CA posterior mean `[L, 3]` and its scalar variance.
-    """
-
-    t_idx = t - 1
-    beta_schedule = beta_schedule.to(device=noisy_coords.device, dtype=noisy_coords.dtype)
-    alphabar_schedule = alphabar_schedule.to(device=noisy_coords.device, dtype=noisy_coords.dtype)
-    sigma = ((1 - alphabar_schedule[t_idx - 1]) / (1 - alphabar_schedule[t_idx])) * beta_schedule[t_idx]
-    noisy_coords_ca = noisy_coords[:, 1]
-    pred_coords_ca = pred_coords[:, 1]
-    a = (
-        (torch.sqrt(alphabar_schedule[t_idx - 1] + eps) * beta_schedule[t_idx])
-        / (1 - alphabar_schedule[t_idx])
-        * pred_coords_ca
-    )
-    b = (
-        torch.sqrt(1 - beta_schedule[t_idx] + eps)
-        * (1 - alphabar_schedule[t_idx - 1])
-        / (1 - alphabar_schedule[t_idx])
-        * noisy_coords_ca
-    )
-    return a + b, sigma
-
-
 def _next_alpha_carbon(
     noisy_coords: Tensor,
     pred_coords: Tensor,
@@ -4904,8 +4871,12 @@ def _next_alpha_carbon(
 
     pred_coords_scaled = pred_coords * crd_scale
     noisy_coords_scaled = noisy_coords * crd_scale
-    mu, sigma = _posterior_mean(
-        noisy_coords_scaled, pred_coords_scaled, t, beta_schedule=beta_schedule, alphabar_schedule=alphabar_schedule
+    mu, sigma = ddpm_posterior(
+        noisy_coords_scaled[:, 1],
+        pred_coords_scaled[:, 1],
+        t,
+        beta_schedule,
+        alphabar_schedule,
     )
     sampled = mu + torch.randn(mu.shape, dtype=mu.dtype, device=mu.device, generator=generator) * torch.sqrt(
         sigma * noise_scale
@@ -4986,32 +4957,6 @@ def _beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tens
     c = carbon - alpha_carbon
     a = torch.cross(b, c, dim=-1)
     return -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + alpha_carbon
-
-
-def _rigid_from_three_points(
-    nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor, *, eps: float = 1e-8
-) -> tuple[Tensor, Tensor]:
-    r"""
-    Build orthonormal residue frames from backbone N/CA/C coords (Gram-Schmidt).
-
-    Args:
-        nitrogen: N coords `[..., 3]`.
-        alpha_carbon: CA coords `[..., 3]`.
-        carbon: C coords `[..., 3]`.
-        eps: Numerical floor for the normalizations.
-
-    Returns:
-        A tuple ``(rotations, translations)`` of the per-residue rotation matrices `[..., 3, 3]` and CA
-        translations `[..., 3]`.
-    """
-
-    v1 = carbon - alpha_carbon
-    v2 = nitrogen - alpha_carbon
-    e1 = v1 / (torch.norm(v1, dim=-1, keepdim=True) + eps)
-    u2 = v2 - (torch.einsum("...i,...i->...", e1, v2)[..., None] * e1)
-    e2 = u2 / (torch.norm(u2, dim=-1, keepdim=True) + eps)
-    e3 = torch.cross(e1, e2, dim=-1)
-    return torch.stack((e1, e2, e3), dim=-1), alpha_carbon
 
 
 def _pair_distance(a: Tensor, b: Tensor) -> Tensor:
@@ -5270,7 +5215,7 @@ def _torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
     B, L = coords.shape[:2]
     seq = seq.long().reshape(B, L)
     coords = coords.clone()
-    rotation, translation = _rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
+    rotation, translation = rigid_from_three_points(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :])
     ideal_nitrogen = coords.new_tensor((-0.5272, 1.3593, 0.0))
     ideal_carbon = coords.new_tensor((1.5233, 0.0, 0.0))
     coords[..., 0, :] = torch.einsum("...ij,j->...i", rotation, ideal_nitrogen) + translation
@@ -5385,131 +5330,6 @@ def _template_torsion_features(template_coordinates: Tensor, seq: Tensor) -> Ten
     alpha = alpha.reshape(B, T, length, 10, 2)
     alpha_mask = alpha_mask.reshape(B, T, length, 10, 1).float()
     return torch.cat((alpha, alpha_mask), dim=-1).reshape(B, T, length, 30)
-
-
-_IGSO3_DEFAULT_NUM_TERMS = 2000
-
-
-def _exponential_map(rotation_vector: Tensor) -> Tensor:
-    r"""
-    Map rotation vectors to rotation matrices via the SO(3) exponential map.
-
-    Args:
-        rotation_vector: Rotation vectors `[..., 3]` (axis times angle).
-
-    Returns:
-        The corresponding rotation matrices `[..., 3, 3]`.
-    """
-
-    angle = torch.linalg.vector_norm(rotation_vector, dim=-1, keepdim=True)
-    scale = torch.sinc(angle / math.pi)
-    second_order_scale = 0.5 * torch.sinc(angle / (2 * math.pi)).square()
-    x, y, z = rotation_vector.unbind(dim=-1)
-    zero = torch.zeros_like(x)
-    skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), dim=-1).reshape(rotation_vector.shape[:-1] + (3, 3))
-    identity = torch.eye(3, dtype=rotation_vector.dtype, device=rotation_vector.device)
-    return identity + scale[..., None] * skew + second_order_scale[..., None] * (skew @ skew)
-
-
-def _igso3_expansion(omega_value: Tensor, t: float | Tensor, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> Tensor:
-    r"""
-    Evaluate the truncated IGSO3 density power series at rotation angle ``omega``.
-
-    Args:
-        omega_value: Rotation angles `[...]`.
-        t: Diffusion time (variance) parameter.
-        num_terms: Number of series terms.
-
-    Returns:
-        The IGSO3 density values `[...]`.
-    """
-
-    omega_value = omega_value.float()
-    t_tensor = torch.as_tensor(t, dtype=omega_value.dtype, device=omega_value.device)
-    ell = torch.arange(num_terms, dtype=omega_value.dtype, device=omega_value.device)[None]
-    angles = omega_value[..., None]
-    denom = torch.sin(angles / 2).clamp_min(1e-12)
-    terms = (2 * ell + 1) * torch.exp(-ell * (ell + 1) * t_tensor / 2)
-    return (terms * torch.sin(angles * (ell + 0.5)) / denom).sum(dim=-1)
-
-
-def _igso3_log_derivative(omega_value: np.ndarray, t: float, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> np.ndarray:
-    r"""
-    Return the derivative of the log IGSO3 density with respect to the rotation angle (the score).
-
-    Args:
-        omega_value: Rotation angles at which to evaluate the score.
-        t: Diffusion time (variance) parameter.
-        num_terms: Number of density-series terms.
-
-    Returns:
-        The score ``d/d_omega log f`` evaluated at each ``omega_value``, same shape as the input.
-    """
-
-    with torch.inference_mode(False), torch.enable_grad():
-        omega_t = torch.tensor(omega_value, dtype=torch.float32, requires_grad=True)
-        log_f = torch.log(_igso3_expansion(omega_t, t, num_terms=num_terms).clamp_min(1e-30))
-        return torch.autograd.grad(log_f.sum(), omega_t)[0].detach().cpu().numpy()
-
-
-def _igso3_angle_density(omega_value: np.ndarray, t: float, num_terms: int = _IGSO3_DEFAULT_NUM_TERMS) -> np.ndarray:
-    r"""
-    Return the IGSO3 angular density (density times the SO(3) angle Haar factor) at ``omega``.
-
-    Args:
-        omega_value: Rotation angles at which to evaluate the density.
-        t: Diffusion time (variance) parameter.
-        num_terms: Number of density-series terms.
-
-    Returns:
-        The angular density evaluated at each ``omega_value``, same shape as the input.
-    """
-
-    omega_t = torch.tensor(omega_value, dtype=torch.float32)
-    density = _igso3_expansion(omega_t, t, num_terms=num_terms).detach().cpu().numpy()
-    return density * (1 - np.cos(omega_value)) / np.pi
-
-
-def _calculate_igso3(
-    *,
-    num_sigma: int,
-    num_omega: int,
-    min_sigma: float,
-    max_sigma: float,
-    num_terms: int = _IGSO3_DEFAULT_NUM_TERMS,
-) -> dict[str, np.ndarray]:
-    r"""
-    Precompute IGSO3 CDFs and score norms over a sigma/angle grid for inverse-CDF sampling.
-
-    Args:
-        num_sigma: Number of discretized sigma levels.
-        num_omega: Number of discretized rotation angles.
-        min_sigma: Minimum sigma.
-        max_sigma: Maximum sigma.
-        num_terms: Number of density-series terms.
-
-    Returns:
-        A dict with ``cdf``, ``score_norm``, ``exp_score_norms``, ``discrete_omega``, and ``discrete_sigma``.
-    """
-
-    discrete_omega = np.linspace(0, np.pi, num_omega + 1, dtype=np.float64)[1:]
-    discrete_sigma = 10 ** np.linspace(np.log10(min_sigma), np.log10(max_sigma), num_sigma + 1, dtype=np.float64)[1:]
-    pdf_vals = np.asarray(
-        [_igso3_angle_density(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
-    )
-    cdf_vals = np.asarray([pdf.cumsum() / num_omega * np.pi for pdf in pdf_vals])
-    score_norm = np.asarray(
-        [_igso3_log_derivative(discrete_omega, float(sigma**2), num_terms=num_terms) for sigma in discrete_sigma]
-    )
-    score_moment = np.sum(score_norm**2 * pdf_vals, axis=1) / np.sum(pdf_vals, axis=1)
-    exp_score_norms = np.sqrt(np.clip(score_moment, a_min=0.0, a_max=None))
-    return {
-        "cdf": cdf_vals,
-        "score_norm": score_norm,
-        "exp_score_norms": exp_score_norms,
-        "discrete_omega": discrete_omega,
-        "discrete_sigma": discrete_sigma,
-    }
 
 
 def _write_pickle(path: str | Path, value: object) -> None:
@@ -7104,7 +6924,7 @@ class RfDiffusionPointGroupSymmetry:
 
     Args:
         units: Residue groups representing symmetric copies.
-        kind: Point-group kind, such as cyclic or _dihedral_angle.
+        kind: Point-group kind, such as cyclic or dihedral.
         order: Symmetry order when required by ``kind``.
         tolerance_angstrom: Accepted symmetry deviation in angstroms.
     """

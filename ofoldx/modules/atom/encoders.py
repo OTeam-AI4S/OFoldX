@@ -12,7 +12,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..backend import LayerNorm, resolve_config_operator_backend
-from ..transformer import ConditionedTransformer, CrossAttentionKeySource, TransitionKind
+from ..transformer import (
+    AtomCrossAttentionTransformer,
+    NormalizedKeyAtomCrossAttentionTransformer,
+)
 from .context import AtomContext, AtomToTokenOutput
 from .pair_encoding import encode_atom_pair
 from .transfer import (
@@ -42,15 +45,12 @@ class AtomToTokenEncoderBase(nn.Module):
         token_hidden_size: Width of the produced token hidden states.
         atom_hidden_size: Width of the per-atom conditioning / query channel.
         atom_pair_hidden_size: Width of the atom-pair representation feeding the attention bias.
-        num_blocks: Number of atom self-attention blocks.
-        num_attention_heads: Number of attention heads per block.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         atom_feature_size: Width of the raw reference atom-feature vector.
         operator_backend: Backend selector passed down to atom self-attention (``"auto"`` picks the
             OOps-owned implementation when available, else the public implementation).
-        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
-            or the query-normalized state.
+        atom_self_attention: Exact atom-attention equation used by the encoder.
     """
 
     def __init__(
@@ -58,13 +58,12 @@ class AtomToTokenEncoderBase(nn.Module):
         token_hidden_size: int,
         atom_hidden_size: int = 128,
         atom_pair_hidden_size: int = 16,
-        num_blocks: int = 3,
-        num_attention_heads: int = 4,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         atom_feature_size: int = 385,
         operator_backend: str = "auto",
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
+        *,
+        atom_self_attention: AtomSelfAttention,
     ) -> None:
         super().__init__()
         self.operator_backend = resolve_config_operator_backend(
@@ -79,17 +78,7 @@ class AtomToTokenEncoderBase(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
-        self.atom_self_attention = AtomSelfAttention(
-            atom_hidden_size=atom_hidden_size,
-            conditioning_size=atom_hidden_size,
-            pair_size=atom_pair_hidden_size,
-            num_blocks=num_blocks,
-            num_attention_heads=num_attention_heads,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            operator_backend=self.operator_backend,
-            cross_attention_key_source=cross_attention_key_source,
-        )
+        self.atom_self_attention = atom_self_attention
         self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
         self.relu = nn.ReLU()
 
@@ -170,6 +159,38 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
     Constructor arguments are inherited from
     [`AtomToTokenEncoderBase`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase].
     """
+
+    def __init__(
+        self,
+        token_hidden_size: int,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        atom_feature_size: int = 385,
+        operator_backend: str = "auto",
+    ) -> None:
+        super().__init__(
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            atom_feature_size=atom_feature_size,
+            operator_backend=operator_backend,
+            atom_self_attention=AtomSelfAttention(
+                atom_hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                pair_size=atom_pair_hidden_size,
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                operator_backend=operator_backend,
+            ),
+        )
 
     def forward(
         self,
@@ -256,8 +277,6 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         num_key_atoms: Number of key atoms gathered around each query window.
         atom_feature_size: Width of the raw reference atom-feature vector.
         operator_backend: Backend selector passed down to atom self-attention.
-        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
-            or the query-normalized state.
     """
 
     def __init__(
@@ -273,19 +292,26 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         num_key_atoms: int = 128,
         atom_feature_size: int = 385,
         operator_backend: str = "auto",
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
-        super().__init__(
-            token_hidden_size=token_hidden_size,
+        atom_self_attention = AtomSelfAttention(
             atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
+            conditioning_size=atom_hidden_size,
+            pair_size=atom_pair_hidden_size,
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
+            operator_backend=operator_backend,
+        )
+        super().__init__(
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
             operator_backend=operator_backend,
-            cross_attention_key_source=cross_attention_key_source,
+            atom_self_attention=atom_self_attention,
         )
         self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
         self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
@@ -665,7 +691,7 @@ class AtomPairEncoder(nn.Module):
 
 class PackedAtomAttention(nn.Module):
     r"""
-    Run atom attention over an already-packed per-block pair bias.
+    Apply a concrete atom transformer over an already-packed per-block pair bias.
 
     ``packed_bias`` stores all block/head pair-bias projections on the last axis, so the underlying
     [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer] can slice its per-block
@@ -673,45 +699,21 @@ class PackedAtomAttention(nn.Module):
     local query/key window layout used by atom-level attention blocks.
 
     Args:
-        atom_hidden_size: Width of the atom hidden channel.
-        conditioning_size: Width of the per-atom conditioning channel.
-        num_blocks: Number of transformer blocks.
-        num_attention_heads: Number of attention heads per block.
+        transformer: Concrete atom transformer whose block/head biases are packed on the last axis.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        operator_backend: Backend selector for the transformer's attention/transition implementations.
-        cross_attention_mode: Whether the transformer runs in cross-attention mode (query/key panes differ).
-        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
-            or the query-normalized state.
-        transition: Transition-block kind used inside each transformer block.
     """
 
     def __init__(
         self,
-        atom_hidden_size: int = 128,
-        conditioning_size: int = 128,
-        num_blocks: int = 3,
-        num_attention_heads: int = 4,
+        transformer: nn.Module,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        operator_backend: str = "auto",
-        cross_attention_mode: bool = True,
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
-        transition: TransitionKind = "double",
     ) -> None:
         super().__init__()
+        self.transformer = transformer
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
-        self.transformer = ConditionedTransformer(
-            num_blocks=num_blocks,
-            num_attention_heads=num_attention_heads,
-            hidden_size=atom_hidden_size,
-            conditioning_size=conditioning_size,
-            operator_backend=operator_backend,
-            cross_attention_mode=cross_attention_mode,
-            cross_attention_key_source=cross_attention_key_source,
-            transition=transition,
-        )
 
     def forward(
         self,
@@ -826,8 +828,6 @@ class AtomSelfAttention(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         operator_backend: Backend selector for the underlying attention/transition implementations.
-        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
-            or the query-normalized state.
     """
 
     def __init__(
@@ -840,7 +840,6 @@ class AtomSelfAttention(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         # The pair is projected to per-head attention logits independently in each block.
@@ -851,16 +850,15 @@ class AtomSelfAttention(nn.Module):
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
         self.atom_attention = PackedAtomAttention(
-            atom_hidden_size=atom_hidden_size,
-            conditioning_size=conditioning_size,
-            num_blocks=num_blocks,
-            num_attention_heads=num_attention_heads,
+            AtomCrossAttentionTransformer(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=conditioning_size,
+                operator_backend=operator_backend,
+            ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
-            cross_attention_mode=True,
-            cross_attention_key_source=cross_attention_key_source,
-            transition="double",
         )
 
     def forward(
@@ -902,6 +900,134 @@ class AtomSelfAttention(nn.Module):
         )
 
 
+class NormalizedKeyAtomSelfAttention(AtomSelfAttention):
+    r"""
+    Atom self-attention whose gathered keys are normalized from query-normalized states.
+    """
+
+    def __init__(
+        self,
+        atom_hidden_size: int = 128,
+        conditioning_size: int = 128,
+        pair_size: int = 16,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.pair_norms = nn.ModuleList(
+            LayerNorm(pair_size, bias=False, operator_backend=operator_backend) for _ in range(num_blocks)
+        )
+        self.bias_projections = nn.ModuleList(
+            nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
+        )
+        self.atom_attention = PackedAtomAttention(
+            NormalizedKeyAtomCrossAttentionTransformer(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=conditioning_size,
+                operator_backend=operator_backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+
+
+class NormalizedKeyAtomToTokenEncoder(AtomToTokenEncoder):
+    r"""
+    Reference-atom encoder with query-normalized gathered keys.
+    """
+
+    def __init__(
+        self,
+        token_hidden_size: int,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        atom_feature_size: int = 385,
+        operator_backend: str = "auto",
+    ) -> None:
+        AtomToTokenEncoderBase.__init__(
+            self,
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            atom_feature_size=atom_feature_size,
+            operator_backend=operator_backend,
+            atom_self_attention=NormalizedKeyAtomSelfAttention(
+                atom_hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                pair_size=atom_pair_hidden_size,
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                operator_backend=operator_backend,
+            ),
+        )
+
+
+class NormalizedKeyCoordinateAtomToTokenEncoder(CoordinateAtomToTokenEncoder):
+    r"""
+    Coordinate atom encoder with query-normalized gathered keys.
+    """
+
+    def __init__(
+        self,
+        token_hidden_size: int,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        atom_feature_size: int = 385,
+        operator_backend: str = "auto",
+    ) -> None:
+        AtomToTokenEncoderBase.__init__(
+            self,
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            atom_feature_size=atom_feature_size,
+            operator_backend=operator_backend,
+            atom_self_attention=NormalizedKeyAtomSelfAttention(
+                atom_hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                pair_size=atom_pair_hidden_size,
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                operator_backend=operator_backend,
+            ),
+        )
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
+        self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
+        self.token_pair_to_local_atom_pair_broadcast = TokenPairToLocalAtomPairBroadcast(
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            operator_backend=operator_backend,
+        )
+        self.single_norm = LayerNorm(single_size, bias=False, operator_backend=operator_backend)
+        self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, bias=False, operator_backend=operator_backend)
+        self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
+        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+
+
 class TokenToAtomDecoder(nn.Module):
     r"""
     Decode token hidden states into per-atom coordinate updates.
@@ -919,8 +1045,6 @@ class TokenToAtomDecoder(nn.Module):
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
         operator_backend: Backend selector passed down to atom self-attention.
-        cross_attention_key_source: Whether key/value normalization starts from the raw hidden state
-            or the query-normalized state.
     """
 
     def __init__(
@@ -933,7 +1057,6 @@ class TokenToAtomDecoder(nn.Module):
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
         operator_backend: str = "auto",
-        cross_attention_key_source: CrossAttentionKeySource = "raw",
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
@@ -947,7 +1070,6 @@ class TokenToAtomDecoder(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             operator_backend=operator_backend,
-            cross_attention_key_source=cross_attention_key_source,
         )
         self.query_norm = LayerNorm(atom_hidden_size, bias=False, operator_backend=operator_backend)
         self.output_projection = nn.Linear(atom_hidden_size, 3, bias=False)
@@ -995,6 +1117,39 @@ class TokenToAtomDecoder(nn.Module):
             num_valid_atoms=num_valid_atoms,
         )
         return self.output_projection(self.query_norm(atom_query))
+
+
+class NormalizedKeyTokenToAtomDecoder(TokenToAtomDecoder):
+    r"""
+    Token-to-atom decoder with query-normalized gathered keys.
+    """
+
+    def __init__(
+        self,
+        token_hidden_size: int = 768,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        operator_backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
+        self.atom_self_attention = NormalizedKeyAtomSelfAttention(
+            atom_hidden_size=atom_hidden_size,
+            conditioning_size=atom_hidden_size,
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            operator_backend=operator_backend,
+        )
+        self.query_norm = LayerNorm(atom_hidden_size, bias=False, operator_backend=operator_backend)
+        self.output_projection = nn.Linear(atom_hidden_size, 3, bias=False)
 
 
 def _flatten_batch(tensor: Tensor, prefix: tuple[int, ...], payload_ndim: int) -> Tensor:

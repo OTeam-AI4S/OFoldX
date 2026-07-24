@@ -484,6 +484,8 @@ def _replace_pairformer_key(key: str) -> str:
     return _replace_many(
         key,
         {
+            ".pair_update.transition.": ".pair_transition.",
+            ".pair_update.": ".",
             ".msa_update.": ".msa_stack.",
             ".triangle_pair_update.": ".pair_stack.",
             ".triangle_multiplication_outgoing.": ".tri_mul_out.",

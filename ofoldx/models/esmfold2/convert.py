@@ -204,8 +204,31 @@ def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, 
                 source_name=source_name,
             )
 
+    _move_final_msa_block(translated)
     _pack_adaptive_norms(translated)
     return translated
+
+
+def _move_final_msa_block(state: dict[str, Tensor]) -> None:
+    prefix = "msa_encoder.blocks."
+    block_indices = {int(key.removeprefix(prefix).split(".", 1)[0]) for key in state if key.startswith(prefix)}
+    if not block_indices:
+        return
+    final_prefix = f"{prefix}{max(block_indices)}."
+    replacements = (
+        ("outer_product_mean.", "msa_encoder.final_outer_product_mean."),
+        ("triangle_multiplication_outgoing.", "msa_encoder.final_pair_update.triangle_multiplication_outgoing."),
+        ("triangle_multiplication_incoming.", "msa_encoder.final_pair_update.triangle_multiplication_incoming."),
+        ("pair_transition.", "msa_encoder.final_pair_update.transition."),
+    )
+    for key in tuple(state):
+        if not key.startswith(final_prefix):
+            continue
+        suffix = key.removeprefix(final_prefix)
+        for source, target in replacements:
+            if suffix.startswith(source):
+                state[f"{target}{suffix.removeprefix(source)}"] = state.pop(key)
+                break
 
 
 def _pack_adaptive_norms(state: dict[str, Tensor]) -> None:

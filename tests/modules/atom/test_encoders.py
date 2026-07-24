@@ -7,7 +7,6 @@ from ofoldx.modules.atom import (
     AtomConditioner,
     AtomPairEncoder,
     CoordinateAtomToTokenEncoder,
-    PackedAtomAttention,
     TokenToAtomDecoder,
 )
 
@@ -80,23 +79,6 @@ def test_pair_encoder(pair_encoder: AtomPairEncoder, num_bias_samples: int) -> N
     torch.testing.assert_close(output[:, 0], no_bias)
     for sample in range(1, num_bias_samples):
         assert not torch.allclose(output[:, 0], output[:, sample])
-
-
-def test_invalid_inputs(pair_encoder: AtomPairEncoder) -> None:
-    with pytest.raises(ValueError, match="reference_positions is required"):
-        pair_encoder(torch.zeros(1, 5, 8))
-
-    attention = PackedAtomAttention(
-        atom_hidden_size=8,
-        conditioning_size=8,
-        num_blocks=1,
-        num_attention_heads=2,
-        num_query_atoms=2,
-        num_key_atoms=4,
-        operator_backend="torch",
-    )
-    with pytest.raises(ValueError, match="unsupported attention_layout"):
-        attention(torch.zeros(1, 5, 8), torch.zeros(1, 5, 8), torch.zeros(1, 5, 5, 1), attention_layout="bogus")
 
 
 @pytest.mark.parametrize("backend", ("torch", "oops"))

@@ -37,8 +37,13 @@ from .model import (
     BoltzGenSymmetry,
 )
 from .pipeline import BoltzGenFoldModel, BoltzGenPipeline, BoltzGenScoreModel, BoltzGenStageProcessor
-from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
-from .projection import DesignMaskResidue, from_design_mask, to_design_mask
+from .processor import (
+    BoltzGenInverseFoldingProcessor,
+    BoltzGenProcessor,
+    DesignMaskResidue,
+    from_design_mask,
+    to_design_mask,
+)
 
 _MODELS.register_model(
     "ofoldx.boltzgen",

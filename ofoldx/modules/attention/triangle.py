@@ -25,8 +25,6 @@ class TriangleAttention(nn.Module):
         pair_size: Width of the pair-representation channel (query/key/value and output width).
         head_dim: Per-head dimension of the attention.
         num_attention_heads: Number of attention heads.
-        transpose_bias: Whether the per-head bias is read from the opposite pair orientation. Ending-node
-            callers that transpose ``pair`` can enable this to derive the bias from the pre-transpose state.
         output_bias: Whether the attention output projection carries a learnable bias.
         gate_bias: Whether the output-gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
@@ -41,7 +39,6 @@ class TriangleAttention(nn.Module):
         head_dim: int = 32,
         num_attention_heads: int = 4,
         *,
-        transpose_bias: bool = False,
         output_bias: bool = False,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
@@ -50,9 +47,6 @@ class TriangleAttention(nn.Module):
         super().__init__()
         self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
-        # Ending-node callers may transpose the pair before this update. In that case,
-        # ``transpose_bias`` keeps the bias tied to the original pair orientation.
-        self.transpose_bias = transpose_bias
         self.attention = GatedMultiheadAttention(
             pair_size,
             num_attention_heads=num_attention_heads,
@@ -83,10 +77,8 @@ class TriangleAttention(nn.Module):
         normalized = self.pair_norm(pair)
         # Triangle bias term b_{jk} = Linear(z_{jk}): a per-head function of the two attended columns, shared across
         # the starting-node row/batch axis. Project the pair, then move heads ahead of the (query, key) axes and add
-        # a singleton row axis so the same bias broadcasts over every row. ``transpose_bias`` reads the bias from the
-        # opposite token orientation used by ending-node attention.
-        bias_source = normalized.transpose(-3, -2) if self.transpose_bias else normalized
-        projected_bias = self.bias_projection(bias_source)  # (..., n_query, n_key, num_heads)
+        # a singleton row axis so the same bias broadcasts over every row.
+        projected_bias = self.bias_projection(normalized)  # (..., n_query, n_key, num_heads)
         triangle_bias = projected_bias.movedim(-1, -3).unsqueeze(-4)  # (..., 1, num_heads, n_query, n_key)
         return dispatch_triangle_attention(
             normalized,

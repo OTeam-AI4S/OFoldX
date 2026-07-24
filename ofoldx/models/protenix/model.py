@@ -21,8 +21,8 @@ from ...data.molecular import (
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.atom import (
-    AtomToTokenEncoder,
     LocalAtomGeometry,
+    NormalizedKeyAtomToTokenEncoder,
 )
 from ...modules.backend import LayerNorm
 from ...modules.backend.attention import projected_attention
@@ -117,7 +117,6 @@ class ProtenixModel(Model):
             num_atom_decoder_attention_heads=config.denoiser.num_atom_decoder_attention_heads,
             num_query_atoms=config.denoiser.num_query_atoms,
             num_key_atoms=config.denoiser.num_key_atoms,
-            cross_attention_key_source="normalized",
         )
         self.coordinate_sampler = CoordinateEdmSampler(
             scheduler=EdmScheduler(
@@ -155,12 +154,6 @@ class ProtenixModel(Model):
             expansion=config.confidence.expansion,
             dropout=config.confidence.pairformer_dropout,
             single_max_abs=config.confidence.single_max_abs,
-            # This confidence head normalizes the single representation, projects
-            # raw distances, and symmetrizes pair states before PDE projection.
-            use_single_norm=True,
-            use_distance_projection=True,
-            symmetrize_pde_before_projection=True,
-            persistent_distance_bins=True,
         )
         self.post_init()
 
@@ -770,10 +763,9 @@ class ProtenixInputEmbeddings(nn.Module):
     ) -> None:
         super().__init__()
         self.single_size = single_size
-        self.atom_encoder = AtomToTokenEncoder(
+        self.atom_encoder = NormalizedKeyAtomToTokenEncoder(
             token_hidden_size=single_size,
             atom_feature_size=atom_feature_size,
-            cross_attention_key_source="normalized",
         )
 
     def forward(

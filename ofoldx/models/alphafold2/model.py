@@ -1561,7 +1561,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         self.backbone_pair_mask_projection = nn.Linear(1, template_size)
         self.query_pair_projection = nn.Linear(query_size, template_size)
         self.query_embedding_norm = LayerNorm(query_size, operator_backend=operator_backend)
-        self.template_pair_stack = AlphaFold2TemplatePairStack(
+        self.template_pair_stack = AlphaFold2MultimerTemplatePairStack(
             num_blocks=num_blocks,
             pair_size=template_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -1570,9 +1570,6 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
             transition_expansion=transition_expansion,
             dropout=dropout,
             operator_backend=operator_backend,
-            # AF-Multimer applies triangle multiplication before attention in the
-            # template pair stack; monomer keeps attention first.
-            triangle_multiplication_first=True,
         )
         self.output_norm = LayerNorm(template_size, operator_backend=operator_backend)
 
@@ -1708,7 +1705,6 @@ class AlphaFold2TemplatePairStack(nn.Module):
         transition_expansion: int,
         dropout: float,
         operator_backend: str,
-        triangle_multiplication_first: bool = False,
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1722,7 +1718,6 @@ class AlphaFold2TemplatePairStack(nn.Module):
                     transition_expansion=transition_expansion,
                     dropout=dropout,
                     operator_backend=operator_backend,
-                    triangle_multiplication_first=triangle_multiplication_first,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1738,7 +1733,7 @@ class AlphaFold2TemplatePairBlock(nn.Module):
     r"""
     Update a template pair representation with triangle operations.
 
-    ``triangle_multiplication_first`` selects the multimer operation order.
+    AlphaFold 2 monomer applies triangle attention before triangle multiplication.
     """
 
     def __init__(
@@ -1751,10 +1746,8 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         transition_expansion: int,
         dropout: float,
         operator_backend: str,
-        triangle_multiplication_first: bool = False,
     ) -> None:
         super().__init__()
-        self.triangle_multiplication_first = triangle_multiplication_first
         self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
@@ -1783,15 +1776,6 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         self.rowwise_dropout = RowwiseDropout(dropout)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
-        # AF-Multimer's template pair stack applies triangle multiplication before
-        # triangle attention; the monomer template stack keeps attention first. The
-        # Evoformer operation order is unaffected because this stack is template-only.
-        if self.triangle_multiplication_first:
-            pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
-            pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
-            pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
-            pair = pair + self.rowwise_dropout(self._ending_node(pair, pair_mask))
-            return pair + self.transition(pair, pair_mask)
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self._ending_node(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
@@ -1803,6 +1787,101 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         # therefore transposes the pair and mask residue axes around the call, then restores them.
         end_pair_mask = pair_mask.transpose(-2, -1)
         return self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
+
+
+class AlphaFold2MultimerTemplatePairStack(nn.Module):
+    r"""
+    Homogeneous stack of AlphaFold 2 Multimer template-pair blocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_blocks: int,
+        pair_size: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        transition_expansion: int,
+        dropout: float,
+        operator_backend: str,
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            [
+                AlphaFold2MultimerTemplatePairBlock(
+                    pair_size=pair_size,
+                    triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                    triangle_attention_hidden_size=triangle_attention_hidden_size,
+                    num_triangle_attention_heads=num_triangle_attention_heads,
+                    transition_expansion=transition_expansion,
+                    dropout=dropout,
+                    operator_backend=operator_backend,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
+        for block in self.blocks:
+            pair = block(pair, pair_mask=pair_mask)
+        return pair
+
+
+class AlphaFold2MultimerTemplatePairBlock(nn.Module):
+    r"""
+    AlphaFold 2 Multimer template-pair update with triangle multiplication before attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        pair_size: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        transition_expansion: int,
+        dropout: float,
+        operator_backend: str,
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
+            operator_backend=operator_backend,
+        )
+        self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            operator_backend=operator_backend,
+        )
+        self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
+        self.rowwise_dropout = RowwiseDropout(dropout)
+
+    def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
+        end_pair_mask = pair_mask.transpose(-2, -1)
+        pair = pair + self.rowwise_dropout(
+            self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
+        )
+        return pair + self.transition(pair, pair_mask)
 
 
 class AlphaFold2StructureModuleBlock(nn.Module):

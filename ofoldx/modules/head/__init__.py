@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from .confidence import (
     AtomConfidenceProjector,
+    BinnedDistancePairEmbedder,
     ConfidenceHead,
     ConfidencePairEmbedder,
     PairConfidenceProjector,
+    PostProjectionSymmetricPairConfidenceProjector,
     expected_plddt,
 )
-from .distogram import DistogramHead
+from .distogram import DistogramHead, PairSymmetrizedDistogramHead
 from .tm import tm_bin_weights, tm_length_scale, tm_weight_from_pae

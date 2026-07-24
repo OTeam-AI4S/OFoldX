@@ -263,8 +263,12 @@ def _constraint_embeddings_key(key: str) -> str:
     if not key.startswith("constraint_embeddings."):
         return key
     key = "constraint_distogram_embedder." + key.removeprefix("constraint_embeddings.")
-    if key.startswith("constraint_distogram_embedder.pairformer_stack."):
-        return key
+    if key.startswith("constraint_distogram_embedder.pair_update_stack."):
+        return key.replace(
+            "constraint_distogram_embedder.pair_update_stack.",
+            "constraint_distogram_embedder.pairformer_stack.",
+            1,
+        )
     for current, reference in {
         ".pair_norm.": ".layernorm_z.",
         ".pair_projection.": ".linear_no_bias_z.",
@@ -483,6 +487,8 @@ def _replace_pairformer_key(key: str) -> str:
     return _replace_many(
         key,
         {
+            ".pair_update.transition.": ".pair_transition.",
+            ".pair_update.": ".",
             ".msa_update.": ".msa_stack.",
             ".triangle_pair_update.": ".pair_stack.",
             ".triangle_multiplication_outgoing.": ".tri_mul_out.",

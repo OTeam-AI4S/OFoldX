@@ -1615,7 +1615,7 @@ class EsmFold2FoldingTrunk(nn.Module):
 
 class EsmFold2MsaEncoder(nn.Module):
     r"""
-    Stack of [`EsmFold2MsaEncoderBlock`] modules that conditions the pair on an MSA.
+    Homogeneous MSA blocks followed by one final OPM and pair update.
     """
 
     def __init__(
@@ -1642,15 +1642,27 @@ class EsmFold2MsaEncoder(nn.Module):
                     num_msa_attention_heads=num_msa_attention_heads,
                     msa_head_width=msa_head_width,
                     operator_backend=operator_backend,
-                    is_final_block=(i == num_blocks - 1),
                 )
-                for i in range(num_blocks)
+                for _ in range(num_blocks - 1)
             ]
+        )
+        self.final_outer_product_mean = EsmFold2OuterProductMean(
+            msa_size,
+            hidden_size,
+            pair_size,
+            operator_backend,
+        )
+        self.final_pair_update = EsmFold2FoldingBlock(
+            operator_backend,
+            pair_size=pair_size,
+            expansion=4,
         )
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
         for block in self.blocks:
             cast(EsmFold2MsaEncoderBlock, block).set_chunk_size(chunk_size)
+        self.final_outer_product_mean.set_chunk_size(chunk_size)
+        self.final_pair_update.set_chunk_size(chunk_size)
 
     def forward(
         self,
@@ -1672,6 +1684,8 @@ class EsmFold2MsaEncoder(nn.Module):
         pair_attention_mask = token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
         for block in self.blocks:
             m, pair = block(m, pair, msa_attention_mask, pair_attention_mask)
+        pair = pair + self.final_outer_product_mean(m, msa_attention_mask)
+        pair = self.final_pair_update(pair, pair_attention_mask)
         return pair
 
 
@@ -2338,20 +2352,17 @@ class EsmFold2MsaEncoderBlock(nn.Module):
         num_msa_attention_heads: int,
         msa_head_width: int,
         operator_backend: str = "auto",
-        is_final_block: bool = False,
     ) -> None:
         super().__init__()
-        self.is_final_block = is_final_block
         self.outer_product_mean = EsmFold2OuterProductMean(msa_size, hidden_size, pair_size, operator_backend)
-        if not is_final_block:
-            self.msa_pair_weighted_averaging = EsmFold2MsaPairWeightedAveraging(
-                msa_size,
-                pair_size,
-                operator_backend,
-                num_msa_attention_heads,
-                msa_head_width,
-            )
-            self.msa_transition = EsmFold2Transition(msa_size, operator_backend, expansion=4)
+        self.msa_pair_weighted_averaging = EsmFold2MsaPairWeightedAveraging(
+            msa_size,
+            pair_size,
+            operator_backend,
+            num_msa_attention_heads,
+            msa_head_width,
+        )
+        self.msa_transition = EsmFold2Transition(msa_size, operator_backend, expansion=4)
         self.triangle_multiplication_outgoing = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
@@ -2370,8 +2381,7 @@ class EsmFold2MsaEncoderBlock(nn.Module):
         self.outer_product_mean.set_chunk_size(chunk_size)
         self.triangle_multiplication_outgoing.set_chunk_size(chunk_size)
         self.triangle_multiplication_incoming.set_chunk_size(chunk_size)
-        if not self.is_final_block:
-            self.msa_transition.set_chunk_size(chunk_size)
+        self.msa_transition.set_chunk_size(chunk_size)
         self.pair_transition.set_chunk_size(chunk_size)
 
     def forward(
@@ -2382,9 +2392,8 @@ class EsmFold2MsaEncoderBlock(nn.Module):
         pair_attention_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
         pair = pair + self.outer_product_mean(m, msa_attention_mask)
-        if not self.is_final_block:
-            m = m + self.msa_pair_weighted_averaging(m, pair, pair_attention_mask)
-            m = m + self.msa_transition(m)
+        m = m + self.msa_pair_weighted_averaging(m, pair, pair_attention_mask)
+        m = m + self.msa_transition(m)
         pair = pair + self.triangle_multiplication_outgoing(pair, visibility=pair_attention_mask)
         pair = pair + self.triangle_multiplication_incoming(pair, visibility=pair_attention_mask)
         pair = pair + self.pair_transition(pair)

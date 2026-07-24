@@ -5,7 +5,8 @@ Input processing for BoltzGen structure design and inverse folding.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -18,13 +19,14 @@ from torch import Tensor
 from ...data.components import get_component
 from ...data.conditions import Endpoint
 from ...data.evidence import MSA, MSACollection, Template
-from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
+from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence, PolymerType
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
     InstanceIdAllocator,
     PlacementMap,
     PlacementSpec,
+    PlacementValue,
     SymbolicAtomSite,
     SymbolicResidueSite,
 )
@@ -479,6 +481,118 @@ class BoltzGenInverseFoldingProcessor(Processor):
         return BoltzGenInverseFoldingInput(
             **{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout
         )
+
+
+@dataclass(frozen=True)
+class DesignMaskResidue:
+    r"""
+    Describe one generated or retained residue in a BoltzGen design mask.
+    """
+
+    designed: bool
+    polymer_type: PolymerType | None = None
+    source: ComponentReference | None = None
+
+
+def from_design_mask(
+    residues: Sequence[DesignMaskResidue],
+    *,
+    group_of: Callable[[int], str],
+    placement_id_of: Callable[[int], str],
+) -> PlacementSpec:
+    r"""
+    Convert BoltzGen residue design specifications to placements.
+    """
+
+    placement: PlacementSpec = {}
+    seen_placement_ids: set[str] = set()
+    run: list[DesignMaskResidue] = []
+    run_group: str | None = None
+    run_placement_id: str | None = None
+
+    def flush() -> None:
+        nonlocal run
+        if not run:
+            return
+        assert run_group is not None and run_placement_id is not None
+        if run_placement_id in seen_placement_ids:
+            raise ValueError(
+                f"placement_id {run_placement_id!r} is non-contiguous: it reappears after another "
+                "placement; a placement_id must name one contiguous run"
+            )
+        seen_placement_ids.add(run_placement_id)
+        placement.setdefault(run_group, {})[run_placement_id] = _placement_value_of_run(run_placement_id, run)
+        run = []
+
+    for index, residue in enumerate(residues):
+        group = group_of(index)
+        placement_id = placement_id_of(index)
+        if placement_id != run_placement_id or group != run_group:
+            flush()
+            run_group = group
+            run_placement_id = placement_id
+        run.append(residue)
+    flush()
+    return placement
+
+
+def to_design_mask(
+    placement: PlacementSpec,
+    placement_map: PlacementMap,
+) -> tuple[list[bool], list[str]]:
+    r"""
+    Recover BoltzGen designedness and declaration groups from realized placements.
+    """
+
+    design_mask: list[bool] = []
+    row_groups: list[str] = []
+    for group, placements in placement.items():
+        for placement_id, value in placements.items():
+            designed = isinstance(value, GeneratedSegment)
+            for _ in placement_map[group][placement_id]:
+                design_mask.append(designed)
+                row_groups.append(group)
+    return design_mask, row_groups
+
+
+def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> PlacementValue:
+    designed = run[0].designed
+    if any(residue.designed != designed for residue in run):
+        raise ValueError(
+            f"placement {placement_id!r} mixes designed and fixed residues; a placement_id must be "
+            "either wholly designed (GeneratedSegment) or wholly fixed (ExistingSpan)"
+        )
+
+    if designed:
+        polymer_type = run[0].polymer_type
+        if polymer_type is None:
+            raise ValueError(
+                f"designed placement {placement_id!r} has no polymer_type: a designed non-polymer "
+                "(GAP-1 de-novo ligand) has no PlacementValue and must be routed out-of-band"
+            )
+        if any(residue.polymer_type != polymer_type for residue in run):
+            raise ValueError(
+                f"designed placement {placement_id!r} spans more than one polymer type; a maximal "
+                "designed run is one polymer type"
+            )
+        if any(residue.source is not None for residue in run):
+            raise ValueError(f"designed placement {placement_id!r} carries a source reference")
+        return GeneratedSegment(polymer_type, len(run), len(run))
+
+    sources: list[ComponentReference] = []
+    for residue in run:
+        if residue.source is None:
+            raise ValueError(f"fixed placement {placement_id!r} has a residue with no source reference")
+        sources.append(residue.source)
+    instance_id = sources[0][0]
+    start = sources[0][1]
+    for offset, source in enumerate(sources):
+        if source[0] != instance_id or source[1] != start + offset:
+            raise ValueError(
+                f"fixed placement {placement_id!r} is not one contiguous source interval of a single "
+                f"instance: {sources!r}"
+            )
+    return ExistingSpan(instance_id, start, start + len(run))
 
 
 # BoltzGen processor implementation helpers.
