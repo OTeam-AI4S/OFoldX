@@ -337,12 +337,12 @@ class AlphaFold2DistogramHeadConfig(Config):
     Args:
         first_break: Center of the first distance bin, in angstroms.
         last_break: Center of the last bounded distance bin, in angstroms.
-        num_bins: Number of distogram output bins.
+        num_distogram_bins: Number of distogram output bins.
     """
 
     first_break: float = 2.3125
     last_break: float = 21.6875
-    num_bins: int = 64
+    num_distogram_bins: int = 64
 
 
 class AlphaFold2PredictedAlignedErrorHeadConfig(Config):
@@ -352,12 +352,12 @@ class AlphaFold2PredictedAlignedErrorHeadConfig(Config):
     Args:
         enabled: Whether to build and run the predicted-aligned-error head.
         max_error_bin: Upper predicted-aligned-error bin center, in angstroms.
-        num_bins: Number of predicted-aligned-error bins.
+        num_pae_bins: Number of predicted-aligned-error bins.
     """
 
     enabled: bool = True
     max_error_bin: float = 31.0
-    num_bins: int = 64
+    num_pae_bins: int = 64
 
 
 class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
@@ -367,7 +367,7 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
     Args:
         enabled: Whether to build and run the predicted-aligned-error head.
         max_error_bin: Upper predicted-aligned-error bin center, in angstroms.
-        num_bins: Number of predicted-aligned-error bins.
+        num_pae_bins: Number of predicted-aligned-error bins.
         interface: Whether to compute interface pTM.
         ptm_weight: pTM contribution to the combined ranking score.
         iptm_weight: ipTM contribution to the combined ranking score.
@@ -375,7 +375,7 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
 
     enabled: bool = True
     max_error_bin: float = 31.0
-    num_bins: int = 64
+    num_pae_bins: int = 64
     interface: bool = True
     ptm_weight: float = 0.2
     iptm_weight: float = 0.8
@@ -386,11 +386,11 @@ class AlphaFold2PredictedLddtHeadConfig(Config):
     Configure the AlphaFold 2 predicted-lDDT head.
 
     Args:
-        num_bins: Number of predicted-lDDT bins.
+        num_plddt_bins: Number of predicted-lDDT bins.
         hidden_size: Width of head hidden states.
     """
 
-    num_bins: int = 50
+    num_plddt_bins: int = 50
     hidden_size: int = 128
 
 

@@ -176,20 +176,20 @@ class AlphaFold2Model(Model):
         )
         self.distogram_head = DistogramHead(
             pair_size=evoformer_config.pair_size,
-            num_bins=heads.distogram.num_bins,
+            num_bins=heads.distogram.num_distogram_bins,
         )
         nn.init.zeros_(self.distogram_head.projection.weight)
         nn.init.zeros_(self.distogram_head.projection.bias)
         self.predicted_lddt_head = AlphaFold2PredictedLddtHead(
             input_size=structure_module_config.hidden_size,
             hidden_size=heads.predicted_lddt.hidden_size,
-            num_bins=heads.predicted_lddt.num_bins,
+            num_bins=heads.predicted_lddt.num_plddt_bins,
         )
         self.predicted_aligned_error_head: AlphaFold2PredictedAlignedErrorHead | None = None
         if heads.predicted_aligned_error.enabled:
             self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
                 pair_size=evoformer_config.pair_size,
-                num_bins=heads.predicted_aligned_error.num_bins,
+                num_bins=heads.predicted_aligned_error.num_pae_bins,
             )
         self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
             input_size=evoformer_config.single_size,
@@ -721,19 +721,19 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         )
         self.distogram_head = DistogramHead(
             pair_size=evoformer_config.pair_size,
-            num_bins=heads.distogram.num_bins,
+            num_bins=heads.distogram.num_distogram_bins,
         )
         nn.init.zeros_(self.distogram_head.projection.weight)
         nn.init.zeros_(self.distogram_head.projection.bias)
         self.predicted_lddt_head = AlphaFold2PredictedLddtHead(
             input_size=structure_module_config.hidden_size,
             hidden_size=heads.predicted_lddt.hidden_size,
-            num_bins=heads.predicted_lddt.num_bins,
+            num_bins=heads.predicted_lddt.num_plddt_bins,
         )
         # The multimer TM head is always present.
         self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
             pair_size=evoformer_config.pair_size,
-            num_bins=heads.predicted_aligned_error.num_bins,
+            num_bins=heads.predicted_aligned_error.num_pae_bins,
         )
         self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
             input_size=evoformer_config.single_size,

@@ -14,7 +14,7 @@ class ODesignConstraintEmbeddingsConfig(Config):
     Args:
         num_blocks: Number of condition embedding blocks.
         hidden_size: Width of condition pair features.
-        num_bins: Number of condition distance bins.
+        num_distogram_bins: Number of condition distance bins.
         min_distance: Lower condition distance bound, in angstroms.
         max_distance: Upper condition distance bound, in angstroms.
         dropout: Dropout probability in condition embedding blocks.
@@ -22,7 +22,7 @@ class ODesignConstraintEmbeddingsConfig(Config):
 
     num_blocks: int = 2
     hidden_size: int = 64
-    num_bins: int = 39
+    num_distogram_bins: int = 39
     min_distance: float = 3.25
     max_distance: float = 50.75
     dropout: float = 0.25

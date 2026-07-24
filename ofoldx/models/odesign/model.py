@@ -78,7 +78,7 @@ class ODesignModel(Model):
             pair_size=config.pair_size,
             hidden_size=config.constraint_embeddings.hidden_size,
             num_blocks=config.constraint_embeddings.num_blocks,
-            num_bins=config.constraint_embeddings.num_bins,
+            num_bins=config.constraint_embeddings.num_distogram_bins,
             min_distance=config.constraint_embeddings.min_distance,
             max_distance=config.constraint_embeddings.max_distance,
             dropout=config.constraint_embeddings.dropout,
