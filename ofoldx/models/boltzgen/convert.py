@@ -1065,8 +1065,8 @@ def boltzgen_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> BoltzGenCo
         config.design.num_token_distance_blocks = token_distance_args["token_distance_blocks"]
         config.design.distance_gaussian_dim = token_distance_args["distance_gaussian_dim"]
 
-    config.denoiser.num_token_transformer_blocks = score_model_args["token_transformer_depth"]
-    config.denoiser.num_token_transformer_heads = score_model_args["token_transformer_heads"]
+    config.denoiser.num_token_encoder_blocks = score_model_args["token_transformer_depth"]
+    config.denoiser.num_token_encoder_attention_heads = score_model_args["token_transformer_heads"]
     config.denoiser.num_atom_encoder_blocks = score_model_args["atom_encoder_depth"]
     config.denoiser.num_atom_decoder_blocks = score_model_args["atom_decoder_depth"]
     config.denoiser.num_atom_attention_heads = score_model_args["atom_encoder_heads"]

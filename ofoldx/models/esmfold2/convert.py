@@ -544,8 +544,8 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
                 "fourier_embedding_size": diffusion["fourier_dim"],
                 "num_atom_blocks": diffusion["atom_num_blocks"],
                 "num_atom_attention_heads": diffusion["atom_num_heads"],
-                "num_token_blocks": diffusion["token_num_blocks"],
-                "num_token_attention_heads": diffusion["token_num_heads"],
+                "num_token_encoder_blocks": diffusion["token_num_blocks"],
+                "num_token_encoder_attention_heads": diffusion["token_num_heads"],
                 "expansion": diffusion["transition_multiplier"],
             },
             "num_distogram_bins": structure["distogram_bins"],
@@ -656,8 +656,8 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     denoiser_config.fourier_embedding_size = diffusion["fourier_dim"]
     denoiser_config.num_atom_blocks = diffusion["atom_num_blocks"]
     denoiser_config.num_atom_attention_heads = diffusion["atom_num_heads"]
-    denoiser_config.num_token_blocks = diffusion["token_num_blocks"]
-    denoiser_config.num_token_attention_heads = diffusion["token_num_heads"]
+    denoiser_config.num_token_encoder_blocks = diffusion["token_num_blocks"]
+    denoiser_config.num_token_encoder_attention_heads = diffusion["token_num_heads"]
     denoiser_config.expansion = diffusion["transition_multiplier"]
 
     confidence = raw_config["confidence_head"]

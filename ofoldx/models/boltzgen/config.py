@@ -97,8 +97,8 @@ class BoltzGenDenoiserConfig(Config):
     Configure the BoltzGen EDM score network.
 
     Args:
-        num_token_transformer_blocks: Number of token transformer blocks.
-        num_token_transformer_heads: Number of token transformer attention heads.
+        num_token_encoder_blocks: Number of token transformer blocks.
+        num_token_encoder_attention_heads: Number of token transformer attention heads.
         num_atom_encoder_blocks: Number of atom encoder blocks.
         num_atom_decoder_blocks: Number of atom decoder blocks.
         num_atom_attention_heads: Number of atom attention heads.
@@ -111,8 +111,8 @@ class BoltzGenDenoiserConfig(Config):
         alignment_reverse_diff: Whether to rigid-align each reverse-diffusion step.
     """
 
-    num_token_transformer_blocks: int = 24
-    num_token_transformer_heads: int = 16
+    num_token_encoder_blocks: int = 24
+    num_token_encoder_attention_heads: int = 16
     num_atom_encoder_blocks: int = 3
     num_atom_decoder_blocks: int = 3
     num_atom_attention_heads: int = 4
@@ -290,7 +290,7 @@ class BoltzGenConfig(Config):
         config.trunk.num_trunk_blocks = 12
         config.trunk.num_msa_blocks = 3
         config.template.miniformer_blocks = True
-        config.denoiser.num_token_transformer_blocks = 8
+        config.denoiser.num_token_encoder_blocks = 8
         config.design.use_token_distance = False
         return config
 

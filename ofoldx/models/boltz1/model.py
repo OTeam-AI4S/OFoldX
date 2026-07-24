@@ -139,8 +139,8 @@ class Boltz1Model(Model):
             num_atom_encoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
-            num_token_transformer_blocks=denoiser_config.num_token_transformer_blocks,
-            num_token_transformer_heads=denoiser_config.num_token_transformer_heads,
+            num_token_encoder_blocks=denoiser_config.num_token_encoder_blocks,
+            num_token_encoder_attention_heads=denoiser_config.num_token_encoder_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
         )
         denoiser = Boltz1Denoiser(
@@ -152,8 +152,8 @@ class Boltz1Model(Model):
             num_key_atoms=denoiser_config.num_key_atoms,
             num_atom_encoder_blocks=denoiser_config.num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=denoiser_config.num_atom_attention_heads,
-            num_token_transformer_blocks=denoiser_config.num_token_transformer_blocks,
-            num_token_transformer_heads=denoiser_config.num_token_transformer_heads,
+            num_token_encoder_blocks=denoiser_config.num_token_encoder_blocks,
+            num_token_encoder_attention_heads=denoiser_config.num_token_encoder_attention_heads,
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
@@ -1121,8 +1121,8 @@ class Boltz1DenoiserConditioning(nn.Module):
         num_atom_encoder_attention_heads: int = 4,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
-        num_token_transformer_blocks: int = 24,
-        num_token_transformer_heads: int = 16,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 16,
         num_conditioning_transitions: int = 2,
         backend: str = "auto",
     ) -> None:
@@ -1159,9 +1159,9 @@ class Boltz1DenoiserConditioning(nn.Module):
         self.token_transformer_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
                 LayerNorm(pair_size, backend=backend),
-                nn.Linear(pair_size, num_token_transformer_heads, bias=False),
+                nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False),
             )
-            for _ in range(num_token_transformer_blocks)
+            for _ in range(num_token_encoder_blocks)
         )
 
     def forward(
@@ -1230,8 +1230,8 @@ class Boltz1Denoiser(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        num_token_transformer_blocks: int = 24,
-        num_token_transformer_heads: int = 8,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 8,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
         num_conditioning_transitions: int = 2,
@@ -1257,8 +1257,8 @@ class Boltz1Denoiser(nn.Module):
         )
         self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
         self.token_transformer = ConditionedTransformer(
-            num_blocks=num_token_transformer_blocks,
-            num_attention_heads=num_token_transformer_heads,
+            num_blocks=num_token_encoder_blocks,
+            num_attention_heads=num_token_encoder_attention_heads,
             hidden_size=hidden,
             conditioning_size=hidden,
             backend=backend,

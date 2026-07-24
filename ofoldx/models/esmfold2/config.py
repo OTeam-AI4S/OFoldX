@@ -179,8 +179,8 @@ class EsmFold2DenoiserConfig(Config):
         fourier_embedding_size: Width of diffusion-noise Fourier features.
         num_atom_blocks: Number of atom attention blocks.
         num_atom_attention_heads: Number of atom attention heads.
-        num_token_blocks: Number of token transformer blocks.
-        num_token_attention_heads: Number of token transformer attention heads.
+        num_token_encoder_blocks: Number of token transformer blocks.
+        num_token_encoder_attention_heads: Number of token transformer attention heads.
         expansion: Feed-forward expansion factor.
     """
 
@@ -192,8 +192,8 @@ class EsmFold2DenoiserConfig(Config):
     fourier_embedding_size: int = 256
     num_atom_blocks: int = 3
     num_atom_attention_heads: int = 4
-    num_token_blocks: int = 12
-    num_token_attention_heads: int = 16
+    num_token_encoder_blocks: int = 12
+    num_token_encoder_attention_heads: int = 16
     expansion: int = 2
 
 

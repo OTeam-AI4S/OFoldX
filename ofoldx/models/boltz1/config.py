@@ -66,8 +66,8 @@ class Boltz1DenoiserConfig(Config):
     Configure the Boltz-1 EDM token transformer and atom encoder-decoder.
 
     Args:
-        num_token_transformer_blocks: Number of conditioned token-transformer blocks in the score model.
-        num_token_transformer_heads: Head count for the token transformer.
+        num_token_encoder_blocks: Number of conditioned token-transformer blocks in the score model.
+        num_token_encoder_attention_heads: Head count for the token transformer.
         num_atom_encoder_blocks: Number of atom-attention encoder blocks in the denoiser.
         num_atom_decoder_blocks: Number of atom-attention decoder blocks in the denoiser.
         num_atom_attention_heads: Head count shared by the denoiser atom encoder and decoder.
@@ -80,8 +80,8 @@ class Boltz1DenoiserConfig(Config):
         alignment_reverse_diff: Whether to weighted-rigid-align each reverse-diffusion step to the denoised coords.
     """
 
-    num_token_transformer_blocks: int = 24
-    num_token_transformer_heads: int = 16
+    num_token_encoder_blocks: int = 24
+    num_token_encoder_attention_heads: int = 16
     num_atom_encoder_blocks: int = 3
     num_atom_decoder_blocks: int = 3
     num_atom_attention_heads: int = 4
