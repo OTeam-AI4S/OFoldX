@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ofoldx.data import ChemicalAtom, ChemicalBond, ChemicalComponent, Molecule
+from ofoldx.data import ChemicalAtom, ChemicalBond, ChemicalComponent
 from ofoldx.io import read_structure, read_structures
 
 _ALTLOC_PDB = """\
@@ -63,11 +63,6 @@ def test_unknown_component_requires_an_explicit_complete_graph(tmp_path: Path) -
     assert structure.system.atom(structure.sites[0]).element == "C"
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: complete_all hydrogen-count materialization is a reopened §3.5 I/O "
-    "graph transform; §3.5.1/§3.3 also removed component provenance",
-    strict=True,
-)
 def test_complete_all_materializes_hydrogen_counts_as_an_explicit_graph_transform(tmp_path: Path) -> None:
     path = tmp_path / "methane.pdb"
     path.write_text(
@@ -77,8 +72,8 @@ def test_complete_all_materializes_hydrogen_counts_as_an_explicit_graph_transfor
     component = ChemicalComponent(
         "MET",
         atoms=(
-            ChemicalAtom("C1", "C", implicit_hydrogens=3),
-            ChemicalAtom("O1", "O", implicit_hydrogens=1),
+            ChemicalAtom("C1", "C", explicit_hydrogens=0, implicit_hydrogens=3),
+            ChemicalAtom("O1", "O", explicit_hydrogens=0, implicit_hydrogens=1),
         ),
         bonds=frozenset({ChemicalBond("C1", "O1")}),
         reference_coordinates=((0.0, 0.0, 0.0), (1.4, 0.0, 0.0)),
@@ -88,12 +83,8 @@ def test_complete_all_materializes_hydrogen_counts_as_an_explicit_graph_transfor
 
     assert len(structure.sites) == 6
     assert int(structure.coordinate_mask.sum()) == 1
-    molecule = next(iter(structure.system.entities.values()))
-    assert type(molecule) is Molecule
-    materialized = molecule.components[0]
+    materialized = next(iter(structure.system.entities.values())).components[0]
     assert all(atom.explicit_hydrogens == atom.implicit_hydrogens == 0 for atom in materialized.atoms)
-    # §3.3/§3.5.1 removed ChemicalComponent.provenance; the materialization transform record is
-    # reopened, so only the resulting hydrogen graph and reference coordinates remain observable.
     reference_by_atom = dict(zip((atom.atom_id for atom in materialized.atoms), materialized.reference_coordinates))
     assert reference_by_atom["C1"] == (0.0, 0.0, 0.0)
     assert reference_by_atom["O1"] == (1.4, 0.0, 0.0)

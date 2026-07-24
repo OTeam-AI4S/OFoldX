@@ -9,7 +9,7 @@ from collections.abc import Sequence
 
 from torch import Tensor, nn
 
-from ..backend import resolve_config_operator_backend
+from ..backend import resolve_config_backend
 from ..backend.attention import gated_multihead_attention
 
 
@@ -18,7 +18,7 @@ class GatedMultiheadAttention(nn.Module):
     Full multi-head attention primitive with optional output gating and additive pair bias.
 
     Wraps a [`MultiheadAttentionProjection`][ofoldx.modules.attention.multihead.MultiheadAttentionProjection]
-    and dispatches the scaled-dot-product core to the resolved operator backend
+    and dispatches the scaled-dot-product core to the resolved backend
     through the selected operator provider. This is the shared attention block used by the trunk,
     atom, and diffusion stacks; higher-level modules supply the pair-derived ``biases``.
 
@@ -35,7 +35,7 @@ class GatedMultiheadAttention(nn.Module):
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        operator_backend: Operator provider; attention uses SDPA as its default
+        backend: Operator provider; attention uses SDPA as its default
             PyTorch implementation.
     """
 
@@ -52,12 +52,10 @@ class GatedMultiheadAttention(nn.Module):
         gating: bool = True,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "sdpa", "eager"), public_default="sdpa"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "sdpa", "eager"), public_default="sdpa")
         self.projection = MultiheadAttentionProjection(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -105,7 +103,7 @@ class GatedMultiheadAttention(nn.Module):
             biases=biases,
             attention_mask=attention_mask,
             projection=self.projection,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )
 
 
@@ -115,7 +113,7 @@ class MultiheadAttentionProjection(nn.Module):
 
     Owns the learnable linear projections (query/key/value/output plus an optional query bias and
     output gate) so that [`GatedMultiheadAttention`][ofoldx.modules.attention.multihead.GatedMultiheadAttention]
-    and the operator-backend dispatch can share one projection module while keeping the attention core
+    and the backend dispatch can share one projection module while keeping the attention core
     backend-agnostic.
 
     Args:

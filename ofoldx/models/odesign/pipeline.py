@@ -15,6 +15,7 @@ import torch
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Hotspot
+from ...data.evidence import MSA, MSACollection
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence, is_water_component
 from ...data.structure import Structure
 from ...modules.mpnn import (
@@ -72,6 +73,7 @@ class ODesignPipeline(CompositePipeline):
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         *,
         placement: ODesignPlacements | None = None,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
         num_candidates: int | None = None,
         num_seeds: int = 1,
         num_backbones: int = 1,
@@ -91,6 +93,7 @@ class ODesignPipeline(CompositePipeline):
         Args:
             input: Optional target or context system, structure, or local structure path.
             placement: Optional topology of existing and generated molecular segments.
+            msa: Optional MSA evidence or alignment path.
             num_candidates: Alias for ``num_backbones``. ``None`` leaves
                 ``num_backbones`` unchanged.
             num_seeds: Number of random generation streams when ``seeds`` is not supplied.
@@ -125,7 +128,7 @@ class ODesignPipeline(CompositePipeline):
 
         seed_list = self._resolve_seeds(num_seeds, seeds, generator)
 
-        model_input = self._build_batch(input, placement, conditions, receptor_mode)
+        model_input = self._build_batch(input, placement, msa, conditions, receptor_mode)
         candidates: list[ODesignDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(int(backbone_seed), None, device=model_input.reference_positions.device)
@@ -227,12 +230,14 @@ class ODesignPipeline(CompositePipeline):
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None,
         placement: ODesignPlacements | None,
+        msa: MSA | MSACollection | str | PathLike[str] | None,
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates],
         receptor_mode: Literal["rigid", "flex"] | None,
     ) -> ODesignInput:
         return self.processor(
             input,
             placement=placement,
+            msa=msa,
             conditions=conditions,
             receptor_mode=receptor_mode,
         )

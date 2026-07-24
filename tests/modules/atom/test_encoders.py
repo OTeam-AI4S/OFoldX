@@ -81,7 +81,7 @@ def test_pair_encoder(pair_encoder: AtomPairEncoder, num_bias_samples: int) -> N
         assert not torch.allclose(output[:, 0], output[:, sample])
 
 
-@pytest.mark.parametrize("backend", ("torch", "oops"))
+@pytest.mark.parametrize("backend", ("eager", "oops"))
 def test_coordinate_atom_modules_propagate_backend(backend: str) -> None:
     encoder = CoordinateAtomToTokenEncoder(
         token_hidden_size=8,
@@ -94,7 +94,7 @@ def test_coordinate_atom_modules_propagate_backend(backend: str) -> None:
         num_query_atoms=2,
         num_key_atoms=4,
         atom_feature_size=6,
-        operator_backend=backend,
+        backend=backend,
     )
     decoder = TokenToAtomDecoder(
         token_hidden_size=8,
@@ -104,9 +104,9 @@ def test_coordinate_atom_modules_propagate_backend(backend: str) -> None:
         num_attention_heads=2,
         num_query_atoms=2,
         num_key_atoms=4,
-        operator_backend=backend,
+        backend=backend,
     )
 
-    assert encoder.token_to_atom_broadcast.operator_backend == backend
-    assert encoder.token_pair_to_local_atom_pair_broadcast.operator_backend == backend
-    assert decoder.token_to_atom_broadcast.operator_backend == backend
+    assert encoder.token_to_atom_broadcast.backend == backend
+    assert encoder.token_pair_to_local_atom_pair_broadcast.backend == backend
+    assert decoder.token_to_atom_broadcast.backend == backend

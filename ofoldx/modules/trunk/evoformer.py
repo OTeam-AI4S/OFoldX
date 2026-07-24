@@ -1,5 +1,5 @@
 r"""
-AlphaFold 2 Evoformer representation refinement.
+Evoformer representation refinement shared by AlphaFold-derived models.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ class EvoformerStack(nn.Module):
         msa_size: Width of the MSA representation.
         pair_size: Width of the pair representation.
         outer_product_hidden_size: Hidden width of the outer-product mean.
-        outer_product_first: Whether pair projection precedes the MSA-track block.
         num_msa_attention_heads: Number of MSA attention heads.
         triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
         triangle_attention_hidden_size: Per-head width of triangle attention.
@@ -35,8 +34,7 @@ class EvoformerStack(nn.Module):
         pair_transition_expansion: Expansion factor of the pair transition.
         msa_dropout: Row-wise dropout probability on MSA residuals.
         pair_dropout: Row-wise dropout probability on pair residuals.
-        is_extra_msa: Whether to use global rather than ordinary MSA-column attention.
-        operator_backend: Operator backend used by attention and pair updates.
+        backend: Backend used by attention and pair updates.
     """
 
     def __init__(
@@ -46,7 +44,6 @@ class EvoformerStack(nn.Module):
         msa_size: int,
         pair_size: int,
         outer_product_hidden_size: int,
-        outer_product_first: bool,
         num_msa_attention_heads: int,
         triangle_multiplication_hidden_size: int,
         triangle_attention_hidden_size: int,
@@ -55,8 +52,7 @@ class EvoformerStack(nn.Module):
         pair_transition_expansion: int,
         msa_dropout: float,
         pair_dropout: float,
-        is_extra_msa: bool,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -66,7 +62,6 @@ class EvoformerStack(nn.Module):
                     msa_size=msa_size,
                     pair_size=pair_size,
                     outer_product_hidden_size=outer_product_hidden_size,
-                    outer_product_first=outer_product_first,
                     num_msa_attention_heads=num_msa_attention_heads,
                     triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
                     triangle_attention_hidden_size=triangle_attention_hidden_size,
@@ -75,8 +70,7 @@ class EvoformerStack(nn.Module):
                     pair_transition_expansion=pair_transition_expansion,
                     msa_dropout=msa_dropout,
                     pair_dropout=pair_dropout,
-                    is_extra_msa=is_extra_msa,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ],
@@ -114,37 +108,18 @@ class EvoformerStack(nn.Module):
         return msa, pair
 
 
-class EvoformerBlock(nn.Module):
+class ExtraMsaEvoformerStack(EvoformerStack):
     r"""
-    Own one ordered Evoformer update of the MSA and pair tracks.
-
-    The block places outer-product mean before or after the MSA-track block, then
-    applies the pair-track block. Its children own their respective residual order.
-
-    Args:
-        msa_size: Width of the MSA representation.
-        pair_size: Width of the pair representation.
-        outer_product_hidden_size: Hidden width of the outer-product mean.
-        outer_product_first: Whether pair projection precedes the MSA-track block.
-        num_msa_attention_heads: Number of MSA attention heads.
-        triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
-        triangle_attention_hidden_size: Per-head width of triangle attention.
-        num_triangle_attention_heads: Number of triangle-attention heads.
-        msa_transition_expansion: Expansion factor of the MSA transition.
-        pair_transition_expansion: Expansion factor of the pair transition.
-        msa_dropout: Row-wise dropout probability on MSA residuals.
-        pair_dropout: Row-wise dropout probability on pair residuals.
-        is_extra_msa: Whether to use global MSA-column attention.
-        operator_backend: Operator backend used by attention and pair updates.
+    Homogeneous stack of AlphaFold 2 extra-MSA blocks.
     """
 
     def __init__(
         self,
         *,
+        num_blocks: int,
         msa_size: int,
         pair_size: int,
         outer_product_hidden_size: int,
-        outer_product_first: bool,
         num_msa_attention_heads: int,
         triangle_multiplication_hidden_size: int,
         triangle_attention_hidden_size: int,
@@ -153,16 +128,158 @@ class EvoformerBlock(nn.Module):
         pair_transition_expansion: int,
         msa_dropout: float,
         pair_dropout: float,
-        is_extra_msa: bool,
-        operator_backend: str,
+        backend: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            ExtraMsaEvoformerBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                num_msa_attention_heads=num_msa_attention_heads,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                msa_transition_expansion=msa_transition_expansion,
+                pair_transition_expansion=pair_transition_expansion,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+
+class OuterProductFirstEvoformerStack(EvoformerStack):
+    r"""
+    Homogeneous Evoformer stack whose blocks apply outer-product mean before MSA attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_blocks: int,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            OuterProductFirstEvoformerBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                num_msa_attention_heads=num_msa_attention_heads,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                msa_transition_expansion=msa_transition_expansion,
+                pair_transition_expansion=pair_transition_expansion,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+
+class OuterProductFirstExtraMsaEvoformerStack(EvoformerStack):
+    r"""
+    Extra-MSA stack whose blocks apply outer-product mean before global-column MSA attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_blocks: int,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            OuterProductFirstExtraMsaEvoformerBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                num_msa_attention_heads=num_msa_attention_heads,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                msa_transition_expansion=msa_transition_expansion,
+                pair_transition_expansion=pair_transition_expansion,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+
+class EvoformerBlock(nn.Module):
+    r"""
+    Own one ordered Evoformer update of the MSA and pair tracks.
+
+    The block updates the MSA, applies outer-product mean, then updates the pair track.
+
+    Args:
+        msa_size: Width of the MSA representation.
+        pair_size: Width of the pair representation.
+        outer_product_hidden_size: Hidden width of the outer-product mean.
+        num_msa_attention_heads: Number of MSA attention heads.
+        triangle_multiplication_hidden_size: Hidden width of triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        msa_transition_expansion: Expansion factor of the MSA transition.
+        pair_transition_expansion: Expansion factor of the pair transition.
+        msa_dropout: Row-wise dropout probability on MSA residuals.
+        pair_dropout: Row-wise dropout probability on pair residuals.
+        backend: Backend used by attention and pair updates.
+    """
+
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
     ) -> None:
         super().__init__()
-        self.outer_product_first = outer_product_first
         self.outer_product_mean = AlphaFold2OuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.msa_block = EvoformerMsaBlock(
             msa_size=msa_size,
@@ -170,8 +287,7 @@ class EvoformerBlock(nn.Module):
             num_attention_heads=num_msa_attention_heads,
             transition_expansion=msa_transition_expansion,
             dropout=msa_dropout,
-            is_extra_msa=is_extra_msa,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_block = EvoformerPairBlock(
             pair_size=pair_size,
@@ -180,7 +296,7 @@ class EvoformerBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             transition_expansion=pair_transition_expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
@@ -197,11 +313,85 @@ class EvoformerBlock(nn.Module):
             Updated MSA and pair representations with unchanged shapes.
         """
 
-        if self.outer_product_first:
-            pair = pair + self.outer_product_mean(msa, msa_mask)
         msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-        if not self.outer_product_first:
-            pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class ExtraMsaEvoformerBlock(nn.Module):
+    r"""
+    One extra-MSA update with global column attention and outer-product mean after the MSA update.
+    """
+
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
+    ) -> None:
+        super().__init__()
+        self.outer_product_mean = AlphaFold2OuterProductMean(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            hidden_size=outer_product_hidden_size,
+            backend=backend,
+        )
+        self.msa_block = ExtraMsaTrackBlock(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            transition_expansion=msa_transition_expansion,
+            dropout=msa_dropout,
+            backend=backend,
+        )
+        self.pair_block = EvoformerPairBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            transition_expansion=pair_transition_expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class OuterProductFirstEvoformerBlock(EvoformerBlock):
+    r"""
+    One ordinary-MSA Evoformer block with outer-product mean before the MSA update.
+    """
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class OuterProductFirstExtraMsaEvoformerBlock(ExtraMsaEvoformerBlock):
+    r"""
+    One extra-MSA block with outer-product mean before global-column MSA attention.
+    """
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         pair = self.pair_block(pair, pair_mask=pair_mask)
         return msa, pair
 
@@ -216,8 +406,7 @@ class EvoformerMsaBlock(nn.Module):
         num_attention_heads: Number of MSA attention heads.
         transition_expansion: Expansion factor of the MSA transition.
         dropout: Row-wise dropout probability on row-attention updates.
-        is_extra_msa: Whether column attention uses a global query over MSA rows.
-        operator_backend: Operator backend used by MSA attention.
+        backend: Backend used by MSA attention.
     """
 
     def __init__(
@@ -228,29 +417,20 @@ class EvoformerMsaBlock(nn.Module):
         num_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        is_extra_msa: bool,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.msa_row_attention_with_pair_bias = MsaRowAttentionWithPairBias(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        if is_extra_msa:
-            self.msa_column_global_attention: nn.Module = MsaColumnGlobalAttention(
-                msa_size=msa_size,
-                num_attention_heads=num_attention_heads,
-            )
-            self.msa_column_attention: nn.Module | None = None
-        else:
-            self.msa_column_attention = MsaColumnAttention(
-                msa_size=msa_size,
-                num_attention_heads=num_attention_heads,
-                operator_backend=operator_backend,
-            )
-            self.msa_column_global_attention = None
+        self.msa_column_attention = MsaColumnAttention(
+            msa_size=msa_size,
+            num_attention_heads=num_attention_heads,
+            backend=backend,
+        )
         self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
 
@@ -271,10 +451,44 @@ class EvoformerMsaBlock(nn.Module):
         msa = msa + self.rowwise_dropout(
             self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask),
         )
-        if self.msa_column_attention is not None:
-            msa = msa + self.msa_column_attention(msa, msa_mask=msa_mask)
-        if self.msa_column_global_attention is not None:
-            msa = msa + self.msa_column_global_attention(msa, msa_mask=msa_mask)
+        msa = msa + self.msa_column_attention(msa, msa_mask=msa_mask)
+        return msa + self.transition(msa, msa_mask)
+
+
+class ExtraMsaTrackBlock(nn.Module):
+    r"""
+    Extra-MSA track update with row attention, global column attention, and transition.
+    """
+
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        num_attention_heads: int,
+        transition_expansion: int,
+        dropout: float,
+        backend: str,
+    ) -> None:
+        super().__init__()
+        self.msa_row_attention_with_pair_bias = MsaRowAttentionWithPairBias(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_attention_heads,
+            backend=backend,
+        )
+        self.msa_column_global_attention = MsaColumnGlobalAttention(
+            msa_size=msa_size,
+            num_attention_heads=num_attention_heads,
+        )
+        self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
+        self.rowwise_dropout = RowwiseDropout(dropout)
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
+        msa = msa + self.rowwise_dropout(
+            self.msa_row_attention_with_pair_bias(msa, pair, msa_mask=msa_mask),
+        )
+        msa = msa + self.msa_column_global_attention(msa, msa_mask=msa_mask)
         return msa + self.transition(msa, msa_mask)
 
 
@@ -289,7 +503,7 @@ class EvoformerPairBlock(nn.Module):
         num_triangle_attention_heads: Number of triangle-attention heads.
         transition_expansion: Expansion factor of the pair transition.
         dropout: Row-wise dropout probability on pair updates.
-        operator_backend: Operator backend used by triangle operations.
+        backend: Backend used by triangle operations.
     """
 
     def __init__(
@@ -301,32 +515,32 @@ class EvoformerPairBlock(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
@@ -363,7 +577,7 @@ class MsaRowAttentionWithPairBias(nn.Module):
         msa_size: Width of the MSA representation.
         pair_size: Width of the pair representation.
         num_attention_heads: Number of row-attention heads.
-        operator_backend: Operator backend used by gated attention.
+        backend: Backend used by gated attention.
     """
 
     def __init__(
@@ -372,11 +586,11 @@ class MsaRowAttentionWithPairBias(nn.Module):
         msa_size: int,
         pair_size: int,
         num_attention_heads: int,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
-        self.query_norm = LayerNorm(msa_size, operator_backend=operator_backend)
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.query_norm = LayerNorm(msa_size, backend=backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.attention = GatedMultiheadAttention(
             msa_size,
@@ -385,7 +599,7 @@ class MsaRowAttentionWithPairBias(nn.Module):
             output_bias=True,
             gate_bias=True,
             gate_bias_init=1.0,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor) -> Tensor:
@@ -414,12 +628,12 @@ class MsaColumnAttention(nn.Module):
     Args:
         msa_size: Width of the MSA representation.
         num_attention_heads: Number of column-attention heads.
-        operator_backend: Operator backend used by gated attention.
+        backend: Backend used by gated attention.
     """
 
-    def __init__(self, *, msa_size: int, num_attention_heads: int, operator_backend: str) -> None:
+    def __init__(self, *, msa_size: int, num_attention_heads: int, backend: str) -> None:
         super().__init__()
-        self.query_norm = LayerNorm(msa_size, operator_backend=operator_backend)
+        self.query_norm = LayerNorm(msa_size, backend=backend)
         self.attention = GatedMultiheadAttention(
             msa_size,
             num_attention_heads=num_attention_heads,
@@ -427,7 +641,7 @@ class MsaColumnAttention(nn.Module):
             output_bias=True,
             gate_bias=True,
             gate_bias_init=1.0,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(self, msa: Tensor, *, msa_mask: Tensor) -> Tensor:
@@ -614,7 +828,7 @@ class AlphaFold2OuterProductMean(OuterProductMean):
         pair_size: Width of the returned pair update.
         hidden_size: Width of each projected MSA factor.
         eps: Epsilon added to the valid-sequence count.
-        operator_backend: Operator backend used by the outer-product contraction.
+        backend: Backend used by the outer-product contraction.
     """
 
     def __init__(
@@ -624,7 +838,7 @@ class AlphaFold2OuterProductMean(OuterProductMean):
         pair_size: int,
         hidden_size: int,
         eps: float = 1e-3,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__(
             msa_size=msa_size,
@@ -632,7 +846,7 @@ class AlphaFold2OuterProductMean(OuterProductMean):
             pair_size=pair_size,
             eps=eps,
             divide_before_projection=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.left_projection = nn.Linear(msa_size, hidden_size)
         self.right_projection = nn.Linear(msa_size, hidden_size)
@@ -651,7 +865,7 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
         pair_size: Width of the pair representation.
         hidden_size: Width of projected multiplicative factors.
         outgoing: Whether to contract outgoing rather than incoming edges.
-        operator_backend: Operator backend used by the triangle contraction.
+        backend: Backend used by the triangle contraction.
     """
 
     def __init__(
@@ -660,13 +874,13 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
         pair_size: int,
         hidden_size: int,
         outgoing: bool,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__(
             pair_size=pair_size,
             hidden_size=hidden_size,
             outgoing=outgoing,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.left_projection = nn.Linear(pair_size, hidden_size)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size)
@@ -688,10 +902,10 @@ class AlphaFold2TriangleAttention(TriangleAttention):
         pair_size: Width of the pair representation.
         head_dim: Width of each triangle-attention head.
         num_attention_heads: Number of triangle-attention heads.
-        operator_backend: Operator backend used by attention.
+        backend: Backend used by attention.
     """
 
-    def __init__(self, *, pair_size: int, head_dim: int, num_attention_heads: int, operator_backend: str) -> None:
+    def __init__(self, *, pair_size: int, head_dim: int, num_attention_heads: int, backend: str) -> None:
         super().__init__(
             pair_size=pair_size,
             head_dim=head_dim,
@@ -699,5 +913,5 @@ class AlphaFold2TriangleAttention(TriangleAttention):
             output_bias=True,
             gate_bias=True,
             gate_bias_init=1.0,
-            operator_backend=operator_backend,
+            backend=backend,
         )

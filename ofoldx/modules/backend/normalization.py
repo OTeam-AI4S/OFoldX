@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from ._apex import apex_layer_norm
 from ._deepspeed import deepspeed_layer_norm
 from ._oops import oops_kernel
-from .resolve import resolve_config_operator_backend, resolve_tensor_operator_backend
+from .resolve import resolve_config_backend, resolve_tensor_backend
 
 _oops_layer_norm = oops_kernel("layer_norm")
 
@@ -28,7 +28,7 @@ def layer_norm(
     bias: Tensor | None,
     eps: float,
     *,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Apply layer normalization with a selectable backend.
@@ -39,14 +39,14 @@ def layer_norm(
         weight: Optional affine scale with shape ``normalized_shape``.
         bias: Optional affine bias with shape ``normalized_shape``.
         eps: Value added to the variance for numerical stability.
-        operator_backend: Backend used for normalization.
+        backend: Backend used for normalization.
 
     Returns:
         A normalized tensor with the same shape and dtype as ``input``.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(input, weight, bias),
         supported=_SUPPORTED,
         public_default="eager",
@@ -81,10 +81,10 @@ class LayerNorm(nn.LayerNorm):
         bias: Whether to learn an additive bias when affine parameters are enabled.
         device: Device of newly created parameters.
         dtype: Dtype of newly created parameters.
-        operator_backend: Backend used for normalization.
+        backend: Backend used for normalization.
     """
 
-    operator_backend: str
+    backend: str
 
     def __init__(
         self,
@@ -95,7 +95,7 @@ class LayerNorm(nn.LayerNorm):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         *,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__(
             normalized_shape,
@@ -105,8 +105,8 @@ class LayerNorm(nn.LayerNorm):
             device=device,
             dtype=dtype,
         )
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend,
+        self.backend = resolve_config_backend(
+            backend,
             supported=_SUPPORTED,
             public_default="eager",
         )
@@ -128,5 +128,5 @@ class LayerNorm(nn.LayerNorm):
             self.weight,
             self.bias,
             self.eps,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )

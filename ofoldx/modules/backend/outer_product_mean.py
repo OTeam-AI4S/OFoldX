@@ -9,7 +9,7 @@ from torch import Tensor
 
 from ._oops import oops_kernel
 from .normalization import layer_norm
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_outer_product_mean = oops_kernel("outer_product_mean")
 
@@ -29,7 +29,7 @@ def outer_product_mean(
     norm_eps: float,
     denom_eps: float,
     divide_before_projection: bool,
-    operator_backend: str,
+    backend: str,
     proj_left_bias: Tensor | None = None,
     proj_right_bias: Tensor | None = None,
 ) -> Tensor:
@@ -50,7 +50,7 @@ def outer_product_mean(
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
         proj_left_bias: Optional left projection bias; ``None`` keeps the projection bias-free.
         proj_right_bias: Optional right projection bias; ``None`` keeps the projection bias-free.
 
@@ -58,8 +58,8 @@ def outer_product_mean(
         ``(B, N, N, pair_size)`` pair update, where ``pair_size`` is the row count of ``proj_out_weight``.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(msa, msa_mask),
         supported=_SUPPORTED,
         public_default="eager",
@@ -81,7 +81,7 @@ def outer_product_mean(
             divide_before_projection=divide_before_projection,
         )
 
-    msa = layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps, operator_backend=backend)
+    msa = layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps, backend=backend)
     left = torch.nn.functional.linear(msa, proj_left_weight, proj_left_bias)
     right = torch.nn.functional.linear(msa, proj_right_weight, proj_right_bias)
     if msa_mask is None:

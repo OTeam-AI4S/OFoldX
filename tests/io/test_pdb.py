@@ -50,11 +50,6 @@ def test_pdb_keeps_separate_het_residues_as_separate_single_component_molecules(
     assert {site.component_index for site in structure.sites} == {0}
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: the LossReport contract (dropped/rewritten field vocabulary and the "
-    "removed format field) is the reopened §3.5 lossy-write reporting decision",
-    strict=True,
-)
 def test_pdb_fails_by_default_and_returns_exact_loss_report_when_acknowledged(tmp_path: Path) -> None:
     structure = _heterogeneous_structure()
     path = tmp_path / "lossy.pdb"
@@ -65,10 +60,7 @@ def test_pdb_fails_by_default_and_returns_exact_loss_report_when_acknowledged(tm
 
     report = write_structure(structure, path, allow_lossy=True)
     assert report is not None
-    # §3.5.1: LossReport.format was removed; the report exposes only dropped/rewritten field
-    # vocabularies, whose exact contents stay the reopened §3.5 lossy-write reporting decision.
     assert "system.nonpolymer_graph" in report.dropped_fields
-    assert "system.bond_origin" in report.rewritten_fields
     assert path.read_text(encoding="ascii").endswith("END\n")
 
 

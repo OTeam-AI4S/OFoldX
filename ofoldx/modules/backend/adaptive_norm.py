@@ -10,7 +10,7 @@ from torch import Tensor
 
 from ._oops import oops_kernel
 from .normalization import layer_norm
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_adaptive_layer_norm = oops_kernel("adaptive_layer_norm")
 
@@ -25,7 +25,7 @@ def adaptive_layer_norm(
     projection_weight: Tensor,
     scale_bias: Tensor,
     eps: float,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Apply adaptive layer norm ``sigmoid(scale) * norm(hidden) + shift`` on the selected backend.
@@ -44,14 +44,14 @@ def adaptive_layer_norm(
             weight; the first ``hidden_size`` rows produce the scale, the remainder the shift.
         scale_bias: ``[hidden_size]`` additive bias applied to the scale half before the sigmoid.
         eps: LayerNorm epsilon shared by both norms.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., hidden_size]`` conditioned activations.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(hidden, conditioning),
         supported=_SUPPORTED,
         public_default="eager",
@@ -66,14 +66,14 @@ def adaptive_layer_norm(
             eps=eps,
             conditioning_eps=eps,
         )
-    hidden_normed = layer_norm(hidden, (hidden.shape[-1],), None, None, eps, operator_backend=backend)
+    hidden_normed = layer_norm(hidden, (hidden.shape[-1],), None, None, eps, backend=backend)
     conditioning_normed = layer_norm(
         conditioning,
         (conditioning.shape[-1],),
         conditioning_norm_weight,
         None,
         eps,
-        operator_backend=backend,
+        backend=backend,
     )
     scale, shift = F.linear(conditioning_normed, projection_weight).chunk(2, dim=-1)
     return torch.sigmoid(scale + scale_bias) * hidden_normed + shift

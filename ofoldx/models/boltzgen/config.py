@@ -37,7 +37,7 @@ class BoltzGenTrunkConfig(Config):
     Configure the Pairformer and MSA trunk shared by BoltzGen structure-design variants.
 
     Args:
-        num_pairformer_blocks: Number of pair trunk blocks.
+        num_trunk_blocks: Number of pair trunk blocks.
         num_pair_attention_heads: Number of pair-biased attention heads.
         num_msa_blocks: Number of MSA blocks.
         msa_size: Width of MSA representations.
@@ -54,7 +54,7 @@ class BoltzGenTrunkConfig(Config):
         msa_dropout: Dropout probability inside the MSA trunk.
     """
 
-    num_pairformer_blocks: int = 64
+    num_trunk_blocks: int = 64
     num_pair_attention_heads: int = 16
     num_msa_blocks: int = 4
     msa_size: int = 64
@@ -287,7 +287,7 @@ class BoltzGenConfig(Config):
         config.input_embeddings.add_ss_specification = False
         config.trunk.use_miniformer = True
         config.trunk.msa_miniformer_blocks = True
-        config.trunk.num_pairformer_blocks = 12
+        config.trunk.num_trunk_blocks = 12
         config.trunk.num_msa_blocks = 3
         config.template.miniformer_blocks = True
         config.denoiser.num_token_transformer_blocks = 8

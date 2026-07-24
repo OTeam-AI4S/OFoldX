@@ -12,7 +12,7 @@ from torch import nn
 from typing_extensions import Self
 
 #: Backend request accepted by [`Model.set_backend`][].
-ModelBackend = Literal["auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"]
+ModelBackend = Literal["auto", "eager", "oops"]
 
 
 class Model(nn.Module):
@@ -34,13 +34,13 @@ class Model(nn.Module):
 
     def post_init(self, *, backend: ModelBackend = "auto") -> None:
         r"""
-        Initialize model parameters and select an operator backend.
+        Initialize model parameters and select a backend.
 
         Subclasses may override this hook when initialization requires additional
         model-wide work.
 
         Args:
-            backend: Operator backend selected after parameter initialization.
+            backend: Backend selected after parameter initialization.
         """
 
         self.initialize_parameters()
@@ -102,13 +102,13 @@ class Model(nn.Module):
             ValueError: If ``backend`` is not supported.
         """
 
-        if backend not in ("auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"):
-            raise ValueError("backend must be exactly one of: auto, torch, sdpa, oops, cueq, apex, deepspeed")
+        if backend not in ("auto", "eager", "oops"):
+            raise ValueError("backend must be exactly one of: auto, eager, oops")
         self._set_backend(backend)
         self.backend = backend
         return self
 
     def _set_backend(self, backend: ModelBackend) -> None:
         for module in self.modules():
-            if hasattr(module, "operator_backend"):
-                module.operator_backend = backend
+            if module is not self and hasattr(module, "backend"):
+                module.backend = backend

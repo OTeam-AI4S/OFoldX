@@ -11,7 +11,6 @@ from os import PathLike
 from pathlib import Path
 from typing import cast, get_args
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -49,6 +48,7 @@ from ...data.placement import instance_of as _placement_instance_of
 from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
+from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...processor import Processor
 from .config import ODesignProcessorConfig
@@ -1423,37 +1423,16 @@ def _normalize_msa(
                     f"but the entity has {len(entity)} components"
                 )
         return msa
-    path = Path(msa).expanduser()
     polymers = [
         (entity_id, entity) for entity_id, entity in system.entities.items() if isinstance(entity, PolymerSequence)
     ]
     if len(polymers) != 1:
         raise ValueError("a FASTA MSA path is unambiguous only for a single-polymer system; pass MSACollection")
-    from multimolecule.io import read_fasta_records
-
     entity_id, entity = polymers[0]
-    # A plain aligned FASTA uses row 0 as the ungapped query and carries no
-    # insertion state, so every row becomes a query-width one-letter symbol string and both pools'
-    # deletion counts stay zero. Column ``i`` binds to ``entity.components[i]`` positionally.
-    rows = tuple(_aligned_symbols(record.sequence) for record in read_fasta_records(path))
-    width = len(rows[0]) if rows else len(entity)
-    if width != len(entity):
+    value = read_msa(msa, entity_id=entity_id)
+    if len(value.unpaired_sequences[0]) != len(entity):
         raise ValueError("MSA query width disagrees with the ODesign entity length")
-    return MSA(
-        entity_id=entity_id,
-        unpaired_sequences=rows,
-        unpaired_deletion_counts=np.zeros((len(rows), width), dtype=np.uint32),
-        paired_sequences=(rows[0],),
-        paired_deletion_counts=np.zeros((1, width), dtype=np.uint32),
-    )
-
-
-def _aligned_symbols(sequence: str) -> str:
-    r"""
-    Project one aligned FASTA row to an uppercase one-letter symbol string (``.`` folds to ``-``).
-    """
-
-    return "".join("-" if symbol in "-." else symbol for symbol in sequence.upper())
+    return value
 
 
 def _atom_features(system: MolecularSystem, sites: tuple[AtomSite, ...], reference_mask: Tensor) -> Tensor:

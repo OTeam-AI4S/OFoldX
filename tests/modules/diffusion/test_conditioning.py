@@ -73,13 +73,13 @@ def test_condition_pair_applies_relative_position_and_transitions() -> None:
     torch.testing.assert_close(pair, torch.ones(2, 3, 3, 4))
 
 
-@pytest.mark.parametrize("backend", ("torch", "oops"))
+@pytest.mark.parametrize("backend", ("eager", "oops"))
 def test_pairwise_conditioning_propagates_backend(backend: str) -> None:
     conditioning = PairwiseConditioning(
         pair_size=4,
         relative_position_size=3,
         num_transitions=2,
-        operator_backend=backend,
+        backend=backend,
     )
 
-    assert {transition.operator_backend for transition in conditioning.transitions} == {backend}
+    assert {transition.backend for transition in conditioning.transitions} == {backend}

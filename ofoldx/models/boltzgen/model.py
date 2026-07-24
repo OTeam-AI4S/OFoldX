@@ -137,7 +137,7 @@ class BoltzGenModel(Model):
             num_molecule_types=input_embeddings_config.num_molecule_types,
             add_binding_specification=input_embeddings_config.add_binding_specification,
             add_ss_specification=input_embeddings_config.add_ss_specification,
-            operator_backend="auto",
+            backend="auto",
         )
 
         self.single_init_projection = nn.Linear(single_size, single_size, bias=False)
@@ -169,7 +169,7 @@ class BoltzGenModel(Model):
             max_dist=config.template.max_distance,
             triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
             num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-            operator_backend="auto",
+            backend="auto",
         )
         self.token_distance_embedder = (
             BoltzGenTokenDistanceEmbedder(
@@ -182,7 +182,7 @@ class BoltzGenModel(Model):
                 max_dist=config.template.max_distance,
                 triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
                 num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-                operator_backend="auto",
+                backend="auto",
             )
             if design.use_token_distance
             else None
@@ -204,7 +204,7 @@ class BoltzGenModel(Model):
                 msa_head_dim=trunk.msa_head_dim,
                 triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-                operator_backend="auto",
+                backend="auto",
             )
             if not trunk.msa_miniformer_blocks
             else BoltzGenMiniformerMsaTrunk(
@@ -220,28 +220,28 @@ class BoltzGenModel(Model):
                 pair_dropout=trunk.dropout,
                 num_msa_attention_heads=trunk.num_msa_attention_heads,
                 msa_head_dim=trunk.msa_head_dim,
-                operator_backend="auto",
+                backend="auto",
             )
         )
-        self.pairformer_stack = (
+        self.trunk_stack = (
             BoltzGenMiniformerStack(
-                num_blocks=trunk.num_pairformer_blocks,
+                num_blocks=trunk.num_trunk_blocks,
                 single_size=single_size,
                 pair_size=pair_size,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.dropout,
-                operator_backend="auto",
+                backend="auto",
             )
             if trunk.use_miniformer
             else PairformerStack(
-                num_blocks=trunk.num_pairformer_blocks,
+                num_blocks=trunk.num_trunk_blocks,
                 single_size=single_size,
                 pair_size=pair_size,
                 triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.dropout,
-                operator_backend="auto",
+                backend="auto",
             )
         )
         self.distogram_head = PairSymmetrizedDistogramHead(pair_size=pair_size, num_bins=config.num_distogram_bins)
@@ -275,7 +275,7 @@ class BoltzGenModel(Model):
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
-            operator_backend="auto",
+            backend="auto",
         )
         self.coordinate_diffusion = BoltzGenCoordinateDiffusion(
             denoiser,
@@ -331,14 +331,11 @@ class BoltzGenModel(Model):
             targets of shape ``(B, A, 3)``, and one ``noise_level`` per batch item.
         """
 
-        single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
-            input,
-            recycling_steps=recycling_steps,
-        )
+        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
         conditioning = self.denoiser_conditioning(
-            single,
-            pair,
-            relative_position_encoding,
+            trunk.single,
+            trunk.pair,
+            trunk.relative_position_encoding,
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
             atom_mask=input.atom_mask,
@@ -366,16 +363,16 @@ class BoltzGenModel(Model):
             sigmas,
             multiplicity=1,
             atom_mask=atom_mask,
-            single_inputs=single_inputs,
-            single_trunk=single,
+            single_inputs=trunk.single_inputs,
+            single_trunk=trunk.single,
             conditioning=conditioning,
             atom_to_token=input.atom_to_token,
             token_mask=input.token_mask,
         )
         return BoltzGenOutput(
             coordinates=denoised_coordinates,
-            distogram_logits=distogram_logits,
-            bfactor_logits=self.bfactor_head(single),
+            distogram_logits=trunk.distogram_logits,
+            bfactor_logits=self.bfactor_head(trunk.single),
             augmented_target_coordinates=augmented_target_coordinates,
             noise_level=sigmas,
         )
@@ -453,14 +450,11 @@ class BoltzGenModel(Model):
 
         """
 
-        single_inputs, single, pair, relative_position_encoding, distogram_logits = self._run_trunk(
-            input,
-            recycling_steps=recycling_steps,
-        )
+        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
         conditioning = self.denoiser_conditioning(
-            single,
-            pair,
-            relative_position_encoding,
+            trunk.single,
+            trunk.pair,
+            trunk.relative_position_encoding,
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
             atom_mask=input.atom_mask,
@@ -474,8 +468,8 @@ class BoltzGenModel(Model):
             generator=generator,
             step_scale=step_scale,
             noise_scale=noise_scale,
-            single_inputs=single_inputs,
-            single_trunk=single,
+            single_inputs=trunk.single_inputs,
+            single_trunk=trunk.single,
             conditioning=conditioning,
             atom_to_token=input.atom_to_token,
             token_mask=input.token_mask,
@@ -483,8 +477,8 @@ class BoltzGenModel(Model):
         batch_size = input.token_mask.shape[0]
         return BoltzGenOutput(
             coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
-            distogram_logits=distogram_logits,
-            bfactor_logits=self.bfactor_head(single).unsqueeze(1).expand(-1, num_samples, -1, -1),
+            distogram_logits=trunk.distogram_logits,
+            bfactor_logits=self.bfactor_head(trunk.single).unsqueeze(1).expand(-1, num_samples, -1, -1),
         )
 
     def _run_trunk(
@@ -492,7 +486,7 @@ class BoltzGenModel(Model):
         input: BoltzGenInput,
         *,
         recycling_steps: int | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> _BoltzGenTrunkOutput:
         r"""
         Run the structure trunk.
 
@@ -501,7 +495,7 @@ class BoltzGenModel(Model):
             recycling_steps: Optional number of recycling passes. Defaults to the config value.
 
         Returns:
-            ``(single_inputs, single, pair, relative_position_encoding, distogram_logits)``.
+            Trunk representations and distogram logits.
 
         """
 
@@ -573,14 +567,14 @@ class BoltzGenModel(Model):
                         msa_mask=input.msa_mask,
                         token_mask=token_mask,
                     )
-                single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+                single, pair = self.trunk_stack(single, pair, pair_mask=pair_mask)
 
-        return (
-            single_inputs,
-            single,
-            pair,
-            relative_position_encoding,
-            self.distogram_head(pair),
+        return _BoltzGenTrunkOutput(
+            single_inputs=single_inputs,
+            single=single,
+            pair=pair,
+            relative_position_encoding=relative_position_encoding,
+            distogram_logits=self.distogram_head(pair),
         )
 
 
@@ -615,7 +609,7 @@ class BoltzGenInverseFoldingModel(Model):
             msa_profile_size=config.input_embeddings.msa_profile_size,
             num_method_types=config.input_embeddings.num_method_types,
             num_molecule_types=config.input_embeddings.num_molecule_types,
-            operator_backend="auto",
+            backend="auto",
         )
         self.inverse_folding_encoder = BoltzGenInverseFoldingEncoder(
             single_size=config.single_size,
@@ -802,7 +796,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         add_ss_specification: bool = False,
         num_binding_types: int = 3,
         num_ss_types: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.atom_encoder = BoltzGenAtomEncoder(
@@ -813,7 +807,7 @@ class BoltzGenInputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
         )
         self.atom_pair_bias_projection = nn.Sequential(
-            LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+            LayerNorm(atom_pair_hidden_size, backend=backend),
             nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
         )
         self.atom_attention_encoder = BoltzGenAtomAttentionEncoder(
@@ -823,7 +817,7 @@ class BoltzGenInputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
         self.residue_type_projection = nn.Linear(vocab_size, single_size, bias=False)
@@ -922,11 +916,8 @@ class BoltzGenAtomEncoder(nn.Module):
         atom_feature_size: int = 388,
         atom_hidden_size: int = 128,
         atom_pair_hidden_size: int = 16,
-        single_size: int = 384,
-        pair_size: int = 128,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        structure_prediction: bool = False,
     ) -> None:
         super().__init__()
         self.num_query_atoms = num_query_atoms
@@ -935,16 +926,6 @@ class BoltzGenAtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.single_trunk_projection: nn.Sequential | None = None
-        self.pair_trunk_projection: nn.Sequential | None = None
-        if structure_prediction:
-            self.single_trunk_projection = nn.Sequential(
-                LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
-            )
-            self.pair_trunk_projection = nn.Sequential(
-                LayerNorm(pair_size),
-                nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
-            )
         self.left_atom_projection = nn.Sequential(
             nn.ReLU(),
             nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
@@ -968,10 +949,6 @@ class BoltzGenAtomEncoder(nn.Module):
         reference_positions: Tensor,
         atom_mask: Tensor,
         reference_space_id: Tensor,
-        *,
-        atom_to_token: Tensor | None = None,
-        single_trunk: Tensor | None = None,
-        pair_trunk: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         atom_query = self.atom_feature_projection(atom_features)
         atom_single = atom_query
@@ -1013,21 +990,118 @@ class BoltzGenAtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        pair_bias = None
-        single_trunk_projection = self.single_trunk_projection
-        if single_trunk_projection is not None:
-            token_index = cast(Tensor, atom_to_token)
-            single_proj = single_trunk_projection(cast(Tensor, single_trunk))
-            atom_single = atom_single + single_proj.gather(
-                1, token_index.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
-            )
-            pair_from_trunk = cast(nn.Sequential, self.pair_trunk_projection)(cast(Tensor, pair_trunk))
-            token_windows = pad_atoms(token_index)
-            query_token = token_windows.view(batch, num_windows, num_query_atoms)
-            key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
-            batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
-            pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
-            pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
+        single_windows = pad_atoms(atom_single)
+        atom_pair = encode_atom_pair(
+            self,
+            distance_vectors,
+            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
+            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
+            distance_term_mask=valid,
+            inverse_term_mask=valid,
+            valid_mask=valid,
+            pair_bias=None,
+            prefix_ndim=1,
+        )
+        return atom_query, atom_single, atom_pair
+
+
+class BoltzGenDenoiserAtomEncoder(nn.Module):
+    r"""
+    Build trunk-conditioned atom states and atom-pair biases for coordinate denoising.
+    """
+
+    def __init__(
+        self,
+        atom_feature_size: int = 388,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+    ) -> None:
+        super().__init__()
+        self.num_query_atoms = num_query_atoms
+        self.num_key_atoms = num_key_atoms
+        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.single_trunk_projection = nn.Sequential(
+            LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
+        )
+        self.pair_trunk_projection = nn.Sequential(
+            LayerNorm(pair_size),
+            nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
+        )
+        self.left_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.right_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.feed_forward = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+        *,
+        atom_to_token: Tensor,
+        single_trunk: Tensor,
+        pair_trunk: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = self.atom_feature_projection(atom_features)
+        atom_single = atom_query
+        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
+        batch, length = atom_single.shape[:2]
+        padding = (-length) % num_query_atoms
+        num_windows = (length + padding) // num_query_atoms
+        to_keys = partial(
+            gather_key_windows,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+
+        def pad_atoms(value: Tensor) -> Tensor:
+            if not padding:
+                return value
+            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
+
+        positions = pad_atoms(reference_positions)
+        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
+        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
+        distance_vectors = positions_keys - positions_queries
+        mask = pad_atoms(atom_mask).bool()
+        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
+        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
+        space_id = pad_atoms(reference_space_id)
+        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
+        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
+
+        single_proj = self.single_trunk_projection(single_trunk)
+        atom_single = atom_single + single_proj.gather(
+            1, atom_to_token.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
+        )
+        pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+        token_windows = pad_atoms(atom_to_token)
+        query_token = token_windows.view(batch, num_windows, num_query_atoms)
+        key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
+        batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
+        pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
+        pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
 
         single_windows = pad_atoms(atom_single)
         atom_pair = encode_atom_pair(
@@ -1057,7 +1131,7 @@ class BoltzGenAtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.atom_transformer = PackedAtomAttention(
@@ -1066,7 +1140,7 @@ class BoltzGenAtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -1106,7 +1180,7 @@ class BoltzGenDenoiserAtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
@@ -1116,7 +1190,7 @@ class BoltzGenDenoiserAtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -1166,7 +1240,7 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
@@ -1176,13 +1250,13 @@ class BoltzGenAtomAttentionDecoder(nn.Module):
                 num_attention_heads=num_atom_decoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
         self.position_update = nn.Sequential(
-            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+            LayerNorm(atom_hidden_size, backend=backend), nn.Linear(atom_hidden_size, 3, bias=False)
         )
 
     def forward(
@@ -1697,7 +1771,7 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         distance_gaussian_dim: int = 32,
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1705,8 +1779,8 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
-        self.hidden_norm = LayerNorm(token_distance_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
         self.distance_feature_projection = nn.Linear(num_bins + 4 * pair_size, token_distance_size, bias=False)
         self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
@@ -1716,7 +1790,7 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
                 triangle_multiplication_hidden_size=token_distance_size,
                 triangle_attention_hidden_size=triangle_attention_hidden_size,
                 num_triangle_attention_heads=num_triangle_attention_heads,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -1766,7 +1840,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         max_dist: float = 50.75,
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1774,15 +1848,15 @@ class BoltzGenTemplateEmbedder(nn.Module):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
-        self.hidden_norm = LayerNorm(template_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = FactorizedPairLinear(
             pair_size=num_bins + 5,
             token_size=vocab_size,
             output_size=template_size,
             bias=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_projection = nn.Linear(template_size, pair_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1791,7 +1865,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
                 triangle_multiplication_hidden_size=template_size,
                 triangle_attention_hidden_size=triangle_attention_hidden_size,
                 num_triangle_attention_heads=num_triangle_attention_heads,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -1881,7 +1955,7 @@ class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
         max_dist: float = 50.75,
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
@@ -1889,20 +1963,19 @@ class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
-        self.hidden_norm = LayerNorm(template_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = FactorizedPairLinear(
             pair_size=num_bins + 5,
             token_size=vocab_size,
             output_size=template_size,
             bias=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_projection = nn.Linear(template_size, pair_size, bias=False)
         self.blocks = nn.ModuleList(
-            BoltzGenMiniTrianglePairUpdateBlock(pair_size=template_size, operator_backend=operator_backend)
-            for _ in range(num_blocks)
+            BoltzGenMiniTrianglePairUpdateBlock(pair_size=template_size, backend=backend) for _ in range(num_blocks)
         )
 
 
@@ -1963,7 +2036,7 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
         num_msa_attention_heads: int = 8,
         msa_head_dim: int = 32,
         expansion: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1982,7 +2055,7 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
                     num_msa_attention_heads=num_msa_attention_heads,
                     msa_head_dim=msa_head_dim,
                     expansion=expansion,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -2030,7 +2103,7 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
         num_msa_attention_heads: int = 8,
         msa_head_dim: int = 32,
         expansion: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pair_weighted_averaging = MsaPairWeightedAveraging(
@@ -2038,21 +2111,21 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
             head_dim=msa_head_dim,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.msa_transition = Transition(msa_size, expansion=expansion, operator_backend=operator_backend)
+        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
             divide_before_projection=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = BoltzGenMiniTrianglePairUpdateBlock(
             pair_size=pair_size,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.msa_dropout = RowwiseDropout(msa_dropout)
 
@@ -2093,7 +2166,7 @@ class BoltzGenMiniformerStack(nn.Module):
         pair_size: int = 128,
         num_pair_attention_heads: int = 16,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -2104,7 +2177,7 @@ class BoltzGenMiniformerStack(nn.Module):
                     pair_size=pair_size,
                     num_pair_attention_heads=num_pair_attention_heads,
                     dropout=dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -2128,19 +2201,19 @@ class BoltzGenMiniformerBlock(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.pair_transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
         self.attention = PairBiasedSelfAttention(
             hidden_size=single_size,
             pair_size=pair_size,
             num_attention_heads=num_pair_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         if pair_mask is None:
@@ -2161,12 +2234,12 @@ class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
         pair_size: int = 128,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.pair_transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         if pair_mask is None:
@@ -2266,16 +2339,16 @@ class BoltzGenDenoiserConditioning(nn.Module):
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.atom_encoder = BoltzGenAtomEncoder(
+        self.atom_encoder = BoltzGenDenoiserAtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -2283,25 +2356,24 @@ class BoltzGenDenoiserConditioning(nn.Module):
             pair_size=pair_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            structure_prediction=True,
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(pair_size, operator_backend=operator_backend),
+                LayerNorm(pair_size, backend=backend),
                 nn.Linear(pair_size, num_token_transformer_heads, bias=False),
             )
             for _ in range(num_token_transformer_blocks)
@@ -2360,7 +2432,7 @@ class BoltzGenDenoiser(nn.Module):
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
@@ -2368,7 +2440,7 @@ class BoltzGenDenoiser(nn.Module):
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_attention_encoder = BoltzGenDenoiserAtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -2377,19 +2449,17 @@ class BoltzGenDenoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_to_token = nn.Sequential(
-            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
-        )
+        self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
             hidden_size=hidden,
             conditioning_size=hidden,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
+        self.token_norm = LayerNorm(hidden, backend=backend)
         self.atom_attention_decoder = BoltzGenAtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -2397,7 +2467,7 @@ class BoltzGenDenoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_decoder_blocks=num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=num_atom_decoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -2461,18 +2531,17 @@ class BoltzGenSingleConditioning(nn.Module):
         fourier_embedding_size: int = 256,
         num_transitions: int = 2,
         transition_expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(hidden, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(hidden, backend=backend)
         self.single_projection = nn.Linear(hidden, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, backend=backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=transition_expansion, operator_backend=operator_backend)
-            for _ in range(num_transitions)
+            Transition(hidden, expansion=transition_expansion, backend=backend) for _ in range(num_transitions)
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
@@ -3308,6 +3377,19 @@ class BoltzGenInverseFoldingInput:
     symmetric_group: Tensor | None = None
     # Molecular identities aligned to inverse-folding rows for result decoding.
     layout: BoltzGenInverseFoldingLayout | None = None
+
+
+@dataclass(eq=False)
+class _BoltzGenTrunkOutput:
+    r"""
+    Trunk representations consumed by the diffusion and confidence heads.
+    """
+
+    single_inputs: Tensor
+    single: Tensor
+    pair: Tensor
+    relative_position_encoding: Tensor
+    distogram_logits: Tensor
 
 
 @dataclass(eq=False)

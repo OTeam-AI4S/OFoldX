@@ -54,7 +54,7 @@ class TemplateEmbedder(nn.Module):
         num_triangle_attention_heads: Number of template triangle-attention heads.
         expansion: Transition expansion factor inside each triangle update block.
         dropout: Dropout probability inside each triangle update block.
-        operator_backend: Operator backend selector forwarded to the triangle update blocks.
+        backend: Backend selector forwarded to the triangle update blocks.
     """
 
     def __init__(
@@ -68,12 +68,12 @@ class TemplateEmbedder(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 2,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = FactorizedPairLinear(
             pair_size=num_distogram_bins + 5,
@@ -81,7 +81,7 @@ class TemplateEmbedder(nn.Module):
             output_size=hidden_size,
             pair_prefix_size=num_distogram_bins + 1,
             bias=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.blocks = nn.ModuleList(
             [
@@ -92,12 +92,12 @@ class TemplateEmbedder(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     expansion=expansion,
                     dropout=dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ]
         )
-        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(hidden_size, backend=backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 

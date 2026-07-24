@@ -673,8 +673,7 @@ def convert_trunk_key(
         index, _, remainder = key[len(prefix) :].partition(".")
         converter = convert_miniformer_layer if miniformer_pairformer else _convert_pairformer_layer
         return [
-            (f"pairformer_stack.blocks.{index}.{new_key}", new_value)
-            for new_key, new_value in converter(remainder, tensor)
+            (f"trunk_stack.blocks.{index}.{new_key}", new_value) for new_key, new_value in converter(remainder, tensor)
         ]
     if key.startswith("distogram_module."):
         new = convert_keys(key[len("distogram_module.") :], DISTOGRAM_RULES)
@@ -1044,7 +1043,7 @@ def boltzgen_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> BoltzGenCo
     )
     config.input_embeddings.add_ss_specification = "input_embedder.ss_specification_init.weight" in state
 
-    config.trunk.num_pairformer_blocks = pairformer_args["num_blocks"]
+    config.trunk.num_trunk_blocks = pairformer_args["num_blocks"]
     config.trunk.num_pair_attention_heads = pairformer_args["num_heads"]
     config.trunk.num_msa_blocks = msa_args["msa_blocks"]
     config.trunk.msa_size = msa_args["msa_s"]

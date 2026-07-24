@@ -9,7 +9,7 @@ from ofoldx.modules.attention import PairBiasedSelfAttention
 @pytest.fixture
 def attention() -> PairBiasedSelfAttention:
     torch.manual_seed(0)
-    return PairBiasedSelfAttention(hidden_size=8, pair_size=4, num_attention_heads=2, operator_backend="sdpa").eval()
+    return PairBiasedSelfAttention(hidden_size=8, pair_size=4, num_attention_heads=2, backend="sdpa").eval()
 
 
 def test_pair_bias_couples_query_row(attention: PairBiasedSelfAttention) -> None:

@@ -9,14 +9,13 @@ from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
 import torch
-from multimolecule.io import read_fasta_records
 from torch import Tensor
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
+from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...processor import Processor
 from .model import Boltz1Input, Boltz1Layout, Boltz1Pocket
@@ -664,7 +663,7 @@ def _augment_reference_positions(
 
     if not len(space_ids):
         return
-    for space_id in range(int(space_ids.max().item())):
+    for space_id in range(int(space_ids.max().item()) + 1):
         included = space_ids == space_id
         mask = resolved[included]
         if not bool(mask.any()):
@@ -797,7 +796,6 @@ def _normalize_msa(
     if isinstance(msa, MSA | MSACollection):
         resolve_msa_bindings(msa, system)
         return msa
-    path = Path(msa).expanduser()
     proteins = [
         entity_id
         for entity_id, entity in system.entities.items()
@@ -805,22 +803,4 @@ def _normalize_msa(
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA is unambiguous only for one protein entity; pass MSACollection")
-    records = read_fasta_records(path)
-    if not records:
-        raise ValueError("MSA FASTA contains no rows")
-    # Project each row to the query axis (drop query-gap columns, fold ``.`` into ``-``) with all-zero
-    # deletion counts; row 0 is the ungapped query.
-    query = records[0].sequence.upper()
-    keep = [index for index, symbol in enumerate(query) if symbol not in "-."]
-    width = len(keep)
-    projected: list[str] = []
-    for record in records:
-        sequence = record.sequence.upper()
-        projected.append("".join("-" if sequence[index] in "-." else sequence[index] for index in keep))
-    return MSA(
-        entity_id=proteins[0],
-        unpaired_sequences=tuple(projected),
-        unpaired_deletion_counts=np.zeros((len(projected), width), dtype=np.uint32),
-        paired_sequences=(projected[0],),
-        paired_deletion_counts=np.zeros((1, width), dtype=np.uint32),
-    )
+    return read_msa(msa, entity_id=proteins[0])

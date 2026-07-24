@@ -18,7 +18,7 @@ class TestFactorizedPairLinear:
             output_size=7,
             pair_prefix_size=pair_prefix_size,
             bias=False,
-            operator_backend="eager",
+            backend="eager",
         ).double()
 
         prefix = pair[..., :pair_prefix_size]

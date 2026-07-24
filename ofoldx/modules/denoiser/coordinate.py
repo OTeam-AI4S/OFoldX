@@ -46,7 +46,7 @@ class CoordinateDenoiser(nn.Module):
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_query_atoms: Query window size for local atom attention.
         num_key_atoms: Key window size for local atom attention.
-        operator_backend: Backend selector passed to the attention/transition operators.
+        backend: Backend selector passed to the attention/transition operators.
     """
 
     def __init__(
@@ -68,7 +68,7 @@ class CoordinateDenoiser(nn.Module):
         num_atom_decoder_attention_heads: int = 4,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
@@ -78,7 +78,7 @@ class CoordinateDenoiser(nn.Module):
             single_conditioning_size=single_size + token_feature_size,
             single_size=single_size,
             sigma_data=sigma_data,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_encoder = NormalizedKeyCoordinateAtomToTokenEncoder(
             token_hidden_size=token_hidden_size,
@@ -91,7 +91,7 @@ class CoordinateDenoiser(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.token_refiner = DenoisingTokenRefiner(
             num_blocks=num_encoder_blocks,
@@ -99,7 +99,7 @@ class CoordinateDenoiser(nn.Module):
             token_hidden_size=token_hidden_size,
             single_size=single_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_decoder = NormalizedKeyTokenToAtomDecoder(
             token_hidden_size=token_hidden_size,
@@ -109,7 +109,7 @@ class CoordinateDenoiser(nn.Module):
             num_attention_heads=num_atom_decoder_attention_heads,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def build_local_geometry(
@@ -234,7 +234,7 @@ class DenoisingConditioner(nn.Module):
         single_size: Width of the conditioned single representation.
         noise_embedding_size: Width of the Fourier noise embedding.
         sigma_data: EDM data-scale hyperparameter used to normalise the log-noise.
-        operator_backend: Public backend request forwarded to the pair and single transitions.
+        backend: Public backend request forwarded to the pair and single transitions.
     """
 
     def __init__(
@@ -246,27 +246,21 @@ class DenoisingConditioner(nn.Module):
         single_size: int = 384,
         noise_embedding_size: int = 256,
         sigma_data: float = 16.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.sigma_data = sigma_data
         self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
-        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, operator_backend=operator_backend)
+        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, backend=backend)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
-        self.pair_transitions = nn.ModuleList(
-            Transition(pair_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
-        )
+        self.pair_transitions = nn.ModuleList(Transition(pair_size, expansion=2, backend=backend) for _ in range(2))
 
-        self.single_conditioning_norm = LayerNorm(
-            single_conditioning_size, bias=False, operator_backend=operator_backend
-        )
+        self.single_conditioning_norm = LayerNorm(single_conditioning_size, bias=False, backend=backend)
         self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
         self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
-        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, operator_backend=operator_backend)
+        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, backend=backend)
         self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
-        self.single_transitions = nn.ModuleList(
-            Transition(single_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
-        )
+        self.single_transitions = nn.ModuleList(Transition(single_size, expansion=2, backend=backend) for _ in range(2))
 
     def forward(
         self,
@@ -327,7 +321,7 @@ class DenoisingTokenRefiner(nn.Module):
         single_size: Width of the single conditioning representation.
         pair_size: Width of the pair conditioning representation.
         num_attention_heads: Number of attention heads per token-encoder block.
-        operator_backend: Backend selector passed to the attention operators.
+        backend: Backend selector passed to the attention operators.
     """
 
     def __init__(
@@ -337,10 +331,10 @@ class DenoisingTokenRefiner(nn.Module):
         single_size: int = 384,
         pair_size: int = 128,
         num_attention_heads: int = 16,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.single_norm = LayerNorm(single_size, bias=False, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(single_size, bias=False, backend=backend)
         self.single_to_token_projection = nn.Linear(single_size, token_hidden_size, bias=False)
         self.token_encoder = DenoisingTokenEncoder(
             num_blocks=num_blocks,
@@ -348,9 +342,9 @@ class DenoisingTokenRefiner(nn.Module):
             token_hidden_size=token_hidden_size,
             conditioning_size=single_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.token_norm = LayerNorm(token_hidden_size, bias=False, operator_backend=operator_backend)
+        self.token_norm = LayerNorm(token_hidden_size, bias=False, backend=backend)
 
     def forward(
         self,

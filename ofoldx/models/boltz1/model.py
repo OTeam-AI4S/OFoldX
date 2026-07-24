@@ -77,7 +77,7 @@ class Boltz1Model(Model):
             num_atom_encoder_blocks=input_embeddings_config.num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=input_embeddings_config.num_atom_encoder_attention_heads,
             use_atom_encoder=input_embeddings_config.use_atom_encoder,
-            operator_backend="auto",
+            backend="auto",
         )
 
         self.single_init_projection = nn.Linear(input_size, single_size, bias=False)
@@ -110,7 +110,7 @@ class Boltz1Model(Model):
                 msa_head_dim=trunk.msa_head_dim,
                 triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-                operator_backend="auto",
+                backend="auto",
             )
         self.pairformer_stack = PairformerStack(
             num_blocks=trunk.num_pairformer_blocks,
@@ -120,7 +120,7 @@ class Boltz1Model(Model):
             num_triangle_attention_heads=trunk.num_triangle_attention_heads,
             num_pair_attention_heads=trunk.num_pair_attention_heads,
             dropout=trunk.dropout,
-            operator_backend="auto",
+            backend="auto",
         )
         self.distogram_head = PairSymmetrizedDistogramHead(
             pair_size=pair_size,
@@ -157,7 +157,7 @@ class Boltz1Model(Model):
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
-            operator_backend="auto",
+            backend="auto",
         )
         sampler = config.sampler
         self.coordinate_diffusion = Boltz1CoordinateDiffusion(
@@ -221,7 +221,7 @@ class Boltz1Model(Model):
                 triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
                 relative_position_size=config.relative_position_size,
-                operator_backend="auto",
+                backend="auto",
             )
         self.post_init()
 
@@ -441,7 +441,7 @@ class Boltz1Model(Model):
             confidence_scores=confidence_scores,
         )
 
-    def _trunk(self, input: Boltz1Input, *, recycling_steps: int | None = None) -> _Boltz1TrunkState:
+    def _trunk(self, input: Boltz1Input, *, recycling_steps: int | None = None) -> _Boltz1TrunkOutput:
         r"""
         Iterate the recycling loop: recycle-project the running single/pair, fold in the MSA module (when
         present), and run the Pairformer for ``recycling_steps`` total passes.
@@ -451,7 +451,7 @@ class Boltz1Model(Model):
             recycling_steps: Total number of trunk passes; defaults to the configured value.
 
         Returns:
-            The final trunk [`_Boltz1TrunkState`][ofoldx.models.boltz1.model._Boltz1TrunkState].
+            The final trunk [`_Boltz1TrunkOutput`][ofoldx.models.boltz1.model._Boltz1TrunkOutput].
 
         """
 
@@ -483,7 +483,7 @@ class Boltz1Model(Model):
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
-        return _Boltz1TrunkState(
+        return _Boltz1TrunkOutput(
             single_inputs=single_inputs,
             single=cast(Tensor, single),
             pair=pair,
@@ -538,7 +538,7 @@ class Boltz1Model(Model):
 
     def _sample_diffusion(
         self,
-        representations: _Boltz1TrunkState,
+        representations: _Boltz1TrunkOutput,
         input: Boltz1Input,
         *,
         num_sampling_steps: int | None,
@@ -594,7 +594,7 @@ class Boltz1Model(Model):
             return cast(tuple[Tensor, Tensor], sample)
         return cast(Tensor, sample), None
 
-    def _denoiser_conditioning(self, representations: _Boltz1TrunkState, input: Boltz1Input) -> dict[str, Tensor]:
+    def _denoiser_conditioning(self, representations: _Boltz1TrunkOutput, input: Boltz1Input) -> dict[str, Tensor]:
         r"""
         Precompute the per-structure diffusion conditioning reused by every denoiser call.
 
@@ -640,7 +640,7 @@ class Boltz1InputEmbeddings(nn.Module):
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
         use_atom_encoder: bool = True,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.input_size = input_size
@@ -668,7 +668,7 @@ class Boltz1InputEmbeddings(nn.Module):
                 num_key_atoms=num_key_atoms,
                 num_atom_encoder_blocks=num_atom_encoder_blocks,
                 num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-                operator_backend=operator_backend,
+                backend=backend,
             )
 
     def forward(
@@ -735,11 +735,8 @@ class Boltz1AtomEncoder(nn.Module):
         atom_feature_size: int = 388,
         atom_hidden_size: int = 128,
         atom_pair_hidden_size: int = 16,
-        single_size: int = 384,
-        pair_size: int = 128,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        structure_prediction: bool = False,
     ) -> None:
         super().__init__()
         self.num_query_atoms = num_query_atoms
@@ -748,16 +745,6 @@ class Boltz1AtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.single_trunk_projection: nn.Sequential | None = None
-        self.pair_trunk_projection: nn.Sequential | None = None
-        if structure_prediction:
-            self.single_trunk_projection = nn.Sequential(
-                LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
-            )
-            self.pair_trunk_projection = nn.Sequential(
-                LayerNorm(pair_size),
-                nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
-            )
         self.left_atom_projection = nn.Sequential(
             nn.ReLU(),
             nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
@@ -781,10 +768,6 @@ class Boltz1AtomEncoder(nn.Module):
         reference_positions: Tensor,
         atom_mask: Tensor,
         reference_space_id: Tensor,
-        *,
-        atom_to_token: Tensor | None = None,
-        single_trunk: Tensor | None = None,
-        pair_trunk: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         atom_query = self.atom_feature_projection(atom_features)
         atom_single = atom_query
@@ -827,21 +810,118 @@ class Boltz1AtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        pair_bias = None
-        single_trunk_projection = self.single_trunk_projection
-        if single_trunk_projection is not None:
-            token_index = cast(Tensor, atom_to_token)
-            single_proj = single_trunk_projection(cast(Tensor, single_trunk))
-            atom_single = atom_single + single_proj.gather(
-                1, token_index.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
-            )
-            pair_from_trunk = cast(nn.Sequential, self.pair_trunk_projection)(cast(Tensor, pair_trunk))
-            token_windows = pad_atoms(token_index)
-            query_token = token_windows.view(batch, num_windows, num_query_atoms)
-            key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
-            batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
-            pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
-            pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
+        single_windows = pad_atoms(atom_single)
+        atom_pair = encode_atom_pair(
+            self,
+            distance_vectors,
+            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
+            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
+            distance_term_mask=valid,
+            inverse_term_mask=valid,
+            valid_mask=valid,
+            pair_bias=None,
+            prefix_ndim=1,
+        )
+        return atom_query, atom_single, atom_pair
+
+
+class Boltz1DenoiserAtomEncoder(nn.Module):
+    r"""
+    Build trunk-conditioned atom states and atom-pair biases for coordinate denoising.
+    """
+
+    def __init__(
+        self,
+        atom_feature_size: int = 388,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+    ) -> None:
+        super().__init__()
+        self.num_query_atoms = num_query_atoms
+        self.num_key_atoms = num_key_atoms
+        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size, bias=False)
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.single_trunk_projection = nn.Sequential(
+            LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
+        )
+        self.pair_trunk_projection = nn.Sequential(
+            LayerNorm(pair_size),
+            nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
+        )
+        self.left_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.right_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.feed_forward = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+        *,
+        atom_to_token: Tensor,
+        single_trunk: Tensor,
+        pair_trunk: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = self.atom_feature_projection(atom_features)
+        atom_single = atom_query
+        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
+        batch, length = atom_single.shape[:2]
+        padding = (-length) % num_query_atoms
+        num_windows = (length + padding) // num_query_atoms
+        to_keys = partial(
+            gather_key_windows,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+
+        def pad_atoms(value: Tensor) -> Tensor:
+            if not padding:
+                return value
+            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
+
+        positions = pad_atoms(reference_positions)
+        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
+        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
+        distance_vectors = positions_keys - positions_queries
+        mask = pad_atoms(atom_mask).bool()
+        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
+        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
+        space_id = pad_atoms(reference_space_id)
+        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
+        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
+
+        single_proj = self.single_trunk_projection(single_trunk)
+        atom_single = atom_single + single_proj.gather(
+            1, atom_to_token.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
+        )
+        pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+        token_windows = pad_atoms(atom_to_token)
+        query_token = token_windows.view(batch, num_windows, num_query_atoms)
+        key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
+        batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
+        pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
+        pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
 
         single_windows = pad_atoms(atom_single)
         atom_pair = encode_atom_pair(
@@ -871,7 +951,7 @@ class Boltz1AtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.atom_transformer = PackedAtomAttention(
@@ -880,7 +960,7 @@ class Boltz1AtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -920,7 +1000,7 @@ class Boltz1DenoiserAtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
@@ -930,7 +1010,7 @@ class Boltz1DenoiserAtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -980,7 +1060,7 @@ class Boltz1AtomAttentionDecoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
@@ -990,13 +1070,13 @@ class Boltz1AtomAttentionDecoder(nn.Module):
                 num_attention_heads=num_atom_decoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
         self.position_update = nn.Sequential(
-            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+            LayerNorm(atom_hidden_size, backend=backend), nn.Linear(atom_hidden_size, 3, bias=False)
         )
 
     def forward(
@@ -1044,16 +1124,16 @@ class Boltz1DenoiserConditioning(nn.Module):
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.atom_encoder = Boltz1AtomEncoder(
+        self.atom_encoder = Boltz1DenoiserAtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -1061,25 +1141,24 @@ class Boltz1DenoiserConditioning(nn.Module):
             pair_size=pair_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            structure_prediction=True,
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(pair_size, operator_backend=operator_backend),
+                LayerNorm(pair_size, backend=backend),
                 nn.Linear(pair_size, num_token_transformer_heads, bias=False),
             )
             for _ in range(num_token_transformer_blocks)
@@ -1156,7 +1235,7 @@ class Boltz1Denoiser(nn.Module):
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
@@ -1165,7 +1244,7 @@ class Boltz1Denoiser(nn.Module):
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_conditioning_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_attention_encoder = Boltz1DenoiserAtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -1174,19 +1253,17 @@ class Boltz1Denoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_to_token = nn.Sequential(
-            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
-        )
+        self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
             hidden_size=hidden,
             conditioning_size=hidden,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
+        self.token_norm = LayerNorm(hidden, backend=backend)
         self.atom_attention_decoder = Boltz1AtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -1194,7 +1271,7 @@ class Boltz1Denoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_decoder_blocks=num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=num_atom_decoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -1261,17 +1338,17 @@ class Boltz1SingleConditioning(nn.Module):
         fourier_embedding_size: int = 256,
         num_conditioning_transitions: int = 2,
         transition_expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(single_size + input_size, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(single_size + input_size, backend=backend)
         self.single_projection = nn.Linear(single_size + input_size, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, backend=backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=transition_expansion, operator_backend=operator_backend)
+            Transition(hidden, expansion=transition_expansion, backend=backend)
             for _ in range(num_conditioning_transitions)
         )
 
@@ -1719,7 +1796,7 @@ class Boltz1ConfidenceHead(nn.Module):
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
         relative_position_size: int = 139,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.input_size = input_size
@@ -1754,7 +1831,7 @@ class Boltz1ConfidenceHead(nn.Module):
         self.input_single_projection: nn.Linear | None = None
 
         if use_single_diffusion:
-            self.diffusion_single_norm = LayerNorm(2 * single_size, operator_backend=operator_backend)
+            self.diffusion_single_norm = LayerNorm(2 * single_size, backend=backend)
             self.diffusion_single_projection = nn.Linear(2 * single_size, single_size, bias=False)
 
         self.single_to_pair_row = nn.Linear(input_size, pair_size, bias=False)
@@ -1779,12 +1856,12 @@ class Boltz1ConfidenceHead(nn.Module):
                 num_atom_encoder_blocks=num_atom_encoder_blocks,
                 num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
                 use_atom_encoder=use_atom_encoder,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
             self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
-            self.single_recycle_norm = LayerNorm(single_size, operator_backend=operator_backend)
-            self.pair_recycle_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+            self.single_recycle_norm = LayerNorm(single_size, backend=backend)
+            self.pair_recycle_norm = LayerNorm(pair_size, backend=backend)
             self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
             self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
             nn.init.zeros_(self.single_recycle_projection.weight)
@@ -1805,7 +1882,7 @@ class Boltz1ConfidenceHead(nn.Module):
                     msa_head_dim=msa_head_dim,
                     triangle_attention_hidden_size=triangle_attention_hidden_size,
                     num_triangle_attention_heads=num_triangle_attention_heads,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
             self.pairformer_stack = PairformerStack(
                 num_blocks=num_blocks,
@@ -1815,14 +1892,14 @@ class Boltz1ConfidenceHead(nn.Module):
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 num_pair_attention_heads=num_pair_attention_heads,
                 dropout=pair_dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
-            self.final_single_norm = LayerNorm(single_size, operator_backend=operator_backend)
-            self.final_pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+            self.final_single_norm = LayerNorm(single_size, backend=backend)
+            self.final_pair_norm = LayerNorm(pair_size, backend=backend)
         else:
-            self.input_single_norm = LayerNorm(input_size, operator_backend=operator_backend)
-            self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
-            self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+            self.input_single_norm = LayerNorm(input_size, backend=backend)
+            self.single_norm = LayerNorm(single_size, backend=backend)
+            self.pair_norm = LayerNorm(pair_size, backend=backend)
             if add_single_input_to_single:
                 self.input_single_projection = nn.Linear(input_size, single_size, bias=False)
             if add_pair_input_to_pair:
@@ -1836,7 +1913,7 @@ class Boltz1ConfidenceHead(nn.Module):
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 num_pair_attention_heads=num_pair_attention_heads,
                 dropout=pair_dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
 
         self.output_head = Boltz1ConfidenceOutputHead(
@@ -3312,7 +3389,7 @@ class Boltz1Input:
 
 
 @dataclass(kw_only=True)
-class _Boltz1TrunkState:
+class _Boltz1TrunkOutput:
     r"""
     Boltz-1 trunk representations returned by the recycling trunk.
     """

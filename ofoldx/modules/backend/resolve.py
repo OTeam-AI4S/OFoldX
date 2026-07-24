@@ -1,5 +1,5 @@
 r"""
-Operator-backend selection and validation.
+Backend selection and validation.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from torch import Tensor
 
 from ._oops import OOPS_AVAILABLE
 
-PUBLIC_OPERATOR_BACKENDS = frozenset({"auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"})
+PUBLIC_BACKENDS = frozenset({"auto", "eager", "sdpa", "oops", "cueq", "apex", "deepspeed"})
 
 
 def oops_available() -> bool:
@@ -26,15 +26,16 @@ def oops_available() -> bool:
     return OOPS_AVAILABLE
 
 
-def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
+def resolve_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
     r"""
     Resolve a backend request without tensor-specific constraints.
 
-    ``"auto"`` becomes ``"oops"`` when OOps is available and supported, otherwise ``public_default``.
-    ``"torch"`` becomes ``public_default``. Concrete implementation names are validated and returned unchanged.
+    ``"auto"`` becomes ``"oops"`` when OOps is available and supported, otherwise
+    ``public_default``. Explicit implementation names are validated and returned
+    unchanged.
 
     Args:
-        requested: The requested public backend or a concrete implementation name.
+        requested: The requested backend.
         supported: The backends this particular operator implements, in preference order.
         public_default: The operator's default PyTorch implementation.
 
@@ -42,42 +43,40 @@ def resolve_operator_backend(requested: str, *, supported: tuple[str, ...], publ
         A concrete backend name drawn from ``supported`` (or ``public_default``).
 
     Raises:
-        ValueError: If the request is neither a public provider nor a supported concrete implementation.
+        ValueError: If the requested backend is not supported.
     """
 
     if requested == "auto":
         return "oops" if "oops" in supported and oops_available() else public_default
-    if requested == "torch":
-        return public_default
-    if requested in PUBLIC_OPERATOR_BACKENDS and requested not in supported:
+    if requested in PUBLIC_BACKENDS and requested not in supported:
         return public_default
     if requested not in supported:
-        options = ", ".join(sorted({*PUBLIC_OPERATOR_BACKENDS, *supported}))
-        raise ValueError(f"unsupported operator_backend {requested!r}; expected one of: {options}")
+        options = ", ".join(sorted({*PUBLIC_BACKENDS, *supported}))
+        raise ValueError(f"unsupported backend {requested!r}; expected one of: {options}")
     return requested
 
 
-def resolve_config_operator_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
+def resolve_config_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
     r"""
     Validate a stored backend setting while preserving public backend requests.
 
     Runtime dispatchers resolve every public provider for the concrete operator when it executes.
 
     Args:
-        requested: The requested public backend or a concrete implementation name.
+        requested: The requested backend.
         supported: The backends this particular operator implements, in preference order.
         public_default: The operator's default PyTorch implementation.
 
     Returns:
-        A preserved public request or a validated concrete implementation name.
+        A preserved automatic request or a validated concrete implementation name.
     """
 
-    if requested in PUBLIC_OPERATOR_BACKENDS:
+    if requested in PUBLIC_BACKENDS:
         return requested
-    return resolve_operator_backend(requested, supported=supported, public_default=public_default)
+    return resolve_backend(requested, supported=supported, public_default=public_default)
 
 
-def resolve_tensor_operator_backend(
+def resolve_tensor_backend(
     requested: str,
     *,
     tensors: Iterable[Tensor | None],
@@ -88,12 +87,12 @@ def resolve_tensor_operator_backend(
     Resolve a backend for concrete tensors.
 
     ``"auto"`` selects OOps only when it is available, supported, and every provided
-    tensor is on CUDA. It otherwise selects the default PyTorch implementation.
-    ``"torch"`` always selects that PyTorch implementation. ``None`` values are ignored
-    and at least one tensor is required for automatic OOps selection.
+    tensor is on CUDA. It otherwise selects the eager implementation. ``None``
+    values are ignored and at least one tensor is required for automatic OOps
+    selection.
 
     Args:
-        requested: The requested public backend or a concrete implementation name.
+        requested: The requested backend.
         tensors: Tensors considered by ``"auto"`` backend selection. ``None`` values are ignored so
             optional masks can be passed directly.
         supported: The backends this particular operator implements, in preference order.
@@ -116,4 +115,4 @@ def resolve_tensor_operator_backend(
                 if has_tensor:
                     return "oops"
         return public_default
-    return resolve_operator_backend(requested, supported=supported, public_default=public_default)
+    return resolve_backend(requested, supported=supported, public_default=public_default)

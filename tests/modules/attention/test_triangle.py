@@ -9,7 +9,7 @@ def test_triangle_bias_couples_rows() -> None:
     # Regression: the shared bias b_{jk}=Linear(z_{jk}) must couple untouched rows at query column
     # == the perturbed row; the earlier row-tied bias [row, key] left other rows invariant.
     torch.manual_seed(0)
-    module = TriangleAttention(pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="sdpa").eval()
+    module = TriangleAttention(pair_size=8, head_dim=4, num_attention_heads=2, backend="sdpa").eval()
     pair = torch.randn(1, 5, 5, 8)
 
     with torch.no_grad():
@@ -24,10 +24,10 @@ def test_triangle_bias_couples_rows() -> None:
 
 
 def test_triangle_backend_propagates_to_layer_norms() -> None:
-    attention = TriangleAttention(pair_size=8, head_dim=4, num_attention_heads=2, operator_backend="apex")
-    multiplication = TriangleMultiplication(pair_size=8, hidden_size=8, outgoing=True, operator_backend="deepspeed")
+    attention = TriangleAttention(pair_size=8, head_dim=4, num_attention_heads=2, backend="apex")
+    multiplication = TriangleMultiplication(pair_size=8, hidden_size=8, outgoing=True, backend="deepspeed")
 
-    assert attention.pair_norm.operator_backend == "apex"
-    assert attention.attention.operator_backend == "apex"
-    assert multiplication.input_norm.operator_backend == "deepspeed"
-    assert multiplication.output_norm.operator_backend == "deepspeed"
+    assert attention.pair_norm.backend == "apex"
+    assert attention.attention.backend == "apex"
+    assert multiplication.input_norm.backend == "deepspeed"
+    assert multiplication.output_norm.backend == "deepspeed"

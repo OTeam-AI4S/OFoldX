@@ -24,7 +24,7 @@ class ConditionedTransformer(nn.Module):
         num_attention_heads: int,
         hidden_size: int = 384,
         conditioning_size: int | None = None,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
@@ -34,7 +34,7 @@ class ConditionedTransformer(nn.Module):
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
-                operator_backend,
+                backend,
             )
             for _ in range(num_blocks)
         )
@@ -61,7 +61,7 @@ class DenoisingTransformer(nn.Module):
         num_attention_heads: int,
         hidden_size: int = 384,
         conditioning_size: int | None = None,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
@@ -71,7 +71,7 @@ class DenoisingTransformer(nn.Module):
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
-                operator_backend,
+                backend,
             )
             for _ in range(num_blocks)
         )
@@ -98,7 +98,7 @@ class AtomCrossAttentionTransformer(nn.Module):
         num_attention_heads: int,
         hidden_size: int,
         conditioning_size: int,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -107,7 +107,7 @@ class AtomCrossAttentionTransformer(nn.Module):
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
-                operator_backend,
+                backend,
             )
             for _ in range(num_blocks)
         )
@@ -134,7 +134,7 @@ class NormalizedKeyAtomCrossAttentionTransformer(nn.Module):
         num_attention_heads: int,
         hidden_size: int,
         conditioning_size: int,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -143,7 +143,7 @@ class NormalizedKeyAtomCrossAttentionTransformer(nn.Module):
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
-                operator_backend,
+                backend,
             )
             for _ in range(num_blocks)
         )
@@ -169,22 +169,22 @@ class ConditionedTransformerBlock(nn.Module):
         hidden_size: int,
         conditioning_size: int,
         num_attention_heads: int,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, operator_backend=operator_backend)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
             query_bias=True,
             gating=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
         self.transition = TripleProductConditionedTransition(
             hidden_size,
             conditioning_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -221,23 +221,23 @@ class DenoisingTransformerBlock(nn.Module):
         hidden_size: int,
         conditioning_size: int,
         num_attention_heads: int,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, operator_backend=operator_backend)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
             query_bias=True,
             gating=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
         self.transition = ConditionedTransition(
             hidden_size,
             conditioning_size,
             expansion=2,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -274,10 +274,10 @@ class AtomCrossAttentionTransformerBlock(DenoisingTransformerBlock):
         hidden_size: int,
         conditioning_size: int,
         num_attention_heads: int,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
-        super().__init__(hidden_size, conditioning_size, num_attention_heads, operator_backend)
-        self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, operator_backend=operator_backend)
+        super().__init__(hidden_size, conditioning_size, num_attention_heads, backend)
+        self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
 
     def forward(
         self,
@@ -342,11 +342,11 @@ class TripleProductConditionedTransition(nn.Module):
         hidden_size: int,
         conditioning_size: int,
         expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         inner_size = hidden_size * expansion
-        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, operator_backend=operator_backend)
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
         self.gate_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.expand_projection = nn.Linear(hidden_size, inner_size, bias=False)

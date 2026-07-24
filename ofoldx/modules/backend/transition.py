@@ -9,7 +9,7 @@ from torch import Tensor
 
 from ._oops import oops_kernel
 from .normalization import layer_norm
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_transition = oops_kernel("transition")
 
@@ -25,7 +25,7 @@ def transition(
     up_weight: Tensor,
     down_weight: Tensor,
     eps: float,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Apply the SwiGLU transition ``down(silu(gate(norm(x))) * up(norm(x)))`` on the selected backend.
@@ -42,14 +42,14 @@ def transition(
         up_weight: ``[intermediate_size, hidden_size]`` bias-free up projection weight.
         down_weight: ``[hidden_size, intermediate_size]`` bias-free down projection weight.
         eps: LayerNorm epsilon.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., hidden_size]`` transformed activations.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(hidden,),
         supported=_SUPPORTED,
         public_default="eager",
@@ -64,5 +64,5 @@ def transition(
             down_weight=down_weight,
             eps=eps,
         )
-    normed = layer_norm(hidden, (hidden.shape[-1],), norm_weight, norm_bias, eps, operator_backend=backend)
+    normed = layer_norm(hidden, (hidden.shape[-1],), norm_weight, norm_bias, eps, backend=backend)
     return F.linear(F.silu(F.linear(normed, gate_weight)) * F.linear(normed, up_weight), down_weight)

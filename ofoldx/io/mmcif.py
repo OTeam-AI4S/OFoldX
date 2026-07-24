@@ -189,7 +189,7 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     if set(container) != {"metadata", "arrays"}:
         raise ValueError("canonical mmCIF payload must contain metadata and arrays")
     payload = _expect_object(container["metadata"], "canonical mmCIF metadata")
-    array_values = _expect_object(container["arrays"], "canonical mmCIF arrays")
+    _expect_object(container["arrays"], "canonical mmCIF arrays")
     rows = tuple(sorted(parsed.rows, key=lambda row: row.row_index))
     coordinates_key = payload.get("coordinates")
     coordinate_mask_key = payload.get("coordinate_mask")
@@ -205,19 +205,16 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     occupancy_dtype_value = payload.get("occupancy_dtype")
     occupancy_dtype = None if occupancy_dtype_value is None else np.dtype(occupancy_dtype_value)
     arrays: dict[str, np.ndarray] = {
-        coordinates_key: np.asarray(array_values[coordinates_key], dtype=coordinate_dtype),
-        coordinate_mask_key: np.asarray(array_values[coordinate_mask_key], dtype=np.bool_),
+        coordinates_key: np.asarray([row.coordinates for row in rows], dtype=coordinate_dtype),
+        coordinate_mask_key: np.asarray([row.coordinate_present for row in rows], dtype=np.bool_),
     }
     if occupancy_key is not None:
         if not isinstance(occupancy_key, str) or not occupancy_key:
             raise ValueError("canonical mmCIF payload has invalid occupancy array reference")
         if occupancy_dtype is None:
             raise ValueError("canonical mmCIF occupancy dtype is missing")
-        occupancy_values = array_values[occupancy_key]
-        if not isinstance(occupancy_values, list):
-            raise ValueError("canonical mmCIF occupancy array must be a list")
         arrays[occupancy_key] = np.asarray(
-            [np.nan if value is None else value for value in occupancy_values],
+            [np.nan if row.occupancy is None else row.occupancy for row in rows],
             dtype=occupancy_dtype,
         )
     # Structure has no per-site B-factor field, so canonical payloads do not retain it.
@@ -667,8 +664,11 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             residue_number.insertion_code if residue_number is not None and residue_number.insertion_code else "?"
         )
         coordinate = structure.coordinates[index]
-        if not np.all(np.isfinite(coordinate)):
+        coordinate_present = bool(structure.coordinate_mask[index])
+        if coordinate_present and not np.all(np.isfinite(coordinate)):
             raise ValueError("mmCIF cannot represent non-finite coordinates")
+        if not coordinate_present and not np.all(np.isfinite(coordinate)):
+            coordinate = np.zeros(3, dtype=structure.coordinates.dtype)
         occupancy = (
             "."
             if structure.occupancy is None or np.isnan(structure.occupancy[index])
@@ -726,19 +726,7 @@ def write_mmcif(structure: Structure, path: Path) -> None:
                     json.dumps(
                         {
                             "metadata": payload,
-                            "arrays": {
-                                payload["coordinates"]: structure.coordinates.tolist(),
-                                payload["coordinate_mask"]: structure.coordinate_mask.tolist(),
-                                **(
-                                    {}
-                                    if structure.occupancy is None
-                                    else {
-                                        payload["occupancy"]: [
-                                            None if np.isnan(value) else value for value in structure.occupancy.tolist()
-                                        ]
-                                    }
-                                ),
-                            },
+                            "arrays": {},
                         },
                         sort_keys=True,
                         separators=(",", ":"),

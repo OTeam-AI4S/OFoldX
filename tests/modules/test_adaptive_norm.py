@@ -8,7 +8,7 @@ from ofoldx.modules.adaptive_norm import AdaptiveLayerNorm
 
 class TestAdaptiveLayerNorm:
     def test_forward_and_gradients(self) -> None:
-        module = AdaptiveLayerNorm(4, 3, operator_backend="eager")
+        module = AdaptiveLayerNorm(4, 3, backend="eager")
         hidden = torch.randn(2, 5, 4, requires_grad=True)
         conditioning = torch.randn(2, 5, 3, requires_grad=True)
 

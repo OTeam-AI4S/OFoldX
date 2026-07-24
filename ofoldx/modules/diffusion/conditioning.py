@@ -22,7 +22,7 @@ class PairwiseConditioning(nn.Module):
         relative_position_size: Width of the relative-position features concatenated with the pair.
         num_transitions: Number of transition blocks refining the conditioned pair.
         expansion: Inner-width expansion factor of each transition block.
-        operator_backend: Public backend request forwarded to every transition.
+        backend: Public backend request forwarded to every transition.
     """
 
     def __init__(
@@ -31,16 +31,15 @@ class PairwiseConditioning(nn.Module):
         relative_position_size: int = 128,
         num_transitions: int = 2,
         expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.init_projection = nn.Sequential(
-            LayerNorm(pair_size + relative_position_size, operator_backend=operator_backend),
+            LayerNorm(pair_size + relative_position_size, backend=backend),
             nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
         )
         self.transitions = nn.ModuleList(
-            Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
-            for _ in range(num_transitions)
+            Transition(pair_size, expansion=expansion, backend=backend) for _ in range(num_transitions)
         )
 
     def forward(self, pair_trunk: Tensor, relative_position_encoding: Tensor) -> Tensor:

@@ -13,7 +13,7 @@ def test_denoising_token_encoder_zero_blocks_is_identity() -> None:
         conditioning_size=3,
         pair_size=2,
         num_attention_heads=1,
-        operator_backend="torch",
+        backend="eager",
     )
     token_hidden = torch.randn(2, 5, 4)
 
@@ -58,7 +58,7 @@ def test_denoising_token_encoder_accepts_key_or_pair_masks(mask: torch.Tensor) -
         conditioning_size=3,
         pair_size=2,
         num_attention_heads=1,
-        operator_backend="torch",
+        backend="eager",
     ).eval()
 
     with torch.no_grad():

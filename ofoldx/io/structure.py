@@ -253,6 +253,8 @@ def _materialize_component_hydrogens(component: ChemicalComponent) -> ChemicalCo
                 ChemicalAtom(
                     atom_id=hydrogen_id,
                     element="H",
+                    explicit_hydrogens=0,
+                    implicit_hydrogens=0,
                     implicit_hydrogens_allowed=False,
                 )
             )
@@ -421,7 +423,11 @@ def _build_structure(
     for (symmetry_id, chain_id), residue_order in chain_residue_order.items():
         base_instance_id = chain_id if symmetry_id is None else f"{chain_id}#{symmetry_id}"
         if parsed.format == "mmcif":
-            polymer_residues = [key for key in residue_order if residue_rows[key][0].label_seq_id is not None]
+            polymer_residues = [
+                key
+                for key in residue_order
+                if get_builtin_component_polymer_type(residue_rows[key][0].component_id) is not None
+            ]
         else:
             polymer_indices = [
                 index

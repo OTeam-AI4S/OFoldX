@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ofoldx.modules.trunk import EvoformerStack
+from ofoldx.modules.trunk.evoformer import EvoformerStack, ExtraMsaEvoformerStack
 
 
 def test_evoformer_stack_refines_msa_and_pair_shapes() -> None:
@@ -11,7 +11,6 @@ def test_evoformer_stack_refines_msa_and_pair_shapes() -> None:
         msa_size=8,
         pair_size=4,
         outer_product_hidden_size=4,
-        outer_product_first=False,
         num_msa_attention_heads=2,
         triangle_multiplication_hidden_size=4,
         triangle_attention_hidden_size=2,
@@ -20,8 +19,7 @@ def test_evoformer_stack_refines_msa_and_pair_shapes() -> None:
         pair_transition_expansion=2,
         msa_dropout=0.0,
         pair_dropout=0.0,
-        is_extra_msa=False,
-        operator_backend="torch",
+        backend="eager",
     ).eval()
 
     msa, pair = stack(
@@ -41,7 +39,6 @@ def test_evoformer_stack_allows_zero_blocks() -> None:
         msa_size=8,
         pair_size=4,
         outer_product_hidden_size=4,
-        outer_product_first=False,
         num_msa_attention_heads=2,
         triangle_multiplication_hidden_size=4,
         triangle_attention_hidden_size=2,
@@ -50,8 +47,7 @@ def test_evoformer_stack_allows_zero_blocks() -> None:
         pair_transition_expansion=2,
         msa_dropout=0.0,
         pair_dropout=0.0,
-        is_extra_msa=False,
-        operator_backend="torch",
+        backend="eager",
     )
     msa = torch.randn(1, 2, 3, 8)
     pair = torch.randn(1, 3, 3, 4)
@@ -63,12 +59,11 @@ def test_evoformer_stack_allows_zero_blocks() -> None:
 
 
 def test_evoformer_stack_supports_extra_msa_global_attention() -> None:
-    stack = EvoformerStack(
+    stack = ExtraMsaEvoformerStack(
         num_blocks=1,
         msa_size=8,
         pair_size=4,
         outer_product_hidden_size=4,
-        outer_product_first=False,
         num_msa_attention_heads=2,
         triangle_multiplication_hidden_size=4,
         triangle_attention_hidden_size=2,
@@ -77,8 +72,7 @@ def test_evoformer_stack_supports_extra_msa_global_attention() -> None:
         pair_transition_expansion=2,
         msa_dropout=0.0,
         pair_dropout=0.0,
-        is_extra_msa=True,
-        operator_backend="torch",
+        backend="eager",
     ).eval()
 
     msa, pair = stack(

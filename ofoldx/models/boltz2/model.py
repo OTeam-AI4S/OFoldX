@@ -81,7 +81,7 @@ class Boltz2Model(Model):
             add_modified_flag=input_embeddings_config.add_modified_flag,
             add_cyclic_flag=input_embeddings_config.add_cyclic_flag,
             add_mol_type_feat=input_embeddings_config.add_mol_type_feat,
-            operator_backend="auto",
+            backend="auto",
         )
 
         # s/z initialisation. z_init is built from the single INPUT embedding (s_inputs).
@@ -116,7 +116,7 @@ class Boltz2Model(Model):
                 expansion=config.template.expansion,
                 triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
                 num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-                operator_backend="auto",
+                backend="auto",
             )
         self.msa_trunk = CategoricalMsaTrunk(
             single_size=single_size,
@@ -133,7 +133,7 @@ class Boltz2Model(Model):
             msa_head_dim=trunk.msa_head_dim,
             triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
             num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-            operator_backend="auto",
+            backend="auto",
         )
         self.pairformer_stack = PairformerStack(
             num_blocks=trunk.num_pairformer_blocks,
@@ -143,7 +143,7 @@ class Boltz2Model(Model):
             num_triangle_attention_heads=trunk.num_triangle_attention_heads,
             num_pair_attention_heads=trunk.num_pair_attention_heads,
             dropout=trunk.dropout,
-            operator_backend="auto",
+            backend="auto",
         )
         self.distogram_head = PairSymmetrizedDistogramHead(pair_size=pair_size, num_bins=config.num_distogram_bins)
 
@@ -177,7 +177,7 @@ class Boltz2Model(Model):
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
-            operator_backend="auto",
+            backend="auto",
         )
         sampler = config.sampler
         self.coordinate_diffusion = Boltz2CoordinateDiffusion(
@@ -208,7 +208,7 @@ class Boltz2Model(Model):
             num_plddt_bins=confidence.num_plddt_bins,
             num_pae_bins=confidence.num_pae_bins,
             num_pde_bins=confidence.num_pde_bins,
-            operator_backend="auto",
+            backend="auto",
         )
         self.bfactor_head: Boltz2BFactorHead | None = None
         if config.predict_bfactor:
@@ -388,7 +388,7 @@ class Boltz2Model(Model):
             ),
         )
 
-    def _trunk(self, input: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2TrunkState:
+    def _trunk(self, input: Boltz2Input, *, recycling_steps: int | None = None) -> _Boltz2TrunkOutput:
         r"""
         Run the recycled folding trunk (template + MSA + Pairformer) and emit the trunk representations.
 
@@ -449,7 +449,7 @@ class Boltz2Model(Model):
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
-        return _Boltz2TrunkState(
+        return _Boltz2TrunkOutput(
             single_inputs=single_inputs,
             single=single,
             pair=pair,
@@ -509,7 +509,7 @@ class Boltz2Model(Model):
 
     def _sample_coords(
         self,
-        representations: _Boltz2TrunkState,
+        representations: _Boltz2TrunkOutput,
         input: Boltz2Input,
         *,
         num_sampling_steps: int | None,
@@ -544,7 +544,9 @@ class Boltz2Model(Model):
             token_mask=input.token_mask,
         )
 
-    def _build_denoiser_conditioning(self, representations: _Boltz2TrunkState, input: Boltz2Input) -> dict[str, Tensor]:
+    def _build_denoiser_conditioning(
+        self, representations: _Boltz2TrunkOutput, input: Boltz2Input
+    ) -> dict[str, Tensor]:
         r"""
         Precompute the per-call-invariant diffusion conditioning from the trunk representations.
 
@@ -611,7 +613,7 @@ class Boltz2AffinityModel(Boltz2Model):
             triangle_attention_hidden_size=affinity.triangle_attention_hidden_size,
             num_triangle_attention_heads=affinity.num_triangle_attention_heads,
             dropout=affinity.dropout,
-            operator_backend="auto",
+            backend="auto",
         )
 
     @torch.inference_mode()
@@ -841,7 +843,7 @@ class Boltz2AffinityModel(Boltz2Model):
 
     def _score_affinity(
         self,
-        representations: _Boltz2TrunkState,
+        representations: _Boltz2TrunkOutput,
         input: Boltz2Input,
         coordinates: Tensor,
         *,
@@ -964,7 +966,7 @@ class Boltz2InputEmbeddings(nn.Module):
         add_modified_flag: bool = True,
         add_cyclic_flag: bool = True,
         add_mol_type_feat: bool = True,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.atom_encoder = Boltz2AtomEncoder(
@@ -975,7 +977,7 @@ class Boltz2InputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
         )
         self.atom_pair_bias_projection = nn.Sequential(
-            LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+            LayerNorm(atom_pair_hidden_size, backend=backend),
             nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
         )
         self.atom_attention_encoder = Boltz2AtomAttentionEncoder(
@@ -985,7 +987,7 @@ class Boltz2InputEmbeddings(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
         self.residue_type_projection = nn.Linear(vocab_size, single_size, bias=False)
@@ -1060,11 +1062,8 @@ class Boltz2AtomEncoder(nn.Module):
         atom_feature_size: int = 388,
         atom_hidden_size: int = 128,
         atom_pair_hidden_size: int = 16,
-        single_size: int = 384,
-        pair_size: int = 128,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        structure_prediction: bool = False,
     ) -> None:
         super().__init__()
         self.num_query_atoms = num_query_atoms
@@ -1073,16 +1072,6 @@ class Boltz2AtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.single_trunk_projection: nn.Sequential | None = None
-        self.pair_trunk_projection: nn.Sequential | None = None
-        if structure_prediction:
-            self.single_trunk_projection = nn.Sequential(
-                LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
-            )
-            self.pair_trunk_projection = nn.Sequential(
-                LayerNorm(pair_size),
-                nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
-            )
         self.left_atom_projection = nn.Sequential(
             nn.ReLU(),
             nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
@@ -1106,10 +1095,6 @@ class Boltz2AtomEncoder(nn.Module):
         reference_positions: Tensor,
         atom_mask: Tensor,
         reference_space_id: Tensor,
-        *,
-        atom_to_token: Tensor | None = None,
-        single_trunk: Tensor | None = None,
-        pair_trunk: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         atom_query = self.atom_feature_projection(atom_features)
         atom_single = atom_query
@@ -1152,20 +1137,117 @@ class Boltz2AtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        pair_bias = None
-        single_trunk_projection = self.single_trunk_projection
-        if single_trunk_projection is not None:
-            token_index = cast(Tensor, atom_to_token)
-            single_proj = single_trunk_projection(cast(Tensor, single_trunk))
-            single_from_trunk = single_proj.gather(1, token_index.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1]))
-            atom_single = atom_single + single_from_trunk * atom_mask.unsqueeze(-1).to(single_from_trunk.dtype)
-            pair_from_trunk = cast(nn.Sequential, self.pair_trunk_projection)(cast(Tensor, pair_trunk))
-            token_windows = pad_atoms(token_index)
-            query_token = token_windows.view(batch, num_windows, num_query_atoms)
-            key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
-            batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
-            pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
-            pair_bias = pair_gathered * (mask_queries & mask_keys).unsqueeze(-1).to(pair_gathered.dtype)
+        single_windows = pad_atoms(atom_single)
+        atom_pair = encode_atom_pair(
+            self,
+            distance_vectors,
+            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
+            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
+            distance_term_mask=valid,
+            inverse_term_mask=valid,
+            valid_mask=valid,
+            pair_bias=None,
+            prefix_ndim=1,
+        )
+        return atom_query, atom_single, atom_pair
+
+
+class Boltz2DenoiserAtomEncoder(nn.Module):
+    r"""
+    Build trunk-conditioned atom states and atom-pair biases for coordinate denoising.
+    """
+
+    def __init__(
+        self,
+        atom_feature_size: int = 388,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+    ) -> None:
+        super().__init__()
+        self.num_query_atoms = num_query_atoms
+        self.num_key_atoms = num_key_atoms
+        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.single_trunk_projection = nn.Sequential(
+            LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
+        )
+        self.pair_trunk_projection = nn.Sequential(
+            LayerNorm(pair_size),
+            nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
+        )
+        self.left_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.right_atom_projection = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+        self.feed_forward = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        )
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+        *,
+        atom_to_token: Tensor,
+        single_trunk: Tensor,
+        pair_trunk: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = self.atom_feature_projection(atom_features)
+        atom_single = atom_query
+        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
+        batch, length = atom_single.shape[:2]
+        padding = (-length) % num_query_atoms
+        num_windows = (length + padding) // num_query_atoms
+        to_keys = partial(
+            gather_key_windows,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+
+        def pad_atoms(value: Tensor) -> Tensor:
+            if not padding:
+                return value
+            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
+
+        positions = pad_atoms(reference_positions)
+        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
+        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
+        distance_vectors = positions_keys - positions_queries
+        mask = pad_atoms(atom_mask).bool()
+        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
+        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
+        space_id = pad_atoms(reference_space_id)
+        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
+        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
+
+        single_proj = self.single_trunk_projection(single_trunk)
+        single_from_trunk = single_proj.gather(1, atom_to_token.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1]))
+        atom_single = atom_single + single_from_trunk * atom_mask.unsqueeze(-1).to(single_from_trunk.dtype)
+        pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+        token_windows = pad_atoms(atom_to_token)
+        query_token = token_windows.view(batch, num_windows, num_query_atoms)
+        key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
+        batch_index = torch.arange(batch, device=atom_single.device)[:, None, None, None]
+        pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
+        pair_bias = pair_gathered * (mask_queries & mask_keys).unsqueeze(-1).to(pair_gathered.dtype)
 
         single_windows = pad_atoms(atom_single)
         atom_pair = encode_atom_pair(
@@ -1195,7 +1277,7 @@ class Boltz2AtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.atom_transformer = PackedAtomAttention(
@@ -1204,7 +1286,7 @@ class Boltz2AtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -1244,7 +1326,7 @@ class Boltz2DenoiserAtomAttentionEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
@@ -1254,7 +1336,7 @@ class Boltz2DenoiserAtomAttentionEncoder(nn.Module):
                 num_attention_heads=num_atom_encoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
@@ -1304,7 +1386,7 @@ class Boltz2AtomAttentionDecoder(nn.Module):
         num_key_atoms: int = 128,
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
@@ -1314,13 +1396,13 @@ class Boltz2AtomAttentionDecoder(nn.Module):
                 num_attention_heads=num_atom_decoder_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
-                operator_backend=operator_backend,
+                backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
         self.position_update = nn.Sequential(
-            LayerNorm(atom_hidden_size, operator_backend=operator_backend), nn.Linear(atom_hidden_size, 3, bias=False)
+            LayerNorm(atom_hidden_size, backend=backend), nn.Linear(atom_hidden_size, 3, bias=False)
         )
 
     def forward(
@@ -1375,7 +1457,7 @@ class Boltz2TemplateEmbedder(nn.Module):
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1384,7 +1466,7 @@ class Boltz2TemplateEmbedder(nn.Module):
         self.min_distance = min_distance
         self.max_distance = max_distance
         template_feature_size = 2 * vocab_size + num_bins + 5
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1395,11 +1477,11 @@ class Boltz2TemplateEmbedder(nn.Module):
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 expansion=expansion,
                 dropout=dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
-        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(hidden_size, backend=backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 
@@ -1557,16 +1639,16 @@ class Boltz2DenoiserConditioning(nn.Module):
         num_token_transformer_blocks: int = 24,
         num_token_transformer_heads: int = 16,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.atom_encoder = Boltz2AtomEncoder(
+        self.atom_encoder = Boltz2DenoiserAtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -1574,25 +1656,24 @@ class Boltz2DenoiserConditioning(nn.Module):
             pair_size=pair_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            structure_prediction=True,
         )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_encoder_blocks)
         )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, operator_backend=operator_backend),
+                LayerNorm(atom_pair_hidden_size, backend=backend),
                 nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
             )
             for _ in range(num_atom_decoder_blocks)
         )
         self.token_transformer_pair_bias_projections = nn.ModuleList(
             nn.Sequential(
-                LayerNorm(pair_size, operator_backend=operator_backend),
+                LayerNorm(pair_size, backend=backend),
                 nn.Linear(pair_size, num_token_transformer_heads, bias=False),
             )
             for _ in range(num_token_transformer_blocks)
@@ -1651,7 +1732,7 @@ class Boltz2Denoiser(nn.Module):
         num_atom_decoder_blocks: int = 3,
         num_atom_decoder_attention_heads: int = 4,
         num_conditioning_transitions: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
@@ -1659,7 +1740,7 @@ class Boltz2Denoiser(nn.Module):
             single_size=single_size,
             fourier_embedding_size=fourier_embedding_size,
             num_conditioning_transitions=num_conditioning_transitions,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_attention_encoder = Boltz2DenoiserAtomAttentionEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -1668,19 +1749,17 @@ class Boltz2Denoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_encoder_blocks=num_atom_encoder_blocks,
             num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_to_token = nn.Sequential(
-            LayerNorm(hidden, operator_backend=operator_backend), nn.Linear(hidden, hidden, bias=False)
-        )
+        self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
         self.token_transformer = ConditionedTransformer(
             num_blocks=num_token_transformer_blocks,
             num_attention_heads=num_token_transformer_heads,
             hidden_size=hidden,
             conditioning_size=hidden,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.token_norm = LayerNorm(hidden, operator_backend=operator_backend)
+        self.token_norm = LayerNorm(hidden, backend=backend)
         self.atom_attention_decoder = Boltz2AtomAttentionDecoder(
             atom_hidden_size=atom_hidden_size,
             single_size=single_size,
@@ -1688,7 +1767,7 @@ class Boltz2Denoiser(nn.Module):
             num_key_atoms=num_key_atoms,
             num_atom_decoder_blocks=num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=num_atom_decoder_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -1752,18 +1831,17 @@ class Boltz2SingleConditioning(nn.Module):
         fourier_embedding_size: int = 256,
         num_conditioning_transitions: int = 2,
         expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         hidden = 2 * single_size
-        self.single_norm = LayerNorm(hidden, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(hidden, backend=backend)
         self.single_projection = nn.Linear(hidden, hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size, operator_backend=operator_backend)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, backend=backend)
         self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
         self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=expansion, operator_backend=operator_backend)
-            for _ in range(num_conditioning_transitions)
+            Transition(hidden, expansion=expansion, backend=backend) for _ in range(num_conditioning_transitions)
         )
 
     def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
@@ -1954,7 +2032,7 @@ class Boltz2AffinityHead(nn.Module):
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
         dropout: float = 0.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
@@ -1962,14 +2040,14 @@ class Boltz2AffinityHead(nn.Module):
         nn.init.zeros_(self.dist_bin_pairwise_embed.weight)
         self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
         self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, pair_size, bias=False)
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
             num_transitions=num_conditioning_transitions,
             expansion=expansion,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_update_stack = TrianglePairUpdateStack(
             num_blocks=num_blocks,
@@ -1977,7 +2055,7 @@ class Boltz2AffinityHead(nn.Module):
             triangle_attention_hidden_size=triangle_attention_hidden_size,
             num_triangle_attention_heads=num_triangle_attention_heads,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_head = Boltz2AffinityOutputHead(pair_size=pair_size, single_size=single_size)
 
@@ -2083,15 +2161,15 @@ class Boltz2ConfidenceHead(nn.Module):
         num_plddt_bins: int = 50,
         num_pae_bins: int = 64,
         num_pde_bins: int = 64,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
         self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
 
-        self.input_single_norm = LayerNorm(single_size, operator_backend=operator_backend)
-        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.input_single_norm = LayerNorm(single_size, backend=backend)
+        self.single_norm = LayerNorm(single_size, backend=backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
         self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
         self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
@@ -2111,7 +2189,7 @@ class Boltz2ConfidenceHead(nn.Module):
             single_size=single_size,
             pair_size=pair_size,
             num_pair_attention_heads=num_pair_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_head = Boltz2ConfidenceOutputHead(
             single_size, pair_size, num_plddt_bins=num_plddt_bins, num_pae_bins=num_pae_bins, num_pde_bins=num_pde_bins
@@ -2594,7 +2672,7 @@ class Boltz2Input:
 
 
 @dataclass
-class _Boltz2TrunkState:
+class _Boltz2TrunkOutput:
     r"""
     Trunk outputs consumed by the diffusion / confidence heads.
     """

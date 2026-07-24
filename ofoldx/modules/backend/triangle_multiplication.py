@@ -10,7 +10,7 @@ from torch import Tensor
 from ._cueq import cueq_triangle_multiplication
 from ._oops import oops_kernel
 from .normalization import layer_norm
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_triangle_multiplication = oops_kernel("triangle_multiplication")
 
@@ -33,7 +33,7 @@ def triangle_multiplication(
     output_weight: Tensor,
     output_gate_weight: Tensor,
     eps: float,
-    operator_backend: str,
+    backend: str,
     left_value_bias: Tensor | None = None,
     left_gate_bias: Tensor | None = None,
     right_value_bias: Tensor | None = None,
@@ -67,7 +67,7 @@ def triangle_multiplication(
         output_weight: Projection weight mapping back to ``pair_size``.
         output_gate_weight: Gate-projection weight applied to the normalized input.
         eps: LayerNorm epsilon shared by the input and output normalizations.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
         left_value_bias: Optional left value-projection bias.
         left_gate_bias: Optional left gate-projection bias.
         right_value_bias: Optional right value-projection bias.
@@ -81,8 +81,8 @@ def triangle_multiplication(
 
     hidden_size = left_value_weight.shape[0]
     pair_size = pair.shape[-1]
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(pair, pair_mask),
         supported=_SUPPORTED,
         public_default="eager",
@@ -141,7 +141,7 @@ def triangle_multiplication(
             output_gate_bias=output_gate_bias,
             eps=eps,
         )
-    normalized = layer_norm(pair, (pair_size,), input_norm_weight, input_norm_bias, eps, operator_backend=backend)
+    normalized = layer_norm(pair, (pair_size,), input_norm_weight, input_norm_bias, eps, backend=backend)
     left = torch.nn.functional.linear(normalized, left_value_weight, left_value_bias) * torch.sigmoid(
         torch.nn.functional.linear(normalized, left_gate_weight, left_gate_bias)
     )
@@ -157,7 +157,7 @@ def triangle_multiplication(
         output_norm_weight,
         output_norm_bias,
         eps,
-        operator_backend=backend,
+        backend=backend,
     )
     update = torch.nn.functional.linear(normed_update, output_weight, output_bias)
     return update * torch.sigmoid(torch.nn.functional.linear(normalized, output_gate_weight, output_gate_bias))

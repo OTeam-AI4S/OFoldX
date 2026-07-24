@@ -811,14 +811,12 @@ class ProtenixConstraintEmbeddings(nn.Module):
     Project and combine pocket, token-contact, atom-contact, and substructure constraints.
     """
 
-    def __init__(self, pair_size: int = 128, *, operator_backend: str = "auto") -> None:
+    def __init__(self, pair_size: int = 128, *, backend: str = "auto") -> None:
         super().__init__()
         self.pocket_projection = nn.Linear(1, pair_size, bias=False)
         self.token_contact_projection = nn.Linear(2, pair_size, bias=False)
         self.atom_contact_projection = nn.Linear(2, pair_size, bias=False)
-        self.substructure_embeddings = ProtenixConstraintSubstructureEmbeddings(
-            pair_size, operator_backend=operator_backend
-        )
+        self.substructure_embeddings = ProtenixConstraintSubstructureEmbeddings(pair_size, backend=backend)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -846,7 +844,7 @@ class ProtenixConstraintSubstructureEmbeddings(nn.Module):
     Embed the flattened token-pair substructure grid with a Transformer.
     """
 
-    def __init__(self, pair_size: int = 128, *, operator_backend: str = "auto") -> None:
+    def __init__(self, pair_size: int = 128, *, backend: str = "auto") -> None:
         super().__init__()
         hidden_size = 128
         self.input_projection = nn.Linear(4, hidden_size, bias=False)
@@ -856,7 +854,7 @@ class ProtenixConstraintSubstructureEmbeddings(nn.Module):
             num_attention_heads=4,
             transition_size=hidden_size * 4,
             dropout=0.1,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 
@@ -880,7 +878,7 @@ class ProtenixConstraintSubstructureTransformer(nn.Module):
         num_attention_heads: int,
         transition_size: int,
         dropout: float,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -890,7 +888,7 @@ class ProtenixConstraintSubstructureTransformer(nn.Module):
                 num_attention_heads=num_attention_heads,
                 transition_size=transition_size,
                 dropout=dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -913,14 +911,14 @@ class ProtenixConstraintSubstructureBlock(nn.Module):
         num_attention_heads: int,
         transition_size: int,
         dropout: float,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.attention = ProtenixConstraintSubstructureAttention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.attention_output_dropout = nn.Dropout(dropout)
         self.attention_norm = LayerNorm(hidden_size)
@@ -948,13 +946,13 @@ class ProtenixConstraintSubstructureAttention(nn.Module):
         hidden_size: int,
         num_attention_heads: int,
         dropout: float,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
         self.head_size = hidden_size // num_attention_heads
         self.dropout = dropout
-        self.operator_backend = operator_backend
+        self.backend = backend
         self.query_projection = nn.Linear(hidden_size, hidden_size)
         self.key_projection = nn.Linear(hidden_size, hidden_size)
         self.value_projection = nn.Linear(hidden_size, hidden_size)
@@ -974,7 +972,7 @@ class ProtenixConstraintSubstructureAttention(nn.Module):
             key,
             value,
             attention_mask=None,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
             dropout_p=self.dropout if self.training else 0.0,
         )
         return self.output_projection(update.transpose(-3, -2).flatten(-2))

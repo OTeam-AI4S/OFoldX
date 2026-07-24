@@ -11,7 +11,7 @@ class TestDenoisingTransformerBlock:
             hidden_size=4,
             conditioning_size=3,
             num_attention_heads=1,
-            operator_backend="eager",
+            backend="eager",
         ).eval()
 
         output = block(

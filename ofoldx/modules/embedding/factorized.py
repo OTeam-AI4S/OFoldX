@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from ..backend import factorized_pair_linear, resolve_config_operator_backend
+from ..backend import factorized_pair_linear, resolve_config_backend
 
 
 class FactorizedPairLinear(nn.Linear):
@@ -26,7 +26,7 @@ class FactorizedPairLinear(nn.Linear):
         pair_prefix_size: Number of pair-feature columns before the two token
             blocks. ``None`` places all pair features before them.
         bias: Whether to learn an output bias.
-        operator_backend: Which operator backend to run; see
+        backend: Which backend to run; see
             [ofoldx.modules.backend][].
     """
 
@@ -38,12 +38,12 @@ class FactorizedPairLinear(nn.Linear):
         *,
         pair_prefix_size: int | None = None,
         bias: bool = True,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__(pair_size + 2 * token_size, output_size, bias=bias)
         self.pair_prefix_size = pair_size if pair_prefix_size is None else pair_prefix_size
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend,
+        self.backend = resolve_config_backend(
+            backend,
             supported=("oops", "eager"),
             public_default="eager",
         )
@@ -66,5 +66,5 @@ class FactorizedPairLinear(nn.Linear):
             self.weight,
             self.bias,
             pair_prefix_size=self.pair_prefix_size,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )

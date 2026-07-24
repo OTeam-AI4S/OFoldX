@@ -11,7 +11,7 @@ from ofoldx.modules.backend import resolve as resolve_module
     "build",
     [
         lambda: MultiheadAttentionProjection(hidden_size=8, num_attention_heads=3),
-        lambda: GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="bogus"),
+        lambda: GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, backend="bogus"),
     ],
 )
 def test_invalid_inputs(build) -> None:
@@ -50,11 +50,11 @@ def test_explicit_head_dim_defines_the_inner_width() -> None:
     assert projection.output_projection.in_features == 12
 
 
-@pytest.mark.parametrize("backend", ("auto", "torch"))
-def test_public_torch_paths_use_sdpa_without_changing_state_dict(monkeypatch, backend: str) -> None:
+@pytest.mark.parametrize("backend", ("auto", "eager"))
+def test_public_backends_do_not_change_state_dict(monkeypatch, backend: str) -> None:
     monkeypatch.setattr(resolve_module, "oops_available", lambda: False)
-    public = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend=backend)
-    sdpa = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, operator_backend="sdpa")
+    public = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, backend=backend)
+    sdpa = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, backend="sdpa")
     sdpa.load_state_dict(public.state_dict())
 
     query = torch.randn(2, 4, 8)

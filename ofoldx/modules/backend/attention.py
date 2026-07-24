@@ -15,7 +15,7 @@ from ._apex import apex_evoformer_attention, apex_evoformer_attention_supported
 from ._cueq import cueq_triangle_attention
 from ._deepspeed import deepspeed_evoformer_attention
 from ._oops import oops_kernel
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_gated_pair_bias_attention = oops_kernel("gated_pair_bias_attention")
 _oops_pair_bias_attention = oops_kernel("pair_bias_attention")
@@ -33,10 +33,10 @@ def gated_multihead_attention(
     biases: Sequence[Tensor] | None,
     attention_mask: Tensor | None,
     projection: MultiheadAttentionProjection,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
-    Project q/k/v via ``projection``, run attention on ``operator_backend``, and merge heads.
+    Project q/k/v via ``projection``, run attention on ``backend``, and merge heads.
 
     Dispatches attention to the selected provider when that provider implements the
     concrete tensor contract, otherwise to PyTorch SDPA. ``biases`` are summed into a single additive pair
@@ -50,7 +50,7 @@ def gated_multihead_attention(
         attention_mask: Optional boolean mask broadcastable to ``(..., q_tokens, k_tokens)`` or
             ``(..., k_tokens)``; ``False`` positions are masked out.
         projection: The q/k/v (and optional gate/output) projection owned by the calling module.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``(..., q_tokens, hidden_size)`` attention output with heads merged.
@@ -58,17 +58,17 @@ def gated_multihead_attention(
 
     key = query if key is None else key
     value = key if value is None else value
-    operator_backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
         supported=("oops", "apex", "deepspeed", "sdpa", "eager"),
         public_default="sdpa",
     )
-    if operator_backend in {"eager", "apex", "deepspeed"}:
+    if backend in {"eager", "apex", "deepspeed"}:
         query_projection, key_projection, value_projection = projection.project_unscaled(query, key, value)
     else:
         query_projection, key_projection, value_projection = projection.project(query, key, value)
-    if operator_backend == "eager":
+    if backend == "eager":
         output = _eager_attention(
             query_projection,
             key_projection,
@@ -76,7 +76,7 @@ def gated_multihead_attention(
             biases=biases,
             attention_mask=attention_mask,
         )
-    elif operator_backend == "oops":
+    elif backend == "oops":
         can_use_fused_gated_output = (
             projection.gating and projection.output_projection.bias is None and projection.gate_projection.bias is None
         )
@@ -99,7 +99,7 @@ def gated_multihead_attention(
             biases=biases,
             attention_mask=attention_mask,
         )
-    elif operator_backend == "apex":
+    elif backend == "apex":
         output = _apex_attention(
             query_projection,
             key_projection,
@@ -116,7 +116,7 @@ def gated_multihead_attention(
                 attention_mask=attention_mask,
                 scale=None,
             )
-    elif operator_backend == "deepspeed":
+    elif backend == "deepspeed":
         output = _deepspeed_attention(
             query_projection,
             key_projection,
@@ -153,7 +153,7 @@ def projected_attention(
     *,
     biases: Sequence[Tensor] | None = None,
     attention_mask: Tensor | None,
-    operator_backend: str,
+    backend: str,
     dropout_p: float = 0.0,
     scale: float | None = None,
 ) -> Tensor:
@@ -171,7 +171,7 @@ def projected_attention(
             ``(..., num_heads, num_query_tokens, num_key_tokens)``.
         attention_mask: Optional boolean keep-mask
             broadcastable to ``(..., num_heads, num_query_tokens, num_key_tokens)``.
-        operator_backend: Backend used for the attention operation.
+        backend: Backend used for the attention operation.
         dropout_p: Dropout probability applied to attention weights.
         scale: Optional multiplier applied to query-key logits. ``None`` uses
             ``head_size ** -0.5``.
@@ -182,8 +182,8 @@ def projected_attention(
     """
 
     supported = ("oops", "sdpa", "eager") if dropout_p == 0.0 else ("sdpa", "eager")
-    resolved = resolve_tensor_operator_backend(
-        operator_backend,
+    resolved = resolve_tensor_backend(
+        backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
         supported=supported,
         public_default="sdpa",
@@ -224,7 +224,7 @@ def triangle_attention(
     attention_mask: Tensor | None,
     *,
     projection: MultiheadAttentionProjection,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Row-batched triangle self-attention over the pair representation.
@@ -244,14 +244,14 @@ def triangle_attention(
         triangle_bias: Per-head triangle bias ``(..., 1, heads, cols, cols)`` (row axis broadcast).
         attention_mask: Optional boolean keep-mask ``(..., rows, cols)``; ``False`` keys are excluded.
         projection: The q/k/v/gate/output projection owned by the calling triangle-attention module.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         Gated pair update ``(..., rows, cols, pair_size)``.
     """
 
-    resolved = resolve_tensor_operator_backend(
-        operator_backend,
+    resolved = resolve_tensor_backend(
+        backend,
         tensors=(pair, triangle_bias, attention_mask),
         supported=("oops", "cueq", "apex", "deepspeed", "sdpa", "eager"),
         public_default="sdpa",
@@ -274,7 +274,7 @@ def triangle_attention(
         biases=(triangle_bias,),
         attention_mask=key_mask,
         projection=projection,
-        operator_backend=operator_backend,
+        backend=backend,
     )
 
 
@@ -365,7 +365,7 @@ def _eager_attention(
     Pure PyTorch attention with explicit float32 logits and softmax.
 
     Unlike SDPA, this path explicitly performs the attention logits and softmax in float32 and uses the
-    ``-1e6`` additive mask convention. It is selected only by an explicit ``operator_backend="eager"``
+    ``-1e6`` additive mask convention. It is selected only by an explicit ``backend="eager"``
     request.
     """
 

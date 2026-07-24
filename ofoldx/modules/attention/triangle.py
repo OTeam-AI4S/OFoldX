@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from ..backend import LayerNorm, resolve_config_operator_backend
+from ..backend import LayerNorm, resolve_config_backend
 from ..backend import triangle_multiplication as dispatch_triangle_multiplication
 from ..backend.attention import triangle_attention as dispatch_triangle_attention
 from .multihead import GatedMultiheadAttention
@@ -28,7 +28,7 @@ class TriangleAttention(nn.Module):
         output_bias: Whether the attention output projection carries a learnable bias.
         gate_bias: Whether the output-gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][]. A bias-free
+        backend: Operator provider; see [ofoldx.modules.backend][]. A bias-free
             module on the ``oops`` backend uses the
             dedicated OOps-owned ``triangle_attention`` implementation.
     """
@@ -42,10 +42,10 @@ class TriangleAttention(nn.Module):
         output_bias: bool = False,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.attention = GatedMultiheadAttention(
             pair_size,
@@ -55,7 +55,7 @@ class TriangleAttention(nn.Module):
             output_bias=output_bias,
             gate_bias=gate_bias,
             gate_bias_init=gate_bias_init,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
@@ -85,7 +85,7 @@ class TriangleAttention(nn.Module):
             triangle_bias,
             pair_mask,
             projection=self.attention.projection,
-            operator_backend=self.attention.operator_backend,
+            backend=self.attention.backend,
         )
 
 
@@ -103,7 +103,7 @@ class TriangleMultiplication(nn.Module):
         hidden_size: Width of the intermediate left/right factors.
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
     def __init__(
@@ -112,15 +112,13 @@ class TriangleMultiplication(nn.Module):
         hidden_size: int = 128,
         *,
         outgoing: bool,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.outgoing = outgoing
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
-        self.input_norm = LayerNorm(pair_size, operator_backend=operator_backend)
-        self.output_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
+        self.input_norm = LayerNorm(pair_size, backend=backend)
+        self.output_norm = LayerNorm(hidden_size, backend=backend)
         self.left_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(pair_size, hidden_size, bias=False)
@@ -165,7 +163,7 @@ class TriangleMultiplication(nn.Module):
             output_weight=self.output_projection.weight,
             output_gate_weight=self.gate_projection.weight,
             eps=self.input_norm.eps,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
             left_value_bias=self.left_projection.bias,
             left_gate_bias=self.left_gate_projection.bias,
             right_value_bias=self.right_projection.bias,

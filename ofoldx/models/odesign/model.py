@@ -82,7 +82,7 @@ class ODesignModel(Model):
             min_distance=config.constraint_embeddings.min_distance,
             max_distance=config.constraint_embeddings.max_distance,
             dropout=config.constraint_embeddings.dropout,
-            operator_backend="auto",
+            backend="auto",
         )
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
@@ -498,22 +498,22 @@ class ODesignConstraintEmbeddings(nn.Module):
         min_distance: float = 3.25,
         max_distance: float = 50.75,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_bins = num_bins
         self.min_distance = min_distance
         self.max_distance = max_distance
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.distogram_projection = nn.Linear(num_bins, hidden_size, bias=False)
         self.pair_update_stack = TrianglePairUpdateStack(
             num_blocks=num_blocks,
             pair_size=hidden_size,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(hidden_size, backend=backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 

@@ -9,7 +9,7 @@ from torch import Tensor
 
 from ._oops import oops_kernel
 from .normalization import layer_norm
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_pair_weighted_average = oops_kernel("pair_weighted_average")
 
@@ -33,7 +33,7 @@ def pair_weighted_average(
     head_dim: int,
     msa_norm_eps: float,
     pair_norm_eps: float,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Average MSA values along the query-residue axis with per-head weights softmaxed from the pair
@@ -55,14 +55,14 @@ def pair_weighted_average(
         head_dim: Width of each attention head.
         msa_norm_eps: Epsilon used by the MSA LayerNorm.
         pair_norm_eps: Epsilon used by the pair LayerNorm.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``(B, S, N, msa_size)`` MSA update, matching the shape of ``msa``.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(msa, pair, pair_mask),
         supported=_SUPPORTED,
         public_default="eager",
@@ -85,9 +85,7 @@ def pair_weighted_average(
             pair_norm_eps=pair_norm_eps,
         )
 
-    normalized = layer_norm(
-        msa, (msa.shape[-1],), msa_norm_weight, msa_norm_bias, msa_norm_eps, operator_backend=backend
-    )
+    normalized = layer_norm(msa, (msa.shape[-1],), msa_norm_weight, msa_norm_bias, msa_norm_eps, backend=backend)
     values = torch.nn.functional.linear(normalized, value_weight).reshape(*normalized.shape[:-1], num_heads, head_dim)
     pair_normalized = layer_norm(
         pair,
@@ -95,7 +93,7 @@ def pair_weighted_average(
         pair_norm_weight,
         pair_norm_bias,
         pair_norm_eps,
-        operator_backend=backend,
+        backend=backend,
     )
     logits = torch.nn.functional.linear(pair_normalized, pair_logits_weight).movedim(-1, -3)
     if pair_mask is not None:

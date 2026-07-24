@@ -53,7 +53,7 @@ class ConfidenceHead(nn.Module):
         expansion: Feed-forward expansion factor in the Pairformer transitions.
         dropout: Pairformer dropout probability.
         single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
-        operator_backend: Public backend request forwarded to the Pairformer and atom projector.
+        backend: Public backend request forwarded to the Pairformer and atom projector.
     """
 
     def __init__(
@@ -77,11 +77,11 @@ class ConfidenceHead(nn.Module):
         expansion: int = 4,
         dropout: float = 0.0,
         single_max_abs: float | None = 512.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
-        self.single_norm = LayerNorm(single_size, operator_backend=operator_backend)
+        self.single_norm = LayerNorm(single_size, backend=backend)
         self.pair_embedder = ConfidencePairEmbedder(
             pair_size=pair_size,
             token_feature_size=token_feature_size,
@@ -99,14 +99,14 @@ class ConfidenceHead(nn.Module):
             num_pair_attention_heads=num_pair_attention_heads,
             expansion=expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_projector = AtomConfidenceProjector(
             single_size=single_size,
             num_plddt_bins=num_plddt_bins,
             num_resolved_bins=num_resolved_bins,
             max_atoms_per_token=max_atoms_per_token,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_projector = PairConfidenceProjector(
             pair_size=pair_size,
@@ -250,7 +250,7 @@ class AtomConfidenceProjector(nn.Module):
         num_plddt_bins: Number of pLDDT bins.
         num_resolved_bins: Number of resolved-classification bins.
         max_atoms_per_token: Maximum atoms per token, sizing the per-offset weight tables.
-        operator_backend: Public backend request forwarded to token-to-atom broadcast.
+        backend: Public backend request forwarded to token-to-atom broadcast.
     """
 
     def __init__(
@@ -259,14 +259,14 @@ class AtomConfidenceProjector(nn.Module):
         num_plddt_bins: int = 50,
         num_resolved_bins: int = 2,
         max_atoms_per_token: int = 24,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ):
         super().__init__()
         self.plddt_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_plddt_bins))
         self.resolved_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_resolved_bins))
-        self.plddt_norm = LayerNorm(single_size, operator_backend=operator_backend)
-        self.resolved_norm = LayerNorm(single_size, operator_backend=operator_backend)
-        self.token_to_atom_broadcast = TokenToAtomBroadcast(operator_backend=operator_backend)
+        self.plddt_norm = LayerNorm(single_size, backend=backend)
+        self.resolved_norm = LayerNorm(single_size, backend=backend)
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

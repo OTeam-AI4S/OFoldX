@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..backend import atom_to_token_mean as dispatch_atom_to_token_mean
-from ..backend import resolve_config_operator_backend
+from ..backend import resolve_config_backend
 from ..backend import token_pair_to_atom_window_gather as dispatch_token_pair_to_atom_window_gather
 from ..backend import token_to_atom_broadcast as dispatch_token_to_atom_broadcast
 from .window import LocalAtomWindowing
@@ -20,7 +20,7 @@ def scatter_mean_to_tokens(
     atom_to_token: Tensor,
     num_tokens: int,
     atom_mask: Tensor | None = None,
-    operator_backend: str = "auto",
+    backend: str = "auto",
 ) -> Tensor:
     r"""
     Mean-pool per-atom features to tokens by scattering on the atom->token index.
@@ -33,7 +33,7 @@ def scatter_mean_to_tokens(
         atom_to_token: ``[..., N_atom]`` token index for each atom.
         num_tokens: Number of output tokens.
         atom_mask: Optional ``[..., N_atom]`` valid-atom mask.
-        operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
+        backend: Which backend to run; see [`backend`][ofoldx.modules.backend].
 
     Returns:
         ``[..., N_token, C]`` token features; tokens with no atoms stay zero.
@@ -49,7 +49,7 @@ def scatter_mean_to_tokens(
         num_tokens=num_tokens,
         atom_mask=atom_mask,
         eps=1.0,
-        operator_backend=operator_backend,
+        backend=backend,
     )
 
 
@@ -101,14 +101,12 @@ class TokenToAtomBroadcast(nn.Module):
     vector to all of its atoms, so a per-token signal can condition atom-level layers.
 
     Args:
-        operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
+        backend: Which backend to run; see [`backend`][ofoldx.modules.backend].
     """
 
-    def __init__(self, operator_backend: str = "auto") -> None:
+    def __init__(self, backend: str = "auto") -> None:
         super().__init__()
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
 
     def forward(self, token_hidden: Tensor, atom_to_token: Tensor) -> Tensor:
         r"""
@@ -123,7 +121,7 @@ class TokenToAtomBroadcast(nn.Module):
         """
 
         atom_to_token = _expand_atom_axis(atom_to_token, tuple(token_hidden.shape[:-2]))
-        return dispatch_token_to_atom_broadcast(token_hidden, atom_to_token, operator_backend=self.operator_backend)
+        return dispatch_token_to_atom_broadcast(token_hidden, atom_to_token, backend=self.backend)
 
 
 class TokenPairToAtomPairBroadcast(nn.Module):
@@ -177,15 +175,13 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
     Args:
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        operator_backend: Which operator backend to run; see [`backend`][ofoldx.modules.backend].
+        backend: Which backend to run; see [`backend`][ofoldx.modules.backend].
     """
 
-    def __init__(self, num_query_atoms: int = 32, num_key_atoms: int = 128, operator_backend: str = "auto") -> None:
+    def __init__(self, num_query_atoms: int = 32, num_key_atoms: int = 128, backend: str = "auto") -> None:
         super().__init__()
         self.windowing = LocalAtomWindowing(num_query_atoms=num_query_atoms, num_key_atoms=num_key_atoms)
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
 
     def forward(self, token_pair: Tensor, atom_to_token: Tensor, num_valid_atoms: int | None = None) -> Tensor:
         r"""
@@ -207,7 +203,7 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
             atom_to_token,
             n_queries=self.windowing.num_query_atoms,
             n_keys=self.windowing.num_key_atoms,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
             num_valid_atoms=num_valid_atoms,
         )
 

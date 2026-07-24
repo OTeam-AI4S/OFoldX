@@ -24,11 +24,14 @@ from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm
 from ...modules.dropout import RowwiseDropout
 from ...modules.head import DistogramHead, tm_bin_weights
-from ...modules.trunk import EvoformerStack
 from ...modules.trunk.evoformer import (
     AlphaFold2TriangleAttention,
     AlphaFold2TriangleMultiplication,
+    EvoformerStack,
     EvoformerTransition,
+    ExtraMsaEvoformerStack,
+    OuterProductFirstEvoformerStack,
+    OuterProductFirstExtraMsaEvoformerStack,
 )
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold2Config, AlphaFold2EvoformerConfig, AlphaFold2MultimerConfig
@@ -107,7 +110,7 @@ class AlphaFold2Model(Model):
                 transition_expansion=template_config.template_pair_stack.transition.expansion,
                 dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
                 num_attention_heads=template_config.attention.num_heads,
-                operator_backend="auto",
+                backend="auto",
             )
             if template_config.embed_torsion_angles:
                 self.template_msa_embedder = AlphaFold2TemplateMsaEmbedder(
@@ -118,12 +121,17 @@ class AlphaFold2Model(Model):
             extra_msa_feature_size=input_config.extra_msa_feature_size,
             extra_msa_size=evoformer_config.extra_msa_size,
         )
-        self.extra_msa_stack = EvoformerStack(
+        extra_msa_stack_type = (
+            OuterProductFirstExtraMsaEvoformerStack if block_config.outer_product_mean.first else ExtraMsaEvoformerStack
+        )
+        evoformer_stack_type = (
+            OuterProductFirstEvoformerStack if block_config.outer_product_mean.first else EvoformerStack
+        )
+        self.extra_msa_stack = extra_msa_stack_type(
             num_blocks=evoformer_config.num_extra_msa_blocks,
             msa_size=evoformer_config.extra_msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
@@ -132,15 +140,13 @@ class AlphaFold2Model(Model):
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
-            is_extra_msa=True,
-            operator_backend="auto",
+            backend="auto",
         )
-        self.evoformer_stack = EvoformerStack(
+        self.evoformer_stack = evoformer_stack_type(
             num_blocks=evoformer_config.num_blocks,
             msa_size=evoformer_config.msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
@@ -149,8 +155,7 @@ class AlphaFold2Model(Model):
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
-            is_extra_msa=False,
-            operator_backend="auto",
+            backend="auto",
         )
         self.single_projection = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
         self.structure_module = AlphaFold2StructureModule(
@@ -651,7 +656,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                 ),
                 transition_expansion=template_config.template_pair_stack.transition.expansion,
                 dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
-                operator_backend="auto",
+                backend="auto",
             )
             self.template_msa_embedder = AlphaFold2MultimerTemplateMsaEmbedder(
                 msa_size=evoformer_config.msa_size,
@@ -661,12 +666,17 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             extra_msa_feature_size=input_config.extra_msa_feature_size,
             extra_msa_size=evoformer_config.extra_msa_size,
         )
-        self.extra_msa_stack = EvoformerStack(
+        extra_msa_stack_type = (
+            OuterProductFirstExtraMsaEvoformerStack if block_config.outer_product_mean.first else ExtraMsaEvoformerStack
+        )
+        evoformer_stack_type = (
+            OuterProductFirstEvoformerStack if block_config.outer_product_mean.first else EvoformerStack
+        )
+        self.extra_msa_stack = extra_msa_stack_type(
             num_blocks=evoformer_config.num_extra_msa_blocks,
             msa_size=evoformer_config.extra_msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
@@ -675,15 +685,13 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
-            is_extra_msa=True,
-            operator_backend="auto",
+            backend="auto",
         )
-        self.evoformer_stack = EvoformerStack(
+        self.evoformer_stack = evoformer_stack_type(
             num_blocks=evoformer_config.num_blocks,
             msa_size=evoformer_config.msa_size,
             pair_size=evoformer_config.pair_size,
             outer_product_hidden_size=block_config.outer_product_mean.hidden_size,
-            outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
             triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
@@ -692,8 +700,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_transition_expansion=block_config.pair_transition.expansion,
             msa_dropout=block_config.msa_row_attention_with_pair_bias.dropout,
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
-            is_extra_msa=False,
-            operator_backend="auto",
+            backend="auto",
         )
         self.single_projection = nn.Linear(evoformer_config.msa_size, evoformer_config.single_size)
         self.structure_module = AlphaFold2MultimerStructureModule(
@@ -1080,7 +1087,7 @@ class AlphaFold2TemplateEmbedder(nn.Module):
         transition_expansion: int,
         dropout: float,
         num_attention_heads: int,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.single_template_embedder = AlphaFold2SingleTemplateEmbedder(
@@ -1096,7 +1103,7 @@ class AlphaFold2TemplateEmbedder(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             transition_expansion=transition_expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.attention = GatedMultiheadAttention(
             hidden_size=query_size,
@@ -1108,7 +1115,7 @@ class AlphaFold2TemplateEmbedder(nn.Module):
             query_bias=False,
             output_bias=True,
             gating=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(self, query_embedding: Tensor, input: AlphaFold2Input, *, pair_mask: Tensor) -> Tensor:
@@ -1159,7 +1166,7 @@ class AlphaFold2MultimerTemplateEmbedder(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.single_template_embedder = AlphaFold2MultimerSingleTemplateEmbedder(
@@ -1175,7 +1182,7 @@ class AlphaFold2MultimerTemplateEmbedder(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             transition_expansion=transition_expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.output_projection = nn.Linear(template_size, query_size)
 
@@ -1458,7 +1465,7 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.num_distogram_bins = num_distogram_bins
@@ -1476,9 +1483,9 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             transition_expansion=transition_expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.output_norm = LayerNorm(template_size, operator_backend=operator_backend)
+        self.output_norm = LayerNorm(template_size, backend=backend)
 
     def forward(self, template_batch: AlphaFold2TemplateBatch, *, pair_mask: Tensor) -> Tensor:
         features, template_pair_mask = self._features(template_batch)
@@ -1544,7 +1551,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.num_distogram_bins = num_distogram_bins
@@ -1560,7 +1567,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         self.unit_vector_z_projection = nn.Linear(1, template_size)
         self.backbone_pair_mask_projection = nn.Linear(1, template_size)
         self.query_pair_projection = nn.Linear(query_size, template_size)
-        self.query_embedding_norm = LayerNorm(query_size, operator_backend=operator_backend)
+        self.query_embedding_norm = LayerNorm(query_size, backend=backend)
         self.template_pair_stack = AlphaFold2MultimerTemplatePairStack(
             num_blocks=num_blocks,
             pair_size=template_size,
@@ -1569,9 +1576,9 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             transition_expansion=transition_expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.output_norm = LayerNorm(template_size, operator_backend=operator_backend)
+        self.output_norm = LayerNorm(template_size, backend=backend)
 
     def forward(
         self,
@@ -1704,7 +1711,7 @@ class AlphaFold2TemplatePairStack(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1717,7 +1724,7 @@ class AlphaFold2TemplatePairStack(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     transition_expansion=transition_expansion,
                     dropout=dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1745,32 +1752,32 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)
@@ -1804,7 +1811,7 @@ class AlphaFold2MultimerTemplatePairStack(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -1817,7 +1824,7 @@ class AlphaFold2MultimerTemplatePairStack(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     transition_expansion=transition_expansion,
                     dropout=dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1843,32 +1850,32 @@ class AlphaFold2MultimerTemplatePairBlock(nn.Module):
         num_triangle_attention_heads: int,
         transition_expansion: int,
         dropout: float,
-        operator_backend: str,
+        backend: str,
     ) -> None:
         super().__init__()
         self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
         self.rowwise_dropout = RowwiseDropout(dropout)

@@ -11,7 +11,7 @@ from ofoldx.modules.backend import LayerNorm
 class _Operator(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.operator_backend = "auto"
+        self.backend = "auto"
 
 
 class _Model(Model):
@@ -24,13 +24,13 @@ class _Model(Model):
         self.post_init()
 
 
-@pytest.mark.parametrize("backend", ["auto", "torch", "sdpa", "oops", "cueq", "apex", "deepspeed"])
-def test_set_backend_updates_nested_operator_owners(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["auto", "eager", "oops"])
+def test_set_backend_updates_nested_backend_owners(backend: str) -> None:
     model = _Model()
 
     returned = model.set_backend(backend)
 
     assert returned is model
     assert model.backend == backend
-    assert model.operator.operator_backend == backend
-    assert model.norm.operator_backend == backend
+    assert model.operator.backend == backend
+    assert model.norm.backend == backend

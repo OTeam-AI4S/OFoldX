@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ._oops import oops_kernel
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_atom_to_token_mean = oops_kernel("atom_to_token_mean")
 _oops_token_pair_to_atom_window_gather = oops_kernel("token_pair_to_atom_window_gather")
@@ -27,7 +27,7 @@ def atom_to_token_mean(
     num_tokens: int,
     atom_mask: Tensor | None,
     eps: float,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Masked mean-pool atom features onto tokens on the selected backend.
@@ -38,14 +38,14 @@ def atom_to_token_mean(
         num_tokens: Number of output tokens.
         atom_mask: Optional ``[..., N_atom]`` valid-atom mask; padded atoms drop from sum and count.
         eps: Denominator floor (``denom.clamp(min=eps)``).
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., N_token, C]`` token features.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(atom, atom_to_token, atom_mask),
         supported=_SUPPORTED,
         public_default="eager",
@@ -74,21 +74,21 @@ def atom_to_token_mean(
     return out / denom.clamp(min=eps)
 
 
-def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, operator_backend: str) -> Tensor:
+def token_to_atom_broadcast(token: Tensor, atom_to_token: Tensor, *, backend: str) -> Tensor:
     r"""
     Broadcast token features to atoms by gathering each atom's token row on the selected backend.
 
     Args:
         token: ``[..., N_token, C]`` token features.
         atom_to_token: ``[..., N_atom]`` long token index for each atom.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         ``[..., N_atom, C]`` atom features.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(token, atom_to_token),
         supported=_SUPPORTED,
         public_default="eager",
@@ -106,7 +106,7 @@ def token_pair_to_atom_window_gather(
     *,
     n_queries: int,
     n_keys: int,
-    operator_backend: str,
+    backend: str,
     num_valid_atoms: int | None = None,
 ) -> Tensor:
     r"""
@@ -118,7 +118,7 @@ def token_pair_to_atom_window_gather(
             broadcasted map lets OOps select its Triton gather when supported.
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
         num_valid_atoms: Number of contiguous valid atoms at the start of the atom
             axis. When provided, key windows are shifted away from padding where
             possible.
@@ -127,8 +127,8 @@ def token_pair_to_atom_window_gather(
         ``[..., N_blocks, n_queries, n_keys, C]`` local atom-pair features.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(token_pair, atom_to_token),
         supported=_SUPPORTED,
         public_default="eager",

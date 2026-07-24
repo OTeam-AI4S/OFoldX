@@ -12,7 +12,7 @@ from ..attention import TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
 from ..backend import outer_product_mean as dispatch_outer_product_mean
 from ..backend import pair_weighted_average as dispatch_pair_weighted_average
-from ..backend import resolve_config_operator_backend
+from ..backend import resolve_config_backend
 from ..dropout import RowwiseDropout
 from ..functional import pair_mask_from_msa_mask, pair_mask_from_token_mask
 from ..transition import Transition
@@ -41,7 +41,7 @@ class MsaTrunk(nn.Module):
         expansion: Expansion factor of every transition.
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -59,7 +59,7 @@ class MsaTrunk(nn.Module):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
@@ -76,7 +76,7 @@ class MsaTrunk(nn.Module):
                 expansion=expansion,
                 msa_dropout=msa_dropout,
                 pair_dropout=pair_dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks - 1)
         ]
@@ -91,7 +91,7 @@ class MsaTrunk(nn.Module):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     expansion=expansion,
                     pair_dropout=pair_dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
             )
         self.num_blocks = num_blocks
@@ -160,7 +160,7 @@ class CategoricalMsaTrunk(nn.Module):
         triangle_attention_hidden_size: Per-head width of each triangle-attention update.
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Feed-forward expansion factor of every transition.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -180,7 +180,7 @@ class CategoricalMsaTrunk(nn.Module):
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -200,7 +200,7 @@ class CategoricalMsaTrunk(nn.Module):
                 triangle_attention_hidden_size=triangle_attention_hidden_size,
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 expansion=expansion,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -276,7 +276,7 @@ class MsaBlock(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Feed-forward expansion factor of every transition.
         divide_before_projection: Whether the outer-product mean divides before its projection.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -292,7 +292,7 @@ class MsaBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         divide_before_projection: bool = True,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pair_weighted_averaging = MsaPairWeightedAveraging(
@@ -300,15 +300,15 @@ class MsaBlock(nn.Module):
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
             head_dim=msa_head_dim,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.msa_transition = Transition(msa_size, expansion=expansion, operator_backend=operator_backend)
+        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
             divide_before_projection=divide_before_projection,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = TrianglePairUpdateBlock(
             pair_size=pair_size,
@@ -316,7 +316,7 @@ class MsaBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.msa_dropout = RowwiseDropout(msa_dropout)
 
@@ -361,7 +361,7 @@ class MsaPairBlock(nn.Module):
         expansion: Feed-forward expansion factor of every transition.
         msa_dropout: Row-wise dropout probability on the MSA residual.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -376,14 +376,14 @@ class MsaPairBlock(nn.Module):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.msa_update = MsaUpdateBlock(
             msa_size=msa_size,
@@ -391,7 +391,7 @@ class MsaPairBlock(nn.Module):
             num_attention_heads=num_msa_attention_heads,
             expansion=expansion,
             dropout=msa_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = TrianglePairUpdateBlock(
             pair_size=pair_size,
@@ -400,7 +400,7 @@ class MsaPairBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -447,7 +447,7 @@ class FinalMsaPairBlock(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Expansion factor of every transition.
         pair_dropout: Row-wise dropout probability on each pair residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -460,14 +460,14 @@ class FinalMsaPairBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = TrianglePairUpdateBlock(
             pair_size=pair_size,
@@ -476,7 +476,7 @@ class FinalMsaPairBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -518,7 +518,7 @@ class MsaUpdateBlock(nn.Module):
         num_attention_heads: Number of heads in the MSA pair-weighted averaging.
         expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability on the pair-weighted averaging residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -528,17 +528,17 @@ class MsaUpdateBlock(nn.Module):
         num_attention_heads: int = 8,
         expansion: int = 4,
         dropout: float = 0.15,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.msa_pair_weighted_averaging = MsaPairWeightedAveraging(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.transition = Transition(msa_size, expansion=expansion, operator_backend=operator_backend)
+        self.transition = Transition(msa_size, expansion=expansion, backend=backend)
 
     def forward(self, msa: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -569,7 +569,7 @@ class TrianglePairUpdateStack(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability applied to each residual.
-        operator_backend: Operator backend selector forwarded to every block.
+        backend: Backend selector forwarded to every block.
     """
 
     def __init__(
@@ -581,7 +581,7 @@ class TrianglePairUpdateStack(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -593,7 +593,7 @@ class TrianglePairUpdateStack(nn.Module):
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 expansion=expansion,
                 dropout=dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -629,7 +629,7 @@ class TrianglePairUpdateBlock(nn.Module):
         num_triangle_attention_heads: Number of heads in triangle attention.
         expansion: Expansion factor of the transition.
         dropout: Row-wise dropout probability applied to each residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -640,35 +640,35 @@ class TrianglePairUpdateBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.triangle_multiplication_outgoing = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_starting_node = TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_ending_node = TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -728,7 +728,7 @@ class MsaPairWeightedAveraging(nn.Module):
         pair_size: Width of the pair representation used to compute the per-head weights.
         num_attention_heads: Number of averaging heads.
         head_dim: Per-head width; defaults to ``msa_size // num_attention_heads`` when ``None``.
-        operator_backend: Operator backend selector; resolves to ``"oops"`` or ``"eager"``.
+        backend: Backend selector; resolves to ``"oops"`` or ``"eager"``.
 
     Raises:
         ValueError: If ``head_dim`` is ``None`` and ``msa_size`` is not divisible by
@@ -741,12 +741,10 @@ class MsaPairWeightedAveraging(nn.Module):
         pair_size: int = 128,
         num_attention_heads: int = 8,
         head_dim: int | None = None,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         if head_dim is None:
             if msa_size % num_attention_heads != 0:
                 raise ValueError(
@@ -757,9 +755,9 @@ class MsaPairWeightedAveraging(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         inner_size = num_attention_heads * head_dim
-        self.msa_norm = LayerNorm(msa_size, operator_backend=operator_backend)
+        self.msa_norm = LayerNorm(msa_size, backend=backend)
         self.value_projection = nn.Linear(msa_size, inner_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.gate_projection = nn.Linear(msa_size, inner_size, bias=False)
         self.output_projection = nn.Linear(inner_size, msa_size, bias=False)
@@ -799,7 +797,7 @@ class MsaPairWeightedAveraging(nn.Module):
             head_dim=self.head_dim,
             msa_norm_eps=self.msa_norm.eps,
             pair_norm_eps=self.pair_norm.eps,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )
 
 
@@ -819,7 +817,7 @@ class OuterProductMean(nn.Module):
         pair_size: Width of the produced pair update.
         eps: Floor added to (or applied via ``clamp`` on) the per-pair sequence count.
         divide_before_projection: Whether to divide by the sequence count before the output projection.
-        operator_backend: Operator backend selector; resolves to ``"oops"`` or ``"eager"``.
+        backend: Backend selector; resolves to ``"oops"`` or ``"eager"``.
     """
 
     def __init__(
@@ -829,15 +827,13 @@ class OuterProductMean(nn.Module):
         pair_size: int = 128,
         eps: float = 1e-3,
         divide_before_projection: bool = False,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         self.eps = eps
         self.divide_before_projection = divide_before_projection
-        self.msa_norm = LayerNorm(msa_size, operator_backend=operator_backend)
+        self.msa_norm = LayerNorm(msa_size, backend=backend)
         self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
         self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
@@ -872,5 +868,5 @@ class OuterProductMean(nn.Module):
             norm_eps=self.msa_norm.eps,
             denom_eps=self.eps,
             divide_before_projection=self.divide_before_projection,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )

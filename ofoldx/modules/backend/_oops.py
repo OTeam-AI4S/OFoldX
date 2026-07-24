@@ -49,7 +49,7 @@ def oops_kernel(name: str) -> Callable[..., object]:
 
     def _unavailable(*_args: object, **_kwargs: object) -> object:
         raise OOpsUnsupportedError(
-            f"operator_backend='oops' requires the optional 'oops' package (kernel {name!r} is unavailable)"
+            f"backend='oops' requires the optional 'oops' package (kernel {name!r} is unavailable)"
         )
 
     return _unavailable

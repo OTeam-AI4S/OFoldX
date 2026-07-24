@@ -56,7 +56,7 @@ from ...data.structure import Structure
 from ...model import Model
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm, _oops
-from ...modules.backend.resolve import resolve_tensor_operator_backend
+from ...modules.backend.resolve import resolve_tensor_backend
 from ...modules.diffusion.ddpm import ddpm_forward_step, ddpm_posterior
 from ...modules.diffusion.igso3 import calculate_igso3, so3_exp_map
 from ...modules.dropout import StructuredDropout
@@ -668,7 +668,7 @@ class RfDiffusionTemplateEmbedder(nn.Module):
             query_bias=False,
             output_bias=True,
             gating=False,
-            operator_backend="eager",
+            backend="eager",
         )
         self.pair_attention = GatedMultiheadAttention(
             hidden_size=pair_size,
@@ -680,7 +680,7 @@ class RfDiffusionTemplateEmbedder(nn.Module):
             query_bias=False,
             output_bias=True,
             gating=False,
-            operator_backend="eager",
+            backend="eager",
         )
         self.reset_parameters()
 
@@ -1792,7 +1792,7 @@ class RfDiffusionSe3TensorProductConvolution(nn.Module):
         self.freq_sum = freq_sum
         self.channels_out = channels_out
         self.channels_in = channels_in
-        self.operator_backend = "auto"
+        self.backend = "auto"
         self.radial_profile = RfDiffusionSe3RadialProfile(
             num_freq=freq_sum,
             channels_in=channels_in,
@@ -1807,7 +1807,7 @@ class RfDiffusionSe3TensorProductConvolution(nn.Module):
         )
         if basis is None:
             return radial_weights @ features
-        return _weighted_tensor_product(features, basis, radial_weights, operator_backend=self.operator_backend)
+        return _weighted_tensor_product(features, basis, radial_weights, backend=self.backend)
 
 
 class RfDiffusionSe3Linear(nn.Module):
@@ -1881,7 +1881,7 @@ class RfDiffusionSe3Convolution(nn.Module):
         self.self_interaction = self_interaction
         self.max_degree = max_degree
         self.allow_fused_output = allow_fused_output
-        self.operator_backend = "auto"
+        self.backend = "auto"
         channels_in_set = {channels + fiber_edge[degree] * (degree > 0) for degree, channels in self.fiber_in.items()}
         channels_out_set = set(self.fiber_out.values())
         unique_channels_in = len(channels_in_set) == 1
@@ -1971,7 +1971,7 @@ class RfDiffusionSe3Convolution(nn.Module):
                     out[str(degree_out)],
                     graph.row_offsets,
                     num_segments=graph.num_nodes,
-                    operator_backend=self.operator_backend,
+                    backend=self.backend,
                 )
         return out
 
@@ -1986,7 +1986,7 @@ class RfDiffusionSe3Attention(nn.Module):
         self.num_heads = num_heads
         self.key_fiber = key_fiber
         self.value_fiber = value_fiber
-        self.operator_backend = "auto"
+        self.backend = "auto"
 
     def forward(
         self,
@@ -2006,7 +2006,7 @@ class RfDiffusionSe3Attention(nn.Module):
         )
         edge_weights = cast(
             Tensor,
-            _segment_softmax_csr(edge_weights, graph.row_offsets, operator_backend=self.operator_backend),
+            _segment_softmax_csr(edge_weights, graph.row_offsets, backend=self.backend),
         )[..., None, None]
 
         value_heads = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
@@ -2016,7 +2016,7 @@ class RfDiffusionSe3Attention(nn.Module):
                 edge_weights * value_heads,
                 graph.row_offsets,
                 num_segments=graph.num_nodes,
-                operator_backend=self.operator_backend,
+                backend=self.backend,
             ),
         )
         feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])
@@ -2101,7 +2101,7 @@ class RfDiffusionSe3Transformer(nn.Module):
         self.fiber_edge = fiber_edge
         self.num_heads = num_heads
         self.channels_div = channels_div
-        self.operator_backend = "auto"
+        self.backend = "auto"
         self.max_degree = max(*fiber_in.degrees, *fiber_hidden.degrees, *fiber_out.degrees)
         blocks = []
         for _ in range(num_blocks):
@@ -2139,7 +2139,7 @@ class RfDiffusionSe3Transformer(nn.Module):
             _se3_basis(
                 graph.relative_positions,
                 max_degree=self.max_degree,
-                operator_backend=self.operator_backend,
+                backend=self.backend,
             ),
         )
         edge_features = _populated_edge_features(graph.relative_positions, edge_features)
@@ -3975,14 +3975,14 @@ def _se3_basis(
     relative_pos: Tensor,
     max_degree: int,
     *,
-    operator_backend: str = "auto",
+    backend: str = "auto",
 ) -> dict[str, Tensor]:
     r"""
     Dispatch the exact RFdiffusion SE(3)-basis contract.
     """
 
-    selected = resolve_tensor_operator_backend(
-        operator_backend,
+    selected = resolve_tensor_backend(
+        backend,
         tensors=(relative_pos,),
         supported=("oops", "eager"),
         public_default="eager",
@@ -4005,14 +4005,14 @@ def _segment_sum_csr(
     row_offsets: Tensor,
     *,
     num_segments: int | None = None,
-    operator_backend: str = "auto",
+    backend: str = "auto",
 ) -> Tensor:
     r"""
     Dispatch the exact RFdiffusion CSR-sum contract.
     """
 
-    selected = resolve_tensor_operator_backend(
-        operator_backend,
+    selected = resolve_tensor_backend(
+        backend,
         tensors=(values, row_offsets),
         supported=("oops", "eager"),
         public_default="eager",
@@ -4033,14 +4033,14 @@ def _segment_softmax_csr(
     logits: Tensor,
     row_offsets: Tensor,
     *,
-    operator_backend: str = "auto",
+    backend: str = "auto",
 ) -> Tensor:
     r"""
     Dispatch the exact RFdiffusion CSR-softmax contract.
     """
 
-    selected = resolve_tensor_operator_backend(
-        operator_backend,
+    selected = resolve_tensor_backend(
+        backend,
         tensors=(logits, row_offsets),
         supported=("oops", "eager"),
         public_default="eager",
@@ -4055,14 +4055,14 @@ def _weighted_tensor_product(
     basis: Tensor,
     radial_weights: Tensor,
     *,
-    operator_backend: str = "auto",
+    backend: str = "auto",
 ) -> Tensor:
     r"""
     Dispatch the exact RFdiffusion weighted tensor-product contract.
     """
 
-    selected = resolve_tensor_operator_backend(
-        operator_backend,
+    selected = resolve_tensor_backend(
+        backend,
         tensors=(features, basis, radial_weights),
         supported=("oops", "eager"),
         public_default="eager",

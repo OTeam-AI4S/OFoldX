@@ -7,7 +7,7 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 from .adaptive_norm import AdaptiveLayerNorm
-from .backend import LayerNorm, resolve_config_operator_backend
+from .backend import LayerNorm, resolve_config_backend
 from .backend import transition as dispatch_transition
 from .feed_forward import SwiGluFeedForward
 
@@ -25,16 +25,14 @@ class Transition(nn.Module):
     Args:
         hidden_size: Input and output hidden width.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
-        operator_backend: Which operator backend to run; see [ofoldx.modules.backend][].
+        backend: Which backend to run; see [ofoldx.modules.backend][].
     """
 
-    def __init__(self, hidden_size: int, expansion: int = 4, operator_backend: str = "auto") -> None:
+    def __init__(self, hidden_size: int, expansion: int = 4, backend: str = "auto") -> None:
         super().__init__()
-        self.operator_backend = resolve_config_operator_backend(
-            operator_backend, supported=("oops", "eager"), public_default="eager"
-        )
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         expanded_size = expansion * hidden_size
-        self.input_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.input_norm = LayerNorm(hidden_size, backend=backend)
         self.feed_forward = SwiGluFeedForward(hidden_size, expanded_size)
 
     def forward(self, hidden: Tensor) -> Tensor:
@@ -56,7 +54,7 @@ class Transition(nn.Module):
             up_weight=self.feed_forward.value_projection.weight,
             down_weight=self.feed_forward.output_projection.weight,
             eps=self.input_norm.eps,
-            operator_backend=self.operator_backend,
+            backend=self.backend,
         )
 
 
@@ -73,7 +71,7 @@ class ConditionedTransition(nn.Module):
         hidden_size: Input and output hidden width.
         conditioning_size: Conditioning tensor width.
         expansion: Hidden expansion factor; the inner width is ``expansion * hidden_size``.
-        operator_backend: Public backend request forwarded to the adaptive norm.
+        backend: Public backend request forwarded to the adaptive norm.
     """
 
     def __init__(
@@ -81,14 +79,14 @@ class ConditionedTransition(nn.Module):
         hidden_size: int = 768,
         conditioning_size: int = 384,
         expansion: int = 2,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         expanded_size = expansion * hidden_size
         self.conditioned_norm = AdaptiveLayerNorm(
             hidden_size,
             conditioning_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.feed_forward = SwiGluFeedForward(hidden_size, expanded_size)
         self.conditioning_gate_projection = nn.Linear(conditioning_size, hidden_size)

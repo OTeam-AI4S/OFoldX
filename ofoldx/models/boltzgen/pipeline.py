@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from ...data.components import get_component
+from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...pipelines import CompositePair, CompositePipeline, PipelineProcessor, resolve_generator
@@ -180,6 +181,8 @@ class BoltzGenPipeline(CompositePipeline):
         placement: BoltzGenPlacements | None = None,
         total_len: int | None = None,
         conditions: Sequence[BoltzGenSchema] = (),
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
         num_candidates: int = 1,
         num_sampling_steps: int | None = None,
         temperature: float | None = None,
@@ -195,6 +198,8 @@ class BoltzGenPipeline(CompositePipeline):
             placement: Optional topology of existing and generated molecular segments.
             total_len: Total token budget used to realize generated segments.
             conditions: BoltzGen conditioning records.
+            msa: Optional MSA evidence or alignment path.
+            templates: Optional structural templates.
             num_candidates: Number of structure and sequence candidates.
             num_sampling_steps: Number of coordinate-diffusion steps. ``None`` uses
                 the model configuration.
@@ -216,6 +221,8 @@ class BoltzGenPipeline(CompositePipeline):
             placement=placement,
             total_len=total_len,
             conditions=tuple(conditions),
+            msa=msa,
+            templates=templates,
             generator=generator,
         )
         design_output = self.design_model.design(

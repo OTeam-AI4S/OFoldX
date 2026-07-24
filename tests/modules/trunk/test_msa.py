@@ -14,7 +14,7 @@ def test_outer_product_mean(divide_before_projection: bool) -> None:
         msa_size=4,
         hidden_size=2,
         pair_size=5,
-        operator_backend="eager",
+        backend="eager",
         divide_before_projection=divide_before_projection,
     )
     with torch.no_grad():  # non-zero bias so the divide/project branches place it differently
@@ -48,7 +48,7 @@ def test_outer_product_mean(divide_before_projection: bool) -> None:
 
 def test_pair_weighted_average() -> None:
     torch.manual_seed(3)
-    module = MsaPairWeightedAveraging(msa_size=4, pair_size=5, num_attention_heads=2, operator_backend="eager")
+    module = MsaPairWeightedAveraging(msa_size=4, pair_size=5, num_attention_heads=2, backend="eager")
     # zero the pair projection so logits vanish and softmax-over-valid-j becomes a hand-computable uniform average
     with torch.no_grad():
         module.pair_projection.weight.zero_()
@@ -84,7 +84,7 @@ def test_triangle_pair_update_stack() -> None:
         triangle_attention_hidden_size=2,
         num_triangle_attention_heads=2,
         dropout=0.0,
-        operator_backend="eager",
+        backend="eager",
     )
 
     output = stack(pair)

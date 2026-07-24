@@ -27,7 +27,7 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
         expansion: Expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -41,7 +41,7 @@ class PairformerStack(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
@@ -56,7 +56,7 @@ class PairformerStack(nn.Module):
                     num_pair_attention_heads=num_pair_attention_heads,
                     expansion=expansion,
                     dropout=dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
                 for _ in range(num_blocks)
             ],
@@ -96,7 +96,7 @@ class PairformerBlock(nn.Module):
         num_pair_attention_heads: Number of heads in the pair-biased single self-attention.
         expansion: Feed-forward expansion factor of every transition.
         dropout: Row-wise dropout probability applied to each pair residual.
-        operator_backend: Operator backend selector forwarded to every submodule.
+        backend: Backend selector forwarded to every submodule.
     """
 
     def __init__(
@@ -109,7 +109,7 @@ class PairformerBlock(nn.Module):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.pair_update = TrianglePairUpdateBlock(
@@ -119,15 +119,15 @@ class PairformerBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_attention = PairBiasedSelfAttention(
             hidden_size=single_size,
             pair_size=pair_size,
             num_attention_heads=num_pair_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         r"""

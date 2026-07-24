@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ._oops import oops_kernel
-from .resolve import resolve_tensor_operator_backend
+from .resolve import resolve_tensor_backend
 
 _oops_factorized_pair_linear = oops_kernel("factorized_pair_linear")
 
@@ -21,7 +21,7 @@ def factorized_pair_linear(
     bias: Tensor | None,
     *,
     pair_prefix_size: int,
-    operator_backend: str,
+    backend: str,
 ) -> Tensor:
     r"""
     Project pair features and one token feature track used on both pair axes.
@@ -35,14 +35,14 @@ def factorized_pair_linear(
         weight: Linear projection weight with shape ``[C, P + 2 * T]``.
         bias: Optional linear projection bias with shape ``[C]``.
         pair_prefix_size: Number of pair-feature columns before the token blocks.
-        operator_backend: Operator provider; see [ofoldx.modules.backend][].
+        backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
         Projected pair features with shape ``[..., N, N, C]``.
     """
 
-    backend = resolve_tensor_operator_backend(
-        operator_backend,
+    backend = resolve_tensor_backend(
+        backend,
         tensors=(pair_features, token_features, weight, bias),
         supported=("oops", "eager"),
         public_default="eager",

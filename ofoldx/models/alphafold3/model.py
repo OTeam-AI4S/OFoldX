@@ -783,7 +783,7 @@ class AlphaFold3ConfidenceHead(nn.Module):
         expansion: int = 4,
         dropout: float = 0.0,
         single_max_abs: float | None = 512.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
@@ -804,14 +804,14 @@ class AlphaFold3ConfidenceHead(nn.Module):
             num_pair_attention_heads=num_pair_attention_heads,
             expansion=expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_projector = AtomConfidenceProjector(
             single_size=single_size,
             num_plddt_bins=num_plddt_bins,
             num_resolved_bins=num_resolved_bins,
             max_atoms_per_token=max_atoms_per_token,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_projector = PostProjectionSymmetricPairConfidenceProjector(
             pair_size=pair_size,
@@ -878,7 +878,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
         num_atom_decoder_attention_heads: int = 4,
         num_query_atoms: int = 32,
         num_key_atoms: int = 128,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
@@ -888,7 +888,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
             single_conditioning_size=single_size + token_feature_size,
             single_size=single_size,
             sigma_data=sigma_data,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_encoder = CoordinateAtomToTokenEncoder(
             token_hidden_size=token_hidden_size,
@@ -901,7 +901,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             atom_feature_size=atom_feature_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.token_refiner = DenoisingTokenRefiner(
             num_blocks=num_encoder_blocks,
@@ -909,7 +909,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
             token_hidden_size=token_hidden_size,
             single_size=single_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.atom_decoder = TokenToAtomDecoder(
             token_hidden_size=token_hidden_size,
@@ -919,7 +919,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
             num_attention_heads=num_atom_decoder_attention_heads,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
 
@@ -936,25 +936,19 @@ class AlphaFold3DenoisingConditioner(nn.Module):
         single_size: int = 384,
         noise_embedding_size: int = 256,
         sigma_data: float = 16.0,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.sigma_data = sigma_data
-        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, operator_backend=operator_backend)
+        self.pair_input_norm = LayerNorm(pair_input_size, bias=False, backend=backend)
         self.pair_projection = nn.Linear(pair_input_size, pair_size, bias=False)
-        self.pair_transitions = nn.ModuleList(
-            Transition(pair_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
-        )
-        self.single_conditioning_norm = LayerNorm(
-            single_conditioning_size, bias=False, operator_backend=operator_backend
-        )
+        self.pair_transitions = nn.ModuleList(Transition(pair_size, expansion=2, backend=backend) for _ in range(2))
+        self.single_conditioning_norm = LayerNorm(single_conditioning_size, bias=False, backend=backend)
         self.single_conditioning_projection = nn.Linear(single_conditioning_size, single_size, bias=False)
         self.noise_embedding = FrozenFourierEmbedding(noise_embedding_size)
-        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, operator_backend=operator_backend)
+        self.noise_norm = LayerNorm(noise_embedding_size, bias=False, backend=backend)
         self.noise_projection = nn.Linear(noise_embedding_size, single_size, bias=False)
-        self.single_transitions = nn.ModuleList(
-            Transition(single_size, expansion=2, operator_backend=operator_backend) for _ in range(2)
-        )
+        self.single_transitions = nn.ModuleList(Transition(single_size, expansion=2, backend=backend) for _ in range(2))
 
     def forward(
         self,
@@ -1067,7 +1061,7 @@ class AlphaFold3InputEmbeddings(nn.Module):
         )
 
 
-class AlphaFold3TriangleAttention(TriangleAttention):
+class AlphaFold3EndingNodeTriangleAttention(TriangleAttention):
     r"""
     AlphaFold 3 ending-node triangle attention with bias from the pre-transpose pair orientation.
     """
@@ -1082,7 +1076,7 @@ class AlphaFold3TriangleAttention(TriangleAttention):
             triangle_bias,
             pair_mask,
             projection=self.attention.projection,
-            operator_backend=self.attention.operator_backend,
+            backend=self.attention.backend,
         )
 
 
@@ -1099,35 +1093,35 @@ class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.triangle_multiplication_outgoing = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_attention_starting_node = TriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.triangle_attention_ending_node = AlphaFold3TriangleAttention(
+        self.triangle_attention_ending_node = AlphaFold3EndingNodeTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.rowwise_dropout = RowwiseDropout(dropout)
-        self.transition = Transition(pair_size, expansion=expansion, operator_backend=operator_backend)
+        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
 
 class AlphaFold3PairformerBlock(PairformerBlock):
@@ -1145,7 +1139,7 @@ class AlphaFold3PairformerBlock(PairformerBlock):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.pair_update = AlphaFold3TrianglePairUpdateBlock(
@@ -1155,15 +1149,15 @@ class AlphaFold3PairformerBlock(PairformerBlock):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.pair_attention = PairBiasedSelfAttention(
             hidden_size=single_size,
             pair_size=pair_size,
             num_attention_heads=num_pair_attention_heads,
-            operator_backend=operator_backend,
+            backend=backend,
         )
-        self.single_transition = Transition(single_size, expansion=expansion, operator_backend=operator_backend)
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
 
 
 class AlphaFold3PairformerStack(PairformerStack):
@@ -1182,7 +1176,7 @@ class AlphaFold3PairformerStack(PairformerStack):
         num_pair_attention_heads: int = 16,
         expansion: int = 4,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
@@ -1196,7 +1190,7 @@ class AlphaFold3PairformerStack(PairformerStack):
                 num_pair_attention_heads=num_pair_attention_heads,
                 expansion=expansion,
                 dropout=dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
@@ -1219,14 +1213,14 @@ class AlphaFold3MsaPairBlock(MsaPairBlock):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.msa_update = MsaUpdateBlock(
             msa_size=msa_size,
@@ -1234,7 +1228,7 @@ class AlphaFold3MsaPairBlock(MsaPairBlock):
             num_attention_heads=num_msa_attention_heads,
             expansion=expansion,
             dropout=msa_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = AlphaFold3TrianglePairUpdateBlock(
             pair_size=pair_size,
@@ -1243,7 +1237,7 @@ class AlphaFold3MsaPairBlock(MsaPairBlock):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
 
@@ -1262,14 +1256,14 @@ class AlphaFold3FinalMsaPairBlock(nn.Module):
         num_triangle_attention_heads: int = 4,
         expansion: int = 4,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.triangle_pair_update = AlphaFold3TrianglePairUpdateBlock(
             pair_size=pair_size,
@@ -1278,7 +1272,7 @@ class AlphaFold3FinalMsaPairBlock(nn.Module):
             num_triangle_attention_heads=num_triangle_attention_heads,
             expansion=expansion,
             dropout=pair_dropout,
-            operator_backend=operator_backend,
+            backend=backend,
         )
 
     def forward(
@@ -1314,7 +1308,7 @@ class AlphaFold3MsaTrunk(MsaTrunk):
         expansion: int = 4,
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
@@ -1331,7 +1325,7 @@ class AlphaFold3MsaTrunk(MsaTrunk):
                 expansion=expansion,
                 msa_dropout=msa_dropout,
                 pair_dropout=pair_dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks - 1)
         ]
@@ -1346,7 +1340,7 @@ class AlphaFold3MsaTrunk(MsaTrunk):
                     num_triangle_attention_heads=num_triangle_attention_heads,
                     expansion=expansion,
                     pair_dropout=pair_dropout,
-                    operator_backend=operator_backend,
+                    backend=backend,
                 )
             )
         self.num_blocks = num_blocks
@@ -1369,12 +1363,12 @@ class AlphaFold3TemplateEmbedder(TemplateEmbedder):
         num_triangle_attention_heads: int = 4,
         expansion: int = 2,
         dropout: float = 0.25,
-        operator_backend: str = "auto",
+        backend: str = "auto",
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
-        self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.template_projection = FactorizedPairLinear(
             pair_size=num_distogram_bins + 5,
@@ -1382,7 +1376,7 @@ class AlphaFold3TemplateEmbedder(TemplateEmbedder):
             output_size=hidden_size,
             pair_prefix_size=num_distogram_bins + 1,
             bias=False,
-            operator_backend=operator_backend,
+            backend=backend,
         )
         self.blocks = nn.ModuleList(
             AlphaFold3TrianglePairUpdateBlock(
@@ -1392,11 +1386,11 @@ class AlphaFold3TemplateEmbedder(TemplateEmbedder):
                 num_triangle_attention_heads=num_triangle_attention_heads,
                 expansion=expansion,
                 dropout=dropout,
-                operator_backend=operator_backend,
+                backend=backend,
             )
             for _ in range(num_blocks)
         )
-        self.hidden_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
+        self.hidden_norm = LayerNorm(hidden_size, backend=backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
 

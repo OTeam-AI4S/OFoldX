@@ -200,8 +200,9 @@ def upload_repository(
         commit_message: Optional commit message.
         allow_patterns: Optional local file patterns to upload.
         delete_patterns: Remote file patterns to delete before upload. By default,
-            repository-managed metadata and weights absent locally are removed while
-            user-owned files such as model cards are retained.
+            a complete upload removes repository-managed metadata and weights absent
+            locally, while a selective upload leaves unselected remote files untouched.
+            User-owned files such as model cards are retained in either case.
 
     Returns:
         Information about the created Hub commit.
@@ -211,7 +212,11 @@ def upload_repository(
 
     folder = Path(directory).expanduser()
     resolved_allow = None if allow_patterns is None else list(allow_patterns)
-    resolved_delete = None if delete_patterns is None else list(delete_patterns)
+    resolved_delete = (
+        None
+        if delete_patterns is None or (allow_patterns is not None and delete_patterns is MIRROR_REPOSITORY)
+        else list(delete_patterns)
+    )
 
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)

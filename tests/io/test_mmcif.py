@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from ofoldx.data import AtomSite, ChemicalAtom, ChemicalBond, ChemicalComponent, Molecule
+from ofoldx.data import ChemicalAtom, ChemicalBond, ChemicalComponent, Molecule
 from ofoldx.io import LossReport, read_structure, write_structure
 from tests.data.test_codec import _heterogeneous_structure
 
@@ -93,12 +94,7 @@ _struct_conn.pdbx_value_order
     assert {bond.site_a.atom_id, bond.site_b.atom_id} == {"CA", "C1"}
 
 
-@pytest.mark.xfail(
-    reason="reopened §3.5: source-evidence nonpolymer grouping (which HETATM occurrences share "
-    "one Molecule entity and their component order) is the reopened §3.5 classification decision",
-    strict=True,
-)
-def test_external_mmcif_groups_ordered_nonpolymer_positions_by_entity_and_asym(tmp_path: Path) -> None:
+def test_external_mmcif_rejects_conflicting_nonpolymer_definitions_for_one_entity(tmp_path: Path) -> None:
     path = tmp_path / "multi-component-ligand.cif"
     path.write_text(
         """data_ligand
@@ -144,16 +140,44 @@ HETATM 4 N N1 . LFT L 7 2 ? 4 0 0 1 10 0 12 LFT Z N1 1
         ),
     }
 
-    structure = read_structure(path, components=components)
+    with pytest.raises(ValueError, match="source entity ID .* has conflicting molecular definitions"):
+        read_structure(path, components=components)
 
-    assert len(structure.system.entities) == 1
-    assert len(structure.system.instances) == 1
-    molecule = next(iter(structure.system.entities.values()))
-    assert type(molecule) is Molecule
-    assert tuple(component.component_id for component in molecule.components) == ("RGT", "LFT")
-    assert structure.sites == (
-        AtomSite("L", 0, "N1"),
-        AtomSite("L", 0, "O1"),
-        AtomSite("L", 1, "C1"),
-        AtomSite("L", 1, "N1"),
+
+def test_canonical_mmcif_reads_coordinates_from_atom_site(tmp_path: Path) -> None:
+    from biotite.structure.io import pdbx
+
+    path = tmp_path / "coordinates.cif"
+    write_structure(_heterogeneous_structure(), path)
+    cif_file = pdbx.CIFFile.read(str(path))
+    coordinates = cif_file.block["atom_site"]["Cartn_x"].as_array()
+    coordinates[0] = 123.0
+    cif_file.block["atom_site"]["Cartn_x"] = pdbx.CIFColumn(coordinates)
+    cif_file.write(str(path))
+
+    restored = read_structure(path)
+
+    assert restored.coordinates[0, 0] == 123.0
+
+
+def test_mmcif_writes_finite_placeholder_for_masked_coordinates(tmp_path: Path) -> None:
+    structure = _heterogeneous_structure()
+    coordinates = structure.coordinates.copy()
+    coordinate_mask = structure.coordinate_mask.copy()
+    coordinates[0] = np.nan
+    coordinate_mask[0] = False
+    masked = type(structure)(
+        structure.system,
+        structure.sites,
+        coordinates,
+        coordinate_mask,
+        structure.occupancy,
+        structure.residue_numbers,
     )
+    path = tmp_path / "masked.cif"
+
+    write_structure(masked, path)
+    restored = read_structure(path)
+
+    assert not restored.coordinate_mask[0]
+    assert np.array_equal(restored.coordinates[0], np.zeros(3, dtype=restored.coordinates.dtype))

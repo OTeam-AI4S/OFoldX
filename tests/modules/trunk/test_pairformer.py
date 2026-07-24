@@ -14,7 +14,7 @@ def test_pairformer_block_and_stack() -> None:
         "num_triangle_attention_heads": 2,
         "num_pair_attention_heads": 2,
         "dropout": 0.0,
-        "operator_backend": "eager",
+        "backend": "eager",
     }
     single = torch.randn(1, 3, 8)
     pair = torch.randn(1, 3, 3, 4)

@@ -7,7 +7,7 @@ from ofoldx.modules.transition import ConditionedTransition, Transition
 
 class TestTransition:
     def test_returns_feed_forward_update(self) -> None:
-        transition = Transition(hidden_size=8, expansion=2, operator_backend="eager")
+        transition = Transition(hidden_size=8, expansion=2, backend="eager")
         hidden = torch.randn(2, 3, 8, requires_grad=True)
 
         output = transition(hidden)
