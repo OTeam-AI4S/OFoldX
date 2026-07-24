@@ -541,7 +541,7 @@ def _token_refiner_ref(rest: str, base: str) -> _OfficialParamRef | None:
             layer // 4,
             layer % 4,
         )
-    if match := re.match(r"token_encoder\.transformer\.layers\.(\d+)\.(.+)", rest):
+    if match := re.match(r"token_encoder\.transformer\.blocks\.(\d+)\.(.+)", rest):
         layer = int(match.group(1))
         return _conditioned_transformer_layer_ref(
             match.group(2),
@@ -629,7 +629,7 @@ def _atom_attention_stack_ref(rest: str, stack: str) -> _OfficialParamRef | None
         return _ref(_k(f"{root}/pair_input_layer_norm", "scale"))
     if match := re.match(r"bias_projections\.(\d+)\.weight", rest):
         return _ref(_k(f"{root}/pair_logits_projection", "weights"), "atom_pair_logits", int(match.group(1)))
-    if match := re.match(r"atom_attention\.transformer\.layers\.(\d+)\.(.+)", rest):
+    if match := re.match(r"atom_attention\.transformer\.blocks\.(\d+)\.(.+)", rest):
         return _conditioned_transformer_layer_ref(
             match.group(2),
             stack,
@@ -750,9 +750,9 @@ def _transition_ref(rest: str, block: int | None, scope: str) -> _OfficialParamR
     mapping = {
         "input_norm.weight": _ref(_k(f"{scope}/input_layer_norm", "scale"), "identity", *indices),
         "input_norm.bias": _ref(_k(f"{scope}/input_layer_norm", "offset"), "identity", *indices),
-        "gate_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_gate", *indices),
-        "value_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_value", *indices),
-        "output_projection.weight": _ref(_k(f"{scope}/transition2", "weights"), "linear", *indices),
+        "feed_forward.gate_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_gate", *indices),
+        "feed_forward.value_projection.weight": _ref(_k(f"{scope}/transition1", "weights"), "glu_value", *indices),
+        "feed_forward.output_projection.weight": _ref(_k(f"{scope}/transition2", "weights"), "linear", *indices),
     }
     return mapping.get(rest)
 
@@ -761,9 +761,9 @@ def _flat_diffusion_transition_ref(rest: str, scope: str) -> _OfficialParamRef |
     mapping = {
         "input_norm.weight": _ref(_k(f"{scope}_layer_norm", "scale")),
         "input_norm.bias": _ref(_k(f"{scope}_layer_norm", "offset")),
-        "gate_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_gate"),
-        "value_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_value"),
-        "output_projection.weight": _ref(_k(f"{scope}_transition2", "weights"), "linear"),
+        "feed_forward.gate_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_gate"),
+        "feed_forward.value_projection.weight": _ref(_k(f"{scope}_transition1", "weights"), "glu_value"),
+        "feed_forward.output_projection.weight": _ref(_k(f"{scope}_transition2", "weights"), "linear"),
     }
     return mapping.get(rest)
 
@@ -833,9 +833,9 @@ def _conditioned_transition_ref(rest: str, scope: str, indices: tuple[int, ...])
     if rest.startswith("conditioned_norm."):
         return _adaln_ref(rest.removeprefix("conditioned_norm."), scope, indices, "ffw_single_cond")
     mapping = {
-        "gate_projection.weight": _ref(_k(f"{scope}ffw_transition1", "weights"), "glu_gate", *indices),
-        "value_projection.weight": _ref(_k(f"{scope}ffw_transition1", "weights"), "glu_value", *indices),
-        "output_projection.weight": _ref(_k(f"{scope}ffw_transition2", "weights"), "linear", *indices),
+        "feed_forward.gate_projection.weight": _ref(_k(f"{scope}ffw_transition1", "weights"), "glu_gate", *indices),
+        "feed_forward.value_projection.weight": _ref(_k(f"{scope}ffw_transition1", "weights"), "glu_value", *indices),
+        "feed_forward.output_projection.weight": _ref(_k(f"{scope}ffw_transition2", "weights"), "linear", *indices),
         "conditioning_gate_projection.weight": _ref(
             _k(f"{scope}ffw_adaptive_zero_cond", "weights"), "linear", *indices
         ),

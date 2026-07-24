@@ -37,7 +37,7 @@ class AF3Node:
     block: int | None
 
 
-_MSA_STACK_PREFIX = "msa_stack."
+_MSA_UPDATE_PREFIX = "msa_update."
 _PAIRFORMER_BLOCK = re.compile(r"blocks\.(\d+)\.(.+)")
 
 
@@ -82,13 +82,14 @@ def _resolve_msa(rest: str) -> AF3Node | None:
     inner = match.group(2)
     if inner.startswith("outer_product_mean."):
         return AF3Node("msa_outer_product_mean", "", inner.removeprefix("outer_product_mean."), block)
-    averaging_prefix = _MSA_STACK_PREFIX + "msa_pair_weighted_averaging."
+    averaging_prefix = _MSA_UPDATE_PREFIX + "msa_pair_weighted_averaging."
     if inner.startswith(averaging_prefix):
         return AF3Node("msa_attention", "", inner.removeprefix(averaging_prefix), block)
-    if inner.startswith(_MSA_STACK_PREFIX + "feed_forward."):
-        return AF3Node("msa_transition", "", inner.removeprefix(_MSA_STACK_PREFIX + "feed_forward."), block)
-    if inner.startswith("pair_stack."):
-        return AF3Node("pairformer", "msa_pair", inner.removeprefix("pair_stack."), block)
+    transition_prefix = _MSA_UPDATE_PREFIX + "transition."
+    if inner.startswith(transition_prefix):
+        return AF3Node("msa_transition", "", inner.removeprefix(transition_prefix), block)
+    if inner.startswith("triangle_pair_update."):
+        return AF3Node("pairformer", "msa_pair", inner.removeprefix("triangle_pair_update."), block)
     return None
 
 

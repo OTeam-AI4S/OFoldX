@@ -54,8 +54,10 @@ from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import symbolic_residue_aliases
 from ...data.structure import Structure
 from ...model import Model
+from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm, _oops
 from ...modules.backend.resolve import resolve_tensor_operator_backend
+from ...modules.dropout import StructuredDropout
 from ...results import Metric, Score, best
 from .config import RfDiffusionConfig
 
@@ -642,13 +644,32 @@ class RfDiffusionTemplateEmbedder(nn.Module):
             hidden_size=hidden_size,
             dropout=dropout,
         )
+        self.template_pair_norm = LayerNorm(template_size)
         self.single_input_projection = nn.Linear(template_single_feature_size + torsion_size, template_size)
         self.single_output_projection = nn.Linear(template_size, template_size)
-        self.state_attention = RfDiffusionMultiheadAttention(
-            state_size, template_size, num_attention_heads, hidden_size, state_size
+        self.state_attention = GatedMultiheadAttention(
+            hidden_size=state_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=hidden_size,
+            query_size=state_size,
+            key_size=template_size,
+            value_size=template_size,
+            query_bias=False,
+            output_bias=True,
+            gating=False,
+            operator_backend="eager",
         )
-        self.pair_attention = RfDiffusionMultiheadAttention(
-            pair_size, template_size, num_attention_heads, hidden_size, pair_size
+        self.pair_attention = GatedMultiheadAttention(
+            hidden_size=pair_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=hidden_size,
+            query_size=pair_size,
+            key_size=template_size,
+            value_size=template_size,
+            query_bias=False,
+            output_bias=True,
+            gating=False,
+            operator_backend="eager",
         )
         self.reset_parameters()
 
@@ -659,6 +680,13 @@ class RfDiffusionTemplateEmbedder(nn.Module):
         _zero_bias(self.single_input_projection)
         self.single_output_projection = _initialize_lecun_normal(self.single_output_projection)
         _zero_bias(self.single_output_projection)
+        for attention in (self.state_attention, self.pair_attention):
+            projection = attention.projection
+            nn.init.xavier_uniform_(projection.query_projection.weight)
+            nn.init.xavier_uniform_(projection.key_projection.weight)
+            nn.init.xavier_uniform_(projection.value_projection.weight)
+            nn.init.zeros_(projection.output_projection.weight)
+            nn.init.zeros_(projection.output_projection.bias)
 
     def forward(
         self,
@@ -677,7 +705,7 @@ class RfDiffusionTemplateEmbedder(nn.Module):
 
         template_coordinates = template_coordinates.reshape(batch_size * template_count, length, -1, 3)
         radial_features = _radial_basis(torch.cdist(template_coordinates[:, :, 1], template_coordinates[:, :, 1]))
-        template_pair = self.template_pair_stack(template_pair, radial_features)
+        template_pair = self.template_pair_norm(self.template_pair_stack(template_pair, radial_features))
 
         template_single = torch.cat((template_single_features, template_torsion_features), dim=-1)
         template_single = self.single_output_projection(F.relu(self.single_input_projection(template_single)))
@@ -719,14 +747,12 @@ class RfDiffusionTemplatePairStack(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.output_norm = LayerNorm(template_size)
 
     def forward(self, template_pair: torch.Tensor, radial_features: torch.Tensor) -> torch.Tensor:
         batch_size, template_count, length = template_pair.shape[:3]
         template_pair = template_pair.reshape(batch_size * template_count, length, length, -1)
         for block in self.blocks:
             template_pair = block(template_pair, radial_features)
-        template_pair = self.output_norm(template_pair)
         return template_pair.reshape(batch_size, template_count, length, length, -1)
 
 
@@ -1071,7 +1097,7 @@ class RfDiffusionMsaBlock(nn.Module):
         self.row_attention = RfDiffusionMsaRowAttentionWithPairBias(
             msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
-        self.row_dropout = RfDiffusionStructuredDropout(broadcast_dim=1, dropout=dropout)
+        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
         self.column_attention = (
             RfDiffusionMsaColumnGlobalAttention(
                 msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
@@ -1122,11 +1148,11 @@ class RfDiffusionPairBlock(nn.Module):
         self.row_attention = RfDiffusionPairAxialAttention(
             pair_size, pair_size, num_attention_heads, hidden_size, is_row=True
         )
-        self.row_dropout = RfDiffusionStructuredDropout(broadcast_dim=1, dropout=dropout)
+        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
         self.column_attention = RfDiffusionPairAxialAttention(
             pair_size, pair_size, num_attention_heads, hidden_size, is_row=False
         )
-        self.column_dropout = RfDiffusionStructuredDropout(broadcast_dim=2, dropout=dropout)
+        self.column_dropout = StructuredDropout(dropout, broadcast_dim=2)
         self.transition = RfDiffusionTransition(pair_size, 2)
         self.reset_parameters()
 
@@ -1290,43 +1316,6 @@ class RfDiffusionTransition(nn.Module):
     def forward(self, src: torch.Tensor) -> torch.Tensor:
         src = self.input_norm(src)
         return self.output_projection(self.dropout(F.relu_(self.input_projection(src))))
-
-
-class RfDiffusionMultiheadAttention(nn.Module):
-    r"""
-    Multi-head scaled dot-product attention with separate query/key sizes.
-    """
-
-    def __init__(
-        self, query_size: int, key_size: int, num_attention_heads: int, head_dim: int, output_size: int
-    ) -> None:
-        super().__init__()
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = head_dim
-        self.query_projection = nn.Linear(query_size, num_attention_heads * head_dim, bias=False)
-        self.key_projection = nn.Linear(key_size, num_attention_heads * head_dim, bias=False)
-        self.value_projection = nn.Linear(key_size, num_attention_heads * head_dim, bias=False)
-        self.output_projection = nn.Linear(num_attention_heads * head_dim, output_size)
-        self.scale = 1 / math.sqrt(head_dim)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.query_projection.weight)
-        nn.init.xavier_uniform_(self.key_projection.weight)
-        nn.init.xavier_uniform_(self.value_projection.weight)
-        nn.init.zeros_(self.output_projection.weight)
-        nn.init.zeros_(self.output_projection.bias)
-
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        batch_size, query_len = query.shape[:2]
-        key_len = key.shape[1]
-        query = self.query_projection(query).reshape(batch_size, query_len, self.num_attention_heads, self.head_dim)
-        key = self.key_projection(key).reshape(batch_size, key_len, self.num_attention_heads, self.head_dim)
-        value = self.value_projection(value).reshape(batch_size, key_len, self.num_attention_heads, self.head_dim)
-        attn = einsum("bqhd,bkhd->bhqk", query * self.scale, key)
-        attn = F.softmax(attn, dim=-1)
-        out = einsum("bhqk,bkhd->bqhd", attn, value)
-        return self.output_projection(out.reshape(batch_size, query_len, self.num_attention_heads * self.head_dim))
 
 
 class RfDiffusionMsaSequenceWeighting(nn.Module):
@@ -2086,26 +2075,6 @@ class RfDiffusionSe3StructureModule(nn.Module):
         return self.transformer(graph, node_features, {"0": edge_features})
 
 
-class RfDiffusionStructuredDropout(nn.Module):
-    r"""
-    Structured dropout that can share the drop mask along one axis.
-    """
-
-    def __init__(self, broadcast_dim: int | None = None, dropout: float = 0.15) -> None:
-        super().__init__()
-        self.broadcast_dim = broadcast_dim
-        self.dropout = dropout
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.dropout == 0:
-            return x
-        shape = list(x.shape)
-        if self.broadcast_dim is not None:
-            shape[self.broadcast_dim] = 1
-        mask = (torch.rand(shape, device=x.device) >= self.dropout).to(x.dtype)
-        return mask * x / (1.0 - self.dropout)
-
-
 class RfDiffusionAllAtomReconstruction(nn.Module):
     r"""
     Reconstruct RFdiffusion atom14 coords from backbone frames and predicted torsion angles.
@@ -2179,6 +2148,24 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
         return frames, coords_out[..., :14, :3]
 
 
+class RfDiffusionTorsionBlock(nn.Module):
+    r"""
+    One residual ReLU feed-forward unit in the torsion head.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.input_projection = nn.Linear(hidden_size, hidden_size)
+        self.output_projection = nn.Linear(hidden_size, hidden_size)
+        nn.init.kaiming_normal_(self.input_projection.weight, nonlinearity="relu")
+        nn.init.zeros_(self.input_projection.bias)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        return hidden + self.output_projection(F.relu_(self.input_projection(F.relu_(hidden))))
+
+
 class RfDiffusionTorsionHead(nn.Module):
     r"""
     Predict sidechain and backbone torsion angles from the MSA row and node state.
@@ -2195,10 +2182,7 @@ class RfDiffusionTorsionHead(nn.Module):
         self.msa_projection = nn.Linear(msa_size, hidden_size)
         self.state_norm = LayerNorm(state_size)
         self.state_projection = nn.Linear(state_size, hidden_size)
-        self.first_transition_input = nn.Linear(hidden_size, hidden_size)
-        self.first_transition_output = nn.Linear(hidden_size, hidden_size)
-        self.second_transition_input = nn.Linear(hidden_size, hidden_size)
-        self.second_transition_output = nn.Linear(hidden_size, hidden_size)
+        self.blocks = nn.ModuleList(RfDiffusionTorsionBlock(hidden_size) for _ in range(2))
         self.output_projection = nn.Linear(hidden_size, 20)
         self.reset_parameters()
 
@@ -2210,21 +2194,11 @@ class RfDiffusionTorsionHead(nn.Module):
         nn.init.zeros_(self.state_projection.bias)
         nn.init.zeros_(self.output_projection.bias)
 
-        nn.init.kaiming_normal_(self.first_transition_input.weight, nonlinearity="relu")
-        nn.init.zeros_(self.first_transition_input.bias)
-        nn.init.kaiming_normal_(self.second_transition_input.weight, nonlinearity="relu")
-        nn.init.zeros_(self.second_transition_input.bias)
-
-        nn.init.zeros_(self.first_transition_output.weight)
-        nn.init.zeros_(self.first_transition_output.bias)
-        nn.init.zeros_(self.second_transition_output.weight)
-        nn.init.zeros_(self.second_transition_output.bias)
-
     def forward(self, seq: Tensor, state: Tensor) -> Tensor:
         batch_size, length = seq.shape[:2]
         hidden = self.msa_projection(self.msa_norm(seq)) + self.state_projection(self.state_norm(state))
-        hidden = hidden + self.first_transition_output(F.relu_(self.first_transition_input(F.relu_(hidden))))
-        hidden = hidden + self.second_transition_output(F.relu_(self.second_transition_input(F.relu_(hidden))))
+        for block in self.blocks:
+            hidden = block(hidden)
         return self.output_projection(F.relu_(hidden)).view(batch_size, length, 10, 2)
 
 
@@ -4802,8 +4776,9 @@ def _next_frames(
         noisy_coords: Current noised backbone coords `[L, A, 3]`.
         pred_coords: Predicted clean backbone coords `[L, A, 3]`.
         t: Current timestep.
-        diffuser: The forward [`RfDiffusionDiffuser`][ofoldx.models.rfdiffusion.model.RfDiffusionDiffuser] whose IGSO3 reverse
-            sampler is used.
+        diffuser: The forward
+            [`RfDiffusionDiffuser`][ofoldx.models.rfdiffusion.model.RfDiffusionDiffuser]
+            whose IGSO3 reverse sampler is used.
         so3_type: Rotation diffuser type; only `"igso3"` is supported.
         diffusion_mask: Per-residue mask; masked (motif) frames stay fixed.
         noise_scale: Scale on the reverse rotation noise.
@@ -6705,8 +6680,9 @@ def rfdiffusion_residue_token_id(residue_name: str) -> int:
         residue_name: Three-letter residue name (e.g. `"ALA"`); case is ignored.
 
     Returns:
-        The residue id from [`RFDIFFUSION_RESIDUE_TYPE_INDEX`][ofoldx.models.rfdiffusion.model.RFDIFFUSION_RESIDUE_TYPE_INDEX], or ``RFDIFFUSION_UNKNOWN_TOKEN_ID``
-        for an unrecognized name.
+        The residue id from
+        [`RFDIFFUSION_RESIDUE_TYPE_INDEX`][ofoldx.models.rfdiffusion.model.RFDIFFUSION_RESIDUE_TYPE_INDEX],
+        or ``RFDIFFUSION_UNKNOWN_TOKEN_ID`` for an unrecognized name.
     """
 
     return RFDIFFUSION_RESIDUE_TYPE_INDEX.get(residue_name.upper(), RFDIFFUSION_UNKNOWN_TOKEN_ID)

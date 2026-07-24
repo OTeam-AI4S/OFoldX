@@ -151,6 +151,26 @@ normalization, gate, dropout, or residual remains at the exact mathematical owne
 required by the released architecture; naming consistency never relocates an
 operation or changes an equation.
 
+The 2026-07-24 cross-model equation audit further fixes the implementation
+boundary for this cycle. A pure feed-forward Module owns its complete learned
+projection/activation/projection path, including every parallel gating projection,
+but no input normalization, conditioning gate, outer residual, or post-residual
+normalization. A pre-normalized or conditioned update is a `Transition` that owns
+the corresponding normalization or conditioning plus its feed-forward computation
+and returns only the update. In a post-normalized architecture, the containing
+`Block` instead owns the residual, dropout, and post-normalization around a
+`FeedForward`. Exact feed-forward equations may share a Module after two real
+consumers are established; activation family, projection depth, bias, dropout, or
+an extra multiplicative branch remain distinct equations rather than constructor
+flags invented only to force sharing.
+
+The same audit confirms that a `Stack` moves only a homogeneous representation
+through its `blocks`. A final normalization, projection, head, feature construction,
+or scientific routing step belongs to the enclosing `Encoder`, `Decoder`, `Trunk`,
+or embedder. A Model may directly own several block lists when those lists are
+different scientific stages; homogeneous repetition does not require an otherwise
+empty wrapper.
+
 The remaining package files are similarly predictable: `config.py` follows model
 and component construction order; `processor.py` follows input-to-tensor lowering;
 `pipeline.py` follows call-to-Result execution; `convert.py` follows load,
@@ -6622,6 +6642,28 @@ OOps is co-developed with OFoldX and distributed as ooperators. It is optional. 
 Models call an OFoldX dispatcher, not OOps directly. Backends cannot change Model configs, state-dict keys, concrete raw output types, or Results.
 
 The dispatcher and OOps adapter are implementation details. The first release has no third-party backend extension ABI.
+
+#### 8.1.1 Factorized pair linear projection
+
+Status: frozen — the owner's 2026-07-24 operator-ownership decision, AlphaFold 3
+revision `7b197fe8`, BoltzGen revision `31d9d9b9`, the two current template
+consumers, strict checkpoint conversion, and the measured dense-feature
+materialization cost support this bounded shared operator.
+
+`FactorizedPairLinear` projects pair features together with one per-token feature
+track used on both pair axes. Its learned `weight` and optional `bias`, their
+initialization, and their state-dict layout are exactly those of `nn.Linear` over
+the equivalent packed feature order. The forward input remains factorized as a
+pair tensor and a token tensor; the module owns the projection and broadcasting.
+It supports the two evidenced packed layouts by recording how many pair-feature
+columns precede the two token-feature blocks. It does not accept a generic list of
+feature groups.
+
+The eager PyTorch implementation defines the result. Models do not slice this
+weight, materialize the packed pair input, or choose a projection schedule
+themselves. OOps owns any fused or otherwise optimized implementation of the same
+operation, selected through the ordinary operator backend. Backend choice cannot
+change the module's parameters or checkpoint keys.
 
 ### 8.2 Selection
 

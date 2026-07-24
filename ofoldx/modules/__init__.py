@@ -5,6 +5,8 @@ Reusable neural-network and geometry components.
 from __future__ import annotations
 
 from .attention import GatedMultiheadAttention, MultiheadAttentionProjection
+from .dropout import RowwiseDropout, StructuredDropout
+from .feed_forward import SwiGluFeedForward
 from .geometry import uniform_random_rotation, weighted_rigid_align
 from .mpnn import (
     AMINO_ACID_COMPONENT_IDS,

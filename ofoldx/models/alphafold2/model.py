@@ -22,8 +22,8 @@ from ...model import Model
 from ...modules import residue_constants
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm
+from ...modules.dropout import RowwiseDropout
 from ...modules.head import DistogramHead, tm_bin_weights
-from ...modules.transition import RowwiseDropout
 from ...modules.trunk import EvoformerStack
 from ...modules.trunk.evoformer import (
     AlphaFold2TriangleAttention,
@@ -99,7 +99,7 @@ class AlphaFold2Model(Model):
                     template_config.template_pair_stack.triangle_multiplication_outgoing.hidden_size
                 ),
                 triangle_attention_hidden_size=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
+                    template_config.template_pair_stack.triangle_attention_starting_node.head_dim
                 ),
                 num_triangle_attention_heads=(
                     template_config.template_pair_stack.triangle_attention_starting_node.num_heads
@@ -126,7 +126,7 @@ class AlphaFold2Model(Model):
             outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
-            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.value_dim,
+            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
             num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
@@ -143,7 +143,7 @@ class AlphaFold2Model(Model):
             outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
-            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.value_dim,
+            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
             num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
@@ -644,7 +644,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                     template_config.template_pair_stack.triangle_multiplication_outgoing.hidden_size
                 ),
                 triangle_attention_hidden_size=(
-                    template_config.template_pair_stack.triangle_attention_starting_node.value_dim
+                    template_config.template_pair_stack.triangle_attention_starting_node.head_dim
                 ),
                 num_triangle_attention_heads=(
                     template_config.template_pair_stack.triangle_attention_starting_node.num_heads
@@ -669,7 +669,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
-            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.value_dim,
+            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
             num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,
@@ -686,7 +686,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             outer_product_first=block_config.outer_product_mean.first,
             num_msa_attention_heads=block_config.msa_row_attention_with_pair_bias.num_heads,
             triangle_multiplication_hidden_size=block_config.triangle_multiplication_outgoing.hidden_size,
-            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.value_dim,
+            triangle_attention_hidden_size=block_config.triangle_attention_starting_node.head_dim,
             num_triangle_attention_heads=block_config.triangle_attention_starting_node.num_heads,
             msa_transition_expansion=block_config.msa_transition.expansion,
             pair_transition_expansion=block_config.pair_transition.expansion,

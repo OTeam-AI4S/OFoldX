@@ -607,7 +607,7 @@ def _features(
         reference_mask=integer(reference_mask),
         reference_charges=floating(reference_charges[:, None]),
         token_bonds=floating(token_bonds),
-        msa=integer(_msa_rows),
+        msa_tokens=integer(_msa_rows),
         has_deletion=floating(has_deletion),
         deletion_value=floating(deletion_value),
         pocket=floating(pocket_feature),

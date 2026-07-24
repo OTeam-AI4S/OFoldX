@@ -402,7 +402,7 @@ def _prepare_esmfold2_features(
         indices = [index for index, value in enumerate(reference_space_indices) if value == current_reference_space_id]
         if len(indices) > 1 and any(optional_reference_coordinates[index] is None for index in indices):
             raise ValueError(f"ESMFold2 reference conformer is incomplete for {atom_sites[indices[0]].instance_id!r}")
-    reference_coordinates: list[tuple[float, float, float]] = []
+    reference_position_values: list[tuple[float, float, float]] = []
     atomic_numbers: list[int] = []
     formal_charges: list[int] = []
     encoded_atom_names: list[list[int]] = []
@@ -416,7 +416,7 @@ def _prepare_esmfold2_features(
             coordinate = optional_reference_coordinates[atom_cursor]
             atom_cursor += 1
             atom = system.atom(site)
-            reference_coordinates.append((0.0, 0.0, 0.0) if coordinate is None else coordinate)
+            reference_position_values.append((0.0, 0.0, 0.0) if coordinate is None else coordinate)
             atomic_numbers.append(int(periodic_table.GetAtomicNumber(atom.element)))
             formal_charges.append(0 if atom.formal_charge is None else atom.formal_charge)
             entity = system.entities[system.instances[site.instance_id]]
@@ -438,7 +438,7 @@ def _prepare_esmfold2_features(
     reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
-    reference_positions[:real_atom_count] = torch.tensor(reference_coordinates, dtype=torch.float32)
+    reference_positions[:real_atom_count] = torch.tensor(reference_position_values, dtype=torch.float32)
     reference_elements[:real_atom_count] = torch.tensor(atomic_numbers, dtype=torch.long)
     reference_charges[:real_atom_count] = torch.tensor(formal_charges, dtype=torch.int8)
     reference_atom_name_characters[:real_atom_count] = torch.tensor(encoded_atom_names, dtype=torch.long)
@@ -662,7 +662,7 @@ def _msa_tensors(
     has_deletion = deletion_counts > 0
     deletion_value = (math.pi / 2) * torch.atan(deletion_counts / 3)
     return {
-        "msa": tokens,
+        "msa_tokens": tokens,
         "has_deletion": has_deletion,
         "deletion_value": deletion_value,
         "deletion_mean": deletion_value.mean(dim=0),

@@ -273,7 +273,7 @@ class ProtenixModel(Model):
 
         reference_positions = input.reference_positions
         msa_indices = tuple(
-            self._sample_msa_indices(input.msa.shape[-2], input.msa.device, generator=generator)
+            self._sample_msa_indices(input.msa_tokens.shape[-2], input.msa_tokens.device, generator=generator)
             for _ in range(recycling_steps)
         )
         output = self._sample(
@@ -645,14 +645,14 @@ class ProtenixModel(Model):
         """
 
         if indices is None:
-            msa = input.msa
+            msa_tokens = input.msa_tokens
             has_deletion = input.has_deletion
             deletion_value = input.deletion_value
         else:
-            msa = torch.index_select(input.msa, -2, indices)
+            msa_tokens = torch.index_select(input.msa_tokens, -2, indices)
             has_deletion = torch.index_select(input.has_deletion, -2, indices)
             deletion_value = torch.index_select(input.deletion_value, -2, indices)
-        one_hot = F.one_hot(msa.long(), num_classes=32).to(dtype=input.token_features.dtype)
+        one_hot = F.one_hot(msa_tokens.long(), num_classes=32).to(dtype=input.token_features.dtype)
         return torch.cat(
             (
                 one_hot,
@@ -1430,7 +1430,7 @@ class ProtenixInput:
         reference_mask: Reference-coordinate validity mask with shape ``(B, A)``.
         reference_charges: Reference formal charges with shape ``(B, A, 1)``.
         token_bonds: Token-level bond adjacency with shape ``(B, N, N)``.
-        msa: MSA token IDs with shape ``(B, M, N)``.
+        msa_tokens: MSA token IDs with shape ``(B, M, N)``.
         has_deletion: MSA deletion flags with shape ``(B, M, N)``.
         deletion_value: Transformed MSA deletion values with shape ``(B, M, N)``.
         pocket: Directed pocket-distance features with shape ``(B, N, N, 1)``
@@ -1463,7 +1463,7 @@ class ProtenixInput:
     reference_mask: Tensor
     reference_charges: Tensor
     token_bonds: Tensor
-    msa: Tensor
+    msa_tokens: Tensor
     has_deletion: Tensor
     deletion_value: Tensor
     pocket: Tensor

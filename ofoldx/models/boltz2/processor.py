@@ -999,7 +999,7 @@ def _msa_features(
     has_deletion = deletion_counts > 0
     deletion_value = (math.pi / 2) * torch.atan(deletion_counts / 3)
     return {
-        "msa": rows,
+        "msa_tokens": rows,
         "has_deletion": has_deletion,
         "deletion_value": deletion_value,
         "msa_paired": paired,

@@ -21,6 +21,7 @@ from ...data.evidence import MSA, MSACollection
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
+from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.backend import LayerNorm
 from ...modules.backend.atom_window import atom_to_token_mean as dispatch_atom_to_token_mean
 from ...modules.backend.atom_window import token_to_atom_broadcast as dispatch_token_to_atom_broadcast
@@ -30,6 +31,8 @@ from ...modules.backend.pair_weighted_average import pair_weighted_average as di
 from ...modules.backend.resolve import resolve_tensor_operator_backend
 from ...modules.backend.transition import transition as dispatch_transition
 from ...modules.backend.triangle_multiplication import triangle_multiplication as dispatch_triangle_multiplication
+from ...modules.feed_forward import SwiGluFeedForward
+from ...modules.transition import ConditionedTransition
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score, best
 from .config import EsmFold2Config, EsmFold2ExperimentalConfig
 
@@ -179,7 +182,7 @@ class EsmFold2Model(Model):
         input_matrix: Tensor,
         token_mask: Tensor,
         total_steps: int,
-        msa: Tensor | None,
+        msa_tokens: Tensor | None,
         msa_attention_mask: Tensor | None,
         has_deletion: Tensor | None,
         deletion_value: Tensor | None,
@@ -215,11 +218,16 @@ class EsmFold2Model(Model):
             if self.language_model_encoder is None:
                 injected_pair = injected_pair + loop_language_model_pair.to(injected_pair.dtype)
 
-            if self.msa_encoder is not None and msa is not None:
+            if self.msa_encoder is not None and msa_tokens is not None:
                 # Fresh row subsample each iteration (column mask was applied
                 # once in forward, before this loop).
-                sampled_msa, sampled_msa_mask, sampled_has_deletion, sampled_deletion_value = _maybe_subsample_msa(
-                    msa,
+                (
+                    sampled_msa_tokens,
+                    sampled_msa_mask,
+                    sampled_has_deletion,
+                    sampled_deletion_value,
+                ) = _maybe_subsample_msa(
+                    msa_tokens,
                     msa_attention_mask,
                     has_deletion,
                     deletion_value,
@@ -227,9 +235,9 @@ class EsmFold2Model(Model):
                     enabled=msa_subsample_at_inference,
                     generator=generator,
                 )
-                batch_size, msa_depth, sequence_length = sampled_msa.shape
+                batch_size, msa_depth, sequence_length = sampled_msa_tokens.shape
                 msa_residue_features = F.one_hot(
-                    sampled_msa.permute(0, 2, 1).long(),
+                    sampled_msa_tokens.permute(0, 2, 1).long(),
                     num_classes=_NUM_RESIDUE_TYPES,
                 ).float()
                 msa_attention = (
@@ -242,12 +250,12 @@ class EsmFold2Model(Model):
                 has_deletion_features = (
                     sampled_has_deletion.permute(0, 2, 1).float()
                     if sampled_has_deletion is not None
-                    else torch.zeros(batch_size, sequence_length, msa_depth, device=sampled_msa.device)
+                    else torch.zeros(batch_size, sequence_length, msa_depth, device=sampled_msa_tokens.device)
                 )
                 deletion_features = (
                     sampled_deletion_value.permute(0, 2, 1).float()
                     if sampled_deletion_value is not None
-                    else torch.zeros(batch_size, sequence_length, msa_depth, device=sampled_msa.device)
+                    else torch.zeros(batch_size, sequence_length, msa_depth, device=sampled_msa_tokens.device)
                 )
                 msa_pair_update = self.msa_encoder(
                     pair=injected_pair,
@@ -290,7 +298,7 @@ class EsmFold2Model(Model):
         atom_mask: Tensor,
         atom_to_token: Tensor,
         deletion_mean: Tensor | None = None,
-        msa: Tensor | None = None,
+        msa_tokens: Tensor | None = None,
         has_deletion: Tensor | None = None,
         deletion_value: Tensor | None = None,
         msa_attention_mask: Tensor | None = None,
@@ -323,8 +331,8 @@ class EsmFold2Model(Model):
         residue_type_features = F.one_hot(residue_type.long(), num_classes=_NUM_RESIDUE_TYPES).float()
         residue_type_features = residue_type_features * token_mask.unsqueeze(-1).float()
 
-        if msa is not None:
-            msa_residue_features = F.one_hot(msa.long(), num_classes=_NUM_RESIDUE_TYPES).float()
+        if msa_tokens is not None:
+            msa_residue_features = F.one_hot(msa_tokens.long(), num_classes=_NUM_RESIDUE_TYPES).float()
             if msa_attention_mask is not None:
                 mask_f = msa_attention_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
@@ -415,7 +423,7 @@ class EsmFold2Model(Model):
         # Inference-time MSA diversity: column mask is applied once here
         # (shared across recycling loops); row subsampling is deferred to
         # per-iter inside _run_one_loop (fresh subset per loop).
-        if self.msa_encoder is not None and msa is not None:
+        if self.msa_encoder is not None and msa_tokens is not None:
             msa_attention_mask = _maybe_apply_msa_column_masking(
                 msa_attention_mask,
                 rate=msa_column_mask_rate,
@@ -432,7 +440,7 @@ class EsmFold2Model(Model):
             input_matrix=input_matrix,
             token_mask=token_mask,
             total_steps=total_steps,
-            msa=msa,
+            msa_tokens=msa_tokens,
             msa_attention_mask=msa_attention_mask,
             has_deletion=has_deletion,
             deletion_value=deletion_value,
@@ -519,7 +527,7 @@ class EsmFold2Model(Model):
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
             deletion_mean=input.deletion_mean,
-            msa=input.msa,
+            msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
             msa_attention_mask=input.msa_attention_mask,
@@ -559,7 +567,7 @@ class EsmFold2Model(Model):
         atom_to_token: Tensor,
         distogram_atom_index: Tensor,
         deletion_mean: Tensor | None = None,
-        msa: Tensor | None = None,
+        msa_tokens: Tensor | None = None,
         has_deletion: Tensor | None = None,
         deletion_value: Tensor | None = None,
         msa_attention_mask: Tensor | None = None,
@@ -601,7 +609,7 @@ class EsmFold2Model(Model):
             atom_mask=atom_mask,
             atom_to_token=atom_to_token,
             deletion_mean=deletion_mean,
-            msa=msa,
+            msa_tokens=msa_tokens,
             has_deletion=has_deletion,
             deletion_value=deletion_value,
             msa_attention_mask=msa_attention_mask,
@@ -756,7 +764,7 @@ class EsmFold2Model(Model):
             atom_to_token=input.atom_to_token,
             distogram_atom_index=input.distogram_atom_index,
             deletion_mean=input.deletion_mean,
-            msa=input.msa,
+            msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
             msa_attention_mask=input.msa_attention_mask,
@@ -916,7 +924,7 @@ class EsmFold2Model(Model):
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
             deletion_mean=input.deletion_mean,
-            msa=input.msa,
+            msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
             msa_attention_mask=input.msa_attention_mask,
@@ -1117,15 +1125,16 @@ class EsmFold2ExperimentalModel(Model):
 
         deletion_mean = torch.zeros(residue_type.shape[0], residue_type.shape[1], device=residue_type.device)
 
-        msa = input.msa
+        msa_tokens = input.msa_tokens
+        msa_features: Tensor | None = None
         msa_attention_mask = input.msa_attention_mask
         if self.use_msa_features and residue_type_probabilities is not None:
             # Fold the soft sequence into the single-row MSA profile and track.
             msa_profile = residue_type_features
-            msa = residue_type_features.unsqueeze(1)
+            msa_features = residue_type_features.unsqueeze(1)
             msa_attention_mask = token_mask.unsqueeze(1)
-        elif msa is not None:
-            msa_residue_features = F.one_hot(msa.long(), num_classes=_NUM_RESIDUE_TYPES).float()
+        elif msa_tokens is not None:
+            msa_residue_features = F.one_hot(msa_tokens.long(), num_classes=_NUM_RESIDUE_TYPES).float()
             if msa_attention_mask is not None:
                 mask_f = msa_attention_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
@@ -1139,7 +1148,8 @@ class EsmFold2ExperimentalModel(Model):
         if not self.use_msa_features:
             msa_profile = torch.zeros_like(msa_profile)
             deletion_mean = torch.zeros_like(deletion_mean)
-            msa = None
+            msa_tokens = None
+            msa_features = None
 
         reference_element_features = F.one_hot(input.reference_elements.long(), num_classes=_MAX_ATOMIC_NUMBER).float()
         reference_atom_name_character_features = F.one_hot(
@@ -1214,14 +1224,15 @@ class EsmFold2ExperimentalModel(Model):
         pair = torch.zeros_like(initial_pair)
         for _ in range(total_steps):
             pair = initial_pair + self.recycling_projection(self.recycling_norm(pair))
-            if self.msa_encoder is not None and msa is not None:
-                if msa.dim() == 4:
-                    msa_depth = msa.shape[1]
-                    msa_residue_features = msa.permute(0, 2, 1, 3).float()
+            if self.msa_encoder is not None and (msa_tokens is not None or msa_features is not None):
+                if msa_features is not None:
+                    msa_depth = msa_features.shape[1]
+                    msa_residue_features = msa_features.permute(0, 2, 1, 3).float()
                 else:
-                    msa_depth = msa.shape[1]
+                    msa_depth = cast(Tensor, msa_tokens).shape[1]
                     msa_residue_features = F.one_hot(
-                        msa.permute(0, 2, 1).long(), num_classes=_NUM_RESIDUE_TYPES
+                        cast(Tensor, msa_tokens).permute(0, 2, 1).long(),
+                        num_classes=_NUM_RESIDUE_TYPES,
                     ).float()
                 msa_attention = (
                     msa_attention_mask.permute(0, 2, 1).float()
@@ -2477,7 +2488,7 @@ class EsmFold2AtomBlock(nn.Module):
             atom_hidden_size, num_attention_heads, operator_backend, half_window=half_window
         )
         hidden_size = ((expansion * (atom_hidden_size // 3) * 2) + 255) // 256 * 256
-        self.transition = EsmFold2FeedForward(atom_hidden_size, hidden_size)
+        self.transition = SwiGluFeedForward(atom_hidden_size, hidden_size)
 
     def forward(
         self,
@@ -2573,7 +2584,14 @@ class EsmFold2DiffusionTransformerBlock(nn.Module):
             conditioning_size,
             operator_backend=operator_backend,
         )
-        self.transition = EsmFold2ConditionedTransition(hidden_size, conditioning_size, expansion)
+        self.transition = ConditionedTransition(
+            hidden_size,
+            conditioning_size,
+            expansion,
+            operator_backend=operator_backend,
+        )
+        nn.init.zeros_(self.transition.conditioning_gate_projection.weight)
+        nn.init.constant_(self.transition.conditioning_gate_projection.bias, -2.0)
 
     def forward(
         self,
@@ -2591,29 +2609,6 @@ class EsmFold2DiffusionTransformerBlock(nn.Module):
             num_diffusion_samples=num_diffusion_samples,
         )
         return hidden + self.transition(hidden, conditioning)
-
-
-class EsmFold2ConditionedTransition(nn.Module):
-    r"""
-    Conditioned SwiGLU transition with adaptive layer norm.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        conditioning_size: int,
-        expansion: int = 2,
-    ) -> None:
-        super().__init__()
-        self.adaptive_norm = EsmFold2AdaptiveLayerNorm(hidden_size, conditioning_size, eps=1e-5)
-        self.feed_forward = EsmFold2FeedForward(hidden_size, expansion * hidden_size)
-        self.output_gate_projection = nn.Linear(conditioning_size, hidden_size, bias=True)
-        nn.init.zeros_(self.output_gate_projection.weight)
-        nn.init.constant_(self.output_gate_projection.bias, -2.0)
-
-    def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        update = self.feed_forward(self.adaptive_norm(hidden, conditioning))
-        return torch.sigmoid(self.output_gate_projection(conditioning)) * update
 
 
 _DEFAULT_CHUNK_SIZE = 64
@@ -2816,16 +2811,16 @@ class EsmFold2MsaPairWeightedAveraging(nn.Module):
         self.gate_projection = nn.Linear(msa_size, num_attention_heads * head_width, bias=False)
         self.output_projection = nn.Linear(num_attention_heads * head_width, msa_size, bias=False)
 
-    def forward(self, msa: Tensor, pair: Tensor, pair_attention_mask: Tensor) -> Tensor:
+    def forward(self, msa_representation: Tensor, pair: Tensor, pair_attention_mask: Tensor) -> Tensor:
         resolved = resolve_tensor_operator_backend(
             self.operator_backend,
-            tensors=(msa, pair, pair_attention_mask),
+            tensors=(msa_representation, pair, pair_attention_mask),
             supported=("oops", "eager"),
             public_default="eager",
         )
         if resolved == "oops":
             return dispatch_pair_weighted_average(
-                msa.transpose(1, 2),
+                msa_representation.transpose(1, 2),
                 pair,
                 pair_attention_mask,
                 msa_norm_weight=self.msa_norm.weight,
@@ -2843,10 +2838,10 @@ class EsmFold2MsaPairWeightedAveraging(nn.Module):
                 operator_backend="oops",
             ).transpose(1, 2)
 
-        B, L, M, _ = msa.shape
+        B, L, M, _ = msa_representation.shape
         h, dh = self.num_attention_heads, self.head_width
 
-        msa_normed = self.msa_norm(msa)
+        msa_normed = self.msa_norm(msa_representation)
         bias = self.pair_bias_projection(self.pair_norm(pair))  # [B, L, L, num_attention_heads]
         bias.masked_fill_(~pair_attention_mask.unsqueeze(-1).bool(), torch.finfo(bias.dtype).min)
         attn = torch.softmax(bias, dim=-2)  # softmax over j
@@ -2878,7 +2873,7 @@ class EsmFold2Transition(nn.Module):
         super().__init__()
         self.operator_backend = operator_backend
         self.input_norm = LayerNorm(hidden_size, eps=eps)
-        self.feed_forward = EsmFold2FeedForward(hidden_size, expansion * hidden_size)
+        self.feed_forward = SwiGluFeedForward(hidden_size, expansion * hidden_size)
         self._chunk_size = chunk_size
 
     def set_chunk_size(self, chunk_size: int | None) -> None:
@@ -2930,7 +2925,11 @@ class EsmFold2PairBiasAttention(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
         self.scale = self.head_dim**-0.5
-        self.adaptive_norm = EsmFold2AdaptiveLayerNorm(hidden_size, conditioning_size, eps=1e-5)
+        self.adaptive_norm = AdaptiveLayerNorm(
+            hidden_size,
+            conditioning_size,
+            operator_backend=operator_backend,
+        )
         self.query_projection = nn.Linear(hidden_size, hidden_size, bias=True)
         self.key_projection = nn.Linear(hidden_size, hidden_size, bias=False)
         self.value_projection = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -3184,43 +3183,6 @@ class EsmFold2RowAttentionPooling(nn.Module):
         return self.output_projection(pooled)
 
 
-class EsmFold2AdaptiveLayerNorm(nn.Module):
-    r"""
-    Adaptive layer normalization (adaLN-Zero).
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        conditioning_size: int,
-        eps: float = 1e-5,
-        operator_backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.hidden_norm = LayerNorm(
-            hidden_size,
-            eps=eps,
-            elementwise_affine=False,
-            bias=False,
-            operator_backend=operator_backend,
-        )
-        self.conditioning_norm = LayerNorm(
-            conditioning_size,
-            eps=eps,
-            bias=False,
-            operator_backend=operator_backend,
-        )
-        self.gate_projection = nn.Linear(conditioning_size, hidden_size, bias=True)
-        self.shift_projection = nn.Linear(conditioning_size, hidden_size, bias=False)
-
-    def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        normalized_hidden = self.hidden_norm(hidden)
-        normalized_conditioning = self.conditioning_norm(conditioning)
-        return torch.sigmoid(self.gate_projection(normalized_conditioning)) * normalized_hidden + self.shift_projection(
-            normalized_conditioning
-        )
-
-
 class EsmFold2FourierEmbedding(nn.Module):
     r"""
     Embed noise levels with learned Fourier frequencies and phases.
@@ -3237,28 +3199,6 @@ class EsmFold2FourierEmbedding(nn.Module):
     def forward(self, noise_level: Tensor) -> Tensor:
         noise_level = noise_level.to(device=self.frequencies.device, dtype=self.frequencies.dtype).reshape(-1)
         return torch.cos(2.0 * torch.pi * (noise_level[:, None] * self.frequencies[None, :] + self.phases[None, :]))
-
-
-class EsmFold2FeedForward(nn.Module):
-    r"""
-    Two-projection SwiGLU feed-forward computation.
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int | None = None,
-        bias: bool = False,
-    ) -> None:
-        super().__init__()
-        output_size = input_size if output_size is None else output_size
-        self.gate_projection = nn.Linear(input_size, hidden_size, bias=bias)
-        self.value_projection = nn.Linear(input_size, hidden_size, bias=bias)
-        self.output_projection = nn.Linear(hidden_size, output_size, bias=bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.output_projection(F.silu(self.gate_projection(x)) * self.value_projection(x))
 
 
 class EsmFold2DiffusionStructureHead(nn.Module):
@@ -4046,7 +3986,7 @@ _CONFIDENCE_EPSILON = 1e-6
 
 
 def _maybe_subsample_msa(
-    msa: Tensor,
+    msa_tokens: Tensor,
     msa_attention_mask: Tensor | None,
     has_deletion: Tensor | None,
     deletion_value: Tensor | None,
@@ -4062,22 +4002,22 @@ def _maybe_subsample_msa(
     disabled, ``max_depth`` is None, or depth <= ``max_depth``.
     """
     if not enabled or max_depth is None:
-        return msa, msa_attention_mask, has_deletion, deletion_value
-    depth = msa.size(1)
+        return msa_tokens, msa_attention_mask, has_deletion, deletion_value
+    depth = msa_tokens.size(1)
     if depth <= 1 or depth <= max_depth:
-        return msa, msa_attention_mask, has_deletion, deletion_value
-    indices = torch.zeros(max_depth, dtype=torch.long, device=msa.device)
-    perm = torch.randperm(depth - 1, device=msa.device, generator=generator)[: max_depth - 1]
+        return msa_tokens, msa_attention_mask, has_deletion, deletion_value
+    indices = torch.zeros(max_depth, dtype=torch.long, device=msa_tokens.device)
+    perm = torch.randperm(depth - 1, device=msa_tokens.device, generator=generator)[: max_depth - 1]
     indices[1:] = perm + 1
     indices = indices.sort().values
-    msa = msa[:, indices]
+    msa_tokens = msa_tokens[:, indices]
     if msa_attention_mask is not None:
         msa_attention_mask = msa_attention_mask[:, indices]
     if has_deletion is not None:
         has_deletion = has_deletion[:, indices]
     if deletion_value is not None:
         deletion_value = deletion_value[:, indices]
-    return msa, msa_attention_mask, has_deletion, deletion_value
+    return msa_tokens, msa_attention_mask, has_deletion, deletion_value
 
 
 def _maybe_apply_msa_column_masking(
@@ -4506,7 +4446,7 @@ class EsmFold2Input:
             ``(B, N)``.
         layout: Molecular identities and evidence aligned to the token and atom axes.
         deletion_mean: Optional per-token mean deletion values with shape ``(B, N)``.
-        msa: Optional MSA token IDs with shape ``(B, M, N)``.
+        msa_tokens: Optional MSA token IDs with shape ``(B, M, N)``.
         has_deletion: Optional MSA deletion flags with shape ``(B, M, N)``.
         deletion_value: Optional transformed MSA deletion values with shape
             ``(B, M, N)``.
@@ -4542,7 +4482,7 @@ class EsmFold2Input:
     token_has_esmc: Tensor
     layout: EsmFold2Layout
     deletion_mean: Tensor | None = None
-    msa: Tensor | None = None
+    msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
     deletion_value: Tensor | None = None
     msa_attention_mask: Tensor | None = None

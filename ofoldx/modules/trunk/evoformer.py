@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from ..attention import GatedMultiheadAttention, TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
-from ..transition import RowwiseDropout
+from ..dropout import RowwiseDropout
 from .msa import OuterProductMean
 
 

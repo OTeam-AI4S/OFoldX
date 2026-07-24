@@ -110,9 +110,9 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
 def _transition_index_rules() -> list[tuple[str, str | None]]:
     return [
         (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.input_norm."),
-        (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
-        (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.value_projection."),
-        (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.output_projection."),
+        (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.feed_forward.gate_projection."),
+        (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.feed_forward.value_projection."),
+        (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.feed_forward.output_projection."),
     ]
 
 
@@ -235,9 +235,9 @@ def _triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | N
 def _transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
         (rf"^{boltz}\.norm\.", f"{clean}.input_norm."),
-        (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
-        (rf"^{boltz}\.fc2\.", f"{clean}.value_projection."),
-        (rf"^{boltz}\.fc3\.", f"{clean}.output_projection."),
+        (rf"^{boltz}\.fc1\.", f"{clean}.feed_forward.gate_projection."),
+        (rf"^{boltz}\.fc2\.", f"{clean}.feed_forward.value_projection."),
+        (rf"^{boltz}\.fc3\.", f"{clean}.feed_forward.output_projection."),
     ]
 
 
@@ -367,9 +367,9 @@ MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
 MSA_TRANSITION_RULES = compile_rules(
     [
         (r"^norm\.", "input_norm."),
-        (r"^fc1\.", "gate_projection."),
-        (r"^fc2\.", "value_projection."),
-        (r"^fc3\.", "output_projection."),
+        (r"^fc1\.", "feed_forward.gate_projection."),
+        (r"^fc2\.", "feed_forward.value_projection."),
+        (r"^fc3\.", "feed_forward.output_projection."),
     ]
 )
 
@@ -730,17 +730,37 @@ def convert_input_embedder(key: str) -> str | None:
 
 
 GNN_LAYER_RENAME = {
-    "attn_weight_mlp": "attention_weight_mlp",
-    "attn_value_mlp": "attention_value_mlp",
-    "attn_output_linear": "attention_output",
-    "attn_FFN": "node_transition",
-    "edge_FFN": "edge_transition",
+    "attn_weight_mlp": {
+        "0": "attention.weight_feed_forward.input_projection",
+        "2": "attention.weight_feed_forward.hidden_projections.0",
+        "4": "attention.weight_feed_forward.output_projection",
+    },
+    "attn_value_mlp": {
+        "0": "attention.value_feed_forward.input_projection",
+        "2": "attention.value_feed_forward.hidden_projections.0",
+        "4": "attention.value_feed_forward.output_projection",
+    },
+    "attn_output_linear": {
+        "0": "attention.output_projection",
+        "2": "attention_norm",
+    },
+    "attn_FFN": {
+        "0": "node_feed_forward.input_projection",
+        "2": "node_feed_forward.output_projection",
+        "4": "node_norm",
+    },
+    "edge_FFN": {
+        "0": "edge_feed_forward.input_projection",
+        "2": "edge_feed_forward.output_projection",
+        "4": "edge_norm",
+    },
 }
 
 
 def _convert_gnn_layer(suffix: str) -> str:
     head, rest = suffix.split(".", 1)
-    return f"{GNN_LAYER_RENAME.get(head, head)}.{rest}"
+    index, parameter = rest.split(".", 1)
+    return f"{GNN_LAYER_RENAME[head][index]}.{parameter}"
 
 
 ENCODER_TOP = {
@@ -799,10 +819,10 @@ TOKEN_DISTANCE_TOP = {
 
 TOKEN_DISTANCE_ENCODER = {
     "distance_gaussian_smearing": "distance_smearing",
-    "distance_token_bias_trans.norm": "distance_transition.input_norm",
-    "distance_token_bias_trans.fc1": "distance_transition.gate_projection",
-    "distance_token_bias_trans.fc2": "distance_transition.value_projection",
-    "distance_token_bias_trans.fc3": "distance_transition.output_projection",
+    "distance_token_bias_trans.norm": "distance_norm",
+    "distance_token_bias_trans.fc1": "distance_feed_forward.gate_projection",
+    "distance_token_bias_trans.fc2": "distance_feed_forward.value_projection",
+    "distance_token_bias_trans.fc3": "distance_feed_forward.output_projection",
 }
 
 

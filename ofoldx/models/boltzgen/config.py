@@ -195,7 +195,7 @@ class BoltzGenInverseFoldingModuleConfig(Config):
         num_key_atoms: Key-window size for local atom attention.
         dropout: Dropout probability in graph blocks.
         softmax_dropout: Probability of masking attention logits before destination-wise softmax.
-        inverse_fold_noise: Training-time coordinate-noise standard deviation.
+        coordinate_noise: Training-time coordinate-noise standard deviation.
     """
 
     node_size: int = 128
@@ -211,7 +211,7 @@ class BoltzGenInverseFoldingModuleConfig(Config):
     num_key_atoms: int = 128
     dropout: float = 0.1
     softmax_dropout: float = 0.2
-    inverse_fold_noise: float = 0.2
+    coordinate_noise: float = 0.2
 
 
 class BoltzGenConfig(Config):

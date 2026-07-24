@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from ..backend import LayerNorm
 from ..trunk.msa import TrianglePairUpdateBlock
+from .factorized import FactorizedPairLinear
 
 
 @dataclass
@@ -73,12 +74,18 @@ class TemplateEmbedder(nn.Module):
         operator_backend: str = "auto",
     ) -> None:
         super().__init__()
-        template_feature_size = num_distogram_bins + 1 + 2 * vocab_size + 3 + 1
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
         self.pair_norm = LayerNorm(pair_size, operator_backend=operator_backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
+        self.template_projection = FactorizedPairLinear(
+            pair_size=num_distogram_bins + 5,
+            token_size=vocab_size,
+            output_size=hidden_size,
+            pair_prefix_size=num_distogram_bins + 1,
+            bias=False,
+            operator_backend=operator_backend,
+        )
         self.blocks = nn.ModuleList(
             [
                 TrianglePairUpdateBlock(
@@ -167,20 +174,7 @@ class TemplateEmbedder(nn.Module):
         """
         geom, residue_one_hot = self._pack_features(templates, template_index)
         template_pair = self.pair_projection(pair)
-        # Project the per-token residue types and broadcast over the pair, instead of materialising the
-        # (..., N, N, 2*K) expanded one-hots. F.linear(one_hot, W_slice) == one_hot @ W_slice columns (exact).
-        # The packed feature order is [distogram, pseudo_beta_mask, residue_i(K), residue_j(K), unit_vector(3),
-        # frame_mask(1)], so the geometric columns are the leading (distogram+mask) plus the trailing 4.
-        weight = self.template_projection.weight
-        vocab_size = self.vocab_size
-        leading = geom.shape[-1] - 4
-        geom_weight = torch.cat([weight[:, :leading], weight[:, leading + 2 * vocab_size :]], dim=-1)
-        template_pair = (
-            template_pair
-            + F.linear(geom, geom_weight)
-            + F.linear(residue_one_hot, weight[:, leading : leading + vocab_size]).unsqueeze(-2)
-            + F.linear(residue_one_hot, weight[:, leading + vocab_size : leading + 2 * vocab_size]).unsqueeze(-3)
-        )
+        template_pair = template_pair + self.template_projection(geom, residue_one_hot)
         for block in self.blocks:
             template_pair = block(template_pair, pair_mask=pair_mask)
         return self.hidden_norm(template_pair)

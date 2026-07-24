@@ -109,9 +109,9 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
 def _transition_index_rules() -> list[tuple[str, str | None]]:
     return [
         (r"^transitions\.(\d+)\.norm\.", r"transitions.\1.input_norm."),
-        (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.gate_projection."),
-        (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.value_projection."),
-        (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.output_projection."),
+        (r"^transitions\.(\d+)\.fc1\.", r"transitions.\1.feed_forward.gate_projection."),
+        (r"^transitions\.(\d+)\.fc2\.", r"transitions.\1.feed_forward.value_projection."),
+        (r"^transitions\.(\d+)\.fc3\.", r"transitions.\1.feed_forward.output_projection."),
     ]
 
 
@@ -234,9 +234,9 @@ def _triangle_attention_rules(boltz: str, clean: str) -> list[tuple[str, str | N
 def _transition_rules(boltz: str, clean: str) -> list[tuple[str, str | None]]:
     return [
         (rf"^{boltz}\.norm\.", f"{clean}.input_norm."),
-        (rf"^{boltz}\.fc1\.", f"{clean}.gate_projection."),
-        (rf"^{boltz}\.fc2\.", f"{clean}.value_projection."),
-        (rf"^{boltz}\.fc3\.", f"{clean}.output_projection."),
+        (rf"^{boltz}\.fc1\.", f"{clean}.feed_forward.gate_projection."),
+        (rf"^{boltz}\.fc2\.", f"{clean}.feed_forward.value_projection."),
+        (rf"^{boltz}\.fc3\.", f"{clean}.feed_forward.output_projection."),
     ]
 
 
@@ -366,9 +366,9 @@ MSA_PAIR_WEIGHTED_AVERAGING_RULES = compile_rules(
 MSA_TRANSITION_RULES = compile_rules(
     [
         (r"^norm\.", "input_norm."),
-        (r"^fc1\.", "gate_projection."),
-        (r"^fc2\.", "value_projection."),
-        (r"^fc3\.", "output_projection."),
+        (r"^fc1\.", "feed_forward.gate_projection."),
+        (r"^fc2\.", "feed_forward.value_projection."),
+        (r"^fc3\.", "feed_forward.output_projection."),
     ]
 )
 

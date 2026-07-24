@@ -56,7 +56,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         num_candidates: int = 1,
         num_decoding_orders: int = 1,
         temperature: float = 0.1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         global_logit_bias: Tensor | None = None,
         global_omit_tokens: Sequence[str] = ("X",),
         pssm_mixture: float = 0.0,
@@ -81,7 +81,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             num_candidates: Number of complete sequence candidates to sample.
             num_decoding_orders: Number of decoding orders used to score the input sequence.
             temperature: Positive autoregressive sampling temperature.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             global_logit_bias: Global bias vector over the 21-token vocabulary.
             global_omit_tokens: One-letter residue tokens excluded from sampling.
             pssm_mixture: Global PSSM mixture weight between zero and one.
@@ -114,7 +114,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             num_candidates=num_candidates,
             num_decoding_orders=num_decoding_orders,
             temperature=temperature,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             global_logit_bias=global_logit_bias,
             global_omit_token_mask=_global_omit_token_mask(global_omit_tokens, device=model_input.residue_mask.device),
             pssm_mixture=pssm_mixture,
@@ -129,7 +129,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
@@ -143,7 +143,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             design_positions: Residue occurrences included in the designed-sequence score.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent decoding orders to evaluate.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             seed: Optional integer seed.
             generator: Optional PyTorch random generator.
 
@@ -160,7 +160,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         return self.model.score(
             model_input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -171,7 +171,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[TiedResidueIdentities] = (),
         num_decoding_orders: int = 1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
@@ -184,7 +184,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
             num_decoding_orders: Number of independent decoding orders to evaluate.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             seed: Optional integer seed.
             generator: Optional PyTorch random generator.
 
@@ -201,7 +201,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         return self.model.autoregressive_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -212,7 +212,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[TiedResidueIdentities] = (),
         num_decoding_orders: int = 1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
@@ -225,7 +225,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
             num_decoding_orders: Number of independent decoding orders to evaluate.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             seed: Optional integer seed.
             generator: Optional PyTorch random generator.
 
@@ -242,7 +242,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         return self.model.sequence_free_autoregressive_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -252,7 +252,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         *,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
@@ -264,7 +264,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             seed: Optional integer seed.
             generator: Optional PyTorch random generator.
 
@@ -282,7 +282,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         return self.model.conditional_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -292,7 +292,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         *,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
@@ -304,7 +304,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             seed: Optional integer seed.
             generator: Optional PyTorch random generator.
 
@@ -322,7 +322,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         return self.model.unconditional_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -380,7 +380,7 @@ class ProteinMpnnDesignAndPackPipeline:
         num_candidates: int = 1,
         num_decoding_orders: int = 1,
         temperature: float = 0.1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         global_logit_bias: Tensor | None = None,
         global_omit_tokens: Sequence[str] = ("X",),
         pssm_mixture: float = 0.0,
@@ -411,7 +411,7 @@ class ProteinMpnnDesignAndPackPipeline:
             num_candidates: Number of complete sequence candidates to sample.
             num_decoding_orders: Number of decoding orders used to score the input sequence.
             temperature: Positive autoregressive sampling temperature.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             global_logit_bias: Global bias vector over the 21-token vocabulary.
             global_omit_tokens: One-letter residue tokens excluded from sampling.
             pssm_mixture: Global PSSM mixture weight between zero and one.
@@ -453,7 +453,7 @@ class ProteinMpnnDesignAndPackPipeline:
             num_candidates=num_candidates,
             num_decoding_orders=num_decoding_orders,
             temperature=temperature,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             global_logit_bias=global_logit_bias,
             global_omit_token_mask=_global_omit_token_mask(global_omit_tokens, device=device),
             pssm_mixture=pssm_mixture,

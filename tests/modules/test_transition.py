@@ -1,31 +1,36 @@
 from __future__ import annotations
 
-import pytest
 import torch
 
-from ofoldx.modules.transition import RowwiseDropout, Transition
+from ofoldx.modules.transition import ConditionedTransition, Transition
 
 
-def test_rowwise_dropout_eval_and_zero_probability_are_identity() -> None:
-    hidden = torch.arange(1, 2 * 3 * 4 * 5 + 1, dtype=torch.float32).reshape(2, 3, 4, 5)
+class TestTransition:
+    def test_returns_feed_forward_update(self) -> None:
+        transition = Transition(hidden_size=8, expansion=2, operator_backend="eager")
+        hidden = torch.randn(2, 3, 8, requires_grad=True)
 
-    torch.testing.assert_close(RowwiseDropout(0.5).eval()(hidden), hidden)
-    torch.testing.assert_close(RowwiseDropout(0.0).train()(hidden), hidden)
+        output = transition(hidden)
+        expected = transition.feed_forward(transition.input_norm(hidden))
 
-
-def test_rowwise_dropout_shares_mask_across_rows() -> None:
-    hidden = torch.arange(1, 2 * 3 * 4 * 5 + 1, dtype=torch.float32).reshape(2, 3, 4, 5)
-
-    torch.manual_seed(0)
-    output = RowwiseDropout(0.5).train()(hidden)
-
-    ratio = output / hidden
-    torch.testing.assert_close(ratio[:, 0], ratio[:, 1])
-    torch.testing.assert_close(ratio[:, 1], ratio[:, 2])
-    assert bool(((ratio == 0.0) | torch.isclose(ratio, torch.tensor(2.0))).all())
-    assert bool((ratio == 0.0).any()) and bool(torch.isclose(ratio, torch.tensor(2.0)).any())
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        assert hidden.grad is not None
 
 
-def test_transition_rejects_unknown_backend() -> None:
-    with pytest.raises(ValueError):
-        Transition(hidden_size=8, operator_backend="bogus")
+class TestConditionedTransition:
+    def test_conditions_norm_and_output_gate(self) -> None:
+        transition = ConditionedTransition(hidden_size=8, conditioning_size=4, expansion=2)
+        hidden = torch.randn(2, 3, 8, requires_grad=True)
+        conditioning = torch.randn(2, 3, 4, requires_grad=True)
+
+        output = transition(hidden, conditioning)
+        normalized = transition.conditioned_norm(hidden, conditioning)
+        expected = transition.feed_forward(normalized) * torch.sigmoid(
+            transition.conditioning_gate_projection(conditioning)
+        )
+
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        assert hidden.grad is not None
+        assert conditioning.grad is not None

@@ -9,14 +9,15 @@ from torch import Tensor, nn
 from .adaptive_norm import AdaptiveLayerNorm
 from .backend import LayerNorm, resolve_config_operator_backend
 from .backend import transition as dispatch_transition
+from .feed_forward import SwiGluFeedForward
 
 
 class Transition(nn.Module):
     r"""
     Pre-normalized position-wise SwiGLU transition.
 
-    Layer-norms the input, then applies a gated linear unit: the SiLU-activated ``gate_projection``
-    modulates the ``value_projection`` before ``output_projection`` maps back to ``hidden_size``.
+    Layer-norms the input, then applies a
+    [SwiGluFeedForward][ofoldx.modules.feed_forward.SwiGluFeedForward].
     The computation is dispatched through
     [ofoldx.modules.backend][], which selects the OOps-owned or eager implementation.
     It returns an update; the containing block owns the residual addition.
@@ -34,9 +35,7 @@ class Transition(nn.Module):
         )
         expanded_size = expansion * hidden_size
         self.input_norm = LayerNorm(hidden_size, operator_backend=operator_backend)
-        self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)
+        self.feed_forward = SwiGluFeedForward(hidden_size, expanded_size)
 
     def forward(self, hidden: Tensor) -> Tensor:
         r"""
@@ -53,49 +52,12 @@ class Transition(nn.Module):
             hidden,
             norm_weight=self.input_norm.weight,
             norm_bias=self.input_norm.bias,
-            gate_weight=self.gate_projection.weight,
-            up_weight=self.value_projection.weight,
-            down_weight=self.output_projection.weight,
+            gate_weight=self.feed_forward.gate_projection.weight,
+            up_weight=self.feed_forward.value_projection.weight,
+            down_weight=self.feed_forward.output_projection.weight,
             eps=self.input_norm.eps,
             operator_backend=self.operator_backend,
         )
-
-
-class RowwiseDropout(nn.Module):
-    r"""
-    Apply dropout with a mask shared across the row axis.
-
-    For an input shaped ``(..., num_rows, num_columns, hidden_size)``, the sampled
-    mask has shape ``(..., 1, num_columns, hidden_size)`` and is broadcast to every
-    row. Evaluation mode and zero probability are identities.
-
-    Args:
-        probability: Dropout probability for each element of the broadcast mask.
-    """
-
-    def __init__(self, probability: float = 0.0) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(probability)
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        r"""
-        Apply a dropout mask broadcast across the ``-3`` axis.
-
-        Args:
-            hidden: Tensor whose row axis is ``-3``.
-
-        Returns:
-            A tensor with the same shape as ``hidden``.
-        """
-
-        # Dropout is an identity in eval (and at p=0); short-circuit so we neither waste work nor
-        # build a padded mask that would not align with a NestedTensor's ragged structure.
-        if not self.training or self.dropout.p == 0:
-            return hidden
-        shape = list(hidden.shape)
-        shape[-3] = 1
-        mask = hidden.new_ones(shape)
-        return hidden * self.dropout(mask)
 
 
 class ConditionedTransition(nn.Module):
@@ -128,12 +90,9 @@ class ConditionedTransition(nn.Module):
             conditioning_size,
             operator_backend=operator_backend,
         )
-        self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)
+        self.feed_forward = SwiGluFeedForward(hidden_size, expanded_size)
         self.conditioning_gate_projection = nn.Linear(conditioning_size, hidden_size)
         self.sigmoid = nn.Sigmoid()
-        self.silu = nn.SiLU()
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
         r"""
@@ -149,7 +108,5 @@ class ConditionedTransition(nn.Module):
         """
 
         hidden = self.conditioned_norm(hidden, conditioning)
-        output = self.output_projection(
-            self.silu(self.gate_projection(hidden)) * self.value_projection(hidden),
-        )
+        output = self.feed_forward(hidden)
         return output * self.sigmoid(self.conditioning_gate_projection(conditioning))

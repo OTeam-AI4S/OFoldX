@@ -204,7 +204,23 @@ def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, 
                 source_name=source_name,
             )
 
+    _pack_adaptive_norms(translated)
     return translated
+
+
+def _pack_adaptive_norms(state: dict[str, Tensor]) -> None:
+    scale_weight_suffix = ".gate_projection.weight"
+    for scale_weight_key in tuple(
+        key
+        for key in state
+        if key.endswith(scale_weight_suffix) and (".adaptive_norm." in key or ".conditioned_norm." in key)
+    ):
+        prefix = scale_weight_key.removesuffix("gate_projection.weight")
+        scale_weight = state.pop(scale_weight_key)
+        scale_bias = state.pop(prefix + "gate_projection.bias")
+        shift_weight = state.pop(prefix + "shift_projection.weight")
+        state[prefix + "conditioning_projection.weight"] = torch.cat((scale_weight, shift_weight), dim=0)
+        state[prefix + "conditioning_scale_bias"] = scale_bias
 
 
 def _store_translated_tensor(
@@ -389,10 +405,13 @@ def _translate_biohub_state_key(name: str) -> str:
         (".diffusion_module.s_step_norm.", ".diffusion_module.single_norm."),
         (".diffusion_module.s_to_token.", ".diffusion_module.single_projection."),
         (".attention.adaln.", ".attention.adaptive_norm."),
-        (".transition.adaln.", ".transition.adaptive_norm."),
+        (".transition.adaln.", ".transition.conditioned_norm."),
         (".adaptive_norm.s_scale", ".adaptive_norm.conditioning_norm.weight"),
         (".adaptive_norm.s_gate.", ".adaptive_norm.gate_projection."),
         (".adaptive_norm.s_shift.", ".adaptive_norm.shift_projection."),
+        (".conditioned_norm.s_scale", ".conditioned_norm.conditioning_norm.weight"),
+        (".conditioned_norm.s_gate.", ".conditioned_norm.gate_projection."),
+        (".conditioned_norm.s_shift.", ".conditioned_norm.shift_projection."),
         (".attention.out_gate.", ".attention.output_gate_projection."),
         (".attention.q_proj.", ".attention.query_projection."),
         (".attention.kv_proj.", ".attention.key_value_projection."),
@@ -401,7 +420,7 @@ def _translate_biohub_state_key(name: str) -> str:
         (".attention.pair_bias_proj.", ".attention.pair_bias_projection."),
         (".transition.lin_swish.", ".transition.feed_forward.gate_value_projection."),
         (".transition.lin_out.", ".transition.feed_forward.output_projection."),
-        (".transition.output_gate.", ".transition.output_gate_projection."),
+        (".transition.output_gate.", ".transition.conditioning_gate_projection."),
     )
     for source, target in diffusion_replacements:
         name = name.replace(source, target)

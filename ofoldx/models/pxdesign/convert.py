@@ -406,22 +406,28 @@ def _replace_transition_key(key: str) -> str:
         {
             ".input_norm.": ".layernorm1.",
             ".conditioned_norm.": ".adaln.",
-            ".conditioned_transition_block.gate_projection.": ".conditioned_transition_block.linear_nobias_a1.",
-            ".conditioned_transition_block.value_projection.": ".conditioned_transition_block.linear_nobias_a2.",
-            ".conditioned_transition_block.output_projection.": ".conditioned_transition_block.linear_nobias_b.",
+            (
+                ".conditioned_transition_block.feed_forward.gate_projection."
+            ): ".conditioned_transition_block.linear_nobias_a1.",
+            (
+                ".conditioned_transition_block.feed_forward.value_projection."
+            ): ".conditioned_transition_block.linear_nobias_a2.",
+            (
+                ".conditioned_transition_block.feed_forward.output_projection."
+            ): ".conditioned_transition_block.linear_nobias_b.",
             ".conditioned_transition_block.conditioning_gate_projection.": ".conditioned_transition_block.linear_s.",
-            ".transition_z1.gate_projection.": ".transition_z1.linear_no_bias_a.",
-            ".transition_z1.value_projection.": ".transition_z1.linear_no_bias_b.",
-            ".transition_z1.output_projection.": ".transition_z1.linear_no_bias.",
-            ".transition_z2.gate_projection.": ".transition_z2.linear_no_bias_a.",
-            ".transition_z2.value_projection.": ".transition_z2.linear_no_bias_b.",
-            ".transition_z2.output_projection.": ".transition_z2.linear_no_bias.",
-            ".transition_s1.gate_projection.": ".transition_s1.linear_no_bias_a.",
-            ".transition_s1.value_projection.": ".transition_s1.linear_no_bias_b.",
-            ".transition_s1.output_projection.": ".transition_s1.linear_no_bias.",
-            ".transition_s2.gate_projection.": ".transition_s2.linear_no_bias_a.",
-            ".transition_s2.value_projection.": ".transition_s2.linear_no_bias_b.",
-            ".transition_s2.output_projection.": ".transition_s2.linear_no_bias.",
+            ".transition_z1.feed_forward.gate_projection.": ".transition_z1.linear_no_bias_a.",
+            ".transition_z1.feed_forward.value_projection.": ".transition_z1.linear_no_bias_b.",
+            ".transition_z1.feed_forward.output_projection.": ".transition_z1.linear_no_bias.",
+            ".transition_z2.feed_forward.gate_projection.": ".transition_z2.linear_no_bias_a.",
+            ".transition_z2.feed_forward.value_projection.": ".transition_z2.linear_no_bias_b.",
+            ".transition_z2.feed_forward.output_projection.": ".transition_z2.linear_no_bias.",
+            ".transition_s1.feed_forward.gate_projection.": ".transition_s1.linear_no_bias_a.",
+            ".transition_s1.feed_forward.value_projection.": ".transition_s1.linear_no_bias_b.",
+            ".transition_s1.feed_forward.output_projection.": ".transition_s1.linear_no_bias.",
+            ".transition_s2.feed_forward.gate_projection.": ".transition_s2.linear_no_bias_a.",
+            ".transition_s2.feed_forward.value_projection.": ".transition_s2.linear_no_bias_b.",
+            ".transition_s2.feed_forward.output_projection.": ".transition_s2.linear_no_bias.",
         },
     )
 

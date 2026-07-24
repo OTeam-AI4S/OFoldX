@@ -11,7 +11,8 @@ from ..attention import (
     TriangleAttention,
     TriangleMultiplication,
 )
-from ..transition import RowwiseDropout, Transition
+from ..dropout import RowwiseDropout
+from ..transition import Transition
 
 
 class PairformerStack(nn.Module):

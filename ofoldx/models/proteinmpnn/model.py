@@ -92,17 +92,6 @@ class ProteinMpnnModel(Model):
                 nn.init.xavier_uniform_(parameter)
 
     @staticmethod
-    def _validate_backbone_noise(backbone_noise: float) -> float:
-        r"""
-        Coerce and validate the inference-time coordinate perturbation.
-        """
-
-        backbone_noise = float(backbone_noise)
-        if not math.isfinite(backbone_noise) or backbone_noise < 0:
-            raise ValueError("backbone_noise must be a finite nonnegative number")
-        return backbone_noise
-
-    @staticmethod
     def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
         r"""
         Validate the independent decoding-order evaluation count.
@@ -257,15 +246,15 @@ class ProteinMpnnModel(Model):
         residue_index: Tensor,
         chain_index: Tensor,
         *,
-        backbone_noise: float,
+        coordinate_noise: float,
         generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Run the one coordinate encoder shared by every operation.
         """
 
-        if backbone_noise:
-            backbone_coordinates = backbone_coordinates + backbone_noise * torch.randn(
+        if coordinate_noise:
+            backbone_coordinates = backbone_coordinates + coordinate_noise * torch.randn(
                 backbone_coordinates.shape,
                 device=backbone_coordinates.device,
                 dtype=backbone_coordinates.dtype,
@@ -359,7 +348,7 @@ class ProteinMpnnModel(Model):
         self,
         input: ProteinMpnnInput,
         *,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
@@ -367,7 +356,7 @@ class ProteinMpnnModel(Model):
 
         Args:
             input: ProteinMPNN tensors with batch and residue axes.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for coordinate noise.
 
         Returns:
@@ -375,13 +364,12 @@ class ProteinMpnnModel(Model):
             ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
         """
 
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         return self._encode(
             input.backbone_coordinates,
             input.residue_mask,
             input.residue_index,
             input.chain_index,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
 
@@ -390,7 +378,7 @@ class ProteinMpnnModel(Model):
         input: ProteinMpnnInput,
         *,
         decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnOutput:
         r"""
@@ -400,14 +388,13 @@ class ProteinMpnnModel(Model):
             input: ProteinMPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier. A fixed-first random order is drawn when omitted.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for the order and coordinate noise.
 
         Returns:
             Vocabulary logits and the decoding ranks used for the forward pass.
         """
 
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, input.tied_group_ids)
         node_states, edge_states, neighbor_indices = self._encode(
@@ -415,7 +402,7 @@ class ProteinMpnnModel(Model):
             input.residue_mask,
             input.residue_index,
             input.chain_index,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
         if decoding_ranks is None:
@@ -441,7 +428,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
@@ -452,7 +439,7 @@ class ProteinMpnnModel(Model):
             num_decoding_orders: Number of decoding orders to evaluate.
             decoding_ranks: Optional ranks with shape
                 ``(num_decoding_orders, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for orders and coordinate noise.
 
         Returns:
@@ -461,12 +448,11 @@ class ProteinMpnnModel(Model):
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         output = self.forward(
             repeated,
             decoding_ranks=decoding_ranks,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
         return self._probability_result(input, output.logits, output.decoding_ranks)
@@ -477,7 +463,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
@@ -488,7 +474,7 @@ class ProteinMpnnModel(Model):
             num_decoding_orders: Number of decoding orders to evaluate.
             decoding_ranks: Optional ranks with shape
                 ``(num_decoding_orders, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for orders and coordinate noise.
 
         Returns:
@@ -498,7 +484,6 @@ class ProteinMpnnModel(Model):
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
@@ -507,7 +492,7 @@ class ProteinMpnnModel(Model):
             repeated.residue_mask,
             repeated.residue_index,
             repeated.chain_index,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
         if decoding_ranks is None:
@@ -532,7 +517,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int,
         base_decoding_ranks: Tensor | None,
-        backbone_noise: float,
+        coordinate_noise: float,
         generator: torch.Generator | None,
         move_last: bool,
     ) -> MpnnProbabilityResult:
@@ -542,7 +527,6 @@ class ProteinMpnnModel(Model):
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         device = repeated.backbone_coordinates.device
         node_states, edge_states, neighbor_indices = self._encode(
@@ -550,7 +534,7 @@ class ProteinMpnnModel(Model):
             repeated.residue_mask,
             repeated.residue_index,
             repeated.chain_index,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
         length = repeated.sequence_tokens.shape[1]
@@ -617,7 +601,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
         base_decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
@@ -628,7 +612,7 @@ class ProteinMpnnModel(Model):
             num_decoding_orders: Number of base decoding orders to evaluate.
             base_decoding_ranks: Optional base ranks with shape
                 ``(num_decoding_orders, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for orders and coordinate noise.
 
         Returns:
@@ -641,7 +625,7 @@ class ProteinMpnnModel(Model):
             input,
             num_decoding_orders=num_decoding_orders,
             base_decoding_ranks=base_decoding_ranks,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
             move_last=True,
         )
@@ -652,7 +636,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
         base_decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
@@ -663,7 +647,7 @@ class ProteinMpnnModel(Model):
             num_decoding_orders: Number of base decoding orders to evaluate.
             base_decoding_ranks: Optional base ranks with shape
                 ``(num_decoding_orders, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for orders and coordinate noise.
 
         Returns:
@@ -676,7 +660,7 @@ class ProteinMpnnModel(Model):
             input,
             num_decoding_orders=num_decoding_orders,
             base_decoding_ranks=base_decoding_ranks,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
             move_last=False,
         )
@@ -688,7 +672,7 @@ class ProteinMpnnModel(Model):
         *,
         num_decoding_orders: int = 1,
         decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> ScoreResult:
         r"""
@@ -699,7 +683,7 @@ class ProteinMpnnModel(Model):
             num_decoding_orders: Number of decoding orders to evaluate.
             decoding_ranks: Optional ranks with shape
                 ``(num_decoding_orders, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for orders and coordinate noise.
 
         Returns:
@@ -708,12 +692,11 @@ class ProteinMpnnModel(Model):
 
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         log_probabilities = self.forward(
             repeated,
             decoding_ranks=decoding_ranks,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         ).log_probabilities
         losses = -torch.gather(
@@ -830,7 +813,7 @@ class ProteinMpnnModel(Model):
         num_samples: int = 1,
         temperature: float = 0.1,
         decoding_ranks: Tensor | None = None,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         global_logit_bias: Tensor | None = None,
         global_omit_token_mask: Tensor | None = None,
         pssm_mixture: float = 0.0,
@@ -845,7 +828,7 @@ class ProteinMpnnModel(Model):
             num_samples: Number of sequences to sample.
             temperature: Positive sampling temperature.
             decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``.
-            backbone_noise: Standard deviation of Gaussian coordinate noise.
+            coordinate_noise: Standard deviation of Gaussian coordinate noise.
             global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
             global_omit_token_mask: Optional exclusion mask with shape
                 ``(vocabulary_size,)``.
@@ -863,7 +846,6 @@ class ProteinMpnnModel(Model):
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         pssm_mixture = float(pssm_mixture)
         if not 0 <= pssm_mixture <= 1:
             raise ValueError("pssm_mixture must be between zero and one")
@@ -880,7 +862,7 @@ class ProteinMpnnModel(Model):
             repeated.residue_mask,
             repeated.residue_index,
             repeated.chain_index,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=generator,
         )
         length = repeated.sequence_tokens.shape[1]
@@ -1094,7 +1076,7 @@ class ProteinMpnnModel(Model):
         num_candidates: int = 1,
         num_decoding_orders: int = 1,
         temperature: float = 0.1,
-        backbone_noise: float = 0.0,
+        coordinate_noise: float = 0.0,
         global_logit_bias: Tensor | None = None,
         global_omit_token_mask: Tensor | None = None,
         pssm_mixture: float = 0.0,
@@ -1109,7 +1091,7 @@ class ProteinMpnnModel(Model):
             num_candidates: Number of sequence candidates to sample.
             num_decoding_orders: Number of autoregressive orders used to score each candidate.
             temperature: Positive sampling temperature.
-            backbone_noise: Standard deviation of coordinate noise applied before encoding.
+            coordinate_noise: Standard deviation of coordinate noise applied before encoding.
             global_logit_bias: Optional vocabulary-wide additive logit bias.
             global_omit_token_mask: Optional vocabulary-wide token exclusion mask.
             pssm_mixture: Weight assigned to the input position-specific scoring matrix.
@@ -1126,7 +1108,6 @@ class ProteinMpnnModel(Model):
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")
-        backbone_noise = self._validate_backbone_noise(backbone_noise)
         pssm_mixture = float(pssm_mixture)
         if not 0 <= pssm_mixture <= 1:
             raise ValueError("pssm_mixture must be between zero and one")
@@ -1142,7 +1123,7 @@ class ProteinMpnnModel(Model):
             input,
             num_samples=num_candidates,
             temperature=temperature,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             global_logit_bias=global_logit_bias,
             global_omit_token_mask=global_omit_token_mask,
             pssm_mixture=pssm_mixture,
@@ -1152,7 +1133,7 @@ class ProteinMpnnModel(Model):
         input_score = self.score(
             input,
             num_decoding_orders=num_decoding_orders,
-            backbone_noise=backbone_noise,
+            coordinate_noise=coordinate_noise,
             generator=score_generator,
         )
         losses = nll_loss(sampled.sequence_tokens, sampled.log_probabilities)

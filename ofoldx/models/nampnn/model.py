@@ -283,7 +283,7 @@ class NaMpnnModel(Model):
         self,
         input: NaMpnnInput,
         *,
-        polymer_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        polymer_coordinate_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
@@ -291,12 +291,12 @@ class NaMpnnModel(Model):
         """
 
         coordinates = input.atom_coordinates
-        protein_noise, dna_noise, rna_noise = polymer_noise
-        if protein_noise or dna_noise or rna_noise:
+        protein_coordinate_noise, dna_coordinate_noise, rna_coordinate_noise = polymer_coordinate_noise
+        if protein_coordinate_noise or dna_coordinate_noise or rna_coordinate_noise:
             scale = (
-                input.protein_mask.to(coordinates.dtype) * protein_noise
-                + input.dna_mask.to(coordinates.dtype) * dna_noise
-                + input.rna_mask.to(coordinates.dtype) * rna_noise
+                input.protein_mask.to(coordinates.dtype) * protein_coordinate_noise
+                + input.dna_mask.to(coordinates.dtype) * dna_coordinate_noise
+                + input.rna_mask.to(coordinates.dtype) * rna_coordinate_noise
             )
             noise = torch.randn(
                 coordinates.shape,
@@ -378,9 +378,9 @@ class NaMpnnModel(Model):
         self,
         input: NaMpnnInput,
         *,
-        protein_noise: float = 0.0,
-        dna_noise: float = 0.0,
-        rna_noise: float = 0.0,
+        protein_coordinate_noise: float = 0.0,
+        dna_coordinate_noise: float = 0.0,
+        rna_coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
@@ -388,9 +388,9 @@ class NaMpnnModel(Model):
 
         Args:
             input: NA-MPNN tensors with batch and residue axes.
-            protein_noise: Gaussian coordinate-noise standard deviation for proteins.
-            dna_noise: Gaussian coordinate-noise standard deviation for DNA.
-            rna_noise: Gaussian coordinate-noise standard deviation for RNA.
+            protein_coordinate_noise: Gaussian coordinate-noise standard deviation for proteins.
+            dna_coordinate_noise: Gaussian coordinate-noise standard deviation for DNA.
+            rna_coordinate_noise: Gaussian coordinate-noise standard deviation for RNA.
             generator: Random generator used for coordinate noise.
 
         Returns:
@@ -400,7 +400,11 @@ class NaMpnnModel(Model):
 
         return self._encode(
             input,
-            polymer_noise=(float(protein_noise), float(dna_noise), float(rna_noise)),
+            polymer_coordinate_noise=(
+                protein_coordinate_noise,
+                dna_coordinate_noise,
+                rna_coordinate_noise,
+            ),
             generator=generator,
         )
 
@@ -410,9 +414,9 @@ class NaMpnnModel(Model):
         *,
         decoding_ranks: Tensor | None = None,
         decode_protein_first: bool = False,
-        protein_noise: float = 0.0,
-        dna_noise: float = 0.0,
-        rna_noise: float = 0.0,
+        protein_coordinate_noise: float = 0.0,
+        dna_coordinate_noise: float = 0.0,
+        rna_coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> NaMpnnOutput:
         r"""
@@ -424,9 +428,9 @@ class NaMpnnModel(Model):
                 decode earlier.
             decode_protein_first: Whether generated protein rows precede generated
                 nucleic-acid rows when ranks are drawn.
-            protein_noise: Gaussian coordinate-noise standard deviation for proteins.
-            dna_noise: Gaussian coordinate-noise standard deviation for DNA.
-            rna_noise: Gaussian coordinate-noise standard deviation for RNA.
+            protein_coordinate_noise: Gaussian coordinate-noise standard deviation for proteins.
+            dna_coordinate_noise: Gaussian coordinate-noise standard deviation for DNA.
+            rna_coordinate_noise: Gaussian coordinate-noise standard deviation for RNA.
             generator: Random generator used for the order and coordinate noise.
 
         Returns:
@@ -435,7 +439,11 @@ class NaMpnnModel(Model):
 
         node_states, edge_states, neighbor_indices = self._encode(
             input,
-            polymer_noise=(float(protein_noise), float(dna_noise), float(rna_noise)),
+            polymer_coordinate_noise=(
+                protein_coordinate_noise,
+                dna_coordinate_noise,
+                rna_coordinate_noise,
+            ),
             generator=generator,
         )
         if decoding_ranks is None:

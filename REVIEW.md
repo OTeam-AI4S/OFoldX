@@ -8,6 +8,86 @@ An item appears here when it changes a public contract, invalidates an earlier
 premise, or materially changes the route to a complete family. Routine
 implementation details do not belong here.
 
+## Cross-model abstraction levels were inconsistent
+
+The 2026-07-24 equation audit found several roles represented at different source
+levels despite identical computation. Boltz-1 and ESMFold2 retained family-local
+adaptive layer norms equivalent to the shared `AdaptiveLayerNorm`; Boltz-1 also
+retained a duplicate triple-product conditioned transition. Pure SwiGLU
+feed-forwards were owned directly by shared transitions, by an ESMFold2
+`FeedForward`, and by BoltzGen's misleading `ProjectionTransition`. BoltzGen
+inverse folding duplicated graph feed-forward and segmented-attention equations
+inside its encoder and decoder blocks. RFdiffusion expanded two identical torsion
+residual units into four Linear attributes, while its template-pair `Stack` also
+owned a final normalization.
+
+The MPNN family supplies the counterexample to indiscriminate frameworkization:
+its shared message, feed-forward, encoder block, and decoder block already have
+coherent ownership, while each Model directly coordinates scientifically distinct
+encoder/context/decoder block lists. No additional MPNN Stack is justified.
+
+**Decision:** implement frozen DESIGN §1.2.1 by equation. Share exact pure
+feed-forward and adaptive-normalization computations with multiple consumers;
+keep scientifically different activation, depth, bias, dropout, and multiplicative
+branches distinct. Blocks own residual composition, Stacks own homogeneous
+repetition only, and checkpoint spelling is translated in family converters rather
+than preserving an inconsistent source abstraction.
+
+## Semantic tensor naming audit changed public inputs
+
+The cross-family data-flow audit separated external MSA evidence, integer model
+tokens, dense features, and hidden representations. Boltz-1, Boltz-2, BoltzGen,
+Protenix, and ESMFold2 now expose integer model inputs as `msa_tokens`; external
+Processor and Pipeline evidence remains `msa`. ESMFold2 consistently stores its
+public MSA mask as `[batch, depth, token]` and transposes both tokens and mask only
+at the encoder boundary, so the suspected axis conflict was not confirmed.
+
+The same audit renamed ProteinMPNN's public `backbone_noise` to
+`coordinate_noise`, and NA-MPNN's distinct axes to
+`protein_coordinate_noise`, `dna_coordinate_noise`, and
+`rna_coordinate_noise`. Explicit noise values are passed directly rather than
+coerced or rejected. Boltz-1, Boltz-2, and BoltzGen now use
+`noisy_coordinates`. The owner accepted pre-release config and call-schema
+changes, so no aliases or compatibility layer were added.
+
+## Pair-projection optimization belongs to a shared operator
+
+AlphaFold 3 and BoltzGen both project pair geometry plus the same per-token
+features on the two pair axes. Keeping an `nn.Linear` parameter while slicing its
+weight with `F.linear` inside each Model preserves checkpoint layout but puts a
+computational optimization in the model graph. Conversely, a custom
+parameter-owning projection that merely reimplements `nn.Linear` initialization
+adds the wrong abstraction.
+
+The accepted boundary is `FactorizedPairLinear(nn.Linear)`: ordinary Linear
+parameters and state, a factorized-input forward contract, eager PyTorch
+semantics in OFoldX, and an optimized implementation owned by OOps. The Model
+only composes the module. This decision is limited to the two evidenced
+pair-plus-two-token-axis consumers; it does not authorize a generic projection
+framework.
+
+## Membrane ProteinMPNN ownership contract is inconsistent
+
+The 2026-07-24 release handoff records that
+`global_label_membrane_mpnn_v_48_020.pt` and
+`per_residue_label_membrane_mpnn_v_48_020.pt` are official ProteinMPNN variants
+released through LigandMPNN and implemented by the same upstream `ProteinMPNN`
+class. It therefore directs the next cycle to merge both variants into
+`ofoldx.models.proteinmpnn` and remove an independent `membranempnn` family.
+
+The current frozen `DESIGN.md` still specifies the opposite ownership: Section
+4.9 defines a separate `MembraneMpnnModel`, package, converters, Pipelines, and
+registration IDs, and later repository and Result sections depend on that
+surface. The current code contains no membrane package, so no compatibility
+surface constrains the correction.
+
+This is a public family-identity conflict, not an implementation naming task.
+Before membrane Tok begins, re-audit the two released checkpoints and command
+paths at an exact upstream revision, then revise every affected frozen subsection
+as one contract. Do not implement the handoff direction while the contradictory
+frozen contract remains normative, and do not resurrect the separate package
+merely because its older design text is frozen.
+
 ## ESMFold2, MultiMolecule ESMC, and explicit dtype
 
 MultiMolecule's `EsmCPreTrainedModel` inherits Transformers'

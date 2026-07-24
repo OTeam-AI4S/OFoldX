@@ -13,8 +13,9 @@ from ..backend import LayerNorm
 from ..backend import outer_product_mean as dispatch_outer_product_mean
 from ..backend import pair_weighted_average as dispatch_pair_weighted_average
 from ..backend import resolve_config_operator_backend
+from ..dropout import RowwiseDropout
 from ..functional import pair_mask_from_msa_mask, pair_mask_from_token_mask
-from ..transition import RowwiseDropout, Transition
+from ..transition import Transition
 
 
 class MsaTrunk(nn.Module):
@@ -214,7 +215,7 @@ class CategoricalMsaTrunk(nn.Module):
         pair: Tensor,
         single_inputs: Tensor,
         *,
-        msa: Tensor,
+        msa_tokens: Tensor,
         has_deletion: Tensor,
         deletion_value: Tensor,
         is_paired: Tensor,
@@ -232,7 +233,7 @@ class CategoricalMsaTrunk(nn.Module):
         Args:
             pair: Pair representation `[B, N, N, pair_size]`.
             single_inputs: Per-token single input embedding `[B, N, single_size]`.
-            msa: Integer MSA token ids `[B, S, N]`.
+            msa_tokens: Integer MSA token ids `[B, S, N]`.
             has_deletion: Binary deletion-presence feature `[B, S, N]`.
             deletion_value: Continuous deletion-count feature `[B, S, N]`.
             is_paired: Binary paired-sequence feature `[B, S, N]`; used only when
@@ -245,18 +246,18 @@ class CategoricalMsaTrunk(nn.Module):
         """
 
         features = [
-            F.one_hot(msa, num_classes=self.vocab_size).to(pair.dtype),
+            F.one_hot(msa_tokens, num_classes=self.vocab_size).to(pair.dtype),
             has_deletion.unsqueeze(-1).to(pair.dtype),
             deletion_value.unsqueeze(-1).to(pair.dtype),
         ]
         if self.use_paired_feature:
             features.append(is_paired.unsqueeze(-1).to(pair.dtype))
-        msa_state = self.msa_projection(torch.cat(features, dim=-1))
-        msa_state = msa_state + self.token_projection(single_inputs).unsqueeze(1)
+        msa_representation = self.msa_projection(torch.cat(features, dim=-1))
+        msa_representation = msa_representation + self.token_projection(single_inputs).unsqueeze(1)
 
         pair_mask = pair_mask_from_token_mask(token_mask)
         for block in self.blocks:
-            pair, msa_state = block(pair, msa_state, pair_mask, msa_mask)
+            pair, msa_representation = block(pair, msa_representation, pair_mask, msa_mask)
         return pair
 
 

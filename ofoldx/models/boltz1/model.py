@@ -31,7 +31,7 @@ from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import DistogramHead
 from ...modules.head.tm import tm_weight_from_pae
-from ...modules.transformer import ConditionedTransformer
+from ...modules.transformer import ConditionedTransformer, TripleProductConditionedTransition
 from ...modules.transition import Transition
 from ...modules.trunk.msa import CategoricalMsaTrunk
 from ...modules.trunk.pairformer import PairformerStack
@@ -471,11 +471,11 @@ class Boltz1Model(Model):
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
-                if input.msa is not None:
+                if input.msa_tokens is not None:
                     pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
                         pair,
                         single_inputs,
-                        msa=input.msa,
+                        msa_tokens=input.msa_tokens,
                         has_deletion=cast(Tensor, input.has_deletion),
                         deletion_value=cast(Tensor, input.deletion_value),
                         is_paired=cast(Tensor, input.msa_paired),
@@ -1264,7 +1264,7 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
         self.next_norm = LayerNorm(hidden)
         self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
         self.fourier_norm = LayerNorm(fourier_embedding_size)
-        self.transition = Boltz1TripleProductConditionedTransition(hidden, hidden + fourier_embedding_size)
+        self.transition = TripleProductConditionedTransition(hidden, hidden + fourier_embedding_size)
 
     def forward(self, *, noise_level: Tensor, accumulated: Tensor, next_repr: Tensor) -> Tensor:
         next_repr = self.next_norm(next_repr)
@@ -1272,50 +1272,6 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
         fourier = fourier.unsqueeze(1).expand(-1, next_repr.shape[1], -1)
         conditioning = torch.cat([accumulated, fourier], dim=-1)
         return accumulated + self.transition(next_repr, conditioning)
-
-
-class Boltz1TripleProductConditionedTransition(nn.Module):
-    r"""
-    Triple-product conditioned transition used by the output-token accumulator.
-    """
-
-    def __init__(self, hidden_size: int, conditioning_size: int, expansion: int = 2) -> None:
-        super().__init__()
-        self.adaptive_norm = Boltz1AdaptiveLayerNorm(hidden_size, conditioning_size)
-        expanded_size = hidden_size * expansion
-        self.gate_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.value_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.expand_projection = nn.Linear(hidden_size, expanded_size, bias=False)
-        self.output_projection = nn.Linear(expanded_size, hidden_size, bias=False)
-        self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
-        self.silu = nn.SiLU()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        hidden = self.adaptive_norm(hidden, conditioning)
-        gate = self.gate_projection(hidden)
-        value = self.value_projection(hidden)
-        update = self.silu(gate) * value * self.expand_projection(hidden)
-        return self.sigmoid(self.output_gate_projection(conditioning)) * self.output_projection(update)
-
-
-class Boltz1AdaptiveLayerNorm(nn.Module):
-    r"""
-    Lightweight adaptive layer norm (AdaLN) used by the Boltz conditioned transition.
-    """
-
-    def __init__(self, hidden_size: int, conditioning_size: int) -> None:
-        super().__init__()
-        self.hidden_norm = LayerNorm(hidden_size, elementwise_affine=False, bias=False)
-        self.conditioning_norm = LayerNorm(conditioning_size, bias=False)
-        self.gate_projection = nn.Linear(conditioning_size, hidden_size)
-        self.shift_projection = nn.Linear(conditioning_size, hidden_size, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
-        hidden = self.hidden_norm(hidden)
-        conditioning = self.conditioning_norm(conditioning)
-        return self.sigmoid(self.gate_projection(conditioning)) * hidden + self.shift_projection(conditioning)
 
 
 class _Boltz1CoordinateDiffusionBase(nn.Module):
@@ -1431,18 +1387,18 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
 
     def preconditioned_network_forward(
         self,
-        noised_coords: Tensor,
+        noisy_coordinates: Tensor,
         sigma: Tensor | float,
         *,
         multiplicity: int = 1,
         return_token_repr: bool = False,
         **conditioning: object,
     ) -> Tensor | tuple[Tensor, Tensor]:
-        batch = noised_coords.shape[0]
-        sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
+        batch = noisy_coordinates.shape[0]
+        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
         padded = sigma.reshape(batch, 1, 1)
         update = self.denoiser(
-            noisy_positions=self.preconditioner.c_in(padded) * noised_coords,
+            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
             noise_level=self.preconditioner.c_noise(sigma),
             multiplicity=multiplicity,
             return_token_repr=return_token_repr,
@@ -1452,7 +1408,7 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
             update, token_repr = cast(tuple[Tensor, Tensor], update)
         else:
             update = cast(Tensor, update)
-        denoised = self.preconditioner.c_skip(padded) * noised_coords + self.preconditioner.c_out(padded) * update
+        denoised = self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
         if return_token_repr:
             return denoised, token_repr
         return denoised
@@ -1476,9 +1432,9 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         batch_size = augmented_target_coordinates.shape[0]
         noise_level = self.noise_distribution(batch_size, device=device, dtype=dtype, generator=generator)
         noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
-        noised_coords = augmented_target_coordinates + noise_level[:, None, None] * noise
+        noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * noise
         denoised_coordinates = self.preconditioned_network_forward(
-            noised_coords,
+            noisy_coordinates,
             noise_level,
             multiplicity=multiplicity,
             atom_mask=atom_mask,
@@ -1931,11 +1887,11 @@ class Boltz1ConfidenceHead(nn.Module):
         token_mask = input.token_mask.repeat_interleave(multiplicity, 0)
         confidence_pair_mask = pair_mask_from_token_mask(token_mask)
         if self.input_embeddings is not None:
-            if input.msa is not None:
+            if input.msa_tokens is not None:
                 pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
                     pair,
                     single_inputs,
-                    msa=input.msa,
+                    msa_tokens=input.msa_tokens,
                     has_deletion=cast(Tensor, input.has_deletion),
                     deletion_value=cast(Tensor, input.deletion_value),
                     is_paired=cast(Tensor, input.msa_paired),
@@ -3237,7 +3193,7 @@ class Boltz1Input:
         frame_atom_index: Optional `[B, N, 3]` three-atom frame indices per token.
         frame_mask: Optional `[B, N]` frame validity mask.
         cyclic_period: Optional `[B, N]` cyclic-period feature for relative positions.
-        msa: Optional `[B, S, N]` MSA token grid.
+        msa_tokens: Optional `[B, S, N]` MSA token grid.
         has_deletion: Optional `[B, S, N]` per-MSA deletion-present flag.
         deletion_value: Optional `[B, S, N]` per-MSA deletion count feature.
         msa_paired: Optional `[B, S, N]` cross-chain pairing flag.
@@ -3290,7 +3246,7 @@ class Boltz1Input:
     frame_atom_index: Tensor | None = None
     frame_mask: Tensor | None = None
     cyclic_period: Tensor | None = None
-    msa: Tensor | None = None
+    msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
     deletion_value: Tensor | None = None
     msa_paired: Tensor | None = None

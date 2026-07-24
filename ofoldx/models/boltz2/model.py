@@ -436,12 +436,12 @@ class Boltz2Model(Model):
                         template_mask=cast(Tensor, input.template_mask),
                         pair_mask=pair_mask,
                     )
-                if input.msa is not None:
+                if input.msa_tokens is not None:
                     # Boltz adds the MSA module's (input-inclusive) refined pair as a residual.
                     pair = pair + self.msa_trunk(
                         pair,
                         single_inputs,
-                        msa=input.msa,
+                        msa_tokens=input.msa_tokens,
                         has_deletion=cast(Tensor, input.has_deletion),
                         deletion_value=cast(Tensor, input.deletion_value),
                         is_paired=cast(Tensor, input.msa_paired),
@@ -1807,25 +1807,29 @@ class Boltz2CoordinateDiffusion(nn.Module):
         batch = coords.shape[0]
         sigmas = self.noise_distribution(batch, device=coords.device, dtype=coords.dtype, generator=generator)
         noise = torch.randn(coords.shape, device=coords.device, dtype=coords.dtype, generator=generator)
-        noised = coords + sigmas.reshape(batch, 1, 1) * noise
+        noisy_coordinates = coords + sigmas.reshape(batch, 1, 1) * noise
         denoised = self.preconditioned_network_forward(
-            noised, sigmas, multiplicity=multiplicity, atom_mask=atom_mask, **conditioning
+            noisy_coordinates,
+            sigmas,
+            multiplicity=multiplicity,
+            atom_mask=atom_mask,
+            **conditioning,
         )
         return denoised, sigmas, coords
 
     def preconditioned_network_forward(
-        self, noised_coords: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
+        self, noisy_coordinates: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
     ) -> Tensor:
-        batch = noised_coords.shape[0]
-        sigma = torch.as_tensor(sigma, device=noised_coords.device, dtype=noised_coords.dtype).expand(batch)
+        batch = noisy_coordinates.shape[0]
+        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
         padded = sigma.reshape(batch, 1, 1)
         update = self.denoiser(
-            noisy_positions=self.preconditioner.c_in(padded) * noised_coords,
+            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
             noise_level=self.preconditioner.c_noise(sigma),
             multiplicity=multiplicity,
             **conditioning,
         )
-        return self.preconditioner.c_skip(padded) * noised_coords + self.preconditioner.c_out(padded) * update
+        return self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
 
     def sample_schedule(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
         steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
@@ -2482,7 +2486,7 @@ class Boltz2Input:
         method_feature: Optional experimental-method ids.
         modified: Optional modified-residue flags.
         cyclic_period: Optional cyclic-position periods.
-        msa: Optional integer MSA token ids.
+        msa_tokens: Optional integer MSA token ids.
         has_deletion: Optional MSA deletion flags.
         deletion_value: Optional MSA deletion values.
         msa_paired: Optional paired-MSA flags.
@@ -2532,7 +2536,7 @@ class Boltz2Input:
     method_feature: Tensor | None = None
     modified: Tensor | None = None
     cyclic_period: Tensor | None = None
-    msa: Tensor | None = None
+    msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
     deletion_value: Tensor | None = None
     msa_paired: Tensor | None = None

@@ -94,12 +94,12 @@ class AlphaFold2TriangleAttentionConfig(Config):
 
     Args:
         num_heads: Number of triangle-attention heads.
-        value_dim: Per-head value width.
+        head_dim: Per-head value width.
         dropout: Dropout probability along the pair path.
     """
 
     num_heads: int = 4
-    value_dim: int = 32
+    head_dim: int = 32
     dropout: float = 0.25
 
 
@@ -153,7 +153,7 @@ class AlphaFold2TemplatePairStackConfig(Config):
     num_blocks: int = 2
     pair_size: int = 64
     triangle_attention_starting_node: AlphaFold2TriangleAttentionConfig = AlphaFold2TriangleAttentionConfig(
-        {"value_dim": 16}
+        {"head_dim": 16}
     )
     triangle_multiplication_outgoing: AlphaFold2TriangleMultiplicationConfig = AlphaFold2TriangleMultiplicationConfig(
         {"hidden_size": 64}
