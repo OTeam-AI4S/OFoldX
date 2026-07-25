@@ -44,18 +44,20 @@ class DiffusionObjective:
     def __call__(self, model: nn.Module, batch: Any) -> tuple[Any, Tensor]:
         output = model(batch, num_samples=self.num_samples)
 
-        denoised: Tensor = output.denoised_coords
-        target: Tensor = output.augmented_target
-        batch_size, num_samples = denoised.shape[0], denoised.shape[1]
+        # The denoiser flattens the (batch, sample) axes: coordinates and the augmented training
+        # target are ``(B*S, A, 3)`` and the per-sample noise level is ``(B*S,)``.
+        denoised: Tensor = output.coordinates
+        target: Tensor = output.augmented_target_coordinates
+        squared_error = (denoised - target).pow(2).sum(dim=-1)  # (B*S, A)
 
-        squared_error = (denoised - target).pow(2).sum(dim=-1)
+        weight = edm_weight(output.noise_level, self.sigma_data).unsqueeze(-1)  # (B*S, 1)
+        weighted_error = weight * squared_error  # (B*S, A)
 
-        weight = edm_weight(output.noise_level, self.sigma_data).reshape(batch_size, num_samples, 1)
-        weighted_error = weight * squared_error
-
+        # The loss mask is atom-aligned ``(B, A)``; repeat it per drawn sample to match ``B*S``.
         target_mask: Tensor | None = getattr(batch, "target_mask", None)
-        loss_mask = batch.atom_mask if target_mask is None else target_mask
-        mask = loss_mask.unsqueeze(1).to(weighted_error.dtype).expand_as(weighted_error)
+        loss_mask = getattr(batch, "atom_mask", None) if target_mask is None else target_mask
+        samples = weighted_error.shape[0] // loss_mask.shape[0]
+        mask = loss_mask.to(weighted_error.dtype).repeat_interleave(samples, dim=0)  # (B*S, A)
         denominator = mask.sum().clamp_min(torch.finfo(weighted_error.dtype).tiny)
         loss = (weighted_error * mask).sum() / denominator
 

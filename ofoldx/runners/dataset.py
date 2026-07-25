@@ -44,7 +44,11 @@ class StructureDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, index: int) -> Any:
-        return self.processor(self.records[index], **self.processor_kwargs)
+        from ..io import read_structure
+
+        # Records are structure-file paths; read each into a Structure (which every family
+        # Processor accepts) before lowering. Reading stays lazy -- one file per access.
+        return self.processor(read_structure(self.records[index]), **self.processor_kwargs)
 
 
 def _resolve_records(source: Any) -> list[str]:
