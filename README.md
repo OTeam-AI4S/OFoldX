@@ -81,16 +81,16 @@ ID; the class owns how its model/processor pair or fixed composition is loaded.
 
 ## Explore
 
-| Package                                | Purpose                                                                                  |
-| -------------------------------------- | ---------------------------------------------------------------------------------------- |
-| [`ofoldx.models`](ofoldx/models)       | Model registration; concrete family packages are imported explicitly.                    |
-| `ofoldx.artifacts`                     | The one public writer for a validated standard Model/Processor repository.               |
-| `ofoldx.hub`                           | Hugging Face Hub repository resolution, publication, and loading.                        |
-| [`ofoldx.pipelines`](ofoldx/pipelines) | Concrete family Pipeline registration and shared paired/composite persistence.         |
-| [`ofoldx.modules`](ofoldx/modules)     | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion.    |
-| [`ofoldx.io`](ofoldx/io)               | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.         |
-| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, placement, and scientific domain values.                  |
-| `ofoldx.runners`                       | Pre-release Danling Runner scaffold; its config-only construction contract is deferred.  |
+| Package                                | Purpose                                                                                 |
+| -------------------------------------- | --------------------------------------------------------------------------------------- |
+| [`ofoldx.models`](ofoldx/models)       | Model registration; concrete family packages are imported explicitly.                   |
+| `ofoldx.artifacts`                     | The one public writer for a validated standard Model/Processor repository.              |
+| `ofoldx.hub`                           | Hugging Face Hub repository resolution, publication, and loading.                       |
+| [`ofoldx.pipelines`](ofoldx/pipelines) | Concrete family Pipeline registration and shared paired/composite persistence.          |
+| [`ofoldx.modules`](ofoldx/modules)     | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion.   |
+| [`ofoldx.io`](ofoldx/io)               | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.        |
+| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, placement, and scientific domain values.                 |
+| `ofoldx.runners`                       | Pre-release Danling Runner scaffold; its config-only construction contract is deferred. |
 
 The low-level values exported by `ofoldx.data` are part of the domain API: atom, bond,
 component, attachment, entity, instance, and site values are what make an in-memory

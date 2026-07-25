@@ -26,9 +26,9 @@ from ...modules.dropout import RowwiseDropout
 from ...modules.head import DistogramHead, tm_bin_weights
 from ...modules.trunk.evoformer import (
     EvoformerStack,
+    EvoformerTransition,
     EvoformerTriangleAttention,
     EvoformerTriangleMultiplication,
-    EvoformerTransition,
     ExtraMsaEvoformerStack,
     OuterProductFirstEvoformerStack,
     OuterProductFirstExtraMsaEvoformerStack,

@@ -26,8 +26,8 @@ from .results import (
     PackResult,
     PairMetric,
     Score,
-    ScoreResult,
     Scored,
+    ScoreResult,
     best,
 )
 
