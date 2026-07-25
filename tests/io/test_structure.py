@@ -42,7 +42,7 @@ def test_complete_heavy_materializes_declared_sites_with_missing_masks(tmp_path:
     assert len(structure.sites) > 5
 
 
-def test_unknown_component_requires_an_explicit_complete_graph(tmp_path: Path) -> None:
+def test_unknown_component_reads_in_observed_layout_but_completion_needs_explicit_graph(tmp_path: Path) -> None:
     path = tmp_path / "ligand.pdb"
     path.write_text(
         "HETATM    1  C1  LIG L   1       0.000   0.000   0.000  1.00 10.00           C  \n"
@@ -50,17 +50,23 @@ def test_unknown_component_requires_an_explicit_complete_graph(tmp_path: Path) -
         "CONECT    1    2\nEND\n",
         encoding="ascii",
     )
+    # The observed layout keeps source atoms, so an unknown ligand is declared from what the file shows.
+    observed = read_structure(path)
+    assert len(observed.system.entities) == 1
+    assert observed.system.atom(observed.sites[0]).element == "C"
+
+    # Completing the graph needs the full declared chemistry, so an unknown component must be supplied.
     with pytest.raises(ValueError, match="unknown component 'LIG'"):
-        read_structure(path)
+        read_structure(path, atom_layout="complete_heavy")
 
     ligand = ChemicalComponent(
         "LIG",
         atoms=(ChemicalAtom("C1", "C"), ChemicalAtom("O1", "O")),
         bonds=frozenset({ChemicalBond("C1", "O1")}),
     )
-    structure = read_structure(path, components={"LIG": ligand})
-    assert len(structure.system.entities) == 1
-    assert structure.system.atom(structure.sites[0]).element == "C"
+    completed = read_structure(path, atom_layout="complete_heavy", components={"LIG": ligand})
+    assert len(completed.system.entities) == 1
+    assert completed.system.atom(completed.sites[0]).element == "C"
 
 
 def test_complete_all_materializes_hydrogen_counts_as_an_explicit_graph_transform(tmp_path: Path) -> None:

@@ -61,11 +61,13 @@ def test_public_backends_do_not_change_state_dict(monkeypatch, backend: str) -> 
     bias = torch.randn(2, 2, 4, 4)
     mask = torch.tensor([[True, True, False, True], [True, False, True, True]]).unsqueeze(1).expand(-1, 4, -1)
 
+    # eager (manual fp32 einsum + softmax) and sdpa (fused kernel) are numerically equivalent up to
+    # fp32 kernel-reduction noise (~1e-8), not bitwise identical -- we do not require bit-exactness.
     torch.testing.assert_close(
         public(query, biases=(bias,), attention_mask=mask),
         sdpa(query, biases=(bias,), attention_mask=mask),
-        rtol=0,
-        atol=0,
+        atol=1e-5,
+        rtol=1e-4,
     )
     assert public.state_dict().keys() == sdpa.state_dict().keys()
     assert all("backend" not in key for key in public.state_dict())
