@@ -29,4 +29,5 @@ ARCHITECTURE_OBJECTIVES: dict[str, str] = {
     "ofoldx.boltz2": "diffusion",
     "ofoldx.boltzgen": "diffusion",
     "ofoldx.protenix": "diffusion",
+    "ofoldx.odesign": "denoiser",
 }

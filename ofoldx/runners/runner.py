@@ -77,7 +77,7 @@ class Runner(dl.Runner):
         if train_objective is not None:
             self.objective: Objective = train_objective
         else:
-            from .objectives import diffusion, mpnn  # noqa: F401 — register the built-in objectives
+            from .objectives import denoiser, diffusion, mpnn  # noqa: F401 — register the built-in objectives
 
             name = self.config.objective or ARCHITECTURE_OBJECTIVES.get(self._architecture)
             if name is None:
