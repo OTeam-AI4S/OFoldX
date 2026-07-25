@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from ofoldx.modules.backend import LayerNorm
+from ofoldx.modules.backend.resolve import oops_available
 
 
 @pytest.mark.parametrize("elementwise_affine", [False, True])
@@ -27,3 +28,21 @@ def test_provider_uses_eager_normalization_when_not_supported(backend: str) -> N
     norm.backend = backend
 
     torch.testing.assert_close(norm(hidden), expected)
+
+
+@pytest.mark.skipif(not oops_available(), reason="OOps is not installed")
+def test_oops_layer_norm_preserves_mixed_precision_affine_contract() -> None:
+    norm = LayerNorm(8, dtype=torch.float32, backend="oops")
+    hidden = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+
+    output = norm(hidden)
+    output.float().square().mean().backward()
+
+    assert output.dtype == torch.bfloat16
+    assert hidden.grad is not None
+    assert hidden.grad.dtype == torch.bfloat16
+    assert norm.weight.grad is not None
+    assert norm.weight.grad.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(hidden.grad).all()
+    assert torch.isfinite(norm.weight.grad).all()

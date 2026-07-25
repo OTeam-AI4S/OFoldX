@@ -11,7 +11,6 @@ import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from operator import index as integer_index
-from pathlib import Path
 from typing import Literal, cast
 
 import numpy as np
@@ -91,16 +90,6 @@ _IGSO3_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
     ("discrete_omega", (_IGSO3_NUM_OMEGA,)),
     ("discrete_sigma", (_IGSO3_NUM_SIGMA,)),
 )
-_IGSO3_SCHEDULE_PATH = Path(__file__).with_name("rfdiffusion_schedule.npz")
-
-
-def _default_igso3_schedule() -> dict[str, np.ndarray]:
-    r"""
-    Load the released RFdiffusion IGSO(3) lookup table bundled with the family.
-    """
-
-    with np.load(_IGSO3_SCHEDULE_PATH, allow_pickle=False) as values:
-        return {name: values[name] for name, _shape in _IGSO3_FIELDS}
 
 
 class RfDiffusionModel(Model):
@@ -148,13 +137,10 @@ class RfDiffusionModel(Model):
         self.sidechain_input = preprocess.sidechain_input
         self.structure_self_conditioning = preprocess.structure_self_conditioning
         self.all_atom_reconstruction = RfDiffusionAllAtomReconstruction()
-        # Keep the exact IGSO(3) lookup table with the model as persistent float64 buffers.
-        for name, array in _default_igso3_schedule().items():
-            self.register_buffer(
-                f"igso3_{name}",
-                torch.as_tensor(array, dtype=torch.float64),
-                persistent=True,
-            )
+        # Conversion fills these persistent buffers from the released IGSO(3)
+        # lookup table before the model repository is saved.
+        for name, shape in _IGSO3_FIELDS:
+            self.register_buffer(f"igso3_{name}", torch.zeros(shape, dtype=torch.float64), persistent=True)
         self.post_init()
 
     def _igso3_schedule(self) -> dict[str, np.ndarray]:

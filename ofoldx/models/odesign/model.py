@@ -379,7 +379,7 @@ class ODesignModel(Model):
             token_embedding=token_embedding,
             single=single,
             pair=pair,
-            relative_position_features=relative_features,
+            relative_features=relative_features,
         )
 
     def _initial_pair(
@@ -409,7 +409,7 @@ class ODesignModel(Model):
             token_embedding=trunk.token_embedding,
             single=trunk.single,
             pair=trunk.pair,
-            relative_features=trunk.relative_position_features,
+            relative_features=trunk.relative_features,
             local_geometry=self.coordinate_denoiser.build_local_geometry(
                 input.reference_positions,
                 input.reference_space_id,
@@ -619,7 +619,7 @@ class _ODesignTrunkOutput:
     token_embedding: Tensor
     single: Tensor
     pair: Tensor
-    relative_position_features: RelativePositionBuckets
+    relative_features: RelativePositionBuckets
 
 
 @dataclass(frozen=True)

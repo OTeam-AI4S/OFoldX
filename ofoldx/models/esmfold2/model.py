@@ -183,7 +183,7 @@ class EsmFold2Model(Model):
         token_mask: Tensor,
         total_steps: int,
         msa_tokens: Tensor | None,
-        msa_attention_mask: Tensor | None,
+        msa_mask: Tensor | None,
         has_deletion: Tensor | None,
         deletion_value: Tensor | None,
         single_inputs: Tensor,
@@ -228,7 +228,7 @@ class EsmFold2Model(Model):
                     sampled_deletion_value,
                 ) = _maybe_subsample_msa(
                     msa_tokens,
-                    msa_attention_mask,
+                    msa_mask,
                     has_deletion,
                     deletion_value,
                     max_depth=msa_max_depth,
@@ -263,7 +263,7 @@ class EsmFold2Model(Model):
                     msa_residue_features=msa_residue_features,
                     has_deletion=has_deletion_features,
                     deletion_value=deletion_features,
-                    msa_attention_mask=msa_attention,
+                    msa_mask=msa_attention,
                 ).to(injected_pair.dtype)
                 injected_pair = msa_pair_update if self.msa_encoder_overwrite else (injected_pair + msa_pair_update)
 
@@ -301,7 +301,7 @@ class EsmFold2Model(Model):
         msa_tokens: Tensor | None = None,
         has_deletion: Tensor | None = None,
         deletion_value: Tensor | None = None,
-        msa_attention_mask: Tensor | None = None,
+        msa_mask: Tensor | None = None,
         language_model_tokens: Tensor | None = None,
         language_model_mask: Tensor | None = None,
         token_to_esmc: Tensor | None = None,
@@ -333,10 +333,10 @@ class EsmFold2Model(Model):
 
         if msa_tokens is not None:
             msa_residue_features = F.one_hot(msa_tokens.long(), num_classes=_NUM_RESIDUE_TYPES).float()
-            if msa_attention_mask is not None:
-                mask_f = msa_attention_mask.float().unsqueeze(-1)
+            if msa_mask is not None:
+                mask_f = msa_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
-                valid_seq_count = msa_attention_mask.float().sum(dim=1).clamp(min=1)
+                valid_seq_count = msa_mask.float().sum(dim=1).clamp(min=1)
                 msa_profile = msa_residue_features.sum(dim=1) / valid_seq_count.unsqueeze(-1)
             else:
                 msa_profile = msa_residue_features.mean(dim=1)
@@ -426,8 +426,8 @@ class EsmFold2Model(Model):
         # (shared across recycling loops); row subsampling is deferred to
         # per-iter inside _run_one_loop (fresh subset per loop).
         if self.msa_encoder is not None and msa_tokens is not None:
-            msa_attention_mask = _maybe_apply_msa_column_masking(
-                msa_attention_mask,
+            msa_mask = _maybe_apply_msa_column_masking(
+                msa_mask,
                 rate=msa_column_mask_rate,
                 generator=generator,
             )
@@ -443,7 +443,7 @@ class EsmFold2Model(Model):
             token_mask=token_mask,
             total_steps=total_steps,
             msa_tokens=msa_tokens,
-            msa_attention_mask=msa_attention_mask,
+            msa_mask=msa_mask,
             has_deletion=has_deletion,
             deletion_value=deletion_value,
             single_inputs=single_inputs,
@@ -532,7 +532,7 @@ class EsmFold2Model(Model):
             msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
-            msa_attention_mask=input.msa_attention_mask,
+            msa_mask=input.msa_mask,
             language_model_tokens=input.language_model_tokens,
             language_model_mask=input.language_model_mask,
             token_to_esmc=input.token_to_esmc,
@@ -572,7 +572,7 @@ class EsmFold2Model(Model):
         msa_tokens: Tensor | None = None,
         has_deletion: Tensor | None = None,
         deletion_value: Tensor | None = None,
-        msa_attention_mask: Tensor | None = None,
+        msa_mask: Tensor | None = None,
         language_model_tokens: Tensor | None = None,
         language_model_mask: Tensor | None = None,
         token_to_esmc: Tensor | None = None,
@@ -614,7 +614,7 @@ class EsmFold2Model(Model):
             msa_tokens=msa_tokens,
             has_deletion=has_deletion,
             deletion_value=deletion_value,
-            msa_attention_mask=msa_attention_mask,
+            msa_mask=msa_mask,
             language_model_tokens=language_model_tokens,
             language_model_mask=language_model_mask,
             token_to_esmc=token_to_esmc,
@@ -762,7 +762,7 @@ class EsmFold2Model(Model):
             msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
-            msa_attention_mask=input.msa_attention_mask,
+            msa_mask=input.msa_mask,
             language_model_tokens=input.language_model_tokens,
             language_model_mask=input.language_model_mask,
             token_to_esmc=input.token_to_esmc,
@@ -922,7 +922,7 @@ class EsmFold2Model(Model):
             msa_tokens=input.msa_tokens,
             has_deletion=input.has_deletion,
             deletion_value=input.deletion_value,
-            msa_attention_mask=input.msa_attention_mask,
+            msa_mask=input.msa_mask,
             language_model_tokens=input.language_model_tokens,
             language_model_mask=input.language_model_mask,
             token_to_esmc=input.token_to_esmc,
@@ -1124,18 +1124,18 @@ class EsmFold2ExperimentalModel(Model):
 
         msa_tokens = input.msa_tokens
         msa_features: Tensor | None = None
-        msa_attention_mask = input.msa_attention_mask
+        msa_mask = input.msa_mask
         if self.use_msa_features and residue_type_probabilities is not None:
             # Fold the soft sequence into the single-row MSA profile and track.
             msa_profile = residue_type_features
             msa_features = residue_type_features.unsqueeze(1)
-            msa_attention_mask = token_mask.unsqueeze(1)
+            msa_mask = token_mask.unsqueeze(1)
         elif msa_tokens is not None:
             msa_residue_features = F.one_hot(msa_tokens.long(), num_classes=_NUM_RESIDUE_TYPES).float()
-            if msa_attention_mask is not None:
-                mask_f = msa_attention_mask.float().unsqueeze(-1)
+            if msa_mask is not None:
+                mask_f = msa_mask.float().unsqueeze(-1)
                 msa_residue_features = msa_residue_features * mask_f
-                valid_seq_count = msa_attention_mask.float().sum(dim=1).clamp(min=1)
+                valid_seq_count = msa_mask.float().sum(dim=1).clamp(min=1)
                 msa_profile = msa_residue_features.sum(dim=1) / valid_seq_count.unsqueeze(-1)
             else:
                 msa_profile = msa_residue_features.mean(dim=1)
@@ -1232,8 +1232,8 @@ class EsmFold2ExperimentalModel(Model):
                         num_classes=_NUM_RESIDUE_TYPES,
                     ).float()
                 msa_attention = (
-                    msa_attention_mask.permute(0, 2, 1).float()
-                    if msa_attention_mask is not None
+                    msa_mask.permute(0, 2, 1).float()
+                    if msa_mask is not None
                     else token_mask[:, :, None].expand(-1, -1, msa_depth).float()
                 )
                 msa_residue_features = msa_residue_features * msa_attention.unsqueeze(-1)
@@ -1249,7 +1249,7 @@ class EsmFold2ExperimentalModel(Model):
                     msa_residue_features=msa_residue_features,
                     has_deletion=zero_deletion_features,
                     deletion_value=zero_deletion_features,
-                    msa_attention_mask=msa_attention,
+                    msa_mask=msa_attention,
                 ).to(pair.dtype)
             pair = self.folding_trunk(pair, pair_attention_mask=pair_mask)
 
@@ -1795,7 +1795,7 @@ class EsmFold2MsaEncoder(nn.Module):
         msa_residue_features: Tensor,
         has_deletion: Tensor,
         deletion_value: Tensor,
-        msa_attention_mask: Tensor,
+        msa_mask: Tensor,
     ) -> Tensor:
         # All inputs are pre-transposed to [B, L, M, ...] before calling.
         msa_features = torch.cat(
@@ -1804,11 +1804,11 @@ class EsmFold2MsaEncoder(nn.Module):
         )
         m = self.msa_projection(msa_features.to(dtype=self.msa_projection.weight.dtype))
         m = m + self.input_projection(single_inputs.to(dtype=self.input_projection.weight.dtype)).unsqueeze(2)
-        token_mask = msa_attention_mask[:, :, 0].bool()
+        token_mask = msa_mask[:, :, 0].bool()
         pair_attention_mask = token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
         for block in self.blocks:
-            m, pair = block(m, pair, msa_attention_mask, pair_attention_mask)
-        pair = pair + self.final_outer_product_mean(m, msa_attention_mask)
+            m, pair = block(m, pair, msa_mask, pair_attention_mask)
+        pair = pair + self.final_outer_product_mean(m, msa_mask)
         pair = self.final_pair_update(pair, pair_attention_mask)
         return pair
 
@@ -1864,10 +1864,10 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
         msa_residue_features: Tensor,
         has_deletion: Tensor,
         deletion_value: Tensor,
-        msa_attention_mask: Tensor,
+        msa_mask: Tensor,
     ) -> Tensor:
         # All inputs are pre-transposed to [B, L, M, ...] before calling.
-        B, L, M = msa_attention_mask.shape
+        B, L, M = msa_mask.shape
         msa_features = torch.cat(
             [msa_residue_features, has_deletion.unsqueeze(-1), deletion_value.unsqueeze(-1)],
             dim=-1,
@@ -1876,14 +1876,14 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
         m = m + self.input_projection(single_inputs.to(dtype=self.input_projection.weight.dtype)).unsqueeze(2)
 
         if M > 1:
-            msa_track_mask = msa_attention_mask[:, :, 1:].any(dim=(1, 2))
+            msa_track_mask = msa_mask[:, :, 1:].any(dim=(1, 2))
         else:
             msa_track_mask = torch.zeros(B, dtype=torch.bool, device=pair.device)
 
-        token_mask = msa_attention_mask[:, :, 0]
+        token_mask = msa_mask[:, :, 0]
         pair_attention_mask = token_mask.unsqueeze(2) * token_mask.unsqueeze(1)
         for block in self.blocks:
-            m, pair = block(m, pair, msa_attention_mask, pair_attention_mask, msa_track_mask)
+            m, pair = block(m, pair, msa_mask, pair_attention_mask, msa_track_mask)
         return pair * msa_track_mask[:, None, None, None].to(pair.dtype)
 
 
@@ -2634,10 +2634,10 @@ class EsmFold2MsaEncoderBlock(nn.Module):
         self,
         m: Tensor,
         pair: Tensor,
-        msa_attention_mask: Tensor,
+        msa_mask: Tensor,
         pair_attention_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        pair = pair + self.outer_product_mean(m, msa_attention_mask)
+        pair = pair + self.outer_product_mean(m, msa_mask)
         m = m + self.msa_pair_weighted_averaging(m, pair, pair_attention_mask)
         m = m + self.msa_transition(m)
         pair = pair + self.triangle_multiplication_outgoing(pair, visibility=pair_attention_mask)
@@ -2704,7 +2704,7 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
         self,
         m: Tensor,
         pair: Tensor,
-        msa_attention_mask: Tensor,
+        msa_mask: Tensor,
         pair_attention_mask: Tensor,
         msa_track_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -2715,7 +2715,7 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
 
         m = m + masked(self.msa_pair_weighted_averaging(m, pair, pair_attention_mask))
         m = m + masked(self.msa_transition(m))
-        pair = pair + masked(self.outer_product_mean(m, msa_attention_mask))
+        pair = pair + masked(self.outer_product_mean(m, msa_mask))
         pair = pair + masked(self.triangle_multiplication_outgoing(pair, visibility=pair_attention_mask))
         pair = pair + masked(self.triangle_multiplication_incoming(pair, visibility=pair_attention_mask))
         pair = pair + masked(self.pair_transition(pair))
@@ -2996,17 +2996,17 @@ class EsmFold2OuterProductMean(nn.Module):
     def set_chunk_size(self, chunk_size: int | None) -> None:
         self._chunk_size = chunk_size
 
-    def forward(self, m: Tensor, msa_attention_mask: Tensor) -> Tensor:
+    def forward(self, m: Tensor, msa_mask: Tensor) -> Tensor:
         resolved = resolve_tensor_backend(
             self.backend,
-            tensors=(m, msa_attention_mask),
+            tensors=(m, msa_mask),
             supported=("oops", "eager"),
             public_default="eager",
         )
         if resolved == "oops":
             return dispatch_outer_product_mean(
                 m.transpose(1, 2),
-                msa_attention_mask.transpose(1, 2),
+                msa_mask.transpose(1, 2),
                 msa_norm_weight=self.msa_norm.weight,
                 msa_norm_bias=self.msa_norm.bias,
                 proj_left_weight=self.left_projection.weight,
@@ -3020,10 +3020,10 @@ class EsmFold2OuterProductMean(nn.Module):
                 backend="oops",
             )
         m_norm = self.msa_norm(m)
-        mask = msa_attention_mask.unsqueeze(-1).to(m_norm.dtype)
+        mask = msa_mask.unsqueeze(-1).to(m_norm.dtype)
         a = self.left_projection(m_norm) * mask
         b = self.right_projection(m_norm) * mask
-        mask_f = msa_attention_mask.to(a.dtype)
+        mask_f = msa_mask.to(a.dtype)
         n_valid = (mask_f @ mask_f.transpose(-1, -2)).unsqueeze(-1).clamp(min=1.0)
         if self._chunk_size is None:
             outer = torch.einsum("bimc,bjmd->bijcd", a, b).flatten(-2)
@@ -4241,7 +4241,7 @@ _CONFIDENCE_EPSILON = 1e-6
 
 def _maybe_subsample_msa(
     msa_tokens: Tensor,
-    msa_attention_mask: Tensor | None,
+    msa_mask: Tensor | None,
     has_deletion: Tensor | None,
     deletion_value: Tensor | None,
     *,
@@ -4256,40 +4256,40 @@ def _maybe_subsample_msa(
     disabled, ``max_depth`` is None, or depth <= ``max_depth``.
     """
     if not enabled or max_depth is None:
-        return msa_tokens, msa_attention_mask, has_deletion, deletion_value
+        return msa_tokens, msa_mask, has_deletion, deletion_value
     depth = msa_tokens.size(1)
     if depth <= 1 or depth <= max_depth:
-        return msa_tokens, msa_attention_mask, has_deletion, deletion_value
+        return msa_tokens, msa_mask, has_deletion, deletion_value
     indices = torch.zeros(max_depth, dtype=torch.long, device=msa_tokens.device)
     perm = torch.randperm(depth - 1, device=msa_tokens.device, generator=generator)[: max_depth - 1]
     indices[1:] = perm + 1
     indices = indices.sort().values
     msa_tokens = msa_tokens[:, indices]
-    if msa_attention_mask is not None:
-        msa_attention_mask = msa_attention_mask[:, indices]
+    if msa_mask is not None:
+        msa_mask = msa_mask[:, indices]
     if has_deletion is not None:
         has_deletion = has_deletion[:, indices]
     if deletion_value is not None:
         deletion_value = deletion_value[:, indices]
-    return msa_tokens, msa_attention_mask, has_deletion, deletion_value
+    return msa_tokens, msa_mask, has_deletion, deletion_value
 
 
 def _maybe_apply_msa_column_masking(
-    msa_attention_mask: Tensor | None,
+    msa_mask: Tensor | None,
     rate: float,
     generator: torch.Generator | None = None,
 ) -> Tensor | None:
     r"""
     Mask fraction ``rate`` of MSA columns in non-query rows of
-    ``msa_attention_mask``, keeping query row 0. No-op when absent, ``rate <= 0``,
+    ``msa_mask``, keeping query row 0. No-op when absent, ``rate <= 0``,
     or depth <= 1.
     """
-    if msa_attention_mask is None or rate <= 0.0 or msa_attention_mask.size(1) <= 1:
-        return msa_attention_mask
-    B, _M, L = msa_attention_mask.shape
-    col_keep = torch.rand(B, L, device=msa_attention_mask.device, generator=generator) >= rate
-    masked = msa_attention_mask.bool() & col_keep.unsqueeze(1)
-    masked[:, 0, :] = msa_attention_mask[:, 0, :].bool()
+    if msa_mask is None or rate <= 0.0 or msa_mask.size(1) <= 1:
+        return msa_mask
+    B, _M, L = msa_mask.shape
+    col_keep = torch.rand(B, L, device=msa_mask.device, generator=generator) >= rate
+    masked = msa_mask.bool() & col_keep.unsqueeze(1)
+    masked[:, 0, :] = msa_mask[:, 0, :].bool()
     return masked
 
 
@@ -4661,7 +4661,7 @@ class EsmFold2Input:
         has_deletion: Optional MSA deletion flags with shape ``(B, M, N)``.
         deletion_value: Optional transformed MSA deletion values with shape
             ``(B, M, N)``.
-        msa_attention_mask: Optional MSA validity mask with shape ``(B, M, N)``.
+        msa_mask: Optional MSA validity mask with shape ``(B, M, N)``.
         language_model_tokens: Optional language-model token IDs with shape ``(C, L)``.
         language_model_mask: Optional validity mask with shape ``(C, L)``.
         token_to_esmc: Optional flattened language-model index for each structure token,
@@ -4696,7 +4696,7 @@ class EsmFold2Input:
     msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
     deletion_value: Tensor | None = None
-    msa_attention_mask: Tensor | None = None
+    msa_mask: Tensor | None = None
     language_model_tokens: Tensor | None = None
     language_model_mask: Tensor | None = None
     token_to_esmc: Tensor | None = None

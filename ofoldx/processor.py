@@ -15,8 +15,9 @@ class Processor:
     r"""
     Base class for processors with a default tensor device and dtype.
 
-    ``config_class`` owns the Processor's repository configuration schema. It is
-    ``None`` for configuration-free Processors.
+    ``config_class`` owns the Processor's repository configuration schema.
+    ``config`` stores one instance of that schema; both are ``None`` for
+    configuration-free Processors.
 
     Args:
         device: Device used for newly created tensors. Defaults to CPU.
@@ -25,6 +26,7 @@ class Processor:
     """
 
     config_class: ClassVar[type[chanfig.Config] | None] = None
+    config: chanfig.Config | None = None
     device: torch.device
     dtype: torch.dtype
 

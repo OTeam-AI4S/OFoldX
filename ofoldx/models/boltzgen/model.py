@@ -25,12 +25,14 @@ from ...model import Model
 from ...modules.atom import (
     PackedAtomToTokenEncoder,
     PackedDenoisingAtomToTokenEncoder,
+    PackedReferenceAtomEncoder,
     PackedTokenToAtomDecoder,
 )
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.window import gather_key_windows
 from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention
 from ...modules.backend import LayerNorm
+from ...modules.contact import BoltzContactConditioning
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.dropout import RowwiseDropout
@@ -147,7 +149,7 @@ class BoltzGenModel(Model):
         self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
         self.token_bond_type_embedding = nn.Embedding(config.num_bond_types, pair_size)
-        self.contact_conditioning = BoltzGenContactConditioning(
+        self.contact_conditioning = BoltzContactConditioning(
             pair_size, cutoff_min=config.conditioning_cutoff_min, cutoff_max=config.conditioning_cutoff_max
         )
         self.single_recycle_norm = LayerNorm(single_size)
@@ -294,7 +296,7 @@ class BoltzGenModel(Model):
             time_dilation_start=sampler.time_dilation_start,
             time_dilation_end=sampler.time_dilation_end,
         )
-        self.bfactor_head = BoltzGenBFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
+        self.bfactor_head = nn.Linear(single_size, config.num_distogram_bins)
         self.post_init()
 
     def initialize_parameters(self) -> None:
@@ -800,7 +802,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.atom_encoder = BoltzGenAtomEncoder(
+        self.atom_encoder = PackedReferenceAtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -912,119 +914,6 @@ class BoltzGenInputEmbeddings(nn.Module):
         if self.ss_specification_embedding is not None:
             single = single + self.ss_specification_embedding(cast(Tensor, ss_type))
         return single
-
-
-class BoltzGenAtomEncoder(nn.Module):
-    r"""
-    Build atom single states and windowed atom-pair states from reference geometry.
-    """
-
-    def __init__(
-        self,
-        atom_feature_size: int = 388,
-        atom_hidden_size: int = 128,
-        atom_pair_hidden_size: int = 16,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-    ) -> None:
-        super().__init__()
-        self.num_query_atoms = num_query_atoms
-        self.num_key_atoms = num_key_atoms
-        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
-        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
-        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.left_atom_projection = nn.Linear(
-            atom_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.right_atom_projection = nn.Linear(
-            atom_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_input_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_hidden_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_output_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-
-    def feed_forward(self, pair: Tensor) -> Tensor:
-        pair = self.feed_forward_input_projection(F.relu(pair))
-        pair = self.feed_forward_hidden_projection(F.relu(pair))
-        return self.feed_forward_output_projection(F.relu(pair))
-
-    def forward(
-        self,
-        atom_features: Tensor,
-        reference_positions: Tensor,
-        atom_mask: Tensor,
-        reference_space_id: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        atom_query = self.atom_feature_projection(atom_features)
-        atom_single = atom_query
-
-        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
-        batch, length = atom_single.shape[:2]
-        padding = (-length) % num_query_atoms
-        num_windows = (length + padding) // num_query_atoms
-        to_keys = partial(
-            gather_key_windows,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-
-        def pad_atoms(value: Tensor) -> Tensor:
-            r"""
-            Right-pad the atom axis (dim 1) of ``value`` by ``padding`` zeros so it tiles into whole windows.
-
-            Args:
-                value: A tensor whose dim 1 is the per-atom axis, e.g. `[B, num_atoms, ...]`.
-
-            Returns:
-                ``value`` with ``padding`` trailing zeros appended along dim 1 (unchanged when ``padding`` is 0).
-            """
-            if not padding:
-                return value
-            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
-
-        positions = pad_atoms(reference_positions)
-        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
-        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
-        distance_vectors = positions_keys - positions_queries
-
-        mask = pad_atoms(atom_mask).bool()
-        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
-        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
-        space_id = pad_atoms(reference_space_id)
-        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
-        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
-        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
-
-        single_windows = F.relu(pad_atoms(atom_single))
-        atom_pair = encode_atom_pair(
-            self,
-            distance_vectors,
-            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
-            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
-            distance_term_mask=valid,
-            inverse_term_mask=valid,
-            valid_mask=valid,
-            pair_bias=None,
-            prefix_ndim=1,
-        )
-        return atom_query, atom_single, atom_pair
 
 
 class BoltzGenDenoiserAtomEncoder(nn.Module):
@@ -2017,15 +1906,6 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
         return pair, msa_representation
 
 
-_CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
-    "UNSPECIFIED",
-    "UNSELECTED",
-    "POCKET>BINDER",
-    "BINDER>POCKET",
-    "CONTACT",
-)
-
-
 class BoltzGenMiniformerStack(nn.Module):
     r"""
     Stack of BoltzGen Miniformer blocks (the trunk variant selected by ``use_miniformer``).
@@ -2146,48 +2026,6 @@ class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
             update = torch.cat((outgoing, incoming), dim=-1).to(pair.dtype)
         update = self.output_norm(update)
         return self.output_projection(update) * torch.sigmoid(self.output_gate_projection(update))
-
-
-class BoltzGenContactConditioning(nn.Module):
-    r"""
-    Additive pair bias encoding pocket and contact constraints.
-    """
-
-    def __init__(
-        self,
-        pair_size: int,
-        *,
-        cutoff_min: float,
-        cutoff_max: float,
-        num_classes: int | None = None,
-    ) -> None:
-        super().__init__()
-        num_classes = len(_CONTACT_CONDITIONING_CLASSES) if num_classes is None else num_classes
-        self.cutoff_min = cutoff_min
-        self.cutoff_max = cutoff_max
-        self.num_classes = num_classes
-        self.threshold_fourier = FrozenFourierEmbedding(pair_size)
-        self.constraint_encoder = nn.Linear(pair_size + num_classes - 1, pair_size)
-        self.unspecified_bias = nn.Parameter(torch.zeros(pair_size))
-        self.unselected_bias = nn.Parameter(torch.zeros(pair_size))
-
-    def forward(self, contact_conditioning: Tensor, contact_threshold: Tensor) -> Tensor:
-        active = contact_conditioning[..., 2:]
-        threshold_normalized = (contact_threshold - self.cutoff_min) / (self.cutoff_max - self.cutoff_min)
-        threshold_fourier = self.threshold_fourier(threshold_normalized)
-
-        encoder_input = torch.cat(
-            [active, threshold_normalized.unsqueeze(-1), threshold_fourier],
-            dim=-1,
-        )
-        encoded = self.constraint_encoder(encoder_input)
-
-        gate = 1 - contact_conditioning[..., 0:2].sum(dim=-1, keepdim=True)
-        return (
-            encoded * gate
-            + self.unspecified_bias * contact_conditioning[..., 0:1]
-            + self.unselected_bias * contact_conditioning[..., 1:2]
-        )
 
 
 class BoltzGenDenoiserConditioning(nn.Module):
@@ -2664,19 +2502,6 @@ class BoltzGenGaussianSmearing(nn.Module):
         return torch.exp(self.coeff * delta.pow(2))
 
 
-class BoltzGenBFactorHead(nn.Module):
-    r"""
-    Predict per-token B-factor logits from the trunk single representation.
-    """
-
-    def __init__(self, single_size: int = 384, num_bins: int = 64) -> None:
-        super().__init__()
-        self.projection = nn.Linear(single_size, num_bins)
-
-    def forward(self, single: Tensor) -> Tensor:
-        return self.projection(single)
-
-
 # Scoring heads are optional so the design-only generator keeps its base parameter count.
 
 
@@ -2757,7 +2582,7 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
     """
 
     for child in module.modules():
-        if isinstance(child, (BoltzGenAtomEncoder, BoltzGenDenoiserAtomEncoder)):
+        if isinstance(child, (PackedReferenceAtomEncoder, BoltzGenDenoiserAtomEncoder)):
             if isinstance(child, BoltzGenDenoiserAtomEncoder):
                 nn.init.zeros_(child.single_trunk_projection.weight)
                 nn.init.zeros_(child.pair_trunk_projection.weight)

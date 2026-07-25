@@ -80,6 +80,7 @@ class AlphaFold2Processor(Processor):
     """
 
     config_class = AlphaFold2ProcessorConfig
+    config: AlphaFold2ProcessorConfig
 
     def __init__(
         self,

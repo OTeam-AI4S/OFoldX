@@ -45,17 +45,13 @@ from ...modules.embedding import (
     FrozenFourierEmbedding,
     RelativePositionBuckets,
     RelativePositionEmbedder,
-    TemplateEmbedder,
-    TemplateFeatures,
     generate_relative_position_features,
 )
 from ...modules.embedding.factorized import FactorizedPairLinear
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import (
     AtomConfidenceProjector,
-    BinnedDistancePairEmbedder,
     DistogramHead,
-    PostProjectionSymmetricPairConfidenceProjector,
     expected_plddt,
     tm_bin_weights,
 )
@@ -96,8 +92,9 @@ class AlphaFold3Model(Model):
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
         self.pair_recycle_norm = LayerNorm(config.pair_size)
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_norm = LayerNorm(config.single_size)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
+        # Preserve released initialization order while registering children in execution order.
+        single_recycle_norm = LayerNorm(config.single_size)
+        single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.template_embedder = AlphaFold3TemplateEmbedder(
             pair_size=config.pair_size,
             hidden_size=config.template.hidden_size,
@@ -115,6 +112,8 @@ class AlphaFold3Model(Model):
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
         )
+        self.single_recycle_norm = single_recycle_norm
+        self.single_recycle_projection = single_recycle_projection
         self.pairformer_stack = AlphaFold3PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
             single_size=config.single_size,
@@ -783,7 +782,7 @@ class AlphaFold3ConfidenceHead(nn.Module):
     ) -> None:
         super().__init__()
         self.single_max_abs = single_max_abs
-        self.pair_embedder = BinnedDistancePairEmbedder(
+        self.pair_embedder = AlphaFold3BinnedDistancePairEmbedder(
             pair_size=pair_size,
             token_feature_size=token_feature_size,
             distance_bin_start=distance_bin_start,
@@ -809,7 +808,7 @@ class AlphaFold3ConfidenceHead(nn.Module):
             max_atoms_per_token=max_atoms_per_token,
             backend=backend,
         )
-        self.pair_projector = PostProjectionSymmetricPairConfidenceProjector(
+        self.pair_projector = AlphaFold3PostProjectionSymmetricPairConfidenceProjector(
             pair_size=pair_size,
             num_pae_bins=num_pae_bins,
             num_pde_bins=num_pde_bins,
@@ -876,7 +875,7 @@ class AlphaFold3CoordinateDenoiser(CoordinateDenoiser):
         num_key_atoms: int = 128,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
         self.conditioner = AlphaFold3DenoisingConditioner(
             pair_input_size=pair_size + 139,
@@ -1343,9 +1342,21 @@ class AlphaFold3MsaTrunk(MsaTrunk):
         self.blocks = nn.ModuleList(blocks)
 
 
-class AlphaFold3TemplateEmbedder(TemplateEmbedder):
+class AlphaFold3TemplateEmbedder(nn.Module):
     r"""
-    AlphaFold 3 template embedder with the family-owned triangle-bias equation.
+    Embed AlphaFold 3 template-derived pair features into the trunk pair representation.
+
+    Args:
+        pair_size: Width of the trunk pair representation this update is added into.
+        hidden_size: Width of the internal template pair channel.
+        num_blocks: Number of pair-only triangle update blocks; ``0`` disables the embedder.
+        vocab_size: Residue-type vocabulary size (one block per side of the pair).
+        num_distogram_bins: Number of distogram bins in the packed template features.
+        triangle_attention_hidden_size: Per-head width of template triangle attention.
+        num_triangle_attention_heads: Number of template triangle-attention heads.
+        expansion: Transition expansion factor inside each triangle update block.
+        dropout: Dropout probability inside each triangle update block.
+        backend: Backend selector forwarded to the triangle update blocks.
     """
 
     def __init__(
@@ -1389,6 +1400,160 @@ class AlphaFold3TemplateEmbedder(TemplateEmbedder):
         self.hidden_norm = LayerNorm(hidden_size, backend=backend)
         self.activation = nn.ReLU()
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
+
+    def forward(
+        self,
+        pair: Tensor,
+        templates: TemplateFeatures,
+        pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        r"""
+        Return template pair updates for an input pair representation.
+
+        Args:
+            pair: ``[..., N_token, N_token, pair_size]`` trunk pair representation.
+            templates: Pre-packed AlphaFold 3 template features.
+            pair_mask: Optional ``[..., N_token, N_token]`` pair validity mask forwarded to the
+                triangle update blocks.
+
+        Returns:
+            ``[..., N_token, N_token, pair_size]`` template pair update. The
+            update is zero when ``num_blocks == 0`` or the template count is zero.
+        """
+
+        if self.num_blocks == 0 or templates.distogram.shape[-4] == 0:
+            return pair.new_zeros(pair.shape)
+
+        normalized_pair = self.pair_norm(pair)
+        template_updates = []
+        for template_index in range(templates.distogram.shape[-4]):
+            template_pair = self._single_template_update(
+                normalized_pair,
+                templates=templates,
+                template_index=template_index,
+                pair_mask=pair_mask,
+            )
+            if templates.template_mask is not None:
+                mask = templates.template_mask[..., template_index].to(
+                    device=template_pair.device,
+                    dtype=template_pair.dtype,
+                )
+                template_pair = template_pair * mask.reshape(*mask.shape, 1, 1, 1)
+            template_updates.append(template_pair)
+
+        update = torch.stack(template_updates, dim=-4).mean(dim=-4)
+        return self.output_projection(self.activation(update))
+
+    def _single_template_update(
+        self,
+        pair: Tensor,
+        *,
+        templates: TemplateFeatures,
+        template_index: int,
+        pair_mask: Tensor | None,
+    ) -> Tensor:
+        r"""
+        Embed and refine one AlphaFold 3 template in the hidden pair channel.
+        """
+
+        geom, residue_one_hot = self._pack_features(templates, template_index)
+        template_pair = self.pair_projection(pair)
+        template_pair = template_pair + self.template_projection(geom, residue_one_hot)
+        for block in self.blocks:
+            template_pair = block(template_pair, pair_mask=pair_mask)
+        return self.hidden_norm(template_pair)
+
+    def _pack_features(self, templates: TemplateFeatures, template_index: int) -> tuple[Tensor, Tensor]:
+        r"""
+        Return geometric pair features and residue one-hot features for one template.
+        """
+
+        expected_residue_shape = templates.distogram.shape[:-2]
+        if templates.residue_type_ids.shape != expected_residue_shape:
+            raise ValueError(
+                "residue_type_ids must have shape " f"{expected_residue_shape}; got {templates.residue_type_ids.shape}"
+            )
+        residue_type_ids = templates.residue_type_ids[..., template_index, :]
+        residue_one_hot = F.one_hot(residue_type_ids, num_classes=self.vocab_size).to(dtype=templates.distogram.dtype)
+
+        geom = torch.cat(
+            [
+                templates.distogram[..., template_index, :, :, :],
+                templates.pseudo_beta_mask[..., template_index, :, :].unsqueeze(-1),
+                templates.unit_vector[..., template_index, :, :, :],
+                templates.backbone_frame_mask[..., template_index, :, :].unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return geom, residue_one_hot
+
+
+class AlphaFold3BinnedDistancePairEmbedder(nn.Module):
+    r"""
+    Add token features and binned representative-atom distances to an AlphaFold 3 pair state.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+    ) -> None:
+        super().__init__()
+        self.left_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        self.right_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        buffer_device = self.left_token_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        lower_bins = torch.arange(
+            distance_bin_start,
+            distance_bin_end,
+            distance_bin_step,
+            device=buffer_device,
+            dtype=self.left_token_projection.weight.dtype,
+        )
+        upper_bins = torch.cat([lower_bins[1:], lower_bins.new_tensor([torch.inf])], dim=-1)
+        self.lower_bins: Tensor
+        self.upper_bins: Tensor
+        self.register_buffer("lower_bins", lower_bins, persistent=False)
+        self.register_buffer("upper_bins", upper_bins, persistent=False)
+        self.distance_one_hot_projection = nn.Linear(len(lower_bins), pair_size, bias=False)
+
+    def forward(self, pair: Tensor, token_embedding: Tensor, representative_coords: Tensor) -> Tensor:
+        pair = pair + self.left_token_projection(token_embedding).unsqueeze(-2)
+        pair = pair + self.right_token_projection(token_embedding).unsqueeze(-3)
+        distance = torch.cdist(representative_coords.to(torch.float32), representative_coords.to(torch.float32))
+        distance_bins = ((distance[..., None] > self.lower_bins) & (distance[..., None] < self.upper_bins)).to(
+            pair.dtype
+        )
+        return pair + self.distance_one_hot_projection(distance_bins)
+
+
+class AlphaFold3PostProjectionSymmetricPairConfidenceProjector(nn.Module):
+    r"""
+    Project AlphaFold 3 pair states and symmetrize PDE after nonlinear normalization.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+    ) -> None:
+        super().__init__()
+        self.pae_norm = LayerNorm(pair_size)
+        self.pde_norm = LayerNorm(pair_size)
+        self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+        self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+
+    def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:
+        pae_pair = pair.to(dtype=self.pae_projection.weight.dtype)
+        pde_pair = pair.to(dtype=self.pde_projection.weight.dtype)
+        pae_logits = self.pae_projection(self.pae_norm(pae_pair))
+        left_distance_logits = self.pde_projection(self.pde_norm(pde_pair))
+        return pae_logits, left_distance_logits + left_distance_logits.transpose(-2, -3)
 
 
 def _build_alphafold3_local_geometry(
@@ -2177,6 +2342,31 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
 
     tree = spatial.cKDTree(coordinates)
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
+
+
+@dataclass(eq=False)
+class TemplateFeatures:
+    r"""
+    Template features consumed by [`AlphaFold3TemplateEmbedder`][].
+
+    Every tensor carries a ``num_templates`` axis.
+
+    Args:
+        distogram: ``[..., num_templates, N_token, N_token, num_distogram_bins]`` template pair distogram
+            features.
+        pseudo_beta_mask: ``[..., num_templates, N_token, N_token]`` template pseudo-beta validity mask.
+        residue_type_ids: Integer template residue type ids ``[..., num_templates, N_token]``.
+        unit_vector: ``[..., num_templates, N_token, N_token, 3]`` template pair unit-vector features.
+        backbone_frame_mask: ``[..., num_templates, N_token, N_token]`` template backbone-frame validity mask.
+        template_mask: Optional ``[..., num_templates]`` per-template validity mask.
+    """
+
+    distogram: Tensor
+    pseudo_beta_mask: Tensor
+    residue_type_ids: Tensor
+    unit_vector: Tensor
+    backbone_frame_mask: Tensor
+    template_mask: Tensor | None = None
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)

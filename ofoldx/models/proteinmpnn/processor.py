@@ -54,6 +54,7 @@ class ProteinMpnnProcessor(Processor):
     """
 
     config_class = ProteinMpnnProcessorConfig
+    config: ProteinMpnnProcessorConfig
 
     def __init__(
         self,

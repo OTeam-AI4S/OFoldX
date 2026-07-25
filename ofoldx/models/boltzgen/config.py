@@ -269,7 +269,7 @@ class BoltzGenConfig(Config):
         This variant preserves the single, pair, atom, and EDM dimensions while using a shallower graph:
 
         - Miniformer trunk (compact triangular pair updates) instead of the full Pairformer/MSA stack.
-        - ``12`` Miniformer pairformer blocks (vs ``64``) and ``3`` MSA blocks (vs ``4``).
+        - ``12`` Miniformer trunk blocks (vs ``64``) and ``3`` MSA blocks (vs ``4``).
         - Miniformer template pair updates.
         - ``8`` diffusion token-encoder blocks (vs ``24``).
         - No token-distance conditioning module.

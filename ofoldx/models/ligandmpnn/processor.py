@@ -99,6 +99,7 @@ class LigandMpnnProcessor(Processor):
     """
 
     config_class = LigandMpnnProcessorConfig
+    config: LigandMpnnProcessorConfig
 
     def __init__(
         self,

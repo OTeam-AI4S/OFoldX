@@ -72,9 +72,6 @@ urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
 [tool.setuptools]
 packages.find.include = [ "ofoldx*" ]
 
-[tool.setuptools.package-data]
-ofoldx = [ "models/rfdiffusion/rfdiffusion_schedule.npz" ]
-
 [tool.setuptools_scm]
 write_to = "ofoldx/_version.py"
 

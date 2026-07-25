@@ -43,6 +43,7 @@ class MpnnPackerProcessor(Processor):
     """
 
     config_class = MpnnPackerProcessorConfig
+    config: MpnnPackerProcessorConfig
 
     def __init__(
         self,

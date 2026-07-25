@@ -5,6 +5,7 @@ Input processing for Boltz-1 structure prediction.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -558,23 +559,23 @@ def _steering_features(
                 if component.component_id in _CONSTRAINT_FREE_COMPONENTS[entity.polymer_type]:
                     continue
                 rdkit_molecule = _canonical_rdkit_molecule(Molecule((component,)))
-                atom_index = {
+                component_atom_index = {
                     local_index: site_to_atom[site]
                     for local_index, atom in enumerate(component.atoms)
                     if (site := AtomSite(instance_id, component_index, atom.atom_id)) in site_to_atom
                 }
-                constraint_scopes.append((rdkit_molecule, atom_index))
+                constraint_scopes.append((rdkit_molecule, component_atom_index))
         else:
             rdkit_molecule = _canonical_rdkit_molecule(entity)
-            atom_index: dict[int, int] = {}
+            molecule_atom_index: dict[int, int] = {}
             local_index = 0
             for component_index, component in enumerate(entity.components):
                 for atom in component.atoms:
                     site = AtomSite(instance_id, component_index, atom.atom_id)
                     if site in site_to_atom:
-                        atom_index[local_index] = site_to_atom[site]
+                        molecule_atom_index[local_index] = site_to_atom[site]
                     local_index += 1
-            constraint_scopes.append((rdkit_molecule, atom_index))
+            constraint_scopes.append((rdkit_molecule, molecule_atom_index))
 
     for rdkit_molecule, atom_index in constraint_scopes:
         (
@@ -643,7 +644,7 @@ def _steering_features(
     }
 
 
-def _index_columns(values: list[tuple[int, ...]], width: int) -> Tensor:
+def _index_columns(values: Sequence[tuple[int, ...]], width: int) -> Tensor:
     if not values:
         return torch.empty(width, 0, dtype=torch.long)
     return torch.tensor(values, dtype=torch.long).T.contiguous()

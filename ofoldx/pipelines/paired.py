@@ -12,15 +12,14 @@ import chanfig
 import torch
 from typing_extensions import Self
 
-from ..artifacts import SaveableModel, save_model
+from ..artifacts import save_model
 from ..hub import load_model, load_processor, resolve_repository
 from ..model import Model
 from ..processor import Processor
-from .generator import PipelineProcessor
 from .registry import PIPELINES
 
-_ModelT = TypeVar("_ModelT", bound=SaveableModel)
-_ProcessorT = TypeVar("_ProcessorT", bound=PipelineProcessor)
+_ModelT = TypeVar("_ModelT", bound=Model)
+_ProcessorT = TypeVar("_ProcessorT", bound=Processor)
 
 
 class PairedPipeline(Generic[_ModelT, _ProcessorT]):
@@ -115,8 +114,8 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
         save_model(
             directory,
-            model=cast(Model, self.model),
-            processor=cast(Processor, self.processor),
+            model=self.model,
+            processor=self.processor,
             max_shard_size=max_shard_size,
         )
         chanfig.NestedDict({"pipeline": pipeline_id}).dump(Path(directory).expanduser() / "pipeline.json")

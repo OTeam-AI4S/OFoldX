@@ -37,6 +37,7 @@ class AlphaFold2MultimerProcessor(Processor):
     """
 
     config_class = AlphaFold2MultimerProcessorConfig
+    config: AlphaFold2MultimerProcessorConfig
 
     def __init__(
         self,

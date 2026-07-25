@@ -34,9 +34,10 @@ def resolve_backend(requested: str, *, supported: tuple[str, ...], public_defaul
     r"""
     Resolve a backend request without tensor-specific constraints.
 
-    ``"auto"`` becomes ``"oops"`` when OOps is available and supported, otherwise
-    ``public_default``. Explicit implementation names are validated and returned
-    unchanged.
+    ``"auto"`` becomes ``"oops"`` when OOps is available and supported,
+    otherwise ``public_default``. An explicit public provider is a preference:
+    it is returned when this operator supports it and otherwise resolves to
+    ``public_default``.
 
     Args:
         requested: The requested backend.
@@ -47,7 +48,8 @@ def resolve_backend(requested: str, *, supported: tuple[str, ...], public_defaul
         A concrete backend name drawn from ``supported`` (or ``public_default``).
 
     Raises:
-        ValueError: If the requested backend is not supported.
+        ValueError: If the request is not a public backend or a supported
+            operator-specific implementation.
     """
 
     if requested == "auto":
@@ -91,9 +93,8 @@ def resolve_tensor_backend(
     Resolve a backend for concrete tensors.
 
     ``"auto"`` selects OOps only when it is available, supported, and every provided
-    tensor is on CUDA. It otherwise selects the eager implementation. ``None``
-    values are ignored and at least one tensor is required for automatic OOps
-    selection.
+    tensor is on CUDA. It otherwise selects ``public_default``. ``None`` values
+    are ignored and at least one tensor is required for automatic OOps selection.
 
     Args:
         requested: The requested backend.

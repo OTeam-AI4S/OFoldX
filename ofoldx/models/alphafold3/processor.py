@@ -35,10 +35,9 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...modules.embedding import TemplateFeatures
 from ...processor import Processor
 from .config import AlphaFold3ProcessorConfig
-from .model import AlphaFold3Input
+from .model import AlphaFold3Input, TemplateFeatures
 
 # AlphaFold 3 target residue-type vocabulary (POLYMER_TYPES_WITH_UNKNOWN_AND_GAP, 31 classes):
 # 20 standard amino acids, UNK, the gap, then A G C U (RNA) DA DG DC DT (DNA) and the shared
@@ -151,6 +150,7 @@ class AlphaFold3Processor(Processor):
     """
 
     config_class = AlphaFold3ProcessorConfig
+    config: AlphaFold3ProcessorConfig
 
     def __init__(
         self,
@@ -206,6 +206,18 @@ class AlphaFold3Processor(Processor):
 def molecular_system_from_input(
     input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
 ) -> MolecularSystem:
+    r"""
+    Normalize one AlphaFold 3 biological input to its molecular system.
+
+    Args:
+        input: One polymer, a polymer collection, a molecular system, or a
+            structure whose topology supplies the system.
+
+    Returns:
+        The existing molecular system or one constructed from the supplied
+        polymer sequence values.
+    """
+
     if isinstance(input, Structure):
         return input.system
     if isinstance(input, MolecularSystem):
@@ -229,6 +241,19 @@ def molecular_system_from_input(
 def molecular_system_from_named_sequences(
     named: tuple[tuple[str, PolymerSequence], ...],
 ) -> MolecularSystem:
+    r"""
+    Construct an AlphaFold 3 molecular system from named polymer instances.
+
+    Repeated names receive deterministic numeric suffixes while preserving
+    declaration order.
+
+    Args:
+        named: Ordered ``(base_id, sequence)`` pairs.
+
+    Returns:
+        A molecular system with one entity and instance per sequence.
+    """
+
     used: set[str] = set()
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}

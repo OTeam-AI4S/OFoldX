@@ -8,7 +8,6 @@ import math
 from collections.abc import Sequence
 from typing import cast
 
-import numpy as np
 import torch
 from multimolecule import ProteinTokenizer
 
@@ -82,6 +81,7 @@ class EsmFold2Processor(Processor):
     """
 
     config_class = EsmFold2ProcessorConfig
+    config: EsmFold2ProcessorConfig
 
     def __init__(
         self,
@@ -140,6 +140,7 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
     """
 
     config_class = EsmFold2ExperimentalProcessorConfig
+    config: EsmFold2ExperimentalProcessorConfig
 
     def __init__(
         self,
@@ -149,12 +150,7 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
         dtype: torch.dtype | None = None,
     ) -> None:
         config = EsmFold2ExperimentalProcessorConfig() if config is None else config
-        super().__init__(
-            EsmFold2ProcessorConfig({"msa_conditioning": config.msa_conditioning}),
-            device=device,
-            dtype=dtype,
-        )
-        self.config = config
+        super().__init__(config, device=device, dtype=dtype)
 
 
 def molecular_system_from_sequences(
@@ -612,7 +608,7 @@ def _msa_tensors(
         "has_deletion": has_deletion,
         "deletion_value": deletion_value,
         "deletion_mean": deletion_value.mean(dim=0),
-        "msa_attention_mask": torch.ones_like(tokens, dtype=torch.bool),
+        "msa_mask": torch.ones_like(tokens, dtype=torch.bool),
     }
 
 

@@ -75,6 +75,7 @@ class PxDesignProcessor(Processor):
     """
 
     config_class = PxDesignProcessorConfig
+    config: PxDesignProcessorConfig
 
     def __init__(
         self,

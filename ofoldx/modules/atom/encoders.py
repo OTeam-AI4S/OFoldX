@@ -713,6 +713,120 @@ class AtomPairEncoder(nn.Module):
         )
 
 
+class PackedReferenceAtomEncoder(nn.Module):
+    r"""
+    Project reference atom features and geometry into packed atom single and pair states.
+    """
+
+    def __init__(
+        self,
+        atom_feature_size: int = 388,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+    ) -> None:
+        super().__init__()
+        self.num_query_atoms = num_query_atoms
+        self.num_key_atoms = num_key_atoms
+        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.left_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.right_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        pair = self.feed_forward_input_projection(F.relu(pair))
+        pair = self.feed_forward_hidden_projection(F.relu(pair))
+        return self.feed_forward_output_projection(F.relu(pair))
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = self.atom_feature_projection(atom_features)
+        atom_single = atom_query
+
+        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
+        batch, length = atom_single.shape[:2]
+        padding = (-length) % num_query_atoms
+        num_windows = (length + padding) // num_query_atoms
+        to_keys = partial(
+            gather_key_windows,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+
+        def pad_atoms(value: Tensor) -> Tensor:
+            r"""
+            Zero-pad the atom axis (dim 1) up to a whole number of query windows; no-op when already aligned.
+
+            Args:
+                value: Tensor whose dim-1 atom axis is padded from ``length`` to ``length + padding``.
+
+            Returns:
+                ``value`` with its atom axis right-padded with zeros, or ``value`` unchanged when ``padding`` is 0.
+            """
+
+            if not padding:
+                return value
+            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
+
+        positions = pad_atoms(reference_positions)
+        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
+        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
+        distance_vectors = positions_keys - positions_queries
+
+        mask = pad_atoms(atom_mask).bool()
+        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
+        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
+        space_id = pad_atoms(reference_space_id)
+        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
+        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
+        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
+
+        single_windows = F.relu(pad_atoms(atom_single))
+        atom_pair = encode_atom_pair(
+            self,
+            distance_vectors,
+            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
+            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
+            distance_term_mask=valid,
+            inverse_term_mask=valid,
+            valid_mask=valid,
+            pair_bias=None,
+            prefix_ndim=1,
+        )
+        return atom_query, atom_single, atom_pair
+
+
 class PackedAtomAttention(nn.Module):
     r"""
     Apply a concrete atom transformer over an already-packed per-block pair bias.

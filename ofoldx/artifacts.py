@@ -8,77 +8,10 @@ import json
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Protocol, cast
-
-import torch
 
 from .model import Model
 from .models.registry import MODELS
 from .processor import Processor
-
-
-class SaveableModel(Protocol):
-    r"""
-    Structural model surface used only to compose task-specific Protocols.
-    """
-
-    @property
-    def config(self) -> Mapping[str, object]:
-        r"""
-        Return the serializable model configuration.
-
-        Returns:
-            Configuration values written to the model repository.
-        """
-
-        ...
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        r"""
-        Return the model state dictionary.
-
-        Returns:
-            Model tensors keyed by state-dictionary name.
-        """
-
-        ...
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> object:
-        r"""
-        Move or cast the model.
-
-        Args:
-            device: Destination device, or `None` to preserve the current device.
-            dtype: Destination dtype, or `None` to preserve the current dtype.
-
-        Returns:
-            The moved or cast model.
-        """
-
-        ...
-
-
-class SaveableProcessor(Protocol):
-    r"""
-    Configured Processor state written to ``processor.json``.
-    """
-
-    dtype: torch.dtype
-
-    @property
-    def config(self) -> Mapping[str, object]:
-        r"""
-        Return the serializable processor configuration.
-
-        Returns:
-            Configuration values written to the model repository.
-        """
-
-        ...
 
 
 def _config_json(config: Mapping[str, object], *, architecture: str | None = None) -> str:
@@ -131,11 +64,7 @@ def save_model(
 
     registration = MODELS.for_pair(model, processor)
     model_json = _config_json(model.config, architecture=registration.id)
-    processor_config = registration.processor.config_class
-    processor_json = _processor_json(
-        processor,
-        None if processor_config is None else cast(SaveableProcessor, processor).config,
-    )
+    processor_json = _processor_json(processor, processor.config)
 
     destination = Path(directory).expanduser()
     destination.mkdir(parents=True, exist_ok=True)

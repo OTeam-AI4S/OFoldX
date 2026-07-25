@@ -451,7 +451,6 @@ FodyWeavers.xsd
 **/*.np
 **/*.npy
 **/*.npz
-!ofoldx/models/rfdiffusion/rfdiffusion_schedule.npz
 **/*.numpy
 **/*.pd
 **/*.pandas

@@ -72,6 +72,7 @@ class RfDiffusionProcessor(Processor):
     """
 
     config_class = RfDiffusionProcessorConfig
+    config: RfDiffusionProcessorConfig
 
     def __init__(
         self,

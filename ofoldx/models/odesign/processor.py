@@ -176,6 +176,7 @@ class ODesignProcessor(Processor):
     """
 
     config_class = ODesignProcessorConfig
+    config: ODesignProcessorConfig
 
     def __init__(
         self,
@@ -250,8 +251,14 @@ class ODesignProcessor(Processor):
 
         # ODesign validates condition semantics inline: type and intent above, endpoints and
         # referenced atoms below.
-        structure = input if isinstance(input, Structure) else None
-        source_system = structure.system if structure is not None else input
+        structure: Structure | None
+        source_system: MolecularSystem | None
+        if isinstance(input, Structure):
+            structure = input
+            source_system = input.system
+        else:
+            structure = None
+            source_system = input
         # A GeneratedSegment carries no embedded id; its identity is the
         # globally-unique ``placement_id`` inner key of the PlacementSpec mapping.
         segments = {

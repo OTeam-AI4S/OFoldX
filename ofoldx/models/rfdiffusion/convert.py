@@ -25,13 +25,11 @@ _DTYPES = {
 }
 
 
-def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str, np.ndarray]:
+def rfdiffusion_schedule(source: str | PathLike[str]) -> dict[str, np.ndarray]:
     r"""
     Load the released IGSO(3) lookup table from an original or safe converted source.
     """
 
-    if source is None:
-        source = Path(__file__).with_name("rfdiffusion_schedule.npz")
     path = Path(source)
     if path.suffix == ".pkl":
         with path.open("rb") as handle:
@@ -302,16 +300,17 @@ def convert_rfdiffusion_state_dict(
 def convert_rfdiffusion_checkpoint(
     checkpoint: str | PathLike[str],
     *,
+    schedule_source: str | PathLike[str],
     dtype: torch.dtype | None = None,
-    schedule_source: str | PathLike[str] | None = None,
 ) -> RfDiffusionModel:
     r"""
     Return one native Model loaded strictly from an official checkpoint.
 
-    The released IGSO(3) schedule table is copied verbatim from ``schedule_source``
-    (an ``.npz`` or original RFdiffusion ``.pkl``), or from the bundled family
-    table when no source is given, into the model's persistent ``igso3_*``
-    float64 buffers.
+    The released IGSO(3) schedule table is copied verbatim from
+    ``schedule_source`` (an ``.npz`` or original RFdiffusion ``.pkl``) into the
+    model's persistent ``igso3_*`` float64 buffers. Repository saving then stores
+    those buffers in ``model.safetensors``; OFoldX does not vendor the source
+    table as package data.
     """
 
     loaded = load_rfdiffusion_checkpoint(checkpoint)
@@ -332,8 +331,8 @@ def save_rfdiffusion_checkpoint(
     checkpoint: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
+    schedule_source: str | PathLike[str],
     dtype: torch.dtype | None = None,
-    schedule_source: str | PathLike[str] | None = None,
     repo_id: str | None = None,
     token: str | None = None,
     private: bool = False,
@@ -376,9 +375,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--schedule-source",
         type=Path,
-        default=None,
-        help="optional IGSO(3) schedule source (the original RFdiffusion .pkl cache, or an .npz "
-        "archive of the same arrays); defaults to the bundled released table",
+        required=True,
+        help="IGSO(3) schedule source (the original RFdiffusion .pkl cache, or an .npz archive "
+        "of the same arrays); conversion stores it in the model safetensors",
     )
     parser.add_argument(
         "--repo-id",

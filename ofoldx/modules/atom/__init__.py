@@ -19,6 +19,7 @@ from .encoders import (
     PackedAtomAttention,
     PackedAtomToTokenEncoder,
     PackedDenoisingAtomToTokenEncoder,
+    PackedReferenceAtomEncoder,
     PackedTokenToAtomDecoder,
     TokenToAtomDecoder,
 )

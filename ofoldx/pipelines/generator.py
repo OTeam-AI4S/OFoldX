@@ -4,44 +4,7 @@ Random-generator handling shared by task pipelines.
 
 from __future__ import annotations
 
-from typing import Protocol
-
 import torch
-
-
-class PipelineProcessor(Protocol):
-    r"""
-    Runtime placement required from processors used by task pipelines.
-    """
-
-    @property
-    def device(self) -> torch.device:
-        r"""
-        Device used for tensors produced by this processor.
-
-        Returns:
-            The processor's current tensor device.
-        """
-
-        ...
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> object:
-        r"""
-        Update the processor's tensor device and dtype.
-
-        Args:
-            device: New tensor device. ``None`` preserves the current device.
-            dtype: New floating-point dtype. ``None`` preserves the current dtype.
-
-        Returns:
-            The updated processor.
-        """
-
-        ...
 
 
 def resolve_generator(

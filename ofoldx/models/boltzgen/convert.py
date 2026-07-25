@@ -89,7 +89,7 @@ CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES: list[Rule] = compile_rules(
 DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "projection.")])
 
 
-BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "projection.")])
+BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "")])
 
 
 ATOM_ENCODER_RULES: list[Rule] = compile_rules(

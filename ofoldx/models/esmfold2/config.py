@@ -368,7 +368,7 @@ class EsmFold2ExperimentalConfig(Config):
     confidence: EsmFold2ExperimentalConfidenceHeadConfig = EsmFold2ExperimentalConfidenceHeadConfig()
 
 
-class EsmFold2ExperimentalProcessorConfig(Config):
+class EsmFold2ExperimentalProcessorConfig(EsmFold2ProcessorConfig):
     r"""
     Configure input processing for recurrent ESMFold2 binder design.
 

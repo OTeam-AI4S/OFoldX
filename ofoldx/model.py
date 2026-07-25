@@ -10,7 +10,7 @@ import chanfig
 from torch import nn
 from typing_extensions import Self
 
-from .modules.backend.resolve import Backend, PUBLIC_BACKENDS
+from .modules.backend.resolve import PUBLIC_BACKENDS, Backend
 
 
 class Model(nn.Module):
@@ -58,7 +58,9 @@ class Model(nn.Module):
 
         Args:
             backend: Backend name. ``"auto"`` selects the best available implementation,
-                while the remaining values request a specific implementation.
+                while the remaining values express a model-wide provider
+                preference. An operator that does not implement that provider
+                uses its public default.
 
         Returns:
             This model.

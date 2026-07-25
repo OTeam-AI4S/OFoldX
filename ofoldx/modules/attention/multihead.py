@@ -10,7 +10,8 @@ from collections.abc import Sequence
 from torch import Tensor, nn
 
 from ..backend import resolve_config_backend
-from ..backend.attention import gated_multihead_attention, projected_attention as dispatch_projected_attention
+from ..backend.attention import gated_multihead_attention
+from ..backend.attention import projected_attention as dispatch_projected_attention
 
 
 class GatedMultiheadAttention(nn.Module):
@@ -89,8 +90,12 @@ class GatedMultiheadAttention(nn.Module):
             key: Key tokens `[..., kv_tokens, key_size]`; defaults to ``query`` (self-attention).
             value: Value tokens `[..., kv_tokens, value_size]`; defaults to ``key``.
             biases: Additive pair biases, each broadcastable to `[..., heads, q_tokens, kv_tokens]`.
-            attention_mask: Boolean keep-mask broadcastable to `[..., q_tokens, kv_tokens]` or
-                `[..., kv_tokens]`; ``False`` positions are excluded from the softmax.
+            attention_mask: Boolean pair-first keep-mask. ``(q_tokens,
+                kv_tokens)`` is a shared pair mask, ``(kv_tokens,)`` is shared
+                key validity, and prefix-specific key validity uses
+                ``(..., kv_tokens)`` when unambiguous or
+                ``(..., 1, kv_tokens)`` otherwise. A head-specific mask retains
+                every prefix position, followed by the head axis.
 
         Returns:
             Updated hidden states `[..., q_tokens, hidden_size]`.
@@ -155,9 +160,12 @@ class ProjectedAttention(nn.Module):
                 ``(..., num_heads, num_key_tokens, value_size)``.
             biases: Optional additive biases broadcastable to
                 ``(..., num_heads, num_query_tokens, num_key_tokens)``.
-            attention_mask: Optional boolean keep-mask. A full-rank mask
-                includes the head axis, one fewer axis omits it, and a
-                shorter mask supplies only key validity.
+            attention_mask: Optional boolean pair-first keep-mask. A trailing
+                ``(num_query_tokens, num_key_tokens)`` payload is a pair mask,
+                ``(num_key_tokens,)`` is shared key validity, and an explicit
+                singleton query axis disambiguates prefix-specific key validity.
+                Head-specific masks retain every prefix position, followed by
+                the head axis.
             scale: Optional multiplier applied to query-key logits. ``None`` uses
                 ``head_size ** -0.5``.
 

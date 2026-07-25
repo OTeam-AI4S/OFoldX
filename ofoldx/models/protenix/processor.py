@@ -126,6 +126,7 @@ class ProtenixProcessor(Processor):
     """
 
     config_class = ProtenixProcessorConfig
+    config: ProtenixProcessorConfig
 
     def __init__(
         self,
@@ -209,6 +210,7 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
     """
 
     config_class = ProtenixConstraintProcessorConfig
+    config: ProtenixConstraintProcessorConfig
 
     def __init__(
         self,
@@ -266,6 +268,18 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
 def molecular_system_from_input(
     input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
 ) -> MolecularSystem:
+    r"""
+    Normalize one Protenix biological input to its molecular system.
+
+    Args:
+        input: One polymer, a polymer collection, a molecular system, or a
+            structure whose topology supplies the system.
+
+    Returns:
+        The existing molecular system or one constructed from the supplied
+        polymer sequence values.
+    """
+
     # A Structure input contributes only its topology: v0.5.3 substructure conditioning is always the
     # all-zero grid, so observed coordinates are not lowered into the constraint channels.
     if isinstance(input, Structure):
@@ -290,6 +304,19 @@ def molecular_system_from_input(
 def molecular_system_from_named_sequences(
     named: tuple[tuple[str, PolymerSequence], ...],
 ) -> MolecularSystem:
+    r"""
+    Construct a Protenix molecular system from named polymer instances.
+
+    Repeated names receive deterministic numeric suffixes while preserving
+    declaration order.
+
+    Args:
+        named: Ordered ``(base_id, sequence)`` pairs.
+
+    Returns:
+        A molecular system with one entity and instance per sequence.
+    """
+
     used: set[str] = set()
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}

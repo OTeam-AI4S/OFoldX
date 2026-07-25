@@ -34,7 +34,8 @@ from ...modules.embedding import (
     generate_relative_position_features,
 )
 from ...modules.functional import pair_mask_from_token_mask
-from ...modules.head import ConfidenceHead, DistogramHead, expected_plddt, tm_bin_weights
+from ...modules.head import AtomConfidenceProjector, DistogramHead, expected_plddt, tm_bin_weights
+from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...results import (
     FoldPrediction,
@@ -76,14 +77,17 @@ class ProtenixModel(Model):
         self.constraint_embeddings = ProtenixConstraintEmbeddings(config.pair_size) if config.constraints else None
         self.pair_recycle_norm = LayerNorm(config.pair_size)
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_norm = LayerNorm(config.single_size)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
+        # Preserve released initialization order while registering children in execution order.
+        single_recycle_norm = LayerNorm(config.single_size)
+        single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
         )
+        self.single_recycle_norm = single_recycle_norm
+        self.single_recycle_projection = single_recycle_projection
         self.pairformer_stack = PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
             single_size=config.single_size,
@@ -124,7 +128,7 @@ class ProtenixModel(Model):
         )
         self._num_sampling_steps = config.sampler.num_sampling_steps
         self.distogram_head = DistogramHead(config.pair_size, config.distogram.num_bins)
-        self.confidence_head = ConfidenceHead(
+        self.confidence_head = ProtenixConfidenceHead(
             single_size=config.single_size,
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
@@ -741,6 +745,136 @@ class ProtenixConstraintModel(ProtenixModel):
         super().__init__(ProtenixConstraintConfig() if config is None else config)
 
 
+class ProtenixConfidenceHead(nn.Module):
+    r"""
+    Predict Protenix pLDDT, PAE, PDE, and resolved logits.
+
+    Args:
+        single_size: Width of the single (token) representation.
+        pair_size: Width of the pair representation.
+        token_feature_size: Width of the packed per-token feature vector.
+        distance_bin_start: Lower edge of the representative-distance one-hot bins in Angstrom.
+        distance_bin_end: Upper edge of the representative-distance one-hot bins in Angstrom.
+        distance_bin_step: Width of each representative-distance bin in Angstrom.
+        num_plddt_bins: Number of pLDDT bins.
+        num_resolved_bins: Number of resolved-classification bins.
+        max_atoms_per_token: Maximum atoms per token, sizing the per-offset weight tables.
+        num_pae_bins: Number of predicted-aligned-error bins.
+        num_pde_bins: Number of predicted-distance-error bins.
+        num_blocks: Number of Pairformer blocks in the confidence stack.
+        num_pair_attention_heads: Number of pair-attention heads in the Pairformer stack.
+        triangle_multiplication_hidden_size: Hidden width of the triangle-multiplication updates.
+        triangle_attention_hidden_size: Per-head width of the triangle-attention updates.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        expansion: Feed-forward expansion factor in the Pairformer transitions.
+        dropout: Pairformer dropout probability.
+        single_max_abs: Optional clamp on the single representation before scoring; ``None`` disables it.
+        backend: Public backend request forwarded to the Pairformer and atom projector.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+        num_plddt_bins: int = 50,
+        num_resolved_bins: int = 2,
+        max_atoms_per_token: int = 24,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        num_blocks: int = 4,
+        num_pair_attention_heads: int = 16,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        single_max_abs: float | None = 512.0,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.single_max_abs = single_max_abs
+        self.single_norm = LayerNorm(single_size, backend=backend)
+        self.pair_embedder = ProtenixConfidencePairEmbedder(
+            pair_size=pair_size,
+            token_feature_size=token_feature_size,
+            distance_bin_start=distance_bin_start,
+            distance_bin_end=distance_bin_end,
+            distance_bin_step=distance_bin_step,
+        )
+        self.pairformer_stack = PairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            backend=backend,
+        )
+        self.atom_projector = AtomConfidenceProjector(
+            single_size=single_size,
+            num_plddt_bins=num_plddt_bins,
+            num_resolved_bins=num_resolved_bins,
+            max_atoms_per_token=max_atoms_per_token,
+            backend=backend,
+        )
+        self.pair_projector = ProtenixPairConfidenceProjector(
+            pair_size=pair_size,
+            num_pae_bins=num_pae_bins,
+            num_pde_bins=num_pde_bins,
+        )
+
+    def forward(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        token_embedding: Tensor,
+        pred_coords: Tensor,
+        token_to_rep_atom: Tensor,
+        atom_to_token: Tensor,
+        atom_token_index: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        r"""
+        Return atom-level and token-pair confidence logits for every predicted sample.
+        """
+
+        if self.single_max_abs is not None:
+            single = torch.clamp(single, min=-self.single_max_abs, max=self.single_max_abs)
+        single = self.single_norm(single)
+        representative_coords = gather_atoms_by_index(
+            pred_coords,
+            insert_sample_axis(token_to_rep_atom, pred_coords.shape[-3]),
+        )
+
+        plddt_logits = []
+        pae_logits = []
+        pde_logits = []
+        resolved_logits = []
+        for representative_coords_sample in representative_coords.unbind(dim=-3):
+            sample_pair = self.pair_embedder(pair, token_embedding, representative_coords_sample)
+            sample_single, sample_pair = self.pairformer_stack(single, sample_pair, pair_mask=pair_mask)
+            sample_plddt, sample_resolved = self.atom_projector(sample_single, atom_to_token, atom_token_index)
+            sample_pae, sample_pde = self.pair_projector(sample_pair)
+            plddt_logits.append(sample_plddt)
+            pae_logits.append(sample_pae)
+            pde_logits.append(sample_pde)
+            resolved_logits.append(sample_resolved)
+
+        return (
+            torch.stack(plddt_logits, dim=-3),
+            torch.stack(pae_logits, dim=-4),
+            torch.stack(pde_logits, dim=-4),
+            torch.stack(resolved_logits, dim=-3),
+        )
+
+
 class ProtenixInputEmbeddings(nn.Module):
     r"""
     Build token input embeddings from packed atom and token features.
@@ -983,6 +1117,78 @@ class ProtenixConstraintSubstructureTransition(nn.Module):
         hidden = self.input_projection(hidden)
         hidden = self.activation_dropout(F.relu(hidden))
         return self.output_projection(hidden)
+
+
+class ProtenixConfidencePairEmbedder(nn.Module):
+    r"""
+    Add Protenix token and representative-atom distance features to a pair state.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_feature_size: int = 449,
+        distance_bin_start: float = 3.25,
+        distance_bin_end: float = 52.0,
+        distance_bin_step: float = 1.25,
+    ) -> None:
+        super().__init__()
+        self.left_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        self.right_token_projection = nn.Linear(token_feature_size, pair_size, bias=False)
+        buffer_device = self.left_token_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        lower_bins = torch.arange(
+            distance_bin_start,
+            distance_bin_end,
+            distance_bin_step,
+            device=buffer_device,
+            dtype=self.left_token_projection.weight.dtype,
+        )
+        upper_bins = torch.cat([lower_bins[1:], lower_bins.new_tensor([torch.inf])], dim=-1)
+        self.lower_bins: Tensor
+        self.upper_bins: Tensor
+        self.register_buffer("lower_bins", lower_bins)
+        self.register_buffer("upper_bins", upper_bins)
+        self.distance_one_hot_projection = nn.Linear(len(lower_bins), pair_size, bias=False)
+        self.distance_projection = nn.Linear(1, pair_size, bias=False)
+
+    def forward(self, pair: Tensor, token_embedding: Tensor, representative_coords: Tensor) -> Tensor:
+        pair = pair + self.left_token_projection(token_embedding).unsqueeze(-2)
+        pair = pair + self.right_token_projection(token_embedding).unsqueeze(-3)
+        # torch.cdist does not implement CUDA bf16; keep the cast local to this distance calculation.
+        distance = torch.cdist(representative_coords.to(torch.float32), representative_coords.to(torch.float32))
+        distance_bins = ((distance[..., None] > self.lower_bins) & (distance[..., None] < self.upper_bins)).to(
+            pair.dtype
+        )
+        pair = pair + self.distance_one_hot_projection(distance_bins)
+        pair = pair + self.distance_projection(distance.to(pair.dtype).unsqueeze(-1))
+        return pair
+
+
+class ProtenixPairConfidenceProjector(nn.Module):
+    r"""
+    Project Protenix pair representations to PAE and symmetric PDE logits.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+    ) -> None:
+        super().__init__()
+        self.pae_norm = LayerNorm(pair_size)
+        self.pde_norm = LayerNorm(pair_size)
+        self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+        self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+
+    def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:
+        pae_pair = pair.to(dtype=self.pae_projection.weight.dtype)
+        pde_pair = pair.to(dtype=self.pde_projection.weight.dtype)
+        pae_logits = self.pae_projection(self.pae_norm(pae_pair))
+        pde_logits = self.pde_projection(self.pde_norm(pde_pair + pde_pair.transpose(-2, -3)))
+        return pae_logits, pde_logits
 
 
 def _protenix_bin_centers(

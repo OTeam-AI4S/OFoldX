@@ -87,7 +87,7 @@ CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES: list[Rule] = compile_rules(
 DISTOGRAM_RULES: list[Rule] = compile_rules([(r"^distogram\.", "projection.")])
 
 
-BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "projection.")])
+BFACTOR_RULES: list[Rule] = compile_rules([(r"^bfactor\.", "")])
 
 
 ATOM_ENCODER_RULES: list[Rule] = compile_rules(
@@ -666,7 +666,7 @@ AFFINITY_HEAD_RULES: list[Rule] = compile_rules(
         (r"^to_affinity_logits_binary\.", "binder_logit_projection."),
     ]
 )
-AFFINITY_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
+AFFINITY_PAIR_UPDATE_BLOCK_RULES: list[Rule] = compile_rules(
     [
         *_triangle_multiplication_rules("tri_mul_out", "triangle_multiplication_outgoing"),
         *_triangle_multiplication_rules("tri_mul_in", "triangle_multiplication_incoming"),
@@ -677,9 +677,9 @@ AFFINITY_PAIR_ONLY_LAYER_RULES: list[Rule] = compile_rules(
 )
 
 
-def convert_affinity_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+def convert_affinity_pair_update_block(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     r"""
-    Tensor-aware converter for an affinity-module pair-only Pairformer layer.
+    Convert one upstream affinity Pairformer layer into a triangle pair-update block.
 
     The affinity head uses ``TrianglePairUpdateStack``, whose blocks own one pair ``transition``.
     """
@@ -687,7 +687,7 @@ def convert_affinity_pairformer_layer(key: str, tensor: Tensor) -> list[tuple[st
     split = _split_fused_projection(key, tensor)
     if split is not None:
         return split
-    new_key = convert_keys(key, AFFINITY_PAIR_ONLY_LAYER_RULES)
+    new_key = convert_keys(key, AFFINITY_PAIR_UPDATE_BLOCK_RULES)
     return [] if new_key is None else [(new_key, tensor)]
 
 
@@ -710,7 +710,7 @@ def convert_affinity_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
         index, _, remainder = key[len("pairformer_stack.layers.") :].partition(".")
         return [
             (f"pair_update_stack.blocks.{index}.{nk}", nv)
-            for nk, nv in convert_affinity_pairformer_layer(remainder, tensor)
+            for nk, nv in convert_affinity_pair_update_block(remainder, tensor)
         ]
     if key.startswith("affinity_heads."):
         new = convert_keys(key[len("affinity_heads.") :], AFFINITY_HEAD_RULES)

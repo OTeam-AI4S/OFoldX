@@ -61,6 +61,7 @@ class NaMpnnProcessor(Processor):
     """
 
     config_class = NaMpnnProcessorConfig
+    config: NaMpnnProcessorConfig
 
     def __init__(
         self,

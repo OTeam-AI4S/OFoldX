@@ -21,10 +21,12 @@ from ...modules.atom import (
     PackedAtomAttention,
     PackedAtomToTokenEncoder,
     PackedDenoisingAtomToTokenEncoder,
+    PackedReferenceAtomEncoder,
 )
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.window import gather_key_windows
 from ...modules.backend import LayerNorm
+from ...modules.contact import BoltzContactConditioning
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
 from ...modules.embedding.fourier import FrozenFourierEmbedding
@@ -93,7 +95,7 @@ class Boltz2Model(Model):
         self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
         self.token_bond_type_embedding = nn.Embedding(config.num_bond_types, pair_size)
-        self.contact_conditioning = Boltz2ContactConditioning(
+        self.contact_conditioning = BoltzContactConditioning(
             pair_size, cutoff_min=config.conditioning_cutoff_min, cutoff_max=config.conditioning_cutoff_max
         )
 
@@ -212,9 +214,9 @@ class Boltz2Model(Model):
             num_pde_bins=confidence.num_pde_bins,
             backend="auto",
         )
-        self.bfactor_head: Boltz2BFactorHead | None = None
+        self.bfactor_head: nn.Linear | None = None
         if config.predict_bfactor:
-            self.bfactor_head = Boltz2BFactorHead(single_size=single_size, num_bins=config.num_distogram_bins)
+            self.bfactor_head = nn.Linear(single_size, config.num_distogram_bins)
         self.post_init()
 
     def forward(
@@ -608,7 +610,7 @@ class Boltz2AffinityModel(Boltz2Model):
         return Boltz2AffinityHead(
             single_size=self.config.single_size,
             pair_size=self.config.pair_size,
-            num_blocks=affinity.num_pairformer_blocks,
+            num_blocks=affinity.num_pair_update_blocks,
             num_distogram_bins=affinity.num_distogram_bins,
             max_distance=affinity.max_distance,
             num_conditioning_transitions=affinity.num_conditioning_transitions,
@@ -972,7 +974,7 @@ class Boltz2InputEmbeddings(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.atom_encoder = Boltz2AtomEncoder(
+        self.atom_encoder = PackedReferenceAtomEncoder(
             atom_feature_size=atom_feature_size,
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
@@ -1060,120 +1062,6 @@ class Boltz2InputEmbeddings(nn.Module):
         if self.molecule_type_embedding is not None:
             single = single + self.molecule_type_embedding(cast(Tensor, molecule_type))
         return single
-
-
-class Boltz2AtomEncoder(nn.Module):
-    r"""
-    Build atom single states and windowed atom-pair states from reference geometry.
-    """
-
-    def __init__(
-        self,
-        atom_feature_size: int = 388,
-        atom_hidden_size: int = 128,
-        atom_pair_hidden_size: int = 16,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-    ) -> None:
-        super().__init__()
-        self.num_query_atoms = num_query_atoms
-        self.num_key_atoms = num_key_atoms
-        self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
-        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
-        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.left_atom_projection = nn.Linear(
-            atom_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.right_atom_projection = nn.Linear(
-            atom_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_input_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_hidden_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-        self.feed_forward_output_projection = nn.Linear(
-            atom_pair_hidden_size,
-            atom_pair_hidden_size,
-            bias=False,
-        )
-
-    def feed_forward(self, pair: Tensor) -> Tensor:
-        pair = self.feed_forward_input_projection(F.relu(pair))
-        pair = self.feed_forward_hidden_projection(F.relu(pair))
-        return self.feed_forward_output_projection(F.relu(pair))
-
-    def forward(
-        self,
-        atom_features: Tensor,
-        reference_positions: Tensor,
-        atom_mask: Tensor,
-        reference_space_id: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        atom_query = self.atom_feature_projection(atom_features)
-        atom_single = atom_query
-
-        num_query_atoms, num_key_atoms = self.num_query_atoms, self.num_key_atoms
-        batch, length = atom_single.shape[:2]
-        padding = (-length) % num_query_atoms
-        num_windows = (length + padding) // num_query_atoms
-        to_keys = partial(
-            gather_key_windows,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-
-        def pad_atoms(value: Tensor) -> Tensor:
-            r"""
-            Zero-pad the atom axis (dim 1) up to a whole number of query windows; no-op when already aligned.
-
-            Args:
-                value: Tensor whose dim-1 atom axis is padded from ``length`` to ``length + padding``.
-
-            Returns:
-                ``value`` with its atom axis right-padded with zeros, or ``value`` unchanged when ``padding`` is 0.
-            """
-
-            if not padding:
-                return value
-            return torch.nn.functional.pad(value, [0, 0] * (value.dim() - 2) + [0, padding])
-
-        positions = pad_atoms(reference_positions)
-        positions_queries = positions.view(batch, num_windows, num_query_atoms, 1, 3)
-        positions_keys = to_keys(positions).view(batch, num_windows, 1, num_key_atoms, 3)
-        distance_vectors = positions_keys - positions_queries
-
-        mask = pad_atoms(atom_mask).bool()
-        mask_queries = mask.view(batch, num_windows, num_query_atoms, 1)
-        mask_keys = to_keys(mask.unsqueeze(-1).float()).view(batch, num_windows, 1, num_key_atoms).bool()
-        space_id = pad_atoms(reference_space_id)
-        uid_queries = space_id.view(batch, num_windows, num_query_atoms, 1)
-        uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
-        valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
-
-        single_windows = F.relu(pad_atoms(atom_single))
-        atom_pair = encode_atom_pair(
-            self,
-            distance_vectors,
-            single_windows.view(batch, num_windows, num_query_atoms, 1, -1),
-            to_keys(single_windows).view(batch, num_windows, 1, num_key_atoms, -1),
-            distance_term_mask=valid,
-            inverse_term_mask=valid,
-            valid_mask=valid,
-            pair_bias=None,
-            prefix_ndim=1,
-        )
-        return atom_query, atom_single, atom_pair
 
 
 class Boltz2DenoiserAtomEncoder(nn.Module):
@@ -1359,15 +1247,6 @@ class Boltz2AtomAttentionDecoder(nn.Module):
         return self.position_update_projection(self.position_norm(atom_query))
 
 
-_CONTACT_CONDITIONING_CLASSES: tuple[str, ...] = (
-    "UNSPECIFIED",
-    "UNSELECTED",
-    "POCKET>BINDER",
-    "BINDER>POCKET",
-    "CONTACT",
-)
-
-
 class Boltz2TemplateEmbedder(nn.Module):
     r"""
     Boltz-2 template embedder with on-the-fly distogram / unit-vector featurization.
@@ -1500,48 +1379,6 @@ class Boltz2TemplateEmbedder(nn.Module):
         weight = present[:, :, None, None, None]
         update = (template_pair * weight).sum(dim=1) / template_count[:, None, None, None].to(pair.dtype)
         return self.output_projection(self.activation(update))
-
-
-class Boltz2ContactConditioning(nn.Module):
-    r"""
-    Additive pair bias encoding Boltz-2 pocket and contact constraints.
-    """
-
-    def __init__(
-        self,
-        pair_size: int,
-        *,
-        cutoff_min: float,
-        cutoff_max: float,
-        num_classes: int | None = None,
-    ) -> None:
-        super().__init__()
-        num_classes = len(_CONTACT_CONDITIONING_CLASSES) if num_classes is None else num_classes
-        self.cutoff_min = cutoff_min
-        self.cutoff_max = cutoff_max
-        self.num_classes = num_classes
-        self.threshold_fourier = FrozenFourierEmbedding(pair_size)
-        self.constraint_encoder = nn.Linear(pair_size + num_classes - 1, pair_size)
-        self.unspecified_bias = nn.Parameter(torch.zeros(pair_size))
-        self.unselected_bias = nn.Parameter(torch.zeros(pair_size))
-
-    def forward(self, contact_conditioning: Tensor, contact_threshold: Tensor) -> Tensor:
-        active = contact_conditioning[..., 2:]
-        threshold_normalized = (contact_threshold - self.cutoff_min) / (self.cutoff_max - self.cutoff_min)
-        threshold_fourier = self.threshold_fourier(threshold_normalized)
-
-        encoder_input = torch.cat(
-            [active, threshold_normalized.unsqueeze(-1), threshold_fourier],
-            dim=-1,
-        )
-        encoded = self.constraint_encoder(encoder_input)
-
-        gate = 1 - contact_conditioning[..., 0:2].sum(dim=-1, keepdim=True)
-        return (
-            encoded * gate
-            + self.unspecified_bias * contact_conditioning[..., 0:1]
-            + self.unselected_bias * contact_conditioning[..., 1:2]
-        )
 
 
 class Boltz2DenoiserConditioning(nn.Module):
@@ -2126,7 +1963,7 @@ class Boltz2ConfidenceHead(nn.Module):
         self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
         self.token_bond_type_embedding = nn.Embedding(num_bond_types, pair_size)
-        self.contact_conditioning = Boltz2ContactConditioning(
+        self.contact_conditioning = BoltzContactConditioning(
             pair_size, cutoff_min=conditioning_cutoff_min, cutoff_max=conditioning_cutoff_max
         )
 
@@ -2237,19 +2074,6 @@ class Boltz2ConfidenceOutputHead(nn.Module):
             "plddt_logits": self.plddt_projection(single),
             "resolved_logits": self.resolved_projection(single),
         }
-
-
-class Boltz2BFactorHead(nn.Module):
-    r"""
-    Predict per-token B-factor logits from the trunk single representation.
-    """
-
-    def __init__(self, single_size: int = 384, num_bins: int = 64) -> None:
-        super().__init__()
-        self.projection = nn.Linear(single_size, num_bins)
-
-    def forward(self, single: Tensor) -> Tensor:
-        return self.projection(single)
 
 
 def _decode_boltz2_fold_result(output: _Boltz2FoldOutput, input: Boltz2Input) -> FoldResult:

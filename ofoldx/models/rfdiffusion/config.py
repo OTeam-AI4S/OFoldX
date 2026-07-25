@@ -100,7 +100,9 @@ class RfDiffusionDiffuserConfig(Config):
         min_rotation_beta: Minimum rotation beta.
         max_rotation_beta: Maximum rotation beta.
         min_rotation_sigma: Minimum rotation noise scale.
-        max_rotation_sigma: Maximum rotation noise scale.
+        max_rotation_sigma: Maximum rotation noise scale for the exponential
+            schedule. The linear schedule derives its endpoint from the beta
+            integral and does not consume this value.
     """
 
     num_timesteps: int = 50

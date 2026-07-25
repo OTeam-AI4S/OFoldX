@@ -38,17 +38,22 @@ def gated_multihead_attention(
     r"""
     Project q/k/v via ``projection``, run attention on ``backend``, and merge heads.
 
-    Dispatches attention to the selected provider when that provider implements the
-    concrete tensor contract, otherwise to PyTorch SDPA. ``biases`` are summed into a single additive pair
-    bias and ``attention_mask`` becomes a large-negative additive mask; both are broadcast to the attention shape.
+    Dispatches attention to the selected provider when that provider implements
+    the concrete tensor contract, otherwise to PyTorch SDPA. ``biases`` are
+    summed into one additive pair bias. ``attention_mask`` follows the common
+    pair-first mask contract and is normalized before provider selection.
 
     Args:
         query: ``(..., q_tokens, query_size)`` query input.
         key: ``(..., k_tokens, key_size)`` key input; defaults to ``query`` when ``None``.
         value: ``(..., k_tokens, value_size)`` value input; defaults to ``key`` when ``None``.
         biases: Optional additive pair biases, each broadcastable to ``(..., heads, q_tokens, k_tokens)``.
-        attention_mask: Optional boolean mask broadcastable to ``(..., q_tokens, k_tokens)`` or
-            ``(..., k_tokens)``; ``False`` positions are masked out.
+        attention_mask: Optional boolean pair-first keep-mask. ``(q_tokens,
+            k_tokens)`` is a shared pair mask, ``(k_tokens,)`` is shared key
+            validity, and prefix-specific key validity uses ``(..., k_tokens)``
+            when unambiguous or ``(..., 1, k_tokens)`` otherwise. An explicit
+            head-specific form retains every prefix position followed by the
+            head axis.
         projection: The q/k/v (and optional gate/output) projection owned by the calling module.
         backend: Operator provider; see [ofoldx.modules.backend][].
 
@@ -58,6 +63,13 @@ def gated_multihead_attention(
 
     key = query if key is None else key
     value = key if value is None else value
+    attention_mask = _normalize_attention_mask(
+        attention_mask,
+        prefix_shape=query.shape[:-2],
+        num_heads=projection.num_attention_heads,
+        query_length=query.shape[-2],
+        key_length=key.shape[-2],
+    )
     oops_mask_supported = (
         attention_mask is None or attention_mask.dim() != query.dim() + 1 or attention_mask.shape[-3] == 1
     )
@@ -150,11 +162,7 @@ def gated_multihead_attention(
             attention_mask=attention_mask,
             scale=1.0,
         )
-    output = _zero_fully_masked_rows(
-        output,
-        attention_mask,
-        key_length=key_projection.shape[-2],
-    )
+    output = _zero_fully_masked_rows(output, attention_mask)
     output = output.transpose(-2, -3)
     return projection.merge(output, query)
 
@@ -182,8 +190,12 @@ def projected_attention(
             ``(..., num_heads, num_key_tokens, value_size)``.
         biases: Optional additive pair biases broadcastable to
             ``(..., num_heads, num_query_tokens, num_key_tokens)``.
-        attention_mask: Optional boolean keep-mask
-            broadcastable to ``(..., num_heads, num_query_tokens, num_key_tokens)``.
+        attention_mask: Optional boolean pair-first keep-mask. A trailing
+            ``(num_query_tokens, num_key_tokens)`` payload is a pair mask;
+            ``(num_key_tokens,)`` is shared key validity, and an explicit
+            singleton query axis disambiguates prefix-specific key validity.
+            Head-specific masks retain every prefix position followed by the
+            head axis.
         backend: Backend used for the attention operation.
         dropout_p: Dropout probability applied to attention weights.
         scale: Optional multiplier applied to query-key logits. ``None`` uses
@@ -194,6 +206,13 @@ def projected_attention(
         ``(..., num_heads, num_query_tokens, value_size)``.
     """
 
+    attention_mask = _normalize_attention_mask(
+        attention_mask,
+        prefix_shape=query.shape[:-3],
+        num_heads=query.shape[-3],
+        query_length=query.shape[-2],
+        key_length=key.shape[-2],
+    )
     oops_supported = (
         dropout_p == 0.0
         and value.shape[-1] == query.shape[-1]
@@ -235,7 +254,7 @@ def projected_attention(
             dropout_p=dropout_p,
             scale=scale,
         )
-    return _zero_fully_masked_rows(output, attention_mask, key_length=key.shape[-2])
+    return _zero_fully_masked_rows(output, attention_mask)
 
 
 def triangle_attention(
@@ -372,6 +391,93 @@ def _cueq_triangle_flash(
     return projection.merge(output, pair)
 
 
+def _normalize_attention_mask(
+    attention_mask: Tensor | None,
+    *,
+    prefix_shape: torch.Size,
+    num_heads: int,
+    query_length: int,
+    key_length: int,
+) -> Tensor | None:
+    r"""
+    Normalize a public pair-first keep-mask before provider dispatch.
+
+    A mask without a head axis is returned as ``(..., q|1, k)``; an
+    explicitly head-specific mask is returned as ``(..., heads|1, q|1, k)``.
+    Prefix axes are expanded to ``prefix_shape`` while singleton query and
+    head axes are retained for provider capability checks. Head-specific
+    forms include every prefix position so the head axis cannot change
+    ownership when two dimension sizes happen to coincide.
+    """
+
+    if attention_mask is None:
+        return None
+    mask = attention_mask.bool()
+
+    if mask.dim() >= 2 and mask.shape[-2] in {1, query_length} and mask.shape[-1] in {1, key_length}:
+        query_payload = 1 if mask.shape[-2] == 1 else query_length
+        if mask.dim() - 2 <= len(prefix_shape):
+            normalized = _try_broadcast_to_attention_shape(
+                mask,
+                (*prefix_shape, query_payload, key_length),
+                tail_dims=2,
+            )
+            if normalized is not None:
+                return normalized
+
+        if mask.dim() == len(prefix_shape) + 3 and mask.shape[-3] in {1, num_heads}:
+            head_payload = 1 if mask.shape[-3] == 1 else num_heads
+            normalized = _try_broadcast_to_attention_shape(
+                mask,
+                (*prefix_shape, head_payload, query_payload, key_length),
+                tail_dims=3,
+            )
+            if normalized is not None:
+                return normalized
+
+    if mask.dim() == len(prefix_shape) + 2 and mask.shape[-2] in {1, num_heads} and mask.shape[-1] in {1, key_length}:
+        head_payload = 1 if mask.shape[-2] == 1 else num_heads
+        normalized = _try_broadcast_to_attention_shape(
+            mask,
+            (*prefix_shape, head_payload, key_length),
+            tail_dims=2,
+        )
+        if normalized is not None:
+            return normalized.unsqueeze(-2)
+
+    if mask.dim() >= 1 and mask.shape[-1] in {1, key_length} and mask.dim() - 1 <= len(prefix_shape):
+        normalized = _try_broadcast_to_attention_shape(
+            mask,
+            (*prefix_shape, key_length),
+            tail_dims=1,
+        )
+        if normalized is not None:
+            return normalized.unsqueeze(-2)
+
+    raise ValueError(
+        "attention_mask must be a pair-first boolean mask with trailing "
+        f"({query_length}, {key_length}), (..., 1, {key_length}), "
+        f"(..., {num_heads}, {key_length}), or ({key_length},); "
+        f"got {tuple(attention_mask.shape)}"
+    )
+
+
+def _try_broadcast_to_attention_shape(
+    tensor: Tensor,
+    target_shape: tuple[int, ...],
+    *,
+    tail_dims: int,
+) -> Tensor | None:
+    r"""
+    Return the ordinary broadcast to ``target_shape``, or ``None`` when incompatible.
+    """
+
+    try:
+        return _broadcast_to_attention_shape(tensor, target_shape, tail_dims=tail_dims)
+    except RuntimeError:
+        return None
+
+
 def _eager_attention(
     query_projection: Tensor,
     key_projection: Tensor,
@@ -426,17 +532,22 @@ def _sdpa_attention(
     Run PyTorch scaled-dot-product attention.
     """
 
-    attention_biases = _attention_biases(
-        query,
-        key,
-        biases=biases,
-        attention_mask=attention_mask,
-    )
+    if not biases and attention_mask is not None:
+        attention_bias = _attention_mask_view(query, attention_mask)
+    else:
+        attention_bias = _sum_biases(
+            _attention_biases(
+                query,
+                key,
+                biases=biases,
+                attention_mask=attention_mask,
+            )
+        )
     return F.scaled_dot_product_attention(
         query,
         key,
         value,
-        attn_mask=_sum_biases(attention_biases),
+        attn_mask=attention_bias,
         dropout_p=dropout_p,
         scale=scale,
     )
@@ -726,12 +837,12 @@ def _oops_attention_mask(
     key_length: int,
 ) -> Tensor | None:
     r"""
-    Broadcast the attention mask to the flat boolean mask consumed by the OOps callable.
+    Broadcast a normalized attention mask to the flat mask consumed by OOps.
 
-    Accepts a per-query-key mask ``(..., q, k)``, its SDPA-style
-    singleton-head form ``(..., 1, q, k)``, or a key-only mask
-    ``(..., k)`` and flattens the leading batch dims accordingly. Rank,
-    rather than coincident dimension sizes, determines which form was supplied.
+    The public entry point has already normalized a mask without a head axis
+    to ``(..., q|1, k)``. A singleton explicit head axis is also accepted and
+    removed here; masks with distinct head values are excluded before OOps
+    dispatch.
 
     Args:
         attention_mask: Optional boolean mask; ``None`` yields ``None``.
@@ -740,10 +851,11 @@ def _oops_attention_mask(
         query_length, key_length: Query and key token counts.
 
     Returns:
-        The flattened boolean mask (``(flat_prefix, q, k)`` or ``(flat_prefix, k)``), or ``None``.
+        The flattened boolean mask ``(flat_prefix, q, k)`` or the key-only
+        form ``(flat_prefix, k)``, or ``None``.
 
     Raises:
-        ValueError: If ``attention_mask`` is not broadcastable to ``(..., q, k)`` or ``(..., k)``.
+        ValueError: If ``attention_mask`` is not a normalized head-independent mask.
     """
     if attention_mask is None:
         return None
@@ -752,18 +864,18 @@ def _oops_attention_mask(
     if attention_mask.dim() == prefix_ndim + 3 and attention_mask.shape[-3] == 1:
         attention_mask = attention_mask.squeeze(-3)
     if attention_mask.dim() == prefix_ndim + 2:
+        if attention_mask.shape[-2] == 1:
+            target_shape = (*prefix_shape, 1, key_length)
+            return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=2).reshape(
+                flat_prefix_size, key_length
+            )
         target_shape = (*prefix_shape, query_length, key_length)
         return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=2).reshape(
             flat_prefix_size, query_length, key_length
         )
-    if attention_mask.dim() <= prefix_ndim + 1:
-        target_shape = (*prefix_shape, key_length)
-        return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=1).reshape(
-            flat_prefix_size, key_length
-        )
     raise ValueError(
-        "attention_mask must have shape broadcastable to "
-        f"(..., {query_length}, {key_length}) or (..., {key_length}), got {tuple(attention_mask.shape)}"
+        "normalized attention_mask must have shape "
+        f"(..., {query_length}|1, {key_length}), got {tuple(attention_mask.shape)}"
     )
 
 
@@ -803,13 +915,13 @@ def _attention_biases(
         key_length=key_projection.shape[-2],
     )
 
-    mask_bias = torch.zeros(
-        *query_projection.shape[:-1],
-        key_projection.shape[-2],
+    mask_bias = torch.full(
+        (*query_projection.shape[:-1], key_projection.shape[-2]),
+        torch.finfo(query_projection.dtype).min,
         dtype=query_projection.dtype,
         device=query_projection.device,
     )
-    mask_bias = mask_bias.masked_fill(~attention_mask, torch.finfo(query_projection.dtype).min)
+    mask_bias.masked_fill_(attention_mask, 0)
     attention_biases.insert(0, mask_bias)
     return attention_biases
 
@@ -835,21 +947,44 @@ def _sum_biases(biases: Sequence[Tensor]) -> Tensor | None:
 def _zero_fully_masked_rows(
     output: Tensor,
     attention_mask: Tensor | None,
-    *,
-    key_length: int,
 ) -> Tensor:
     r"""
     Zero pre-projection attention values for queries with no valid key.
 
-    ``output`` has head-major shape ``(..., heads, queries, value_size)``. The
-    mask may already include the head axis, omit it, or contain only a key axis.
-    Zeroing here preserves any bias subsequently owned by an output projection.
+    ``output`` has head-major shape ``(..., heads, queries, value_size)`` and
+    the public mask has already been normalized. Zeroing here preserves any
+    bias subsequently owned by an output projection.
     """
 
     if attention_mask is None:
         return output
-    mask = _broadcast_attention_mask(output, attention_mask, key_length=key_length)
-    return output * mask.any(dim=-1, keepdim=True).to(dtype=output.dtype)
+    valid_rows = attention_mask.any(dim=-1, keepdim=True)
+    if attention_mask.dim() == output.dim() - 1:
+        valid_rows = valid_rows.unsqueeze(-3)
+    elif attention_mask.dim() != output.dim():
+        raise ValueError(
+            f"normalized attention_mask with shape {tuple(attention_mask.shape)} does not match "
+            f"attention output with shape {tuple(output.shape)}"
+        )
+    return output * valid_rows.to(dtype=output.dtype)
+
+
+def _attention_mask_view(reference: Tensor, attention_mask: Tensor) -> Tensor:
+    r"""
+    Insert the omitted head axis without materializing broadcast attention weights.
+
+    ``reference`` has head-major shape ``(..., heads, queries, channels)`` and
+    ``attention_mask`` has already been normalized.
+    """
+
+    if attention_mask.dim() == reference.dim():
+        return attention_mask
+    if attention_mask.dim() == reference.dim() - 1:
+        return attention_mask.unsqueeze(-3)
+    raise ValueError(
+        f"normalized attention_mask with shape {tuple(attention_mask.shape)} does not match "
+        f"attention reference with shape {tuple(reference.shape)}"
+    )
 
 
 def _broadcast_attention_mask(
@@ -859,13 +994,11 @@ def _broadcast_attention_mask(
     key_length: int,
 ) -> Tensor:
     r"""
-    Broadcast a keep-mask to head-major attention weights.
+    Expand a normalized keep-mask to head-major attention weights.
 
-    ``reference`` has shape ``(..., heads, queries, channels)``. A full-rank
-    mask includes the head axis. A mask with one fewer axis omits the head
-    axis, and a still shorter mask provides only the key axis. This
-    rank-based interpretation avoids treating a batch axis as a head or query
-    axis when their sizes happen to be equal.
+    ``reference`` has shape ``(..., heads, queries, channels)``. Normalization
+    has already made prefix axes explicit, so a full-rank mask includes the
+    head axis and a mask with one fewer axis omits it.
     """
 
     prefix_shape = reference.shape[:-3]
@@ -893,15 +1026,10 @@ def _broadcast_attention_mask(
             ) from error
         return torch.broadcast_to(mask.unsqueeze(-3), target_shape)
 
-    target_keys = (*prefix_shape, key_length)
-    try:
-        mask = _broadcast_to_attention_shape(mask, target_keys, tail_dims=1)
-    except RuntimeError as error:
-        raise ValueError(
-            f"attention_mask with shape {tuple(attention_mask.shape)} is not broadcastable "
-            f"to attention weights with shape {target_shape}"
-        ) from error
-    return torch.broadcast_to(mask.unsqueeze(-2).unsqueeze(-2), target_shape)
+    raise ValueError(
+        f"normalized attention_mask with shape {tuple(attention_mask.shape)} does not match "
+        f"attention weights with shape {target_shape}"
+    )
 
 
 def _broadcast_to_attention_shape(tensor: Tensor, target_shape: tuple[int, ...], *, tail_dims: int) -> Tensor:

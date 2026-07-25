@@ -275,13 +275,14 @@ class EvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.outer_product_mean = EvoformerOuterProductMean(
+        # Preserve released initialization order while registering children in execution order.
+        outer_product_mean = EvoformerOuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
             backend=backend,
         )
-        self.msa_block = EvoformerMsaBlock(
+        msa_block = EvoformerMsaBlock(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
@@ -289,6 +290,8 @@ class EvoformerBlock(nn.Module):
             dropout=msa_dropout,
             backend=backend,
         )
+        self.msa_block = msa_block
+        self.outer_product_mean = outer_product_mean
         self.pair_block = EvoformerPairBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -341,6 +344,115 @@ class ExtraMsaEvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
+        # Preserve released initialization order while registering children in execution order.
+        outer_product_mean = EvoformerOuterProductMean(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            hidden_size=outer_product_hidden_size,
+            backend=backend,
+        )
+        msa_block = ExtraMsaTrackBlock(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            transition_expansion=msa_transition_expansion,
+            dropout=msa_dropout,
+            backend=backend,
+        )
+        self.msa_block = msa_block
+        self.outer_product_mean = outer_product_mean
+        self.pair_block = EvoformerPairBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            transition_expansion=pair_transition_expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class OuterProductFirstEvoformerBlock(nn.Module):
+    r"""
+    One ordinary-MSA Evoformer block with outer-product mean before the MSA update.
+    """
+
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
+    ) -> None:
+        super().__init__()
+        self.outer_product_mean = EvoformerOuterProductMean(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            hidden_size=outer_product_hidden_size,
+            backend=backend,
+        )
+        self.msa_block = EvoformerMsaBlock(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            transition_expansion=msa_transition_expansion,
+            dropout=msa_dropout,
+            backend=backend,
+        )
+        self.pair_block = EvoformerPairBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            transition_expansion=pair_transition_expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+
+    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        pair = self.pair_block(pair, pair_mask=pair_mask)
+        return msa, pair
+
+
+class OuterProductFirstExtraMsaEvoformerBlock(nn.Module):
+    r"""
+    One extra-MSA block with outer-product mean before global-column MSA attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        msa_size: int,
+        pair_size: int,
+        outer_product_hidden_size: int,
+        num_msa_attention_heads: int,
+        triangle_multiplication_hidden_size: int,
+        triangle_attention_hidden_size: int,
+        num_triangle_attention_heads: int,
+        msa_transition_expansion: int,
+        pair_transition_expansion: int,
+        msa_dropout: float,
+        pair_dropout: float,
+        backend: str,
+    ) -> None:
+        super().__init__()
         self.outer_product_mean = EvoformerOuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
@@ -364,30 +476,6 @@ class ExtraMsaEvoformerBlock(nn.Module):
             dropout=pair_dropout,
             backend=backend,
         )
-
-    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
-        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-        pair = pair + self.outer_product_mean(msa, msa_mask)
-        pair = self.pair_block(pair, pair_mask=pair_mask)
-        return msa, pair
-
-
-class OuterProductFirstEvoformerBlock(EvoformerBlock):
-    r"""
-    One ordinary-MSA Evoformer block with outer-product mean before the MSA update.
-    """
-
-    def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
-        pair = pair + self.outer_product_mean(msa, msa_mask)
-        msa = self.msa_block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-        pair = self.pair_block(pair, pair_mask=pair_mask)
-        return msa, pair
-
-
-class OuterProductFirstExtraMsaEvoformerBlock(ExtraMsaEvoformerBlock):
-    r"""
-    One extra-MSA block with outer-product mean before global-column MSA attention.
-    """
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> tuple[Tensor, Tensor]:
         pair = pair + self.outer_product_mean(msa, msa_mask)

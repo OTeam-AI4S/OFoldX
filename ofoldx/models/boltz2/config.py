@@ -180,20 +180,20 @@ class Boltz2ConfidenceConfig(Config):
 
 class Boltz2AffinityHeadConfig(Config):
     r"""
-    Configure one Boltz-2 masked-pair affinity head and its pair-only Pairformer.
+    Configure one Boltz-2 masked-pair affinity head and its triangle pair updates.
 
     Args:
-        num_pairformer_blocks: Number of pair-only Pairformer blocks in the affinity head.
+        num_pair_update_blocks: Number of triangle pair-update blocks in the affinity head.
         num_distogram_bins: Number of distogram bins used to condition the pair features.
         max_distance: Upper edge of the distogram binning range, in angstroms.
         num_conditioning_transitions: Number of transitions in the pairwise conditioner.
         expansion: Transition expansion factor in the pairwise conditioner.
         triangle_attention_hidden_size: Per-head width of the affinity triangle attention.
         num_triangle_attention_heads: Affinity triangle-attention head count.
-        dropout: Dropout applied in the affinity Pairformer stack.
+        dropout: Dropout applied in the triangle pair-update stack.
     """
 
-    num_pairformer_blocks: int = 4
+    num_pair_update_blocks: int = 4
     num_distogram_bins: int = 64
     max_distance: float = 22.0
     num_conditioning_transitions: int = 2
@@ -270,6 +270,6 @@ class Boltz2AffinityConfig(Boltz2Config):
     recycling_steps: int = 6
 
     affinity_heads: tuple[Boltz2AffinityHeadConfig, Boltz2AffinityHeadConfig] = (
-        Boltz2AffinityHeadConfig({"num_pairformer_blocks": 8}),
-        Boltz2AffinityHeadConfig({"num_pairformer_blocks": 4}),
+        Boltz2AffinityHeadConfig({"num_pair_update_blocks": 8}),
+        Boltz2AffinityHeadConfig({"num_pair_update_blocks": 4}),
     )

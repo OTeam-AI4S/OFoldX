@@ -309,9 +309,11 @@ subsequent ownership review falsified that conclusion: `Structure.residue_number
 is sufficient to preserve the family-specific gap/index transforms, so file
 parsing remains generic IO and every MPNN Processor accepts only `Structure`.
 Concrete Pipelines may accept paths, call `read_structure` exactly once, and pass
-the resulting value to the Processor. The old `_codec.py`, private JSON-in-mmCIF
-payload, broad `SourceAtomIdentity`, generic annotations map, and model-specific
-`read_mpnn_pdb` do not solve a remaining invariant and remain rejected.
+the resulting value to the Processor. A broad `SourceAtomIdentity`, generic
+annotations map, and model-specific `read_mpnn_pdb` do not solve a remaining
+invariant and remain rejected. The later frozen `data/codec.py` and canonical
+JSON-in-mmCIF exchange payload preserve the generic Structure; they are not an
+MPNN-specific residue-number workaround.
 
 The frozen bounded value is deliberately smaller than source identity:
 
@@ -1331,28 +1333,43 @@ attribution remain part of the reopened writer contract. None belongs in
 
 ## Owner review — §3.3 value-shape slice (+ §3.4.3 `iter_bonds()`, §3.5.2 atom-access)
 
-**Verdict: REOPENED.** The §3.3 value-shape freeze is rejected. The committed `ofoldx/data/molecular.py` already implements frozen §3.4.1's dict `MolecularSystem`, so a migration landing spot for the stale io/processor calls is still needed — but the proposed frozen shape was wrong on the points below, and DESIGN §3.3's premature `Status: frozen` was corrected back to reopened (it does not authorize Tok).
+**Verdict: REOPENED.** The §3.3 value-shape freeze is rejected. The committed
+`ofoldx/data/molecular.py` already implements frozen §3.4.1's dict
+`MolecularSystem`; the former stale I/O/Processor calls have since migrated to
+that representation. The proposed frozen shape was still wrong on the points
+below, and DESIGN §3.3's premature `Status: frozen` was corrected back to reopened
+(it does not authorize Tok).
 
 Freeze-blockers (must be resolved before any §3.3 freeze):
 
-- **`instances` must be an ordered entry array**, not an unordered `dict[str, str]` — otherwise order is lost on round-trip, because `io/structure.py:1503` serializes with `json.dumps(..., sort_keys=True)` (which reorders object keys).
+- **Resolved 2026-07-25: `instances` is an ordered entry array**, not an
+  unordered JSON object. `ofoldx.data.codec.encode_system` and `decode_system`
+  now preserve declaration order across the current `io/mmcif.py` writer.
 - **Keep the 5-member `PolymerType` including `"pna"`.** The proposed 4-member alias makes `pna` unrepresentable before family lowering resolves it.
 - **`from_one_letter` must support** protein `X → UNK`, RNA `N → N`, and DNA `N → DN`.
 - **`from_smiles` emits one `UNL` `ChemicalComponent`** carrying its atoms plus `ChemicalBond` edges — not a separate `MoleculeBond` type resolved against a side table.
 - **Import classification is declaration-driven:** `PolymerSequence.polymer_type` is a fact the producer declares, with a format-local component-ID fallback permitted _inside_ the importer — never a reusable public chemistry-keyed classifier.
-- **MSA/Template entity serialization is not owned here.** `Template.target`/`.monomers` are not fields on the committed shapes, so every "`encode_msa`/`encode_template` reuse verbatim" claim is void; that serialization moves to reopened §3.6.
+- **MSA/Template entity serialization is not owned here.** `Template.target`/`.monomers` are not fields on the committed shapes, so every "`encode_msa`/`encode_template` reuse verbatim" claim is void; the current evidence codec is now frozen separately by §3.6.
 - **`iter_bonds()` is not complete.** Its incident-bond-removal predicate (coupled to `iter_atoms()`) and cross-layer physical-pair dedup remain unresolved. (The `BondOrigin` domain is now resolved: `geometry_inferred` was deleted, so committed code and §3.4.3 both carry the 5 members `component/molecule/polymer_rule/source/user`.)
 
-Preserved factual/migration findings: the stale callers are `io/structure.py` plus six processors invoking a pre-dict API (`system.entity()`, `system.components`, `EntityInstance`, `AtomSite(inst, atom_id, monomer_index)`, `entity.monomers`, `iter_bonds()`). The migration is not a rename: iterating a bare dict yields KEYS (silently always-False `isinstance` at `esmfold2:200`, `odesign:200,946`, `io:1663`, `pxdesign:537,589`); `AtomSite` is a transpose to `(instance_id, component_index, atom_id)`; `component_index` is a required non-`None` int (so `is None` polymer/nonpolymer tests are always-False); `system.component(ref)` takes `(instance_id, component_index)`; there is no system-level component table; `Molecule` has no `.atoms`/`.reference_coordinates`; `EntityInstance` is gone; `SystemBond.provenance → .origin`. Two consumers stay separately blocked on reopened facets: `odesign` cyclic closure (`processor.py:662-693`, reads removed `PolymerAttachment.order/.aromatic` and synthesizes cyclic `SystemBond`s) and `protenix` SMILES-origin routing (`processor.py:615`, committed `Molecule` has no `provenance`).
+Historical migration finding (resolved): `io/structure.py` and six Processors
+formerly invoked the pre-dict API (`system.entity()`, `system.components`,
+`EntityInstance`, old `AtomSite` argument order, `entity.monomers`). That migration
+was not a rename: dictionary iteration, occurrence indexing, direct component
+ownership, and bond origins all changed together. The current callers use the
+committed dictionary-based `MolecularSystem`.
 
 <!-- proposed 2026-07-16 via §3.5.1 freeze-drafting investigation; OWNER VERDICT 2026-07-16: ACCEPTED (carrier only) -->
-<!-- PARTIALLY SUPERSEDED 2026-07-20: the six-field carrier freeze below stands unchanged, but its "does NOT authorize the codec/writer" and "stays in the reopened §3.5 Structure I/O contract" carve-out was RATIFIED — the implemented read/exchange-write/LossReport surface is now frozen as DESIGN §3.5.3. See "Owner review — §3.5 Structure I/O contract ratification" at the end of this file. Only the codec `instances` ordered-entry-array (§3.4.1) stays open. -->
+<!-- SUPERSEDED: the six-field carrier and implemented read/exchange-write/LossReport surface are frozen by DESIGN §3.5.1/§3.5.3, and the ordered `instances` codec was resolved on 2026-07-25 by DESIGN §3.4.1. -->
 
 ## Owner review — §3.5.1 Structure value carrier
 
 **Verdict: ACCEPTED (carrier only).** The six-field `Structure` (`system`, `sites`, `coordinates`, `coordinate_mask`, `occupancy`, `residue_numbers`) plus `ResidueNumber(number: int, insertion_code: str = "")` carrier is frozen in DESIGN §3.5.1 exactly as committed in `ofoldx/data/structure.py`. This covers ONLY the carrier: the writer policy (label/auth column selection, B-factor/altloc placeholders, one-based fallback), the exact codec JSON shape, the "author when present, else label" rule, and "nonpolymer extra entries are harmless" are removed from DESIGN and stay in the reopened §3.5 Structure I/O contract. This freeze does NOT authorize implementing the codec (`encode_structure`/`decode_structure`) or the writer.
 
-Sequencing (factual): this carrier does not by itself make `_codec.py` or `io/structure.py` compile — both also target the pre-§3.4.1 `MolecularSystem` and must land together with the §3.3/§3.4.1 codec-system migration and the reopened §3.5 I/O rewrite; §3.5.1 does not unblock §3.3 (the dependency runs the other way).
+Historical sequencing note (resolved): the carrier originally had to land with
+the MolecularSystem codec and Structure I/O migrations. Those migrations now live
+in `data/codec.py` and `io/`; the later §3.5.3 ratification supersedes this
+carrier-only boundary.
 
 <!-- proposed 2026-07-16 via §3.7.2 Protenix conditioning freeze-drafting; OWNER VERDICT 2026-07-16: REOPENED — positive API rejected, v0.5 constraint slice only -->
 
@@ -1806,19 +1823,22 @@ that does not exist today.
 
 **Verdict: ACCEPTED.** The Structure I/O surface that was implemented and public-exported after the 2026-07-16 §3.5.1
 carrier freeze (`ofoldx/io/__init__.py` exports `read_structure`/`read_structures`/`write_structure`/`LossReport`;
-`ofoldx/io/structure.py` PDB+mmCIF parsers, altloc selection/expansion, mmCIF exchange writer, source bonds;
-`ofoldx/data/_codec.py` structure payload) is ratified. The freeze boundary moves to ACCEPT it: DESIGN §3.5 is now
+`ofoldx/io/structure.py` owns orchestration and materialization, `io/pdb.py` and
+`io/mmcif.py` own their formats, and `ofoldx/data/codec.py` owns the Structure
+payload) is ratified. The freeze boundary moves to ACCEPT it: DESIGN §3.5 is now
 **Status: frozen**, and a new **§3.5.3 "Structure I/O: read, exchange write, and loss reporting"** freezes the
 implemented behavior. The §3.5.1 six-field carrier text is unchanged; its "does NOT authorize the codec/writer" and
 "stays reopened §3.5" carve-outs are replaced by frozen §3.5.3 resolutions.
 
 Resolved-to-implementation (each formerly-reopened question):
 
-- **Source-atom identity / source-category derivation** — the parser retains both label and author namespaces per row
-  (`_rows_from_atom_array`, mmCIF read with `use_author_fields=False`); the canonical grouping axis is label chain +
-  label residue number. Polymer/non-polymer partition is the importer-internal component-ID classifier
-  `_component_polymer_type` (audited protein/nucleic sets; `D*` → dna), NOT source `_entity_poly`/ATOM-HETATM. This is
-  the §3.5.2 format-local fallback and stays non-public. `residue_numbers` is populated for polymer occurrences only,
+- **Source-atom identity / source-category derivation** — `io.records.AtomRecord`
+  retains both label and author namespaces (`atom_records_from_array`; mmCIF reads
+  with `use_author_fields=False`); the canonical grouping axis is label chain +
+  label residue number. mmCIF uses the built-in component registry; PDB also uses
+  `ATOM` membership and `_pdb_component_polymer_type`. This is the §3.5.2
+  format-local fallback and stays outside the public data surface.
+  `residue_numbers` is populated for polymer occurrences only,
   value = author number when present else label number; numberless polymer rows and all non-polymers contribute no key.
 - **Altloc / model / assembly** — `read_structure` materializes one model + one residue-consistent altloc
   (`highest_occupancy` default / `first`); `read_structures` expands the Cartesian product of per-residue altloc labels
@@ -1836,13 +1856,11 @@ Resolved-to-implementation (each formerly-reopened question):
 - **Codec JSON shape** — `encode_structure`/`decode_structure` structure/site/`residue_numbers`/array-reference shape
   is frozen.
 
-**Legitimately scoped-open (the ONE remaining item):** the codec's system-ordering/persistence facet — `encode_system`
-serializes `instances` as a plain JSON object and the writer's recursive `json.dumps(..., sort_keys=True)`
-(`io/structure.py:_write_mmcif`) reorders its keys, so instance declaration order is not preserved across an
-`_ofoldx_structure` round-trip. This is the already-recorded §3.4.1 "Open questions" / §3.3 freeze-blocker
-(REVIEW.md:1153): serialize `instances` as an ordered `(instance_id, entity_id)` entry array read back in order. It
-bounds instance ordinals inside the decoded system only, not the read/exchange-write/LossReport surface frozen in
-§3.5.3.
+**Resolved 2026-07-25 — codec instance ordering.** `encode_system` now stores
+`instances` as an ordered `(instance_id, entity_id)` entry array and
+`decode_system` rebuilds it in declaration order. The current `io/mmcif.py`
+writer's recursive key sorting cannot reorder array entries. DESIGN §3.4.1 and
+the codec round-trip test now carry this contract.
 
 ## 2026-07-24 Pipeline, Result, and repository contract audit
 
@@ -2043,13 +2061,16 @@ eager dot product. They must not claim an OOps path until OOps exposes the exact
 return-weights/dropout and edge-keep-mask contracts.
 
 The shared projected-attention dispatcher also preserves an independent value
-width by falling back from the narrower OOps Q/K/V contract, and interprets
-mask layouts by rank so equal batch, head, or query sizes cannot silently
-change axis ownership.
+width by falling back from the narrower OOps Q/K/V contract. The former
+rank-only mask interpretation was falsified by a shared `(Q, K)` mask with a
+batch prefix; DESIGN §8.1.2 now freezes pair-first normalization and requires
+an explicit singleton query axis for an otherwise ambiguous batched key mask.
 
 The unconsumed RFdiffusion `schedule_directory` / `cache_dir` pickle lifecycle
-was deleted. Non-default schedules are computed in memory, while the released
-default lookup table remains a packaged scientific constant; no Model or
+was deleted. Non-default schedules are computed in memory. The checkpoint
+converter alone reads the released default lookup table and writes it into the
+Model's persistent `igso3_*` buffers, which the ordinary repository writer stores
+in `model.safetensors`; the OFoldX wheel carries no schedule table and no Model or
 Processor accepts a user input file.
 
 ## 2026-07-25 minimal validation and documentation surface
@@ -2066,3 +2087,44 @@ fallback.
 The canonical Pipeline writer still emits a one-field marker. The loader reads
 its owned `pipeline` member and intentionally does not add a defensive
 extra-member scan; unknown IDs fail at the ordinary registry lookup.
+
+## 2026-07-25 attention and mathematical-owner completion
+
+**Verdict: ACCEPTED FOR IMPLEMENTATION.** DESIGN §8.1.2 now freezes one
+pair-first attention-mask interpretation before provider dispatch. A shared
+`(Q, K)` mask remains a pair mask when `batch_size == Q`; ambiguous batched key
+validity uses `(B, 1, K)`. Head-specific forms retain every prefix position,
+including the unambiguous `(B, H, K)` key-validity form; a coincident `H == Q`
+uses an explicit singleton query axis. OOps already implements the exact
+head-independent pair-attention seam, so per-head masks fall back to the public
+implementation and no OOps change is required. SDPA consumes a boolean mask
+directly when there is no additive bias, and fully-masked raw rows are reduced
+without materializing a head-expanded validity tensor.
+
+AF3 template and AF3/Protenix confidence composition now live in each family's
+single `model.py`; only the independently reused `AtomConfidenceProjector` and
+`expected_plddt` remain shared. Boltz2 and BoltzGen share the exact
+`PackedReferenceAtomEncoder`, and three real consumers share
+`BoltzContactConditioning`. Their denoiser compositions stay family-local.
+The one-operation B-factor wrappers are ordinary `nn.Linear`; converters now map
+`bfactor_module.bfactor.{weight,bias}` to
+`bfactor_head.{weight,bias}`.
+
+False lifecycle Protocols were deleted in favor of the real `Model` and
+`Processor` bases plus ordinary attribute access. ESMFold2's public tensor name is
+`msa_mask`; ODesign's private trunk field is `relative_features`. Evoformer,
+AF3, and Protenix register children in execution order while preserving the
+released parameter-construction order, so source organization does not change
+same-seed initialization. OOps and OFoldX remain co-developed worktrees; OOps is
+not published or pinned before this OFoldX surface stabilizes.
+
+The real `Processor` base now exposes `config: Config | None`: configured
+processors narrow it to their concrete config type, while config-less processors
+retain `None`. Repository writing therefore reads `processor.config` directly;
+it does not need a Protocol, cast, constant-name `getattr`, type ignore, or an
+invented empty configuration.
+
+Boltz2 affinity now names its homogeneous `TrianglePairUpdateBlock` repetition
+`num_pair_update_blocks`; neither its config nor its local converter calls that
+pair-only graph a Pairformer. BoltzGen likewise describes its reduced Miniformer
+count as trunk blocks rather than Pairformer blocks.

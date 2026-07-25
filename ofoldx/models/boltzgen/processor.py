@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from rdkit.Chem.rdchem import Mol
 
 
-# Contact-conditioning one-hot classes (must match model.CONTACT_CONDITIONING_CLASSES):
+# Contact-conditioning one-hot classes consumed by BoltzContactConditioning:
 # 0 UNSPECIFIED, 1 UNSELECTED, 2 POCKET>BINDER, 3 BINDER>POCKET, 4 CONTACT.
 _CONTACT_CLASSES = 5
 _CONTACT_KIND_TO_CLASS = {"pocket>binder": 2, "binder>pocket": 3, "contact": 4}

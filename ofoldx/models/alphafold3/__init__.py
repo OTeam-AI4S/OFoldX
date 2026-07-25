@@ -11,6 +11,7 @@ from .model import (
     AlphaFold3Input,
     AlphaFold3Model,
     AlphaFold3Output,
+    TemplateFeatures,
     alphafold3_confidence_summary,
     alphafold3_fraction_disordered,
     alphafold3_has_clash,
