@@ -4,14 +4,14 @@ Training, evaluation, and inference runner for registered OFoldX models.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from typing import Any
 
 import danling as dl
 import torch
 from danling.runners.utils import RunnerMode
-from torch import Tensor
+from torch import Tensor, nn
 
 from ..model import Model
 from ..processor import Processor
@@ -19,40 +19,81 @@ from .collate import collate
 from .config import RunnerConfig
 from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
 
+Objective = Callable[[nn.Module, Any], tuple[Any, Tensor]]
+
 
 @RUNNERS.register("ofoldx", default=True)
 class Runner(dl.Runner):
     r"""
     Train, evaluate, and run forward inference for a registered model.
 
+    The model, datasets, objective, and collate function are built from
+    ``config`` by default; any of them may instead be injected directly (a plain
+    model and in-memory datasets, e.g. for testing or bespoke training loops).
+
     Args:
         config: Runner configuration or values used to construct one.
+        model: Model to train. When omitted, built from ``config.model``.
+        datasets: Split-keyed datasets. When omitted, built from ``config.data``.
+        train_objective: ``(model, batch) -> (output, loss)`` used for training.
+            When omitted, resolved from the model's architecture.
+        evaluate_objective: Objective used for evaluation. Defaults to
+            ``train_objective``.
+        collate_fn: Batch collation. Defaults to the OFoldX structure collate.
     """
 
     config: RunnerConfig
 
-    def __init__(self, config: RunnerConfig | Mapping[str, Any]) -> None:
+    def __new__(cls, config: RunnerConfig | Mapping[str, Any], **kwargs: Any) -> Runner:
+        # danling's factory ``__new__`` composes the dynamic ``(cls, TorchRunner)`` runtime class and
+        # accepts ``config`` only; drop the optional injection kwargs so they do not reach it (they are
+        # applied in ``__init__``).
+        return super().__new__(cls, config)
+
+    def __init__(
+        self,
+        config: RunnerConfig | Mapping[str, Any],
+        *,
+        model: nn.Module | None = None,
+        datasets: Mapping[str, Any] | None = None,
+        train_objective: Objective | None = None,
+        evaluate_objective: Objective | None = None,
+        collate_fn: Callable[[list[Any]], Any] | None = None,
+    ) -> None:
         if not isinstance(config, RunnerConfig):
             config = RunnerConfig(config)
         super().__init__(config)
-        # Config-only construction can skip chanfig's ``boot`` (which runs ``post``), so run the
-        # curated ``RunnerConfig.post`` validation here before ``build_model`` -- otherwise a missing
-        # ``model.name`` surfaces as ``MODELS.lookup_model(None)``'s opaque "unknown model architecture".
-        self.config.post()
         self._architecture = ""
-        self.model = self.build_model()
-        from .objectives import diffusion, mpnn  # noqa: F401 — register the built-in objectives
 
-        name = self.config.objective or ARCHITECTURE_OBJECTIVES.get(self._architecture)
-        if name is None:
-            raise ValueError(
-                f"no training objective is defined for architecture {self._architecture!r}; "
-                f"set `objective` explicitly or use an architecture with a registered objective "
-                f"({', '.join(sorted(set(ARCHITECTURE_OBJECTIVES.values())))})"
-            )
-        self.objective = OBJECTIVES.build(type=name)
-        self.collate_fn = collate
-        self.datasets.update(self.build_datasets())
+        if model is not None:
+            self.model = model
+        else:
+            # Config-only construction can skip chanfig's ``boot`` (which runs ``post``), so run the
+            # curated ``RunnerConfig.post`` validation here before ``build_model`` -- otherwise a missing
+            # ``model.name`` surfaces as ``MODELS.lookup_model(None)``'s opaque "unknown model architecture".
+            self.config.post()
+            self.model = self.build_model()
+
+        if train_objective is not None:
+            self.objective: Objective = train_objective
+        else:
+            from .objectives import diffusion, mpnn  # noqa: F401 — register the built-in objectives
+
+            name = self.config.objective or ARCHITECTURE_OBJECTIVES.get(self._architecture)
+            if name is None:
+                raise ValueError(
+                    f"no training objective is defined for architecture {self._architecture!r}; "
+                    f"set `objective` explicitly or use an architecture with a registered objective "
+                    f"({', '.join(sorted(set(ARCHITECTURE_OBJECTIVES.values())))})"
+                )
+            self.objective = OBJECTIVES.build(type=name)
+        self.evaluate_objective: Objective = self.objective if evaluate_objective is None else evaluate_objective
+        self.collate_fn = collate if collate_fn is None else collate_fn
+
+        if datasets is not None:
+            self.datasets.update(datasets)
+        elif self.config.data:
+            self.datasets.update(self.build_datasets())
 
     # -- construction --------------------------------------------------------
 
@@ -164,7 +205,7 @@ class Runner(dl.Runner):
         data = self.to_device(data)
         model = self.ema or self.model
         with self.infer_context():
-            output, loss = self.objective(model, data)
+            output, loss = self.evaluate_objective(model, data)
         return output, loss
 
     def infer_step(self, data: Any) -> Any:
