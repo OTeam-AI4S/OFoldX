@@ -1,30 +1,13 @@
 # pipelines
 
-OFoldX exposes one concrete Pipeline for each standard biological task:
+OFoldX publishes family-owned concrete Pipelines. Every routable repository carries
+one `pipeline.json` marker naming its registered class; that class owns repository
+loading, saving, placement, and its exact biological method signatures.
 
-- `FoldPipeline`
-- `DesignPipeline`
-- `ScorePipeline`
-- `PackPipeline`
-
-Each package export is the same class object as its top-level export. A standard
-Pipeline binds a Model to its Processor, delegates ordinary `.to(...)` calls, and
-exposes only its matching verb. The repository-backed factory validates registration,
-pairing, and the requested task; a direct constructor trusts the pair supplied
-by its caller.
-
-```python
-from ofoldx import AutoModel, AutoProcessor, FoldPipeline
-
-model_repository = "your-organization/published-fold-model"
-model = AutoModel(model_repository)
-processor = AutoProcessor(model_repository)
-folding = FoldPipeline(model=model, processor=processor)
-result = folding.fold("MKT...")
-```
-
-For repository-backed construction, the task stays explicit and the model ID selects
-the paired Model and Processor:
+`PairedPipeline` implements this lifecycle for one Model–Processor pair.
+`CompositePipeline` implements it for a concrete class's fixed named pairs. A family
+may override the lifecycle when its artifact owns another necessary child, as
+ESMFold2 design does for ESMC.
 
 ```python
 import ofoldx
@@ -33,6 +16,7 @@ folding = ofoldx.pipeline("fold", model="your-organization/published-fold-model"
 result = folding.fold("MKT...")
 ```
 
-There is no public generic `Pipeline` base, task inference, default model, or factory
-form that accepts live Model/Processor objects. Standard Pipelines have no independent
-manifest or serialized composition format.
+The task remains explicit and is checked against the selected class. The factory
+does not infer repository layout, load a root pair itself, or fall back when a
+marker or requested public method is missing. There are no generic Fold, Design,
+Score, or Pack Pipeline classes hiding family signature differences.

@@ -24,7 +24,7 @@ class _Model(Model):
         self.post_init()
 
 
-@pytest.mark.parametrize("backend", ["auto", "eager", "oops"])
+@pytest.mark.parametrize("backend", ["auto", "eager", "sdpa", "oops", "cueq", "apex", "deepspeed"])
 def test_set_backend_updates_nested_backend_owners(backend: str) -> None:
     model = _Model()
 

@@ -39,7 +39,7 @@ def convert_ligandmpnn_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert a released LigandMPNN checkpoint into a standard Pipeline repository.
+    Convert a released LigandMPNN checkpoint into a registered concrete Pipeline repository.
 
     Derives every live architecture fact from the checkpoint, strict-loads the flat Model with
     ``assign=True`` to preserve the serialized dtype, writes ``num_context_atoms`` to the paired Processor

@@ -67,6 +67,8 @@ class SaveableProcessor(Protocol):
     Configured Processor state written to ``processor.json``.
     """
 
+    dtype: torch.dtype
+
     @property
     def config(self) -> Mapping[str, object]:
         r"""
@@ -85,6 +87,14 @@ def _config_json(config: Mapping[str, object], *, architecture: str | None = Non
         raise ValueError("Config must not contain repository architecture metadata")
     if architecture is not None:
         values["architecture"] = architecture
+    return json.dumps(values, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
+def _processor_json(processor: Processor, config: Mapping[str, object] | None) -> str:
+    values = {} if config is None else dict(config)
+    if "dtype" in values:
+        raise ValueError("Processor config must not contain repository dtype metadata")
+    values["dtype"] = str(processor.dtype).removeprefix("torch.")
     return json.dumps(values, indent=2, sort_keys=True, allow_nan=False) + "\n"
 
 
@@ -121,10 +131,11 @@ def save_model(
 
     registration = MODELS.for_pair(model, processor)
     model_json = _config_json(model.config, architecture=registration.id)
-    processor_config = registration.processor_config
-    processor_json = None
-    if processor_config is not None:
-        processor_json = _config_json(cast(SaveableProcessor, processor).config)
+    processor_config = registration.processor.config_class
+    processor_json = _processor_json(
+        processor,
+        None if processor_config is None else cast(SaveableProcessor, processor).config,
+    )
 
     destination = Path(directory).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
@@ -134,10 +145,7 @@ def save_model(
         encoding="utf-8",
     )
     processor_path = destination / "processor.json"
-    if processor_json is None:
-        processor_path.unlink(missing_ok=True)
-    else:
-        processor_path.write_text(processor_json, encoding="utf-8")
+    processor_path.write_text(processor_json, encoding="utf-8")
     state_dict = model.state_dict()
     expected_keys = set(state_dict)
     save_torch_state_dict(

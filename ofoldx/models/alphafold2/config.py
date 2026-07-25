@@ -335,13 +335,9 @@ class AlphaFold2DistogramHeadConfig(Config):
     Configure the AlphaFold 2 distogram head.
 
     Args:
-        first_break: Center of the first distance bin, in angstroms.
-        last_break: Center of the last bounded distance bin, in angstroms.
         num_distogram_bins: Number of distogram output bins.
     """
 
-    first_break: float = 2.3125
-    last_break: float = 21.6875
     num_distogram_bins: int = 64
 
 
@@ -368,7 +364,6 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
         enabled: Whether to build and run the predicted-aligned-error head.
         max_error_bin: Upper predicted-aligned-error bin center, in angstroms.
         num_pae_bins: Number of predicted-aligned-error bins.
-        interface: Whether to compute interface pTM.
         ptm_weight: pTM contribution to the combined ranking score.
         iptm_weight: ipTM contribution to the combined ranking score.
     """
@@ -376,7 +371,6 @@ class AlphaFold2MultimerPredictedAlignedErrorHeadConfig(Config):
     enabled: bool = True
     max_error_bin: float = 31.0
     num_pae_bins: int = 64
-    interface: bool = True
     ptm_weight: float = 0.2
     iptm_weight: float = 0.8
 
@@ -427,17 +421,6 @@ class AlphaFold2MultimerMaskedMsaHeadConfig(Config):
     num_output: int = 22
 
 
-class AlphaFold2MultimerChainCenterOfMassHeadConfig(Config):
-    r"""
-    Configure the parameterized but inference-inert multimer chain-center head.
-
-    Args:
-        enabled: Whether to instantiate the chain center-of-mass head.
-    """
-
-    enabled: bool = True
-
-
 class AlphaFold2HeadsConfig(Config):
     r"""
     Configure AlphaFold 2 monomer prediction heads.
@@ -467,7 +450,6 @@ class AlphaFold2MultimerHeadsConfig(Config):
         predicted_aligned_error: Predicted-aligned-error, pTM, ipTM, and ranking head.
         predicted_lddt: Per-residue predicted-lDDT head.
         experimentally_resolved: Atom37 experimentally-resolved head.
-        chain_center_of_mass: Parameterized but inference-inert chain-center head.
     """
 
     distogram: AlphaFold2DistogramHeadConfig = AlphaFold2DistogramHeadConfig()
@@ -477,9 +459,6 @@ class AlphaFold2MultimerHeadsConfig(Config):
     )
     predicted_lddt: AlphaFold2PredictedLddtHeadConfig = AlphaFold2PredictedLddtHeadConfig()
     experimentally_resolved: AlphaFold2ExperimentallyResolvedHeadConfig = AlphaFold2ExperimentallyResolvedHeadConfig()
-    chain_center_of_mass: AlphaFold2MultimerChainCenterOfMassHeadConfig = (
-        AlphaFold2MultimerChainCenterOfMassHeadConfig()
-    )
 
 
 class AlphaFold2MsaConfig(Config):

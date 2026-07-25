@@ -63,7 +63,7 @@ from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
 from ...modules.transition import Transition
 from ...modules.trunk.msa import MsaPairBlock, MsaTrunk, MsaUpdateBlock, OuterProductMean, TrianglePairUpdateBlock
 from ...modules.trunk.pairformer import PairformerBlock, PairformerStack
-from ...results import FoldPrediction, Metric, PairMetric, Score, best
+from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold3Config
 
 
@@ -268,7 +268,7 @@ class AlphaFold3Model(Model):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
-    ) -> AlphaFold3FoldResult:
+    ) -> FoldResult:
         r"""
         Predict structures for one molecular assembly.
 
@@ -287,9 +287,8 @@ class AlphaFold3Model(Model):
                 configured value.
 
         Returns:
-            One seed group containing generation-ordered predictions. Structure
-            coordinates, PAE, and PDE values are in angstroms; pLDDT is on
-            ``0--100``.
+            Generation-ordered predictions. Structure coordinates, PAE, and PDE
+            values are in angstroms; pLDDT is on ``0--100``.
 
         Raises:
             ValueError: If a count is not positive or the input lacks molecular
@@ -311,17 +310,15 @@ class AlphaFold3Model(Model):
                 "bare-tensor inputs can only drive forward/_sample"
             )
 
-        group = self._decode_seed_group(
+        return self._decode_fold_result(
             input,
             num_samples=num_samples,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
             generator=generator,
-            seed=None,
         )
-        return AlphaFold3FoldResult(seed_groups=(group,))
 
-    def _decode_seed_group(
+    def _decode_fold_result(
         self,
         input: AlphaFold3Input,
         *,
@@ -329,10 +326,9 @@ class AlphaFold3Model(Model):
         recycling_steps: int,
         num_sampling_steps: int,
         generator: torch.Generator | None,
-        seed: int | None,
-    ) -> AlphaFold3SeedGroup:
+    ) -> FoldResult:
         r"""
-        Sample one seed's diffusion rollouts and decode them into one seed group.
+        Sample diffusion rollouts and decode one generation-ordered fold result.
 
         Shares one trunk pass across ``num_samples`` rollouts, decodes each sample's
         [`Structure`][ofoldx.data.structure.Structure], and computes pTM, ipTM, PAE/PDE
@@ -499,7 +495,7 @@ class AlphaFold3Model(Model):
                     },
                 )
             )
-        return AlphaFold3SeedGroup(seed=seed, predictions=tuple(predictions))
+        return FoldResult(predictions=tuple(predictions))
 
     def _assemble_output(
         self,
@@ -696,7 +692,7 @@ class AlphaFold3Model(Model):
             template_features = TemplateFeatures(
                 distogram=template_features.distogram.to(dtype=pair_init.dtype),
                 pseudo_beta_mask=template_features.pseudo_beta_mask.to(dtype=pair_init.dtype),
-                residue_type=template_features.residue_type,
+                residue_type_ids=template_features.residue_type_ids,
                 unit_vector=template_features.unit_vector.to(dtype=pair_init.dtype),
                 backbone_frame_mask=template_features.backbone_frame_mask.to(dtype=pair_init.dtype),
                 template_mask=template_features.template_mask,
@@ -2183,7 +2179,7 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True, eq=False)
 class _AlphaFold3TrunkOutput:
     r"""
     Named representations returned by the AlphaFold 3 recycling trunk.
@@ -2195,7 +2191,7 @@ class _AlphaFold3TrunkOutput:
     relative_features: RelativePositionBuckets
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class AlphaFold3Input:
     r"""
     Tensor and molecular-layout input for AlphaFold 3.
@@ -2256,7 +2252,7 @@ class AlphaFold3Input:
     token_sites: tuple[AtomSite | ComponentReference, ...] = ()
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold3Output:
     r"""
     Predictions from one AlphaFold 3 denoising call.
@@ -2291,55 +2287,3 @@ class AlphaFold3Output:
         """
 
         return expected_plddt(self.plddt_logits)
-
-
-# AlphaFold 3 results preserve the sample grouping for each diffusion seed.
-
-
-@dataclass(eq=False)
-class AlphaFold3SeedGroup:
-    r"""
-    One diffusion seed and its generation-ordered samples.
-
-    Args:
-        seed: The integer diffusion seed shared by every sample, when one was supplied.
-        predictions: Generation-ordered samples drawn for this seed; tuple
-            position is the sample identity within the group.
-    """
-
-    seed: int | None
-    predictions: tuple[FoldPrediction, ...]
-
-
-@dataclass(eq=False)
-class AlphaFold3FoldResult:
-    r"""
-    One AlphaFold 3 folding result preserving its per-seed sample groups.
-
-    Args:
-        seed_groups: One [`AlphaFold3SeedGroup`][] per seed, in the order the
-            seeds were run.
-    """
-
-    seed_groups: tuple[AlphaFold3SeedGroup, ...]
-
-    def best(self, score: str) -> FoldPrediction:
-        r"""
-        Return the earliest best prediction under one explicit score.
-
-        Samples from all seed groups are pooled before ranking. Ties retain
-        generation order.
-
-        Args:
-            score: The name of the per-sample score to rank on.
-
-        Returns:
-            The earliest pooled sample that is best under ``score``.
-
-        Raises:
-            ValueError: If the score does not consistently prefer higher or lower
-                values, mixes units or scopes, or contains a NaN value.
-        """
-
-        predictions = tuple(prediction for group in self.seed_groups for prediction in group.predictions)
-        return best(predictions, score)

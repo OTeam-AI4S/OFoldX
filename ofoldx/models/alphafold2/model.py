@@ -25,9 +25,9 @@ from ...modules.backend import LayerNorm
 from ...modules.dropout import RowwiseDropout
 from ...modules.head import DistogramHead, tm_bin_weights
 from ...modules.trunk.evoformer import (
-    AlphaFold2TriangleAttention,
-    AlphaFold2TriangleMultiplication,
     EvoformerStack,
+    EvoformerTriangleAttention,
+    EvoformerTriangleMultiplication,
     EvoformerTransition,
     ExtraMsaEvoformerStack,
     OuterProductFirstEvoformerStack,
@@ -296,10 +296,10 @@ class AlphaFold2Model(Model):
         num_samples = operator.index(num_samples)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
-        if input.residue_type.shape[0] != 1:
+        if input.residue_type_ids.shape[0] != 1:
             raise ValueError("AlphaFold 2 fold accepts one canonical system per call")
 
-        device = input.residue_type.device
+        device = input.residue_type_ids.device
         predictions = []
         for _ in range(num_samples):
             sample_generator = _sample_generator(generator, device)
@@ -818,10 +818,10 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         num_samples = operator.index(num_samples)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
-        if input.residue_type.shape[0] != 1:
+        if input.residue_type_ids.shape[0] != 1:
             raise ValueError("AlphaFold-Multimer fold accepts one canonical system per call")
 
-        device = input.residue_type.device
+        device = input.residue_type_ids.device
         predictions = []
         for _ in range(num_samples):
             sample_generator = _sample_generator(generator, device)
@@ -942,7 +942,7 @@ class AlphaFold2StructureModule(nn.Module):
 
     def forward(self, single: Tensor, pair: Tensor, input: AlphaFold2Input) -> AlphaFold2StructureModuleOutput:
         sequence_mask = input.sequence_mask.to(dtype=single.dtype)
-        residue_type = input.residue_type.clamp(min=0, max=20)
+        residue_type_ids = input.residue_type_ids.clamp(min=0, max=20)
         act = self.single_norm(single)
         initial_act = act
         act = self.input_projection(act)
@@ -957,7 +957,7 @@ class AlphaFold2StructureModule(nn.Module):
                 mask=sequence_mask,
                 affine=affine,
                 initial_act=initial_act,
-                residue_type=residue_type,
+                residue_type_ids=residue_type_ids,
             )
             affines.append(raw_affine.to_tensor())
 
@@ -966,8 +966,8 @@ class AlphaFold2StructureModule(nn.Module):
             [1.0, 1.0, 1.0, 1.0, self.position_scale, self.position_scale, self.position_scale],
         )
         traj = traj * traj_scale
-        atom14_mask = _residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, sequence_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -1027,7 +1027,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
 
     def forward(self, single: Tensor, pair: Tensor, input: AlphaFold2MultimerInput) -> AlphaFold2StructureModuleOutput:
         sequence_mask = input.sequence_mask.to(dtype=single.dtype)
-        residue_type = input.residue_type.clamp(min=0, max=20)
+        residue_type_ids = input.residue_type_ids.clamp(min=0, max=20)
         act = self.single_norm(single)
         initial_act = act
         act = self.input_projection(act)
@@ -1042,7 +1042,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
                 mask=sequence_mask,
                 rigid=rigid,
                 initial_act=initial_act,
-                residue_type=residue_type,
+                residue_type_ids=residue_type_ids,
             )
             scaled = rigid.scale_translation(self.position_scale)
             frames.append(
@@ -1050,8 +1050,8 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             )
 
         traj = torch.stack(frames, dim=0)
-        atom14_mask = _residue_type_atom14_mask(residue_type, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, sequence_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -1187,7 +1187,7 @@ class AlphaFold2MultimerTemplateEmbedder(nn.Module):
         self.output_projection = nn.Linear(template_size, query_size)
 
     def forward(self, query_embedding: Tensor, input: AlphaFold2MultimerInput, *, pair_mask: Tensor) -> Tensor:
-        num_templates = input.template_residue_type.shape[1]
+        num_templates = input.template_residue_type_ids.shape[1]
         chain_index = input.chain_index
         multichain_mask_2d = (chain_index.unsqueeze(-1) == chain_index.unsqueeze(-2)).to(dtype=query_embedding.dtype)
         unit_vectors, backbone_masks = _template_backbone_unit_vector(input)
@@ -1196,7 +1196,7 @@ class AlphaFold2MultimerTemplateEmbedder(nn.Module):
         for index in range(num_templates):
             act = self.single_template_embedder(
                 query_embedding,
-                residue_type=input.template_residue_type[:, index],
+                residue_type_ids=input.template_residue_type_ids[:, index],
                 pseudo_beta=input.template_pseudo_beta[:, index],
                 pseudo_beta_mask=input.template_pseudo_beta_mask[:, index],
                 unit_vector=unit_vectors[:, index],
@@ -1500,8 +1500,8 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
         return act.reshape(batch_size, num_templates, num_tokens, num_tokens, -1)
 
     def _features(self, template_batch: AlphaFold2TemplateBatch) -> tuple[Tensor, Tensor]:
-        residue_type = template_batch.template_residue_type.long().clamp(min=0, max=self.vocab_size - 1)
-        residue_type_one_hot = F.one_hot(residue_type, num_classes=self.vocab_size).to(dtype=template_batch.dtype)
+        residue_type_ids = template_batch.template_residue_type_ids.long().clamp(min=0, max=self.vocab_size - 1)
+        residue_type_one_hot = F.one_hot(residue_type_ids, num_classes=self.vocab_size).to(dtype=template_batch.dtype)
         pseudo_beta, pseudo_beta_mask = template_batch.pseudo_beta()
         template_pair_mask = pseudo_beta_mask.unsqueeze(-1) * pseudo_beta_mask.unsqueeze(-2)
         distogram = _distogram(
@@ -1584,7 +1584,7 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         self,
         query_embedding: Tensor,
         *,
-        residue_type: Tensor,
+        residue_type_ids: Tensor,
         pseudo_beta: Tensor,
         pseudo_beta_mask: Tensor,
         unit_vector: Tensor,
@@ -1605,9 +1605,9 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         act = self.distogram_projection(distogram)
         act = act + self.pseudo_beta_mask_projection(pseudo_beta_mask_2d.unsqueeze(-1).to(dtype))
 
-        residue_type_one_hot = F.one_hot(residue_type.long().clamp(min=0, max=self.vocab_size - 1), self.vocab_size).to(
-            dtype
-        )
+        residue_type_one_hot = F.one_hot(
+            residue_type_ids.long().clamp(min=0, max=self.vocab_size - 1), self.vocab_size
+        ).to(dtype)
         act = act + self.column_residue_type_projection(residue_type_one_hot[..., None, :, :])
         act = act + self.row_residue_type_projection(residue_type_one_hot[..., None, :])
 
@@ -1647,16 +1647,16 @@ class AlphaFold2TemplateMsaEmbedder(nn.Module):
         return activations, msa_mask
 
     def _features(self, template_batch: AlphaFold2TemplateBatch) -> tuple[Tensor, Tensor]:
-        residue_type = template_batch.template_residue_type.long().clamp(min=0, max=self.vocab_size - 1)
-        residue_type_one_hot = F.one_hot(residue_type, num_classes=self.vocab_size).to(dtype=template_batch.dtype)
+        residue_type_ids = template_batch.template_residue_type_ids.long().clamp(min=0, max=self.vocab_size - 1)
+        residue_type_one_hot = F.one_hot(residue_type_ids, num_classes=self.vocab_size).to(dtype=template_batch.dtype)
         torsion = template_batch.template_torsion_angles_sin_cos
         alternative_torsion = template_batch.template_alternative_torsion_angles_sin_cos
         torsion_mask = template_batch.template_torsion_angles_mask
         features = torch.cat(
             [
                 residue_type_one_hot,
-                torsion.reshape(*residue_type.shape, 14).to(dtype=residue_type_one_hot.dtype),
-                alternative_torsion.reshape(*residue_type.shape, 14).to(dtype=residue_type_one_hot.dtype),
+                torsion.reshape(*residue_type_ids.shape, 14).to(dtype=residue_type_one_hot.dtype),
+                alternative_torsion.reshape(*residue_type_ids.shape, 14).to(dtype=residue_type_one_hot.dtype),
                 torsion_mask.to(dtype=residue_type_one_hot.dtype),
             ],
             dim=-1,
@@ -1677,14 +1677,14 @@ class AlphaFold2MultimerTemplateMsaEmbedder(nn.Module):
         self.output_projection = nn.Linear(msa_size, msa_size)
 
     def forward(self, input: AlphaFold2MultimerInput) -> tuple[Tensor, Tensor]:
-        residue_type = input.template_residue_type.long().clamp(min=0, max=self.vocab_size - 1)
-        residue_type_one_hot = F.one_hot(residue_type, self.vocab_size).to(
+        residue_type_ids = input.template_residue_type_ids.long().clamp(min=0, max=self.vocab_size - 1)
+        residue_type_one_hot = F.one_hot(residue_type_ids, self.vocab_size).to(
             dtype=input.template_all_atom_positions.dtype
         )
         chi, chi_mask = _template_chi_angles(
             input.template_all_atom_positions,
             input.template_all_atom_mask,
-            residue_type,
+            residue_type_ids,
         )
         features = torch.cat(
             [residue_type_one_hot, torch.sin(chi) * chi_mask, torch.cos(chi) * chi_mask, chi_mask],
@@ -1755,25 +1755,25 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_starting_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_ending_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_outgoing = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
             backend=backend,
         )
-        self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_incoming = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
@@ -1853,25 +1853,25 @@ class AlphaFold2MultimerTemplatePairBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_outgoing = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
             backend=backend,
         )
-        self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_incoming = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
             backend=backend,
         )
-        self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_starting_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_ending_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
@@ -1947,7 +1947,7 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         mask: Tensor,
         affine: AlphaFold2QuatAffine,
         initial_act: Tensor,
-        residue_type: Tensor,
+        residue_type_ids: Tensor,
     ) -> tuple[Tensor, AlphaFold2QuatAffine, Tensor, Tensor, Tensor, AlphaFold2QuatAffine]:
         attn = self.invariant_point_attention(inputs_1d=act, inputs_2d=pair, mask=mask, affine=affine)
         act = self.attention_norm(act + self.dropout(attn))
@@ -1956,7 +1956,7 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         angles, unnormalized_angles, atom14_positions = self.sidechain(
             affine.scale_translation(self.position_scale),
             (act, initial_act),
-            residue_type,
+            residue_type_ids,
         )
         return act, affine.detach_rotation(), angles, unnormalized_angles, atom14_positions, affine
 
@@ -2015,7 +2015,7 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         mask: Tensor,
         rigid: AlphaFold2Rigid,
         initial_act: Tensor,
-        residue_type: Tensor,
+        residue_type_ids: Tensor,
     ) -> tuple[Tensor, AlphaFold2Rigid, Tensor, Tensor, Tensor]:
         attn = self.invariant_point_attention(single=act, pair=pair, mask=mask, rigid=rigid)
         act = self.attention_norm(act + self.dropout(attn))
@@ -2024,7 +2024,7 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         angles, unnormalized_angles, atom14_positions = self.sidechain(
             rigid.scale_translation(self.position_scale),
             (act, initial_act),
-            residue_type,
+            residue_type_ids,
         )
         rigid_next = AlphaFold2Rigid(rotation=rigid.rotation.detach(), translation=rigid.translation)
         return act, rigid_next, angles, unnormalized_angles, atom14_positions
@@ -2060,9 +2060,7 @@ class AlphaFold2InvariantPointAttention(nn.Module):
         self.key_value_point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * (num_point_qk + num_point_v))
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads)
         output_size = (
-            num_attention_heads * num_scalar_v
-            + 4 * num_attention_heads * num_point_v
-            + num_attention_heads * pair_size
+            num_attention_heads * num_scalar_v + 4 * num_attention_heads * num_point_v + num_attention_heads * pair_size
         )
         self.output_projection = nn.Linear(output_size, hidden_size)
         self.trainable_point_weights = nn.Parameter(torch.empty(num_attention_heads))
@@ -2185,9 +2183,7 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         q_scalar = self.query_scalar_projection(single).view(
             *single.shape[:-1], num_attention_heads, self.num_scalar_qk
         )
-        k_scalar = self.key_scalar_projection(single).view(
-            *single.shape[:-1], num_attention_heads, self.num_scalar_qk
-        )
+        k_scalar = self.key_scalar_projection(single).view(*single.shape[:-1], num_attention_heads, self.num_scalar_qk)
         q_scalar = q_scalar * scalar_weights
         attn_qk_scalar = torch.einsum("...qhc,...khc->...qkh", q_scalar, k_scalar)
 
@@ -2313,15 +2309,15 @@ class AlphaFold2Sidechain(nn.Module):
         self,
         affine: AlphaFold2QuatAffine,
         representations: tuple[Tensor, Tensor],
-        residue_type: Tensor,
+        residue_type_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         act = sum(proj(F.relu(rep)) for proj, rep in zip(self.input_projections, representations, strict=True))
         for block in self.blocks:
             act = block(act)
         unnormalized_angles = self.angle_projection(F.relu(act)).unflatten(-1, (7, 2))
         angles = F.normalize(unnormalized_angles, dim=-1)
-        frames = _torsion_angles_to_frames(residue_type, affine.to_rigid(), angles)
-        atom_pos = _frames_and_literature_positions_to_atom14_pos(residue_type, frames)
+        frames = _torsion_angles_to_frames(residue_type_ids, affine.to_rigid(), angles)
+        atom_pos = _frames_and_literature_positions_to_atom14_pos(residue_type_ids, frames)
         return angles, unnormalized_angles, atom_pos
 
 
@@ -2346,7 +2342,7 @@ class AlphaFold2SidechainBlock(nn.Module):
         return residual + act
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold2Rigid:
     r"""
     Batched rigid transform represented by rotation matrices and translations.
@@ -2391,7 +2387,7 @@ class AlphaFold2Rigid:
         return AlphaFold2Rigid(rotation=self.rotation.detach(), translation=self.translation)
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold2QuatAffine:
     r"""
     AF2 backbone affine represented by a quaternion, rotation, and translation.
@@ -2539,7 +2535,7 @@ class _AlphaFold2RecyclingInput(Protocol):
     Tensor fields shared by monomer and multimer recycling.
     """
 
-    residue_type: Tensor
+    residue_type_ids: Tensor
     token_features: Tensor
     sequence_mask: Tensor
     msa_tokens: Tensor
@@ -3190,7 +3186,7 @@ def _quat_multiply_by_vec(quat: Tensor, vec: Tensor) -> Tensor:
 
 
 def _torsion_angles_to_frames(
-    residue_type: Tensor, backb_to_global: AlphaFold2Rigid, torsion_angles_sin_cos: Tensor
+    residue_type_ids: Tensor, backb_to_global: AlphaFold2Rigid, torsion_angles_sin_cos: Tensor
 ) -> AlphaFold2Rigid:
     r"""
     Build the 8 global side-chain rigid-group frames from the backbone frame and per-residue torsions.
@@ -3202,7 +3198,7 @@ def _torsion_angles_to_frames(
     default_frames = AlphaFold2Rigid.from_tensor4x4(
         _gather_residue_type(
             residue_constants.AMINO_ACID_RIGID_GROUP_DEFAULT_FRAME,
-            residue_type,
+            residue_type_ids,
             dtype=torsion_angles_sin_cos.dtype,
         )
     )
@@ -3249,7 +3245,7 @@ def _torsion_angles_to_frames(
 
 
 def _frames_and_literature_positions_to_atom14_pos(
-    residue_type: Tensor, all_frames_to_global: AlphaFold2Rigid
+    residue_type_ids: Tensor, all_frames_to_global: AlphaFold2Rigid
 ) -> Tensor:
     r"""
     Place each residue's 14 literature atom positions into global coordinates via its rigid-group frames.
@@ -3259,7 +3255,7 @@ def _frames_and_literature_positions_to_atom14_pos(
     """
 
     group_index = _gather_residue_type(
-        residue_constants.AMINO_ACID_ATOM14_TO_RIGID_GROUP, residue_type, dtype=torch.long
+        residue_constants.AMINO_ACID_ATOM14_TO_RIGID_GROUP, residue_type_ids, dtype=torch.long
     )
     group_mask = F.one_hot(group_index, num_classes=8).to(dtype=all_frames_to_global.rotation.dtype)
     atom_frames = AlphaFold2Rigid(
@@ -3268,14 +3264,16 @@ def _frames_and_literature_positions_to_atom14_pos(
     )
     lit_positions = _gather_residue_type(
         residue_constants.AMINO_ACID_ATOM14_RIGID_GROUP_POSITIONS,
-        residue_type,
+        residue_type_ids,
         dtype=all_frames_to_global.rotation.dtype,
     )
     pred_positions = atom_frames.apply(lit_positions)
-    return pred_positions * _residue_type_atom14_mask(residue_type, dtype=pred_positions.dtype).unsqueeze(-1)
+    return pred_positions * _residue_type_atom14_mask(residue_type_ids, dtype=pred_positions.dtype).unsqueeze(-1)
 
 
-def _atom14_to_atom37(atom14_positions: Tensor, residue_type: Tensor, sequence_mask: Tensor) -> tuple[Tensor, Tensor]:
+def _atom14_to_atom37(
+    atom14_positions: Tensor, residue_type_ids: Tensor, sequence_mask: Tensor
+) -> tuple[Tensor, Tensor]:
     r"""
     Scatter dense ``atom14`` coordinates into the ``atom37`` layout.
 
@@ -3283,29 +3281,29 @@ def _atom14_to_atom37(atom14_positions: Tensor, residue_type: Tensor, sequence_m
     existence table with ``sequence_mask``.
     """
 
-    atom37_to_atom14 = _gather_residue_type(_RESIDUE_TYPE_ATOM37_TO_ATOM14, residue_type, dtype=torch.long)
+    atom37_to_atom14 = _gather_residue_type(_RESIDUE_TYPE_ATOM37_TO_ATOM14, residue_type_ids, dtype=torch.long)
     gather_index = atom37_to_atom14.unsqueeze(-1).expand(*atom37_to_atom14.shape, atom14_positions.shape[-1])
     atom37_positions = torch.gather(atom14_positions, dim=-2, index=gather_index)
-    atom37_mask = _gather_residue_type(_RESIDUE_TYPE_ATOM37_MASK, residue_type, dtype=atom14_positions.dtype)
+    atom37_mask = _gather_residue_type(_RESIDUE_TYPE_ATOM37_MASK, residue_type_ids, dtype=atom14_positions.dtype)
     atom37_mask = atom37_mask * sequence_mask.unsqueeze(-1).to(dtype=atom37_mask.dtype)
     return atom37_positions * atom37_mask.unsqueeze(-1), atom37_mask
 
 
-def _residue_type_atom14_mask(residue_type: Tensor, *, dtype: torch.dtype) -> Tensor:
+def _residue_type_atom14_mask(residue_type_ids: Tensor, *, dtype: torch.dtype) -> Tensor:
     r"""
     Gather the per-residue ``atom14`` existence mask for each residue type.
     """
 
-    return _gather_residue_type(residue_constants.AMINO_ACID_ATOM14_MASK, residue_type, dtype=dtype)
+    return _gather_residue_type(residue_constants.AMINO_ACID_ATOM14_MASK, residue_type_ids, dtype=dtype)
 
 
 def _frame_index(rigid: AlphaFold2Rigid, index: int) -> AlphaFold2Rigid:
     return AlphaFold2Rigid(rotation=rigid.rotation[..., index, :, :], translation=rigid.translation[..., index, :])
 
 
-def _gather_residue_type(table: np.ndarray, residue_type: Tensor, *, dtype: torch.dtype) -> Tensor:
-    source = torch.as_tensor(table, device=residue_type.device, dtype=dtype)
-    index = residue_type.clamp(min=0, max=20).long()
+def _gather_residue_type(table: np.ndarray, residue_type_ids: Tensor, *, dtype: torch.dtype) -> Tensor:
+    source = torch.as_tensor(table, device=residue_type_ids.device, dtype=dtype)
+    index = residue_type_ids.clamp(min=0, max=20).long()
     gathered = source.index_select(0, index.reshape(-1))
     return gathered.reshape(*index.shape, *source.shape[1:])
 
@@ -3321,7 +3319,7 @@ _GLY_INDEX = residue_constants.AMINO_ACID_ONE_LETTER_CODES.index("G")
 
 def _template_batch(input: AlphaFold2Input) -> AlphaFold2TemplateBatch:
     return AlphaFold2TemplateBatch(
-        template_residue_type=input.template_residue_type,
+        template_residue_type_ids=input.template_residue_type_ids,
         template_mask=input.template_mask,
         template_all_atom_positions=input.template_all_atom_positions,
         template_all_atom_mask=input.template_all_atom_mask,
@@ -3359,11 +3357,11 @@ def _pseudo_beta_from_atom37(atom37_positions: Tensor, input: AlphaFold2Input) -
     ca = residue_constants.atom_order["CA"]
     cb = residue_constants.atom_order["CB"]
     gly = residue_constants.AMINO_ACID_ONE_LETTER_CODES.index("G")
-    residue_type = input.residue_type
+    residue_type_ids = input.residue_type_ids
     atom_index = torch.where(
-        residue_type == gly,
-        torch.full_like(residue_type, ca),
-        torch.full_like(residue_type, cb),
+        residue_type_ids == gly,
+        torch.full_like(residue_type_ids, ca),
+        torch.full_like(residue_type_ids, cb),
     )
     gather_index = atom_index.unsqueeze(-1).unsqueeze(-1).expand(*atom_index.shape, 1, 3)
     return atom37_positions.gather(-2, gather_index).squeeze(-2)
@@ -3470,7 +3468,7 @@ def _build_chi_atom37_tables() -> tuple[np.ndarray, np.ndarray]:
 _CHI_ATOM37_INDICES, _CHI_ANGLE_MASK = _build_chi_atom37_tables()
 
 
-def _template_chi_angles(positions: Tensor, atom_mask: Tensor, residue_type: Tensor) -> tuple[Tensor, Tensor]:
+def _template_chi_angles(positions: Tensor, atom_mask: Tensor, residue_type_ids: Tensor) -> tuple[Tensor, Tensor]:
     r"""
     Compute the four backbone-independent chi angles per residue from atom37 positions.
 
@@ -3483,7 +3481,7 @@ def _template_chi_angles(positions: Tensor, atom_mask: Tensor, residue_type: Ten
     angle_valid = torch.as_tensor(_CHI_ANGLE_MASK, device=positions.device, dtype=positions.dtype)
     # The chi tables cover residue types 0..19 plus a zero-mask UNK row at index 20;
     # clamp so gap / UNK template tokens index the inert UNK row.
-    table_index = residue_type.long().clamp(min=0, max=indices.shape[0] - 1)
+    table_index = residue_type_ids.long().clamp(min=0, max=indices.shape[0] - 1)
     per_res_indices = indices[table_index]  # [..., N, 4, 4]  (4 chi angles, 4 atoms each)
     per_res_valid = angle_valid[table_index]  # [..., N, 4]
 
@@ -3591,7 +3589,7 @@ def alphafold2_predicted_interface_tm_score(
     return float((alignment * eligible).max().item())
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold2StructureModuleOutput:
     r"""
     Output tensors from the AlphaFold 2 structure module.
@@ -3624,13 +3622,13 @@ class AlphaFold2StructureModuleOutput:
     sidechain_unnormalized_angles: Tensor
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold2TemplateBatch:
     r"""
     Template tensors shared by the pair and torsion embedding modules.
     """
 
-    template_residue_type: Tensor
+    template_residue_type_ids: Tensor
     template_mask: Tensor
     template_all_atom_positions: Tensor
     template_all_atom_mask: Tensor
@@ -3645,11 +3643,11 @@ class AlphaFold2TemplateBatch:
     def pseudo_beta(self) -> tuple[Tensor, Tensor]:
         ca = residue_constants.atom_order["CA"]
         cb = residue_constants.atom_order["CB"]
-        is_gly = self.template_residue_type == _GLY_INDEX
+        is_gly = self.template_residue_type_ids == _GLY_INDEX
         atom_index = torch.where(
             is_gly,
-            torch.full_like(self.template_residue_type, ca),
-            torch.full_like(self.template_residue_type, cb),
+            torch.full_like(self.template_residue_type_ids, ca),
+            torch.full_like(self.template_residue_type_ids, cb),
         )
         gather_index = atom_index[..., None, None].expand(*atom_index.shape, 1, 3)
         pseudo_beta = self.template_all_atom_positions.gather(-2, gather_index).squeeze(-2)
@@ -3699,7 +3697,7 @@ class AlphaFold2Layout:
     templates: tuple[Template, ...]
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class AlphaFold2Input:
     r"""
     Tensor and molecular-layout input for monomer AlphaFold 2.
@@ -3708,7 +3706,7 @@ class AlphaFold2Input:
     count. Row zero of the MSA tensors is the query sequence.
 
     Args:
-        residue_type: Residue token IDs with shape ``(B, N)``.
+        residue_type_ids: Residue token IDs with shape ``(B, N)``.
         token_features: Target features with shape ``(B, N, 22)``.
         residue_index: Chain-local residue indices with shape ``(B, N)``.
         sequence_mask: Valid-residue mask with shape ``(B, N)``.
@@ -3716,7 +3714,7 @@ class AlphaFold2Input:
         msa_deletions: MSA deletion counts with shape ``(B, M, N)``.
         msa_profile: Full-MSA residue frequencies with shape ``(B, N, 22)``.
         template_mask: Template validity mask with shape ``(B, T)``.
-        template_residue_type: Template residue IDs with shape ``(B, T, N)``.
+        template_residue_type_ids: Template residue IDs with shape ``(B, T, N)``.
         template_all_atom_positions: Template atom37 coordinates with shape
             ``(B, T, N, 37, 3)`` in angstroms.
         template_all_atom_mask: Template atom37 validity mask with shape
@@ -3742,7 +3740,7 @@ class AlphaFold2Input:
             ``(B, M_clustered, N)``.
     """
 
-    residue_type: Tensor
+    residue_type_ids: Tensor
     token_features: Tensor
     residue_index: Tensor
     sequence_mask: Tensor
@@ -3750,7 +3748,7 @@ class AlphaFold2Input:
     msa_deletions: Tensor
     msa_profile: Tensor
     template_mask: Tensor
-    template_residue_type: Tensor
+    template_residue_type_ids: Tensor
     template_all_atom_positions: Tensor
     template_all_atom_mask: Tensor
     template_torsion_angles_sin_cos: Tensor
@@ -3765,7 +3763,7 @@ class AlphaFold2Input:
     true_msa: Tensor | None = None
 
 
-@dataclass
+@dataclass(eq=False)
 class AlphaFold2Output:
     r"""
     Differentiable predictions from one AlphaFold 2 forward pass.
@@ -3816,7 +3814,7 @@ class AlphaFold2MultimerLayout:
     templates: tuple[Template, ...]
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class AlphaFold2MultimerInput:
     r"""
     Tensor and molecular-layout input for AlphaFold-Multimer.
@@ -3825,7 +3823,7 @@ class AlphaFold2MultimerInput:
     depth, and ``T`` is template count. Residue indices restart at each chain.
 
     Args:
-        residue_type: Residue token IDs with shape ``(B, N)``.
+        residue_type_ids: Residue token IDs with shape ``(B, N)``.
         token_features: Target features with shape ``(B, N, 21)``.
         residue_index: Chain-local residue indices with shape ``(B, N)``.
         sequence_mask: Valid-residue mask with shape ``(B, N)``.
@@ -3836,7 +3834,7 @@ class AlphaFold2MultimerInput:
         msa_deletions: MSA deletion counts with shape ``(B, M, N)``.
         msa_profile: Full-MSA residue frequencies with shape ``(B, N, 22)``.
         template_mask: Template validity mask with shape ``(B, T)``.
-        template_residue_type: Template residue IDs with shape ``(B, T, N)``.
+        template_residue_type_ids: Template residue IDs with shape ``(B, T, N)``.
         template_all_atom_positions: Template atom37 coordinates with shape
             ``(B, T, N, 37, 3)`` in angstroms.
         template_all_atom_mask: Template atom37 validity mask with shape
@@ -3864,7 +3862,7 @@ class AlphaFold2MultimerInput:
             ``(B, M_clustered, N)``.
     """
 
-    residue_type: Tensor
+    residue_type_ids: Tensor
     token_features: Tensor
     residue_index: Tensor
     sequence_mask: Tensor
@@ -3875,7 +3873,7 @@ class AlphaFold2MultimerInput:
     msa_deletions: Tensor
     msa_profile: Tensor
     template_mask: Tensor
-    template_residue_type: Tensor
+    template_residue_type_ids: Tensor
     template_all_atom_positions: Tensor
     template_all_atom_mask: Tensor
     template_pseudo_beta: Tensor

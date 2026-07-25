@@ -21,16 +21,12 @@ from .processor import MpnnPackerProcessor
 
 write_pdb = _pdb_io.write_pdb
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.mpnn_packer",
     model=MpnnPackerModel,
     processor=MpnnPackerProcessor,
-    processor_config=MpnnPackerProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.mpnn_packer",
     pipeline=MpnnPackerPipeline,
-    tasks=("pack",),
-    architectures=("ofoldx.mpnn_packer",),
 )

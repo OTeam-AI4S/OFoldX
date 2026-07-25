@@ -63,11 +63,11 @@ class Boltz1TrunkConfig(Config):
 
 class Boltz1DenoiserConfig(Config):
     r"""
-    Configure the Boltz-1 EDM token transformer and atom encoder-decoder.
+    Configure the Boltz-1 EDM token encoder and atom encoder-decoder.
 
     Args:
-        num_token_encoder_blocks: Number of conditioned token-transformer blocks in the score model.
-        num_token_encoder_attention_heads: Head count for the token transformer.
+        num_token_encoder_blocks: Number of conditioned token-encoder blocks in the score model.
+        num_token_encoder_attention_heads: Head count for the token encoder.
         num_atom_encoder_blocks: Number of atom-attention encoder blocks in the denoiser.
         num_atom_decoder_blocks: Number of atom-attention decoder blocks in the denoiser.
         num_atom_attention_heads: Head count shared by the denoiser atom encoder and decoder.

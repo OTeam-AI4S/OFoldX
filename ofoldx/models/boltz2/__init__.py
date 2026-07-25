@@ -18,33 +18,30 @@ from .config import (
     Boltz2TemplateConfig,
     Boltz2TrunkConfig,
 )
-from .model import Boltz2AffinityModel, Boltz2Input, Boltz2Model, Boltz2Output
+from .model import (
+    Boltz2AffinityModel,
+    Boltz2Input,
+    Boltz2Model,
+    Boltz2Output,
+)
 from .pipeline import Boltz2AffinityPipeline, Boltz2AffinityResult, Boltz2Pipeline
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.boltz2",
     model=Boltz2Model,
     processor=Boltz2Processor,
-    processor_config=None,
-    standard_tasks=("fold",),
 )
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.boltz2_affinity",
     model=Boltz2AffinityModel,
     processor=Boltz2AffinityProcessor,
-    processor_config=None,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.boltz2",
     pipeline=Boltz2Pipeline,
-    tasks=("fold",),
-    architectures=("ofoldx.boltz2",),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.boltz2_affinity",
     pipeline=Boltz2AffinityPipeline,
-    tasks=("score",),
-    repository_loader=Boltz2AffinityPipeline.from_repository,
 )

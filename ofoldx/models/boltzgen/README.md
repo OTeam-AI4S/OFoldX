@@ -17,8 +17,8 @@ pipeline_tag: other
 BoltzGen is OFoldX's structure-based biomolecular design family for universal
 binder design, controllable protein structure generation, and inverse folding.
 Its concrete Pipeline combines a structure-diffusion designer with a distinct
-autoregressive inverse-folding model and can optionally compose compatible fold
-and affinity pairs.
+autoregressive inverse-folding model and can optionally compose Boltz-2 fold and
+affinity pairs.
 
 ## Disclaimer
 
@@ -73,16 +73,13 @@ pip install ofoldx
 
 ### Biomolecular Design
 
-Use the high-level `design` API:
+Load the BoltzGen design pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.design(
-    None,
-    model="oteam/boltzgen-diverse",
-    total_len=120,
-)
+pipeline = ofoldx.pipeline("design", model="oteam/boltzgen-diverse")
+output = pipeline.design(None, total_len=120)
 ```
 
 ## Training Details

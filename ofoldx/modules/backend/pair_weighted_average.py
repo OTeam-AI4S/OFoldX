@@ -29,7 +29,7 @@ def pair_weighted_average(
     gate_weight: Tensor,
     pair_logits_weight: Tensor,
     output_weight: Tensor,
-    num_heads: int,
+    num_attention_heads: int,
     head_dim: int,
     msa_norm_eps: float,
     pair_norm_eps: float,
@@ -51,7 +51,7 @@ def pair_weighted_average(
         gate_weight: Bias-free gate projection weight.
         pair_logits_weight: Bias-free pair-logit projection weight.
         output_weight: Bias-free output projection weight.
-        num_heads: Number of attention heads.
+        num_attention_heads: Number of attention heads.
         head_dim: Width of each attention head.
         msa_norm_eps: Epsilon used by the MSA LayerNorm.
         pair_norm_eps: Epsilon used by the pair LayerNorm.
@@ -80,13 +80,17 @@ def pair_weighted_average(
             gate_weight=gate_weight,
             pair_logits_weight=pair_logits_weight,
             output_weight=output_weight,
-            num_heads=num_heads,
+            num_heads=num_attention_heads,
             msa_norm_eps=msa_norm_eps,
             pair_norm_eps=pair_norm_eps,
         )
 
     normalized = layer_norm(msa, (msa.shape[-1],), msa_norm_weight, msa_norm_bias, msa_norm_eps, backend=backend)
-    values = torch.nn.functional.linear(normalized, value_weight).reshape(*normalized.shape[:-1], num_heads, head_dim)
+    values = torch.nn.functional.linear(normalized, value_weight).reshape(
+        *normalized.shape[:-1],
+        num_attention_heads,
+        head_dim,
+    )
     pair_normalized = layer_norm(
         pair,
         (pair.shape[-1],),
@@ -102,6 +106,6 @@ def pair_weighted_average(
     weights = torch.softmax(logits, dim=-1)
     weights = weights.to(dtype=values.dtype)
     averaged = torch.einsum("...hij,...sjhd->...sihd", weights, values)
-    averaged = averaged.reshape(*normalized.shape[:-1], num_heads * head_dim)
+    averaged = averaged.reshape(*normalized.shape[:-1], num_attention_heads * head_dim)
     gated = averaged * torch.sigmoid(torch.nn.functional.linear(normalized, gate_weight))
     return torch.nn.functional.linear(gated, output_weight)

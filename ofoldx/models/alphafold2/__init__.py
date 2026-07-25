@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
-from ..registry import Task as _Task
 from .config import (
     AlphaFold2Config,
     AlphaFold2EvoformerBlockConfig,
@@ -39,31 +38,21 @@ from .multimer_processor import AlphaFold2MultimerProcessor
 from .pipeline import AlphaFold2MultimerPipeline, AlphaFold2Pipeline
 from .processor import AlphaFold2Processor
 
-_FOLD_TASKS: tuple[_Task, ...] = ("fold",)
-
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.alphafold2",
     model=AlphaFold2Model,
     processor=AlphaFold2Processor,
-    processor_config=AlphaFold2ProcessorConfig,
-    standard_tasks=_FOLD_TASKS,
 )
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.alphafold2_multimer",
     model=AlphaFold2MultimerModel,
     processor=AlphaFold2MultimerProcessor,
-    processor_config=AlphaFold2MultimerProcessorConfig,
-    standard_tasks=_FOLD_TASKS,
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.alphafold2",
     pipeline=AlphaFold2Pipeline,
-    tasks=_FOLD_TASKS,
-    architectures=("ofoldx.alphafold2",),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.alphafold2_multimer",
     pipeline=AlphaFold2MultimerPipeline,
-    tasks=_FOLD_TASKS,
-    architectures=("ofoldx.alphafold2_multimer",),
 )

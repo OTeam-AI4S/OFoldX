@@ -116,6 +116,8 @@ def resolve_repository(
 
     classified = classify_reference(reference)
     if isinstance(classified, Path):
+        if revision is not None:
+            raise ValueError("revision is valid only for a Hub repository")
         return ResolvedRepository(classified)
     return resolve_hub_repository(
         classified,
@@ -434,18 +436,26 @@ def load_registered_processor(
         The configured processor.
     """
 
-    processor_config = registration.processor_config
     config_path = repository.path / "processor.json"
-    if processor_config is None:
-        if config_path.exists():
-            raise ValueError("processor.json must be absent for a config-less Processor")
-        return registration.processor(device=device, dtype=dtype)
-
     values = load_json_object(config_path)
     if "architecture" in values:
         raise ValueError("processor.json must not repeat the model architecture")
+    saved_dtype_name = values.pop("dtype")
+    if not isinstance(saved_dtype_name, str):
+        raise TypeError("processor.json dtype must be a torch dtype name")
+    saved_dtype = getattr(torch, saved_dtype_name, None)
+    if not isinstance(saved_dtype, torch.dtype):
+        raise ValueError(f"unsupported processor dtype {saved_dtype_name!r}")
+    resolved_dtype = saved_dtype if dtype is None else dtype
+
+    processor_config = registration.processor.config_class
+    if processor_config is None:
+        if values:
+            raise ValueError("a config-less Processor may persist only its dtype")
+        return registration.processor(device=device, dtype=resolved_dtype)
+
     processor = cast(Callable[..., Processor], registration.processor)
-    return processor(processor_config(values), device=device, dtype=dtype)
+    return processor(processor_config(values), device=device, dtype=resolved_dtype)
 
 
 def _weight_map(path: Path) -> dict[str, str]:

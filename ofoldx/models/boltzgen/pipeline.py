@@ -5,8 +5,10 @@ Structure and sequence design operations for BoltzGen.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from os import PathLike
-from typing import Protocol, cast
+from pathlib import Path
+from typing import cast
 
 import numpy as np
 import torch
@@ -15,15 +17,18 @@ from ...data.components import get_component
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...pipelines import CompositePair, CompositePipeline, PipelineProcessor, resolve_generator
-from ...results import FoldResult, Metric, Score, ScoreResult
+from ...io.msa import read_msa
+from ...io.structure import read_structure
+from ...pipelines import CompositePair, CompositePipeline, resolve_generator
+from ...results import Metric, Score
+from ...results.values import best
+from ..boltz2.model import Boltz2AffinityModel, Boltz2Model
+from ..boltz2.processor import Boltz2AffinityProcessor, Boltz2Processor
 from .model import (
-    BoltzGenDesignCandidate,
-    BoltzGenDesignResult,
     BoltzGenInput,
+    BoltzGenInverseFoldingDesignOutput,
     BoltzGenInverseFoldingInput,
     BoltzGenInverseFoldingModel,
-    BoltzGenInverseFoldingOutput,
     BoltzGenLayout,
     BoltzGenModel,
     BoltzGenPlacements,
@@ -31,100 +36,6 @@ from .model import (
     BoltzGenSchema,
 )
 from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
-
-
-class BoltzGenFoldModel(Protocol):
-    r"""
-    Interface required from an optional structure-prediction stage.
-    """
-
-    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object:
-        r"""
-        Move the structure-prediction model to a device and dtype.
-
-        Args:
-            device: Destination device. ``None`` leaves the device unchanged.
-            dtype: Destination floating-point dtype. ``None`` leaves the dtype unchanged.
-
-        Returns:
-            The stage model after conversion.
-        """
-
-        ...
-
-    def fold(
-        self,
-        batch: object,
-        *,
-        num_samples: int = ...,
-        generator: torch.Generator | None = ...,
-    ) -> FoldResult:
-        r"""
-        Predict structures for a processed batch.
-
-        Args:
-            batch: Input produced by the paired stage processor.
-            num_samples: Number of structures to predict.
-            generator: Random generator used by model sampling.
-
-        Returns:
-            Structure predictions and their associated scores.
-        """
-
-        ...
-
-
-class BoltzGenScoreModel(Protocol):
-    r"""
-    Interface required from an optional affinity-scoring stage.
-    """
-
-    def to(self, device: torch.device | str | None = ..., dtype: torch.dtype | None = ...) -> object:
-        r"""
-        Move the affinity model to a device and dtype.
-
-        Args:
-            device: Destination device. ``None`` leaves the device unchanged.
-            dtype: Destination floating-point dtype. ``None`` leaves the dtype unchanged.
-
-        Returns:
-            The stage model after conversion.
-        """
-
-        ...
-
-    def score(self, batch: object, *, generator: torch.Generator | None = ...) -> ScoreResult:
-        r"""
-        Score a processed structure batch.
-
-        Args:
-            batch: Input produced by the paired stage processor.
-            generator: Random generator used by model sampling.
-
-        Returns:
-            Scores for the processed structures.
-        """
-
-        ...
-
-
-class BoltzGenStageProcessor(PipelineProcessor, Protocol):
-    r"""
-    Interface required from an optional stage processor.
-    """
-
-    def __call__(self, input: object, /) -> object:
-        r"""
-        Prepare one input for a paired pipeline stage.
-
-        Args:
-            input: Stage-specific input object.
-
-        Returns:
-            The batch consumed by the paired stage model.
-        """
-
-        ...
 
 
 class BoltzGenPipeline(CompositePipeline):
@@ -136,10 +47,10 @@ class BoltzGenPipeline(CompositePipeline):
         design_processor: Processor for structure design.
         inverse_folding_model: Sequence design model.
         inverse_folding_processor: Processor for sequence design.
-        fold: Optional structure prediction stage.
-        fold_processor: Processor paired with ``fold``.
-        affinity: Optional affinity scoring stage.
-        affinity_processor: Processor paired with ``affinity``.
+        fold: Optional Boltz-2 structure prediction model.
+        fold_processor: Boltz-2 Processor paired with ``fold``.
+        affinity: Optional Boltz-2 affinity model.
+        affinity_processor: Boltz-2 affinity Processor paired with ``affinity``.
     """
 
     pair_layout = (
@@ -156,10 +67,10 @@ class BoltzGenPipeline(CompositePipeline):
         design_processor: BoltzGenProcessor,
         inverse_folding_model: BoltzGenInverseFoldingModel,
         inverse_folding_processor: BoltzGenInverseFoldingProcessor,
-        fold: BoltzGenFoldModel | None = None,
-        fold_processor: BoltzGenStageProcessor | None = None,
-        affinity: BoltzGenScoreModel | None = None,
-        affinity_processor: BoltzGenStageProcessor | None = None,
+        fold: Boltz2Model | None = None,
+        fold_processor: Boltz2Processor | None = None,
+        affinity: Boltz2AffinityModel | None = None,
+        affinity_processor: Boltz2AffinityProcessor | None = None,
     ) -> None:
         if (fold is None) != (fold_processor is None):
             raise ValueError("fold and fold_processor must either both be present or both be absent")
@@ -215,13 +126,17 @@ class BoltzGenPipeline(CompositePipeline):
         """
 
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
-
-        design_batch = self.design_processor(
-            input,
+        canonical_input = _resolve_structure_reference(input)
+        plan = self.design_processor._plan(
+            canonical_input,
             placement=placement,
             total_len=total_len,
             conditions=tuple(conditions),
-            msa=msa,
+        )
+        canonical_msa = _resolve_msa_reference(msa, plan.system)
+        design_batch = self.design_processor._lower(
+            plan,
+            canonical_msa,
             templates=templates,
             generator=generator,
         )
@@ -259,6 +174,7 @@ class BoltzGenPipeline(CompositePipeline):
         design: Sequence[ComponentReference] = (),
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
         temperature: float | None = None,
         num_sequences: int = 1,
         generator: torch.Generator | None = None,
@@ -271,6 +187,7 @@ class BoltzGenPipeline(CompositePipeline):
             design: Residue occurrences whose identities may change.
             aa_constraints: Per-residue amino-acid constraints.
             symmetry: Residue groups sharing one sequence identity.
+            msa: Optional MSA evidence or alignment path.
             temperature: Categorical sampling temperature. ``None`` selects the
                 highest-logit residue at each decoded position.
             num_sequences: Number of sequences to sample.
@@ -281,10 +198,17 @@ class BoltzGenPipeline(CompositePipeline):
             sampling order.
         """
 
+        if num_sequences <= 0:
+            raise ValueError("num_sequences must be positive")
+        backbone = cast(Structure, _resolve_structure_reference(input))
+        canonical_msa = _resolve_msa_reference(msa, backbone.system)
         inverse_folding_input = self.inverse_folding_processor(
-            input, design=design, aa_constraints=aa_constraints, symmetry=symmetry
+            backbone,
+            design=design,
+            aa_constraints=aa_constraints,
+            symmetry=symmetry,
+            msa=canonical_msa,
         )
-        backbone = _fixed_backbone_structure(input)
         candidates: list[BoltzGenDesignCandidate] = []
         for _ in range(num_sequences):
             inverse_folding_output = self.inverse_folding_model.design(
@@ -305,7 +229,7 @@ class BoltzGenPipeline(CompositePipeline):
         *,
         backbone: Structure,
         inverse_folding_input: BoltzGenInverseFoldingInput,
-        inverse_folding_output: BoltzGenInverseFoldingOutput,
+        inverse_folding_output: BoltzGenInverseFoldingDesignOutput,
         generator: torch.Generator | None,
     ) -> BoltzGenDesignCandidate:
         r"""
@@ -321,20 +245,19 @@ class BoltzGenPipeline(CompositePipeline):
         log_probs = torch.log_softmax(logits[0].float(), dim=-1)
         tokens = inverse_folding_output.tokens
         axis = tuple(layout.output_residues)
-        if tokens is not None:
-            per_residue_nll = -log_probs.gather(-1, tokens[0].long().unsqueeze(-1)).squeeze(-1)
-            metrics["per_residue_nll"] = Metric(
-                values=per_residue_nll.detach().cpu().numpy().astype(np.float32),
-                axis=axis,
-                unit="nats",
-            )
+        per_residue_nll = -log_probs.gather(-1, tokens[0].long().unsqueeze(-1)).squeeze(-1)
+        metrics["per_residue_nll"] = Metric(
+            values=per_residue_nll.detach().cpu().numpy().astype(np.float32),
+            axis=axis,
+            unit="nats",
+        )
 
         # Write inverse-fold identities into the candidate before optional refolding.
         structure = _remap_designed_sequence(backbone, inverse_folding_input, inverse_folding_output)
         # Composition IS the switch: refold runs iff a fold Model+Processor is composed in, affinity
         # runs iff a score Model+Processor is composed in. No mode flags.
         if self.fold is not None and self.fold_processor is not None:
-            fold_batch = self.fold_processor(structure)
+            fold_batch = self.fold_processor(structure, generator=generator)
             fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)
             prediction = fold_result.predictions[0]
             structure = prediction.structure
@@ -343,14 +266,55 @@ class BoltzGenPipeline(CompositePipeline):
                     scores[name] = prediction.scores[name]
 
         if self.affinity is not None and self.affinity_processor is not None:
-            affinity_batch = self.affinity_processor(structure)
+            affinity_batch = self.affinity_processor(structure, generator=generator)
             affinity_result = self.affinity.score(affinity_batch, generator=generator)
-            if "affinity_pred_value" in affinity_result.scores:
-                scores["binding_affinity"] = affinity_result.scores["affinity_pred_value"]
-            if "affinity_probability_binary" in affinity_result.scores:
-                scores["binding_probability"] = affinity_result.scores["affinity_probability_binary"]
+            if "binding_affinity" in affinity_result.scores:
+                scores["binding_affinity"] = affinity_result.scores["binding_affinity"]
+            if "binding_probability" in affinity_result.scores:
+                scores["binding_probability"] = affinity_result.scores["binding_probability"]
 
         return BoltzGenDesignCandidate(structure=structure, scores=scores, metrics=metrics)
+
+
+@dataclass(eq=False)
+class BoltzGenDesignCandidate:
+    r"""
+    One designed assembly and its aligned scientific values.
+
+    Args:
+        structure: Designed structure after inverse folding and optional refolding.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+    """
+
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class BoltzGenDesignResult:
+    r"""
+    A generation-ordered collection of BoltzGen designs.
+
+    Args:
+        candidates: Designed assemblies in generation order.
+    """
+
+    candidates: tuple[BoltzGenDesignCandidate, ...]
+
+    def best(self, score: str) -> BoltzGenDesignCandidate:
+        r"""
+        Return the earliest best candidate under a named score.
+
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
+        """
+
+        return best(self.candidates, score)
 
 
 def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
@@ -386,20 +350,36 @@ def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
     )
 
 
-def _fixed_backbone_structure(input: object) -> Structure:
+def _resolve_structure_reference(
+    input: MolecularSystem | Structure | str | PathLike[str] | None,
+) -> MolecularSystem | Structure | None:
     r"""
-    Return the input as a ``Structure`` for candidate carrying (standalone inverse fold).
+    Read one structure reference or preserve an already canonical input.
     """
-
-    from pathlib import Path
-
-    from ...io.structure import read_structure
 
     if isinstance(input, str | PathLike):
         return read_structure(Path(input).expanduser())
-    if isinstance(input, Structure):
-        return input
-    raise TypeError("inverse_fold requires a fixed backbone Structure or structure path")
+    return input
+
+
+def _resolve_msa_reference(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""
+    Bind an alignment path to the unique protein entity of a planned system.
+    """
+
+    if not isinstance(msa, str | PathLike):
+        return msa
+    proteins = [
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    ]
+    if len(proteins) != 1:
+        raise ValueError("an aligned FASTA is unambiguous only for one protein entity; pass MSACollection")
+    return read_msa(Path(msa).expanduser(), entity_id=proteins[0])
 
 
 # Model token id -> canonical component id in the BoltzGen residue vocabulary
@@ -437,7 +417,7 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
 def _remap_designed_sequence(
     backbone: Structure,
     inverse_folding_input: BoltzGenInverseFoldingInput,
-    inverse_folding_output: BoltzGenInverseFoldingOutput,
+    inverse_folding_output: BoltzGenInverseFoldingDesignOutput,
 ) -> Structure:
     r"""
     Write the inverse-fold argmax residue identities into the design positions of ``backbone``.
@@ -449,7 +429,7 @@ def _remap_designed_sequence(
     """
 
     layout = cast(BoltzGenLayout, inverse_folding_input.layout)
-    tokens = cast(torch.Tensor, inverse_folding_output.tokens)
+    tokens = inverse_folding_output.tokens
     design_mask = cast(torch.Tensor, inverse_folding_input.design_mask)
 
     token_ids = tokens[0].long().tolist()

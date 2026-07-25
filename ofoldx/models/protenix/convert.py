@@ -11,12 +11,8 @@ from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
-import chanfig
 import torch
 from torch import Tensor, nn
-
-from ...artifacts import save_model
-from ...processor import Processor
 
 if TYPE_CHECKING:
     from .model import ProtenixModel
@@ -30,6 +26,17 @@ _DTYPES = {
 
 _ReferenceKey: TypeAlias = str | tuple[str, ...]
 _ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
+_INERT_V05_TEMPLATE_KEYS = frozenset(
+    {
+        "template_embedder.linear_no_bias_z.weight",
+        "template_embedder.layernorm_z.weight",
+        "template_embedder.layernorm_z.bias",
+        "template_embedder.linear_no_bias_a.weight",
+        "template_embedder.layernorm_v.weight",
+        "template_embedder.layernorm_v.bias",
+        "template_embedder.linear_no_bias_u.weight",
+    }
+)
 
 
 def load_reference_state(checkpoint_path: str | Any, *, map_location: str | Any = "cpu") -> dict[str, Tensor]:
@@ -90,10 +97,15 @@ def translate_reference_state(
 
 def translate_protenix_state(model: nn.Module, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
     r"""
-    Translate every tensor in one released Protenix graph.
+    Translate every live tensor in one released Protenix v0.5 graph.
+
+    The v0.5 source constructor serializes seven template projection/norm
+    tensors even though its configured zero-block template path is unsupported
+    and unreachable. Only those exact inert tensors are omitted.
     """
 
-    return translate_reference_state(model, reference_state, _protenix_reference_key)
+    live_reference_state = {key: value for key, value in reference_state.items() if key not in _INERT_V05_TEMPLATE_KEYS}
+    return translate_reference_state(model, live_reference_state, _protenix_reference_key)
 
 
 def convert_protenix_checkpoint(
@@ -144,14 +156,10 @@ def save_protenix_checkpoint(
     [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
     auto-selects the default [`ProtenixModel`][] or the constraint
     [`ProtenixConstraintModel`][] from the checkpoint tensors — pairs it with the matching processor,
-    and writes a self-contained ``model.json`` / ``processor.json`` / safetensors repository
-    via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
-
-    The default pair routes through the generic standard ``fold`` route (no marker). The constraint
-    pair additionally writes a ``pipeline.json = {"pipeline": "ofoldx.protenix_constraint"}`` marker so
-    ``pipeline("fold", model=dir)`` routes to [`ProtenixConstraintPipeline`][], whose ``fold``
-    accepts and forwards the released ``atom_contacts`` / ``token_contacts`` / ``pocket`` channels that
-    the generic ``FoldPipeline`` cannot.
+    and writes a self-contained ``model.json`` / ``processor.json`` / safetensors
+    repository marked with the matching concrete Pipeline. The constraint Pipeline's
+    ``fold`` accepts and forwards the released ``atom_contacts`` / ``token_contacts`` /
+    ``pocket`` channels.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
@@ -159,25 +167,27 @@ def save_protenix_checkpoint(
     """
 
     from .model import ProtenixConstraintModel
+    from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline
     from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
     model = convert_protenix_checkpoint(Path(checkpoint_path).expanduser(), dtype=dtype)
-    destination = Path(output_dir).expanduser()
+    pipeline: ProtenixPipeline | ProtenixConstraintPipeline
     if isinstance(model, ProtenixConstraintModel):
-        processor: Processor = ProtenixConstraintProcessor()
+        pipeline = ProtenixConstraintPipeline(
+            model=model,
+            processor=ProtenixConstraintProcessor(dtype=dtype),
+        )
     else:
-        processor = ProtenixProcessor()
-    save_model(destination, model=model, processor=processor)
-    if isinstance(model, ProtenixConstraintModel):
-        from ...pipelines.registry import PIPELINES
-        from .pipeline import ProtenixConstraintPipeline
-
-        pipeline_id = PIPELINES.id_for(ProtenixConstraintPipeline)
-        chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
-    if repo_id is not None:
-        from ...hub import upload_repository
-
-        upload_repository(destination, repo_id, token=token, private=private)
+        pipeline = ProtenixPipeline(
+            model=model,
+            processor=ProtenixProcessor(dtype=dtype),
+        )
+    pipeline.save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -260,7 +270,6 @@ def _reference_key(model_key: str) -> _ReferenceKey:
     """
 
     key = _replace_top_level(model_key)
-    key = _replace_template_key(key)
     key = _replace_confidence_key(key)
     key = _replace_token_stack_key(key)
     key = _replace_denoiser_key(key)
@@ -349,21 +358,6 @@ def _replace_top_level(key: str) -> str:
         if key == source or key.startswith(source + "."):
             return target + key[len(source) :]
     return key
-
-
-def _replace_template_key(key: str) -> str:
-    if not key.startswith("template_embedder."):
-        return key
-    return _replace_many(
-        key,
-        {
-            ".pair_norm.": ".layernorm_z.",
-            ".pair_projection.": ".linear_no_bias_z.",
-            ".template_projection.": ".linear_no_bias_a.",
-            ".hidden_norm.": ".layernorm_v.",
-            ".output_projection.": ".linear_no_bias_u.",
-        },
-    )
 
 
 def _replace_confidence_key(key: str) -> str:
@@ -463,9 +457,9 @@ def _replace_atom_key(key: str) -> str:
             ".atom_pair_encoder.distance_mask_projection.": ".linear_no_bias_v.",
             ".atom_pair_encoder.left_atom_projection.": ".linear_no_bias_cl.",
             ".atom_pair_encoder.right_atom_projection.": ".linear_no_bias_cm.",
-            ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
-            ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
-            ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
+            ".atom_pair_encoder.feed_forward_input_projection.": ".small_mlp.1.",
+            ".atom_pair_encoder.feed_forward_hidden_projection.": ".small_mlp.3.",
+            ".atom_pair_encoder.feed_forward_output_projection.": ".small_mlp.5.",
             ".atom_self_attention.": ".atom_transformer.diffusion_transformer.",
             ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
             ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",

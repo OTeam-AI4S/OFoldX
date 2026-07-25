@@ -10,7 +10,7 @@ def _make_features(num_templates: int = 1, num_tokens: int = 3) -> TemplateFeatu
     return TemplateFeatures(
         distogram=torch.zeros(1, num_templates, num_tokens, num_tokens, 5),
         pseudo_beta_mask=torch.ones(1, num_templates, num_tokens, num_tokens),
-        residue_type=torch.zeros(1, num_templates, num_tokens, dtype=torch.long),
+        residue_type_ids=torch.zeros(1, num_templates, num_tokens, dtype=torch.long),
         unit_vector=torch.zeros(1, num_templates, num_tokens, num_tokens, 3),
         backbone_frame_mask=torch.ones(1, num_templates, num_tokens, num_tokens),
         template_mask=torch.ones(1, num_templates, dtype=torch.bool),
@@ -43,11 +43,11 @@ class TestTemplateEmbedder:
         pseudo_beta_mask = torch.rand(1, 1, num_tokens, num_tokens)
         unit_vector = torch.randn(1, 1, num_tokens, num_tokens, 3)
         backbone_frame_mask = torch.rand(1, 1, num_tokens, num_tokens)
-        residue_type = torch.tensor([[[0, 1, 1]]], dtype=torch.long)
+        residue_type_ids = torch.tensor([[[0, 1, 1]]], dtype=torch.long)
         features = TemplateFeatures(
             distogram=distogram,
             pseudo_beta_mask=pseudo_beta_mask,
-            residue_type=residue_type,
+            residue_type_ids=residue_type_ids,
             unit_vector=unit_vector,
             backbone_frame_mask=backbone_frame_mask,
             template_mask=None,
@@ -62,7 +62,10 @@ class TestTemplateEmbedder:
             pair_mask=None,
         )
 
-        residue_one_hot = torch.nn.functional.one_hot(residue_type[:, 0], num_classes=vocab_size).to(distogram.dtype)
+        residue_one_hot = torch.nn.functional.one_hot(
+            residue_type_ids[:, 0],
+            num_classes=vocab_size,
+        ).to(distogram.dtype)
         residue_i = residue_one_hot.unsqueeze(-2).expand(-1, num_tokens, num_tokens, -1)
         residue_j = residue_one_hot.unsqueeze(-3).expand(-1, num_tokens, num_tokens, -1)
         full_features = torch.cat(

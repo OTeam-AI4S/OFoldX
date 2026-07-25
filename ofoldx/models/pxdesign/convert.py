@@ -11,11 +11,9 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, TypeAlias
 
-import chanfig
 import torch
 from torch import Tensor, nn
 
-from ...artifacts import save_model
 from .config import PxDesignConfig
 from .model import PxDesignModel
 
@@ -95,30 +93,27 @@ def save_pxdesign_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
-    it with [`PxDesignProcessor`][], and writes ``model.json`` / ``processor.json`` /
-    safetensors via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair
-    has no generic standard task, so a
-    ``pipeline.json = {"pipeline": "ofoldx.pxdesign"}`` marker is written to route
-    ``pipeline("design", model=dir)`` to [`PxDesignPipeline`][] — which returns the
-    coordinate-producing ``PxDesignDesignResult`` — rather than the generic standard ``design`` route.
+    it with [`PxDesignProcessor`][], and saves the registered
+    [`PxDesignPipeline`][]. Its one-field marker routes
+    ``pipeline("design", model=dir)`` to that concrete Pipeline, which returns the
+    coordinate-producing ``PxDesignDesignResult``.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
     ``repo_id``.
     """
 
-    from ...pipelines.registry import PIPELINES
     from .pipeline import PxDesignPipeline
     from .processor import PxDesignProcessor
 
     model = convert_pxdesign_checkpoint(checkpoint_path, map_location=map_location, dtype=dtype)
-    destination = Path(output_dir).expanduser()
-    save_model(destination, model=model, processor=PxDesignProcessor())
-    chanfig.NestedDict({"pipeline": PIPELINES.id_for(PxDesignPipeline)}).dump(destination / "pipeline.json")
-    if repo_id is not None:
-        from ...hub import upload_repository
-
-        upload_repository(destination, repo_id, token=token, private=private)
+    processor_dtype = model.condition_embeddings.input_projection.weight.dtype
+    PxDesignPipeline(model=model, processor=PxDesignProcessor(dtype=processor_dtype)).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -345,9 +340,9 @@ def _replace_atom_key(key: str) -> str:
             ".atom_pair_encoder.distance_mask_projection.": ".linear_no_bias_v.",
             ".atom_pair_encoder.left_atom_projection.": ".linear_no_bias_cl.",
             ".atom_pair_encoder.right_atom_projection.": ".linear_no_bias_cm.",
-            ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
-            ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
-            ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
+            ".atom_pair_encoder.feed_forward_input_projection.": ".small_mlp.1.",
+            ".atom_pair_encoder.feed_forward_hidden_projection.": ".small_mlp.3.",
+            ".atom_pair_encoder.feed_forward_output_projection.": ".small_mlp.5.",
             ".atom_self_attention.": ".atom_transformer.diffusion_transformer.",
             ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
             ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",

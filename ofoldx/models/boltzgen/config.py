@@ -97,8 +97,8 @@ class BoltzGenDenoiserConfig(Config):
     Configure the BoltzGen EDM score network.
 
     Args:
-        num_token_encoder_blocks: Number of token transformer blocks.
-        num_token_encoder_attention_heads: Number of token transformer attention heads.
+        num_token_encoder_blocks: Number of token-encoder blocks.
+        num_token_encoder_attention_heads: Number of token-encoder attention heads.
         num_atom_encoder_blocks: Number of atom encoder blocks.
         num_atom_decoder_blocks: Number of atom decoder blocks.
         num_atom_attention_heads: Number of atom attention heads.
@@ -271,7 +271,7 @@ class BoltzGenConfig(Config):
         - Miniformer trunk (compact triangular pair updates) instead of the full Pairformer/MSA stack.
         - ``12`` Miniformer pairformer blocks (vs ``64``) and ``3`` MSA blocks (vs ``4``).
         - Miniformer template pair updates.
-        - ``8`` diffusion token-transformer blocks (vs ``24``).
+        - ``8`` diffusion token-encoder blocks (vs ``24``).
         - No token-distance conditioning module.
         - No binding-specification / design-mask / secondary-structure input conditioning.
 

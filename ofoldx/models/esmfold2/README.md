@@ -76,16 +76,14 @@ output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/esmfold2")
 
 ### Binder Design
 
-Use the high-level `design` API:
+The repository marker selects the experimental ESMFold2 design pipeline, whose
+class-owned loader restores its ESMC model and tokenizer.
 
 ```python
 import ofoldx
 
-output = ofoldx.design(
-    "target.fasta",
-    model="oteam/esmfold2-experimental",
-    binder_length=80,
-)
+pipeline = ofoldx.pipeline("design", model="oteam/esmfold2-experimental")
+output = pipeline.design("target.fasta", binder_length=80)
 ```
 
 ## Training Details

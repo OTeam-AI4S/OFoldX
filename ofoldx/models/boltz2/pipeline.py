@@ -4,17 +4,25 @@ Pipelines for Boltz-2 folding and two-stage affinity scoring.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from os import PathLike
+from pathlib import Path
 
 import torch
 
-from ...data.evidence import MSA, MSACollection
-from ...data.molecular import MolecularSystem
+from ...data.evidence import MSA, MSACollection, Template
+from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...io import read_msa, read_structure
 from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
 from ...results import FoldPrediction, FoldResult, Metric, Score
-from .model import Boltz2AffinityModel, Boltz2Model
+from .model import (
+    Boltz2AffinityModel,
+    Boltz2Contact,
+    Boltz2Model,
+    Boltz2Pocket,
+)
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
 
@@ -28,6 +36,9 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
         input: MolecularSystem | Structure | str | PathLike[str],
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
+        contacts: Sequence[Boltz2Contact] = (),
+        pockets: Sequence[Boltz2Pocket] = (),
         num_samples: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
@@ -40,6 +51,9 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
         Args:
             input: Molecular system, structure, or local structure path.
             msa: Optional MSA value, collection, or alignment path.
+            templates: Structural protein templates with canonical residue alignments.
+            contacts: Learned pairwise contact conditions.
+            pockets: Learned binder-to-pocket conditions.
             num_samples: Number of structure predictions to generate.
             seed: Optional seed for reference-conformer augmentation and
                 coordinate sampling. Mutually exclusive with ``generator``.
@@ -55,7 +69,16 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
-        features = self.processor(input, msa=msa, generator=generator)
+        input = _read_boltz2_input(input)
+        msa = _read_boltz2_msa(msa, input.system if isinstance(input, Structure) else input)
+        features = self.processor(
+            input,
+            msa=msa,
+            templates=templates,
+            contacts=contacts,
+            pockets=pockets,
+            generator=generator,
+        )
         return self.model.fold(
             features,
             num_samples=num_samples,
@@ -107,6 +130,9 @@ class Boltz2AffinityPipeline(CompositePipeline):
         *,
         ligand: str | None = None,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
+        contacts: Sequence[Boltz2Contact] = (),
+        pockets: Sequence[Boltz2Pocket] = (),
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         affinity_num_samples: int = 5,
@@ -123,6 +149,9 @@ class Boltz2AffinityPipeline(CompositePipeline):
             ligand: Instance ID of the molecule to score. May be omitted when the
                 system contains exactly one molecule.
             msa: Optional MSA value, collection, or alignment path used by both passes.
+            templates: Structural protein templates used by the first structure pass.
+            contacts: Learned pairwise contact conditions used by both passes.
+            pockets: Learned binder-to-pocket conditions used by both passes.
             num_samples: Number of first-pass structure samples.
             num_sampling_steps: Number of first-pass diffusion transitions.
             affinity_num_samples: Number of second-pass candidate samples.
@@ -143,8 +172,18 @@ class Boltz2AffinityPipeline(CompositePipeline):
         # Reference augmentation and both model passes advance one RNG stream.
         generator = resolve_generator(seed, generator, device=self.structure_processor.device)
 
+        input = _read_boltz2_input(input)
+        msa = _read_boltz2_msa(msa, input.system if isinstance(input, Structure) else input)
+
         # The structure and affinity passes use independent sampling counts.
-        fold_batch = self.structure_processor(input, msa=msa, generator=generator)
+        fold_batch = self.structure_processor(
+            input,
+            msa=msa,
+            templates=templates,
+            contacts=contacts,
+            pockets=pockets,
+            generator=generator,
+        )
 
         fold_result = self.structure_model.fold(
             fold_batch,
@@ -165,7 +204,14 @@ class Boltz2AffinityPipeline(CompositePipeline):
         )
         best_structure = structure_predictions[0].structure
 
-        affinity_batch = self.processor(best_structure, ligand=ligand, msa=msa, generator=generator)
+        affinity_batch = self.processor(
+            best_structure,
+            ligand=ligand,
+            msa=msa,
+            contacts=contacts,
+            pockets=pockets,
+            generator=generator,
+        )
         score_result = self.model.score(
             affinity_batch,
             num_samples=affinity_num_samples,
@@ -200,3 +246,27 @@ class Boltz2AffinityResult:
     structure_predictions: tuple[FoldPrediction, ...]
     scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
+
+
+def _read_boltz2_input(
+    input: MolecularSystem | Structure | str | PathLike[str],
+) -> MolecularSystem | Structure:
+    if isinstance(input, str | PathLike):
+        return read_structure(Path(input).expanduser())
+    return input
+
+
+def _read_boltz2_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    if not isinstance(msa, str | PathLike):
+        return msa
+    proteins = [
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    ]
+    if len(proteins) != 1:
+        raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")
+    return read_msa(msa, entity_id=proteins[0])

@@ -24,7 +24,8 @@ def adaptive_layer_norm(
     conditioning_norm_weight: Tensor,
     projection_weight: Tensor,
     scale_bias: Tensor,
-    eps: float,
+    input_norm_eps: float,
+    conditioning_norm_eps: float,
     backend: str,
 ) -> Tensor:
     r"""
@@ -43,7 +44,8 @@ def adaptive_layer_norm(
         projection_weight: ``[2 * hidden_size, conditioning_size]`` fused bias-free scale/shift projection
             weight; the first ``hidden_size`` rows produce the scale, the remainder the shift.
         scale_bias: ``[hidden_size]`` additive bias applied to the scale half before the sigmoid.
-        eps: LayerNorm epsilon shared by both norms.
+        input_norm_eps: LayerNorm epsilon for ``hidden``.
+        conditioning_norm_eps: LayerNorm epsilon for ``conditioning``.
         backend: Operator provider; see [ofoldx.modules.backend][].
 
     Returns:
@@ -60,19 +62,26 @@ def adaptive_layer_norm(
         return _oops_adaptive_layer_norm(
             hidden,
             conditioning,
-            projection_weight,
-            scale_bias,
+            conditioning_projection_weight=projection_weight,
+            conditioning_scale_bias=scale_bias,
             conditioning_norm_weight=conditioning_norm_weight,
-            eps=eps,
-            conditioning_eps=eps,
+            input_norm_eps=input_norm_eps,
+            conditioning_norm_eps=conditioning_norm_eps,
         )
-    hidden_normed = layer_norm(hidden, (hidden.shape[-1],), None, None, eps, backend=backend)
+    hidden_normed = layer_norm(
+        hidden,
+        (hidden.shape[-1],),
+        None,
+        None,
+        input_norm_eps,
+        backend=backend,
+    )
     conditioning_normed = layer_norm(
         conditioning,
         (conditioning.shape[-1],),
         conditioning_norm_weight,
         None,
-        eps,
+        conditioning_norm_eps,
         backend=backend,
     )
     scale, shift = F.linear(conditioning_normed, projection_weight).chunk(2, dim=-1)

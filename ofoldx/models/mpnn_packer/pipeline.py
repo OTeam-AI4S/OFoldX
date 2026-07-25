@@ -11,10 +11,10 @@ import torch
 
 from ...data.molecular import ComponentReference
 from ...data.structure import Structure
-from ...io import read_mpnn_pdb
+from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import PackPrediction, PackResult
-from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, _pack_candidate
+from .model import MpnnPackerInput, MpnnPackerModel, MpnnPackerSamplingOutput, pack_candidate
 from .processor import MpnnPackerProcessor
 
 
@@ -57,8 +57,9 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             A ``PackResult`` whose predictions follow sampling order.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             sequence=sequence,
             pack_positions=pack_positions,
             use_atom_context=use_atom_context,
@@ -107,7 +108,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             One ``PackResult`` per input sequence, preserving sequence order.
         """
 
-        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         inputs = tuple(
             self.processor(
                 structure,
@@ -170,6 +171,6 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
                     mix_logits=packed.mix_logits[index : index + 1],
                     input_chi_sin_cos=packed.input_chi_sin_cos[index : index + 1],
                 )
-                predictions[index].append(_pack_candidate(item, candidate))
+                predictions[index].append(pack_candidate(item, candidate))
 
         return tuple(PackResult(predictions=tuple(items)) for items in predictions)

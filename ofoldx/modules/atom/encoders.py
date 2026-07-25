@@ -14,6 +14,7 @@ from torch import Tensor, nn
 from ..backend import LayerNorm, resolve_config_backend
 from ..transformer import (
     AtomCrossAttentionTransformer,
+    ConditionedTransformerEncoder,
     NormalizedKeyAtomCrossAttentionTransformer,
 )
 from .context import AtomContext, AtomToTokenOutput
@@ -22,6 +23,7 @@ from .transfer import (
     TokenPairToAtomPairBroadcast,
     TokenPairToLocalAtomPairBroadcast,
     TokenToAtomBroadcast,
+    dense_mean_to_tokens,
     scatter_mean_to_tokens,
 )
 from .window import LocalAtomGeometry, LocalAtomGeometryBuilder, gather_key_windows
@@ -542,15 +544,37 @@ class AtomPairEncoder(nn.Module):
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.left_atom_projection = nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False)
         self.right_atom_projection = nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False)
-        self.feed_forward = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.relu = nn.ReLU()
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.activation = nn.ReLU()
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        r"""
+        Apply the three projected ReLU stages of the atom-pair residual update.
+
+        Args:
+            pair: Atom-pair representation ending in ``atom_pair_hidden_size``.
+
+        Returns:
+            The residual update with the same shape as ``pair``.
+        """
+
+        pair = self.feed_forward_input_projection(self.activation(pair))
+        pair = self.feed_forward_hidden_projection(self.activation(pair))
+        return self.feed_forward_output_projection(self.activation(pair))
 
     def build_local_geometry(
         self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
@@ -628,7 +652,7 @@ class AtomPairEncoder(nn.Module):
         """
 
         distance_vectors = reference_positions.unsqueeze(-2) - reference_positions.unsqueeze(-3)
-        relu_single = self.relu(atom_conditioning)
+        relu_single = self.activation(atom_conditioning)
         valid = atom_conditioning.new_ones((*distance_vectors.shape[:-1], 1))
         return encode_atom_pair(
             self,
@@ -679,8 +703,8 @@ class AtomPairEncoder(nn.Module):
         return encode_atom_pair(
             self,
             distance_vectors,
-            self.relu(conditioning_windows.query[..., None, :]),
-            self.relu(conditioning_windows.key[..., None, :, :]),
+            self.activation(conditioning_windows.query[..., None, :]),
+            self.activation(conditioning_windows.key[..., None, :, :]),
             distance_term_mask=distance_mask * window_mask,
             inverse_term_mask=distance_mask,
             valid_mask=distance_mask,
@@ -694,7 +718,8 @@ class PackedAtomAttention(nn.Module):
     Apply a concrete atom transformer over an already-packed per-block pair bias.
 
     ``packed_bias`` stores all block/head pair-bias projections on the last axis, so the underlying
-    [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer] can slice its per-block
+    [`ConditionedTransformerEncoder`][ofoldx.modules.transformer.ConditionedTransformerEncoder]
+    can slice its per-block
     bias without re-projecting. Supports the dense atom layout (global attention over all atoms) and the
     local query/key window layout used by atom-level attention blocks.
 
@@ -809,6 +834,212 @@ class PackedAtomAttention(nn.Module):
         if padding:
             output = output[..., :num_atoms, :]
         return output.reshape(*prefix, num_atoms, output.shape[-1])
+
+
+class PackedAtomToTokenEncoder(nn.Module):
+    r"""
+    Run packed local atom attention and mean-pool the result to token representations.
+
+    Args:
+        atom_hidden_size: Width of the atom hidden and conditioning channels.
+        token_hidden_size: Width of the produced token representation.
+        num_query_atoms: Number of query atoms per local window.
+        num_key_atoms: Number of key atoms gathered around each query window.
+        num_blocks: Number of conditioned Transformer-encoder blocks.
+        num_attention_heads: Number of attention heads per block.
+        backend: Backend selector forwarded to the conditioned Transformer encoder.
+    """
+
+    def __init__(
+        self,
+        atom_hidden_size: int = 128,
+        token_hidden_size: int = 384,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.atom_transformer = PackedAtomAttention(
+            ConditionedTransformerEncoder(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                backend=backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
+        self.token_activation = nn.ReLU()
+
+    def forward(
+        self,
+        atom_single: Tensor,
+        atom_conditioning: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+    ) -> Tensor:
+        atom_query = self.atom_transformer(
+            atom_single,
+            atom_conditioning,
+            atom_pair_bias,
+            atom_mask=atom_mask.bool(),
+            attention_layout="local",
+        )
+        token_from_atom = self.token_activation(self.token_projection(atom_query))
+        return dense_mean_to_tokens(
+            token_from_atom,
+            atom_to_token,
+            num_tokens,
+            atom_mask=atom_mask,
+            count_eps=1e-6,
+        )
+
+
+class PackedDenoisingAtomToTokenEncoder(nn.Module):
+    r"""
+    Add noisy coordinates to packed atom states, attend locally, and pool to denoiser tokens.
+
+    Args:
+        atom_hidden_size: Width of the atom hidden and conditioning channels.
+        token_hidden_size: Half the width of the produced denoiser token representation.
+        num_query_atoms: Number of query atoms per local window.
+        num_key_atoms: Number of key atoms gathered around each query window.
+        num_blocks: Number of conditioned Transformer-encoder blocks.
+        num_attention_heads: Number of attention heads per block.
+        backend: Backend selector forwarded to the conditioned Transformer encoder.
+    """
+
+    def __init__(
+        self,
+        atom_hidden_size: int = 128,
+        token_hidden_size: int = 384,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+        self.atom_transformer = PackedAtomAttention(
+            ConditionedTransformerEncoder(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                backend=backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, 2 * token_hidden_size, bias=False)
+        self.token_activation = nn.ReLU()
+
+    def forward(
+        self,
+        atom_single: Tensor,
+        atom_conditioning: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        noisy_positions: Tensor,
+        multiplicity: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = atom_single.repeat_interleave(multiplicity, 0)
+        atom_query = atom_query + self.noisy_position_projection(noisy_positions)
+        conditioning = atom_conditioning.repeat_interleave(multiplicity, 0)
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+        atom_query = self.atom_transformer(
+            atom_query,
+            conditioning,
+            atom_pair_bias,
+            atom_mask=atom_mask.bool(),
+            attention_layout="local",
+        )
+        token_from_atom = self.token_activation(self.token_projection(atom_query))
+        token_repr = dense_mean_to_tokens(
+            token_from_atom,
+            atom_to_token,
+            num_tokens,
+            atom_mask=atom_mask,
+            count_eps=1e-6,
+        )
+        return token_repr, atom_query, conditioning
+
+
+class PackedTokenToAtomDecoder(nn.Module):
+    r"""
+    Broadcast token states to packed atom queries and predict per-atom coordinate updates.
+
+    Args:
+        token_hidden_size: Half the width of the incoming denoiser token representation.
+        atom_hidden_size: Width of the atom hidden and conditioning channels.
+        num_query_atoms: Number of query atoms per local window.
+        num_key_atoms: Number of key atoms gathered around each query window.
+        num_blocks: Number of conditioned Transformer-encoder blocks.
+        num_attention_heads: Number of attention heads per block.
+        backend: Backend selector forwarded to the conditioned Transformer encoder.
+    """
+
+    def __init__(
+        self,
+        token_hidden_size: int = 384,
+        atom_hidden_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.token_projection = nn.Linear(2 * token_hidden_size, atom_hidden_size, bias=False)
+        self.atom_transformer = PackedAtomAttention(
+            ConditionedTransformerEncoder(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                backend=backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.position_norm = LayerNorm(atom_hidden_size, backend=backend)
+        self.position_update_projection = nn.Linear(atom_hidden_size, 3, bias=False)
+
+    def forward(
+        self,
+        token_repr: Tensor,
+        atom_skip: Tensor,
+        conditioning_skip: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        multiplicity: int = 1,
+    ) -> Tensor:
+        token_index = atom_to_token.repeat_interleave(multiplicity, 0)
+        token_projection = self.token_projection(token_repr)
+        atom_query = atom_skip + token_projection.gather(
+            1,
+            token_index.unsqueeze(-1).expand(-1, -1, token_projection.shape[-1]),
+        )
+        mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_query = self.atom_transformer(
+            atom_query,
+            conditioning_skip,
+            atom_pair_bias,
+            atom_mask=mask.bool(),
+            attention_layout="local",
+        )
+        return self.position_update_projection(self.position_norm(atom_query))
 
 
 class AtomSelfAttention(nn.Module):
@@ -1153,7 +1384,7 @@ def _flatten_batch(tensor: Tensor, prefix: tuple[int, ...], payload_ndim: int) -
     Broadcast a tensor to the full leading ``prefix`` and collapse that prefix into one batch axis.
 
     The atom stack runs over arbitrary leading (batch[, sample]) dims: in diffusion the query/conditioning/pair
-    carry a noise-sample axis the mask does not. The conditioned transformer wants one batch axis, so each input
+    carry a noise-sample axis the mask does not. The conditioned Transformer encoder wants one batch axis, so each input
     is broadcast to the query's prefix and flattened.
 
     Args:

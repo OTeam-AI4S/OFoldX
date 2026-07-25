@@ -18,7 +18,6 @@ from safetensors.torch import load_file
 from torch import Tensor
 from transformers import AutoModelForMaskedLM
 
-from ...artifacts import save_model
 from ...references import classify_reference
 from .config import (
     EsmFold2Config,
@@ -68,8 +67,9 @@ def convert_esmfold2_checkpoint(
     Write a self-contained ``model.json``/``processor.json``/safetensors repository.
 
     Local-only by default. When ``repo_id`` is given, the converted repository is also
-    uploaded to that Hub repo via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model];
-    no organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    uploaded to that Hub repo. The repository is marked with the exact
+    [`EsmFold2Pipeline`][]; no organization or token is assumed and nothing is
+    published without an explicit ``repo_id``.
     """
 
     if esmc is not None and esmc_source is not None:
@@ -118,10 +118,16 @@ def convert_esmfold2_checkpoint(
             f"missing_head={missing_head!r}, unexpected={unexpected!r}"
         )
 
-    save_model(
-        output_dir,
+    from .pipeline import EsmFold2Pipeline
+
+    EsmFold2Pipeline(
         model=model,
-        processor=EsmFold2Processor(EsmFold2ProcessorConfig({"msa_conditioning": config.msa_encoder.enabled})),
+        processor=EsmFold2Processor(
+            EsmFold2ProcessorConfig({"msa_conditioning": config.msa_encoder.enabled}),
+            dtype=dtype,
+        ),
+    ).save(
+        output_dir,
         repo_id=repo_id,
         token=token,
         private=private,
@@ -303,10 +309,10 @@ def _translate_biohub_state_key(name: str) -> str:
     diffusion_transformer_prefix = "structure_head.diffusion_module.token_transformer."
     if name.startswith(f"{diffusion_transformer_prefix}attn_blocks."):
         block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}attn_blocks.").split(".", 1)
-        name = f"diffusion_structure_head.denoiser.token_transformer.blocks.{block}.attention.{suffix}"
+        name = f"diffusion_structure_head.denoiser.token_encoder.blocks.{block}.attention.{suffix}"
     elif name.startswith(f"{diffusion_transformer_prefix}transition_blocks."):
         block, suffix = name.removeprefix(f"{diffusion_transformer_prefix}transition_blocks.").split(".", 1)
-        name = f"diffusion_structure_head.denoiser.token_transformer.blocks.{block}.transition.{suffix}"
+        name = f"diffusion_structure_head.denoiser.token_encoder.blocks.{block}.transition.{suffix}"
 
     for upstream_prefix, canonical_prefix in _BIOHUB_STATE_PREFIXES:
         if name.startswith(upstream_prefix):
@@ -710,6 +716,8 @@ def load_experimental_esmfold2(
     config = experimental_config_from_biohub(raw_config)
     model = EsmFold2ExperimentalModel(config, esmc=None)
     head_state = load_esmfold2_state_dict(checkpoint_path)
+    for name in _BIOHUB_UNUSED_STATE_KEYS:
+        head_state.pop(name, None)
     model.load_state_dict(head_state, strict=True)
     if esmc is not None:
         model.load_esmc(esmc)
@@ -730,18 +738,21 @@ def save_experimental_esmfold2_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert an experimental (binder-inversion) ESMFold2 head and write a routable repository.
+    Convert an experimental ESMFold2 head into a self-contained family artifact.
 
     Strict-loads the ``type="experimental"`` recurrent head via
     [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
     ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
     MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
     [`EsmFold2DesignPipeline`][], whose save contract persists them under ``esmc/`` and
-    writes the ``ofoldx.esmfold2_design`` marker. The resulting repository is self-contained
-    and routes ``pipeline("design", model=dir)`` to [`EsmFold2DesignPipeline.design`][].
+    writes the ``ofoldx.esmfold2_design`` root marker only after the complete artifact.
+    The resulting repository is routed through
+    ``ofoldx.pipeline("design", model=...)``, which delegates loading to
+    [`EsmFold2DesignPipeline.from_repository`][].
 
-    Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
-    included. No organization or token is assumed and nothing is published without an explicit ``repo_id``.
+    Saving is local-only by default; passing ``repo_id`` additionally uploads the complete
+    artifact. No organization or token is assumed and nothing is published without an
+    explicit ``repo_id``.
     """
 
     from .pipeline import EsmFold2DesignPipeline
@@ -774,7 +785,8 @@ def save_experimental_esmfold2_checkpoint(
         model.to(dtype=dtype)
     model.load_esmc(esmc)
     processor = EsmFold2ExperimentalProcessor(
-        EsmFold2ExperimentalProcessorConfig({"msa_conditioning": model.config.use_msa_features})
+        EsmFold2ExperimentalProcessorConfig({"msa_conditioning": model.config.use_msa_features}),
+        dtype=dtype,
     )
     processor.tokenizer = cast(ProteinTokenizer, tokenizer)
     EsmFold2DesignPipeline(model=model, processor=processor).save(

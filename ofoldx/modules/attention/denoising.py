@@ -1,5 +1,5 @@
 r"""
-Token transformer for coordinate denoising.
+Token encoder for coordinate denoising.
 """
 
 from __future__ import annotations
@@ -8,22 +8,23 @@ import torch
 from torch import Tensor, nn
 
 from ..backend import LayerNorm
-from ..transformer import DenoisingTransformer
+from ..transformer import DenoisingTransformerEncoder
 
 
 class DenoisingTokenEncoder(nn.Module):
     r"""
-    Token transformer for coordinate denoising, conditioned on a per-block pair-derived attention bias.
+    Token encoder for coordinate denoising, conditioned on a per-block pair-derived attention bias.
 
     Projects the pair representation to per-block attention-bias logits (``pair_norms`` / ``bias_projections``)
-    and delegates to the shared [`ConditionedTransformer`][ofoldx.modules.transformer.ConditionedTransformer]
+    and delegates to the shared
+    [`DenoisingTransformerEncoder`][ofoldx.modules.transformer.DenoisingTransformerEncoder]
     configured with a single adaptive norm and double-product transition. This mirrors
     [`AtomSelfAttention`][ofoldx.modules.atom.encoders.AtomSelfAttention] at the token level.
 
     Args:
-        num_blocks: Number of token-encoder blocks; each contributes one transformer block. ``0`` makes the
+        num_blocks: Number of token-encoder blocks; each contributes one Transformer-encoder block. ``0`` makes the
             module the identity on the tokens.
-        token_hidden_size: Width of the per-token channel carried through the transformer.
+        token_hidden_size: Width of the per-token channel carried through the encoder.
         conditioning_size: Width of the conditioning signal driving the adaptive norm.
         pair_size: Width of the pair representation projected to the attention bias.
         num_attention_heads: Number of attention heads per transformer block.
@@ -44,7 +45,7 @@ class DenoisingTokenEncoder(nn.Module):
         self.bias_projections = nn.ModuleList(
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
-        self.transformer = DenoisingTransformer(
+        self.transformer = DenoisingTransformerEncoder(
             num_blocks=num_blocks,
             num_attention_heads=num_attention_heads,
             hidden_size=token_hidden_size,

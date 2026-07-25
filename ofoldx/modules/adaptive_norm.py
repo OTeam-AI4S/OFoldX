@@ -50,6 +50,7 @@ class AdaptiveLayerNorm(nn.Module):
             conditioning_norm_weight=self.conditioning_norm.weight,
             projection_weight=self.conditioning_projection.weight,
             scale_bias=self.conditioning_scale_bias,
-            eps=self.conditioning_norm.eps,
+            input_norm_eps=self.conditioning_norm.eps,
+            conditioning_norm_eps=self.conditioning_norm.eps,
             backend=self.backend,
         )

@@ -17,7 +17,6 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from ...artifacts import save_model
 from .config import Boltz2AffinityConfig, Boltz2Config
 from .model import Boltz2AffinityModel, Boltz2Model
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
@@ -62,7 +61,7 @@ def _unpack_triple_product_projection(key: str, tensor: Tensor) -> list[tuple[st
     ]
 
 
-CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
+CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES: list[Rule] = compile_rules(
     [
         (r"^transition\.adaln\.s_norm\.", "transition.conditioned_norm.conditioning_norm."),
         (r"^transition\.adaln\.s_scale\.", "transition.conditioned_norm.gate_projection."),
@@ -97,11 +96,15 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
         (r"^embed_atompair_ref_pos\.", "distance_vector_projection."),
         (r"^embed_atompair_ref_dist\.", "inverse_distance_projection."),
         (r"^embed_atompair_mask\.", "distance_mask_projection."),
-        (r"^c_to_p_trans_q\.", "left_atom_projection."),
-        (r"^c_to_p_trans_k\.", "right_atom_projection."),
-        (r"^p_mlp\.", "feed_forward."),
-        (r"^s_to_c_trans\.", "single_trunk_projection."),
-        (r"^z_to_p_trans\.", "pair_trunk_projection."),
+        (r"^c_to_p_trans_q\.1\.", "left_atom_projection."),
+        (r"^c_to_p_trans_k\.1\.", "right_atom_projection."),
+        (r"^p_mlp\.1\.", "feed_forward_input_projection."),
+        (r"^p_mlp\.3\.", "feed_forward_hidden_projection."),
+        (r"^p_mlp\.5\.", "feed_forward_output_projection."),
+        (r"^s_to_c_trans\.0\.", "single_trunk_norm."),
+        (r"^s_to_c_trans\.1\.", "single_trunk_projection."),
+        (r"^z_to_p_trans\.0\.", "pair_trunk_norm."),
+        (r"^z_to_p_trans\.1\.", "pair_trunk_projection."),
     ]
 )
 
@@ -128,7 +131,11 @@ SINGLE_CONDITIONING_RULES: list[Rule] = compile_rules(
 
 
 PAIRWISE_CONDITIONING_RULES: list[Rule] = compile_rules(
-    [(r"^dim_pairwise_init_proj\.", "init_projection."), *_transition_index_rules()]
+    [
+        (r"^dim_pairwise_init_proj\.0\.", "input_norm."),
+        (r"^dim_pairwise_init_proj\.1\.", "input_projection."),
+        *_transition_index_rules(),
+    ]
 )
 
 
@@ -145,13 +152,30 @@ def _convert_diffusion_conditioning(key: str) -> str | None:
     if key.startswith("atom_encoder."):
         inner = convert_keys(key[len("atom_encoder.") :], ATOM_ENCODER_RULES)
         return "atom_encoder." + inner if inner is not None else None
-    for boltz, house in (
-        ("atom_enc_proj_z.", "atom_encoder_pair_bias_projections."),
-        ("atom_dec_proj_z.", "atom_decoder_pair_bias_projections."),
-        ("token_trans_proj_z.", "token_transformer_pair_bias_projections."),
+    for boltz, norm_house, projection_house in (
+        (
+            "atom_enc_proj_z.",
+            "atom_encoder_pair_norms.",
+            "atom_encoder_pair_bias_projections.",
+        ),
+        (
+            "atom_dec_proj_z.",
+            "atom_decoder_pair_norms.",
+            "atom_decoder_pair_bias_projections.",
+        ),
+        (
+            "token_trans_proj_z.",
+            "token_encoder_pair_norms.",
+            "token_encoder_pair_bias_projections.",
+        ),
     ):
         if key.startswith(boltz):
-            return house + key[len(boltz) :]
+            index, _, remainder = key[len(boltz) :].partition(".")
+            if remainder.startswith("0."):
+                return f"{norm_house}{index}.{remainder.removeprefix('0.')}"
+            if remainder.startswith("1."):
+                return f"{projection_house}{index}.{remainder.removeprefix('1.')}"
+            return None
     return key
 
 
@@ -161,10 +185,10 @@ def _convert_atom_attention_encoder(key: str) -> str | None:
             key,
             "atom_encoder.diffusion_transformer.layers.",
             "atom_transformer.transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
-    if key.startswith("atom_to_token_trans."):
-        return key.replace("atom_to_token_trans.", "token_projection.", 1)
+    if key.startswith("atom_to_token_trans.0."):
+        return key.replace("atom_to_token_trans.0.", "token_projection.", 1)
     if key.startswith("r_to_q_trans."):
         return key.replace("r_to_q_trans.", "noisy_position_projection.", 1)
     return key
@@ -176,12 +200,14 @@ def _convert_atom_attention_decoder(key: str) -> str | None:
             key,
             "atom_decoder.diffusion_transformer.layers.",
             "atom_transformer.transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
     if key.startswith("a_to_q_trans."):
         return key.replace("a_to_q_trans.", "token_projection.", 1)
-    if key.startswith("atom_feat_to_atom_pos_update."):
-        return key.replace("atom_feat_to_atom_pos_update.", "position_update.", 1)
+    if key.startswith("atom_feat_to_atom_pos_update.0."):
+        return key.replace("atom_feat_to_atom_pos_update.0.", "position_norm.", 1)
+    if key.startswith("atom_feat_to_atom_pos_update.1."):
+        return key.replace("atom_feat_to_atom_pos_update.1.", "position_update_projection.", 1)
     return key
 
 
@@ -199,11 +225,13 @@ def _convert_score_model(key: str) -> str | None:
         return _layer_route(
             key,
             "token_transformer.layers.",
-            "token_transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            "token_encoder.blocks.",
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
-    if key.startswith("s_to_a_linear."):
-        return key.replace("s_to_a_linear.", "single_to_token.", 1)
+    if key.startswith("s_to_a_linear.0."):
+        return key.replace("s_to_a_linear.0.", "single_to_token_norm.", 1)
+    if key.startswith("s_to_a_linear.1."):
+        return key.replace("s_to_a_linear.1.", "single_to_token_projection.", 1)
     if key.startswith("a_norm."):
         return key.replace("a_norm.", "token_norm.", 1)
     return key
@@ -489,7 +517,9 @@ def convert_template_module(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
 
     if key.startswith("pairformer.layers."):
         index, _, remainder = key[len("pairformer.layers.") :].partition(".")
-        return [(f"blocks.{index}.{nk}", nv) for nk, nv in _convert_pair_only_layer(remainder, tensor)]
+        return [
+            (f"pair_update_stack.blocks.{index}.{nk}", nv) for nk, nv in _convert_pair_only_layer(remainder, tensor)
+        ]
     new_key = convert_keys(key, TEMPLATE_FLAT_RULES)
     return [] if new_key is None else [(new_key, tensor)]
 
@@ -503,8 +533,12 @@ INPUT_EMBEDDER_FLAT_RULES: list[Rule] = compile_rules(
         (r"^modified_conditioning_init\.", "modified_embedding."),
         (r"^cyclic_conditioning_init\.", "cyclic_projection."),
         (r"^mol_type_conditioning_init\.", "molecule_type_embedding."),
-        (r"^atom_enc_proj_z\.", "atom_pair_bias_projection."),
-        (r"^atom_attention_encoder\.atom_to_token_trans\.", "atom_attention_encoder.token_projection."),
+        (r"^atom_enc_proj_z\.0\.", "atom_pair_norm."),
+        (r"^atom_enc_proj_z\.1\.", "atom_pair_bias_projection."),
+        (
+            r"^atom_attention_encoder\.atom_to_token_trans\.0\.",
+            "atom_attention_encoder.token_projection.",
+        ),
     ]
 )
 
@@ -526,7 +560,7 @@ def convert_input_embedder_key(key: str) -> str | None:
     if key.startswith("atom_encoder."):
         return _reprefix(key, "atom_encoder.", "atom_encoder.", ATOM_ENCODER_RULES)
     if key.startswith(_ATTN_OLD):
-        return reprefix_indexed(key, _ATTN_OLD, _ATTN_NEW, CONDITIONED_TRANSFORMER_BLOCK_RULES)
+        return reprefix_indexed(key, _ATTN_OLD, _ATTN_NEW, CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES)
     return convert_keys(key, INPUT_EMBEDDER_FLAT_RULES)
 
 
@@ -621,9 +655,14 @@ AFFINITY_FLAT_RULES: list[Rule] = compile_rules(
 )
 AFFINITY_HEAD_RULES: list[Rule] = compile_rules(
     [
-        (r"^affinity_out_mlp\.", "pair_feature_mlp."),
-        (r"^to_affinity_pred_value\.", "affinity_value_mlp."),
-        (r"^to_affinity_pred_score\.", "affinity_score_mlp."),
+        (r"^affinity_out_mlp\.0\.", "pair_feature_input_projection."),
+        (r"^affinity_out_mlp\.2\.", "pair_feature_output_projection."),
+        (r"^to_affinity_pred_value\.0\.", "affinity_value_input_projection."),
+        (r"^to_affinity_pred_value\.2\.", "affinity_value_hidden_projection."),
+        (r"^to_affinity_pred_value\.4\.", "affinity_value_output_projection."),
+        (r"^to_affinity_pred_score\.0\.", "affinity_score_input_projection."),
+        (r"^to_affinity_pred_score\.2\.", "affinity_score_hidden_projection."),
+        (r"^to_affinity_pred_score\.4\.", "affinity_score_output_projection."),
         (r"^to_affinity_logits_binary\.", "binder_logit_projection."),
     ]
 )
@@ -875,19 +914,19 @@ def save_boltz2_checkpoint(
     Strict-loads the checkpoint via
     [`convert_boltz2_checkpoint`][ofoldx.models.boltz2.convert.convert_boltz2_checkpoint], pairs the
     model with the config-less [`Boltz2Processor`][], and writes a self-contained ``model.json`` /
-    safetensors repository via [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. This is
-    the standard ``fold`` pair (``ofoldx.boltz2``); the Processor carries no config, so no
-    ``processor.json`` is written.
+    ``processor.json`` / safetensors repository marked with the exact [`Boltz2Pipeline`][].
+    The Processor repository metadata records its floating-point dtype even though it has no
+    family configuration.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository. No
     organization or token is assumed and nothing is published without an explicit ``repo_id``.
     """
 
+    from .pipeline import Boltz2Pipeline
+
     model = convert_boltz2_checkpoint(checkpoint_path, config=config, dtype=dtype)
-    save_model(
+    Boltz2Pipeline(model=model, processor=Boltz2Processor(dtype=dtype)).save(
         output_dir,
-        model=model,
-        processor=Boltz2Processor(),
         repo_id=repo_id,
         token=token,
         private=private,
@@ -910,8 +949,8 @@ def save_boltz2_affinity_checkpoint(
     Convert the Boltz-2 affinity + structure checkpoints and write the composite repository.
 
     The affinity deliverable is a multi-pair [`Boltz2AffinityPipeline`][]: the affinity
-    head (``ofoldx.boltz2_affinity``, ``standard_tasks=()``) runs only after a structure/confidence
-    pass, so it cannot route as a lone standard pair. This writes the aggregate repository — the
+    head runs only after a structure/confidence pass, so it is not a standalone Pipeline.
+    This writes the composite repository — the
     affinity pair at the root, the structure/confidence pair ([`Boltz2Model`][] /
     [`Boltz2Processor`][]) at the fixed ``structure/`` sub-directory, and the one-field
     ``pipeline.json`` marker — via ``Boltz2AffinityPipeline.save`` so ``pipeline(..., model=dir)``
@@ -934,9 +973,9 @@ def save_boltz2_affinity_checkpoint(
     )
     Boltz2AffinityPipeline(
         model=affinity_model,
-        processor=Boltz2AffinityProcessor(),
+        processor=Boltz2AffinityProcessor(dtype=dtype),
         structure_model=structure_model,
-        structure_processor=Boltz2Processor(),
+        structure_processor=Boltz2Processor(dtype=dtype),
     ).save(
         output_dir,
         repo_id=repo_id,

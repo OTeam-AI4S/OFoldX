@@ -6,17 +6,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from os import PathLike
+from pathlib import Path
 
 import torch
 
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...io import read_fasta_records, read_msa
 from ...pipelines import PairedPipeline, resolve_generator
+from ...references import classify_reference
 from ...results import FoldResult
 from .model import AlphaFold2Model, AlphaFold2MultimerModel
 from .multimer_processor import AlphaFold2MultimerProcessor
-from .processor import AlphaFold2Processor
+from .processor import AlphaFold2Processor, monomer_system_from_sequences, protein_monomer
+
+_FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".seq"))
 
 
 class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
@@ -57,7 +62,13 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
-        model_input = self.processor(input, msa=msa, templates=templates)
+        canonical_input = _monomer_input(input)
+        system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
+        model_input = self.processor(
+            canonical_input,
+            msa=_monomer_msa(msa, system),
+            templates=templates,
+        )
         return self.model.fold(
             model_input,
             num_samples=num_samples,
@@ -110,3 +121,51 @@ class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFo
             generator=generator,
             recycling_steps=recycling_steps,
         )
+
+
+def _monomer_input(
+    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+) -> MolecularSystem | Structure:
+    r"""
+    Resolve AlphaFold 2's inline-sequence and FASTA conveniences.
+    """
+
+    if isinstance(input, str | PathLike):
+        classified = classify_reference(input)
+        if isinstance(classified, Path):
+            if not any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
+                raise ValueError(
+                    "AlphaFold 2 monomer cannot consume a coordinate-bearing structure path; use a FASTA path, "
+                    "input.system, or templates="
+                )
+            named = [
+                (record.id or "protein", PolymerSequence.from_one_letter(record.sequence.strip().upper()))
+                for record in read_fasta_records(classified)
+            ]
+            if len(named) != 1:
+                raise ValueError("AlphaFold 2 monomer requires exactly one PolymerSequence")
+            entity_id, sequence = named[0]
+            return MolecularSystem(
+                entities={entity_id: sequence},
+                instances={entity_id: entity_id},
+            )
+        return monomer_system_from_sequences(PolymerSequence.from_one_letter(classified.strip().upper()))
+    if isinstance(input, Structure):
+        return input
+    if isinstance(input, MolecularSystem):
+        return input
+    return monomer_system_from_sequences(input)
+
+
+def _monomer_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""
+    Read path evidence against AlphaFold 2's one exact protein entity.
+    """
+
+    if not isinstance(msa, str | PathLike):
+        return msa
+    _target, instance_id = protein_monomer(system)
+    return read_msa(Path(msa).expanduser(), entity_id=system.instances[instance_id])

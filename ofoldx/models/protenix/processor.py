@@ -6,14 +6,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from os import PathLike
-from pathlib import Path
 from typing import cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from multimolecule.io import read_fasta_records
 from torch import Tensor
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT
@@ -21,7 +18,6 @@ from ...data.components import get_component
 from ...data.evidence import (
     MSA,
     MSACollection,
-    Template,
     msa_binding_map,
     msa_bindings,
     resolve_msa_bindings,
@@ -36,11 +32,8 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...modules.geometry import uniform_random_rotation
 from ...processor import Processor
-from ...references import classify_reference
 from .config import ProtenixConstraintProcessorConfig, ProtenixProcessorConfig
 from .model import ProtenixAtomContact, ProtenixInput, ProtenixPocket, ProtenixTokenContact
 
@@ -119,7 +112,6 @@ _MSA_RESIDUE_TYPE = {
     }.items()
 }
 _MSA_RESIDUE_TYPE["-"] = _GAP
-_FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 
 
 class ProtenixProcessor(Processor):
@@ -132,6 +124,8 @@ class ProtenixProcessor(Processor):
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
+
+    config_class = ProtenixProcessorConfig
 
     def __init__(
         self,
@@ -147,21 +141,19 @@ class ProtenixProcessor(Processor):
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template | str | PathLike[str]] = (),
+        msa: MSA | MSACollection | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
         r"""
         Prepare model features for one molecular assembly.
 
         Args:
-            input: Inline protein sequence, FASTA or structure path, one or more
-                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
-                contributes topology, not observed coordinates.
-            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
-            templates: Reserved template evidence; this architecture requires an empty sequence.
+            input: One or more ``PolymerSequence`` values, ``MolecularSystem``,
+                or ``Structure``. A structure contributes topology, not observed
+                coordinates.
+            msa: Optional ``MSA`` or ``MSACollection``.
             generator: Optional PyTorch generator for reference-position augmentation.
 
         Returns:
@@ -170,25 +162,21 @@ class ProtenixProcessor(Processor):
             tensors follow ``token_sites``.
         """
 
-        return self._lower(input, msa=msa, templates=templates, generator=generator)
+        return self._lower(input, msa=msa, generator=generator)
 
     def _lower(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None,
-        templates: Sequence[Template | str | PathLike[str]],
+        msa: MSA | MSACollection | None,
         atom_contacts: Sequence[ProtenixAtomContact] = (),
         token_contacts: Sequence[ProtenixTokenContact] = (),
         pocket: ProtenixPocket | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
-        template_values = tuple(templates)
-        if template_values:
-            raise ValueError("Protenix does not enable template blocks")
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
-        system = _normalize_input(input)
+        system = molecular_system_from_input(input)
         normalized_msa = _normalize_msa(msa, system)
         # Atom contacts require atom-level tokens. Token contacts and pockets use
         # the tokenization already selected for each residue.
@@ -220,6 +208,8 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = ProtenixConstraintProcessorConfig
+
     def __init__(
         self,
         config: ProtenixConstraintProcessorConfig | None = None,
@@ -235,10 +225,9 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template | str | PathLike[str]] = (),
+        msa: MSA | MSACollection | None = None,
         atom_contacts: Sequence[ProtenixAtomContact] = (),
         token_contacts: Sequence[ProtenixTokenContact] = (),
         pocket: ProtenixPocket | None = None,
@@ -248,11 +237,10 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         Prepare model features and spatial constraints for one assembly.
 
         Args:
-            input: Inline protein sequence, FASTA or structure path, one or more
-                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
-                contributes topology, not observed coordinates.
-            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
-            templates: Reserved template evidence; this architecture requires an empty sequence.
+            input: One or more ``PolymerSequence`` values, ``MolecularSystem``,
+                or ``Structure``. A structure contributes topology, not observed
+                coordinates.
+            msa: Optional ``MSA`` or ``MSACollection``.
             atom_contacts: Upper-bound constraints between exact atom pairs.
             token_contacts: Upper-bound constraints between token-level endpoints.
             pocket: Optional directed binder-to-residue pocket constraint.
@@ -268,7 +256,6 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         return self._lower(
             input,
             msa=msa,
-            templates=templates,
             atom_contacts=atom_contacts,
             token_contacts=token_contacts,
             pocket=pocket,
@@ -276,8 +263,8 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         )
 
 
-def _normalize_input(
-    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+def molecular_system_from_input(
+    input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
 ) -> MolecularSystem:
     # A Structure input contributes only its topology: v0.5.3 substructure conditioning is always the
     # all-zero grid, so observed coordinates are not lowered into the constraint channels.
@@ -285,38 +272,24 @@ def _normalize_input(
         return input.system
     if isinstance(input, MolecularSystem):
         return input
-    if isinstance(input, str | PathLike):
-        classified = classify_reference(input)
-        if isinstance(classified, Path):
-            if any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
-                fasta_sequences = tuple(
-                    (
-                        record.id or f"chain_{index + 1}",
-                        PolymerSequence.from_one_letter(record.sequence.strip().upper()),
-                    )
-                    for index, record in enumerate(read_fasta_records(classified))
-                )
-                return _sequence_system(fasta_sequences)
-            return read_structure(classified).system
-        sequence = PolymerSequence.from_one_letter(classified.strip().upper())
-        return _sequence_system((("protein", sequence),))
     if isinstance(input, PolymerSequence):
-        return _sequence_system((("A", input),))
+        return molecular_system_from_named_sequences((("A", input),))
     if isinstance(input, Sequence):
         sequence_values = tuple(cast(Sequence[object], input))
         if not sequence_values or not all(isinstance(sequence, PolymerSequence) for sequence in sequence_values):
             raise TypeError("Protenix sequence collections must contain PolymerSequence values")
         polymer_sequences = cast(tuple[PolymerSequence, ...], sequence_values)
-        return _sequence_system(
+        return molecular_system_from_named_sequences(
             tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
     raise TypeError(
-        "Protenix input must be an inline sequence, FASTA/structure path, PolymerSequence, "
-        "sequence of PolymerSequence values, MolecularSystem, or Structure"
+        "Protenix input must be a PolymerSequence, sequence of PolymerSequence " "values, MolecularSystem, or Structure"
     )
 
 
-def _sequence_system(named: tuple[tuple[str, PolymerSequence], ...]) -> MolecularSystem:
+def molecular_system_from_named_sequences(
+    named: tuple[tuple[str, PolymerSequence], ...],
+) -> MolecularSystem:
     used: set[str] = set()
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
@@ -333,26 +306,15 @@ def _sequence_system(named: tuple[tuple[str, PolymerSequence], ...]) -> Molecula
 
 
 def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
     if msa is None:
         return None
-    if isinstance(msa, MSA | MSACollection):
-        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-            if entity.polymer_type != "protein":
-                raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
-        return msa
-
-    path = Path(msa).expanduser()
-    proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")
-    return read_msa(path, entity_id=proteins[0])
+    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+        if entity.polymer_type != "protein":
+            raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
+    return msa
 
 
 def _atom_constraint_residues(

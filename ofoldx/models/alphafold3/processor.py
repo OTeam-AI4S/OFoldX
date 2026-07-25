@@ -6,14 +6,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from os import PathLike
-from pathlib import Path
 from typing import cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from multimolecule.io import read_fasta_records
 from torch import Tensor
 
 from ...data import ATOMIC_NUMBER_BY_ELEMENT
@@ -38,11 +35,8 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...modules.embedding import TemplateFeatures
 from ...processor import Processor
-from ...references import classify_reference
 from .config import AlphaFold3ProcessorConfig
 from .model import AlphaFold3Input
 
@@ -128,7 +122,6 @@ _MSA_RESIDUE_TYPE = {
     }.items()
 }
 _MSA_RESIDUE_TYPE["-"] = _GAP
-_FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 # AlphaFold 3 template distogram bins: 39 lower breaks over [3.25, 50.75] (squared).
 _TEMPLATE_DISTOGRAM_MIN = 3.25
 _TEMPLATE_DISTOGRAM_MAX = 50.75
@@ -157,6 +150,8 @@ class AlphaFold3Processor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = AlphaFold3ProcessorConfig
+
     def __init__(
         self,
         config: AlphaFold3ProcessorConfig | None = None,
@@ -171,19 +166,19 @@ class AlphaFold3Processor(Processor):
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold3Input:
         r"""
         Prepare model features for one molecular assembly.
 
         Args:
-            input: Inline protein sequence, FASTA or structure path, one or more
-                ``PolymerSequence`` values, ``MolecularSystem``, or ``Structure``. A structure
-                contributes topology, not observed coordinates.
-            msa: Optional ``MSA``, ``MSACollection``, or alignment path.
+            input: One or more ``PolymerSequence`` values, ``MolecularSystem``,
+                or ``Structure``. A structure contributes topology, not observed
+                coordinates.
+            msa: Optional ``MSA`` or ``MSACollection``.
             templates: Template evidence aligned to the target polymers.
 
         Returns:
@@ -193,7 +188,7 @@ class AlphaFold3Processor(Processor):
             method performs no random sampling.
         """
 
-        system = _normalize_input(input)
+        system = molecular_system_from_input(input)
         system = _resolve_components(system, revision=self.config.ccd_revision)
         normalized_msa = _normalize_msa(msa, system)
         tokens = _tokenize(system)
@@ -208,45 +203,32 @@ class AlphaFold3Processor(Processor):
         )
 
 
-def _normalize_input(
-    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+def molecular_system_from_input(
+    input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
 ) -> MolecularSystem:
     if isinstance(input, Structure):
         return input.system
     if isinstance(input, MolecularSystem):
         return input
-    if isinstance(input, str | PathLike):
-        classified = classify_reference(input)
-        if isinstance(classified, Path):
-            if any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
-                sequences = tuple(
-                    (
-                        record.id or f"chain_{index + 1}",
-                        PolymerSequence.from_one_letter(record.sequence.strip().upper()),
-                    )
-                    for index, record in enumerate(read_fasta_records(classified))
-                )
-                return _sequence_system(sequences)
-            return read_structure(classified).system
-        sequence = PolymerSequence.from_one_letter(classified.strip().upper())
-        return _sequence_system((("protein", sequence),))
     if isinstance(input, PolymerSequence):
-        return _sequence_system((("A", input),))
+        return molecular_system_from_named_sequences((("A", input),))
     if isinstance(input, Sequence):
         values = tuple(input)
         if not values or not all(isinstance(sequence, PolymerSequence) for sequence in values):
             raise TypeError("AlphaFold 3 sequence collections must contain PolymerSequence values")
         polymer_sequences = tuple(cast(PolymerSequence, sequence) for sequence in values)
-        return _sequence_system(
+        return molecular_system_from_named_sequences(
             tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
     raise TypeError(
-        "AlphaFold 3 input must be an inline sequence, FASTA/structure path, PolymerSequence, "
-        "sequence of PolymerSequence values, MolecularSystem, or Structure"
+        "AlphaFold 3 input must be a PolymerSequence, sequence of PolymerSequence "
+        "values, MolecularSystem, or Structure"
     )
 
 
-def _sequence_system(named: tuple[tuple[str, PolymerSequence], ...]) -> MolecularSystem:
+def molecular_system_from_named_sequences(
+    named: tuple[tuple[str, PolymerSequence], ...],
+) -> MolecularSystem:
     used: set[str] = set()
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
@@ -308,26 +290,15 @@ def _needs_ccd_resolution(component: ChemicalComponent) -> bool:
 
 
 def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
     if msa is None:
         return None
-    if isinstance(msa, MSA | MSACollection):
-        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-            if entity.polymer_type != "protein":
-                raise ValueError("AlphaFold 3 consumes supplied MSA evidence only for proteins")
-        return msa
-
-    path = Path(msa).expanduser()
-    proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")
-    return read_msa(path, entity_id=proteins[0])
+    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+        if entity.polymer_type != "protein":
+            raise ValueError("AlphaFold 3 consumes supplied MSA evidence only for proteins")
+    return msa
 
 
 def _is_standard(component: ChemicalComponent, polymer_type: str) -> bool:
@@ -763,7 +734,7 @@ def _template_to(features: TemplateFeatures, *, device: torch.device, dtype: tor
     return TemplateFeatures(
         distogram=features.distogram.to(device=device, dtype=dtype),
         pseudo_beta_mask=features.pseudo_beta_mask.to(device=device, dtype=dtype),
-        residue_type=features.residue_type.to(device=device),
+        residue_type_ids=features.residue_type_ids.to(device=device),
         unit_vector=features.unit_vector.to(device=device, dtype=dtype),
         backbone_frame_mask=features.backbone_frame_mask.to(device=device, dtype=dtype),
         template_mask=(
@@ -889,7 +860,7 @@ def _template_features(
     return TemplateFeatures(
         distogram=torch.stack(distograms).unsqueeze(0),
         pseudo_beta_mask=torch.stack(pseudo_beta_masks).unsqueeze(0),
-        residue_type=torch.stack(per_template_residue_type).unsqueeze(0),
+        residue_type_ids=torch.stack(per_template_residue_type).unsqueeze(0),
         unit_vector=torch.stack(unit_vectors).unsqueeze(0),
         backbone_frame_mask=torch.stack(backbone_masks).unsqueeze(0),
         template_mask=torch.ones(1, len(templates)),

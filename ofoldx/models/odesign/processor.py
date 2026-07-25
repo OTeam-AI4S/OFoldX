@@ -6,9 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import replace
-from os import PathLike
-from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import cast, get_args
 
 import torch
@@ -48,8 +46,6 @@ from ...data.placement import instance_of as _placement_instance_of
 from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...processor import Processor
 from .config import ODesignProcessorConfig
 from .model import (
@@ -153,6 +149,21 @@ _MSA_SYMBOL_TOKENS = {
 }
 
 
+@dataclass(eq=False)
+class _ODesignPlan:
+    system: MolecularSystem
+    source_structure: Structure | None
+    atom_sites: tuple[AtomSite, ...]
+    placement: ODesignPlacements | None
+    conditions: tuple[Hotspot | SymbolicBond | ODesignReferenceCoordinates, ...]
+    placement_map: PlacementMap
+    instance_of: dict[str, str]
+    source_residue_map: dict[tuple[str, int], tuple[str, int]]
+    source_atom_map: dict[AtomSite, AtomSite]
+    cyclic_instances: frozenset[str]
+    cyclic_links: frozenset[frozenset[AtomSite]]
+
+
 class ODesignProcessor(Processor):
     r"""
     Convert supported structure-design inputs into `ODesignInput`.
@@ -163,6 +174,8 @@ class ODesignProcessor(Processor):
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
+
+    config_class = ODesignProcessorConfig
 
     def __init__(
         self,
@@ -197,10 +210,10 @@ class ODesignProcessor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str] | None,
+        input: MolecularSystem | Structure | None,
         *,
         placement: ODesignPlacements | None = None,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
         receptor_mode: str | None = None,
     ) -> ODesignInput:
@@ -208,9 +221,9 @@ class ODesignProcessor(Processor):
         Build model inputs for one structure-design problem.
 
         Args:
-            input: Optional context system, structure, or local structure path.
+            input: Optional canonical context system or structure.
             placement: Optional topology of existing and generated molecular segments.
-            msa: Optional MSA evidence or alignment path.
+            msa: Optional canonical MSA evidence.
             conditions: Hotspot, symbolic-bond, and reference-coordinate conditions.
             receptor_mode: Receptor treatment for this call. ``"rigid"`` fixes existing
                 receptor heavy atoms; ``"flex"`` regenerates them except where reference
@@ -221,16 +234,24 @@ class ODesignProcessor(Processor):
             condition, placement, and molecular-layout axes.
         """
 
+        plan = self._plan(input, placement, conditions)
+        return self._lower(plan, msa, receptor_mode)
+
+    def _plan(
+        self,
+        input: MolecularSystem | Structure | None,
+        placement: ODesignPlacements | None,
+        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates],
+    ) -> _ODesignPlan:
         condition_values = tuple(conditions)
         for condition in condition_values:
             if not isinstance(condition, (ODesignReferenceCoordinates, Hotspot, SymbolicBond)):
                 raise TypeError(f"ODesign cannot consume {type(condition).__name__}")
 
-        normalized = _normalize_input(input)
         # ODesign validates condition semantics inline: type and intent above, endpoints and
         # referenced atoms below.
-        structure = normalized if isinstance(normalized, Structure) else None
-        source_system = structure.system if structure is not None else normalized
+        structure = input if isinstance(input, Structure) else None
+        source_system = structure.system if structure is not None else input
         # A GeneratedSegment carries no embedded id; its identity is the
         # globally-unique ``placement_id`` inner key of the PlacementSpec mapping.
         segments = {
@@ -300,7 +321,39 @@ class ODesignProcessor(Processor):
         }
         if unsupported_components:
             raise ValueError("ODesign has no residue token for components " f"{sorted(unsupported_components)!r}")
-        msa_value = _normalize_msa(msa, system)
+
+        return _ODesignPlan(
+            system=system,
+            source_structure=structure,
+            atom_sites=sites,
+            placement=placement,
+            conditions=condition_values,
+            placement_map=placement_map,
+            instance_of=instance_of,
+            source_residue_map=source_residue_map,
+            source_atom_map=source_atom_map,
+            cyclic_instances=cyclic_instances,
+            cyclic_links=cyclic_links,
+        )
+
+    def _lower(
+        self,
+        plan: _ODesignPlan,
+        msa: MSA | MSACollection | None,
+        receptor_mode: str | None,
+    ) -> ODesignInput:
+        system = plan.system
+        structure = plan.source_structure
+        sites = plan.atom_sites
+        placement = plan.placement
+        condition_values = plan.conditions
+        placement_map = plan.placement_map
+        instance_of = plan.instance_of
+        source_residue_map = plan.source_residue_map
+        source_atom_map = plan.source_atom_map
+        cyclic_instances = plan.cyclic_instances
+        cyclic_links = plan.cyclic_links
+        msa_value = _validate_msa(msa, system)
 
         if not sites:
             raise ValueError("ODesign requires at least one heavy atom")
@@ -646,14 +699,6 @@ def _msa_symbol_token(symbol: str, polymer_type: str) -> int:
     if symbol == "-":
         return _MSA_GAP
     return _MSA_SYMBOL_TOKENS[polymer_type].get(symbol, _MSA_UNKNOWN)
-
-
-def _normalize_input(input):
-    if input is None or isinstance(input, (MolecularSystem, Structure)):
-        return input
-    if isinstance(input, str | PathLike):
-        return read_structure(Path(input).expanduser())
-    raise TypeError("ODesign input must be a MolecularSystem, Structure, local path, or None")
 
 
 def _sites_with_reference_coordinates(system: MolecularSystem) -> tuple[AtomSite, ...]:
@@ -1402,37 +1447,26 @@ def _build_cyclic_period(
     )
 
 
-def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+def _validate_msa(
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
     if msa is None:
         return msa
-    if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` and closes
-        # over this system, so the Processor resolves the entity and checks the query width (the
-        # MSA validates neither against an entity). Column ``i`` binds to ``entity.components[i]``.
-        for value in values:
-            entity = system.entities.get(value.entity_id)
-            if not isinstance(entity, PolymerSequence):
-                raise ValueError("MSA entity disagrees with ODesign input")
-            if len(value.unpaired_sequences[0]) != len(entity):
-                raise ValueError(
-                    f"MSA for entity {value.entity_id!r} spans {len(value.unpaired_sequences[0])} columns "
-                    f"but the entity has {len(entity)} components"
-                )
-        return msa
-    polymers = [
-        (entity_id, entity) for entity_id, entity in system.entities.items() if isinstance(entity, PolymerSequence)
-    ]
-    if len(polymers) != 1:
-        raise ValueError("a FASTA MSA path is unambiguous only for a single-polymer system; pass MSACollection")
-    entity_id, entity = polymers[0]
-    value = read_msa(msa, entity_id=entity_id)
-    if len(value.unpaired_sequences[0]) != len(entity):
-        raise ValueError("MSA query width disagrees with the ODesign entity length")
-    return value
+    values = (msa,) if isinstance(msa, MSA) else msa.msas
+    # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` and closes
+    # over this system, so the Processor resolves the entity and checks the query width (the
+    # MSA validates neither against an entity). Column ``i`` binds to ``entity.components[i]``.
+    for value in values:
+        entity = system.entities.get(value.entity_id)
+        if not isinstance(entity, PolymerSequence):
+            raise ValueError("MSA entity disagrees with ODesign input")
+        if len(value.unpaired_sequences[0]) != len(entity):
+            raise ValueError(
+                f"MSA for entity {value.entity_id!r} spans {len(value.unpaired_sequences[0])} columns "
+                f"but the entity has {len(entity)} components"
+            )
+    return msa
 
 
 def _atom_features(system: MolecularSystem, sites: tuple[AtomSite, ...], reference_mask: Tensor) -> Tensor:

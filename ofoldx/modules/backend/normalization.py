@@ -55,7 +55,7 @@ def layer_norm(
         return cast(
             Tensor,
             _oops_layer_norm(input, normalized_shape, weight=weight, bias=bias, eps=eps),
-        )
+        ).to(dtype=input.dtype)
     if backend == "apex" and input.is_cuda:
         output = apex_layer_norm(input, normalized_shape, weight, bias, eps)
         if output is not None:

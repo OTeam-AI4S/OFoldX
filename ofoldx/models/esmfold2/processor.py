@@ -6,14 +6,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from os import PathLike
-from pathlib import Path
 from typing import cast
 
 import numpy as np
 import torch
 from multimolecule import ProteinTokenizer
-from multimolecule.io import read_fasta_records
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
@@ -26,7 +23,6 @@ from ...data.molecular import (
 )
 from ...data.structure import Structure
 from ...processor import Processor
-from ...references import classify_reference
 from .config import EsmFold2ExperimentalProcessorConfig, EsmFold2ProcessorConfig
 from .model import EsmFold2Input, EsmFold2Layout
 
@@ -85,6 +81,8 @@ class EsmFold2Processor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = EsmFold2ProcessorConfig
+
     def __init__(
         self,
         config: EsmFold2ProcessorConfig | None = None,
@@ -98,17 +96,17 @@ class EsmFold2Processor(Processor):
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
     ) -> EsmFold2Input:
         r"""
         Build model inputs for one molecular system and optional MSA evidence.
 
         Args:
-            input: Inline sequence, FASTA path, one or more polymer sequences, molecular
-                system, or structure topology. Coordinates in a ``Structure`` are ignored.
-            msa: Optional MSA evidence or alignment path.
+            input: One or more polymer sequences, molecular system, or structure topology.
+                Coordinates in a ``Structure`` are ignored.
+            msa: Optional canonical MSA evidence.
 
         Returns:
             An [`EsmFold2Input`][] with batch size one and aligned language-model, MSA,
@@ -119,7 +117,7 @@ class EsmFold2Processor(Processor):
             raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
         if isinstance(input, Structure):
             input = input.system
-        system = input if isinstance(input, MolecularSystem) else _molecular_system(input)
+        system = input if isinstance(input, MolecularSystem) else molecular_system_from_sequences(input)
         normalized_msa = _normalize_msa(msa, system)
         return _prepare_esmfold2_features(
             system,
@@ -141,6 +139,8 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = EsmFold2ExperimentalProcessorConfig
+
     def __init__(
         self,
         config: EsmFold2ExperimentalProcessorConfig | None = None,
@@ -157,28 +157,14 @@ class EsmFold2ExperimentalProcessor(EsmFold2Processor):
         self.config = config
 
 
-def _molecular_system(
-    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
+def molecular_system_from_sequences(
+    input: PolymerSequence | Sequence[PolymerSequence],
 ) -> MolecularSystem:
     r"""
     Construct the polymer-only convenience input accepted by the fold boundary.
     """
 
-    named: list[tuple[str, PolymerSequence]]
-    if isinstance(input, str | PathLike):
-        classified = classify_reference(input)
-        if isinstance(classified, Path):
-            records = read_fasta_records(classified)
-            named = [
-                (
-                    record.id or f"chain_{index + 1}",
-                    PolymerSequence.from_one_letter(record.sequence.strip().upper()),
-                )
-                for index, record in enumerate(records)
-            ]
-        else:
-            named = [("protein", PolymerSequence.from_one_letter(classified.strip().upper()))]
-    elif isinstance(input, PolymerSequence):
+    if isinstance(input, PolymerSequence):
         named = [("A", input)]
     elif isinstance(input, Sequence):
         sequences = tuple(input)
@@ -189,9 +175,19 @@ def _molecular_system(
         ]
     else:
         raise TypeError(
-            "ESMFold2 input must be a sequence string, FASTA path, PolymerSequence, "
-            "sequence of PolymerSequence values, MolecularSystem, or Structure"
+            "ESMFold2 input must be a PolymerSequence, sequence of PolymerSequence "
+            "values, MolecularSystem, or Structure"
         )
+
+    return molecular_system_from_named_sequences(named)
+
+
+def molecular_system_from_named_sequences(
+    named: Sequence[tuple[str, PolymerSequence]],
+) -> MolecularSystem:
+    r"""
+    Construct one system while preserving caller-supplied entity names.
+    """
 
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
@@ -215,7 +211,7 @@ def _default_chain_id(index: int) -> str:
 
 
 def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
     r"""
@@ -224,60 +220,10 @@ def _normalize_msa(
 
     if msa is None:
         return None
-    if isinstance(msa, MSA | MSACollection):
-        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-            if entity.polymer_type != "protein":
-                raise ValueError("ESMFold2 accepts MSA evidence only for protein entities")
-        return msa
-
-    path = Path(msa).expanduser()
-    proteins = [
-        (entity_id, entity)
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity; pass MSACollection")
-    records = read_fasta_records(path)
-    if not records:
-        raise ValueError("MSA FASTA contains no rows")
-    entity_id, _ = proteins[0]
-    a3m = ".a3m" in {suffix.lower() for suffix in path.suffixes}
-    parsed = tuple(_aligned_protein_row(record.sequence, a3m=a3m) for record in records)
-    aligned_rows = tuple(row for row, _ in parsed)
-    deletion_rows = tuple(deletions for _, deletions in parsed)
-    width = len(aligned_rows[0])
-    # The FASTA is a plain single-chain alignment: every row goes to the unpaired pool (row 0 is the
-    # ungapped query), and the paired pool carries only the shared query row so both pools validate.
-    return MSA(
-        entity_id=entity_id,
-        unpaired_sequences=aligned_rows,
-        unpaired_deletion_counts=np.array(deletion_rows, dtype=np.uint32).reshape(len(aligned_rows), width),
-        paired_sequences=(aligned_rows[0],),
-        paired_deletion_counts=np.zeros((1, width), dtype=np.uint32),
-    )
-
-
-def _aligned_protein_row(
-    sequence: str,
-    *,
-    a3m: bool = False,
-) -> tuple[str, tuple[int, ...]]:
-    r"""
-    Convert one aligned FASTA/A3M row to a query-width symbol string plus insertion counts.
-    """
-
-    symbols: list[str] = []
-    deletion_counts: list[int] = []
-    insertion_count = 0
-    for symbol in sequence.strip():
-        if a3m and (symbol.islower() or symbol == "."):
-            insertion_count += 1
-            continue
-        symbols.append("-" if symbol in "-." else symbol.upper())
-        deletion_counts.append(insertion_count)
-        insertion_count = 0
-    return "".join(symbols), tuple(deletion_counts)
+    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+        if entity.polymer_type != "protein":
+            raise ValueError("ESMFold2 accepts MSA evidence only for protein entities")
+    return msa
 
 
 def _msa_residue_type(symbol: str) -> int:
@@ -313,7 +259,7 @@ def _prepare_esmfold2_features(
     entity_indices: list[int] = []
     symmetry_indices: list[int] = []
     molecule_types: list[int] = []
-    residue_types: list[int] = []
+    residue_type_ids: list[int] = []
     reference_space_indices: list[int] = []
 
     available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
@@ -363,7 +309,7 @@ def _prepare_esmfold2_features(
                     entity_indices.append(entity_index)
                     symmetry_indices.append(symmetry_index)
                     molecule_types.append(molecule_type)
-                    residue_types.append(residue_type)
+                    residue_type_ids.append(residue_type)
                     reference_space_indices.extend([next_reference_space_id] * len(group))
                 next_reference_space_id += 1
         else:
@@ -387,7 +333,7 @@ def _prepare_esmfold2_features(
                 entity_indices.append(entity_index)
                 symmetry_indices.append(symmetry_index)
                 molecule_types.append(3)
-                residue_types.append(_PROTEIN_UNKNOWN)
+                residue_type_ids.append(_PROTEIN_UNKNOWN)
                 reference_space_indices.append(next_reference_space_id)
             next_reference_space_id += 1
 
@@ -451,7 +397,7 @@ def _prepare_esmfold2_features(
 
     token_count = len(token_groups)
     representative_atoms = [
-        _representative_atom(group, molecule_types[index], residue_types[index], site_to_atom)
+        _representative_atom(group, molecule_types[index], residue_type_ids[index], site_to_atom)
         for index, group in enumerate(token_groups)
     ]
     token_bonds = _token_bond_matrix(system, site_to_token, token_count)
@@ -460,7 +406,7 @@ def _prepare_esmfold2_features(
         token_entity_ids=token_entity_ids,
         token_instance_ids=token_instance_ids,
         token_monomer_indices=token_monomer_indices,
-        residue_types=residue_types,
+        residue_type_ids=residue_type_ids,
     )
     language_model_tokens, language_model_mask, token_to_esmc, token_has_esmc = _esmc_tensors(
         system,
@@ -477,7 +423,7 @@ def _prepare_esmfold2_features(
         "symmetry_index": torch.tensor(symmetry_indices, dtype=torch.long),
         "entity_index": torch.tensor(entity_indices, dtype=torch.long),
         "molecule_type": torch.tensor(molecule_types, dtype=torch.long),
-        "residue_type": torch.tensor(residue_types, dtype=torch.long),
+        "residue_type_ids": torch.tensor(residue_type_ids, dtype=torch.long),
         "token_bonds": token_bonds,
         "token_mask": torch.ones(token_count, dtype=torch.bool),
         "reference_positions": reference_positions,
@@ -600,15 +546,15 @@ def _msa_tensors(
     token_entity_ids: list[str],
     token_instance_ids: list[str],
     token_monomer_indices: list[int | None],
-    residue_types: list[int],
+    residue_type_ids: list[int],
 ) -> dict[str, torch.Tensor]:
     r"""
     Construct paired and unpaired MSA rows over structure tokens.
     """
 
-    token_count = len(residue_types)
+    token_count = len(residue_type_ids)
     if msa is None:
-        tokens = torch.tensor([residue_types], dtype=torch.long)
+        tokens = torch.tensor([residue_type_ids], dtype=torch.long)
         deletion_counts = torch.zeros(1, token_count, dtype=torch.float32)
     else:
         # The MSA holds no PolymerSequence: column ``c`` binds ``columns[c].entity_id`` to a system
@@ -657,7 +603,7 @@ def _msa_tensors(
             deletions.append(deletion_row)
         tokens = torch.stack(rows)
         deletion_counts = torch.stack(deletions)
-        tokens[0] = torch.tensor(residue_types, dtype=torch.long)
+        tokens[0] = torch.tensor(residue_type_ids, dtype=torch.long)
 
     has_deletion = deletion_counts > 0
     deletion_value = (math.pi / 2) * torch.atan(deletion_counts / 3)

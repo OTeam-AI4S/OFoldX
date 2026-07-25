@@ -15,9 +15,7 @@ from .config import (
     ODesignTrunkConfig,
 )
 from .model import (
-    ODesignDesignCandidate,
     ODesignDesignedResidue,
-    ODesignDesignResult,
     ODesignFixedResidue,
     ODesignInput,
     ODesignModel,
@@ -25,20 +23,17 @@ from .model import (
     ODesignPlacements,
     ODesignReferenceCoordinates,
     ODesignResidueSpec,
+    ODesignSamplingOutput,
 )
-from .pipeline import ODesignPipeline
+from .pipeline import ODesignDesignCandidate, ODesignDesignResult, ODesignPipeline
 from .processor import ODesignProcessor, from_design_mask, to_design_mask
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.odesign",
     model=ODesignModel,
     processor=ODesignProcessor,
-    processor_config=ODesignProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.odesign",
     pipeline=ODesignPipeline,
-    tasks=("design",),
-    repository_loader=ODesignPipeline.from_repository,
 )

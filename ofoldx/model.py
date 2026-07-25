@@ -4,15 +4,13 @@ Common lifecycle for registered OFoldX models.
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 import chanfig
-import torch
 from torch import nn
 from typing_extensions import Self
 
-#: Backend request accepted by [`Model.set_backend`][].
-ModelBackend = Literal["auto", "eager", "oops"]
+from .modules.backend.resolve import Backend, PUBLIC_BACKENDS
 
 
 class Model(nn.Module):
@@ -25,14 +23,14 @@ class Model(nn.Module):
 
     config_class: ClassVar[type[chanfig.Config]]
     config: chanfig.Config
-    backend: ModelBackend
+    backend: Backend
 
     def __init__(self, config: chanfig.Config) -> None:
         super().__init__()
         self.config = config
         self.backend = "auto"
 
-    def post_init(self, *, backend: ModelBackend = "auto") -> None:
+    def post_init(self, *, backend: Backend = "auto") -> None:
         r"""
         Initialize model parameters and select a backend.
 
@@ -54,40 +52,7 @@ class Model(nn.Module):
         unchanged. Subclasses may override it for architecture-specific rules.
         """
 
-    @property
-    def device(self) -> torch.device:
-        r"""
-        Return the device of this model's parameters or buffers.
-
-        Returns:
-            The first parameter or buffer device, or CPU when the model has neither.
-        """
-
-        for tensor in self.parameters():
-            return tensor.device
-        for tensor in self.buffers():
-            return tensor.device
-        return torch.device("cpu")
-
-    @property
-    def dtype(self) -> torch.dtype:
-        r"""
-        Return the floating-point dtype used by this model.
-
-        Returns:
-            The first floating-point or complex parameter or buffer dtype, or the
-            default PyTorch dtype when the model has neither.
-        """
-
-        for tensor in self.parameters():
-            if tensor.is_floating_point() or tensor.is_complex():
-                return tensor.dtype
-        for tensor in self.buffers():
-            if tensor.is_floating_point() or tensor.is_complex():
-                return tensor.dtype
-        return torch.get_default_dtype()
-
-    def set_backend(self, backend: ModelBackend) -> Self:
+    def set_backend(self, backend: Backend) -> Self:
         r"""
         Select the backend used by dispatched model operators.
 
@@ -102,13 +67,13 @@ class Model(nn.Module):
             ValueError: If ``backend`` is not supported.
         """
 
-        if backend not in ("auto", "eager", "oops"):
-            raise ValueError("backend must be exactly one of: auto, eager, oops")
+        if backend not in PUBLIC_BACKENDS:
+            raise ValueError("backend must be exactly one of: auto, eager, sdpa, oops, cueq, apex, deepspeed")
         self._set_backend(backend)
         self.backend = backend
         return self
 
-    def _set_backend(self, backend: ModelBackend) -> None:
+    def _set_backend(self, backend: Backend) -> None:
         for module in self.modules():
             if module is not self and hasattr(module, "backend"):
                 module.backend = backend

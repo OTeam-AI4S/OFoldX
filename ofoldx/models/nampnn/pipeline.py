@@ -13,6 +13,7 @@ from torch import Tensor
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference
 from ...data.structure import Structure
+from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, ScoreResult
 from .model import NaMpnnModel
@@ -63,8 +64,9 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             A ``DesignResult`` containing candidates in sampling order.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             conditions=conditions,
             symmetry_groups=symmetry_groups,
@@ -91,6 +93,40 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         num_decoding_orders: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
+    ) -> ScoreResult:
+        r"""
+        Score a mixed-polymer sequence over independently drawn decoding orders.
+
+        Args:
+            input: A ``Structure`` or local structure path.
+            sequence: Optional replacement sequence to evaluate.
+            design_positions: Residue occurrences included in the designed-sequence score.
+            num_decoding_orders: Number of independently sampled decoding orders.
+            seed: Optional integer seed; mutually exclusive with ``generator``.
+            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
+
+        Returns:
+            A ``ScoreResult`` containing designed and global sequence NLL scores.
+        """
+
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(structure, sequence=sequence, design_positions=design_positions)
+        generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
+        return self.model.score(
+            model_input,
+            num_decoding_orders=num_decoding_orders,
+            generator=generator,
+        )
+
+    def autoregressive_probabilities(
+        self,
+        input: Structure | str | PathLike[str],
+        *,
+        sequence: str | Mapping[str, str | Sequence[str]] | None = None,
+        design_positions: Sequence[ComponentReference] | None = None,
+        num_decoding_orders: int = 1,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
         Return sequence-conditioned autoregressive probabilities over decoding orders.
@@ -107,9 +143,10 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             An ``MpnnProbabilityResult`` whose leading axis follows decoding-order draw order.
         """
 
-        model_input = self.processor(input, sequence=sequence, design_positions=design_positions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(structure, sequence=sequence, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
-        return self.model.score(
+        return self.model.autoregressive_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
             generator=generator,
@@ -134,7 +171,8 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             An ``MpnnProbabilityResult`` with one probability tensor per evaluation.
         """
 
-        model_input = self.processor(input, design_positions=design_positions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(structure, design_positions=design_positions)
         return self.model.unconditional_probabilities(
             model_input,
             num_decoding_orders=num_decoding_orders,
@@ -173,8 +211,9 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             A ``ScoreResult`` containing per-residue base-probability metrics.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             conditions=conditions,
             symmetry_groups=symmetry_groups,

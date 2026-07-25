@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from os import PathLike
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -18,24 +20,75 @@ from ...data.conditions import Hotspot
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence, is_water_component
 from ...data.structure import Structure
+from ...io.msa import read_msa
+from ...io.structure import read_structure
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
     AMINO_ACID_UNKNOWN_TOKEN,
 )
 from ...pipelines import CompositePair, CompositePipeline, resolve_generator
-from ...results import Score
+from ...results import Score, best
 from ..ligandmpnn import LigandMpnnPipeline
 from ..proteinmpnn import ProteinMpnnPipeline
 from .model import (
-    ODesignDesignCandidate,
-    ODesignDesignResult,
     ODesignInput,
     ODesignModel,
     ODesignPlacements,
     ODesignReferenceCoordinates,
 )
 from .processor import ODesignProcessor
+
+
+@dataclass(eq=False)
+class ODesignDesignCandidate:
+    r"""
+    One ODesign sample and its aligned scientific values.
+
+    Args:
+        structure: Designed molecular structure.
+        scores: Scalar scores keyed by stable scientific names.
+        seed_index: Zero-based generation-seed index.
+        backbone_index: Zero-based backbone index within the seed.
+        sequence_index: Zero-based sequence index within the backbone.
+    """
+
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
+    seed_index: int = 0
+    backbone_index: int = 0
+    sequence_index: int = 0
+
+
+@dataclass(eq=False)
+class ODesignDesignResult:
+    r"""
+    The seed-by-backbone-by-sequence ODesign result.
+
+    Args:
+        candidates: Candidates ordered by seed, backbone, then sequence.
+        num_seeds: Number of generation seeds.
+        num_backbones: Number of sampled backbones per seed.
+        num_sequences: Number of sequence variants per backbone.
+    """
+
+    candidates: tuple[ODesignDesignCandidate, ...]
+    num_seeds: int
+    num_backbones: int
+    num_sequences: int
+
+    def best(self, score: str) -> ODesignDesignCandidate:
+        r"""
+        Return the earliest best candidate under a named score.
+
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
+        """
+
+        return best(self.candidates, score)
 
 
 class ODesignPipeline(CompositePipeline):
@@ -74,7 +127,6 @@ class ODesignPipeline(CompositePipeline):
         *,
         placement: ODesignPlacements | None = None,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        num_candidates: int | None = None,
         num_seeds: int = 1,
         num_backbones: int = 1,
         num_sequences: int = 1,
@@ -94,8 +146,6 @@ class ODesignPipeline(CompositePipeline):
             input: Optional target or context system, structure, or local structure path.
             placement: Optional topology of existing and generated molecular segments.
             msa: Optional MSA evidence or alignment path.
-            num_candidates: Alias for ``num_backbones``. ``None`` leaves
-                ``num_backbones`` unchanged.
             num_seeds: Number of random generation streams when ``seeds`` is not supplied.
             num_backbones: Number of diffusion backbones generated per seed.
             num_sequences: Number of sequence variants assigned to each backbone.
@@ -118,11 +168,9 @@ class ODesignPipeline(CompositePipeline):
             then sequence. Structure coordinates are in angstroms.
         """
 
+        if seeds is not None and (seed is not None or generator is not None):
+            raise ValueError("seeds cannot be combined with seed or generator")
         generator = resolve_generator(seed, generator)
-        if num_candidates is not None:
-            # Standard single-axis entry: map the OFoldX design count onto the primary
-            # backbone-generation axis (see the method docstring).
-            num_backbones = num_candidates
         if num_seeds <= 0 or num_backbones <= 0 or num_sequences <= 0:
             raise ValueError("num_seeds, num_backbones, and num_sequences must be positive")
 
@@ -146,8 +194,7 @@ class ODesignPipeline(CompositePipeline):
                     "ODesign protein sequence assignment requires at least one designable protein position"
                 )
 
-            for backbone_index, backbone in enumerate(backbones.candidates):
-                structure = backbone.structure
+            for backbone_index, structure in enumerate(backbones):
                 used_ligand = _has_atom_context(structure.system)
                 chain_variants = []
                 for positions in design_chains:
@@ -234,13 +281,23 @@ class ODesignPipeline(CompositePipeline):
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates],
         receptor_mode: Literal["rigid", "flex"] | None,
     ) -> ODesignInput:
-        return self.processor(
-            input,
-            placement=placement,
-            msa=msa,
-            conditions=conditions,
-            receptor_mode=receptor_mode,
-        )
+        canonical_input: MolecularSystem | Structure | None
+        if isinstance(input, str | PathLike):
+            canonical_input = read_structure(Path(input).expanduser())
+        else:
+            canonical_input = input
+        plan = self.processor._plan(canonical_input, placement, conditions)
+        canonical_msa: MSA | MSACollection | None
+        if isinstance(msa, str | PathLike):
+            polymers = [
+                entity_id for entity_id, entity in plan.system.entities.items() if isinstance(entity, PolymerSequence)
+            ]
+            if len(polymers) != 1:
+                raise ValueError("a FASTA MSA path is unambiguous only for a single-polymer system; pass MSACollection")
+            canonical_msa = read_msa(msa, entity_id=polymers[0])
+        else:
+            canonical_msa = msa
+        return self.processor._lower(plan, canonical_msa, receptor_mode)
 
 
 # ODesign pipeline implementation helpers.

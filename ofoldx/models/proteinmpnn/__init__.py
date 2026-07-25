@@ -18,16 +18,12 @@ from .model import (
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
-    processor_config=ProteinMpnnProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.proteinmpnn",
     pipeline=ProteinMpnnPipeline,
-    tasks=("design", "score"),
-    architectures=("ofoldx.proteinmpnn",),
 )

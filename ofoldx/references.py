@@ -23,7 +23,9 @@ def classify_reference(reference: str | PathLike[str]) -> Path | str:
 
     if isinstance(reference, str):
         path = Path(reference)
-        if path.exists() or reference.startswith(("/", "./", "../", "~")) or bool(PureWindowsPath(reference).anchor):
+        if reference and (
+            path.exists() or reference.startswith(("/", "./", "../", "~")) or bool(PureWindowsPath(reference).anchor)
+        ):
             return path.expanduser()
         return reference
 

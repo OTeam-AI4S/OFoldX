@@ -24,29 +24,21 @@ from .model import (
 from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline
 from .processor import ProtenixConstraintProcessor, ProtenixProcessor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.protenix",
     model=ProtenixModel,
     processor=ProtenixProcessor,
-    processor_config=ProtenixProcessorConfig,
-    standard_tasks=("fold",),
 )
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.protenix_constraint",
     model=ProtenixConstraintModel,
     processor=ProtenixConstraintProcessor,
-    processor_config=ProtenixConstraintProcessorConfig,
-    standard_tasks=("fold",),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.protenix",
     pipeline=ProtenixPipeline,
-    tasks=("fold",),
-    architectures=("ofoldx.protenix",),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.protenix_constraint",
     pipeline=ProtenixConstraintPipeline,
-    tasks=("fold",),
-    architectures=("ofoldx.protenix_constraint",),
 )

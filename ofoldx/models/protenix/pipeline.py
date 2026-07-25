@@ -6,13 +6,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from os import PathLike
+from pathlib import Path
 
 import torch
 
-from ...data.evidence import MSA, MSACollection, Template
+from ...data.evidence import MSA, MSACollection
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...io import read_fasta_records, read_msa, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
+from ...references import classify_reference
 from ...results import FoldResult
 from .model import (
     ProtenixAtomContact,
@@ -21,7 +24,14 @@ from .model import (
     ProtenixPocket,
     ProtenixTokenContact,
 )
-from .processor import ProtenixConstraintProcessor, ProtenixProcessor
+from .processor import (
+    ProtenixConstraintProcessor,
+    ProtenixProcessor,
+    molecular_system_from_input,
+    molecular_system_from_named_sequences,
+)
+
+_FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
 
 
 class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
@@ -34,7 +44,6 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template | str | PathLike[str]] = (),
         num_samples: int | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
@@ -48,7 +57,6 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
             input: Inline sequence, FASTA or structure path, polymer sequence collection,
                 molecular system, or structure topology.
             msa: Optional MSA value, collection, or alignment path.
-            templates: Reserved template evidence; this architecture requires an empty sequence.
             num_samples: Number of structure predictions. ``None`` uses five.
             seed: Optional seed for preprocessing, MSA subsampling, and
                 coordinate diffusion. Mutually exclusive with ``generator``.
@@ -64,10 +72,11 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
+        canonical_input = _canonical_input(input)
+        system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
         model_input = self.processor(
-            input,
-            msa=msa,
-            templates=templates,
+            canonical_input,
+            msa=_canonical_msa(msa, system),
             generator=generator,
         )
         return self.model.fold(
@@ -92,7 +101,6 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         token_contacts: Sequence[ProtenixTokenContact] = (),
         pocket: ProtenixPocket | None = None,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template | str | PathLike[str]] = (),
         num_samples: int | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
@@ -109,7 +117,6 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             token_contacts: Upper-bound constraints between token-level endpoints.
             pocket: Optional directed binder-to-residue pocket constraint.
             msa: Optional MSA value, collection, or alignment path.
-            templates: Reserved template evidence; this architecture requires an empty sequence.
             num_samples: Number of structure predictions. ``None`` uses five.
             seed: Optional seed for preprocessing, MSA subsampling, and
                 coordinate diffusion. Mutually exclusive with ``generator``.
@@ -125,13 +132,14 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
+        canonical_input = _canonical_input(input)
+        system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
         model_input = self.processor(
-            input,
+            canonical_input,
             atom_contacts=atom_contacts,
             token_contacts=token_contacts,
             pocket=pocket,
-            msa=msa,
-            templates=templates,
+            msa=_canonical_msa(msa, system),
             generator=generator,
         )
         return self.model.fold(
@@ -141,3 +149,50 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
         )
+
+
+def _canonical_input(
+    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+) -> MolecularSystem | Structure:
+    r"""
+    Resolve Protenix's inline-sequence, FASTA, and structure conveniences.
+    """
+
+    if not isinstance(input, str | PathLike):
+        if isinstance(input, MolecularSystem | Structure):
+            return input
+        return molecular_system_from_input(input)
+    classified = classify_reference(input)
+    if not isinstance(classified, Path):
+        sequence = PolymerSequence.from_one_letter(classified.strip().upper())
+        return molecular_system_from_named_sequences((("protein", sequence),))
+    if any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
+        sequences = tuple(
+            (
+                record.id or f"chain_{index + 1}",
+                PolymerSequence.from_one_letter(record.sequence.strip().upper()),
+            )
+            for index, record in enumerate(read_fasta_records(classified))
+        )
+        return molecular_system_from_named_sequences(sequences)
+    return read_structure(classified)
+
+
+def _canonical_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""
+    Read a path MSA against the only unambiguous protein entity.
+    """
+
+    if not isinstance(msa, str | PathLike):
+        return msa
+    proteins = [
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    ]
+    if len(proteins) != 1:
+        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")
+    return read_msa(Path(msa).expanduser(), entity_id=proteins[0])

@@ -5,8 +5,6 @@ NA-MPNN input processing.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from os import PathLike
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -15,7 +13,6 @@ from torch import Tensor
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io.structure import read_structure
 from ...processor import Processor
 from .config import NaMpnnProcessorConfig
 from .model import (
@@ -63,6 +60,8 @@ class NaMpnnProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = NaMpnnProcessorConfig
+
     def __init__(
         self,
         config: NaMpnnProcessorConfig | None = None,
@@ -75,7 +74,7 @@ class NaMpnnProcessor(Processor):
 
     def __call__(
         self,
-        input: Structure | str | PathLike[str],
+        structure: Structure,
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
@@ -90,7 +89,7 @@ class NaMpnnProcessor(Processor):
         Prepare one mixed-polymer structure for scoring or sequence design.
 
         Args:
-            input: A ``Structure`` or local structure path.
+            structure: Coordinate-bearing mixed-polymer structure.
             sequence: Optional replacement sequence selecting the scoring arm. A bare string
                 requires one polymer instance; a mapping addresses instances explicitly.
             design_positions: Residue occurrences to evaluate or design. ``None`` selects every
@@ -106,7 +105,8 @@ class NaMpnnProcessor(Processor):
             A single-example ``NaMpnnInput`` with aligned structure, residue, and condition axes.
         """
 
-        structure = self._read(input)
+        if not isinstance(structure, Structure):
+            raise TypeError("NaMpnnProcessor requires a Structure")
         rows = self._lower_rows(structure)
         if sequence is not None:
             return self._process_score(structure, rows, sequence=sequence, design_positions=design_positions)
@@ -125,13 +125,6 @@ class NaMpnnProcessor(Processor):
     # ------------------------------------------------------------------
     # Shared lowering.
     # ------------------------------------------------------------------
-    def _read(self, input: Structure | str | PathLike[str]) -> Structure:
-        if isinstance(input, (str, PathLike)):
-            input = read_structure(Path(input).expanduser())
-        if not isinstance(input, Structure):
-            raise TypeError("NaMpnnProcessor input must be a Structure, string, or PathLike")
-        return input
-
     def _polymer_type(self, entity: PolymerSequence, component_id: str) -> str:
         if entity.polymer_type in ("protein", "dna", "rna"):
             return entity.polymer_type

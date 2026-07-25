@@ -10,6 +10,8 @@ from .tasks import (
     MSAInput,
     PackInput,
     ScoreInput,
+    TASKS,
+    Task,
     TemplateInput,
     design,
     fold,

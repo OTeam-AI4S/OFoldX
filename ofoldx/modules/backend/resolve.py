@@ -5,12 +5,16 @@ Backend selection and validation.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Literal, get_args
 
 from torch import Tensor
 
 from ._oops import OOPS_AVAILABLE
 
-PUBLIC_BACKENDS = frozenset({"auto", "eager", "sdpa", "oops", "cueq", "apex", "deepspeed"})
+#: Backend request shared by Models and dispatched operators.
+Backend = Literal["auto", "eager", "sdpa", "oops", "cueq", "apex", "deepspeed"]
+#: All public backend requests.
+PUBLIC_BACKENDS = frozenset(get_args(Backend))
 
 
 def oops_available() -> bool:

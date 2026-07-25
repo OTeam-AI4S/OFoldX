@@ -20,15 +20,16 @@ def outer_product_mean(
     msa: Tensor,
     msa_mask: Tensor | None,
     *,
-    norm_weight: Tensor,
-    norm_bias: Tensor,
+    msa_norm_weight: Tensor,
+    msa_norm_bias: Tensor,
     proj_left_weight: Tensor,
     proj_right_weight: Tensor,
     proj_out_weight: Tensor,
     proj_out_bias: Tensor,
-    norm_eps: float,
+    msa_norm_eps: float,
     denom_eps: float,
     divide_before_projection: bool,
+    clamp_denominator: bool,
     backend: str,
     proj_left_bias: Tensor | None = None,
     proj_right_bias: Tensor | None = None,
@@ -40,16 +41,17 @@ def outer_product_mean(
     Args:
         msa: ``(B, S, N, msa_size)`` MSA representation.
         msa_mask: Optional ``(B, S, N)`` mask zeroing invalid rows and counting valid pairs.
-        norm_weight: LayerNorm weight for the pre-normalization.
-        norm_bias: LayerNorm bias for the pre-normalization.
+        msa_norm_weight: LayerNorm weight for the pre-normalization.
+        msa_norm_bias: LayerNorm bias for the pre-normalization.
         proj_left_weight: Left projection weight.
         proj_right_weight: Right projection weight.
         proj_out_weight: Output projection weight.
         proj_out_bias: Output projection bias.
-        norm_eps: Epsilon used by the pre-normalization.
+        msa_norm_eps: Epsilon used by the pre-normalization.
         denom_eps: Epsilon added to the per-pair count in the divide-after-projection branch.
         divide_before_projection: When ``True`` divide by ``count.clamp(min=1)`` before projecting,
             otherwise project then divide by ``count + denom_eps``.
+        clamp_denominator: Whether to clamp the post-projection denominator to at least one.
         backend: Operator provider; see [ofoldx.modules.backend][].
         proj_left_bias: Optional left projection bias; ``None`` keeps the projection bias-free.
         proj_right_bias: Optional right projection bias; ``None`` keeps the projection bias-free.
@@ -68,20 +70,28 @@ def outer_product_mean(
         return _oops_outer_product_mean(
             msa,
             msa_mask,
-            norm_weight=norm_weight,
-            norm_bias=norm_bias,
+            msa_norm_weight=msa_norm_weight,
+            msa_norm_bias=msa_norm_bias,
             proj_left_weight=proj_left_weight,
             proj_right_weight=proj_right_weight,
             proj_out_weight=proj_out_weight,
             proj_left_bias=proj_left_bias,
             proj_right_bias=proj_right_bias,
             proj_out_bias=proj_out_bias,
-            eps=norm_eps,
+            msa_norm_eps=msa_norm_eps,
             denom_eps=denom_eps,
             divide_before_projection=divide_before_projection,
+            clamp_denominator=clamp_denominator,
         )
 
-    msa = layer_norm(msa, (msa.shape[-1],), norm_weight, norm_bias, norm_eps, backend=backend)
+    msa = layer_norm(
+        msa,
+        (msa.shape[-1],),
+        msa_norm_weight,
+        msa_norm_bias,
+        msa_norm_eps,
+        backend=backend,
+    )
     left = torch.nn.functional.linear(msa, proj_left_weight, proj_left_bias)
     right = torch.nn.functional.linear(msa, proj_right_weight, proj_right_bias)
     if msa_mask is None:
@@ -95,4 +105,7 @@ def outer_product_mean(
     count = torch.einsum("...si,...sj->...ij", msa_mask, msa_mask).unsqueeze(-1)
     if divide_before_projection:
         return torch.nn.functional.linear(outer / count.clamp(min=1), proj_out_weight, proj_out_bias)
-    return torch.nn.functional.linear(outer, proj_out_weight, proj_out_bias) / (count + denom_eps)
+    denominator = count + denom_eps
+    if clamp_denominator:
+        denominator = denominator.clamp_min(1)
+    return torch.nn.functional.linear(outer, proj_out_weight, proj_out_bias) / denominator

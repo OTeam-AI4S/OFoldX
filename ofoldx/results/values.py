@@ -43,7 +43,7 @@ class Score:
 
 class Scored(Protocol):
     r"""
-    Public structural contract for a result item carrying named scores.
+    Structural contract for a result item carrying named scores.
     """
 
     @property

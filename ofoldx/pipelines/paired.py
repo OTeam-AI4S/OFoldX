@@ -13,6 +13,7 @@ import torch
 from typing_extensions import Self
 
 from ..artifacts import SaveableModel, save_model
+from ..hub import load_model, load_processor, resolve_repository
 from ..model import Model
 from ..processor import Processor
 from .generator import PipelineProcessor
@@ -34,6 +35,38 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
     def __init__(self, *, model: _ModelT, processor: _ProcessorT) -> None:
         self.model = model
         self.processor = processor
+
+    @classmethod
+    def from_repository(
+        cls,
+        repository: str | PathLike[str],
+        *,
+        revision: str | None = None,
+        token: str | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        r"""
+        Load the registered model-processor pair from one repository snapshot.
+
+        Args:
+            repository: Local directory or Hugging Face Hub repository ID.
+            revision: Optional Hub revision.
+            token: Optional Hub authentication token.
+            device: Device for the loaded model and processor.
+            dtype: Floating-point dtype for the loaded model and processor.
+
+        Returns:
+            A pipeline bound to the loaded pair.
+        """
+
+        resolved = resolve_repository(repository, revision=revision, token=token)
+        processor = load_processor(resolved, device=device, dtype=dtype)
+        model = load_model(resolved, device=device, dtype=dtype, token=token)
+        return cls(
+            model=cast(_ModelT, model),
+            processor=cast(_ProcessorT, processor),
+        )
 
     def to(
         self,
@@ -66,7 +99,7 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         commit_message: str | None = None,
     ) -> None:
         r"""
-        Save the pair and optional pipeline marker, then upload when requested.
+        Save the registered pair and pipeline marker, then upload when requested.
 
         Args:
             directory: Local repository directory.
@@ -78,14 +111,15 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         """
 
         pipeline_id = PIPELINES.id_for(type(self))
+        if pipeline_id is None:
+            raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
         save_model(
             directory,
             model=cast(Model, self.model),
             processor=cast(Processor, self.processor),
             max_shard_size=max_shard_size,
         )
-        if pipeline_id is not None:
-            chanfig.NestedDict({"pipeline": pipeline_id}).dump(Path(directory).expanduser() / "pipeline.json")
+        chanfig.NestedDict({"pipeline": pipeline_id}).dump(Path(directory).expanduser() / "pipeline.json")
         if repo_id is not None:
             from ..hub import upload_repository
 

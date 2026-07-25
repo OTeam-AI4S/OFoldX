@@ -26,6 +26,7 @@ class AtomRecord:
         group: PDB-style ``ATOM`` or ``HETATM`` record category.
         serial: Source atom serial when present.
         element: Chemical element symbol.
+        isotope: Isotope mass number when the source element identifies one.
         charge: Formal charge when present.
         atom_name: Label atom identifier.
         component_id: Label component identifier.
@@ -51,6 +52,7 @@ class AtomRecord:
     group: Literal["ATOM", "HETATM"]
     serial: str | None
     element: str
+    isotope: int | None
     charge: int | None
     atom_name: str
     component_id: str
@@ -187,7 +189,10 @@ def atom_records_from_array(
 
     rows: list[AtomRecord] = []
     for index in range(length):
-        chain_id = present_string(_at(label_asym_ids, index)) or present_string(array.chain_id[index]) or "_"
+        if format_name == "pdb":
+            chain_id = str(array.chain_id[index]).strip()
+        else:
+            chain_id = present_string(_at(label_asym_ids, index)) or present_string(array.chain_id[index]) or "_"
         label_seq_id = optional_integer(_at(label_seq_ids, index))
         residue_id = label_seq_id
         if residue_id is None:
@@ -214,12 +219,21 @@ def atom_records_from_array(
         charge = optional_integer(_at(charges, index))
         if format_name == "pdb" and charge == 0:
             charge = None
+        element = str(array.element[index]).strip().capitalize()
+        isotope = None
+        if element == "D":
+            element = "H"
+            isotope = 2
+        elif element == "T":
+            element = "H"
+            isotope = 3
         rows.append(
             AtomRecord(
                 row_index=index,
                 group="HETATM" if bool(array.hetero[index]) else "ATOM",
                 serial=present_string(_at(atom_serials, index)),
-                element=str(array.element[index]).strip().capitalize(),
+                element=element,
+                isotope=isotope,
                 charge=charge,
                 atom_name=str(array.atom_name[index]),
                 component_id=str(array.res_name[index]),
@@ -434,7 +448,7 @@ def unique_identifier(seed: str, used: set[str]) -> str:
         The reserved identifier, with a numeric suffix when needed.
     """
 
-    candidate = seed or "_"
+    candidate = seed
     suffix = 2
     while candidate in used:
         candidate = f"{seed}_{suffix}"

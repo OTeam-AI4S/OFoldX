@@ -1,5 +1,5 @@
 r"""
-Concrete conditioned-transformer equations.
+Concrete conditioned Transformer-encoder equations.
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ from .attention.multihead import GatedMultiheadAttention
 from .transition import ConditionedTransition
 
 
-class ConditionedTransformer(nn.Module):
+class ConditionedTransformerEncoder(nn.Module):
     r"""
-    Homogeneous triple-product conditioned self-attention blocks.
+    Homogeneous triple-product conditioned Transformer-encoder blocks.
     """
 
     def __init__(
@@ -30,7 +30,7 @@ class ConditionedTransformer(nn.Module):
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
-            ConditionedTransformerBlock(
+            ConditionedTransformerEncoderBlock(
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
@@ -50,9 +50,9 @@ class ConditionedTransformer(nn.Module):
         return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
 
 
-class DenoisingTransformer(nn.Module):
+class DenoisingTransformerEncoder(nn.Module):
     r"""
-    Homogeneous double-product conditioned self-attention blocks.
+    Homogeneous double-product conditioned Transformer-encoder blocks.
     """
 
     def __init__(
@@ -67,7 +67,7 @@ class DenoisingTransformer(nn.Module):
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
-            DenoisingTransformerBlock(
+            DenoisingTransformerEncoderBlock(
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
@@ -159,9 +159,9 @@ class NormalizedKeyAtomCrossAttentionTransformer(nn.Module):
         return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
 
 
-class ConditionedTransformerBlock(nn.Module):
+class ConditionedTransformerEncoderBlock(nn.Module):
     r"""
-    Pair-biased self-attention followed by a triple-product conditioned transition.
+    Pair-biased encoder self-attention followed by a triple-product conditioned transition.
     """
 
     def __init__(
@@ -211,9 +211,9 @@ class ConditionedTransformerBlock(nn.Module):
         return hidden + self.transition(hidden, conditioning)
 
 
-class DenoisingTransformerBlock(nn.Module):
+class DenoisingTransformerEncoderBlock(nn.Module):
     r"""
-    Pair-biased self-attention followed by a double-product conditioned transition.
+    Pair-biased encoder self-attention followed by a double-product conditioned transition.
     """
 
     def __init__(
@@ -264,7 +264,7 @@ class DenoisingTransformerBlock(nn.Module):
         return hidden + self.transition(hidden, conditioning)
 
 
-class AtomCrossAttentionTransformerBlock(DenoisingTransformerBlock):
+class AtomCrossAttentionTransformerBlock(DenoisingTransformerEncoderBlock):
     r"""
     Double-product atom cross-attention with independently normalized raw keys.
     """

@@ -34,9 +34,11 @@ class PairwiseConditioning(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.init_projection = nn.Sequential(
-            LayerNorm(pair_size + relative_position_size, backend=backend),
-            nn.Linear(pair_size + relative_position_size, pair_size, bias=False),
+        self.input_norm = LayerNorm(pair_size + relative_position_size, backend=backend)
+        self.input_projection = nn.Linear(
+            pair_size + relative_position_size,
+            pair_size,
+            bias=False,
         )
         self.transitions = nn.ModuleList(
             Transition(pair_size, expansion=expansion, backend=backend) for _ in range(num_transitions)
@@ -58,8 +60,8 @@ class PairwiseConditioning(nn.Module):
         return condition_pair(
             pair_trunk,
             relative_position_encoding,
-            norm=self.init_projection[0],
-            projection=self.init_projection[1],
+            norm=self.input_norm,
+            projection=self.input_projection,
             transitions=self.transitions,
         )
 

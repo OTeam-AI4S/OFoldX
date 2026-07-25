@@ -1,28 +1,10 @@
 r"""
-Fixtures for the public task-API surface (registry, pipelines, repository round-trip).
-
-The registrations these tests exercise live in the registry objects
-(``ofoldx.models.registry.MODELS`` and ``ofoldx.pipelines.registry.PIPELINES``). A test that
-registers a synthetic architecture would otherwise leak it into every later test in the process, so
-``_isolate_registries`` snapshots and restores those mappings around each test -- exactly the pattern the
-suite already uses for the global RNG in ``tests/conftest.py``.
-
-The synthetic Model/Processor pair is deliberately tiny: one real ``nn.Parameter`` so the safetensors
-round-trip actually moves weights, a config-less Processor, and four task methods that record the
-keyword arguments the Pipeline forwarded. Recording the forwarded kwargs is what lets the generator
-boundary tests prove that ``seed`` is resolved at the Pipeline and never reaches the model graph.
+Registry isolation for public task-API tests.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import chanfig
 import pytest
-import torch
-from torch import nn
-
-from ofoldx import Model
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +22,6 @@ def _isolate_registries():
         model_registry.MODELS.by_pair,
         pipeline_registry.PIPELINES,
         pipeline_registry.PIPELINES.ids,
-        pipeline_registry.PIPELINES.by_architecture,
     )
     snapshots = [dict(table) for table in tables]
     try:
@@ -49,76 +30,3 @@ def _isolate_registries():
         for table, snapshot in zip(tables, snapshots):
             dict.clear(table)
             dict.update(table, snapshot)
-
-
-def _build_tiny_classes():
-    r"""
-    Create a fresh, uniquely-typed synthetic Model/Processor/Config triple.
-    """
-
-    class TinyConfig(chanfig.Config):
-        r"""
-        A config that is just its own mapping of values.
-        """
-
-    class TinyProcessor:
-        r"""
-        A config-less Processor that yields a one-tensor carrier.
-        """
-
-        def __init__(self, *, device=None, dtype=None):
-            self.device = device
-            self.dtype = dtype
-            self.received = None
-
-        def __call__(self, input, **kwargs):
-            self.received = kwargs
-            return {"x": torch.zeros(1)}
-
-        def to(self, device=None, dtype=None):
-            self.device = device
-            self.dtype = dtype
-            return self
-
-    class TinyModel(Model):
-        r"""
-        A one-parameter Model whose task methods record what the Pipeline forwarded.
-        """
-
-        config_class = TinyConfig
-        config: TinyConfig
-
-        def __init__(self, config):
-            config = TinyConfig(dict(config))
-            super().__init__(config)
-            self.weight = nn.Parameter(torch.zeros(int(self.config.get("dim", 3))))
-            self.received = None
-
-        def _run(self, method, **kwargs):
-            # ``kwargs`` is exactly what the Pipeline chose to forward -- capturing all of it (rather
-            # than naming ``generator``) is what makes a leaked ``seed`` observable.
-            self.received = {"method": method, **kwargs}
-            return SimpleNamespace(**self.received)
-
-        def fold(self, inputs, **kwargs):
-            return self._run("fold", **kwargs)
-
-        def design(self, inputs, **kwargs):
-            return self._run("design", **kwargs)
-
-        def score(self, inputs, **kwargs):
-            return self._run("score", **kwargs)
-
-        def pack(self, inputs, **kwargs):
-            return self._run("pack", **kwargs)
-
-    return TinyConfig, TinyProcessor, TinyModel
-
-
-@pytest.fixture
-def tiny_classes():
-    r"""
-    Factory returning a fresh (TinyConfig, TinyProcessor, TinyModel) triple per call.
-    """
-
-    return _build_tiny_classes

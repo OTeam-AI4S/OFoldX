@@ -15,7 +15,7 @@ from ..trunk.msa import TrianglePairUpdateBlock
 from .factorized import FactorizedPairLinear
 
 
-@dataclass
+@dataclass(eq=False)
 class TemplateFeatures:
     r"""
     Template features consumed by [`TemplateEmbedder`][].
@@ -26,7 +26,7 @@ class TemplateFeatures:
         distogram: ``[..., num_templates, N_token, N_token, num_distogram_bins]`` template pair distogram
             features.
         pseudo_beta_mask: ``[..., num_templates, N_token, N_token]`` template pseudo-beta validity mask.
-        residue_type: Integer template residue type ids ``[..., num_templates, N_token]``.
+        residue_type_ids: Integer template residue type ids ``[..., num_templates, N_token]``.
         unit_vector: ``[..., num_templates, N_token, N_token, 3]`` template pair unit-vector features.
         backbone_frame_mask: ``[..., num_templates, N_token, N_token]`` template backbone-frame validity mask.
         template_mask: Optional ``[..., num_templates]`` per-template validity mask.
@@ -34,7 +34,7 @@ class TemplateFeatures:
 
     distogram: Tensor
     pseudo_beta_mask: Tensor
-    residue_type: Tensor
+    residue_type_ids: Tensor
     unit_vector: Tensor
     backbone_frame_mask: Tensor
     template_mask: Tensor | None = None
@@ -191,12 +191,12 @@ class TemplateEmbedder(nn.Module):
             geometric pair features and ``residue_one_hot`` is ``[..., N_token, vocab_size]``.
         """
         expected_residue_shape = templates.distogram.shape[:-2]
-        if templates.residue_type.shape != expected_residue_shape:
+        if templates.residue_type_ids.shape != expected_residue_shape:
             raise ValueError(
-                f"residue_type must have shape {expected_residue_shape}; got {templates.residue_type.shape}"
+                "residue_type_ids must have shape " f"{expected_residue_shape}; got {templates.residue_type_ids.shape}"
             )
-        residue_type = templates.residue_type[..., template_index, :]
-        residue_one_hot = F.one_hot(residue_type, num_classes=self.vocab_size).to(dtype=templates.distogram.dtype)
+        residue_type_ids = templates.residue_type_ids[..., template_index, :]
+        residue_one_hot = F.one_hot(residue_type_ids, num_classes=self.vocab_size).to(dtype=templates.distogram.dtype)
 
         geom = torch.cat(
             [

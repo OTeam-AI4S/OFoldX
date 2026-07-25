@@ -93,6 +93,8 @@ class AutoModel:
             The model declared by the repository metadata.
         """
 
+        if not isinstance(pretrained, str | PathLike):
+            raise TypeError("pretrained must be a repository reference")
         return cls(pretrained, revision=revision, token=token, device=device, dtype=dtype)
 
 
@@ -156,4 +158,6 @@ class AutoProcessor:
             The processor declared by the repository metadata.
         """
 
+        if not isinstance(pretrained, str | PathLike):
+            raise TypeError("pretrained must be a repository reference")
         return cast(Processor, cls(pretrained, revision=revision, token=token, device=device, dtype=dtype))

@@ -5,20 +5,17 @@ Input processing for Boltz-2 folding and affinity scoring.
 from __future__ import annotations
 
 import math
-from os import PathLike
-from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor
 
-from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
-from ...data.molecular import AtomSite, MolecularSystem, Molecule, PolymerSequence
+from ...data.evidence import MSA, MSACollection, Template, msa_bindings, resolve_msa_bindings
+from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...processor import Processor
-from .model import Boltz2Input, Boltz2Layout
+from .model import Boltz2Contact, Boltz2Input, Boltz2Layout, Boltz2Pocket
 
 if TYPE_CHECKING:
     from rdkit.Chem.rdchem import Mol
@@ -115,6 +112,11 @@ _MAX_TOKENS = 256
 _MAX_POLYMER_TOKENS = 200
 _MAX_ATOMS = 2048
 _CROP_NEIGHBORHOOD = 10
+_CONTACT_UNSPECIFIED = 0
+_CONTACT_UNSELECTED = 1
+_CONTACT_POCKET_TO_BINDER = 2
+_CONTACT_BINDER_TO_POCKET = 3
+_CONTACT_PAIR = 4
 
 
 class Boltz2AffinityProcessor(Processor):
@@ -136,20 +138,24 @@ class Boltz2AffinityProcessor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str],
+        input: MolecularSystem | Structure,
         *,
         ligand: str | None = None,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
+        contacts: Sequence[Boltz2Contact] = (),
+        pockets: Sequence[Boltz2Pocket] = (),
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
         r"""
         Prepare affinity features for one protein-ligand system.
 
         Args:
-            input: Molecular system, structure, or local structure path.
+            input: Molecular system or structure.
             ligand: Molecule instance scored by the affinity head. May be omitted for a system
                 containing exactly one molecule instance.
-            msa: Optional MSA value, collection, or alignment path.
+            msa: Optional MSA value or collection.
+            contacts: Learned pairwise contact conditions.
+            pockets: Learned binder-to-pocket conditions.
             generator: Optional generator for independent rigid transforms of reference
                 conformers.
 
@@ -158,10 +164,8 @@ class Boltz2AffinityProcessor(Processor):
             coordinates are in angstroms; tensor axes align to ``layout``.
         """
 
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         if not isinstance(input, MolecularSystem | Structure):
-            raise TypeError("Boltz2AffinityProcessor input must be a MolecularSystem, Structure, or structure path")
+            raise TypeError("Boltz2AffinityProcessor input must be a MolecularSystem or Structure")
 
         if isinstance(input, Structure):
             structure = input
@@ -195,13 +199,16 @@ class Boltz2AffinityProcessor(Processor):
         if ligand_atom_count > 128:
             raise ValueError("the affinity head supports at most 128 ligand atoms after removing hydrogens")
 
-        normalized_msa = _normalize_msa(msa, system)
+        if msa is not None:
+            resolve_msa_bindings(msa, system)
         return _prepare_boltz2_affinity_features(
             system,
             structure=structure,
             ligand=ligand,
             affinity_mw=affinity_mw,
-            msa=normalized_msa,
+            msa=msa,
+            contacts=contacts,
+            pockets=pockets,
             device=self.device,
             dtype=self.dtype,
             generator=generator,
@@ -227,17 +234,23 @@ class Boltz2Processor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str],
+        input: MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
+        templates: Sequence[Template] = (),
+        contacts: Sequence[Boltz2Contact] = (),
+        pockets: Sequence[Boltz2Pocket] = (),
         generator: torch.Generator | None = None,
     ) -> Boltz2Input:
         r"""
         Prepare folding features for one molecular system.
 
         Args:
-            input: Molecular system, structure, or local structure path.
-            msa: Optional MSA value, collection, or alignment path.
+            input: Molecular system or structure.
+            msa: Optional MSA value or collection.
+            templates: Structural protein templates with canonical residue alignments.
+            contacts: Learned pairwise contact conditions.
+            pockets: Learned binder-to-pocket conditions.
             generator: Optional generator for independent rigid transforms of reference
                 conformers.
 
@@ -246,10 +259,8 @@ class Boltz2Processor(Processor):
             angstroms; tensor axes align to ``layout``.
         """
 
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         if not isinstance(input, MolecularSystem | Structure):
-            raise TypeError("Boltz2Processor input must be a MolecularSystem, Structure, or structure path")
+            raise TypeError("Boltz2Processor input must be a MolecularSystem or Structure")
 
         if isinstance(input, Structure):
             structure = input
@@ -260,11 +271,15 @@ class Boltz2Processor(Processor):
         if not system.instances:
             raise ValueError("Boltz-2 requires at least one molecular instance")
 
-        normalized_msa = _normalize_msa(msa, system)
+        if msa is not None:
+            resolve_msa_bindings(msa, system)
         return _prepare_boltz2_structure_features(
             system,
             structure=structure,
-            msa=normalized_msa,
+            msa=msa,
+            templates=templates,
+            contacts=contacts,
+            pockets=pockets,
             device=self.device,
             dtype=self.dtype,
             generator=generator,
@@ -278,6 +293,8 @@ def _prepare_boltz2_affinity_features(
     ligand: str,
     affinity_mw: float,
     msa: MSA | MSACollection | None,
+    contacts: Sequence[Boltz2Contact],
+    pockets: Sequence[Boltz2Pocket],
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
@@ -465,6 +482,12 @@ def _prepare_boltz2_affinity_features(
     representative_atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     representative_atom_mask[token_to_rep_atom] = True
     token_bonds, type_bonds = _token_bond_features(system, site_to_token, token_count)
+    contact_conditioning, contact_threshold = _contact_features(
+        system,
+        tokens,
+        contacts=contacts,
+        pockets=pockets,
+    )
     msa_values = _msa_features(msa, tokens, system)
     molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
     residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
@@ -501,16 +524,13 @@ def _prepare_boltz2_affinity_features(
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,
-        "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+        "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
         "msa_profile": msa_values.pop("msa_profile"),
         "deletion_mean": msa_values.pop("deletion_mean"),
         "token_bonds": token_bonds,
         "type_bonds": type_bonds,
-        "contact_conditioning": torch.nn.functional.one_hot(
-            torch.zeros(token_count, token_count, dtype=torch.long),
-            5,
-        ),
-        "contact_threshold": torch.zeros(token_count, token_count),
+        "contact_conditioning": contact_conditioning,
+        "contact_threshold": contact_threshold,
         "molecule_type": molecule_types,
         "frame_atom_index": frame_atom_index,
         "frame_mask": frame_mask,
@@ -552,6 +572,9 @@ def _prepare_boltz2_structure_features(
     *,
     structure: Structure | None,
     msa: MSA | MSACollection | None,
+    templates: Sequence[Template],
+    contacts: Sequence[Boltz2Contact],
+    pockets: Sequence[Boltz2Pocket],
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
@@ -735,6 +758,13 @@ def _prepare_boltz2_structure_features(
     representative_atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     representative_atom_mask[token_to_rep_atom] = True
     token_bonds, type_bonds = _token_bond_features(system, site_to_token, token_count)
+    contact_conditioning, contact_threshold = _contact_features(
+        system,
+        tokens,
+        contacts=contacts,
+        pockets=pockets,
+    )
+    template_values = _template_features(system, tokens, templates)
     msa_values = _msa_features(msa, tokens, system)
     molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
     residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
@@ -771,16 +801,13 @@ def _prepare_boltz2_structure_features(
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,
-        "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+        "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
         "msa_profile": msa_values.pop("msa_profile"),
         "deletion_mean": msa_values.pop("deletion_mean"),
         "token_bonds": token_bonds,
         "type_bonds": type_bonds,
-        "contact_conditioning": torch.nn.functional.one_hot(
-            torch.zeros(token_count, token_count, dtype=torch.long),
-            5,
-        ),
-        "contact_threshold": torch.zeros(token_count, token_count),
+        "contact_conditioning": contact_conditioning,
+        "contact_threshold": contact_threshold,
         "molecule_type": molecule_types,
         "frame_atom_index": frame_atom_index,
         "frame_mask": frame_mask,
@@ -793,6 +820,7 @@ def _prepare_boltz2_structure_features(
         ),
         "cyclic_period": cyclic_period,
         **msa_values,
+        **template_values,
     }
     if structure is not None:
         tensor_values["target_positions"] = target_positions
@@ -813,6 +841,238 @@ def _prepare_boltz2_structure_features(
             affinity_instance_id=None,
         ),
     )
+
+
+def _contact_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    *,
+    contacts: Sequence[Boltz2Contact],
+    pockets: Sequence[Boltz2Pocket],
+) -> tuple[Tensor, Tensor]:
+    token_count = len(tokens)
+    token_by_site = {
+        cast(ComponentReference | AtomSite, token["token_site"]): token_index
+        for token_index, token in enumerate(tokens)
+    }
+    contact_class = torch.full(
+        (token_count, token_count),
+        _CONTACT_UNSELECTED,
+        dtype=torch.long,
+    )
+    threshold = torch.zeros(token_count, token_count)
+
+    # Pocket conditioning is directional and precedes exact contacts. A later
+    # contact therefore replaces both the class and threshold for an overlap.
+    for pocket in pockets:
+        binder_entity_id = system.instances[pocket.binder]
+        binder_tokens = [
+            token_index
+            for token_index, token in enumerate(tokens)
+            if token["instance_id"] == pocket.binder and token["entity_id"] == binder_entity_id
+        ]
+        for endpoint in pocket.contacts:
+            pocket_token = _condition_endpoint_token(system, token_by_site, endpoint)
+            if pocket_token is None:
+                continue
+            contact_class[binder_tokens, pocket_token] = _CONTACT_BINDER_TO_POCKET
+            contact_class[pocket_token, binder_tokens] = _CONTACT_POCKET_TO_BINDER
+            threshold[binder_tokens, pocket_token] = pocket.max_distance
+            threshold[pocket_token, binder_tokens] = pocket.max_distance
+
+    for contact in contacts:
+        token_a = _condition_endpoint_token(system, token_by_site, contact.endpoint_a)
+        token_b = _condition_endpoint_token(system, token_by_site, contact.endpoint_b)
+        if token_a is None or token_b is None:
+            continue
+        contact_class[token_a, token_b] = _CONTACT_PAIR
+        contact_class[token_b, token_a] = _CONTACT_PAIR
+        threshold[token_a, token_b] = contact.max_distance
+        threshold[token_b, token_a] = contact.max_distance
+
+    if bool((contact_class == _CONTACT_UNSELECTED).all()):
+        contact_class.fill_(_CONTACT_UNSPECIFIED)
+    return torch.nn.functional.one_hot(contact_class, 5), threshold
+
+
+def _condition_endpoint_token(
+    system: MolecularSystem,
+    token_by_site: dict[ComponentReference | AtomSite, int],
+    endpoint: ComponentReference | AtomSite,
+) -> int | None:
+    if isinstance(endpoint, AtomSite):
+        entity = system.entities[system.instances[endpoint.instance_id]]
+        system.atom(endpoint)
+        if isinstance(entity, PolymerSequence):
+            raise ValueError("Boltz-2 polymer contact endpoints must identify residues, not exact atoms")
+        return token_by_site.get(endpoint)
+
+    instance_id, component_index = endpoint
+    entity = system.entities[system.instances[instance_id]]
+    if not isinstance(entity, PolymerSequence):
+        raise ValueError("Boltz-2 non-polymer contact endpoints must identify exact atoms")
+    system.component(endpoint)
+    return token_by_site.get(endpoint)
+
+
+def _template_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    templates: Sequence[Template],
+) -> dict[str, Tensor]:
+    if not templates:
+        return {}
+
+    token_count = len(tokens)
+    token_by_residue = {
+        (cast(str, token["instance_id"]), cast(int, token["monomer_index"])): token_index
+        for token_index, token in enumerate(tokens)
+        if token["monomer_index"] is not None
+    }
+    tokens_by_instance: dict[str, list[int]] = {}
+    for token_index, token in enumerate(tokens):
+        tokens_by_instance.setdefault(cast(str, token["instance_id"]), []).append(token_index)
+
+    residue_type_rows: list[Tensor] = []
+    frame_rotation_rows: list[Tensor] = []
+    frame_translation_rows: list[Tensor] = []
+    frame_mask_rows: list[Tensor] = []
+    beta_carbon_position_rows: list[Tensor] = []
+    alpha_carbon_position_rows: list[Tensor] = []
+    beta_carbon_mask_rows: list[Tensor] = []
+    template_mask_rows: list[Tensor] = []
+    visibility_rows: list[Tensor] = []
+    identity = torch.eye(3)
+
+    for template_index, template in enumerate(templates):
+        residue_type = torch.zeros(token_count, dtype=torch.long)
+        frame_rotations = torch.zeros(token_count, 3, 3)
+        frame_translations = torch.zeros(token_count, 3)
+        frame_mask = torch.zeros(token_count)
+        beta_carbon_positions = torch.zeros(token_count, 3)
+        alpha_carbon_positions = torch.zeros(token_count, 3)
+        beta_carbon_mask = torch.zeros(token_count)
+        template_mask = torch.zeros(token_count)
+        visibility = torch.tensor(
+            [-1.0 - cast(int, token["chain_index"]) for token in tokens],
+        )
+        covered_instances: set[str] = set()
+        coordinate_index = {site: atom_index for atom_index, site in enumerate(template.structure.sites)}
+
+        for alignment in template.alignments:
+            target_entity = system.entities[alignment.target_entity_id]
+            if not isinstance(target_entity, PolymerSequence) or target_entity.polymer_type != "protein":
+                raise ValueError("Boltz-2 templates support only protein target alignments")
+
+            template_entity_id = template.structure.system.instances[alignment.template_instance_id]
+            template_entity = template.structure.system.entities[template_entity_id]
+            if not isinstance(template_entity, PolymerSequence) or template_entity.polymer_type != "protein":
+                raise ValueError("Boltz-2 templates support only protein template alignments")
+
+            if alignment.target_instance_id is None:
+                target_instances = tuple(
+                    instance_id
+                    for instance_id, entity_id in system.instances.items()
+                    if entity_id == alignment.target_entity_id
+                )
+            else:
+                if system.instances[alignment.target_instance_id] != alignment.target_entity_id:
+                    raise ValueError(
+                        f"template target instance {alignment.target_instance_id!r} does not belong to "
+                        f"entity {alignment.target_entity_id!r}"
+                    )
+                target_instances = (alignment.target_instance_id,)
+
+            for target_component_index, template_component_index in alignment.residue_pairs:
+                if target_component_index >= len(target_entity):
+                    raise IndexError(
+                        f"template target component index {target_component_index} is outside "
+                        f"entity {alignment.target_entity_id!r}"
+                    )
+                template_component = template_entity.components[template_component_index]
+                template_residue_type = _residue_type(template_component.component_id, "protein")
+                atom_values = {
+                    atom_id: _template_atom(
+                        template.structure,
+                        coordinate_index,
+                        AtomSite(
+                            alignment.template_instance_id,
+                            template_component_index,
+                            atom_id,
+                        ),
+                    )
+                    for atom_id in ("N", "CA", "C", "CB")
+                }
+                beta_atom = "CA" if template_component.component_id == "GLY" else "CB"
+
+                for target_instance in target_instances:
+                    target_token = token_by_residue.get((target_instance, target_component_index))
+                    if target_token is None:
+                        continue
+                    covered_instances.add(target_instance)
+                    residue_type[target_token] = template_residue_type
+                    template_mask[target_token] = 1
+                    frame_rotations[target_token] = identity
+
+                    alpha_carbon, alpha_carbon_present = atom_values["CA"]
+                    if alpha_carbon_present:
+                        alpha_carbon_positions[target_token] = alpha_carbon
+                    beta_carbon, beta_carbon_present = atom_values[beta_atom]
+                    if beta_carbon_present:
+                        beta_carbon_positions[target_token] = beta_carbon
+                        beta_carbon_mask[target_token] = 1
+
+                    nitrogen, nitrogen_present = atom_values["N"]
+                    carbon, carbon_present = atom_values["C"]
+                    if nitrogen_present and alpha_carbon_present and carbon_present:
+                        first = carbon - alpha_carbon
+                        first_axis = first / (torch.linalg.vector_norm(first) + 1e-10)
+                        second = nitrogen - alpha_carbon
+                        second = second - first_axis * torch.dot(first_axis, second)
+                        second_axis = second / (torch.linalg.vector_norm(second) + 1e-10)
+                        third_axis = torch.linalg.cross(first_axis, second_axis)
+                        frame_rotations[target_token] = torch.stack(
+                            (first_axis, second_axis, third_axis),
+                            dim=-1,
+                        )
+                        frame_translations[target_token] = alpha_carbon
+                        frame_mask[target_token] = 1
+
+        for instance_id in covered_instances:
+            visibility[tokens_by_instance[instance_id]] = float(template_index)
+
+        residue_type_rows.append(torch.nn.functional.one_hot(residue_type, 33))
+        frame_rotation_rows.append(frame_rotations)
+        frame_translation_rows.append(frame_translations)
+        frame_mask_rows.append(frame_mask)
+        beta_carbon_position_rows.append(beta_carbon_positions)
+        alpha_carbon_position_rows.append(alpha_carbon_positions)
+        beta_carbon_mask_rows.append(beta_carbon_mask)
+        template_mask_rows.append(template_mask)
+        visibility_rows.append(visibility)
+
+    return {
+        "template_residue_type_features": torch.stack(residue_type_rows),
+        "template_frame_rotations": torch.stack(frame_rotation_rows),
+        "template_frame_translations": torch.stack(frame_translation_rows),
+        "template_frame_mask": torch.stack(frame_mask_rows),
+        "template_beta_carbon_positions": torch.stack(beta_carbon_position_rows),
+        "template_alpha_carbon_positions": torch.stack(alpha_carbon_position_rows),
+        "template_beta_carbon_mask": torch.stack(beta_carbon_mask_rows),
+        "template_mask": torch.stack(template_mask_rows),
+        "template_visibility_index": torch.stack(visibility_rows),
+    }
+
+
+def _template_atom(
+    structure: Structure,
+    coordinate_index: dict[AtomSite, int],
+    site: AtomSite,
+) -> tuple[Tensor, bool]:
+    index = coordinate_index.get(site)
+    if index is None or not bool(structure.coordinate_mask[index]):
+        return torch.zeros(3), False
+    return torch.from_numpy(structure.coordinates[index].copy()).to(dtype=torch.float32), True
 
 
 def _affinity_crop(tokens: list[dict[str, object]], *, structure: Structure | None) -> list[int]:
@@ -1202,22 +1462,3 @@ def _residue_type(component_id: str, polymer_type: str) -> int:
     if polymer_type == "rna":
         return _RNA_RESIDUE_TYPES.get(component_id, 27)
     return _DNA_RESIDUE_TYPES.get(component_id, 32)
-
-
-def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    if msa is None:
-        return None
-    if isinstance(msa, MSA | MSACollection):
-        resolve_msa_bindings(msa, system)
-        return msa
-    proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA is unambiguous only for one protein entity; pass MSACollection")
-    return read_msa(msa, entity_id=proteins[0])

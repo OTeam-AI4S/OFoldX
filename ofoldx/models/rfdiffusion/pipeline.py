@@ -18,6 +18,7 @@ from ...data.conditions import AllowedResidueIdentities, Hotspot
 from ...data.evidence import Template
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
+from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from .model import (
     RfDiffusionCoordination,
@@ -125,6 +126,8 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             scale.
         """
 
+        if isinstance(input, str | PathLike):
+            input = read_structure(input)
         batch = self.processor(
             input,
             placement=placement,

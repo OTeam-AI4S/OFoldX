@@ -482,7 +482,7 @@ class NaMpnnModel(Model):
     # Probability operations.
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def score(
+    def autoregressive_probabilities(
         self,
         input: NaMpnnInput,
         *,
@@ -525,6 +525,83 @@ class NaMpnnModel(Model):
             decoding_ranks,
         )
         return self._probability_result(input, logits, decoding_ranks)
+
+    @torch.inference_mode()
+    def score(
+        self,
+        input: NaMpnnInput,
+        *,
+        num_decoding_orders: int = 1,
+        decoding_ranks: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> ScoreResult:
+        r"""
+        Score the observed sequence over one or more decoding orders.
+
+        Args:
+            input: One processed mixed-polymer target.
+            num_decoding_orders: Number of decoding orders to evaluate.
+            decoding_ranks: Optional ranks with shape
+                ``(num_decoding_orders, num_residues)``.
+            generator: Random generator used to draw decoding orders.
+
+        Returns:
+            Designed-position and whole-sequence negative log-likelihood scores.
+        """
+
+        probabilities = self.autoregressive_probabilities(
+            input,
+            num_decoding_orders=num_decoding_orders,
+            decoding_ranks=decoding_ranks,
+            generator=generator,
+        )
+        evaluation_count = probabilities.logits.shape[0]
+        losses = -torch.gather(
+            probabilities.log_probabilities,
+            -1,
+            input.sequence_tokens[0].expand(evaluation_count, -1).unsqueeze(-1),
+        ).squeeze(-1)
+        valid = input.residue_mask[0].to(dtype=losses.dtype)
+        designed = (input.residue_mask[0] & input.design_positions[0]).to(dtype=losses.dtype)
+        designed_evaluations = ((losses * designed).sum(dim=-1) / designed.sum()).detach().cpu().numpy()
+        global_evaluations = ((losses * valid).sum(dim=-1) / valid.sum()).detach().cpu().numpy()
+        references = input.component_references[0]
+        designed_scope = frozenset(
+            reference
+            for reference, selected, present in zip(
+                references,
+                input.design_positions[0].detach().cpu().tolist(),
+                input.residue_mask[0].detach().cpu().tolist(),
+            )
+            if reference is not None and selected and present
+        )
+        global_scope = frozenset(
+            reference
+            for reference, present in zip(
+                references,
+                input.residue_mask[0].detach().cpu().tolist(),
+            )
+            if reference is not None and present
+        )
+        return ScoreResult(
+            target=input.structures[0],
+            scores={
+                "designed_sequence_nll": Score(
+                    value=float(designed_evaluations.mean()),
+                    unit="nat/residue",
+                    preferred="lower",
+                    scope=designed_scope,
+                    evaluations=designed_evaluations,
+                ),
+                "global_sequence_nll": Score(
+                    value=float(global_evaluations.mean()),
+                    unit="nat/residue",
+                    preferred="lower",
+                    scope=global_scope,
+                    evaluations=global_evaluations,
+                ),
+            },
+        )
 
     @torch.inference_mode()
     def unconditional_probabilities(
@@ -1302,9 +1379,6 @@ class NaMpnnOutput:
     def log_probabilities(self) -> Tensor:
         r"""
         Return vocabulary log probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.log_softmax(dim=-1)
@@ -1313,9 +1387,6 @@ class NaMpnnOutput:
     def probabilities(self) -> Tensor:
         r"""
         Return vocabulary probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.softmax(dim=-1)
@@ -1331,8 +1402,7 @@ class NaMpnnSamplingOutput:
             ``(num_samples, num_residues)``.
         log_probabilities: Model log probabilities with shape
             ``(num_samples, num_residues, vocabulary_size)``.
-        sampling_probabilities: Sampling distribution used at each position, with the
-            same shape as ``log_probabilities``.
+        sampling_probabilities: Sampling distribution used at each position.
         decoding_ranks: Autoregressive ranks with shape
             ``(num_samples, num_residues)``.
     """

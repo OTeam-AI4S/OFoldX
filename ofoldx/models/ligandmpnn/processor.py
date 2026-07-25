@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Mapping, Sequence
-from os import PathLike
 
 import numpy as np
 import torch
@@ -21,7 +20,6 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io import read_mpnn_pdb
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
@@ -100,6 +98,8 @@ class LigandMpnnProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = LigandMpnnProcessorConfig
+
     def __init__(
         self,
         config: LigandMpnnProcessorConfig | None = None,
@@ -115,116 +115,6 @@ class LigandMpnnProcessor(Processor):
         super().__init__(device=device, dtype=dtype)
 
     def __call__(
-        self,
-        input: Structure | str | PathLike[str],
-        *,
-        design_positions: Sequence[ComponentReference] | None = None,
-        conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-        tied_weights: Mapping[ComponentReference, float] | None = None,
-        global_logit_bias: Tensor | None = None,
-        residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
-        use_atom_context: bool = True,
-        ligand_interface_cutoff: float = 8.0,
-        filter_by_occupancy: bool = True,
-    ) -> LigandMpnnInput:
-        r"""
-        Prepare a PDB file or ``Structure`` for LigandMPNN.
-
-        Args:
-            input: A coordinate-bearing ``Structure`` or local PDB path.
-            design_positions: Protein residue occurrences to design. ``None`` selects every
-                occurrence with complete backbone coordinates.
-            conditions: Allowed-identity and tied-identity conditions.
-            tied_weights: Optional sampling coefficient for each member of a tied group.
-            global_logit_bias: Global bias vector over the 20 generatable identities.
-            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
-            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
-            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
-            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
-
-        Returns:
-            A single-example ``LigandMpnnInput`` whose residue axes align with
-            ``component_references``.
-
-        Notes:
-            PDB paths and ``Structure`` inputs both follow observed C-alpha sites.
-        """
-
-        if isinstance(input, (str, PathLike)):
-            return self.process_pdb(
-                input,
-                design_positions=design_positions,
-                conditions=conditions,
-                tied_weights=tied_weights,
-                global_logit_bias=global_logit_bias,
-                residue_logit_bias=residue_logit_bias,
-                use_atom_context=use_atom_context,
-                ligand_interface_cutoff=ligand_interface_cutoff,
-                filter_by_occupancy=filter_by_occupancy,
-            )
-        if not isinstance(input, Structure):
-            raise TypeError("LigandMPNN requires coordinates; pass a Structure or local PDB/mmCIF path")
-        return self.process_structure(
-            input,
-            design_positions=design_positions,
-            conditions=conditions,
-            tied_weights=tied_weights,
-            global_logit_bias=global_logit_bias,
-            residue_logit_bias=residue_logit_bias,
-            use_atom_context=use_atom_context,
-            ligand_interface_cutoff=ligand_interface_cutoff,
-            filter_by_occupancy=filter_by_occupancy,
-        )
-
-    def process_pdb(
-        self,
-        path: str | PathLike[str],
-        *,
-        design_positions: Sequence[ComponentReference] | None = None,
-        conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-        tied_weights: Mapping[ComponentReference, float] | None = None,
-        global_logit_bias: Tensor | None = None,
-        residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
-        use_atom_context: bool = True,
-        ligand_interface_cutoff: float = 8.0,
-        filter_by_occupancy: bool = True,
-    ) -> LigandMpnnInput:
-        r"""
-        Read a PDB file and prepare it for LigandMPNN.
-
-        Args:
-            path: Local PDB path parsed by ``read_mpnn_pdb``.
-            design_positions: Protein residue occurrences to design. ``None`` selects every
-                occurrence with complete backbone coordinates.
-            conditions: Allowed-identity and tied-identity conditions.
-            tied_weights: Optional sampling coefficient for each member of a tied group.
-            global_logit_bias: Global bias vector over the 20 generatable identities.
-            residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
-            use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
-            ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
-            filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
-
-        Returns:
-            A single-example ``LigandMpnnInput`` for the parsed PDB structure.
-
-        Notes:
-            Protein rows and nearest-context axes are identical to ``process_structure`` because
-            this method delegates after parsing.
-        """
-
-        return self.process_structure(
-            read_mpnn_pdb(path),
-            design_positions=design_positions,
-            conditions=conditions,
-            tied_weights=tied_weights,
-            global_logit_bias=global_logit_bias,
-            residue_logit_bias=residue_logit_bias,
-            use_atom_context=use_atom_context,
-            ligand_interface_cutoff=ligand_interface_cutoff,
-            filter_by_occupancy=filter_by_occupancy,
-        )
-
-    def process_structure(
         self,
         structure: Structure,
         *,
@@ -253,7 +143,8 @@ class LigandMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``LigandMpnnInput`` for ``structure``.
+            A single-example ``LigandMpnnInput`` whose residue axes align with
+            ``component_references``.
 
         Notes:
             Protein rows follow observed CA sites in ``structure.sites`` order, and
@@ -262,7 +153,7 @@ class LigandMpnnProcessor(Processor):
         """
 
         if not isinstance(structure, Structure):
-            raise TypeError("LigandMpnnProcessor.process_structure requires a Structure")
+            raise TypeError("LigandMpnnProcessor requires a Structure")
         cutoff = float(ligand_interface_cutoff)
 
         system = structure.system

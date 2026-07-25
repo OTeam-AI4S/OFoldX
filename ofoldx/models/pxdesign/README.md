@@ -57,17 +57,14 @@ pip install ofoldx
 
 ### Backbone Design
 
-Use the high-level `design` API:
+Load the PXDesign design pipeline:
 
 ```python
 import ofoldx
 from ofoldx.models.pxdesign import from_binder
 
-output = ofoldx.design(
-    None,
-    model="oteam/pxdesign",
-    placement=from_binder(100),
-)
+pipeline = ofoldx.pipeline("design", model="oteam/pxdesign")
+output = pipeline.design(None, placement=from_binder(100))
 ```
 
 ## Training Details

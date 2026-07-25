@@ -72,7 +72,7 @@ def gather_key_windows(
     return padded.unfold(-2, num_key_atoms, num_query_atoms).movedim(-1, -2)
 
 
-@dataclass
+@dataclass(eq=False)
 class LocalAtomWindowInfo:
     r"""
     Padding and masking metadata describing one local-window partition of an atom axis.
@@ -97,7 +97,7 @@ class LocalAtomWindowInfo:
     num_valid_atoms: int | None = None
 
 
-@dataclass
+@dataclass(eq=False)
 class LocalAtomWindows:
     r"""
     Query and key windows carved from a single atom-axis tensor, plus their padding metadata.
@@ -113,7 +113,7 @@ class LocalAtomWindows:
     info: LocalAtomWindowInfo
 
 
-@dataclass
+@dataclass(eq=False)
 class LocalAtomGeometry:
     r"""
     Windowed atom-pair geometry (displacements and same-space mask) for atom attention blocks.

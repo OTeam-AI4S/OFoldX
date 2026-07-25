@@ -58,10 +58,18 @@ def gated_multihead_attention(
 
     key = query if key is None else key
     value = key if value is None else value
+    oops_mask_supported = (
+        attention_mask is None or attention_mask.dim() != query.dim() + 1 or attention_mask.shape[-3] == 1
+    )
+    supported = (
+        ("oops", "apex", "deepspeed", "sdpa", "eager")
+        if oops_mask_supported
+        else ("apex", "deepspeed", "sdpa", "eager")
+    )
     backend = resolve_tensor_backend(
         backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
-        supported=("oops", "apex", "deepspeed", "sdpa", "eager"),
+        supported=supported,
         public_default="sdpa",
     )
     if backend in {"eager", "apex", "deepspeed"}:
@@ -142,6 +150,11 @@ def gated_multihead_attention(
             attention_mask=attention_mask,
             scale=1.0,
         )
+    output = _zero_fully_masked_rows(
+        output,
+        attention_mask,
+        key_length=key_projection.shape[-2],
+    )
     output = output.transpose(-2, -3)
     return projection.merge(output, query)
 
@@ -181,7 +194,12 @@ def projected_attention(
         ``(..., num_heads, num_query_tokens, value_size)``.
     """
 
-    supported = ("oops", "sdpa", "eager") if dropout_p == 0.0 else ("sdpa", "eager")
+    oops_supported = (
+        dropout_p == 0.0
+        and value.shape[-1] == query.shape[-1]
+        and (attention_mask is None or attention_mask.dim() != query.dim() or attention_mask.shape[-3] == 1)
+    )
+    supported = ("oops", "sdpa", "eager") if oops_supported else ("sdpa", "eager")
     resolved = resolve_tensor_backend(
         backend,
         tensors=(query, key, value, attention_mask, *(biases or ())),
@@ -189,7 +207,7 @@ def projected_attention(
         public_default="sdpa",
     )
     if resolved == "eager":
-        return _eager_attention(
+        output = _eager_attention(
             query,
             key,
             value,
@@ -198,8 +216,8 @@ def projected_attention(
             dropout_p=dropout_p,
             scale=scale,
         )
-    if resolved == "oops":
-        return _oops_attention(
+    elif resolved == "oops":
+        output = _oops_attention(
             query,
             key,
             value,
@@ -207,15 +225,17 @@ def projected_attention(
             attention_mask=attention_mask,
             scale=scale,
         )
-    return _sdpa_attention(
-        query,
-        key,
-        value,
-        biases=biases,
-        attention_mask=attention_mask,
-        dropout_p=dropout_p,
-        scale=scale,
-    )
+    else:
+        output = _sdpa_attention(
+            query,
+            key,
+            value,
+            biases=biases,
+            attention_mask=attention_mask,
+            dropout_p=dropout_p,
+            scale=scale,
+        )
+    return _zero_fully_masked_rows(output, attention_mask, key_length=key.shape[-2])
 
 
 def triangle_attention(
@@ -345,6 +365,8 @@ def _cueq_triangle_flash(
         mask,
         scale=head_dim**-0.5,
     )
+    if mask is not None:
+        output = output * mask.any(dim=-1, keepdim=True).to(dtype=output.dtype)
     output = output.reshape(*prefix_shape, rows, heads, columns, head_dim)
     output = output.transpose(-2, -3)
     return projection.merge(output, pair)
@@ -379,9 +401,11 @@ def _eager_attention(
                 bias = bias.unsqueeze(-3)
             logits = logits + bias.to(dtype=torch.float32)
     if attention_mask is not None:
-        mask = attention_mask.bool()
-        if mask.dim() == logits.dim() - 1:
-            mask = mask.unsqueeze(-3)
+        mask = _broadcast_attention_mask(
+            query_projection,
+            attention_mask,
+            key_length=key_projection.shape[-2],
+        )
         logits = logits + (~mask).to(dtype=torch.float32) * -inf
     attention = logits.softmax(dim=-1)
     attention = F.dropout(attention, p=dropout_p, training=True)
@@ -552,8 +576,10 @@ def _oops_attention_pair_bias(
 
     Args:
         query: ``(..., q_tokens, query_size)`` gating input passed to the OOps callable.
-        query_projection, key_projection, value_projection: Head-split q/k/v of shape
+        query_projection, key_projection: Head-split q/k of shape
             ``(..., heads, tokens, head_dim)``.
+        value_projection: Head-split values of shape
+            ``(..., heads, tokens, value_size)``.
         biases: Optional additive pair biases.
         attention_mask: Optional boolean attention mask.
         projection: The projection supplying the gate/output weights and ``hidden_size``.
@@ -618,20 +644,23 @@ def _oops_attention(
     implementation, and restores the original prefix shape.
 
     Args:
-        query_projection, key_projection, value_projection: Head-split q/k/v of shape
+        query_projection, key_projection: Head-split q/k of shape
             ``(..., heads, tokens, head_dim)``.
+        value_projection: Head-split values of shape
+            ``(..., heads, tokens, value_size)``.
         biases: Optional additive pair biases.
         attention_mask: Optional boolean attention mask.
 
     Returns:
-        ``(..., heads, q_tokens, head_dim)`` attention output before the head merge.
+        ``(..., heads, q_tokens, value_size)`` attention output before the head merge.
     """
     prefix_shape = query_projection.shape[:-3]
     num_heads, query_length, head_dim = query_projection.shape[-3:]
     key_length = key_projection.shape[-2]
+    value_size = value_projection.shape[-1]
     query_flat = query_projection.reshape(-1, num_heads, query_length, head_dim)
     key_flat = key_projection.reshape(-1, num_heads, key_length, head_dim)
-    value_flat = value_projection.reshape(-1, num_heads, key_length, head_dim)
+    value_flat = value_projection.reshape(-1, num_heads, key_length, value_size)
     flat_prefix_size = query_flat.shape[0]
     pair_bias = _oops_pair_bias(
         biases,
@@ -650,7 +679,7 @@ def _oops_attention(
         key_length=key_length,
     )
     output = _oops_pair_bias_attention(query_flat, key_flat, value_flat, mask=mask, pair_bias=pair_bias, scale=scale)
-    return cast(Tensor, output).reshape(*prefix_shape, num_heads, query_length, head_dim)
+    return cast(Tensor, output).reshape(*prefix_shape, num_heads, query_length, value_size)
 
 
 def _oops_pair_bias(
@@ -699,8 +728,10 @@ def _oops_attention_mask(
     r"""
     Broadcast the attention mask to the flat boolean mask consumed by the OOps callable.
 
-    Accepts a per-query-key mask ``(..., q, k)``, its SDPA-style singleton-head form
-    ``(..., 1, q, k)``, or a key-only mask ``(..., k)`` and flattens the leading batch dims accordingly.
+    Accepts a per-query-key mask ``(..., q, k)``, its SDPA-style
+    singleton-head form ``(..., 1, q, k)``, or a key-only mask
+    ``(..., k)`` and flattens the leading batch dims accordingly. Rank,
+    rather than coincident dimension sizes, determines which form was supplied.
 
     Args:
         attention_mask: Optional boolean mask; ``None`` yields ``None``.
@@ -717,29 +748,23 @@ def _oops_attention_mask(
     if attention_mask is None:
         return None
     attention_mask = attention_mask.bool()
-    if attention_mask.dim() == len(prefix_shape) + 3 and attention_mask.shape[-3] == 1:
+    prefix_ndim = len(prefix_shape)
+    if attention_mask.dim() == prefix_ndim + 3 and attention_mask.shape[-3] == 1:
         attention_mask = attention_mask.squeeze(-3)
-    if attention_mask.shape[-2:] == (1, key_length):
-        attention_mask = attention_mask.squeeze(-2)
-        target_shape = (*prefix_shape, key_length)
-        return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=1).reshape(
-            flat_prefix_size, key_length
-        )
-    if attention_mask.shape[-2:] == (query_length, key_length):
+    if attention_mask.dim() == prefix_ndim + 2:
         target_shape = (*prefix_shape, query_length, key_length)
         return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=2).reshape(
             flat_prefix_size, query_length, key_length
         )
-    elif attention_mask.shape[-1:] == (key_length,):
+    if attention_mask.dim() <= prefix_ndim + 1:
         target_shape = (*prefix_shape, key_length)
         return _broadcast_to_attention_shape(attention_mask, target_shape, tail_dims=1).reshape(
             flat_prefix_size, key_length
         )
-    else:
-        raise ValueError(
-            "attention_mask must have shape broadcastable to "
-            f"(..., {query_length}, {key_length}) or (..., {key_length}), got {tuple(attention_mask.shape)}"
-        )
+    raise ValueError(
+        "attention_mask must have shape broadcastable to "
+        f"(..., {query_length}, {key_length}) or (..., {key_length}), got {tuple(attention_mask.shape)}"
+    )
 
 
 def _attention_biases(
@@ -772,9 +797,11 @@ def _attention_biases(
     if attention_mask is None:
         return attention_biases
 
-    attention_mask = attention_mask.bool()
-    if attention_mask.dim() == query_projection.dim() - 1:
-        attention_mask = attention_mask.unsqueeze(-3)
+    attention_mask = _broadcast_attention_mask(
+        query_projection,
+        attention_mask,
+        key_length=key_projection.shape[-2],
+    )
 
     mask_bias = torch.zeros(
         *query_projection.shape[:-1],
@@ -803,6 +830,78 @@ def _sum_biases(biases: Sequence[Tensor]) -> Tensor | None:
     for bias in biases[1:]:
         total = total + bias
     return total
+
+
+def _zero_fully_masked_rows(
+    output: Tensor,
+    attention_mask: Tensor | None,
+    *,
+    key_length: int,
+) -> Tensor:
+    r"""
+    Zero pre-projection attention values for queries with no valid key.
+
+    ``output`` has head-major shape ``(..., heads, queries, value_size)``. The
+    mask may already include the head axis, omit it, or contain only a key axis.
+    Zeroing here preserves any bias subsequently owned by an output projection.
+    """
+
+    if attention_mask is None:
+        return output
+    mask = _broadcast_attention_mask(output, attention_mask, key_length=key_length)
+    return output * mask.any(dim=-1, keepdim=True).to(dtype=output.dtype)
+
+
+def _broadcast_attention_mask(
+    reference: Tensor,
+    attention_mask: Tensor,
+    *,
+    key_length: int,
+) -> Tensor:
+    r"""
+    Broadcast a keep-mask to head-major attention weights.
+
+    ``reference`` has shape ``(..., heads, queries, channels)``. A full-rank
+    mask includes the head axis. A mask with one fewer axis omits the head
+    axis, and a still shorter mask provides only the key axis. This
+    rank-based interpretation avoids treating a batch axis as a head or query
+    axis when their sizes happen to be equal.
+    """
+
+    prefix_shape = reference.shape[:-3]
+    num_heads, query_length = reference.shape[-3:-1]
+    target_shape = (*prefix_shape, num_heads, query_length, key_length)
+    mask = attention_mask.bool()
+
+    if mask.dim() == reference.dim():
+        try:
+            return torch.broadcast_to(mask, target_shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"attention_mask with shape {tuple(attention_mask.shape)} is not broadcastable "
+                f"to attention weights with shape {target_shape}"
+            ) from error
+
+    if mask.dim() == reference.dim() - 1:
+        target_without_heads = (*prefix_shape, query_length, key_length)
+        try:
+            mask = torch.broadcast_to(mask, target_without_heads)
+        except RuntimeError as error:
+            raise ValueError(
+                f"attention_mask with shape {tuple(attention_mask.shape)} is not broadcastable "
+                f"to attention weights with shape {target_shape}"
+            ) from error
+        return torch.broadcast_to(mask.unsqueeze(-3), target_shape)
+
+    target_keys = (*prefix_shape, key_length)
+    try:
+        mask = _broadcast_to_attention_shape(mask, target_keys, tail_dims=1)
+    except RuntimeError as error:
+        raise ValueError(
+            f"attention_mask with shape {tuple(attention_mask.shape)} is not broadcastable "
+            f"to attention weights with shape {target_shape}"
+        ) from error
+    return torch.broadcast_to(mask.unsqueeze(-2).unsqueeze(-2), target_shape)
 
 
 def _broadcast_to_attention_shape(tensor: Tensor, target_shape: tuple[int, ...], *, tail_dims: int) -> Tensor:

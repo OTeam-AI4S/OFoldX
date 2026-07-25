@@ -24,16 +24,12 @@ from .model import (
 from .pipeline import Boltz1Pipeline
 from .processor import Boltz1Processor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.boltz1",
     model=Boltz1Model,
     processor=Boltz1Processor,
-    processor_config=None,
-    standard_tasks=("fold",),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.boltz1",
     pipeline=Boltz1Pipeline,
-    tasks=("fold",),
-    architectures=("ofoldx.boltz1",),
 )

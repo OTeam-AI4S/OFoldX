@@ -5,8 +5,6 @@ ProteinMPNN input processing.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from os import PathLike
-from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -17,14 +15,11 @@ from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import (
     AtomSite,
-    ChemicalAtom,
-    ChemicalComponent,
     ComponentReference,
     MolecularSystem,
-    Molecule,
     PolymerSequence,
 )
-from ...data.structure import ResidueNumber, Structure
+from ...data.structure import Structure
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
@@ -58,6 +53,8 @@ class ProteinMpnnProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = ProteinMpnnProcessorConfig
+
     def __init__(
         self,
         config: ProteinMpnnProcessorConfig | None = None,
@@ -70,131 +67,9 @@ class ProteinMpnnProcessor(Processor):
 
     def __call__(
         self,
-        input: Structure | str | PathLike[str],
-        *,
-        sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        design_positions: Sequence[ComponentReference] | None = None,
-        conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-        tied_weights: Mapping[ComponentReference, float] | None = None,
-        residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
-        pssm_coefficients: Mapping[ComponentReference, float] | None = None,
-        pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
-        pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
-    ) -> ProteinMpnnInput:
-        r"""
-        Prepare a PDB file or ``Structure`` for ProteinMPNN.
-
-        Args:
-            input: A ``Structure`` or local PDB path.
-            sequence: Optional replacement sequence. A bare one-letter string requires one protein
-                instance; a mapping may provide one-letter strings or component-ID sequences by
-                instance.
-            design_positions: Protein residue occurrences to design. ``None`` selects every
-                occurrence with the required backbone coordinates.
-            conditions: Allowed-identity and tied-identity conditions.
-            tied_weights: Optional sampling coefficient for each member of a tied group.
-            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
-            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
-                ``pssm_probabilities``.
-            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
-            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
-
-        Returns:
-            A single-example ``ProteinMpnnInput`` whose residue axes align with
-            ``component_references``.
-
-        Notes:
-            PDB paths preserve integer residue-number gaps; ``Structure`` inputs follow
-            observed C-alpha sites.
-        """
-
-        if isinstance(input, (str, PathLike)):
-            return self.process_pdb(
-                input,
-                chains=None,
-                sequence=sequence,
-                design_positions=design_positions,
-                conditions=conditions,
-                tied_weights=tied_weights,
-                residue_logit_bias=residue_logit_bias,
-                pssm_coefficients=pssm_coefficients,
-                pssm_probabilities=pssm_probabilities,
-                pssm_log_odds=pssm_log_odds,
-            )
-        return self.process_structure(
-            input,
-            sequence=sequence,
-            design_positions=design_positions,
-            conditions=conditions,
-            tied_weights=tied_weights,
-            residue_logit_bias=residue_logit_bias,
-            pssm_coefficients=pssm_coefficients,
-            pssm_probabilities=pssm_probabilities,
-            pssm_log_odds=pssm_log_odds,
-            filter_by_occupancy=True,
-        )
-
-    def process_pdb(
-        self,
-        path: str | PathLike[str],
-        *,
-        chains: Sequence[str] | None = None,
-        sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        design_positions: Sequence[ComponentReference] | None = None,
-        conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-        tied_weights: Mapping[ComponentReference, float] | None = None,
-        residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
-        pssm_coefficients: Mapping[ComponentReference, float] | None = None,
-        pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
-        pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
-    ) -> ProteinMpnnInput:
-        r"""
-        Read a PDB file with ProteinMPNN residue-row semantics.
-
-        Args:
-            path: Local PDB path.
-            chains: Optional chain identifiers retained from the PDB.
-            sequence: Optional replacement sequence. A bare one-letter string requires one protein
-                instance; a mapping may provide one-letter strings or component-ID sequences by
-                instance.
-            design_positions: Protein residue occurrences to design. ``None`` selects every
-                occurrence with the required backbone coordinates.
-            conditions: Allowed-identity and tied-identity conditions.
-            tied_weights: Optional sampling coefficient for each member of a tied group.
-            residue_logit_bias: Per-residue bias vectors over the 21-token vocabulary.
-            pssm_coefficients: Per-residue PSSM mixing coefficients; each key requires matching
-                ``pssm_probabilities``.
-            pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
-            pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
-
-        Returns:
-            A single-example ``ProteinMpnnInput`` for the selected PDB chains.
-
-        Notes:
-            Rows order designed chains before remaining chains, with each group sorted by chain
-            identifier. Integer residue-number gaps become masked rows with ``None`` component
-            references; ``residue_index`` follows ``100 * chain_index + global_row_index``.
-        """
-
-        structure = _read_proteinmpnn_pdb(path, chains)
-        structure, system = self._resolve_target(structure, sequence)
-        rows = self._lower_pdb_rows(structure, system, design_positions)
-        return self._finalize(
-            structure,
-            system,
-            rows,
-            conditions=conditions,
-            tied_weights=tied_weights,
-            residue_logit_bias=residue_logit_bias,
-            pssm_coefficients=pssm_coefficients,
-            pssm_probabilities=pssm_probabilities,
-            pssm_log_odds=pssm_log_odds,
-        )
-
-    def process_structure(
-        self,
         structure: Structure,
         *,
+        protein_instances: Sequence[str] | None = None,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
@@ -209,7 +84,8 @@ class ProteinMpnnProcessor(Processor):
         Prepare a ``Structure`` for ProteinMPNN.
 
         Args:
-            structure: Coordinate-bearing protein structure.
+            structure: Coordinate-bearing molecular structure.
+            protein_instances: Optional protein instance IDs retained as the design target.
             sequence: Optional replacement sequence. A bare one-letter string requires one protein
                 instance; a mapping may provide one-letter strings or component-ID sequences by
                 instance.
@@ -225,17 +101,26 @@ class ProteinMpnnProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``ProteinMpnnInput`` for ``structure``.
+            A single-example ``ProteinMpnnInput`` whose residue axes align with
+            ``component_references``.
 
         Notes:
-            Rows follow observed CA sites in ``structure.sites`` order, and
-            ``component_references`` uses the same axis. ``residue_index`` uses component indices
-            when source residue numbers are absent and source numbers with duplicate offsets when
-            present.
+            Without ``protein_instances``, the complete input structure is retained while only
+            protein occurrences become model rows.
+            Rows order designed protein instances before fixed instances. Complete source numbering
+            inserts numeric gaps and retains insertion occurrences; an unnumbered instance follows
+            component order. ``residue_index`` is ``100 * chain_index + global_row_index``.
         """
 
+        if protein_instances is not None:
+            structure = _select_protein_instances(structure, protein_instances)
         structure, system = self._resolve_target(structure, sequence)
-        rows = self._lower_structure_rows(structure, system, design_positions, filter_by_occupancy)
+        rows = self._lower_rows(
+            structure,
+            system,
+            design_positions,
+            filter_by_occupancy,
+        )
         return self._finalize(
             structure,
             system,
@@ -323,15 +208,20 @@ class ProteinMpnnProcessor(Processor):
         )
         return structure, system
 
-    def _lower_pdb_rows(
+    def _lower_rows(
         self,
         structure: Structure,
         system: MolecularSystem,
         design_positions: Sequence[ComponentReference] | None,
+        filter_by_occupancy: bool,
     ) -> _LoweredRows:
         r"""
-        Build fixed-column rows: designed chains first, numeric gaps, ``100 * c + i`` positions.
+        Lower canonical protein occurrences with numbered gaps and released tensor ordering.
         """
+
+        observed = structure.coordinate_mask
+        if filter_by_occupancy and structure.occupancy is not None:
+            observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
 
         coordinate_index = {site: index for index, site in enumerate(structure.sites)}
         atom_names = ("CA",) if self.config.ca_only else _BACKBONE_ATOMS
@@ -352,12 +242,12 @@ class ProteinMpnnProcessor(Processor):
                 valid = True
                 for atom_index, atom_id in enumerate(atom_names):
                     index = coordinate_index.get(AtomSite(instance_id, component_index, atom_id))
-                    observed = (
+                    atom_observed = (
                         index is not None
-                        and bool(structure.coordinate_mask[index])
+                        and bool(observed[index])
                         and bool(np.isfinite(structure.coordinates[index]).all())
                     )
-                    if observed:
+                    if atom_observed:
                         atom_coordinates[atom_index] = structure.coordinates[index]
                     else:
                         valid = False
@@ -377,7 +267,7 @@ class ProteinMpnnProcessor(Processor):
                     )
 
         designed_instances = {instance_id for instance_id, _component_index in selected_references}
-        chain_order = (
+        instance_order = (
             *sorted(designed_instances),
             *sorted(set(protein_by_instance) - designed_instances),
         )
@@ -389,25 +279,36 @@ class ProteinMpnnProcessor(Processor):
         row_design: list[bool] = []
         row_references: list[ComponentReference | None] = []
         row_component_ids: list[str | None] = []
-        for chain_index, instance_id in enumerate(chain_order):
+        for chain_index, instance_id in enumerate(instance_order):
             entity = protein_by_instance[instance_id]
             references = tuple((instance_id, component_index) for component_index in range(len(entity)))
-            if structure.residue_numbers is None:
+            residue_numbers = structure.residue_numbers
+            numbered = (
+                []
+                if residue_numbers is None
+                else [
+                    (reference, residue_numbers[reference]) for reference in references if reference in residue_numbers
+                ]
+            )
+            if numbered and len(numbered) != len(references):
+                raise ValueError(
+                    f"ProteinMPNN residue numbering for protein instance {instance_id!r} "
+                    "must cover every component occurrence or none"
+                )
+            if not numbered:
                 chain_rows: tuple[ComponentReference | None, ...] = references
             else:
-                numbered = [(reference, structure.residue_numbers[reference]) for reference in references]
                 numbered.sort(key=lambda item: (item[1].number, item[1].insertion_code))
                 references_by_number: dict[int, list[ComponentReference]] = {}
                 for numbered_reference, residue_number in numbered:
                     references_by_number.setdefault(residue_number.number, []).append(numbered_reference)
                 mutable_chain_rows: list[ComponentReference | None] = []
-                if numbered:
-                    for number in range(numbered[0][1].number, numbered[-1][1].number + 1):
-                        occurrences = references_by_number.get(number)
-                        if occurrences is None:
-                            mutable_chain_rows.append(None)
-                        else:
-                            mutable_chain_rows.extend(occurrences)
+                for number in range(numbered[0][1].number, numbered[-1][1].number + 1):
+                    occurrences = references_by_number.get(number)
+                    if occurrences is None:
+                        mutable_chain_rows.append(None)
+                    else:
+                        mutable_chain_rows.extend(occurrences)
                 chain_rows = tuple(mutable_chain_rows)
 
             for row_reference in chain_rows:
@@ -448,111 +349,6 @@ class ProteinMpnnProcessor(Processor):
             tuple(row_component_ids),
         )
 
-    def _lower_structure_rows(
-        self,
-        structure: Structure,
-        system: MolecularSystem,
-        design_positions: Sequence[ComponentReference] | None,
-        filter_by_occupancy: bool,
-    ) -> _LoweredRows:
-        r"""
-        Build updated rows: observed-CA occurrences in source order, cumulative positions.
-        """
-
-        observed = structure.coordinate_mask
-        if filter_by_occupancy and structure.occupancy is not None:
-            observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
-
-        coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-        atom_names = ("CA",) if self.config.ca_only else _BACKBONE_ATOMS
-
-        row_references: list[ComponentReference | None] = []
-        row_coordinates: list[np.ndarray] = []
-        row_valid: list[bool] = []
-        row_component_ids: list[str | None] = []
-        row_chain_index: list[int] = []
-        row_source_numbers: list[int | None] = []
-        chain_label_by_instance: dict[str, int] = {}
-        for index, site in enumerate(structure.sites):
-            if site.atom_id != "CA" or not bool(observed[index]):
-                continue
-            entity = system.entities[system.instances[site.instance_id]]
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                continue
-            reference = (site.instance_id, site.component_index)
-            if site.instance_id not in chain_label_by_instance:
-                chain_label_by_instance[site.instance_id] = len(chain_label_by_instance)
-
-            atom_coordinates = np.zeros(
-                (len(atom_names), 3),
-                dtype=structure.coordinates.dtype,
-            )
-            valid = True
-            for atom_index, atom_id in enumerate(atom_names):
-                atom_position = coordinate_index.get(AtomSite(site.instance_id, site.component_index, atom_id))
-                if atom_position is not None and bool(observed[atom_position]):
-                    atom_coordinates[atom_index] = structure.coordinates[atom_position]
-                else:
-                    valid = False
-
-            row_references.append(reference)
-            row_coordinates.append(atom_coordinates[0] if self.config.ca_only else atom_coordinates)
-            row_valid.append(valid)
-            row_component_ids.append(system.component(reference).component_id)
-            row_chain_index.append(chain_label_by_instance[site.instance_id])
-            row_source_numbers.append(
-                None if structure.residue_numbers is None else structure.residue_numbers[reference].number
-            )
-
-        row_residue_index: list[int] = []
-        if structure.residue_numbers is None:
-            for row_reference in row_references:
-                assert row_reference is not None
-                row_residue_index.append(row_reference[1])
-        else:
-            duplicate_count = 0
-            previous_number: int | None = None
-            for source_number in row_source_numbers:
-                assert source_number is not None
-                if source_number == previous_number:
-                    duplicate_count += 1
-                row_residue_index.append(source_number + duplicate_count)
-                previous_number = source_number
-
-        row_tokens = [
-            (
-                AMINO_ACID_UNKNOWN_TOKEN
-                if component_id is None
-                else AMINO_ACID_TOKEN_BY_COMPONENT.get(component_id, AMINO_ACID_UNKNOWN_TOKEN)
-            )
-            for component_id in row_component_ids
-        ]
-
-        valid_by_reference = dict(zip(row_references, row_valid))
-        if design_positions is None:
-            selected_references = {reference for reference, valid in zip(row_references, row_valid) if valid}
-        else:
-            selected_references = set(design_positions)
-            for selected_reference in selected_references:
-                if selected_reference not in valid_by_reference:
-                    raise ValueError(f"ProteinMPNN position {selected_reference!r} is not a protein occurrence")
-                if not valid_by_reference[selected_reference]:
-                    raise ValueError(
-                        f"ProteinMPNN position {selected_reference!r} lacks its required backbone coordinates"
-                    )
-        row_design = [reference in selected_references and valid for reference, valid in zip(row_references, row_valid)]
-
-        return _LoweredRows(
-            tuple(row_references),
-            tuple(row_coordinates),
-            tuple(row_tokens),
-            tuple(row_valid),
-            tuple(row_residue_index),
-            tuple(row_chain_index),
-            tuple(row_design),
-            tuple(row_component_ids),
-        )
-
     def _finalize(
         self,
         structure: Structure,
@@ -567,7 +363,7 @@ class ProteinMpnnProcessor(Processor):
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None,
     ) -> ProteinMpnnInput:
         r"""
-        Apply shared conditions, tie closure, and evidence to build the arm-agnostic input.
+        Apply conditions, tie closure, and evidence to the canonical rows.
         """
 
         (
@@ -828,83 +624,53 @@ class ProteinMpnnProcessor(Processor):
         )
 
 
-def _read_proteinmpnn_pdb(
-    path: str | PathLike[str],
-    chains: Sequence[str] | None = None,
+def _select_protein_instances(
+    structure: Structure,
+    protein_instances: Sequence[str],
 ) -> Structure:
     r"""
-    Read the ProteinMPNN fixed-column PDB slice.
+    Retain the exact protein instances selected as one ProteinMPNN target.
     """
 
-    residue_keys_by_chain: dict[str, list[tuple[str, int, str]]] = {}
-    component_id_by_residue: dict[tuple[str, int, str], str] = {}
-    atoms_by_residue: dict[
-        tuple[str, int, str],
-        dict[str, tuple[np.ndarray, str]],
-    ] = {}
-    with Path(path).expanduser().open() as handle:
-        for line in handle:
-            record = line[:6]
-            component_id = line[17:20].strip()
-            if line[:4] != "ATOM" and not (record == "HETATM" and component_id == "MSE"):
-                continue
+    selected = set(protein_instances)
+    for instance_id in selected:
+        entity = structure.system.entities[structure.system.instances[instance_id]]
+        if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+            raise ValueError(f"ProteinMPNN instance {instance_id!r} is not a protein")
 
-            instance_id = line[21:22]
-            if chains is not None and instance_id not in chains:
-                continue
-            number = int(line[22:26])
-            insertion_code = line[26:27].strip()
-            residue_key = (instance_id, number, insertion_code)
-            if residue_key not in component_id_by_residue:
-                component_id_by_residue[residue_key] = component_id
-                atoms_by_residue[residue_key] = {}
-                residue_keys_by_chain.setdefault(instance_id, []).append(residue_key)
-
-            atom_id = line[12:16].strip()
-            parsed_coordinates = np.array([float(line[start : start + 8]) for start in (30, 38, 46)])
-            residue_atoms = atoms_by_residue[residue_key]
-            if atom_id not in residue_atoms:
-                residue_atoms[atom_id] = (
-                    parsed_coordinates,
-                    line[76:78].strip().title(),
-                )
-
-    if not component_id_by_residue:
-        raise ValueError("ProteinMPNN requires at least one PDB ATOM residue or HETATM MSE residue")
-
-    entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
-    sites: list[AtomSite] = []
-    coordinates: list[np.ndarray] = []
-    residue_numbers: dict[ComponentReference, ResidueNumber] = {}
-    for instance_id, residue_keys in residue_keys_by_chain.items():
-        components: list[ChemicalComponent] = []
-        for component_index, residue_key in enumerate(residue_keys):
-            residue_atoms = atoms_by_residue[residue_key]
-            components.append(
-                ChemicalComponent(
-                    component_id=component_id_by_residue[residue_key],
-                    atoms=tuple(
-                        ChemicalAtom(atom_id=atom_id, element=element)
-                        for atom_id, (_coordinates, element) in residue_atoms.items()
-                    ),
-                    bonds=None,
-                )
-            )
-            residue_numbers[(instance_id, component_index)] = ResidueNumber(
-                residue_key[1],
-                residue_key[2],
-            )
-            for atom_id, (atom_coordinates, _element) in residue_atoms.items():
-                sites.append(AtomSite(instance_id, component_index, atom_id))
-                coordinates.append(atom_coordinates)
-        entities[instance_id] = PolymerSequence("protein", tuple(components))
-        instances[instance_id] = instance_id
-
+    for instance_id, entity_id in structure.system.instances.items():
+        entity = structure.system.entities[entity_id]
+        if instance_id in selected and isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
+            instances[instance_id] = entity_id
+    if not instances:
+        raise ValueError("ProteinMPNN requires at least one selected protein instance")
+    entities = {entity_id: structure.system.entities[entity_id] for entity_id in dict.fromkeys(instances.values())}
+    selected_instances = set(instances)
+    bonds = frozenset(
+        bond
+        for bond in structure.system.bonds
+        if bond.site_a.instance_id in selected_instances
+        and bond.site_b.instance_id in selected_instances
+        and (bond.stereo_sites is None or all(site.instance_id in selected_instances for site in bond.stereo_sites))
+    )
+    system = MolecularSystem(entities, instances, bonds)
+    indices = [index for index, site in enumerate(structure.sites) if site.instance_id in selected_instances]
+    index_array = np.asarray(indices, dtype=np.int64)
+    residue_numbers = (
+        None
+        if structure.residue_numbers is None
+        else {
+            reference: number
+            for reference, number in structure.residue_numbers.items()
+            if reference[0] in selected_instances
+        }
+    )
     return Structure(
-        MolecularSystem(entities, instances),
-        tuple(sites),
-        np.stack(coordinates),
-        np.ones(len(sites), dtype=np.bool_),
+        system,
+        tuple(structure.sites[index] for index in indices),
+        structure.coordinates[index_array],
+        structure.coordinate_mask[index_array],
+        None if structure.occupancy is None else structure.occupancy[index_array],
         residue_numbers=residue_numbers,
     )

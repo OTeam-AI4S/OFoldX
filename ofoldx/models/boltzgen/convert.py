@@ -63,7 +63,7 @@ def _unpack_triple_product_projection(key: str, tensor: Tensor) -> list[tuple[st
     ]
 
 
-CONDITIONED_TRANSFORMER_BLOCK_RULES: list[Rule] = compile_rules(
+CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES: list[Rule] = compile_rules(
     [
         (r"^transition\.adaln\.s_norm\.", "transition.conditioned_norm.conditioning_norm."),
         (r"^transition\.adaln\.s_scale\.", "transition.conditioned_norm.gate_projection."),
@@ -98,11 +98,15 @@ ATOM_ENCODER_RULES: list[Rule] = compile_rules(
         (r"^embed_atompair_ref_pos\.", "distance_vector_projection."),
         (r"^embed_atompair_ref_dist\.", "inverse_distance_projection."),
         (r"^embed_atompair_mask\.", "distance_mask_projection."),
-        (r"^c_to_p_trans_q\.", "left_atom_projection."),
-        (r"^c_to_p_trans_k\.", "right_atom_projection."),
-        (r"^p_mlp\.", "feed_forward."),
-        (r"^s_to_c_trans\.", "single_trunk_projection."),
-        (r"^z_to_p_trans\.", "pair_trunk_projection."),
+        (r"^c_to_p_trans_q\.1\.", "left_atom_projection."),
+        (r"^c_to_p_trans_k\.1\.", "right_atom_projection."),
+        (r"^p_mlp\.1\.", "feed_forward_input_projection."),
+        (r"^p_mlp\.3\.", "feed_forward_hidden_projection."),
+        (r"^p_mlp\.5\.", "feed_forward_output_projection."),
+        (r"^s_to_c_trans\.0\.", "single_trunk_norm."),
+        (r"^s_to_c_trans\.1\.", "single_trunk_projection."),
+        (r"^z_to_p_trans\.0\.", "pair_trunk_norm."),
+        (r"^z_to_p_trans\.1\.", "pair_trunk_projection."),
     ]
 )
 
@@ -129,7 +133,11 @@ SINGLE_CONDITIONING_RULES: list[Rule] = compile_rules(
 
 
 PAIRWISE_CONDITIONING_RULES: list[Rule] = compile_rules(
-    [(r"^dim_pairwise_init_proj\.", "init_projection."), *_transition_index_rules()]
+    [
+        (r"^dim_pairwise_init_proj\.0\.", "input_norm."),
+        (r"^dim_pairwise_init_proj\.1\.", "input_projection."),
+        *_transition_index_rules(),
+    ]
 )
 
 
@@ -146,13 +154,30 @@ def _convert_diffusion_conditioning(key: str) -> str | None:
     if key.startswith("atom_encoder."):
         inner = convert_keys(key[len("atom_encoder.") :], ATOM_ENCODER_RULES)
         return "atom_encoder." + inner if inner is not None else None
-    for boltz, house in (
-        ("atom_enc_proj_z.", "atom_encoder_pair_bias_projections."),
-        ("atom_dec_proj_z.", "atom_decoder_pair_bias_projections."),
-        ("token_trans_proj_z.", "token_transformer_pair_bias_projections."),
+    for boltz, norm_house, projection_house in (
+        (
+            "atom_enc_proj_z.",
+            "atom_encoder_pair_norms.",
+            "atom_encoder_pair_bias_projections.",
+        ),
+        (
+            "atom_dec_proj_z.",
+            "atom_decoder_pair_norms.",
+            "atom_decoder_pair_bias_projections.",
+        ),
+        (
+            "token_trans_proj_z.",
+            "token_encoder_pair_norms.",
+            "token_encoder_pair_bias_projections.",
+        ),
     ):
         if key.startswith(boltz):
-            return house + key[len(boltz) :]
+            index, _, remainder = key[len(boltz) :].partition(".")
+            if remainder.startswith("0."):
+                return f"{norm_house}{index}.{remainder.removeprefix('0.')}"
+            if remainder.startswith("1."):
+                return f"{projection_house}{index}.{remainder.removeprefix('1.')}"
+            return None
     return key
 
 
@@ -162,10 +187,10 @@ def _convert_atom_attention_encoder(key: str) -> str | None:
             key,
             "atom_encoder.diffusion_transformer.layers.",
             "atom_transformer.transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
-    if key.startswith("atom_to_token_trans."):
-        return key.replace("atom_to_token_trans.", "token_projection.", 1)
+    if key.startswith("atom_to_token_trans.0."):
+        return key.replace("atom_to_token_trans.0.", "token_projection.", 1)
     if key.startswith("r_to_q_trans."):
         return key.replace("r_to_q_trans.", "noisy_position_projection.", 1)
     return key
@@ -177,12 +202,14 @@ def _convert_atom_attention_decoder(key: str) -> str | None:
             key,
             "atom_decoder.diffusion_transformer.layers.",
             "atom_transformer.transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
     if key.startswith("a_to_q_trans."):
         return key.replace("a_to_q_trans.", "token_projection.", 1)
-    if key.startswith("atom_feat_to_atom_pos_update."):
-        return key.replace("atom_feat_to_atom_pos_update.", "position_update.", 1)
+    if key.startswith("atom_feat_to_atom_pos_update.0."):
+        return key.replace("atom_feat_to_atom_pos_update.0.", "position_norm.", 1)
+    if key.startswith("atom_feat_to_atom_pos_update.1."):
+        return key.replace("atom_feat_to_atom_pos_update.1.", "position_update_projection.", 1)
     return key
 
 
@@ -200,11 +227,13 @@ def _convert_score_model(key: str) -> str | None:
         return _layer_route(
             key,
             "token_transformer.layers.",
-            "token_transformer.blocks.",
-            CONDITIONED_TRANSFORMER_BLOCK_RULES,
+            "token_encoder.blocks.",
+            CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES,
         )
-    if key.startswith("s_to_a_linear."):
-        return key.replace("s_to_a_linear.", "single_to_token.", 1)
+    if key.startswith("s_to_a_linear.0."):
+        return key.replace("s_to_a_linear.0.", "single_to_token_norm.", 1)
+    if key.startswith("s_to_a_linear.1."):
+        return key.replace("s_to_a_linear.1.", "single_to_token_projection.", 1)
     if key.startswith("a_norm."):
         return key.replace("a_norm.", "token_norm.", 1)
     return key
@@ -693,7 +722,6 @@ def convert_trunk_key(
 
 
 INPUT_EMBEDDER_CONDITIONING = {
-    "atom_enc_proj_z": "atom_pair_bias_projection",
     "res_type_encoding": "residue_type_projection",
     "msa_profile_encoding": "msa_profile_projection",
     "method_conditioning_init": "method_embedding",
@@ -722,6 +750,10 @@ def convert_input_embedder(key: str) -> str | None:
     if key.startswith("atom_attention_encoder."):
         inner = _convert_atom_attention_encoder(key[len("atom_attention_encoder.") :])
         return None if inner is None else "atom_attention_encoder." + inner
+    if key.startswith("atom_enc_proj_z.0."):
+        return key.replace("atom_enc_proj_z.0.", "atom_pair_norm.", 1)
+    if key.startswith("atom_enc_proj_z.1."):
+        return key.replace("atom_enc_proj_z.1.", "atom_pair_bias_projection.", 1)
     head = key.split(".")[0]
     if head in INPUT_EMBEDDER_CONDITIONING:
         return INPUT_EMBEDDER_CONDITIONING[head] + key[len(head) :]
@@ -1052,7 +1084,7 @@ def boltzgen_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> BoltzGenCo
     config.trunk.use_paired_feature = msa_args["use_paired_feature"]
     config.trunk.use_miniformer = hyperparameters["use_miniformer"]
     config.trunk.msa_miniformer_blocks = msa_args["miniformer_blocks"]
-    config.trunk.dropout = pairformer_args["dropout"]
+    config.trunk.pair_dropout = pairformer_args["dropout"]
     config.trunk.msa_dropout = msa_args["msa_dropout"]
 
     config.design.template_size = template_args["template_dim"]
@@ -1157,15 +1189,16 @@ def save_boltzgen_pipeline(
     Convert the BoltzGen design + inverse-fold checkpoints and write the composite repository.
 
     The released BoltzGen design deliverable is a multi-pair [`BoltzGenPipeline`][]:
-    the structure-design pair (``ofoldx.boltzgen``, ``standard_tasks=()``) owns the runnable root and
-    the inverse-folding pair lives at the fixed ``ifold/`` sub-directory. Neither registered pair
-    routes as a lone standard task, so this writes the aggregate repository — both required pairs and
+    the structure-design pair owns the runnable root and the inverse-folding pair lives at the fixed
+    ``ifold/`` sub-directory. Neither pair is a standalone Pipeline, so this writes the composite
+    repository — both required pairs and
     the one-field ``pipeline.json`` marker — via ``BoltzGenPipeline.save`` so ``pipeline(..., model=dir)``
     routes it back through the multi-pair loader. The optional read-only boltz2 ``fold/`` / ``affinity/``
     stages are injected at load time and are not vendored here.
 
-    Both designer Processors are config-less, so only ``model.json`` + safetensors are written per pair.
-    Saving is local-only by default; passing ``repo_id`` additionally uploads the composite repository.
+    Both designer Processors are config-less; their ``processor.json`` files record only the
+    floating-point dtype. Saving is local-only by default; passing ``repo_id`` additionally uploads
+    the composite repository.
     """
 
     from .pipeline import BoltzGenPipeline
@@ -1176,9 +1209,9 @@ def save_boltzgen_pipeline(
     )
     BoltzGenPipeline(
         design_model=design_model,
-        design_processor=BoltzGenProcessor(),
+        design_processor=BoltzGenProcessor(dtype=dtype),
         inverse_folding_model=inverse_folding_model,
-        inverse_folding_processor=BoltzGenInverseFoldingProcessor(),
+        inverse_folding_processor=BoltzGenInverseFoldingProcessor(dtype=dtype),
     ).save(
         output_dir,
         repo_id=repo_id,

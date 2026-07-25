@@ -5,7 +5,7 @@ PxDesign coordinate-design model graph.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -21,7 +21,6 @@ from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.geometry import uniform_random_rotation
-from ...results import Metric, Score, best
 from .config import PxDesignConfig
 
 
@@ -296,13 +295,13 @@ class PxDesignConditionEmbeddings(nn.Module):
             reference_mask=input.reference_mask,
             atom_mask=input.atom_mask,
             atom_to_token=input.atom_to_token,
-            num_tokens=input.residue_type.shape[-2],
+            num_tokens=input.residue_type_features.shape[-2],
             local_geometry=local_geometry,
         )
         add_feature = F.one_hot(
             torch.zeros(
-                input.residue_type.shape[:-1],
-                device=input.residue_type.device,
+                input.residue_type_features.shape[:-1],
+                device=input.residue_type_features.device,
                 dtype=torch.long,
             ),
             num_classes=self.add_feature_size,
@@ -311,7 +310,7 @@ class PxDesignConditionEmbeddings(nn.Module):
             torch.cat(
                 (
                     atom_output.token_hidden,
-                    input.residue_type.to(atom_output.token_hidden),
+                    input.residue_type_features.to(atom_output.token_hidden),
                     input.plddt.to(atom_output.token_hidden),
                     input.hotspot.to(atom_output.token_hidden),
                     add_feature,
@@ -512,10 +511,6 @@ def _augment_reference_conformers(
 # ============================================================================
 # PxDesign tensor inputs and outputs
 # ============================================================================
-# ``Score`` and ``Metric`` are shared scientific value types. PxDesign defines standalone
-# ``PxDesignDesignCandidate`` and ``PxDesignDesignResult`` records because its candidates carry coordinates;
-# it does not reuse the coordinate-free shared candidate and result records.
-#
 # ``PlacementSpec`` and ``PlacementMap`` are shared records in ``ofoldx.data``. ``Hotspot`` is
 # the shared distance-free per-residue label consumed by PxDesign.
 
@@ -540,7 +535,7 @@ class PxDesignLayout:
     placement_map: PlacementMap
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class PxDesignInput:
     r"""
     Tensor and molecular-layout input for PxDesign.
@@ -561,7 +556,8 @@ class PxDesignInput:
         reference_space_id: Reference conformer group IDs with shape ``(B, A)``.
         reference_mask: Reference-coordinate validity mask with shape ``(B, A)``.
         reference_charges: Reference formal charges with shape ``(B, A, 1)``.
-        residue_type: One-hot residue types with shape ``(B, N, 36)``.
+        residue_type_features: One-hot residue-type features with shape
+            ``(B, N, 36)``.
         plddt: Per-token confidence condition with shape ``(B, N, 1)``.
         hotspot: Per-token hotspot condition with shape ``(B, N, 1)``.
         template_distance_bins: Template distance features aligned to token pairs.
@@ -581,7 +577,7 @@ class PxDesignInput:
     reference_space_id: Tensor
     reference_mask: Tensor
     reference_charges: Tensor
-    residue_type: Tensor
+    residue_type_features: Tensor
     plddt: Tensor
     hotspot: Tensor
     template_distance_bins: Tensor
@@ -589,7 +585,7 @@ class PxDesignInput:
     layout: PxDesignLayout
 
 
-@dataclass
+@dataclass(eq=False)
 class PxDesignOutput:
     r"""
     Predictions from one PxDesign denoising or sampling call.
@@ -610,16 +606,9 @@ class PxDesignDesignCandidate:
     Args:
         structure: Decoded backbone structure. Unassigned binder residues retain their unknown
             component identity.
-        scores: Candidate-level scalar scores, empty before evaluation.
-        metrics: Site- or pair-level metrics, empty before evaluation.
-        sequence: ProteinMPNN-assigned sequences keyed by instance, or ``None`` before sequence
-            design.
     """
 
     structure: Structure
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-    sequence: dict[str, tuple[str, ...]] | None = None
 
 
 @dataclass(eq=False)
@@ -628,54 +617,7 @@ class PxDesignDesignResult:
     A generation-ordered collection of PxDesign candidates.
 
     Args:
-        candidates: Candidates in generation order. Ranking methods retain this order for ties.
+        candidates: Candidates in generation order.
     """
 
     candidates: tuple[PxDesignDesignCandidate, ...]
-
-    def _validated_scores(self, score: str) -> tuple[Score, ...]:
-        scores = tuple(candidate.scores[score] for candidate in self.candidates)
-        directions = {value.preferred for value in scores}
-        if directions not in ({"higher"}, {"lower"}):
-            raise ValueError(f"score {score!r} must consistently prefer higher or lower values")
-        if len({value.unit for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical unit")
-        if len({value.scope for value in scores}) != 1:
-            raise ValueError(f"score {score!r} must use one identical scope")
-        if any(math.isnan(value.value) for value in scores):
-            raise ValueError(f"score {score!r} contains NaN and cannot be ranked")
-        return scores
-
-    def best(self, score: str) -> PxDesignDesignCandidate:
-        r"""
-        Return the earliest best candidate under a named score.
-
-        Args:
-            score: Comparable score name present on every candidate.
-
-        Returns:
-            The best candidate, with generation order breaking ties.
-        """
-
-        return best(self.candidates, score)
-
-    def ranked(self, score: str) -> tuple[PxDesignDesignCandidate, ...]:
-        r"""
-        Return candidates ordered best-first under a named score.
-
-        Args:
-            score: Comparable score name present on every candidate.
-
-        Returns:
-            Candidates in best-first order, with generation order breaking ties.
-        """
-
-        scores = self._validated_scores(score)
-        reverse = {value.preferred for value in scores} == {"higher"}
-        return tuple(
-            sorted(
-                self.candidates,
-                key=lambda candidate: candidate.scores[score].value,
-                reverse=reverse,
-            )
-        )

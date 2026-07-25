@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from functools import cache
 from os import PathLike
 from pathlib import Path
@@ -22,19 +23,26 @@ from ...artifacts import save_model
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import AMINO_ACID_THREE_TO_ONE, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...hub import load_json_object, resolve_repository, upload_repository
+from ...hub import resolve_repository, upload_repository
+from ...io import read_fasta_records, read_msa
 from ...pipelines import PIPELINES, PairedPipeline, resolve_generator
 from ...references import classify_reference
 from ...results import FoldResult, Metric, PairMetric, Score
+from ...results.values import best
 from .model import (
-    EsmFold2DesignCandidate,
-    EsmFold2DesignResult,
     EsmFold2ExperimentalModel,
+    EsmFold2ExperimentalSample,
     EsmFold2Input,
     EsmFold2Model,
-    _compute_esmc_masked_lm_logits,
+    compute_esmc_masked_lm_logits,
 )
-from .processor import EsmFold2ExperimentalProcessor, EsmFold2Processor, antibody_cdr_indices
+from .processor import (
+    EsmFold2ExperimentalProcessor,
+    EsmFold2Processor,
+    antibody_cdr_indices,
+    molecular_system_from_named_sequences,
+    molecular_system_from_sequences,
+)
 
 # 20-dim design amino-acid space, ordered ALA..VAL (residue-type ids 2..21 minus 2), the
 # offset used by the experimental trunk's residue-type features. ``F.pad(design, (2, 11))``
@@ -141,11 +149,15 @@ class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
             order.
         """
 
-        batch = self.processor(input, msa=msa)
+        if msa is not None and not self.processor.config.msa_conditioning:
+            raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
+        system = _fold_system(input)
+        msa = _fold_msa(msa, system)
+        generator = resolve_generator(seed, generator, device=self.processor.device)
+        batch = self.processor(system, msa=msa)
         return self.model.fold(
             batch,
             num_samples=num_samples,
-            seed=seed,
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
@@ -193,27 +205,18 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         from multimolecule import AutoTokenizer, ProteinTokenizer
         from transformers import AutoModelForMaskedLM
 
-        from ...auto import AutoModel, AutoProcessor
-
         root = resolve_repository(repository, revision=revision, token=token).path
-        architecture = load_json_object(root / "model.json").get("architecture")
-        if architecture != "ofoldx.esmfold2_experimental":
-            raise ValueError(
-                "EsmFold2DesignPipeline requires root architecture "
-                f"'ofoldx.esmfold2_experimental', got {architecture!r}"
-            )
-        model = cast(EsmFold2ExperimentalModel, AutoModel(root, device=device, dtype=dtype))
-        processor = cast(EsmFold2ExperimentalProcessor, AutoProcessor(root, device=device, dtype=dtype))
+        pipeline = super().from_repository(root, token=token, device=device, dtype=dtype)
         esmc_repository = root / "esmc"
-        processor.tokenizer = cast(
+        pipeline.processor.tokenizer = cast(
             ProteinTokenizer,
             AutoTokenizer.from_pretrained(esmc_repository, local_files_only=True),
         )
         esmc = AutoModelForMaskedLM.from_pretrained(esmc_repository, local_files_only=True, dtype=dtype)
         if device is not None:
             esmc.to(device=device)
-        model.load_esmc(esmc)
-        return cls(model=model, processor=processor)
+        pipeline.model.load_esmc(esmc)
+        return pipeline
 
     def save(
         self,
@@ -226,7 +229,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         commit_message: str | None = None,
     ) -> None:
         r"""
-        Save the design pair, ESMC child, tokenizer, and pipeline metadata.
+        Save the experimental design pair, ESMC child, and tokenizer.
 
         Args:
             directory: Local repository directory.
@@ -239,13 +242,13 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
         from huggingface_hub import save_torch_state_dict
 
+        pipeline_id = PIPELINES.id_for(type(self))
+        if pipeline_id is None:
+            raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
         esmc = self.model.esmc
         lm_head = self.model.esmc_lm_head
         if esmc is None or lm_head is None:
             raise RuntimeError("saving ESMFold2 design requires an attached EsmCForMaskedLM")
-        pipeline_id = PIPELINES.id_for(type(self))
-        if pipeline_id is None:
-            raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline")
 
         destination = Path(directory).expanduser()
         self.model.esmc = None
@@ -287,7 +290,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
     def design(
         self,
-        target: str | PathLike[str] | Structure | MolecularSystem,
+        input: str | PathLike[str] | Structure | MolecularSystem,
         *,
         binder_length: int,
         binder_prompt: str | None = None,
@@ -301,7 +304,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         Design and refold binder candidates against one single-chain protein target.
 
         Args:
-            target: One-letter sequence, FASTA path, ``Structure``, or ``MolecularSystem``
+            input: One-letter sequence, FASTA path, ``Structure``, or ``MolecularSystem``
                 resolving to one protein chain.
             binder_length: Number of residues in each designed binder.
             binder_prompt: Optional prompt of length ``binder_length``. One-letter amino acids
@@ -335,7 +338,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
         model = self.model
         # The sequence-prior weight is fixed by the Model configuration rather than inferred from
-        # the target or prompt.
+        # the input or prompt.
         language_model_weight = model.config.language_model_weight
         if language_model_weight != 0 and model.esmc_lm_head is None:
             raise RuntimeError("binder design with a nonzero language_model_weight requires an EsmCForMaskedLM")
@@ -345,7 +348,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             return self._run_design(
                 model=model,
                 processor=processor,
-                target=target,
+                input=input,
                 prompt=prompt,
                 binder_length=binder_length,
                 num_candidates=num_candidates,
@@ -360,7 +363,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         *,
         model: EsmFold2ExperimentalModel,
         processor: EsmFold2ExperimentalProcessor,
-        target: str | PathLike[str] | Structure | MolecularSystem,
+        input: str | PathLike[str] | Structure | MolecularSystem,
         prompt: str,
         binder_length: int,
         num_candidates: int,
@@ -371,10 +374,12 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
     ) -> EsmFold2DesignResult:
         device = model.left_pair_projection.weight.device
 
-        target_sequence = _target_one_letter(target)
+        target_sequence = _target_one_letter(input)
         target_length = len(target_sequence)
         target_batch = processor(PolymerSequence.from_one_letter(target_sequence))
-        target_residue_type_features = F.one_hot(target_batch.residue_type.long(), num_classes=33).float().to(device)
+        target_residue_type_features = (
+            F.one_hot(target_batch.residue_type_ids.long(), num_classes=33).float().to(device)
+        )
 
         candidates: list[EsmFold2DesignCandidate] = []
         for _ in range(num_candidates):
@@ -398,16 +403,12 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
                 )
                 residue_type_probabilities = torch.cat([target_residue_type_features, F.pad(design, (2, 11))], dim=1)
 
-                output = model.forward(
+                distogram = model.forward(
                     batch,
                     residue_type_probabilities=residue_type_probabilities,
                     recycling_steps=2,
-                    num_sampling_steps=1,
-                    calculate_confidence=False,
-                    return_structure=False,
                     generator=generator,
-                )
-                distogram = output["distogram_logits"].float()
+                ).float()
                 losses = _structure_losses(distogram, binder_length)
                 structure_grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
                 combined_grad = _normalized_gradient(structure_grad, gradient_mask)
@@ -504,34 +505,38 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             ]
         )
         with torch.no_grad():
-            output = model.forward(
+            prediction = model.sample_with_confidence(
                 batch,
                 recycling_steps=None,
                 num_diffusion_samples=1,
-                calculate_confidence=True,
                 generator=generator,
             )
-        structure = self._structure(batch, output)
+        sample = prediction.sample
+        confidence = prediction.confidence
+        structure = self._structure(batch, sample)
         binder_length = len(binder_sequence)
-        proxy = _distogram_iptm_proxy(output["distogram_logits"].float(), target_length, binder_length)
+        proxy = _distogram_iptm_proxy(sample.distogram_logits.float(), target_length, binder_length)
         scores = {
-            "iptm": Score(float(output["iptm"][0].item()), preferred="higher"),
-            "ptm": Score(float(output["ptm"][0].item()), preferred="higher"),
-            "mean_plddt": Score(float(output["mean_plddt"][0].item()), preferred="higher"),
+            "iptm": Score(float(confidence.iptm[0].item()), preferred="higher"),
+            "ptm": Score(float(confidence.ptm[0].item()), preferred="higher"),
+            "mean_plddt": Score(float(confidence.mean_plddt[0].item()) * 100.0, preferred="higher"),
             "distogram_iptm_proxy": Score(proxy, preferred="higher"),
         }
         layout = batch.layout
         atom_count = len(layout.atom_sites)
         metrics = {
-            "plddt": Metric(values=output["plddt"][0].float().cpu().numpy(), axis=layout.token_sites),
+            "plddt": Metric(
+                values=confidence.plddt[0].float().cpu().numpy() * 100.0,
+                axis=layout.token_sites,
+            ),
             "plddt_per_atom": Metric(
-                values=output["plddt_per_atom"][0, :atom_count].float().cpu().numpy(),
+                values=confidence.plddt_per_atom[0, :atom_count].float().cpu().numpy() * 100.0,
                 axis=layout.atom_sites,
             ),
         }
         pair_metrics = {
             "pae": PairMetric(
-                values=output["pae"][0].float().cpu().numpy(),
+                values=confidence.pae[0].float().cpu().numpy(),
                 row_axis=layout.token_sites,
                 column_axis=layout.token_sites,
                 unit="angstrom",
@@ -540,14 +545,14 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         return EsmFold2DesignCandidate(structure=structure, scores=scores, metrics=metrics, pair_metrics=pair_metrics)
 
     @staticmethod
-    def _structure(input: EsmFold2Input, output: dict[str, torch.Tensor]) -> Structure:
+    def _structure(input: EsmFold2Input, sample: EsmFold2ExperimentalSample) -> Structure:
         r"""
         Scatter model atoms onto the complete non-hydrogen sites of the target|binder system.
         """
 
         layout = input.layout
         atom_count = len(layout.atom_sites)
-        raw_coordinates = output["coordinates"][0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+        raw_coordinates = sample.coordinates[0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
         complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
@@ -561,6 +566,49 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             coordinates=coordinates,
             coordinate_mask=coordinate_mask,
         )
+
+
+@dataclass(eq=False)
+class EsmFold2DesignCandidate:
+    r"""
+    One folded target-binder complex and its aligned scientific values.
+
+    Args:
+        structure: Folded target-binder complex.
+        scores: Scalar scores keyed by stable scientific names.
+        metrics: One-axis metrics keyed by stable scientific names.
+        pair_metrics: Two-axis metrics keyed by stable scientific names.
+    """
+
+    structure: Structure
+    scores: dict[str, Score] = field(default_factory=dict)
+    metrics: dict[str, Metric] = field(default_factory=dict)
+    pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class EsmFold2DesignResult:
+    r"""
+    A generation-ordered collection of folded binder designs.
+
+    Args:
+        candidates: Folded target-binder complexes in generation order.
+    """
+
+    candidates: tuple[EsmFold2DesignCandidate, ...]
+
+    def best(self, score: str) -> EsmFold2DesignCandidate:
+        r"""
+        Return the earliest best candidate under a named score.
+
+        Args:
+            score: Comparable score name present on every candidate.
+
+        Returns:
+            The best candidate, with generation order breaking ties.
+        """
+
+        return best(self.candidates, score)
 
 
 @contextmanager
@@ -581,16 +629,64 @@ def _frozen_eval(model: torch.nn.Module) -> Iterator[None]:
             module.training = enabled
 
 
-def _target_one_letter(target: str | PathLike[str] | Structure | MolecularSystem) -> str:
+def _fold_system(
+    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+) -> MolecularSystem:
+    r"""
+    Resolve the fold Pipeline's inline-sequence and FASTA convenience.
+    """
+
+    if isinstance(input, Structure):
+        return input.system
+    if isinstance(input, MolecularSystem):
+        return input
+    if not isinstance(input, str | PathLike):
+        return molecular_system_from_sequences(input)
+
+    classified = classify_reference(input)
+    if isinstance(classified, Path):
+        named = [
+            (
+                record.id or f"chain_{index + 1}",
+                PolymerSequence.from_one_letter(record.sequence.strip().upper()),
+            )
+            for index, record in enumerate(read_fasta_records(classified))
+        ]
+    else:
+        named = [("protein", PolymerSequence.from_one_letter(classified.strip().upper()))]
+    return molecular_system_from_named_sequences(named)
+
+
+def _fold_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""
+    Read path evidence once and bind a single-entity alignment to its protein.
+    """
+
+    if msa is None or isinstance(msa, MSA | MSACollection):
+        return msa
+    proteins = [
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    ]
+    if len(proteins) != 1:
+        raise ValueError("an alignment path is unambiguous only for one protein entity; pass MSACollection")
+    return read_msa(Path(msa).expanduser(), entity_id=proteins[0])
+
+
+def _target_one_letter(input: str | PathLike[str] | Structure | MolecularSystem) -> str:
     r"""
     Resolve one single-chain protein target to an unambiguous one-letter sequence.
     """
 
     system: MolecularSystem | None = None
-    if isinstance(target, Structure):
-        system = target.system
-    elif isinstance(target, MolecularSystem):
-        system = target
+    if isinstance(input, Structure):
+        system = input.system
+    elif isinstance(input, MolecularSystem):
+        system = input
     if system is not None:
         entities = [entity for entity in system.entities.values() if isinstance(entity, PolymerSequence)]
         proteins = [entity for entity in entities if entity.polymer_type == "protein"]
@@ -598,10 +694,8 @@ def _target_one_letter(target: str | PathLike[str] | Structure | MolecularSystem
             raise NotImplementedError("ESMFold2 design targets one single-chain protein target")
         return "".join(AMINO_ACID_THREE_TO_ONE[component.component_id] for component in proteins[0].components)
 
-    classified = classify_reference(cast(str | PathLike[str], target))
+    classified = classify_reference(cast(str | PathLike[str], input))
     if isinstance(classified, Path):
-        from multimolecule.io import read_fasta_records
-
         records = tuple(read_fasta_records(classified))
         if len(records) != 1:
             raise ValueError("ESMFold2 design requires exactly one target FASTA record")
@@ -756,7 +850,7 @@ def _esmc_pseudo_perplexity_nll(
     for start in range(0, masked_sequences.shape[0], chunk_size):
         chunk = masked_sequences[start : start + chunk_size]
         logit_chunks.append(
-            _compute_esmc_masked_lm_logits(
+            compute_esmc_masked_lm_logits(
                 esmc,
                 lm_head,
                 chunk,

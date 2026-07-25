@@ -27,7 +27,10 @@ class MpnnProbabilityResult:
         logits: Vocabulary logits with shape
             ``(num_evaluations, num_residues, vocabulary_size)``.
         decoding_ranks: Autoregressive ranks with shape
-            ``(num_evaluations, num_residues)``.
+            ``(num_evaluations, num_residues)`` for whole-sequence evaluations.
+            Per-residue conditional and unconditional evaluations retain the
+            effective order for every target and have shape
+            ``(num_evaluations, num_target_residues, num_residues)``.
     """
 
     target: Structure

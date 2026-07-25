@@ -4,6 +4,9 @@ Common runtime placement for OFoldX Processors.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
+import chanfig
 import torch
 from typing_extensions import Self
 
@@ -12,12 +15,16 @@ class Processor:
     r"""
     Base class for processors with a default tensor device and dtype.
 
+    ``config_class`` owns the Processor's repository configuration schema. It is
+    ``None`` for configuration-free Processors.
+
     Args:
         device: Device used for newly created tensors. Defaults to CPU.
         dtype: Floating-point dtype used for newly created tensors. Defaults to
             ``torch.float32``.
     """
 
+    config_class: ClassVar[type[chanfig.Config] | None] = None
     device: torch.device
     dtype: torch.dtype
 

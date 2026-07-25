@@ -4,44 +4,33 @@ Model and Processor registration.
 
 from __future__ import annotations
 
-from collections.abc import Collection
 from importlib import import_module
-from typing import Literal, NamedTuple, cast
+from typing import NamedTuple, cast
 
 import chanfig
 
 from ..model import Model
 from ..processor import Processor
 
-#: Standard task name understood by the high-level task API.
-Task = Literal["fold", "design", "score", "pack"]
-#: All standard task names.
-TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
-
 
 class ModelRegistration(NamedTuple):
     r"""
-    Classes and tasks registered under one architecture ID.
+    Classes registered under one architecture ID.
 
     Attributes:
         id: Architecture ID stored in model metadata.
         model: Registered model class.
         processor: Registered processor class.
-        processor_config: Processor configuration class, or ``None`` when the
-            processor has no configuration.
         model_config: Model configuration class.
-        standard_tasks: Standard tasks supported without a custom pipeline.
     """
 
     id: str
     model: type[Model]
     processor: type[Processor]
-    processor_config: type[chanfig.Config] | None
     model_config: type[chanfig.Config]
-    standard_tasks: frozenset[Task]
 
 
-_BUILTIN_MODEL_MODULES = {
+BUILTIN_MODULES = {
     "ofoldx.alphafold2": "ofoldx.models.alphafold2",
     "ofoldx.alphafold2_multimer": "ofoldx.models.alphafold2",
     "ofoldx.alphafold3": "ofoldx.models.alphafold3",
@@ -51,6 +40,7 @@ _BUILTIN_MODEL_MODULES = {
     "ofoldx.boltzgen": "ofoldx.models.boltzgen",
     "ofoldx.boltzgen_ifold": "ofoldx.models.boltzgen",
     "ofoldx.esmfold2": "ofoldx.models.esmfold2",
+    "ofoldx.esmfold2_design": "ofoldx.models.esmfold2",
     "ofoldx.esmfold2_experimental": "ofoldx.models.esmfold2",
     "ofoldx.ligandmpnn": "ofoldx.models.ligandmpnn",
     "ofoldx.mpnn_packer": "ofoldx.models.mpnn_packer",
@@ -78,14 +68,12 @@ class ModelRegistry(chanfig.Registry):
         self.setattr("by_config", {})
         self.setattr("by_pair", {})
 
-    def register_model(
+    def register(
         self,
         id: str,
         *,
         model: type[Model],
         processor: type[Processor],
-        processor_config: type[chanfig.Config] | None,
-        standard_tasks: Collection[str] = (),
     ) -> None:
         r"""
         Register one architecture.
@@ -94,23 +82,17 @@ class ModelRegistry(chanfig.Registry):
             id: Architecture ID stored in model metadata.
             model: Model class implementing the architecture.
             processor: Processor class producing the model's input type.
-            processor_config: Processor configuration class, or ``None`` for a
-                configuration-free processor.
-            standard_tasks: Standard tasks supported without a custom pipeline.
 
         Raises:
-            ValueError: If a task is unknown or the model, processor, or config is
-                already registered incompatibly.
+            ValueError: If the model, processor, or config is already registered
+                incompatibly.
         """
 
+        if id == "":
+            raise ValueError("model architecture id must be a nonempty string")
+
         self._import_builtin(id)
-
         model_config = model.config_class
-
-        standard_task_values = frozenset(standard_tasks)
-        unknown = standard_task_values - TASKS
-        if unknown:
-            raise ValueError(f"unknown standard tasks: {unknown!r}")
 
         pair = (model, processor)
         if pair in self.by_pair:
@@ -123,16 +105,14 @@ class ModelRegistry(chanfig.Registry):
             id=id,
             model=model,
             processor=processor,
-            processor_config=processor_config,
             model_config=model_config,
-            standard_tasks=cast(frozenset[Task], standard_task_values),
         )
         super().register(registration, id)
         self.by_pair[pair] = registration
         self.by_config.setdefault(model_config, registration)
 
     def _import_builtin(self, id: str) -> None:
-        module = _BUILTIN_MODEL_MODULES.get(id)
+        module = BUILTIN_MODULES.get(id)
         if module is not None and id not in self:
             import_module(module)
 

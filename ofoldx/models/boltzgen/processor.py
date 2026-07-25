@@ -7,8 +7,6 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from os import PathLike
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -16,7 +14,7 @@ import torch
 from torch import Tensor
 
 from ...data.components import get_component
-from ...data.conditions import Endpoint
+from ...data.conditions import Contact, Endpoint
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence, PolymerType
 from ...data.placement import (
@@ -32,16 +30,14 @@ from ...data.placement import (
 from ...data.placement import instance_of as _placement_instance_of
 from ...data.placement import resolve
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...processor import Processor
 from .model import (
     CANONICAL_TOKENS,
     NUM_CANONICAL_TOKENS,
     BoltzGenBinding,
-    BoltzGenContact,
     BoltzGenCovalentBond,
     BoltzGenDesignMask,
+    BoltzGenDirectionalContact,
     BoltzGenInput,
     BoltzGenInverseFoldingInput,
     BoltzGenInverseFoldingLayout,
@@ -71,6 +67,20 @@ _SS_UNSPECIFIED = 3  # num_ss_types == 4; class 3 taken as the masked/unspecifie
 _SS_LABEL_TO_ID = {"H": 0, "E": 1, "L": 2}
 
 
+@dataclass(eq=False)
+class _BoltzGenDesignPlan:
+    r"""
+    Materialized BoltzGen structure-design domain state.
+    """
+
+    system: MolecularSystem
+    source_structure: Structure | None
+    spatial_conditions: tuple[BoltzGenSchema, ...]
+    placement_map: PlacementMap
+    instance_of: dict[str, str]
+    generated_residues: frozenset[ComponentReference]
+
+
 class BoltzGenProcessor(Processor):
     r"""
     Convert supported structure-design inputs into `BoltzGenInput`.
@@ -85,12 +95,12 @@ class BoltzGenProcessor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str] | None,
+        input: MolecularSystem | Structure | None,
         *,
         placement: BoltzGenPlacements | None = None,
         total_len: int | None = None,
         conditions: Sequence[BoltzGenSchema] = (),
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
         templates: Sequence[Template] = (),
         generator: torch.Generator | None = None,
     ) -> BoltzGenInput:
@@ -98,14 +108,14 @@ class BoltzGenProcessor(Processor):
         Build model inputs for one structure-design request.
 
         Args:
-            input: Optional target or context system, structure, or path. ``None`` means
-                a fully generated assembly defined by ``placement`` and ``total_len``.
+            input: Optional target or context system or structure. ``None`` means a
+                fully generated assembly defined by ``placement`` and ``total_len``.
             placement: Optional topology of existing and generated molecular segments.
             total_len: Total token budget used to realize generated segments. With an
                 existing input and no generated placement, appends one generated protein
                 chain of this length.
             conditions: BoltzGen conditioning records.
-            msa: Optional MSA evidence or alignment path.
+            msa: Optional canonical MSA evidence.
             templates: Optional structural templates.
             generator: Random generator used for reference-conformer augmentation.
 
@@ -114,7 +124,30 @@ class BoltzGenProcessor(Processor):
             condition, and molecular-layout axes aligned.
         """
 
+        plan = self._plan(
+            input,
+            placement=placement,
+            total_len=total_len,
+            conditions=conditions,
+        )
+        return self._lower(plan, msa, templates=templates, generator=generator)
+
+    def _plan(
+        self,
+        input: MolecularSystem | Structure | None,
+        *,
+        placement: BoltzGenPlacements | None,
+        total_len: int | None,
+        conditions: Sequence[BoltzGenSchema],
+    ) -> _BoltzGenDesignPlan:
+        r"""
+        Materialize the final design system and placement identities once.
+        """
+
         condition_values = tuple(conditions)
+        for condition in condition_values:
+            if not isinstance(condition, BoltzGenSchema):
+                raise TypeError(f"BoltzGen cannot consume {type(condition).__name__}")
         covalent_bonds = tuple(
             condition for condition in condition_values if isinstance(condition, BoltzGenCovalentBond)
         )
@@ -147,42 +180,36 @@ class BoltzGenProcessor(Processor):
                 system, extension_placements, total_len
             )
         # With no placement or length budget, the input system is used unchanged.
-        template_values = tuple(templates)
-        if not system.instances:
-            raise ValueError("BoltzGen requires at least one molecular instance")
-
         if covalent_bonds:
             system = _materialize_covalent_bonds(system, covalent_bonds, placement_map, instance_of)
 
-        normalized_msa = _normalize_msa(msa, system)
-        return self._prepare(
-            system,
-            structure=structure,
-            msa=normalized_msa,
-            conditions=spatial_conditions,
+        return _BoltzGenDesignPlan(
+            system=system,
+            source_structure=structure,
+            spatial_conditions=spatial_conditions,
             placement_map=placement_map,
             instance_of=instance_of,
             generated_residues=generated_residues,
-            templates=template_values,
-            generator=generator,
         )
 
-    def _prepare(
+    def _lower(
         self,
-        system: MolecularSystem,
-        *,
-        structure: Structure | None,
+        plan: _BoltzGenDesignPlan,
         msa: MSA | MSACollection | None,
-        conditions: tuple[BoltzGenSchema, ...],
-        placement_map: PlacementMap | None = None,
-        instance_of: dict[str, str] | None = None,
-        generated_residues: frozenset[ComponentReference] = frozenset(),
-        templates: tuple[Template, ...] = (),
+        *,
+        templates: Sequence[Template] = (),
         generator: torch.Generator | None = None,
     ) -> BoltzGenInput:
+        r"""
+        Validate canonical evidence and lower one materialized plan to tensors.
+        """
 
+        system = plan.system
+        if not system.instances:
+            raise ValueError("BoltzGen requires at least one molecular instance")
+        msa = _validate_msa(msa, system)
         # Generated protein placeholders use backbone-only GLY reference coordinates.
-        tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
+        tokens, atom_sites = _build_tokens(system, generated_residues=plan.generated_residues)
         token_count = len(tokens)
         (
             atom_features,
@@ -199,8 +226,8 @@ class BoltzGenProcessor(Processor):
             system,
             tokens,
             atom_sites,
-            structure,
-            generated_residues=generated_residues,
+            plan.source_structure,
+            generated_residues=plan.generated_residues,
             generator=generator,
         )
         site_to_token = {
@@ -238,30 +265,40 @@ class BoltzGenProcessor(Processor):
         )
         # BoltzGen conditioning channels realized from the request records.
         contact_conditioning, contact_threshold = _contact_channels(
-            conditions,
+            plan.spatial_conditions,
             token_index_by_residue,
             site_to_token,
-            placement_map or {},
-            instance_of or {},
+            plan.placement_map,
+            plan.instance_of,
             token_count,
         )
-        design_mask = _design_mask(conditions, token_index_by_residue, token_count, generated_residues)
+        design_mask = _design_mask(
+            plan.spatial_conditions,
+            token_index_by_residue,
+            token_count,
+            plan.generated_residues,
+        )
         binding_type = _binding_ids(
-            conditions,
+            plan.spatial_conditions,
             token_index_by_residue,
             site_to_token,
-            placement_map or {},
-            instance_of or {},
+            plan.placement_map,
+            plan.instance_of,
             token_count,
         )
-        ss_type = _ss_ids(conditions, token_index_by_residue, token_count)
-        symmetry_index = _symmetry_index(conditions, token_index_by_residue, tokens)
+        ss_type = _ss_ids(plan.spatial_conditions, token_index_by_residue, token_count)
+        symmetry_index = _symmetry_index(plan.spatial_conditions, token_index_by_residue, tokens)
         # Structure groups affect pairwise geometry through ``token_distance_mask``;
         # atom reference-space ids remain per-residue.
-        structure_group = _structure_group_ids(conditions, token_index_by_residue, token_count, design_mask)
+        structure_group = _structure_group_ids(
+            plan.spatial_conditions,
+            token_index_by_residue,
+            token_count,
+            design_mask,
+        )
         token_distance_mask = _token_distance_mask(structure_group)
         # ``None`` leaves template fields unset so the trunk skips the template embedder.
-        template_values = _template_channels(templates, tokens, token_count)
+        template_values = _template_channels(tuple(templates), tokens, token_count)
 
         tensor_values: dict[str, Tensor] = {
             "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -278,7 +315,7 @@ class BoltzGenProcessor(Processor):
             "representative_atom_mask": representative_atom_mask,
             "atom_token_index": atom_token_index,
             "token_to_rep_atom": token_to_rep_atom,
-            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
             "msa_profile": msa_values.pop("msa_profile"),
             "deletion_mean": msa_values.pop("deletion_mean"),
             "token_bonds": token_bonds,
@@ -315,8 +352,8 @@ class BoltzGenProcessor(Processor):
             token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
             output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
-            placement_map=placement_map if placement_map is not None else {},
-            instance_of=instance_of if instance_of is not None else {},
+            placement_map=plan.placement_map,
+            instance_of=plan.instance_of,
         )
         return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
 
@@ -335,37 +372,35 @@ class BoltzGenInverseFoldingProcessor(Processor):
 
     def __call__(
         self,
-        input: Structure | str | PathLike[str],
+        input: Structure,
         *,
         design: Sequence[ComponentReference] = (),
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
     ) -> BoltzGenInverseFoldingInput:
         r"""
         Build inverse-folding inputs for one fixed structure.
 
         Args:
-            input: Fixed structure or local structure path.
+            input: Fixed canonical structure.
             design: Residue occurrences whose identities may change.
             aa_constraints: Per-residue amino-acid constraints.
             symmetry: Residue groups sharing one sequence identity.
-            msa: Optional MSA evidence or alignment path.
+            msa: Optional canonical MSA evidence.
 
         Returns:
             A [`BoltzGenInverseFoldingInput`][] with batch size one and aligned
             token, atom, design-mask, amino-acid-constraint, and symmetry axes.
         """
 
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         if not isinstance(input, Structure):
-            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure or structure path")
+            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure")
         system = input.system
         if not system.instances:
             raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
 
-        normalized_msa = _normalize_msa(msa, system)
+        normalized_msa = _validate_msa(msa, system)
         return self._prepare(
             input,
             msa=normalized_msa,
@@ -447,7 +482,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             "atom_mask": atom_mask,
             "reference_positions": reference_positions,
             "reference_space_id": reference_space_id,
-            "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
             "msa_profile": msa_values["msa_profile"],
             "deletion_mean": msa_values["deletion_mean"],
             "token_bonds": token_bonds,
@@ -599,7 +634,7 @@ def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> 
 
 
 def _normalize_structure_input(
-    input: MolecularSystem | Structure | str | PathLike[str] | None,
+    input: MolecularSystem | Structure | None,
 ) -> tuple[MolecularSystem | None, Structure | None]:
     r"""
     Resolve an input into (system, optional Structure).
@@ -607,13 +642,11 @@ def _normalize_structure_input(
 
     if input is None:
         return None, None
-    if isinstance(input, str | PathLike):
-        input = read_structure(Path(input).expanduser())
     if isinstance(input, Structure):
         return input.system, input
     if isinstance(input, MolecularSystem):
         return input, None
-    raise TypeError("BoltzGen input must be a MolecularSystem, Structure, structure path, or None")
+    raise TypeError("BoltzGen input must be a MolecularSystem, Structure, or None")
 
 
 def _component_reference_to_token(
@@ -1212,39 +1245,46 @@ def _contact_channels(
     Realize contact records into the ``[N, N, 5]`` one-hot + ``[N, N]`` threshold.
     """
 
-    selected: list[tuple[BoltzGenContact, tuple[int, ...], tuple[int, ...]]] = []
+    selected: list[tuple[Contact, str, tuple[int, ...], tuple[int, ...]]] = []
     for condition in conditions:
-        if isinstance(condition, BoltzGenContact):
-            rows = _endpoint_tokens(
-                condition.side_a,
-                token_index_by_residue,
-                site_to_token,
-                placement_map,
-                instance_of,
-            )
-            columns = _endpoint_tokens(
-                condition.side_b,
-                token_index_by_residue,
-                site_to_token,
-                placement_map,
-                instance_of,
-            )
-            if not rows or not columns:
-                raise ValueError("a BoltzGen contact must resolve to at least one token on each side")
-            selected.append((condition, rows, columns))
+        if isinstance(condition, Contact):
+            contact = condition
+            kind = "contact"
+        elif isinstance(condition, BoltzGenDirectionalContact):
+            contact = condition.contact
+            kind = condition.direction
+        else:
+            continue
+        rows = _endpoint_tokens(
+            contact.side_a,
+            token_index_by_residue,
+            site_to_token,
+            placement_map,
+            instance_of,
+        )
+        columns = _endpoint_tokens(
+            contact.side_b,
+            token_index_by_residue,
+            site_to_token,
+            placement_map,
+            instance_of,
+        )
+        if not rows or not columns:
+            raise ValueError("a BoltzGen contact must resolve to at least one token on each side")
+        selected.append((contact, kind, rows, columns))
 
     # An absent contact request is UNSPECIFIED; background pairs in a request are UNSELECTED.
     classes = torch.full((token_count, token_count), int(bool(selected)), dtype=torch.long)
     threshold = torch.zeros(token_count, token_count)
-    for condition, rows, columns in selected:
-        forward_class = _CONTACT_KIND_TO_CLASS[condition.kind]
+    for contact, kind, rows, columns in selected:
+        forward_class = _CONTACT_KIND_TO_CLASS[kind]
         reverse_class = {2: 3, 3: 2}.get(forward_class, forward_class)
         for row in rows:
             for column in columns:
                 classes[row, column] = forward_class
                 classes[column, row] = reverse_class
-                threshold[row, column] = condition.cutoff_angstrom
-                threshold[column, row] = condition.cutoff_angstrom
+                threshold[row, column] = contact.cutoff_angstrom
+                threshold[column, row] = contact.cutoff_angstrom
     contact_conditioning = torch.nn.functional.one_hot(classes, _CONTACT_CLASSES).float()
     return contact_conditioning, threshold
 
@@ -1660,7 +1700,7 @@ def _template_channels(
             raise ValueError(f"BoltzGen template {template_index} does not cover any lowered target token")
 
     return {
-        "template_residue_type": torch.nn.functional.one_hot(residue_type_ids, 33),
+        "template_residue_type_features": torch.nn.functional.one_hot(residue_type_ids, 33),
         "template_frame_rotations": frame_rotations,
         "template_frame_translations": frame_translations,
         "template_beta_carbon_positions": beta_carbon_positions,
@@ -2062,32 +2102,23 @@ def _residue_type(component_id: str, polymer_type: str) -> int:
     return _DNA_RESIDUE_TYPES.get(component_id, 32)
 
 
-def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+def _validate_msa(
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
 ) -> MSA | MSACollection | None:
     if msa is None:
         return None
-    if isinstance(msa, MSA | MSACollection):
-        values = (msa,) if isinstance(msa, MSA) else msa.msas
-        for value in values:
-            # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over the
-            # primary system supplied here, so the Processor resolves the entity and checks its query width.
-            entity = system.entities.get(value.entity_id)
-            if not isinstance(entity, PolymerSequence):
-                raise ValueError(f"MSA entity {value.entity_id!r} disagrees with the input system")
-            width = len(value.unpaired_sequences[0])
-            if width != len(entity.components):
-                raise ValueError(
-                    f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
-                    f"{len(entity.components)} components"
-                )
-        return msa
-    proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA is unambiguous only for one protein entity; pass MSACollection")
-    return read_msa(msa, entity_id=proteins[0])
+    values = (msa,) if isinstance(msa, MSA) else msa.msas
+    for value in values:
+        # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over the
+        # primary system supplied here, so the Processor resolves the entity and checks its query width.
+        entity = system.entities.get(value.entity_id)
+        if not isinstance(entity, PolymerSequence):
+            raise ValueError(f"MSA entity {value.entity_id!r} disagrees with the input system")
+        width = len(value.unpaired_sequences[0])
+        if width != len(entity.components):
+            raise ValueError(
+                f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
+                f"{len(entity.components)} components"
+            )
+    return msa

@@ -6,12 +6,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from os import PathLike
+from pathlib import Path
 
 import torch
 
 from ...data.evidence import MSA, MSACollection
-from ...data.molecular import MolecularSystem
+from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...io import read_msa, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import FoldResult
 from .model import Boltz1Model, Boltz1Pocket
@@ -61,6 +63,18 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
+        if isinstance(input, str | PathLike):
+            input = read_structure(Path(input).expanduser())
+        if isinstance(msa, str | PathLike):
+            system = input.system if isinstance(input, Structure) else input
+            proteins = [
+                entity_id
+                for entity_id, entity in system.entities.items()
+                if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+            ]
+            if len(proteins) != 1:
+                raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")
+            msa = read_msa(msa, entity_id=proteins[0])
         batch = self.processor(input, msa=msa, pocket=pocket, generator=generator)
         return self.model.fold(
             batch,

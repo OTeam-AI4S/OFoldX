@@ -4,6 +4,7 @@ Generic PDB codec for canonical [`ofoldx.data.Structure`][] values.
 
 from __future__ import annotations
 
+import gzip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -82,7 +83,15 @@ def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStruc
 
     from biotite.structure.io.pdb import PDBFile
 
-    pdb_file = PDBFile.read(str(path))
+    if path.suffix.lower() == ".gz":
+        handle = gzip.open(path, mode="rt", encoding="ascii")
+    else:
+        handle = path.open(encoding="ascii")
+    try:
+        with handle:
+            pdb_file = PDBFile.read(handle)
+    except UnicodeDecodeError as error:
+        raise ValueError("PDB input must be ASCII text") from error
     try:
         if assembly_id is None:
             array = pdb_file.get_structure(
@@ -105,15 +114,11 @@ def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStruc
         raise ValueError(f"PDB does not contain requested assembly {assembly_id!r}") from error
     rows = atom_records_from_array(array, format_name="pdb")
     reject_duplicate_atom_records(rows)
-    try:
-        lines = tuple(path.read_text(encoding="ascii").splitlines())
-    except UnicodeDecodeError as error:
-        raise ValueError("PDB input must be ASCII text") from error
     return ParsedStructure(
         format="pdb",
         rows=rows,
         canonical_payload=None,
-        pdb_lines=lines,
+        pdb_lines=tuple(pdb_file.lines),
     )
 
 

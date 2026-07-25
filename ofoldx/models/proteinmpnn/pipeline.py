@@ -15,7 +15,7 @@ from typing_extensions import Self
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io import read_mpnn_pdb
+from ...io import read_structure
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
     AMINO_ACID_TOKEN_BY_COMPONENT,
@@ -46,6 +46,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
@@ -68,7 +69,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Design ProteinMPNN sequences on a fixed backbone.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the design target.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with the required backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -98,8 +100,10 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             input-score evaluations follow decoding-order draw order.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
+            protein_instances=protein_instances,
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
@@ -126,6 +130,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
@@ -137,7 +142,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Score a ProteinMPNN sequence over independently drawn decoding orders.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the scoring target.
             sequence: Optional target sequence as one-letter text or an instance-to-sequence
                 mapping. ``None`` scores the structure's identities.
             design_positions: Residue occurrences included in the designed-sequence score.
@@ -155,7 +161,13 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             mutually exclusive.
         """
 
-        model_input = self.processor(input, sequence=sequence, design_positions=design_positions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(
+            structure,
+            protein_instances=protein_instances,
+            sequence=sequence,
+            design_positions=design_positions,
+        )
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.score(
             model_input,
@@ -168,6 +180,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[TiedResidueIdentities] = (),
         num_decoding_orders: int = 1,
@@ -179,7 +192,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Compute sequence-conditioned autoregressive probabilities.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the probability target.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -196,7 +210,13 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        model_input = self.processor(input, design_positions=design_positions, conditions=conditions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(
+            structure,
+            protein_instances=protein_instances,
+            design_positions=design_positions,
+            conditions=conditions,
+        )
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.autoregressive_probabilities(
             model_input,
@@ -209,6 +229,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[TiedResidueIdentities] = (),
         num_decoding_orders: int = 1,
@@ -220,7 +241,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Compute sequence-free autoregressive probabilities.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the probability target.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -237,7 +259,13 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        model_input = self.processor(input, design_positions=design_positions, conditions=conditions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(
+            structure,
+            protein_instances=protein_instances,
+            design_positions=design_positions,
+            conditions=conditions,
+        )
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.sequence_free_autoregressive_probabilities(
             model_input,
@@ -250,6 +278,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
         coordinate_noise: float = 0.0,
@@ -260,7 +289,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Compute target-last conditional probabilities for every residue row.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the probability target.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
@@ -277,7 +307,12 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        model_input = self.processor(input, design_positions=design_positions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(
+            structure,
+            protein_instances=protein_instances,
+            design_positions=design_positions,
+        )
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.conditional_probabilities(
             model_input,
@@ -290,6 +325,7 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         num_decoding_orders: int = 1,
         coordinate_noise: float = 0.0,
@@ -300,7 +336,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Compute target-first unconditional probabilities for every residue row.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
+            protein_instances: Optional protein instance IDs retained as the probability target.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             num_decoding_orders: Number of independent base decoding orders to evaluate.
@@ -317,7 +354,12 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        model_input = self.processor(input, design_positions=design_positions)
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.processor(
+            structure,
+            protein_instances=protein_instances,
+            design_positions=design_positions,
+        )
         generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.unconditional_probabilities(
             model_input,
@@ -369,6 +411,7 @@ class ProteinMpnnDesignAndPackPipeline:
         self,
         input: Structure | str | PathLike[str],
         *,
+        protein_instances: Sequence[str] | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
@@ -397,7 +440,8 @@ class ProteinMpnnDesignAndPackPipeline:
         Design ProteinMPNN sequences and pack every resulting candidate.
 
         Args:
-            input: A ``Structure`` or local PDB path, parsed once for both stages.
+            input: A ``Structure`` or local structure path, parsed once for both stages.
+            protein_instances: Optional protein instance IDs retained by both stages.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with the required backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -434,9 +478,10 @@ class ProteinMpnnDesignAndPackPipeline:
             packing-sample order. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
-        model_input = self.designer.processor.process_structure(
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.designer.processor(
             structure,
+            protein_instances=protein_instances,
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
@@ -469,7 +514,7 @@ class ProteinMpnnDesignAndPackPipeline:
                 reference for reference, keep in zip(references, selected) if keep and reference is not None
             ]
         packs = self.packer.pack_sequences(
-            structure,
+            model_input.structures[0],
             sequences=[_candidate_protein_sequences(candidate.system) for candidate in design_result.candidates],
             pack_positions=pack_positions,
             use_atom_context=use_packing_atom_context,

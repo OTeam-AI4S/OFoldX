@@ -21,7 +21,7 @@ from .processor import (
     RESIDUE_TYPE_INDEX_BY_COMPONENT,
     RESIDUE_TYPE_INDEX_BY_SYMBOL,
     UNKNOWN_RESIDUE_TYPE_INDEX,
-    _select_template_alignment,
+    select_template_alignment,
 )
 
 
@@ -35,6 +35,8 @@ class AlphaFold2MultimerProcessor(Processor):
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
+
+    config_class = AlphaFold2MultimerProcessorConfig
 
     def __init__(
         self,
@@ -247,7 +249,7 @@ def prepare_multimer_features(
     """
 
     total_length = chains[-1].stop
-    residue_type = torch.tensor(
+    residue_type_ids = torch.tensor(
         [
             RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id]
             for chain in chains
@@ -255,7 +257,9 @@ def prepare_multimer_features(
         ],
         dtype=torch.long,
     )
-    token_features = F.one_hot(residue_type, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1).to(torch.float32)
+    token_features = F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1).to(
+        torch.float32
+    )
 
     residue_index = torch.cat([torch.arange(chain.stop - chain.start) for chain in chains]).long()
     chain_index = torch.cat([torch.full((chain.stop - chain.start,), chain.chain_index) for chain in chains]).long()
@@ -264,7 +268,7 @@ def prepare_multimer_features(
         [torch.full((chain.stop - chain.start,), chain.symmetry_index) for chain in chains]
     ).long()
 
-    query_tokens = residue_type.clone()
+    query_tokens = residue_type_ids.clone()
     tokens, deletions = materialize_collection(msa, chains, total_length, query_tokens)
     # The Processor emits the raw paired alignment pool and its full-pool profile.
     # The Model samples clustered and extra rows once per recycle. ``msa_profile``
@@ -290,13 +294,13 @@ def prepare_multimer_features(
     }
     placed = {name: value.to(device=device, dtype=dtype).unsqueeze(0) for name, value in floating.items()}
     integral = {
-        "residue_type": residue_type,
+        "residue_type_ids": residue_type_ids,
         "residue_index": residue_index,
         "chain_index": chain_index,
         "entity_index": entity_index,
         "symmetry_index": symmetry_index,
         "msa_tokens": tokens,
-        "template_residue_type": template_values["template_residue_type"],
+        "template_residue_type_ids": template_values["template_residue_type_ids"],
     }
     placed_integral = {name: value.to(device=device).unsqueeze(0) for name, value in integral.items()}
     return AlphaFold2MultimerInput(
@@ -394,7 +398,7 @@ def multimer_template_features(
     atom_type_num = residue_constants.atom_type_num
     if not templates:
         return {
-            "template_residue_type": torch.full((1, total_length), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long),
+            "template_residue_type_ids": torch.full((1, total_length), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long),
             "template_mask": torch.zeros(1),
             "template_all_atom_positions": torch.zeros(1, total_length, atom_type_num, 3),
             "template_all_atom_mask": torch.zeros(1, total_length, atom_type_num),
@@ -409,11 +413,11 @@ def multimer_template_features(
     for chain in chains:
         entity_to_chains.setdefault(chain.entity_id, []).append(chain)
 
-    residue_types: list[Tensor] = []
+    template_residue_type_ids: list[Tensor] = []
     positions_list: list[Tensor] = []
     masks_list: list[Tensor] = []
     for template in templates:
-        residue_type = torch.full((total_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
+        residue_type_ids = torch.full((total_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
         positions = torch.zeros(total_length, atom_type_num, 3)
         masks = torch.zeros(total_length, atom_type_num)
         for alignment in template.alignments:
@@ -423,24 +427,24 @@ def multimer_template_features(
                 else entity_to_chains.get(alignment.target_entity_id, [])
             )
             for chain in target_chains:
-                _select_template_alignment(
+                select_template_alignment(
                     template,
                     target_length=chain.stop - chain.start,
                     target_entity_id=chain.entity_id,
                     target_instance_id=chain.instance_id,
                 )
-                _project_template_chain(template, alignment, chain, residue_type, positions, masks)
-        residue_types.append(residue_type)
+                _project_template_chain(template, alignment, chain, residue_type_ids, positions, masks)
+        template_residue_type_ids.append(residue_type_ids)
         positions_list.append(positions)
         masks_list.append(masks)
 
-    residue_type = torch.stack(residue_types)
+    residue_type_ids = torch.stack(template_residue_type_ids)
     positions = torch.stack(positions_list)
     masks = torch.stack(masks_list)
-    pseudo_beta, pseudo_beta_mask = _template_pseudo_beta(residue_type, positions, masks)
+    pseudo_beta, pseudo_beta_mask = _template_pseudo_beta(residue_type_ids, positions, masks)
     backbone_frame, backbone_frame_mask = _template_backbone_frame(positions, masks)
     return {
-        "template_residue_type": residue_type,
+        "template_residue_type_ids": residue_type_ids,
         "template_mask": torch.ones(len(templates)),
         "template_all_atom_positions": positions,
         "template_all_atom_mask": masks,
@@ -455,7 +459,7 @@ def _project_template_chain(
     template: Template,
     alignment: TemplateAlignment,
     chain: MultimerChain,
-    residue_type: Tensor,
+    residue_type_ids: Tensor,
     positions: Tensor,
     masks: Tensor,
 ) -> None:
@@ -468,7 +472,7 @@ def _project_template_chain(
     for target_index, template_index in alignment.residue_pairs:
         global_index = chain.start + target_index
         component_id = template_entity.components[template_index].component_id
-        residue_type[global_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
+        residue_type_ids[global_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
         for atom_name, atom_index in residue_constants.atom_order.items():
             site = AtomSite(alignment.template_instance_id, template_index, atom_name)
             coordinate_index = sites.get(site)
@@ -478,14 +482,14 @@ def _project_template_chain(
             masks[global_index, atom_index] = 1.0
 
 
-def _template_pseudo_beta(residue_type: Tensor, positions: Tensor, masks: Tensor) -> tuple[Tensor, Tensor]:
+def _template_pseudo_beta(residue_type_ids: Tensor, positions: Tensor, masks: Tensor) -> tuple[Tensor, Tensor]:
     ca = residue_constants.atom_order["CA"]
     cb = residue_constants.atom_order["CB"]
     gly = residue_constants.AMINO_ACID_ONE_LETTER_CODES.index("G")
     atom_index = torch.where(
-        residue_type == gly,
-        torch.full_like(residue_type, ca),
-        torch.full_like(residue_type, cb),
+        residue_type_ids == gly,
+        torch.full_like(residue_type_ids, ca),
+        torch.full_like(residue_type_ids, cb),
     )
     gather = atom_index.unsqueeze(-1).unsqueeze(-1).expand(*atom_index.shape, 1, 3)
     pseudo_beta = positions.gather(-2, gather).squeeze(-2)

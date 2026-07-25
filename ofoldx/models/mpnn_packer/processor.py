@@ -5,7 +5,6 @@ MPNN Packer input processing.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from os import PathLike
 
 import numpy as np
 import torch
@@ -22,7 +21,6 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
-from ...io import read_mpnn_pdb
 from ...modules import residue_constants as rc
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
@@ -44,6 +42,8 @@ class MpnnPackerProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = MpnnPackerProcessorConfig
+
     def __init__(
         self,
         config: MpnnPackerProcessorConfig | None = None,
@@ -56,7 +56,7 @@ class MpnnPackerProcessor(Processor):
 
     def __call__(
         self,
-        input: Structure | str | PathLike[str],
+        structure: Structure,
         *,
         sequence: str | Mapping[str, str | Sequence[str]] | None = None,
         pack_positions: Sequence[ComponentReference] | None = None,
@@ -67,7 +67,7 @@ class MpnnPackerProcessor(Processor):
         Prepare a structure and optional target sequence for side-chain packing.
 
         Args:
-            input: A ``Structure`` or local structure path.
+            structure: Coordinate-bearing source structure.
             sequence: Optional replacement protein sequence. A bare string requires one protein
                 instance; a mapping addresses instances explicitly.
             pack_positions: Residue occurrences to repack. ``None`` selects every eligible
@@ -79,7 +79,8 @@ class MpnnPackerProcessor(Processor):
             A single-example ``MpnnPackerInput`` with aligned atom14, context, and layout values.
         """
 
-        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
+        if not isinstance(structure, Structure):
+            raise TypeError("MpnnPackerProcessor requires a Structure")
         system = structure.system
         protein_instances: list[tuple[str, PolymerSequence]] = []
         for instance_id, entity_id in system.instances.items():

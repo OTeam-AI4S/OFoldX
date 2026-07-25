@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Mapping, Sequence
-from os import PathLike
-from pathlib import Path
 from typing import cast
 
 import torch
@@ -37,7 +35,6 @@ from ...data.placement import (
 from ...data.placement import instance_of as derive_instance_of
 from ...data.placement import symbolic_residue_aliases, validate_placement
 from ...data.structure import Structure
-from ...io.structure import read_structure
 from ...processor import Processor
 from .config import RfDiffusionProcessorConfig
 
@@ -74,6 +71,8 @@ class RfDiffusionProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = RfDiffusionProcessorConfig
+
     def __init__(
         self,
         config: RfDiffusionProcessorConfig | None = None,
@@ -87,7 +86,7 @@ class RfDiffusionProcessor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
+        input: MolecularSystem | Structure | None = None,
         *,
         placement: RfDiffusionPlacements | None = None,
         templates: Sequence[Template] = (),
@@ -111,7 +110,7 @@ class RfDiffusionProcessor(Processor):
         Build model inputs for one backbone-design problem.
 
         Args:
-            input: Optional context system, observed structure, or local structure path.
+            input: Optional context system or observed structure.
             placement: Topology containing existing spans and generated protein segments.
             templates: Zero or one structural template.
             conditions: Residue-identity, hotspot, geometry, symmetry, bond, and
@@ -135,8 +134,6 @@ class RfDiffusionProcessor(Processor):
         template_values = tuple(templates)
         if len(template_values) > 1:
             raise ValueError("RFdiffusion accepts at most one fold-conditioning Template")
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         timestep = operator.index(timestep)
         if timestep <= 0:
             raise ValueError("timestep must be positive")
@@ -459,7 +456,9 @@ class RfDiffusionProcessor(Processor):
         residue_index = torch.tensor(residue_indices, dtype=torch.int64)
         return RfDiffusionInput(
             noisy_coordinates=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
-            sequence=F.one_hot(tokens, num_classes=22).to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            residue_type_features=F.one_hot(tokens, num_classes=22)
+            .to(device=self.device, dtype=self.dtype)
+            .unsqueeze(0),
             residue_index=residue_index.to(self.device).unsqueeze(0),
             fixed_structure_mask=fixed_structure.to(self.device).unsqueeze(0),
             fixed_sequence_mask=fixed_sequence.to(self.device).unsqueeze(0),

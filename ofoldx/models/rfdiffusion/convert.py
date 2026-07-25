@@ -11,12 +11,10 @@ from os import PathLike
 from pathlib import Path
 from typing import cast
 
-import chanfig
 import numpy as np
 import torch
 from torch import Tensor
 
-from ...artifacts import save_model
 from .config import RfDiffusionConfig
 from .model import RfDiffusionModel
 
@@ -33,10 +31,7 @@ def rfdiffusion_schedule(source: str | PathLike[str] | None = None) -> dict[str,
     """
 
     if source is None:
-        raise ValueError(
-            "the IGSO(3) schedule source is required: pass the original RFdiffusion .pkl cache "
-            "or an .npz archive via schedule_source (the convert CLI's --schedule-source)"
-        )
+        source = Path(__file__).with_name("rfdiffusion_schedule.npz")
     path = Path(source)
     if path.suffix == ".pkl":
         with path.open("rb") as handle:
@@ -195,7 +190,11 @@ _DENOISER_LEAF_RENAMES = (
     (".conv_in.", ".input_convolutions."),
     (".conv_out.", ".output_convolutions."),
     (".radial_func.", ".radial_profile."),
-    (".net.", ".mlp."),
+    (".net.0.", ".input_projection."),
+    (".net.1.", ".input_norm."),
+    (".net.3.", ".hidden_projection."),
+    (".net.4.", ".hidden_norm."),
+    (".net.6.", ".output_projection."),
     (".to_kernel_self.", ".self_interaction_weights."),
 )
 
@@ -309,10 +308,10 @@ def convert_rfdiffusion_checkpoint(
     r"""
     Return one native Model loaded strictly from an official checkpoint.
 
-    The released IGSO(3) schedule table is copied verbatim from ``schedule_source`` (an ``.npz`` or
-    original RFdiffusion ``.pkl``; the untracked ``rfdiffusion_schedule.npz`` beside the module by
-    default) into the model's persistent ``igso3_*`` float64 buffers, so it ships baked into
-    ``model.safetensors`` rather than as vendored package data.
+    The released IGSO(3) schedule table is copied verbatim from ``schedule_source``
+    (an ``.npz`` or original RFdiffusion ``.pkl``), or from the bundled family
+    table when no source is given, into the model's persistent ``igso3_*``
+    float64 buffers.
     """
 
     loaded = load_rfdiffusion_checkpoint(checkpoint)
@@ -344,30 +343,25 @@ def save_rfdiffusion_checkpoint(
 
     Strict-loads the checkpoint via
     [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
-    pairs it with [`RfDiffusionProcessor`][], and writes ``model.json`` /
-    ``processor.json`` / safetensors via
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model]. The registered pair has no
-    generic standard task, so a ``pipeline.json = {"pipeline": "ofoldx.rfdiffusion"}`` marker
-    is written to route ``pipeline("design", model=dir)`` to [`RfDiffusionPipeline`][] rather than
-    the generic standard ``design`` route.
+    pairs it with [`RfDiffusionProcessor`][], and saves the registered
+    [`RfDiffusionPipeline`][]. Its one-field marker routes
+    ``pipeline("design", model=dir)`` to that concrete Pipeline.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
     ``repo_id``.
     """
 
-    from ...pipelines.registry import PIPELINES
     from .pipeline import RfDiffusionPipeline
     from .processor import RfDiffusionProcessor
 
     model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype, schedule_source=schedule_source)
-    destination = Path(output_dir).expanduser()
-    save_model(destination, model=model, processor=RfDiffusionProcessor())
-    chanfig.NestedDict({"pipeline": PIPELINES.id_for(RfDiffusionPipeline)}).dump(destination / "pipeline.json")
-    if repo_id is not None:
-        from ...hub import upload_repository
-
-        upload_repository(destination, repo_id, token=token, private=private)
+    RfDiffusionPipeline(model=model, processor=RfDiffusionProcessor(dtype=dtype)).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -382,10 +376,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--schedule-source",
         type=Path,
-        required=True,
-        help="IGSO(3) schedule source (the original RFdiffusion .pkl cache, or an .npz archive of "
-        "the same table); required, as the table is not shipped in the package -- it is baked into "
-        "the converted checkpoint's igso3_* buffers",
+        default=None,
+        help="optional IGSO(3) schedule source (the original RFdiffusion .pkl cache, or an .npz "
+        "archive of the same arrays); defaults to the bundled released table",
     )
     parser.add_argument(
         "--repo-id",

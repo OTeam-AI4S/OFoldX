@@ -28,16 +28,12 @@ from .model import (
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
-    processor_config=NaMpnnProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.nampnn",
     pipeline=NaMpnnPipeline,
-    tasks=("design", "score"),
-    architectures=("ofoldx.nampnn",),
 )

@@ -31,7 +31,6 @@ from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler,
 from ...modules.embedding import (
     RelativePositionBuckets,
     RelativePositionEmbedder,
-    TemplateEmbedder,
     generate_relative_position_features,
 )
 from ...modules.functional import pair_mask_from_token_mask
@@ -69,25 +68,16 @@ class ProtenixModel(Model):
             single_size=config.single_size,
             atom_feature_size=config.atom_feature_size,
         )
-        self.constraint_embeddings = ProtenixConstraintEmbeddings(config.pair_size) if config.constraints else None
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.relative_position_embedder = RelativePositionEmbedder(config.relative_position_size, config.pair_size)
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
+        self.constraint_embeddings = ProtenixConstraintEmbeddings(config.pair_size) if config.constraints else None
         self.pair_recycle_norm = LayerNorm(config.pair_size)
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
         self.single_recycle_norm = LayerNorm(config.single_size)
         self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
-        self.template_embedder = TemplateEmbedder(
-            pair_size=config.pair_size,
-            hidden_size=config.template.hidden_size,
-            num_blocks=config.template.num_blocks,
-            vocab_size=config.template.vocab_size,
-            num_distogram_bins=config.template.num_distogram_bins,
-            expansion=config.template.expansion,
-            dropout=config.template.dropout,
-        )
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
@@ -950,7 +940,7 @@ class ProtenixConstraintSubstructureAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.num_attention_heads = num_attention_heads
-        self.head_size = hidden_size // num_attention_heads
+        self.head_dim = hidden_size // num_attention_heads
         self.dropout = dropout
         self.backend = backend
         self.query_projection = nn.Linear(hidden_size, hidden_size)
@@ -963,7 +953,7 @@ class ProtenixConstraintSubstructureAttention(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, hidden: Tensor) -> Tensor:
-        shape = (*hidden.shape[:-1], self.num_attention_heads, self.head_size)
+        shape = (*hidden.shape[:-1], self.num_attention_heads, self.head_dim)
         query = self.query_projection(hidden).reshape(shape).transpose(-3, -2)
         key = self.key_projection(hidden).reshape(shape).transpose(-3, -2)
         value = self.value_projection(hidden).reshape(shape).transpose(-3, -2)
@@ -1298,7 +1288,7 @@ def _protenix_has_clash(
 # =====================================================================================
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True, eq=False)
 class _ProtenixTrunkOutput:
     r"""
     Named representations returned by the Protenix recycling trunk.

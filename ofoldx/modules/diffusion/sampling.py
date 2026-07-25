@@ -17,7 +17,7 @@ from .schedule import EdmScheduler
 from .types import CoordinateDenoiseFn, CoordinateDenoisingInput
 
 
-@dataclass
+@dataclass(eq=False)
 class CoordinateDenoiseContext:
     r"""
     Conditioning tensors shared by coordinate-denoising steps.

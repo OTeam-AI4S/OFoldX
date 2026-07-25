@@ -1439,9 +1439,6 @@ class LigandMpnnOutput:
     def log_probabilities(self) -> Tensor:
         r"""
         Return vocabulary log probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.log_softmax(dim=-1)
@@ -1450,9 +1447,6 @@ class LigandMpnnOutput:
     def probabilities(self) -> Tensor:
         r"""
         Return vocabulary probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.softmax(dim=-1)
@@ -1468,8 +1462,7 @@ class LigandMpnnSamplingOutput:
             ``(num_samples, num_residues)``.
         log_probabilities: Model log probabilities with shape
             ``(num_samples, num_residues, vocabulary_size)``.
-        sampling_probabilities: Sampling distribution over the 20 generatable amino
-            acids with shape ``(num_samples, num_residues, 20)``.
+        sampling_probabilities: Sampling distribution used at each position.
         decoding_ranks: Autoregressive ranks with shape
             ``(num_samples, num_residues)``.
     """

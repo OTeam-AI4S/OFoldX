@@ -13,7 +13,7 @@ from torch import Tensor, nn
 ChainGate = Literal["same_entity", "not_same_chain"]
 
 
-@dataclass
+@dataclass(eq=False)
 class RelativePositionBuckets:
     r"""
     Integer buckets consumed by [`RelativePositionEmbedder`][].

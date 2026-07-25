@@ -15,6 +15,7 @@ from typing import Literal
 import numpy as np
 
 from ..data.components import get_builtin_component_polymer_type, get_component
+from ..data.elements import ATOMIC_NUMBER_BY_ELEMENT
 from ..data.molecular import (
     AtomSite,
     ChemicalAtom,
@@ -62,7 +63,8 @@ def read_structure(
     Read one structure from PDB or mmCIF.
 
     Args:
-        path: Input path. The suffix selects PDB or mmCIF parsing.
+        path: Input path. The suffix selects PDB or mmCIF parsing; PDB may be
+            gzip-compressed as ``.pdb.gz``.
         model: One-based model number.
         assembly_id: Optional biological assembly identifier.
         altloc: Policy used to choose one alternate location per residue.
@@ -104,7 +106,7 @@ def read_structures(
     Read every residue-consistent alternate-location realization.
 
     Args:
-        path: Input PDB or mmCIF path.
+        path: Input PDB, gzip-compressed PDB, or mmCIF path.
         model: One-based model number.
         assembly_id: Optional biological assembly identifier.
         atom_layout: Atoms included in each returned structure.
@@ -174,7 +176,7 @@ def _prepare_read(
     atom_layout: str,
     components: Mapping[str, ChemicalComponent] | None,
 ) -> tuple[ParsedStructure, dict[str, ChemicalComponent]]:
-    source, format_name = _structure_path(path)
+    source, format_name = _structure_path(path, allow_compressed=True)
     if model <= 0:
         raise ValueError("model must be a positive one-based integer")
     if atom_layout not in _ATOM_LAYOUTS:
@@ -200,6 +202,8 @@ def _prepare_read(
             if component.component_id != component_id:
                 raise ValueError("component mapping keys must equal ChemicalComponent.component_id")
         component_table.update(supplied)
+    if atom_layout == "observed":
+        _add_observed_components(parsed.rows, component_table)
     if atom_layout == "complete_all":
         component_table = {
             component_id: _materialize_component_hydrogens(component)
@@ -271,12 +275,65 @@ def _materialize_component_hydrogens(component: ChemicalComponent) -> ChemicalCo
     )
 
 
-def _structure_path(path: str | os.PathLike[str]) -> tuple[Path, Literal["pdb", "mmcif"]]:
+def _structure_path(
+    path: str | os.PathLike[str],
+    *,
+    allow_compressed: bool = False,
+) -> tuple[Path, Literal["pdb", "mmcif"]]:
     resolved = Path(os.path.expanduser(os.fspath(path)))
+    suffix = resolved.suffix.lower()
+    if allow_compressed and suffix == ".gz":
+        suffix = resolved.with_suffix("").suffix.lower()
+        if suffix != ".pdb":
+            raise ValueError("only PDB structure input may be gzip-compressed")
     try:
-        return resolved, _FORMATS[resolved.suffix.lower()]
+        return resolved, _FORMATS[suffix]
     except KeyError:
-        raise ValueError("structure path suffix must be .pdb, .cif, or .mmcif") from None
+        expected = ".pdb, .pdb.gz, .cif, or .mmcif" if allow_compressed else ".pdb, .cif, or .mmcif"
+        raise ValueError(f"structure path suffix must be {expected}") from None
+
+
+def _add_observed_components(
+    rows: tuple[AtomRecord, ...],
+    component_table: dict[str, ChemicalComponent],
+) -> None:
+    r"""
+    Declare source-observed atoms for components without complete chemistry.
+    """
+
+    atoms_by_component: dict[str, dict[str, ChemicalAtom]] = {}
+    for row in rows:
+        if row.component_id in component_table:
+            continue
+        if row.element not in ATOMIC_NUMBER_BY_ELEMENT:
+            raise ValueError(
+                f"source atom {row.atom_name!r} in component {row.component_id!r} "
+                f"has invalid element {row.element!r}"
+            )
+        atom = ChemicalAtom(
+            atom_id=row.atom_name,
+            element=row.element,
+            isotope=row.isotope,
+            formal_charge=row.charge,
+        )
+        component_atoms = atoms_by_component.setdefault(row.component_id, {})
+        previous = component_atoms.get(row.atom_name)
+        if previous is None:
+            component_atoms[row.atom_name] = atom
+        elif previous != atom:
+            raise ValueError(
+                f"component {row.component_id!r} has conflicting source chemistry " f"for atom {row.atom_name!r}"
+            )
+    component_table.update(
+        {
+            component_id: ChemicalComponent(
+                component_id=component_id,
+                atoms=tuple(atoms.values()),
+                bonds=None,
+            )
+            for component_id, atoms in atoms_by_component.items()
+        }
+    )
 
 
 def _select_altloc(
@@ -406,8 +463,7 @@ def _build_structure(
         branch_entities, branch_component_indices = read_mmcif_branch_entities(parsed, component_table, rows)
     else:
         branch_entities, branch_component_indices = {}, {}
-    # mmCIF uses label_seq_id for polymer membership. PDB uses record type and the
-    # built-in component class because Structure does not retain source categories.
+    # Polymer membership is resolved before source record categories are discarded.
     groups: list[
         tuple[
             int,
@@ -422,24 +478,24 @@ def _build_structure(
 
     for (symmetry_id, chain_id), residue_order in chain_residue_order.items():
         base_instance_id = chain_id if symmetry_id is None else f"{chain_id}#{symmetry_id}"
+        component_polymer_types = {
+            key: (
+                get_builtin_component_polymer_type(residue_rows[key][0].component_id)
+                if parsed.format == "mmcif"
+                else _pdb_component_polymer_type(component_table[residue_rows[key][0].component_id])
+            )
+            for key in residue_order
+        }
         if parsed.format == "mmcif":
+            polymer_residues = [key for key in residue_order if component_polymer_types[key] is not None]
+        else:
             polymer_residues = [
                 key
                 for key in residue_order
-                if get_builtin_component_polymer_type(residue_rows[key][0].component_id) is not None
+                if any(row.group == "ATOM" for row in residue_rows[key]) or component_polymer_types[key] is not None
             ]
-        else:
-            polymer_indices = [
-                index
-                for index, key in enumerate(residue_order)
-                if any(row.group == "ATOM" for row in residue_rows[key])
-                or get_builtin_component_polymer_type(residue_rows[key][0].component_id) is not None
-            ]
-            polymer_residues = residue_order[polymer_indices[0] : polymer_indices[-1] + 1] if polymer_indices else []
         if polymer_residues:
-            classified_polymer_types = (
-                get_builtin_component_polymer_type(residue_rows[key][0].component_id) for key in polymer_residues
-            )
+            classified_polymer_types = (component_polymer_types[key] for key in polymer_residues)
             polymer_types = {value for value in classified_polymer_types if value is not None}
             if polymer_types == {"dna", "rna"}:
                 chain_polymer_type: PolymerType = "dna_rna_hybrid"
@@ -629,6 +685,27 @@ def _reuse_entity(
     if previous != entity:
         raise ValueError(f"source entity ID {entity_id!r} has conflicting molecular definitions")
     return previous
+
+
+def _pdb_component_polymer_type(component: ChemicalComponent) -> PolymerType | None:
+    r"""
+    Infer PDB polymer chemistry from declared or source-observed component atoms.
+    """
+
+    polymer_type = get_builtin_component_polymer_type(component.component_id)
+    if polymer_type is not None:
+        return polymer_type
+    if (
+        component.previous_attachment is not None
+        and component.next_attachment is not None
+        and component.previous_attachment.atom_id == "N"
+        and component.next_attachment.atom_id == "C"
+    ):
+        return "protein"
+    elements_by_atom_id = {atom.atom_id: atom.element for atom in component.atoms}
+    if all(elements_by_atom_id.get(atom_id) == element for atom_id, element in (("N", "N"), ("CA", "C"), ("C", "C"))):
+        return "protein"
+    return None
 
 
 def _read_source_bonds(

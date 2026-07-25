@@ -214,9 +214,9 @@ def convert_odesign_checkpoint(
     The ODesign protein repository contains a multi-pair [`ODesignPipeline`][]: the ODesign
     backbone pair owns the runnable root, and the OInvFold sequence step uses the
     *separately registered, read-only* ProteinMPNN / LigandMPNN Pipelines bound at the fixed
-    ``protein_designer/`` and ``ligand_designer/`` sub-directories. The backbone pair alone keeps
-    ``standard_tasks=()`` and cannot route as a lone standard task, so this writes the AGGREGATE
-    repository — every class-owned pair plus the one-field ``pipeline.json = {"pipeline": "ofoldx.odesign"}``
+    ``protein_designer/`` and ``ligand_designer/`` sub-directories. The backbone pair is not a
+    standalone Pipeline, so this writes the composite repository — every class-owned pair plus
+    the one-field ``pipeline.json = {"pipeline": "ofoldx.odesign"}``
     marker — via ``ODesignPipeline.save`` so ``pipeline("design", model=dir)`` routes it back through the
     multi-pair loader.
 
@@ -241,7 +241,10 @@ def convert_odesign_checkpoint(
     model = convert_odesign_model(checkpoint_path, dtype=dtype, config=config)
     ODesignPipeline(
         model=model,
-        processor=ODesignProcessor(ODesignProcessorConfig(receptor_mode=receptor_mode)),
+        processor=ODesignProcessor(
+            ODesignProcessorConfig(receptor_mode=receptor_mode),
+            dtype=dtype,
+        ),
         protein_designer=_load_pipeline("design", model=protein_designer),
         ligand_designer=_load_pipeline("design", model=ligand_designer),
     ).save(
@@ -255,7 +258,11 @@ def convert_odesign_checkpoint(
 def _bond_type_head_key(key: str) -> str:
     prefix = "token_bond_type_head"
     if key == prefix or key.startswith(prefix + "."):
-        return "bond_type_predictor" + key[len(prefix) :]
+        key = "bond_type_predictor" + key[len(prefix) :]
+        return key.replace(".input_projection.", ".classifier.0.").replace(
+            ".output_projection.",
+            ".classifier.1.",
+        )
     return key
 
 
@@ -466,9 +473,9 @@ def _replace_atom_key(key: str) -> str:
             ".atom_pair_encoder.distance_mask_projection.": ".linear_no_bias_v.",
             ".atom_pair_encoder.left_atom_projection.": ".linear_no_bias_cl.",
             ".atom_pair_encoder.right_atom_projection.": ".linear_no_bias_cm.",
-            ".atom_pair_encoder.feed_forward.1.": ".small_mlp.1.",
-            ".atom_pair_encoder.feed_forward.3.": ".small_mlp.3.",
-            ".atom_pair_encoder.feed_forward.5.": ".small_mlp.5.",
+            ".atom_pair_encoder.feed_forward_input_projection.": ".small_mlp.1.",
+            ".atom_pair_encoder.feed_forward_hidden_projection.": ".small_mlp.3.",
+            ".atom_pair_encoder.feed_forward_output_projection.": ".small_mlp.5.",
             ".atom_self_attention.": ".atom_transformer.diffusion_transformer.",
             ".atom_attention_encoder.token_projection.": ".atom_attention_encoder.linear_no_bias_q.",
             ".atom_attention_decoder.token_projection.": ".atom_attention_decoder.linear_no_bias_a.",

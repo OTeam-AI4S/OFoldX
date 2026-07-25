@@ -13,14 +13,18 @@ from typing import TypeAlias, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
-from ...modules.atom.encoders import PackedAtomAttention
+from ...modules.atom import (
+    PackedAtomToTokenEncoder,
+    PackedDenoisingAtomToTokenEncoder,
+    PackedTokenToAtomDecoder,
+)
 from ...modules.atom.pair_encoding import encode_atom_pair
-from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
@@ -31,7 +35,7 @@ from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import PairSymmetrizedDistogramHead
 from ...modules.head.tm import tm_weight_from_pae
-from ...modules.transformer import ConditionedTransformer, TripleProductConditionedTransition
+from ...modules.transformer import ConditionedTransformerEncoder, TripleProductConditionedTransition
 from ...modules.transition import Transition
 from ...modules.trunk.msa import CategoricalMsaTrunk
 from ...modules.trunk.pairformer import PairformerStack
@@ -178,51 +182,74 @@ class Boltz1Model(Model):
         )
 
         confidence = config.confidence
-        self.confidence_head: Boltz1ConfidenceHead | None = None
+        self.confidence_head: _Boltz1ConfidenceHead | None = None
         if confidence.enabled:
-            self.confidence_head = Boltz1ConfidenceHead(
-                input_size=input_size,
-                single_size=single_size,
-                pair_size=pair_size,
-                atom_hidden_size=config.atom_hidden_size,
-                atom_pair_hidden_size=config.atom_pair_hidden_size,
-                atom_feature_size=config.atom_feature_size,
-                num_query_atoms=denoiser_config.num_query_atoms,
-                num_key_atoms=denoiser_config.num_key_atoms,
-                num_atom_encoder_blocks=input_embeddings_config.num_atom_encoder_blocks,
-                num_atom_encoder_attention_heads=input_embeddings_config.num_atom_encoder_attention_heads,
-                num_blocks=confidence.num_pairformer_blocks,
-                num_pair_attention_heads=confidence.num_pair_attention_heads,
-                num_distogram_bins=confidence.num_distogram_bins,
-                max_distance=confidence.max_distance,
-                num_plddt_bins=confidence.num_plddt_bins,
-                num_pae_bins=confidence.num_pae_bins,
-                num_pde_bins=confidence.num_pde_bins,
-                compute_pae=confidence.compute_pae,
-                imitate_trunk=confidence.imitate_trunk,
-                add_single_to_pair_product=confidence.add_single_to_pair_product,
-                add_single_input_to_single=confidence.add_single_input_to_single,
-                add_pair_input_to_pair=confidence.add_pair_input_to_pair,
-                use_single_diffusion=confidence.use_single_diffusion,
-                ranking_plddt_weight=confidence.ranking_plddt_weight,
-                ranking_ptm_weight=confidence.ranking_ptm_weight,
-                use_atom_encoder=input_embeddings_config.use_atom_encoder,
-                use_msa=config.use_msa,
-                msa_size=trunk.msa_size,
-                msa_feature_size=trunk.msa_feature_size,
-                vocab_size=input_embeddings_config.vocab_size,
-                num_msa_blocks=trunk.num_msa_blocks,
-                use_paired_feature=trunk.use_paired_feature,
-                outer_product_hidden_size=trunk.outer_product_hidden_size,
-                msa_dropout=trunk.msa_dropout,
-                pair_dropout=trunk.pair_dropout,
-                num_msa_attention_heads=trunk.num_msa_attention_heads,
-                msa_head_dim=trunk.msa_head_dim,
-                triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
-                num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-                relative_position_size=config.relative_position_size,
-                backend="auto",
-            )
+            if confidence.imitate_trunk:
+                self.confidence_head = Boltz1TrunkImitationConfidenceHead(
+                    input_size=input_size,
+                    single_size=single_size,
+                    pair_size=pair_size,
+                    atom_hidden_size=config.atom_hidden_size,
+                    atom_pair_hidden_size=config.atom_pair_hidden_size,
+                    atom_feature_size=config.atom_feature_size,
+                    num_query_atoms=denoiser_config.num_query_atoms,
+                    num_key_atoms=denoiser_config.num_key_atoms,
+                    num_atom_encoder_blocks=input_embeddings_config.num_atom_encoder_blocks,
+                    num_atom_encoder_attention_heads=input_embeddings_config.num_atom_encoder_attention_heads,
+                    num_blocks=confidence.num_pairformer_blocks,
+                    num_pair_attention_heads=confidence.num_pair_attention_heads,
+                    num_distogram_bins=confidence.num_distogram_bins,
+                    max_distance=confidence.max_distance,
+                    num_plddt_bins=confidence.num_plddt_bins,
+                    num_pae_bins=confidence.num_pae_bins,
+                    num_pde_bins=confidence.num_pde_bins,
+                    compute_pae=confidence.compute_pae,
+                    add_single_to_pair_product=confidence.add_single_to_pair_product,
+                    use_single_diffusion=confidence.use_single_diffusion,
+                    ranking_plddt_weight=confidence.ranking_plddt_weight,
+                    ranking_ptm_weight=confidence.ranking_ptm_weight,
+                    use_atom_encoder=input_embeddings_config.use_atom_encoder,
+                    use_msa=config.use_msa,
+                    msa_size=trunk.msa_size,
+                    msa_feature_size=trunk.msa_feature_size,
+                    vocab_size=input_embeddings_config.vocab_size,
+                    num_msa_blocks=trunk.num_msa_blocks,
+                    use_paired_feature=trunk.use_paired_feature,
+                    outer_product_hidden_size=trunk.outer_product_hidden_size,
+                    msa_dropout=trunk.msa_dropout,
+                    pair_dropout=trunk.pair_dropout,
+                    num_msa_attention_heads=trunk.num_msa_attention_heads,
+                    msa_head_dim=trunk.msa_head_dim,
+                    triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
+                    num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                    relative_position_size=config.relative_position_size,
+                    backend="auto",
+                )
+            else:
+                self.confidence_head = Boltz1TrunkReuseConfidenceHead(
+                    input_size=input_size,
+                    single_size=single_size,
+                    pair_size=pair_size,
+                    num_blocks=confidence.num_pairformer_blocks,
+                    num_pair_attention_heads=confidence.num_pair_attention_heads,
+                    num_distogram_bins=confidence.num_distogram_bins,
+                    max_distance=confidence.max_distance,
+                    num_plddt_bins=confidence.num_plddt_bins,
+                    num_pae_bins=confidence.num_pae_bins,
+                    num_pde_bins=confidence.num_pde_bins,
+                    compute_pae=confidence.compute_pae,
+                    add_single_to_pair_product=confidence.add_single_to_pair_product,
+                    add_single_input_to_single=confidence.add_single_input_to_single,
+                    add_pair_input_to_pair=confidence.add_pair_input_to_pair,
+                    use_single_diffusion=confidence.use_single_diffusion,
+                    ranking_plddt_weight=confidence.ranking_plddt_weight,
+                    ranking_ptm_weight=confidence.ranking_ptm_weight,
+                    pair_dropout=trunk.pair_dropout,
+                    triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
+                    num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                    relative_position_size=config.relative_position_size,
+                    backend="auto",
+                )
         self.post_init()
 
     def forward(
@@ -361,7 +388,7 @@ class Boltz1Model(Model):
         generator: torch.Generator | None = None,
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
-    ) -> Boltz1Output:
+    ) -> _Boltz1FoldOutput:
         r"""
         Run the trunk and sampler and return the full Boltz-1 output.
 
@@ -380,8 +407,9 @@ class Boltz1Model(Model):
             steering_args: Optional overrides merged onto the configured steering flags.
 
         Returns:
-            A [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output] with predicted coords, distogram
-            logits, optional confidence logits, and optional derived ranking scores.
+            A [`_Boltz1FoldOutput`][ofoldx.models.boltz1.model._Boltz1FoldOutput]
+            with sampled coordinates, distogram logits, optional confidence
+            logits, and optional derived ranking scores.
 
         """
 
@@ -423,7 +451,7 @@ class Boltz1Model(Model):
                 for name, value in confidence.items()
                 if name not in confidence_logits
             }
-        return Boltz1Output(
+        return _Boltz1FoldOutput(
             coordinates=_unflatten_sample_axis(diffusion_coords, batch_size, num_samples),
             distogram_logits=representations.distogram_logits,
             plddt_logits=_unflatten_optional_sample_axis(
@@ -511,7 +539,7 @@ class Boltz1Model(Model):
             atom_mask=input.atom_mask,
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
-            residue_type=input.residue_type,
+            residue_type_features=input.residue_type_features,
             msa_profile=input.msa_profile,
             deletion_mean=input.deletion_mean,
             pocket_feature=input.pocket_feature,
@@ -647,7 +675,7 @@ class Boltz1InputEmbeddings(nn.Module):
         self.single_size = single_size
         self.atom_encoder: Boltz1AtomEncoder | None = None
         self.atom_pair_bias_projection: Boltz1PerBlockPairBiasProjection | None = None
-        self.atom_attention_encoder: Boltz1AtomAttentionEncoder | None = None
+        self.atom_attention_encoder: PackedAtomToTokenEncoder | None = None
         if use_atom_encoder:
             self.atom_encoder = Boltz1AtomEncoder(
                 atom_feature_size=atom_feature_size,
@@ -661,13 +689,13 @@ class Boltz1InputEmbeddings(nn.Module):
                 num_blocks=num_atom_encoder_blocks,
                 num_attention_heads=num_atom_encoder_attention_heads,
             )
-            self.atom_attention_encoder = Boltz1AtomAttentionEncoder(
+            self.atom_attention_encoder = PackedAtomToTokenEncoder(
                 atom_hidden_size=atom_hidden_size,
-                single_size=single_size,
+                token_hidden_size=single_size,
                 num_query_atoms=num_query_atoms,
                 num_key_atoms=num_key_atoms,
-                num_atom_encoder_blocks=num_atom_encoder_blocks,
-                num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
+                num_blocks=num_atom_encoder_blocks,
+                num_attention_heads=num_atom_encoder_attention_heads,
                 backend=backend,
             )
 
@@ -679,7 +707,7 @@ class Boltz1InputEmbeddings(nn.Module):
         atom_mask: Tensor,
         reference_space_id: Tensor,
         atom_to_token: Tensor,
-        residue_type: Tensor,
+        residue_type_features: Tensor,
         msa_profile: Tensor,
         deletion_mean: Tensor,
         pocket_feature: Tensor | None = None,
@@ -689,9 +717,9 @@ class Boltz1InputEmbeddings(nn.Module):
         atom_attention_encoder = self.atom_attention_encoder
         if atom_encoder is None:
             token_from_atom = torch.zeros(
-                (*residue_type.shape[:-1], self.single_size),
-                device=residue_type.device,
-                dtype=residue_type.dtype,
+                (*residue_type_features.shape[:-1], self.single_size),
+                device=residue_type_features.device,
+                dtype=residue_type_features.dtype,
             )
         else:
             atom_query, atom_conditioning, atom_pair = atom_encoder(
@@ -700,22 +728,22 @@ class Boltz1InputEmbeddings(nn.Module):
                 atom_mask,
                 reference_space_id,
             )
-            token_from_atom = cast(Boltz1AtomAttentionEncoder, atom_attention_encoder)(
+            token_from_atom = cast(PackedAtomToTokenEncoder, atom_attention_encoder)(
                 atom_query,
                 atom_conditioning,
                 cast(Boltz1PerBlockPairBiasProjection, atom_pair_bias_projection)(atom_pair),
                 atom_mask,
                 atom_to_token,
-                residue_type.shape[-2],
+                residue_type_features.shape[-2],
             )
-        pocket_size = self.input_size - self.single_size - 2 * residue_type.shape[-1] - 1
+        pocket_size = self.input_size - self.single_size - 2 * residue_type_features.shape[-1] - 1
         if pocket_feature is None:
-            pocket_feature = residue_type.new_zeros(*residue_type.shape[:-1], pocket_size)
+            pocket_feature = residue_type_features.new_zeros(*residue_type_features.shape[:-1], pocket_size)
             pocket_feature[..., 0] = 1
         single = torch.cat(
             [
                 token_from_atom,
-                residue_type.to(token_from_atom.dtype),
+                residue_type_features.to(token_from_atom.dtype),
                 msa_profile.to(token_from_atom.dtype),
                 deletion_mean.unsqueeze(-1).to(token_from_atom.dtype),
                 pocket_feature.to(token_from_atom.dtype),
@@ -745,22 +773,36 @@ class Boltz1AtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.left_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.left_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.right_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.right_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.feed_forward = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        pair = self.feed_forward_input_projection(F.relu(pair))
+        pair = self.feed_forward_hidden_projection(F.relu(pair))
+        return self.feed_forward_output_projection(F.relu(pair))
 
     def forward(
         self,
@@ -810,7 +852,7 @@ class Boltz1AtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        single_windows = pad_atoms(atom_single)
+        single_windows = F.relu(pad_atoms(atom_single))
         atom_pair = encode_atom_pair(
             self,
             distance_vectors,
@@ -847,29 +889,44 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.single_trunk_projection = nn.Sequential(
-            LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.single_trunk_norm = LayerNorm(single_size)
+        self.single_trunk_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.pair_trunk_norm = LayerNorm(pair_size)
+        self.pair_trunk_projection = nn.Linear(
+            pair_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.pair_trunk_projection = nn.Sequential(
-            LayerNorm(pair_size),
-            nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
+        self.left_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.left_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.right_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.right_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.feed_forward = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        pair = self.feed_forward_input_projection(F.relu(pair))
+        pair = self.feed_forward_hidden_projection(F.relu(pair))
+        return self.feed_forward_output_projection(F.relu(pair))
 
     def forward(
         self,
@@ -911,11 +968,11 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        single_proj = self.single_trunk_projection(single_trunk)
+        single_proj = self.single_trunk_projection(self.single_trunk_norm(single_trunk))
         atom_single = atom_single + single_proj.gather(
             1, atom_to_token.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
         )
-        pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+        pair_from_trunk = self.pair_trunk_projection(self.pair_trunk_norm(pair_trunk))
         token_windows = pad_atoms(atom_to_token)
         query_token = token_windows.view(batch, num_windows, num_query_atoms)
         key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
@@ -923,7 +980,7 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
         pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
         pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
 
-        single_windows = pad_atoms(atom_single)
+        single_windows = F.relu(pad_atoms(atom_single))
         atom_pair = encode_atom_pair(
             self,
             distance_vectors,
@@ -936,171 +993,6 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
             prefix_ndim=1,
         )
         return atom_query, atom_single, atom_pair
-
-
-class Boltz1AtomAttentionEncoder(nn.Module):
-    r"""
-    Run windowed atom attention and mean-pool the result to per-token representations.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_encoder_blocks,
-                num_attention_heads=num_atom_encoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, single_size, bias=False), nn.ReLU())
-
-    def forward(
-        self,
-        atom_single: Tensor,
-        atom_conditioning: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-    ) -> Tensor:
-        atom_query = self.atom_transformer(
-            atom_single,
-            atom_conditioning,
-            atom_pair_bias,
-            atom_mask=atom_mask.bool(),
-            attention_layout="local",
-        )
-        token_from_atom = self.token_projection(atom_query)
-        return dense_mean_to_tokens(token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6)
-
-
-class Boltz1DenoiserAtomAttentionEncoder(nn.Module):
-    r"""
-    Encode noisy atom states and pool them into denoiser token states.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_encoder_blocks,
-                num_attention_heads=num_atom_encoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, 2 * single_size, bias=False), nn.ReLU())
-
-    def forward(
-        self,
-        atom_single: Tensor,
-        atom_conditioning: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-        noisy_positions: Tensor,
-        multiplicity: int = 1,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        atom_query = atom_single.repeat_interleave(multiplicity, 0)
-        atom_query = atom_query + self.noisy_position_projection(noisy_positions)
-        conditioning = atom_conditioning.repeat_interleave(multiplicity, 0)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
-        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
-        atom_query = self.atom_transformer(
-            atom_query,
-            conditioning,
-            atom_pair_bias,
-            atom_mask=atom_mask.bool(),
-            attention_layout="local",
-        )
-        token_from_atom = self.token_projection(atom_query)
-        token_repr = dense_mean_to_tokens(
-            token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6
-        )
-        return token_repr, atom_query, conditioning
-
-
-class Boltz1AtomAttentionDecoder(nn.Module):
-    r"""
-    Broadcast token activations back to atoms and predict a per-atom position update.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_decoder_blocks,
-                num_attention_heads=num_atom_decoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.position_update = nn.Sequential(
-            LayerNorm(atom_hidden_size, backend=backend), nn.Linear(atom_hidden_size, 3, bias=False)
-        )
-
-    def forward(
-        self,
-        token_repr: Tensor,
-        atom_skip: Tensor,
-        conditioning_skip: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        multiplicity: int = 1,
-    ) -> Tensor:
-        token_index = atom_to_token.repeat_interleave(multiplicity, 0)
-        token_proj = self.token_projection(token_repr)
-        atom_query = atom_skip + token_proj.gather(1, token_index.unsqueeze(-1).expand(-1, -1, token_proj.shape[-1]))
-        mask = atom_mask.repeat_interleave(multiplicity, 0)
-        atom_query = self.atom_transformer(
-            atom_query,
-            conditioning_skip,
-            atom_pair_bias,
-            atom_mask=mask.bool(),
-            attention_layout="local",
-        )
-        return self.position_update(atom_query)
 
 
 class Boltz1DenoiserConditioning(nn.Module):
@@ -1142,26 +1034,25 @@ class Boltz1DenoiserConditioning(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
+        self.atom_encoder_pair_norms = nn.ModuleList(
+            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_encoder_blocks)
+        )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, backend=backend),
-                nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
-            )
+            nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False)
             for _ in range(num_atom_encoder_blocks)
         )
+        self.atom_decoder_pair_norms = nn.ModuleList(
+            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_decoder_blocks)
+        )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, backend=backend),
-                nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
-            )
+            nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False)
             for _ in range(num_atom_decoder_blocks)
         )
-        self.token_transformer_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(pair_size, backend=backend),
-                nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False),
-            )
-            for _ in range(num_token_encoder_blocks)
+        self.token_encoder_pair_norms = nn.ModuleList(
+            LayerNorm(pair_size, backend=backend) for _ in range(num_token_encoder_blocks)
+        )
+        self.token_encoder_pair_bias_projections = nn.ModuleList(
+            nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False) for _ in range(num_token_encoder_blocks)
         )
 
     def forward(
@@ -1186,15 +1077,42 @@ class Boltz1DenoiserConditioning(nn.Module):
             single_trunk=single_trunk,
             pair_trunk=pair,
         )
-        atom_enc_bias = torch.cat([layer(atom_pair) for layer in self.atom_encoder_pair_bias_projections], dim=-1)
-        atom_dec_bias = torch.cat([layer(atom_pair) for layer in self.atom_decoder_pair_bias_projections], dim=-1)
-        token_trans_bias = torch.cat([layer(pair) for layer in self.token_transformer_pair_bias_projections], dim=-1)
+        atom_enc_bias = torch.cat(
+            [
+                projection(norm(atom_pair))
+                for norm, projection in zip(
+                    self.atom_encoder_pair_norms,
+                    self.atom_encoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
+        atom_dec_bias = torch.cat(
+            [
+                projection(norm(atom_pair))
+                for norm, projection in zip(
+                    self.atom_decoder_pair_norms,
+                    self.atom_decoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
+        token_encoder_bias = torch.cat(
+            [
+                projection(norm(pair))
+                for norm, projection in zip(
+                    self.token_encoder_pair_norms,
+                    self.token_encoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
         return {
             "atom_query": atom_query,
             "atom_conditioning": atom_conditioning,
             "atom_enc_bias": atom_enc_bias,
             "atom_dec_bias": atom_dec_bias,
-            "token_trans_bias": token_trans_bias,
+            "token_encoder_bias": token_encoder_bias,
         }
 
 
@@ -1205,13 +1123,16 @@ class Boltz1PerBlockPairBiasProjection(nn.Module):
 
     def __init__(self, *, pair_size: int, num_blocks: int, num_attention_heads: int) -> None:
         super().__init__()
+        self.pair_norms = nn.ModuleList(LayerNorm(pair_size) for _ in range(num_blocks))
         self.bias_projections = nn.ModuleList(
-            nn.Sequential(LayerNorm(pair_size), nn.Linear(pair_size, num_attention_heads, bias=False))
-            for _ in range(num_blocks)
+            nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
 
     def forward(self, pair: Tensor) -> Tensor:
-        return torch.cat([projection(pair) for projection in self.bias_projections], dim=-1)
+        return torch.cat(
+            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
+            dim=-1,
+        )
 
 
 class Boltz1Denoiser(nn.Module):
@@ -1246,17 +1167,18 @@ class Boltz1Denoiser(nn.Module):
             num_conditioning_transitions=num_conditioning_transitions,
             backend=backend,
         )
-        self.atom_attention_encoder = Boltz1DenoiserAtomAttentionEncoder(
+        self.atom_attention_encoder = PackedDenoisingAtomToTokenEncoder(
             atom_hidden_size=atom_hidden_size,
-            single_size=single_size,
+            token_hidden_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            num_atom_encoder_blocks=num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
             backend=backend,
         )
-        self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
-        self.token_transformer = ConditionedTransformer(
+        self.single_to_token_norm = LayerNorm(hidden, backend=backend)
+        self.single_to_token_projection = nn.Linear(hidden, hidden, bias=False)
+        self.token_encoder = ConditionedTransformerEncoder(
             num_blocks=num_token_encoder_blocks,
             num_attention_heads=num_token_encoder_attention_heads,
             hidden_size=hidden,
@@ -1264,13 +1186,13 @@ class Boltz1Denoiser(nn.Module):
             backend=backend,
         )
         self.token_norm = LayerNorm(hidden, backend=backend)
-        self.atom_attention_decoder = Boltz1AtomAttentionDecoder(
+        self.atom_attention_decoder = PackedTokenToAtomDecoder(
             atom_hidden_size=atom_hidden_size,
-            single_size=single_size,
+            token_hidden_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            num_atom_decoder_blocks=num_atom_decoder_blocks,
-            num_atom_decoder_attention_heads=num_atom_decoder_attention_heads,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
             backend=backend,
         )
 
@@ -1303,11 +1225,11 @@ class Boltz1Denoiser(nn.Module):
             noisy_positions=noisy_positions,
             multiplicity=multiplicity,
         )
-        token_repr = token_repr + self.single_to_token(single)
-        token_repr = self.token_transformer(
+        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
+        token_repr = self.token_encoder(
             token_repr,
             single,
-            conditioning["token_trans_bias"].repeat_interleave(multiplicity, 0),
+            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
             token_mask.repeat_interleave(multiplicity, 0).float(),
         )
         token_repr = self.token_norm(token_repr)
@@ -1748,9 +1670,159 @@ class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
         return (coords, token_repr) if return_token_repr else coords
 
 
-class Boltz1ConfidenceHead(nn.Module):
+class _Boltz1ConfidenceHead(nn.Module):
     r"""
-    Score sampled coordinates into Boltz-1 confidence logits and ranking metrics.
+    Shared sampled-coordinate conditioning and confidence-output tail.
+    """
+
+    diffusion_single_norm: nn.Module | None
+    diffusion_single_projection: nn.Linear | None
+    single_to_pair_row: nn.Linear
+    single_to_pair_col: nn.Linear
+    single_to_pair_product_left: nn.Linear | None
+    single_to_pair_product_right: nn.Linear | None
+    single_to_pair_product_out: nn.Linear | None
+    boundaries: Tensor
+    distance_embedding: nn.Embedding
+    output_head: Boltz1ConfidenceOutputHead
+
+    def __init__(
+        self,
+        *,
+        input_size: int,
+        single_size: int,
+        pair_size: int,
+        ranking_plddt_weight: float,
+        ranking_ptm_weight: float,
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.single_size = single_size
+        self.pair_size = pair_size
+        self.ranking_plddt_weight = ranking_plddt_weight
+        self.ranking_ptm_weight = ranking_ptm_weight
+
+    def _initialize_sample_conditioning(
+        self,
+        *,
+        num_distogram_bins: int,
+        max_distance: float,
+        add_single_to_pair_product: bool,
+        use_single_diffusion: bool,
+        backend: str,
+    ) -> None:
+        if use_single_diffusion:
+            self.diffusion_single_norm = LayerNorm(2 * self.single_size, backend=backend)
+            self.diffusion_single_projection = nn.Linear(2 * self.single_size, self.single_size, bias=False)
+        else:
+            self.diffusion_single_norm = None
+            self.diffusion_single_projection = None
+
+        self.single_to_pair_row = nn.Linear(self.input_size, self.pair_size, bias=False)
+        self.single_to_pair_col = nn.Linear(self.input_size, self.pair_size, bias=False)
+        if add_single_to_pair_product:
+            self.single_to_pair_product_left = nn.Linear(self.input_size, self.pair_size, bias=False)
+            self.single_to_pair_product_right = nn.Linear(self.input_size, self.pair_size, bias=False)
+            self.single_to_pair_product_out = nn.Linear(self.pair_size, self.pair_size, bias=False)
+        else:
+            self.single_to_pair_product_left = None
+            self.single_to_pair_product_right = None
+            self.single_to_pair_product_out = None
+
+        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
+        self.distance_embedding = nn.Embedding(num_distogram_bins, self.pair_size)
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        coordinates: Tensor,
+        *,
+        input: Boltz1Input,
+        pred_distogram_logits: Tensor,
+        single_diffusion: Tensor | None = None,
+        multiplicity: int = 1,
+    ) -> dict[str, Tensor]:
+        single_inputs, single, pair = self._prepare_representations(single_inputs, single, pair, input=input)
+
+        single = single.repeat_interleave(multiplicity, 0)
+        single_inputs = single_inputs.repeat_interleave(multiplicity, 0)
+        if self.diffusion_single_projection is not None and self.diffusion_single_norm is not None:
+            single = single + self.diffusion_single_projection(
+                self.diffusion_single_norm(cast(Tensor, single_diffusion))
+            )
+
+        pair = pair.repeat_interleave(multiplicity, 0)
+        pair = pair + self.single_to_pair_row(single_inputs).unsqueeze(-2)
+        pair = pair + self.single_to_pair_col(single_inputs).unsqueeze(-3)
+        if (
+            self.single_to_pair_product_left is not None
+            and self.single_to_pair_product_right is not None
+            and self.single_to_pair_product_out is not None
+        ):
+            pair = pair + self.single_to_pair_product_out(
+                self.single_to_pair_product_left(single_inputs).unsqueeze(-2)
+                * self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
+            )
+
+        representative_atom_index = input.token_to_rep_atom.repeat_interleave(multiplicity, 0)
+        representative_coordinates = coordinates.gather(
+            1,
+            representative_atom_index.unsqueeze(-1).expand(-1, -1, coordinates.shape[-1]),
+        )
+        distances = torch.cdist(representative_coordinates, representative_coordinates)
+        distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+        pair = pair + self.distance_embedding(distogram)
+
+        token_mask = input.token_mask.repeat_interleave(multiplicity, 0)
+        confidence_pair_mask = pair_mask_from_token_mask(token_mask)
+        single, pair = self._refine_representations(
+            single,
+            pair,
+            single_inputs=single_inputs,
+            input=input,
+            pair_mask=confidence_pair_mask,
+        )
+        logits = self.output_head(single, pair)
+        scores = _boltz1_confidence_scores(
+            logits,
+            distances=distances,
+            input=input,
+            pred_distogram_logits=pred_distogram_logits,
+            coordinates=coordinates,
+            multiplicity=multiplicity,
+            ranking_plddt_weight=self.ranking_plddt_weight,
+            ranking_ptm_weight=self.ranking_ptm_weight,
+        )
+        logits.update(scores)
+        return logits
+
+    def _prepare_representations(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        input: Boltz1Input,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        raise NotImplementedError
+
+    def _refine_representations(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        single_inputs: Tensor,
+        input: Boltz1Input,
+        pair_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        raise NotImplementedError
+
+
+class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
+    r"""
+    Rebuild and refine a confidence-specific copy of the Boltz-1 trunk representations.
     """
 
     def __init__(
@@ -1774,10 +1846,7 @@ class Boltz1ConfidenceHead(nn.Module):
         num_pae_bins: int = 64,
         num_pde_bins: int = 64,
         compute_pae: bool = True,
-        imitate_trunk: bool = True,
         add_single_to_pair_product: bool = True,
-        add_single_input_to_single: bool = True,
-        add_pair_input_to_pair: bool = True,
         use_single_diffusion: bool = True,
         ranking_plddt_weight: float = 4.0,
         ranking_ptm_weight: float = 1.0,
@@ -1798,124 +1867,77 @@ class Boltz1ConfidenceHead(nn.Module):
         relative_position_size: int = 139,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.input_size = input_size
-        self.single_size = single_size
-        self.pair_size = pair_size
-        self.ranking_plddt_weight = ranking_plddt_weight
-        self.ranking_ptm_weight = ranking_ptm_weight
-        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
-        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
+        super().__init__(
+            input_size=input_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            ranking_plddt_weight=ranking_plddt_weight,
+            ranking_ptm_weight=ranking_ptm_weight,
+        )
+        self.input_embeddings = Boltz1InputEmbeddings(
+            input_size=input_size,
+            single_size=single_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            atom_feature_size=atom_feature_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            num_atom_encoder_blocks=num_atom_encoder_blocks,
+            num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
+            use_atom_encoder=use_atom_encoder,
+            backend=backend,
+        )
+        self.single_init_projection = nn.Linear(input_size, single_size, bias=False)
+        self.pair_left_projection = nn.Linear(input_size, pair_size, bias=False)
+        self.pair_right_projection = nn.Linear(input_size, pair_size, bias=False)
+        self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
+        self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
+        self.single_recycle_norm = LayerNorm(single_size, backend=backend)
+        self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
+        self.pair_recycle_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
+        nn.init.zeros_(self.single_recycle_projection.weight)
+        nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        self.diffusion_single_norm: nn.Module | None = None
-        self.diffusion_single_projection: nn.Linear | None = None
-        self.single_to_pair_product_left: nn.Linear | None = None
-        self.single_to_pair_product_right: nn.Linear | None = None
-        self.single_to_pair_product_out: nn.Linear | None = None
-        self.single_init_projection: nn.Linear | None = None
-        self.pair_left_projection: nn.Linear | None = None
-        self.pair_right_projection: nn.Linear | None = None
-        self.input_embeddings: Boltz1InputEmbeddings | None = None
-        self.relative_position_embedder: RelativePositionEmbedder | None = None
-        self.token_bond_projection: nn.Linear | None = None
-        self.single_recycle_norm: nn.Module | None = None
-        self.pair_recycle_norm: nn.Module | None = None
-        self.single_recycle_projection: nn.Linear | None = None
-        self.pair_recycle_projection: nn.Linear | None = None
+        self._initialize_sample_conditioning(
+            num_distogram_bins=num_distogram_bins,
+            max_distance=max_distance,
+            add_single_to_pair_product=add_single_to_pair_product,
+            use_single_diffusion=use_single_diffusion,
+            backend=backend,
+        )
+
         self.msa_trunk: CategoricalMsaTrunk | None = None
-        self.final_single_norm: nn.Module | None = None
-        self.final_pair_norm: nn.Module | None = None
-        self.input_single_norm: nn.Module | None = None
-        self.single_norm: nn.Module | None = None
-        self.pair_norm: nn.Module | None = None
-        self.input_single_projection: nn.Linear | None = None
-
-        if use_single_diffusion:
-            self.diffusion_single_norm = LayerNorm(2 * single_size, backend=backend)
-            self.diffusion_single_projection = nn.Linear(2 * single_size, single_size, bias=False)
-
-        self.single_to_pair_row = nn.Linear(input_size, pair_size, bias=False)
-        self.single_to_pair_col = nn.Linear(input_size, pair_size, bias=False)
-        if add_single_to_pair_product:
-            self.single_to_pair_product_left = nn.Linear(input_size, pair_size, bias=False)
-            self.single_to_pair_product_right = nn.Linear(input_size, pair_size, bias=False)
-            self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
-
-        if imitate_trunk:
-            self.single_init_projection = nn.Linear(input_size, single_size, bias=False)
-            self.pair_left_projection = nn.Linear(input_size, pair_size, bias=False)
-            self.pair_right_projection = nn.Linear(input_size, pair_size, bias=False)
-            self.input_embeddings = Boltz1InputEmbeddings(
-                input_size=input_size,
-                single_size=single_size,
-                atom_hidden_size=atom_hidden_size,
-                atom_pair_hidden_size=atom_pair_hidden_size,
-                atom_feature_size=atom_feature_size,
-                num_query_atoms=num_query_atoms,
-                num_key_atoms=num_key_atoms,
-                num_atom_encoder_blocks=num_atom_encoder_blocks,
-                num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
-                use_atom_encoder=use_atom_encoder,
-                backend=backend,
-            )
-            self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
-            self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
-            self.single_recycle_norm = LayerNorm(single_size, backend=backend)
-            self.pair_recycle_norm = LayerNorm(pair_size, backend=backend)
-            self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
-            self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
-            nn.init.zeros_(self.single_recycle_projection.weight)
-            nn.init.zeros_(self.pair_recycle_projection.weight)
-            if use_msa:
-                self.msa_trunk = CategoricalMsaTrunk(
-                    single_size=input_size,
-                    pair_size=pair_size,
-                    msa_size=msa_size,
-                    msa_feature_size=msa_feature_size,
-                    num_blocks=num_msa_blocks,
-                    vocab_size=vocab_size,
-                    use_paired_feature=use_paired_feature,
-                    outer_product_hidden_size=outer_product_hidden_size,
-                    msa_dropout=msa_dropout,
-                    pair_dropout=pair_dropout,
-                    num_msa_attention_heads=num_msa_attention_heads,
-                    msa_head_dim=msa_head_dim,
-                    triangle_attention_hidden_size=triangle_attention_hidden_size,
-                    num_triangle_attention_heads=num_triangle_attention_heads,
-                    backend=backend,
-                )
-            self.pairformer_stack = PairformerStack(
-                num_blocks=num_blocks,
-                single_size=single_size,
+        if use_msa:
+            self.msa_trunk = CategoricalMsaTrunk(
+                single_size=input_size,
                 pair_size=pair_size,
+                msa_size=msa_size,
+                msa_feature_size=msa_feature_size,
+                num_blocks=num_msa_blocks,
+                vocab_size=vocab_size,
+                use_paired_feature=use_paired_feature,
+                outer_product_hidden_size=outer_product_hidden_size,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                num_msa_attention_heads=num_msa_attention_heads,
+                msa_head_dim=msa_head_dim,
                 triangle_attention_hidden_size=triangle_attention_hidden_size,
                 num_triangle_attention_heads=num_triangle_attention_heads,
-                num_pair_attention_heads=num_pair_attention_heads,
-                dropout=pair_dropout,
                 backend=backend,
             )
-            self.final_single_norm = LayerNorm(single_size, backend=backend)
-            self.final_pair_norm = LayerNorm(pair_size, backend=backend)
-        else:
-            self.input_single_norm = LayerNorm(input_size, backend=backend)
-            self.single_norm = LayerNorm(single_size, backend=backend)
-            self.pair_norm = LayerNorm(pair_size, backend=backend)
-            if add_single_input_to_single:
-                self.input_single_projection = nn.Linear(input_size, single_size, bias=False)
-            if add_pair_input_to_pair:
-                self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
-                self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
-            self.pairformer_stack = PairformerStack(
-                num_blocks=num_blocks,
-                single_size=single_size,
-                pair_size=pair_size,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
-                num_pair_attention_heads=num_pair_attention_heads,
-                dropout=pair_dropout,
-                backend=backend,
-            )
-
+        self.pairformer_stack = PairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+        self.final_single_norm = LayerNorm(single_size, backend=backend)
+        self.final_pair_norm = LayerNorm(pair_size, backend=backend)
         self.output_head = Boltz1ConfidenceOutputHead(
             single_size=single_size,
             pair_size=pair_size,
@@ -1925,132 +1947,28 @@ class Boltz1ConfidenceHead(nn.Module):
             compute_pae=compute_pae,
         )
 
-    def forward(
+    def _prepare_representations(
         self,
         single_inputs: Tensor,
         single: Tensor,
         pair: Tensor,
-        coordinates: Tensor,
         *,
         input: Boltz1Input,
-        pred_distogram_logits: Tensor,
-        single_diffusion: Tensor | None = None,
-        multiplicity: int = 1,
-    ) -> dict[str, Tensor]:
-        if self.input_embeddings is not None:
-            single_inputs = self._imitate_trunk_inputs(input)
-            single_init, pair_init = self._confidence_initial_representations(input, single_inputs, single.dtype)
-            single = single_init + cast(nn.Linear, self.single_recycle_projection)(
-                cast(nn.Module, self.single_recycle_norm)(single)
-            )
-            pair = pair_init + cast(nn.Linear, self.pair_recycle_projection)(
-                cast(nn.Module, self.pair_recycle_norm)(pair)
-            )
-            # The imitate-trunk MSA module, Pairformer, and final norms run once at the end -- after the
-            # single-input pair projections and the per-sample predicted-distance embedding -- mirroring the
-            # These updates run after the distance embedding, not on the pre-distogram pair.
-        else:
-            normalized_inputs = cast(nn.Module, self.input_single_norm)(single_inputs)
-            single = cast(nn.Module, self.single_norm)(single)
-            input_single_projection = self.input_single_projection
-            if input_single_projection is not None:
-                single = single + input_single_projection(normalized_inputs)
-            pair = cast(nn.Module, self.pair_norm)(pair)
-            relative_position_embedder = self.relative_position_embedder
-            if relative_position_embedder is not None:
-                relative_features = generate_relative_position_features(
-                    residue_index=input.residue_index,
-                    chain_index=input.chain_index,
-                    entity_index=input.entity_index,
-                    symmetry_index=input.symmetry_index,
-                    token_index=input.token_index,
-                    cyclic_period=input.cyclic_period,
-                    chain_gate="not_same_chain",
-                    dtype=pair.dtype,
-                )
-                pair = pair + relative_position_embedder(relative_features)
-                pair = pair + cast(nn.Linear, self.token_bond_projection)(
-                    input.token_bonds.unsqueeze(-1).to(pair.dtype)
-                )
-            single_inputs = normalized_inputs
-
-        single = single.repeat_interleave(multiplicity, 0)
-        single_inputs = single_inputs.repeat_interleave(multiplicity, 0)
-        diffusion_single_projection = self.diffusion_single_projection
-        if diffusion_single_projection is not None:
-            single = single + diffusion_single_projection(
-                cast(nn.Module, self.diffusion_single_norm)(cast(Tensor, single_diffusion))
-            )
-
-        pair = pair.repeat_interleave(multiplicity, 0)
-        pair = pair + self.single_to_pair_row(single_inputs).unsqueeze(-2)
-        pair = pair + self.single_to_pair_col(single_inputs).unsqueeze(-3)
-        single_to_pair_product_out = self.single_to_pair_product_out
-        if single_to_pair_product_out is not None:
-            pair = pair + single_to_pair_product_out(
-                cast(nn.Linear, self.single_to_pair_product_left)(single_inputs).unsqueeze(-2)
-                * cast(nn.Linear, self.single_to_pair_product_right)(single_inputs).unsqueeze(-3)
-            )
-
-        rep_atom_index = input.token_to_rep_atom.repeat_interleave(multiplicity, 0)
-        representative = coordinates.gather(1, rep_atom_index.unsqueeze(-1).expand(-1, -1, coordinates.shape[-1]))
-        distances = torch.cdist(representative, representative)
-        distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        pair = pair + self.distance_embedding(distogram)
-
-        token_mask = input.token_mask.repeat_interleave(multiplicity, 0)
-        confidence_pair_mask = pair_mask_from_token_mask(token_mask)
-        if self.input_embeddings is not None:
-            if input.msa_tokens is not None:
-                pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
-                    pair,
-                    single_inputs,
-                    msa_tokens=input.msa_tokens,
-                    has_deletion=cast(Tensor, input.has_deletion),
-                    deletion_value=cast(Tensor, input.deletion_value),
-                    is_paired=cast(Tensor, input.msa_paired),
-                    msa_mask=cast(Tensor, input.msa_mask),
-                    token_mask=input.token_mask,
-                )
-            single, pair = self.pairformer_stack(single, pair, pair_mask=confidence_pair_mask)
-            single = cast(nn.Module, self.final_single_norm)(cast(Tensor, single))
-            pair = cast(nn.Module, self.final_pair_norm)(pair)
-        else:
-            single, pair = self.pairformer_stack(single, pair, pair_mask=confidence_pair_mask)
-        logits = self.output_head(cast(Tensor, single), pair)
-        scores = _boltz1_confidence_scores(
-            logits,
-            distances=distances,
-            input=input,
-            pred_distogram_logits=pred_distogram_logits,
-            coordinates=coordinates,
-            multiplicity=multiplicity,
-            ranking_plddt_weight=self.ranking_plddt_weight,
-            ranking_ptm_weight=self.ranking_ptm_weight,
-        )
-        logits.update(scores)
-        return logits
-
-    def _imitate_trunk_inputs(self, input: Boltz1Input) -> Tensor:
-        input_embeddings = cast(Boltz1InputEmbeddings, self.input_embeddings)
-        return input_embeddings(
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        single_inputs = self.input_embeddings(
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
             atom_mask=input.atom_mask,
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
-            residue_type=input.residue_type,
+            residue_type_features=input.residue_type_features,
             msa_profile=input.msa_profile,
             deletion_mean=input.deletion_mean,
             pocket_feature=input.pocket_feature,
         )
-
-    def _confidence_initial_representations(
-        self, input: Boltz1Input, single_inputs: Tensor, dtype: torch.dtype
-    ) -> tuple[Tensor, Tensor]:
-        single_init = cast(nn.Linear, self.single_init_projection)(single_inputs)
-        pair_init = cast(nn.Linear, self.pair_left_projection)(single_inputs).unsqueeze(-2)
-        pair_init = pair_init + cast(nn.Linear, self.pair_right_projection)(single_inputs).unsqueeze(-3)
+        single_init = self.single_init_projection(single_inputs)
+        pair_init = self.pair_left_projection(single_inputs).unsqueeze(-2)
+        pair_init = pair_init + self.pair_right_projection(single_inputs).unsqueeze(-3)
         relative_features = generate_relative_position_features(
             residue_index=input.residue_index,
             chain_index=input.chain_index,
@@ -2059,13 +1977,153 @@ class Boltz1ConfidenceHead(nn.Module):
             token_index=input.token_index,
             cyclic_period=input.cyclic_period,
             chain_gate="not_same_chain",
-            dtype=dtype,
+            dtype=single.dtype,
         )
-        pair_init = pair_init + cast(RelativePositionEmbedder, self.relative_position_embedder)(relative_features)
-        pair_init = pair_init + cast(nn.Linear, self.token_bond_projection)(
-            input.token_bonds.unsqueeze(-1).to(pair_init.dtype)
+        pair_init = pair_init + self.relative_position_embedder(relative_features)
+        pair_init = pair_init + self.token_bond_projection(input.token_bonds.unsqueeze(-1).to(pair_init.dtype))
+        single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
+        pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
+        return single_inputs, single, pair
+
+    def _refine_representations(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        single_inputs: Tensor,
+        input: Boltz1Input,
+        pair_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if input.msa_tokens is not None:
+            pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
+                pair,
+                single_inputs,
+                msa_tokens=input.msa_tokens,
+                has_deletion=cast(Tensor, input.has_deletion),
+                deletion_value=cast(Tensor, input.deletion_value),
+                is_paired=cast(Tensor, input.msa_paired),
+                msa_mask=cast(Tensor, input.msa_mask),
+                token_mask=input.token_mask,
+            )
+        single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        return self.final_single_norm(single), self.final_pair_norm(pair)
+
+
+class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
+    r"""
+    Normalize and refine the trunk representations supplied by the Boltz-1 model.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_size: int,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_blocks: int = 48,
+        num_pair_attention_heads: int = 16,
+        num_distogram_bins: int = 64,
+        max_distance: float = 22.0,
+        num_plddt_bins: int = 50,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        compute_pae: bool = True,
+        add_single_to_pair_product: bool = True,
+        add_single_input_to_single: bool = True,
+        add_pair_input_to_pair: bool = True,
+        use_single_diffusion: bool = True,
+        ranking_plddt_weight: float = 4.0,
+        ranking_ptm_weight: float = 1.0,
+        pair_dropout: float = 0.0,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        relative_position_size: int = 139,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__(
+            input_size=input_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            ranking_plddt_weight=ranking_plddt_weight,
+            ranking_ptm_weight=ranking_ptm_weight,
         )
-        return single_init, pair_init
+        self.input_single_norm = LayerNorm(input_size, backend=backend)
+        self.single_norm = LayerNorm(single_size, backend=backend)
+        self.input_single_projection: nn.Linear | None = None
+        if add_single_input_to_single:
+            self.input_single_projection = nn.Linear(input_size, single_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.relative_position_embedder: RelativePositionEmbedder | None = None
+        self.token_bond_projection: nn.Linear | None = None
+        if add_pair_input_to_pair:
+            self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
+            self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
+
+        self._initialize_sample_conditioning(
+            num_distogram_bins=num_distogram_bins,
+            max_distance=max_distance,
+            add_single_to_pair_product=add_single_to_pair_product,
+            use_single_diffusion=use_single_diffusion,
+            backend=backend,
+        )
+
+        self.pairformer_stack = PairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+        self.output_head = Boltz1ConfidenceOutputHead(
+            single_size=single_size,
+            pair_size=pair_size,
+            num_plddt_bins=num_plddt_bins,
+            num_pae_bins=num_pae_bins,
+            num_pde_bins=num_pde_bins,
+            compute_pae=compute_pae,
+        )
+
+    def _prepare_representations(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        input: Boltz1Input,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        normalized_inputs = self.input_single_norm(single_inputs)
+        single = self.single_norm(single)
+        if self.input_single_projection is not None:
+            single = single + self.input_single_projection(normalized_inputs)
+        pair = self.pair_norm(pair)
+        if self.relative_position_embedder is not None and self.token_bond_projection is not None:
+            relative_features = generate_relative_position_features(
+                residue_index=input.residue_index,
+                chain_index=input.chain_index,
+                entity_index=input.entity_index,
+                symmetry_index=input.symmetry_index,
+                token_index=input.token_index,
+                cyclic_period=input.cyclic_period,
+                chain_gate="not_same_chain",
+                dtype=pair.dtype,
+            )
+            pair = pair + self.relative_position_embedder(relative_features)
+            pair = pair + self.token_bond_projection(input.token_bonds.unsqueeze(-1).to(pair.dtype))
+        return normalized_inputs, single, pair
+
+    def _refine_representations(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        single_inputs: Tensor,
+        input: Boltz1Input,
+        pair_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        return self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
 
 class Boltz1ConfidenceOutputHead(nn.Module):
@@ -2120,82 +2178,20 @@ def _boltz1_steering_features(input: Boltz1Input, *, atom_features: Tensor) -> d
         "chain_index": input.chain_index.to(device=device, dtype=torch.long),
         "atom_mask": input.atom_mask.to(device=device),
         "reference_elements": atom_features[..., 5:133].to(device=device),
-        "rdkit_bounds_index": _feature_or_empty(
-            input.rdkit_bounds_index, (input.atom_mask.shape[0], 2, 0), torch.long, device
-        ),
-        "rdkit_bounds_bond_mask": _feature_or_empty(
-            input.rdkit_bounds_bond_mask, (input.atom_mask.shape[0], 0), torch.bool, device
-        ),
-        "rdkit_bounds_angle_mask": _feature_or_empty(
-            input.rdkit_bounds_angle_mask, (input.atom_mask.shape[0], 0), torch.bool, device
-        ),
-        "rdkit_upper_bounds": _feature_or_empty(
-            input.rdkit_upper_bounds, (input.atom_mask.shape[0], 0), atom_features.dtype, device
-        ),
-        "rdkit_lower_bounds": _feature_or_empty(
-            input.rdkit_lower_bounds, (input.atom_mask.shape[0], 0), atom_features.dtype, device
-        ),
-        "chiral_atom_index": _feature_or_empty(
-            input.chiral_atom_index, (input.atom_mask.shape[0], 4, 0), torch.long, device
-        ),
-        "chiral_atom_orientations": _feature_or_empty(
-            input.chiral_atom_orientations, (input.atom_mask.shape[0], 0), torch.bool, device
-        ),
-        "stereo_bond_index": _feature_or_empty(
-            input.stereo_bond_index, (input.atom_mask.shape[0], 4, 0), torch.long, device
-        ),
-        "stereo_bond_orientations": _feature_or_empty(
-            input.stereo_bond_orientations, (input.atom_mask.shape[0], 0), torch.bool, device
-        ),
-        "planar_bond_index": _feature_or_empty(
-            input.planar_bond_index, (input.atom_mask.shape[0], 6, 0), torch.long, device
-        ),
-        "connected_chain_index": _feature_or_empty(
-            input.connected_chain_index, (input.atom_mask.shape[0], 2, 0), torch.long, device
-        ),
-        "connected_atom_index": _feature_or_empty(
-            input.connected_atom_index, (input.atom_mask.shape[0], 2, 0), torch.long, device
-        ),
-        "symmetric_chain_index": _feature_or_empty(
-            input.symmetric_chain_index, (input.atom_mask.shape[0], 2, 0), torch.long, device
-        ),
-        "contact_pair_index": _feature_or_empty(
-            input.contact_pair_index, (input.atom_mask.shape[0], 2, 0), torch.long, device
-        ),
-        "contact_union_index": _feature_or_empty(
-            input.contact_union_index, (input.atom_mask.shape[0], 0), torch.long, device
-        ),
-        "contact_negation_mask": _feature_or_empty(
-            input.contact_negation_mask, (input.atom_mask.shape[0], 0), torch.bool, device
-        ),
-        "contact_thresholds": _feature_or_empty(
-            input.contact_thresholds, (input.atom_mask.shape[0], 0), atom_features.dtype, device
-        ),
+        "geometry_pair_index": input.geometry_pair_index.to(device=device, dtype=torch.long),
+        "geometry_bond_mask": input.geometry_bond_mask.to(device=device, dtype=torch.bool),
+        "geometry_angle_mask": input.geometry_angle_mask.to(device=device, dtype=torch.bool),
+        "geometry_upper_bounds": input.geometry_upper_bounds.to(device=device, dtype=atom_features.dtype),
+        "geometry_lower_bounds": input.geometry_lower_bounds.to(device=device, dtype=atom_features.dtype),
+        "chiral_atom_index": input.chiral_atom_index.to(device=device, dtype=torch.long),
+        "chiral_atom_is_r": input.chiral_atom_is_r.to(device=device, dtype=torch.bool),
+        "stereo_bond_index": input.stereo_bond_index.to(device=device, dtype=torch.long),
+        "stereo_bond_is_e": input.stereo_bond_is_e.to(device=device, dtype=torch.bool),
+        "planar_bond_index": input.planar_bond_index.to(device=device, dtype=torch.long),
+        "connected_chain_index": input.connected_chain_index.to(device=device, dtype=torch.long),
+        "connected_atom_index": input.connected_atom_index.to(device=device, dtype=torch.long),
+        "symmetric_chain_index": input.symmetric_chain_index.to(device=device, dtype=torch.long),
     }
-
-
-def _feature_or_empty(
-    value: Tensor | None,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> Tensor:
-    r"""
-    Return ``value`` cast to the target device/dtype, or an empty tensor of ``shape`` when it is ``None``.
-
-    Args:
-        value: The optional feature tensor.
-        shape: Shape of the empty fallback tensor.
-        dtype: Target dtype for the value or the fallback.
-        device: Target device for the value or the fallback.
-
-    Returns:
-        The device/dtype-placed value, or an empty tensor of ``shape``.
-    """
-
-    if value is None:
-        return torch.empty(shape, dtype=dtype, device=device)
-    return value.to(device=device, dtype=dtype)
 
 
 class Boltz1ParameterSchedule:
@@ -2388,7 +2384,7 @@ class Boltz1DistancePotential(Boltz1Potential):
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
         delta = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
-        distance = torch.linalg.norm(delta, dim=-1).clamp_min(1e-8)
+        distance = torch.linalg.norm(delta, dim=-1)
         if not compute_gradient:
             return distance
         direction = delta / distance.unsqueeze(-1)
@@ -2408,9 +2404,9 @@ class Boltz1DihedralPotential(Boltz1Potential):
         r_kl = coords.index_select(-2, index[2]) - coords.index_select(-2, index[3])
         n_ijk = torch.cross(r_ij, r_kj, dim=-1)
         n_jkl = torch.cross(r_kj, r_kl, dim=-1)
-        r_kj_norm = torch.linalg.norm(r_kj, dim=-1).clamp_min(1e-8)
-        n_ijk_norm = torch.linalg.norm(n_ijk, dim=-1).clamp_min(1e-8)
-        n_jkl_norm = torch.linalg.norm(n_jkl, dim=-1).clamp_min(1e-8)
+        r_kj_norm = torch.linalg.norm(r_kj, dim=-1)
+        n_ijk_norm = torch.linalg.norm(n_ijk, dim=-1)
+        n_jkl_norm = torch.linalg.norm(n_jkl, dim=-1)
         sign_phi = torch.sign(r_kj.unsqueeze(-2) @ torch.cross(n_ijk, n_jkl, dim=-1).unsqueeze(-1)).squeeze(-1, -2)
         cosine = (n_ijk.unsqueeze(-2) @ n_jkl.unsqueeze(-1)).squeeze(-1, -2) / (n_ijk_norm * n_jkl_norm)
         phi = sign_phi * torch.arccos(torch.clamp(cosine, -1 + 1e-8, 1 - 1e-8))
@@ -2442,19 +2438,17 @@ class Boltz1AbsoluteDihedralPotential(Boltz1DihedralPotential):
 
 class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
     r"""
-    PoseBusters bond/angle/clash distance potential over the RDKit bounds, with per-category buffers.
+    PoseBusters bond/angle/clash potential over molecular distance bounds.
     """
 
     def compute_args(
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        pair_index = feats["rdkit_bounds_index"][0]
-        lower_bounds = feats["rdkit_lower_bounds"][0].clone()
-        upper_bounds = feats["rdkit_upper_bounds"][0].clone()
-        bond_mask = feats["rdkit_bounds_bond_mask"][0]
-        angle_mask = feats["rdkit_bounds_angle_mask"][0]
-        if pair_index.shape[1] == 0:
-            return pair_index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), None
+        pair_index = feats["geometry_pair_index"][0]
+        lower_bounds = feats["geometry_lower_bounds"][0].clone()
+        upper_bounds = feats["geometry_upper_bounds"][0].clone()
+        bond_mask = feats["geometry_bond_mask"][0]
+        angle_mask = feats["geometry_angle_mask"][0]
         bond_buffer = float(parameters["bond_buffer"])
         angle_buffer = float(parameters["angle_buffer"])
         clash_buffer = float(parameters["clash_buffer"])
@@ -2466,6 +2460,18 @@ class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
         upper_bounds[bond_mask & angle_mask] *= 1.0 + min(bond_buffer, angle_buffer)
         lower_bounds[~bond_mask & ~angle_mask] *= 1.0 - clash_buffer
         upper_bounds[~bond_mask & ~angle_mask] = float("inf")
+        atom_vdw_radii = (feats["reference_elements"].float() @ _vdw_radii(pair_index.device).unsqueeze(-1)).squeeze(
+            -1
+        )[0]
+        bond_cutoffs = 0.35 + atom_vdw_radii[pair_index].mean(dim=0)
+        lower_bounds[~bond_mask] = torch.max(
+            lower_bounds[~bond_mask],
+            bond_cutoffs[~bond_mask],
+        )
+        upper_bounds[bond_mask] = torch.min(
+            upper_bounds[bond_mask],
+            bond_cutoffs[bond_mask],
+        )
         return pair_index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), None
 
 
@@ -2565,7 +2571,7 @@ class Boltz1StereoBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBotto
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
         index = feats["stereo_bond_index"][0]
-        orientation = feats["stereo_bond_orientations"][0].bool()
+        orientation = feats["stereo_bond_is_e"][0].bool()
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
         upper_bounds = torch.zeros(orientation.shape, device=orientation.device)
         lower_bounds[orientation] = torch.pi - float(parameters["buffer"])
@@ -2584,7 +2590,7 @@ class Boltz1ChiralAtomPotential(Boltz1DihedralPotential, Boltz1FlatBottomPotenti
         self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
     ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
         index = feats["chiral_atom_index"][0]
-        orientation = feats["chiral_atom_orientations"][0].bool()
+        orientation = feats["chiral_atom_is_r"][0].bool()
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
         upper_bounds = torch.zeros(orientation.shape, device=orientation.device)
         lower_bounds[orientation] = float(parameters["buffer"])
@@ -2655,11 +2661,11 @@ def _boltz1_potentials(steering_args: Mapping[str, object]) -> tuple[Boltz1Poten
         Boltz1PoseBustersPotential(
             {
                 "guidance_interval": 1,
-                "guidance_weight": 0.05 * guidance_weight,
+                "guidance_weight": 0.01 * guidance_weight,
                 "resampling_weight": 0.1,
-                "bond_buffer": 0.20,
-                "angle_buffer": 0.20,
-                "clash_buffer": 0.15,
+                "bond_buffer": 0.125,
+                "angle_buffer": 0.125,
+                "clash_buffer": 0.10,
             }
         ),
         Boltz1ChiralAtomPotential(
@@ -3084,7 +3090,7 @@ def _molecule_type_for_confidence(input: Boltz1Input, multiplicity: int, device:
     return input.molecule_type.repeat_interleave(multiplicity, 0).to(device=device, dtype=torch.long)
 
 
-def _decode_boltz1_fold_result(output: Boltz1Output, input: Boltz1Input) -> FoldResult:
+def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) -> FoldResult:
     r"""
     Decode one model output into structures and confidence values.
 
@@ -3104,7 +3110,7 @@ def _decode_boltz1_fold_result(output: Boltz1Output, input: Boltz1Input) -> Fold
     token_count = len(layout.token_sites)
     atom_count = len(layout.atom_sites)
 
-    complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
+    complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element not in {"H", "D", "T"}]
     complete_index = {site: index for index, site in enumerate(complete_sites)}
     model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
 
@@ -3272,7 +3278,7 @@ class Boltz1Layout:
     token_sites: tuple[AtomSite | tuple[str, int], ...]
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class Boltz1Input:
     r"""
     Input tensors consumed by [`Boltz1Model`][].
@@ -3297,11 +3303,24 @@ class Boltz1Input:
         representative_atom_mask: `[B, M]` mask of representative atoms per token.
         atom_token_index: `[B, M]` token index of each atom.
         token_to_rep_atom: `[B, N]` representative-atom index per token.
-        residue_type: `[B, N, vocab_size]` residue-type one-hot.
+        residue_type_features: `[B, N, vocab_size]` residue-type one-hot features.
         msa_profile: `[B, N, vocab_size]` MSA profile feature.
         deletion_mean: `[B, N]` mean-deletion feature.
         token_bonds: `[B, N, N]` inter-token bond indicator.
         molecule_type: `[B, N]` per-token molecule type.
+        geometry_pair_index: `[B, 2, P]` atom pairs with molecular distance bounds.
+        geometry_bond_mask: `[B, P]` mask of directly bonded geometry pairs.
+        geometry_angle_mask: `[B, P]` mask of two-bond angle endpoint pairs.
+        geometry_upper_bounds: `[B, P]` upper distance bounds in angstroms.
+        geometry_lower_bounds: `[B, P]` lower distance bounds in angstroms.
+        chiral_atom_index: `[B, 4, C]` chiral-center improper-dihedral atom indices.
+        chiral_atom_is_r: `[B, C]` handedness flag for each chiral-center constraint.
+        stereo_bond_index: `[B, 4, S]` stereo-bond dihedral atom indices.
+        stereo_bond_is_e: `[B, S]` E/Z flag for each stereo-bond constraint.
+        planar_bond_index: `[B, 6, D]` planar double-bond atom indices.
+        connected_chain_index: `[B, 2, K]` chain pairs joined by assembly bonds.
+        connected_atom_index: `[B, 2, K]` atom pairs joined by assembly bonds.
+        symmetric_chain_index: `[B, 2, Q]` same-entity chain-copy pairs.
         target_positions: Optional `[B, M, 3]` ground-truth atom positions.
         target_mask: Optional `[B, M]` ground-truth validity mask.
         frame_atom_index: Optional `[B, N, 3]` three-atom frame indices per token.
@@ -3313,25 +3332,6 @@ class Boltz1Input:
         msa_paired: Optional `[B, S, N]` cross-chain pairing flag.
         msa_mask: Optional `[B, S, N]` MSA validity mask.
         pocket_feature: Optional `[B, N, pocket_feature_size]` pocket one-hot conditioning.
-        rdkit_bounds_index: Optional Boltz-1x RDKit bounds atom-pair index.
-        rdkit_bounds_bond_mask: Optional Boltz-1x mask marking bond constraints.
-        rdkit_bounds_angle_mask: Optional Boltz-1x mask marking angle constraints.
-        rdkit_upper_bounds: Optional Boltz-1x RDKit upper distance bounds.
-        rdkit_lower_bounds: Optional Boltz-1x RDKit lower distance bounds.
-        chiral_atom_index: Optional Boltz-1x chiral-center atom-quad index.
-        chiral_reference_mask: Optional Boltz-1x chiral reference mask.
-        chiral_atom_orientations: Optional Boltz-1x chiral handedness flags.
-        stereo_bond_index: Optional Boltz-1x stereo-bond atom-quad index.
-        stereo_reference_mask: Optional Boltz-1x stereo reference mask.
-        stereo_bond_orientations: Optional Boltz-1x E/Z orientation flags.
-        planar_bond_index: Optional Boltz-1x planar double-bond atom index.
-        connected_chain_index: Optional Boltz-1x cross-chain connected chain pairs.
-        connected_atom_index: Optional Boltz-1x cross-chain connected atom pairs.
-        symmetric_chain_index: Optional Boltz-1x same-entity symmetric chain pairs.
-        contact_pair_index: Optional Boltz-1x contact atom-pair index.
-        contact_union_index: Optional Boltz-1x contact union index.
-        contact_negation_mask: Optional Boltz-1x contact negation mask.
-        contact_thresholds: Optional Boltz-1x contact distance thresholds.
         layout: Optional [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] aligning the
             tensor axes to molecular identities; populated by ``Boltz1Processor`` and required by ``fold``.
     """
@@ -3350,11 +3350,24 @@ class Boltz1Input:
     representative_atom_mask: Tensor
     atom_token_index: Tensor
     token_to_rep_atom: Tensor
-    residue_type: Tensor
+    residue_type_features: Tensor
     msa_profile: Tensor
     deletion_mean: Tensor
     token_bonds: Tensor
     molecule_type: Tensor
+    geometry_pair_index: Tensor
+    geometry_bond_mask: Tensor
+    geometry_angle_mask: Tensor
+    geometry_upper_bounds: Tensor
+    geometry_lower_bounds: Tensor
+    chiral_atom_index: Tensor
+    chiral_atom_is_r: Tensor
+    stereo_bond_index: Tensor
+    stereo_bond_is_e: Tensor
+    planar_bond_index: Tensor
+    connected_chain_index: Tensor
+    connected_atom_index: Tensor
+    symmetric_chain_index: Tensor
     target_positions: Tensor | None = None
     target_mask: Tensor | None = None
     frame_atom_index: Tensor | None = None
@@ -3366,29 +3379,10 @@ class Boltz1Input:
     msa_paired: Tensor | None = None
     msa_mask: Tensor | None = None
     pocket_feature: Tensor | None = None
-    rdkit_bounds_index: Tensor | None = None
-    rdkit_bounds_bond_mask: Tensor | None = None
-    rdkit_bounds_angle_mask: Tensor | None = None
-    rdkit_upper_bounds: Tensor | None = None
-    rdkit_lower_bounds: Tensor | None = None
-    chiral_atom_index: Tensor | None = None
-    chiral_reference_mask: Tensor | None = None
-    chiral_atom_orientations: Tensor | None = None
-    stereo_bond_index: Tensor | None = None
-    stereo_reference_mask: Tensor | None = None
-    stereo_bond_orientations: Tensor | None = None
-    planar_bond_index: Tensor | None = None
-    connected_chain_index: Tensor | None = None
-    connected_atom_index: Tensor | None = None
-    symmetric_chain_index: Tensor | None = None
-    contact_pair_index: Tensor | None = None
-    contact_union_index: Tensor | None = None
-    contact_negation_mask: Tensor | None = None
-    contact_thresholds: Tensor | None = None
     layout: Boltz1Layout | None = None
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class _Boltz1TrunkOutput:
     r"""
     Boltz-1 trunk representations returned by the recycling trunk.
@@ -3401,20 +3395,15 @@ class _Boltz1TrunkOutput:
     relative_position_encoding: Tensor
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class Boltz1Output:
     r"""
-    Predictions from a Boltz-1 training or sampling pass.
+    Predictions from one Boltz-1 training denoising pass.
 
     Args:
-        coordinates: Atom coordinates in angstroms. Sampling returns shape
-            ``(B, S, A, 3)``; ``forward`` returns ``(B*S, A, 3)``.
+        coordinates: Denoised atom coordinates with shape ``(B*S, A, 3)`` in
+            angstroms.
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
-        plddt_logits: Optional confidence logits with shape ``(B, S, N, D_plddt)``.
-        pae_logits: Optional aligned-error logits with shape ``(B, S, N, N, D_pae)``.
-        pde_logits: Optional distance-error logits with shape ``(B, S, N, N, D_pde)``.
-        resolved_logits: Optional resolved-state logits with shape ``(B, S, N, 2)``.
-        confidence_scores: Optional per-sample confidence and ranking tensors.
         augmented_target_coordinates: Training targets after rigid augmentation,
             with shape ``(B*S, A, 3)`` in angstroms.
         noise_level: Training noise standard deviations with shape ``(B*S,)`` in
@@ -3423,16 +3412,36 @@ class Boltz1Output:
 
     coordinates: Tensor
     distogram_logits: Tensor
-    plddt_logits: Tensor | None = None
-    pae_logits: Tensor | None = None
-    pde_logits: Tensor | None = None
-    resolved_logits: Tensor | None = None
-    confidence_scores: dict[str, Tensor] | None = None
-    augmented_target_coordinates: Tensor | None = None
-    noise_level: Tensor | None = None
+    augmented_target_coordinates: Tensor
+    noise_level: Tensor
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
+class _Boltz1FoldOutput:
+    r"""
+    Raw predictions from one Boltz-1 folding pass.
+
+    Args:
+        coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        plddt_logits: Optional confidence logits with shape ``(B, S, N, D_plddt)``.
+        pae_logits: Optional aligned-error logits with shape ``(B, S, N, N, D_pae)``.
+        pde_logits: Optional distance-error logits with shape ``(B, S, N, N, D_pde)``.
+        resolved_logits: Optional resolved-state logits with shape ``(B, S, N, 2)``.
+        confidence_scores: Optional per-sample confidence and ranking tensors.
+    """
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    plddt_logits: Tensor | None
+    pae_logits: Tensor | None
+    pde_logits: Tensor | None
+    resolved_logits: Tensor | None
+    confidence_scores: dict[str, Tensor] | None
+
+
+@dataclass(kw_only=True, eq=False)
 class Boltz1Representations:
     r"""
     Raw Boltz-1 trunk representations surfaced by ``Boltz1Model.representations``.

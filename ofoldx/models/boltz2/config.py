@@ -104,8 +104,8 @@ class Boltz2DenoiserConfig(Config):
     Configure the Boltz-2 learned coordinate denoiser.
 
     Args:
-        num_token_encoder_blocks: Number of conditioned token-transformer blocks in the score model.
-        num_token_encoder_attention_heads: Head count for the token transformer.
+        num_token_encoder_blocks: Number of conditioned token-encoder blocks in the score model.
+        num_token_encoder_attention_heads: Head count for the token encoder.
         num_atom_encoder_blocks: Number of atom-attention encoder blocks in the score model.
         num_atom_decoder_blocks: Number of atom-attention decoder blocks in the score model.
         num_atom_attention_heads: Head count shared by the atom encoder and decoder.

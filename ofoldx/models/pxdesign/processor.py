@@ -5,8 +5,6 @@ Input processing for PXDesign target-binder generation.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from os import PathLike
-from pathlib import Path
 from typing import cast
 
 import torch
@@ -24,7 +22,6 @@ from ...data.components import get_component
 from ...data.conditions import Hotspot
 from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
 from ...data.structure import Structure
-from ...io.structure import read_structure
 from ...processor import Processor
 from .config import PxDesignProcessorConfig
 from .model import PxDesignInput, PxDesignLayout
@@ -77,6 +74,8 @@ class PxDesignProcessor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = PxDesignProcessorConfig
+
     def __init__(
         self,
         config: PxDesignProcessorConfig | None = None,
@@ -89,7 +88,7 @@ class PxDesignProcessor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
+        input: MolecularSystem | Structure | None = None,
         *,
         placement: PlacementSpec,
         conditions: Sequence[Hotspot] = (),
@@ -98,7 +97,7 @@ class PxDesignProcessor(Processor):
         Build model inputs for one fixed-length target-binder design problem.
 
         Args:
-            input: Optional target system, observed structure, or local structure path.
+            input: Optional target system or observed structure.
             placement: Topology containing complete target spans and one fixed-length
                 generated protein chain.
             conditions: Target hotspot labels.
@@ -108,10 +107,8 @@ class PxDesignProcessor(Processor):
             atom, hotspot, and molecular-layout axes.
         """
 
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         if input is not None and not isinstance(input, (MolecularSystem, Structure)):
-            raise TypeError("input must be a MolecularSystem, Structure, local path, or None")
+            raise TypeError("input must be a MolecularSystem, Structure, or None")
 
         condition_values = tuple(conditions)
         if any(not isinstance(condition, Hotspot) for condition in condition_values):
@@ -230,7 +227,7 @@ class PxDesignProcessor(Processor):
         atom_features, reference_charges = _atom_features(system, sites, reference_mask)
         atom_to_token = torch.tensor([site_to_token[site] for site in sites], dtype=torch.int64)
         token_count = len(token_sites)
-        residue_type = torch.zeros(token_count, 36, dtype=torch.float32)
+        residue_type_features = torch.zeros(token_count, 36, dtype=torch.float32)
         generated_residues = frozenset(generated_map.values())
         for token_index, (residue, component_id) in enumerate(zip(token_residues, token_components)):
             index = (
@@ -241,7 +238,7 @@ class PxDesignProcessor(Processor):
                     _RESIDUE_TYPE_INDEX["UNK"],
                 )
             )
-            residue_type[token_index, index] = 1.0
+            residue_type_features[token_index, index] = 1.0
 
         observed = {} if structure is None else {site: row for row, site in enumerate(structure.sites)}
         representative_coordinates = torch.zeros(token_count, 3, dtype=torch.float32)
@@ -291,7 +288,10 @@ class PxDesignProcessor(Processor):
                 device=self.device,
                 dtype=self.dtype,
             ),
-            residue_type=residue_type.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            residue_type_features=residue_type_features.unsqueeze(0).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
             plddt=torch.zeros(1, token_count, 1, dtype=self.dtype, device=self.device),
             hotspot=torch.tensor(
                 [residue in hotspot_residues for residue in token_residues],

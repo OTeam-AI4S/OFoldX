@@ -48,12 +48,12 @@ class Transition(nn.Module):
 
         return dispatch_transition(
             hidden,
-            norm_weight=self.input_norm.weight,
-            norm_bias=self.input_norm.bias,
+            input_norm_weight=self.input_norm.weight,
+            input_norm_bias=self.input_norm.bias,
             gate_weight=self.feed_forward.gate_projection.weight,
             up_weight=self.feed_forward.value_projection.weight,
             down_weight=self.feed_forward.output_projection.weight,
-            eps=self.input_norm.eps,
+            input_norm_eps=self.input_norm.eps,
             backend=self.backend,
         )
 

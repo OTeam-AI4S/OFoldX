@@ -19,12 +19,12 @@ from .config import (
 )
 from .model import (
     BoltzGenBinding,
-    BoltzGenContact,
-    BoltzGenDesignCandidate,
     BoltzGenDesignMask,
-    BoltzGenDesignResult,
+    BoltzGenDesignOutput,
+    BoltzGenDirectionalContact,
     BoltzGenInput,
     BoltzGenInverseFoldingInput,
+    BoltzGenInverseFoldingDesignOutput,
     BoltzGenInverseFoldingModel,
     BoltzGenInverseFoldingOutput,
     BoltzGenModel,
@@ -36,7 +36,7 @@ from .model import (
     BoltzGenStructureGroup,
     BoltzGenSymmetry,
 )
-from .pipeline import BoltzGenFoldModel, BoltzGenPipeline, BoltzGenScoreModel, BoltzGenStageProcessor
+from .pipeline import BoltzGenDesignCandidate, BoltzGenDesignResult, BoltzGenPipeline
 from .processor import (
     BoltzGenInverseFoldingProcessor,
     BoltzGenProcessor,
@@ -45,23 +45,17 @@ from .processor import (
     to_design_mask,
 )
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
-    processor_config=None,
-    standard_tasks=(),
 )
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.boltzgen_ifold",
     model=BoltzGenInverseFoldingModel,
     processor=BoltzGenInverseFoldingProcessor,
-    processor_config=None,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.boltzgen",
     pipeline=BoltzGenPipeline,
-    tasks=("design",),
-    repository_loader=BoltzGenPipeline.from_repository,
 )

@@ -587,7 +587,7 @@ class MpnnPackerModel(Model):
             return PackResult(predictions=tuple(PackPrediction(input.structure) for _ in range(num_samples)))
 
         predictions = tuple(
-            _pack_candidate(
+            pack_candidate(
                 input,
                 self.sample(
                     input,
@@ -941,7 +941,7 @@ def _sample_von_mises_mixture(
     return torch.gather(component_samples, -1, mixture_indices.unsqueeze(-1)).squeeze(-1)
 
 
-def _pack_candidate(
+def pack_candidate(
     input: MpnnPackerInput,
     packed: MpnnPackerSamplingOutput,
 ) -> PackPrediction:

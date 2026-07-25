@@ -5,18 +5,20 @@ Input processing for Boltz-1 structure prediction.
 from __future__ import annotations
 
 import math
-from os import PathLike
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor
 
 from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
-from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence
+from ...data.molecular import (
+    AtomSite,
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+)
 from ...data.structure import Structure
-from ...io.msa import read_msa
-from ...io.structure import read_structure
 from ...processor import Processor
 from .model import Boltz1Input, Boltz1Layout, Boltz1Pocket
 
@@ -67,6 +69,15 @@ _STANDARD_COMPONENTS = {
     "rna": frozenset(_RNA_RESIDUE_TYPES),
     "dna": frozenset(_DNA_RESIDUE_TYPES),
 }
+# Boltz parses these polymer components through its canonical residue path and
+# therefore does not emit physical-potential constraints for them. MSE is
+# normalized to MET before that decision.
+_CONSTRAINT_FREE_COMPONENTS = {
+    "protein": frozenset((*_PROTEIN_RESIDUE_TYPES, "UNK", "MSE")),
+    "rna": frozenset(_RNA_RESIDUE_TYPES),
+    "dna": frozenset(_DNA_RESIDUE_TYPES),
+}
+_MODEL_HYDROGEN_ELEMENTS = frozenset({"H", "D", "T"})
 _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
 _UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
 _MSA_GAP = 1
@@ -138,9 +149,9 @@ class Boltz1Processor(Processor):
 
     def __call__(
         self,
-        input: MolecularSystem | Structure | str | PathLike[str],
+        input: MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
         pocket: Boltz1Pocket | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz1Input:
@@ -148,8 +159,8 @@ class Boltz1Processor(Processor):
         Prepare folding features for one molecular system.
 
         Args:
-            input: Molecular system, structure, or local structure path.
-            msa: Optional MSA value, collection, or alignment path.
+            input: Molecular system or structure.
+            msa: Optional MSA value or collection.
             pocket: Optional binder and pocket-residue specification.
             generator: Optional generator for independent rigid transforms of reference
                 conformers.
@@ -159,10 +170,8 @@ class Boltz1Processor(Processor):
             are in angstroms; tensor axes align to ``layout``.
         """
 
-        if isinstance(input, str | PathLike):
-            input = read_structure(Path(input).expanduser())
         if not isinstance(input, MolecularSystem | Structure):
-            raise TypeError("Boltz1Processor input must be a MolecularSystem, Structure, or structure path")
+            raise TypeError("Boltz1Processor input must be a MolecularSystem or Structure")
 
         if isinstance(input, Structure):
             structure = input
@@ -173,11 +182,12 @@ class Boltz1Processor(Processor):
         if not system.instances:
             raise ValueError("Boltz-1 requires at least one molecular instance")
 
-        normalized_msa = _normalize_msa(msa, system)
+        if msa is not None:
+            resolve_msa_bindings(msa, system)
         return _prepare_boltz1_features(
             system,
             structure=structure,
-            msa=normalized_msa,
+            msa=msa,
             pocket=pocket,
             device=self.device,
             dtype=self.dtype,
@@ -199,7 +209,7 @@ def _prepare_boltz1_features(
     Build the Boltz-1 token, atom, MSA, and identity layout.
     """
 
-    available_sites = {site for site, atom in system.iter_atoms() if atom.element != "H"}
+    available_sites = {site for site, atom in system.iter_atoms() if atom.element not in _MODEL_HYDROGEN_ELEMENTS}
     entity_index_by_id: dict[str, int] = {}
     instance_count_by_entity: dict[str, int] = {}
     tokens: list[dict[str, object]] = []
@@ -217,7 +227,7 @@ def _prepare_boltz1_features(
                 atom_sites = tuple(
                     site
                     for atom in component.atoms
-                    if atom.element != "H"
+                    if atom.element not in _MODEL_HYDROGEN_ELEMENTS
                     and atom.atom_id not in {"OXT", "OP3"}
                     and (site := AtomSite(instance_id, monomer_index, atom.atom_id)) in available_sites
                 )
@@ -266,7 +276,7 @@ def _prepare_boltz1_features(
                 site
                 for component_index, component in enumerate(entity.components)
                 for atom in component.atoms
-                if atom.element != "H"
+                if atom.element not in _MODEL_HYDROGEN_ELEMENTS
                 and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available_sites
             )
             if not atom_sites:
@@ -394,6 +404,7 @@ def _prepare_boltz1_features(
         dtype=torch.float32,
     )
     pocket_feature = _pocket_feature(pocket, tokens, system)
+    steering_features = _steering_features(system, site_to_atom)
 
     tensor_values: dict[str, Tensor] = {
         "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -410,7 +421,7 @@ def _prepare_boltz1_features(
         "representative_atom_mask": representative_atom_mask,
         "atom_token_index": atom_token_index,
         "token_to_rep_atom": token_to_rep_atom,
-        "residue_type": torch.nn.functional.one_hot(residue_types, 33).float(),
+        "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
         "msa_profile": msa_values.pop("msa_profile"),
         "deletion_mean": msa_values.pop("deletion_mean"),
         "token_bonds": token_bonds,
@@ -419,6 +430,7 @@ def _prepare_boltz1_features(
         "frame_mask": frame_mask,
         "cyclic_period": cyclic_period,
         "pocket_feature": pocket_feature,
+        **steering_features,
         **msa_values,
     }
     if structure is not None:
@@ -517,6 +529,294 @@ def _token_bond_indicator(
     for system_bond in system.bonds:
         add(system_bond.site_a, system_bond.site_b)
     return token_bonds
+
+
+def _steering_features(
+    system: MolecularSystem,
+    site_to_atom: dict[AtomSite, int],
+) -> dict[str, Tensor]:
+    r"""
+    Lower molecular geometry, assembly connections, and entity copies for Boltz-1x.
+    """
+
+    geometry_pairs: list[tuple[int, int]] = []
+    geometry_bond_mask: list[bool] = []
+    geometry_angle_mask: list[bool] = []
+    geometry_upper_bounds: list[float] = []
+    geometry_lower_bounds: list[float] = []
+    chiral_atoms: list[tuple[int, int, int, int]] = []
+    chiral_is_r: list[bool] = []
+    stereo_bonds: list[tuple[int, int, int, int]] = []
+    stereo_is_e: list[bool] = []
+    planar_bonds: list[tuple[int, int, int, int, int, int]] = []
+    constraint_scopes: list[tuple[Mol, dict[int, int]]] = []
+
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        if isinstance(entity, PolymerSequence):
+            for component_index, component in enumerate(entity.components):
+                if component.component_id in _CONSTRAINT_FREE_COMPONENTS[entity.polymer_type]:
+                    continue
+                rdkit_molecule = _canonical_rdkit_molecule(Molecule((component,)))
+                atom_index = {
+                    local_index: site_to_atom[site]
+                    for local_index, atom in enumerate(component.atoms)
+                    if (site := AtomSite(instance_id, component_index, atom.atom_id)) in site_to_atom
+                }
+                constraint_scopes.append((rdkit_molecule, atom_index))
+        else:
+            rdkit_molecule = _canonical_rdkit_molecule(entity)
+            atom_index: dict[int, int] = {}
+            local_index = 0
+            for component_index, component in enumerate(entity.components):
+                for atom in component.atoms:
+                    site = AtomSite(instance_id, component_index, atom.atom_id)
+                    if site in site_to_atom:
+                        atom_index[local_index] = site_to_atom[site]
+                    local_index += 1
+            constraint_scopes.append((rdkit_molecule, atom_index))
+
+    for rdkit_molecule, atom_index in constraint_scopes:
+        (
+            scope_geometry_pairs,
+            scope_bond_mask,
+            scope_angle_mask,
+            scope_upper_bounds,
+            scope_lower_bounds,
+            scope_chiral_atoms,
+            scope_chiral_is_r,
+            scope_stereo_bonds,
+            scope_stereo_is_e,
+            scope_planar_bonds,
+        ) = _rdkit_constraint_features(rdkit_molecule, atom_index)
+        geometry_pairs.extend(scope_geometry_pairs)
+        geometry_bond_mask.extend(scope_bond_mask)
+        geometry_angle_mask.extend(scope_angle_mask)
+        geometry_upper_bounds.extend(scope_upper_bounds)
+        geometry_lower_bounds.extend(scope_lower_bounds)
+        chiral_atoms.extend(scope_chiral_atoms)
+        chiral_is_r.extend(scope_chiral_is_r)
+        stereo_bonds.extend(scope_stereo_bonds)
+        stereo_is_e.extend(scope_stereo_is_e)
+        planar_bonds.extend(scope_planar_bonds)
+
+    chain_index = {instance_id: index for index, instance_id in enumerate(system.instances)}
+    connections = [bond for bond in system.bonds if bond.site_a in site_to_atom and bond.site_b in site_to_atom]
+    connections.sort(
+        key=lambda bond: (
+            min(site_to_atom[bond.site_a], site_to_atom[bond.site_b]),
+            max(site_to_atom[bond.site_a], site_to_atom[bond.site_b]),
+            bond.order,
+            bond.aromatic,
+            bond.stereo or "",
+            bond.origin,
+            repr(bond.stereo_sites),
+        )
+    )
+    connected_chains = [
+        (chain_index[bond.site_a.instance_id], chain_index[bond.site_b.instance_id]) for bond in connections
+    ]
+    connected_atoms = [(site_to_atom[bond.site_a], site_to_atom[bond.site_b]) for bond in connections]
+
+    instances = tuple(system.instances.items())
+    symmetric_chains = [
+        (first_index, second_index)
+        for first_index, (_first_instance, first_entity) in enumerate(instances)
+        for second_index, (_second_instance, second_entity) in enumerate(instances)
+        if first_index < second_index and first_entity == second_entity
+    ]
+
+    return {
+        "geometry_pair_index": _index_columns(geometry_pairs, 2),
+        "geometry_bond_mask": torch.tensor(geometry_bond_mask, dtype=torch.bool),
+        "geometry_angle_mask": torch.tensor(geometry_angle_mask, dtype=torch.bool),
+        "geometry_upper_bounds": torch.tensor(geometry_upper_bounds, dtype=torch.float32),
+        "geometry_lower_bounds": torch.tensor(geometry_lower_bounds, dtype=torch.float32),
+        "chiral_atom_index": _index_columns(chiral_atoms, 4),
+        "chiral_atom_is_r": torch.tensor(chiral_is_r, dtype=torch.bool),
+        "stereo_bond_index": _index_columns(stereo_bonds, 4),
+        "stereo_bond_is_e": torch.tensor(stereo_is_e, dtype=torch.bool),
+        "planar_bond_index": _index_columns(planar_bonds, 6),
+        "connected_chain_index": _index_columns(connected_chains, 2),
+        "connected_atom_index": _index_columns(connected_atoms, 2),
+        "symmetric_chain_index": _index_columns(symmetric_chains, 2),
+    }
+
+
+def _index_columns(values: list[tuple[int, ...]], width: int) -> Tensor:
+    if not values:
+        return torch.empty(width, 0, dtype=torch.long)
+    return torch.tensor(values, dtype=torch.long).T.contiguous()
+
+
+def _rdkit_constraint_features(
+    molecule: Mol,
+    atom_index: dict[int, int],
+) -> tuple[
+    list[tuple[int, int]],
+    list[bool],
+    list[bool],
+    list[float],
+    list[float],
+    list[tuple[int, int, int, int]],
+    list[bool],
+    list[tuple[int, int, int, int]],
+    list[bool],
+    list[tuple[int, int, int, int, int, int]],
+]:
+    from rdkit import Chem
+    from rdkit.Chem import HybridizationType
+    from rdkit.Chem.rdchem import BondStereo
+    from rdkit.Chem.rdDistGeom import GetMoleculeBoundsMatrix
+
+    molecule = Chem.AddHs(molecule)
+    molecule.UpdatePropertyCache(strict=False)
+    Chem.GetSymmSSSR(molecule)
+    Chem.AssignStereochemistry(molecule, force=True, cleanIt=True)
+
+    bounds = GetMoleculeBoundsMatrix(
+        molecule,
+        set15bounds=True,
+        scaleVDW=True,
+        doTriangleSmoothing=True,
+        useMacrocycle14config=False,
+    )
+    bond_pattern = Chem.MolFromSmarts("*~*")
+    angle_pattern = Chem.MolFromSmarts("*~*~*")
+    bond_pairs = {tuple(sorted(match)) for match in molecule.GetSubstructMatches(bond_pattern)}
+    angle_pairs = {tuple(sorted((match[0], match[2]))) for match in molecule.GetSubstructMatches(angle_pattern)}
+
+    geometry_pairs: list[tuple[int, int]] = []
+    geometry_bond_mask: list[bool] = []
+    geometry_angle_mask: list[bool] = []
+    geometry_upper_bounds: list[float] = []
+    geometry_lower_bounds: list[float] = []
+    for first in range(molecule.GetNumAtoms()):
+        for second in range(first + 1, molecule.GetNumAtoms()):
+            if first not in atom_index or second not in atom_index:
+                continue
+            geometry_pairs.append((atom_index[first], atom_index[second]))
+            geometry_bond_mask.append((first, second) in bond_pairs)
+            geometry_angle_mask.append((first, second) in angle_pairs)
+            geometry_upper_bounds.append(float(bounds[first, second]))
+            geometry_lower_bounds.append(float(bounds[second, first]))
+
+    chiral_atoms: list[tuple[int, int, int, int]] = []
+    chiral_is_r: list[bool] = []
+    if all(atom.HasProp("_CIPRank") for atom in molecule.GetAtoms()):
+        for center_index, orientation in Chem.FindMolChiralCenters(
+            molecule,
+            includeUnassigned=False,
+        ):
+            center = molecule.GetAtomWithIdx(center_index)
+            neighbors = tuple(
+                index
+                for index, _rank in sorted(
+                    ((neighbor.GetIdx(), int(neighbor.GetProp("_CIPRank"))) for neighbor in center.GetNeighbors()),
+                    key=lambda value: value[1],
+                    reverse=True,
+                )
+            )
+            if len(neighbors) > 4 or center.GetHybridization() != HybridizationType.SP3:
+                continue
+            indices = (*neighbors[:3], center_index)
+            if all(index in atom_index for index in indices):
+                chiral_atoms.append(
+                    cast(
+                        tuple[int, int, int, int],
+                        tuple(atom_index[index] for index in indices),
+                    )
+                )
+                chiral_is_r.append(orientation == "R")
+            if len(neighbors) == 4:
+                for skipped in range(3):
+                    neighbor_set = neighbors[:skipped] + neighbors[skipped + 1 :]
+                    indices = (
+                        neighbor_set[::-1] + (center_index,) if skipped % 2 == 0 else neighbor_set + (center_index,)
+                    )
+                    if all(index in atom_index for index in indices):
+                        chiral_atoms.append(
+                            cast(
+                                tuple[int, int, int, int],
+                                tuple(atom_index[index] for index in indices),
+                            )
+                        )
+                        chiral_is_r.append(orientation == "R")
+
+    stereo_bonds: list[tuple[int, int, int, int]] = []
+    stereo_is_e: list[bool] = []
+    if all(atom.HasProp("_CIPRank") for atom in molecule.GetAtoms()):
+        for bond in molecule.GetBonds():
+            stereo = bond.GetStereo()
+            if stereo not in {BondStereo.STEREOE, BondStereo.STEREOZ}:
+                continue
+            start_index = bond.GetBeginAtomIdx()
+            end_index = bond.GetEndAtomIdx()
+            start_neighbors = [
+                index
+                for index, _rank in sorted(
+                    (
+                        (neighbor.GetIdx(), int(neighbor.GetProp("_CIPRank")))
+                        for neighbor in molecule.GetAtomWithIdx(start_index).GetNeighbors()
+                        if neighbor.GetIdx() != end_index
+                    ),
+                    key=lambda value: value[1],
+                    reverse=True,
+                )
+            ]
+            end_neighbors = [
+                index
+                for index, _rank in sorted(
+                    (
+                        (neighbor.GetIdx(), int(neighbor.GetProp("_CIPRank")))
+                        for neighbor in molecule.GetAtomWithIdx(end_index).GetNeighbors()
+                        if neighbor.GetIdx() != start_index
+                    ),
+                    key=lambda value: value[1],
+                    reverse=True,
+                )
+            ]
+            indices = (start_neighbors[0], start_index, end_index, end_neighbors[0])
+            if all(index in atom_index for index in indices):
+                stereo_bonds.append(
+                    cast(
+                        tuple[int, int, int, int],
+                        tuple(atom_index[index] for index in indices),
+                    )
+                )
+                stereo_is_e.append(stereo == BondStereo.STEREOE)
+            if len(start_neighbors) == 2 and len(end_neighbors) == 2:
+                indices = (start_neighbors[1], start_index, end_index, end_neighbors[1])
+                if all(index in atom_index for index in indices):
+                    stereo_bonds.append(
+                        cast(
+                            tuple[int, int, int, int],
+                            tuple(atom_index[index] for index in indices),
+                        )
+                    )
+                    stereo_is_e.append(stereo == BondStereo.STEREOE)
+
+    planar_pattern = Chem.MolFromSmarts("[C;X3;^2](*)(*)=[C;X3;^2](*)(*)")
+    planar_bonds = [
+        cast(
+            tuple[int, int, int, int, int, int],
+            tuple(atom_index[index] for index in match),
+        )
+        for match in molecule.GetSubstructMatches(planar_pattern)
+        if all(index in atom_index for index in match)
+    ]
+    return (
+        geometry_pairs,
+        geometry_bond_mask,
+        geometry_angle_mask,
+        geometry_upper_bounds,
+        geometry_lower_bounds,
+        chiral_atoms,
+        chiral_is_r,
+        stereo_bonds,
+        stereo_is_e,
+        planar_bonds,
+    )
 
 
 def _msa_features(
@@ -727,17 +1027,26 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
 
     editable = Chem.RWMol()
     atom_index: dict[tuple[int, str], int] = {}
+    atom_stereo: dict[int, str] = {}
     for component_index, component in enumerate(molecule.components):
         for atom in component.atoms:
             rdkit_atom = Chem.Atom(atom.element)
             if atom.isotope is not None:
                 rdkit_atom.SetIsotope(atom.isotope)
-            rdkit_atom.SetFormalCharge(atom.formal_charge)
-            rdkit_atom.SetNumRadicalElectrons(atom.radical_electrons)
-            rdkit_atom.SetNumExplicitHs(atom.explicit_hydrogens)
-            rdkit_atom.SetNoImplicit(not atom.implicit_hydrogens_allowed)
-            rdkit_atom.SetIsAromatic(atom.aromatic)
-            atom_index[(component_index, atom.atom_id)] = editable.AddAtom(rdkit_atom)
+            if atom.formal_charge is not None:
+                rdkit_atom.SetFormalCharge(atom.formal_charge)
+            if atom.radical_electrons is not None:
+                rdkit_atom.SetNumRadicalElectrons(atom.radical_electrons)
+            if atom.explicit_hydrogens is not None:
+                rdkit_atom.SetNumExplicitHs(atom.explicit_hydrogens)
+            if atom.implicit_hydrogens_allowed is not None:
+                rdkit_atom.SetNoImplicit(not atom.implicit_hydrogens_allowed)
+            if atom.aromatic is not None:
+                rdkit_atom.SetIsAromatic(atom.aromatic)
+            index = editable.AddAtom(rdkit_atom)
+            atom_index[(component_index, atom.atom_id)] = index
+            if atom.stereo is not None:
+                atom_stereo[index] = atom.stereo.upper()
 
     bond_types = {
         1.0: Chem.BondType.SINGLE,
@@ -746,24 +1055,101 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
         3.0: Chem.BondType.TRIPLE,
         4.0: Chem.BondType.QUADRUPLE,
     }
+    bond_stereo: list[tuple[int, str, tuple[int, int] | None]] = []
     for component_index, component in enumerate(molecule.components):
-        for component_bond in component.bonds or ():
+        component_bonds = sorted(
+            component.bonds or (),
+            key=lambda bond: (
+                atom_index[(component_index, bond.atom_a)],
+                atom_index[(component_index, bond.atom_b)],
+            ),
+        )
+        for component_bond in component_bonds:
             editable.AddBond(
                 atom_index[(component_index, component_bond.atom_a)],
                 atom_index[(component_index, component_bond.atom_b)],
                 bond_types[component_bond.order],
             )
-            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(component_bond.aromatic)
-    for molecule_bond in molecule.bonds:
+            bond_index = editable.GetNumBonds() - 1
+            editable.GetBondWithIdx(bond_index).SetIsAromatic(component_bond.aromatic)
+            if component_bond.stereo is not None:
+                stereo_atoms = (
+                    tuple(atom_index[(component_index, atom_id)] for atom_id in component_bond.stereo_atoms)
+                    if component_bond.stereo_atoms is not None
+                    else None
+                )
+                bond_stereo.append(
+                    (
+                        bond_index,
+                        component_bond.stereo,
+                        cast(tuple[int, int] | None, stereo_atoms),
+                    )
+                )
+    molecule_bonds = sorted(
+        molecule.bonds,
+        key=lambda bond: (
+            atom_index[(bond.component_a, bond.atom_a)],
+            atom_index[(bond.component_b, bond.atom_b)],
+        ),
+    )
+    for molecule_bond in molecule_bonds:
         editable.AddBond(
             atom_index[(molecule_bond.component_a, molecule_bond.atom_a)],
             atom_index[(molecule_bond.component_b, molecule_bond.atom_b)],
             bond_types[molecule_bond.order],
         )
-        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(molecule_bond.aromatic)
+        bond_index = editable.GetNumBonds() - 1
+        editable.GetBondWithIdx(bond_index).SetIsAromatic(molecule_bond.aromatic)
+        if molecule_bond.stereo is not None:
+            stereo_atoms = (
+                tuple(atom_index[site] for site in molecule_bond.stereo_atoms)
+                if molecule_bond.stereo_atoms is not None
+                else None
+            )
+            bond_stereo.append(
+                (
+                    bond_index,
+                    molecule_bond.stereo,
+                    cast(tuple[int, int] | None, stereo_atoms),
+                )
+            )
 
     value = editable.GetMol()
     Chem.SanitizeMol(value)
+    for index in atom_stereo:
+        value.GetAtomWithIdx(index).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
+    for index, desired in atom_stereo.items():
+        atom = value.GetAtomWithIdx(index)
+        assigned = atom.GetProp("_CIPCode").upper() if atom.HasProp("_CIPCode") else ""
+        if assigned != desired:
+            atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
+
+    stereo_types = {
+        "E": Chem.BondStereo.STEREOE,
+        "TRANS": Chem.BondStereo.STEREOE,
+        "Z": Chem.BondStereo.STEREOZ,
+        "CIS": Chem.BondStereo.STEREOZ,
+    }
+    for index, stereo, stereo_atoms in bond_stereo:
+        bond = value.GetBondWithIdx(index)
+        if stereo_atoms is None:
+            begin = bond.GetBeginAtomIdx()
+            end = bond.GetEndAtomIdx()
+            begin_neighbors = [
+                neighbor for neighbor in value.GetAtomWithIdx(begin).GetNeighbors() if neighbor.GetIdx() != end
+            ]
+            end_neighbors = [
+                neighbor for neighbor in value.GetAtomWithIdx(end).GetNeighbors() if neighbor.GetIdx() != begin
+            ]
+            stereo_atoms = (
+                max(begin_neighbors, key=lambda atom: int(atom.GetProp("_CIPRank"))).GetIdx(),
+                max(end_neighbors, key=lambda atom: int(atom.GetProp("_CIPRank"))).GetIdx(),
+            )
+        bond.SetStereoAtoms(*stereo_atoms)
+        bond.SetStereo(stereo_types[stereo.upper()])
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
     return value
 
 
@@ -785,22 +1171,3 @@ def _residue_type(component_id: str, polymer_type: str) -> int:
     if polymer_type == "rna":
         return _RNA_RESIDUE_TYPES.get(component_id, 27)
     return _DNA_RESIDUE_TYPES.get(component_id, 32)
-
-
-def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    if msa is None:
-        return None
-    if isinstance(msa, MSA | MSACollection):
-        resolve_msa_bindings(msa, system)
-        return msa
-    proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
-    ]
-    if len(proteins) != 1:
-        raise ValueError("an aligned FASTA is unambiguous only for one protein entity; pass MSACollection")
-    return read_msa(msa, entity_id=proteins[0])

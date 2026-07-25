@@ -11,7 +11,6 @@ from ..config import (
     DenoiserConfig,
     DistogramConfig,
     SamplerConfig,
-    TemplateConfig,
     TrunkConfig,
 )
 
@@ -27,7 +26,6 @@ class ProtenixConfig(Config):
         atom_feature_size: Width of raw atom features.
         relative_position_size: Width of relative-position features.
         constraints: Whether to build the jointly trained four-branch constraint variant.
-        template: Template embedding configuration.
         trunk: Pairformer trunk configuration.
         recycling_steps: Number of trunk recycling passes.
         denoiser: Coordinate denoiser configuration.
@@ -42,7 +40,6 @@ class ProtenixConfig(Config):
     atom_feature_size: int = 385
     relative_position_size: int = 139
     constraints: bool = False
-    template: TemplateConfig = TemplateConfig()
     trunk: TrunkConfig = TrunkConfig()
     recycling_steps: int = 10
     denoiser: DenoiserConfig = DenoiserConfig()

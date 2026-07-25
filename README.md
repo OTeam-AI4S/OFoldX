@@ -42,15 +42,20 @@ result = ofoldx.design(structure, model="oteam/model-name")
 print(result.candidates[0].target)
 ```
 
-Drop down to the `Auto*` factories when you need direct model or processor control:
+Load the concrete family Pipeline when you need its complete controls:
 
 ```python
-from ofoldx import AutoModel, AutoProcessor, DesignPipeline
+pipeline = ofoldx.pipeline("design", model="oteam/model-name")
+result = pipeline.design(structure)
+```
+
+Use the `Auto*` factories only when you need the raw registered pair:
+
+```python
+from ofoldx import AutoModel, AutoProcessor
 
 processor = AutoProcessor("oteam/model-name")
 model = AutoModel("oteam/model-name")
-pipeline = DesignPipeline(model=model, processor=processor)
-result = pipeline.design(structure)
 ```
 
 Write one registered Model/Processor pair as a standard repository with the sole
@@ -62,16 +67,17 @@ from ofoldx.artifacts import save_model
 save_model("./model-repository", model=model, processor=processor)
 ```
 
-The writer emits only `model.json`, `processor.json`, and standard safetensors
-weights. Model-card authorship and Hub publishing are separate. Pipelines do not
-have save/load methods.
+The writer emits `model.json`, `processor.json`, and standard safetensors weights.
+A registered concrete Pipeline additionally writes `pipeline.json` through its
+own `save()` method and is reconstructed by `ofoldx.pipeline(...)`. Model-card
+authorship and Hub publishing remain separate.
 
 Canonical PDB/mmCIF input and output live in `ofoldx.io`; MultiMolecule owns FASTA
 and the other biological-sequence formats used by family Processors.
 
-`AutoModel` and `AutoProcessor` accept either a local model directory or a Hugging Face
-Hub repository ID. A Pipeline is an in-memory binding, not a separately serialized
-artifact.
+`AutoModel` and `AutoProcessor` accept either a local model directory or a Hugging
+Face Hub repository ID. Pipeline repositories persist only the concrete Pipeline
+ID; the class owns how its model/processor pair or fixed composition is loaded.
 
 ## Explore
 
@@ -80,10 +86,10 @@ artifact.
 | [`ofoldx.models`](ofoldx/models)       | Model registration; concrete family packages are imported explicitly.                    |
 | `ofoldx.artifacts`                     | The one public writer for a validated standard Model/Processor repository.               |
 | `ofoldx.hub`                           | Hugging Face Hub repository resolution, publication, and loading.                        |
-| [`ofoldx.pipelines`](ofoldx/pipelines) | Explicit `FoldPipeline`, `DesignPipeline`, `ScorePipeline`, and `PackPipeline` bindings. |
+| [`ofoldx.pipelines`](ofoldx/pipelines) | Concrete family Pipeline registration and shared paired/composite persistence.         |
 | [`ofoldx.modules`](ofoldx/modules)     | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion.    |
 | [`ofoldx.io`](ofoldx/io)               | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.         |
-| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, selection, and closed Condition domain values.            |
+| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, placement, and scientific domain values.                  |
 | `ofoldx.runners`                       | Pre-release Danling Runner scaffold; its config-only construction contract is deferred.  |
 
 The low-level values exported by `ofoldx.data` are part of the domain API: atom, bond,

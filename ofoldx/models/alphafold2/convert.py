@@ -16,8 +16,6 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from ...artifacts import save_model
-from ...processor import Processor
 from .config import AlphaFold2Config
 from .converters import deepmind, openfold
 from .model import AlphaFold2Model, AlphaFold2MultimerModel
@@ -147,8 +145,8 @@ def save_alphafold2_checkpoint(
     pairs the resulting model with the processor selected by the checkpoint variant (the monomer/monomer-pTM
     [`AlphaFold2Processor`][], or the [`AlphaFold2MultimerProcessor`][] when the selected
     ``model_*_multimer`` archive yields an [`AlphaFold2MultimerModel`][]), and writes a
-    self-contained ``model.json`` / ``processor.json`` / safetensors repository via
-    [`ofoldx.artifacts.save_model`][ofoldx.artifacts.save_model].
+    self-contained ``model.json`` / ``processor.json`` / safetensors repository
+    marked with the exact concrete folding Pipeline.
 
     Saving is local-only by default. When ``repo_id`` is given the fully written repository is also
     uploaded to that Hub repo; no organization or token is assumed and nothing is published without
@@ -169,14 +167,21 @@ def save_alphafold2_checkpoint(
         for name, tensor in model.state_dict().items()
     }
     model.load_state_dict(owned, strict=True, assign=True)
+    from .pipeline import AlphaFold2MultimerPipeline, AlphaFold2Pipeline
+
+    pipeline: AlphaFold2Pipeline | AlphaFold2MultimerPipeline
     if isinstance(model, AlphaFold2MultimerModel):
-        processor: Processor = AlphaFold2MultimerProcessor()
+        pipeline = AlphaFold2MultimerPipeline(
+            model=model,
+            processor=AlphaFold2MultimerProcessor(dtype=dtype),
+        )
     else:
-        processor = AlphaFold2Processor()
-    save_model(
+        pipeline = AlphaFold2Pipeline(
+            model=model,
+            processor=AlphaFold2Processor(dtype=dtype),
+        )
+    pipeline.save(
         output_dir,
-        model=model,
-        processor=processor,
         repo_id=repo_id,
         token=token,
         private=private,

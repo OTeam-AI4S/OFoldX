@@ -68,7 +68,7 @@ pip install ofoldx
 
 ### Backbone Design
 
-Use the high-level `design` API:
+Load the RFdiffusion design pipeline:
 
 ```python
 import ofoldx
@@ -76,7 +76,8 @@ from ofoldx.data import GeneratedSegment
 from ofoldx.models.rfdiffusion import RfDiffusionPlacements
 
 placement = RfDiffusionPlacements({"binder": {"binder": GeneratedSegment("protein", 100, 100)}})
-output = ofoldx.design(None, model="oteam/rfdiffusion-base", placement=placement)
+pipeline = ofoldx.pipeline("design", model="oteam/rfdiffusion-base")
+output = pipeline.design(None, placement=placement)
 ```
 
 ## Training Details

@@ -24,7 +24,8 @@ def encode_atom_pair(
 
     ``module`` supplies ``distance_vector_projection``,
     ``inverse_distance_projection``, ``distance_mask_projection``,
-    ``left_atom_projection``, ``right_atom_projection``, and ``feed_forward``.
+    ``left_atom_projection``, ``right_atom_projection``, and the
+    ``feed_forward(pair)`` residual-update method.
 
     Args:
         module: Owner of the atom-pair projections.

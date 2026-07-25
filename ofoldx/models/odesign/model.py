@@ -48,7 +48,6 @@ from ...modules.embedding import (
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.head import DistogramHead
 from ...modules.trunk import MsaTrunk, PairformerStack, TrianglePairUpdateStack
-from ...results import Metric, Score, best
 from .config import ODesignConfig
 
 
@@ -74,16 +73,6 @@ class ODesignModel(Model):
             single_size=config.single_size,
             atom_feature_size=config.atom_feature_size,
         )
-        self.constraint_embeddings = ODesignConstraintEmbeddings(
-            pair_size=config.pair_size,
-            hidden_size=config.constraint_embeddings.hidden_size,
-            num_blocks=config.constraint_embeddings.num_blocks,
-            num_bins=config.constraint_embeddings.num_distogram_bins,
-            min_distance=config.constraint_embeddings.min_distance,
-            max_distance=config.constraint_embeddings.max_distance,
-            dropout=config.constraint_embeddings.dropout,
-            backend="auto",
-        )
         self.single_init_projection = nn.Linear(config.token_feature_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
@@ -94,8 +83,16 @@ class ODesignModel(Model):
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
         self.pair_recycle_norm = LayerNorm(config.pair_size)
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        self.single_recycle_norm = LayerNorm(config.single_size)
-        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
+        self.constraint_embeddings = ODesignConstraintEmbeddings(
+            pair_size=config.pair_size,
+            hidden_size=config.constraint_embeddings.hidden_size,
+            num_blocks=config.constraint_embeddings.num_blocks,
+            num_bins=config.constraint_embeddings.num_distogram_bins,
+            min_distance=config.constraint_embeddings.min_distance,
+            max_distance=config.constraint_embeddings.max_distance,
+            dropout=config.constraint_embeddings.dropout,
+            backend="auto",
+        )
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
@@ -103,6 +100,8 @@ class ODesignModel(Model):
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
         )
+        self.single_recycle_norm = LayerNorm(config.single_size)
+        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.pairformer_stack = PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
             single_size=config.single_size,
@@ -216,7 +215,7 @@ class ODesignModel(Model):
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
-    ) -> ODesignDesignResult:
+    ) -> tuple[Structure, ...]:
         r"""
         Generate decoded structure candidates for one processed design problem.
 
@@ -232,8 +231,7 @@ class ODesignModel(Model):
                 ``input.observed_positions``. ``None`` starts from noise.
 
         Returns:
-            An [`ODesignDesignResult`][] containing ``num_candidates`` structures in
-            sampling order. Coordinates are in angstroms.
+            Backbone structures in sampling order. Coordinates are in angstroms.
         """
 
         output = self.sample(
@@ -251,20 +249,7 @@ class ODesignModel(Model):
         )
         for structure in structures:
             _require_hard_conditions(structure, input)
-        # Sequence assignment and candidate scoring are added by ODesignPipeline.
-        candidates = tuple(
-            ODesignDesignCandidate(
-                structure=structure,
-                backbone_index=index,
-            )
-            for index, structure in enumerate(structures)
-        )
-        return ODesignDesignResult(
-            candidates=candidates,
-            num_seeds=1,
-            num_backbones=num_candidates,
-            num_sequences=0,
-        )
+        return structures
 
     @torch.inference_mode()
     def sample(
@@ -277,7 +262,7 @@ class ODesignModel(Model):
         num_model_seeds: int = 1,
         partial_diffusion_snr: float | None = None,
         generator: torch.Generator | None = None,
-    ) -> ODesignOutput:
+    ) -> ODesignSamplingOutput:
         r"""
         Sample coordinates while retaining the model's pairwise predictions.
 
@@ -296,7 +281,7 @@ class ODesignModel(Model):
             generator: Random generator used by coordinate sampling.
 
         Returns:
-            An [`ODesignOutput`][] with ``coordinates`` of shape
+            An [`ODesignSamplingOutput`][] with ``coordinates`` of shape
             ``(K, B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
             ``(K, B, N, N, D)``, and ``token_bond_type_logits`` of shape
             ``(K, B, N, N, D_b)``.
@@ -330,7 +315,7 @@ class ODesignModel(Model):
                     generator=generator,
                 )
             )
-        return ODesignOutput(
+        return ODesignSamplingOutput(
             coordinates=torch.stack(coordinates),
             distogram_logits=torch.stack(distograms),
             token_bond_type_logits=torch.stack(bond_logits),
@@ -504,8 +489,8 @@ class ODesignConstraintEmbeddings(nn.Module):
         self.num_bins = num_bins
         self.min_distance = min_distance
         self.max_distance = max_distance
-        self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.distogram_projection = nn.Linear(num_bins, hidden_size, bias=False)
         self.pair_update_stack = TrianglePairUpdateStack(
             num_blocks=num_blocks,
@@ -539,13 +524,11 @@ class ODesignTokenBondTypeHead(nn.Module):
 
     def __init__(self, *, pair_size: int = 128, hidden_size: int = 128, num_bond_types: int = 2) -> None:
         super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(pair_size, hidden_size),
-            nn.Linear(hidden_size, num_bond_types),
-        )
+        self.input_projection = nn.Linear(pair_size, hidden_size)
+        self.output_projection = nn.Linear(hidden_size, num_bond_types)
 
     def forward(self, pair: Tensor) -> Tensor:
-        return self.classifier(pair)
+        return self.output_projection(self.input_projection(pair))
 
 
 def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> Structure:
@@ -627,7 +610,7 @@ def _resolve_atom(reference, source_residues, placement_map, instance_of, source
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(eq=False)
 class _ODesignTrunkOutput:
     r"""
     Named representations produced by the ODesign trunk.
@@ -707,7 +690,7 @@ class ODesignFixedResidue:
 ODesignResidueSpec = ODesignDesignedResidue | ODesignFixedResidue
 
 
-@dataclass
+@dataclass(eq=False)
 class ODesignLayout:
     r"""
     Molecular identities and conditions aligned to ODesign tensor axes.
@@ -724,7 +707,7 @@ class ODesignLayout:
     msa: MSA | MSACollection | None = None
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class ODesignInput:
     r"""
     Tensor and molecular-layout input for ODesign.
@@ -785,20 +768,17 @@ class ODesignInput:
     layout: ODesignLayout
 
 
-@dataclass
+@dataclass(eq=False)
 class ODesignOutput:
     r"""
-    Predictions from one ODesign denoising or sampling call.
+    Predictions from one ODesign denoising call.
 
     Args:
-        coordinates: Denoised atom coordinates in angstroms. ``forward`` returns
-            shape ``(B, S, A, 3)``; ``sample`` returns ``(K, B, S, A, 3)`` with a
-            leading model-seed axis.
-        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``
-            for ``forward`` or ``(K, B, N, N, D)`` for ``sample``.
+        coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
         token_bond_type_logits: Token-pair bond-type logits with shape
-            ``(B, N, N, D_b)`` for ``forward`` or ``(K, B, N, N, D_b)`` for
-            ``sample``.
+            ``(B, N, N, D_b)``.
     """
 
     coordinates: Tensor
@@ -806,55 +786,20 @@ class ODesignOutput:
     token_bond_type_logits: Tensor
 
 
-@dataclass
-class ODesignDesignCandidate:
-    r"""
-    One ODesign sample and its aligned scientific values.
-
-    Args:
-        structure: Designed molecular structure.
-        scores: Scalar scores keyed by stable scientific names.
-        metrics: One-axis metrics keyed by stable scientific names.
-        seed_index: Zero-based generation-seed index.
-        backbone_index: Zero-based backbone index within the seed.
-        sequence_index: Zero-based sequence index within the backbone.
-    """
-
-    structure: Structure
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-    seed_index: int = 0
-    backbone_index: int = 0
-    sequence_index: int = 0
-
-
 @dataclass(eq=False)
-class ODesignDesignResult:
+class ODesignSamplingOutput:
     r"""
-    The seed-by-backbone-by-sequence ODesign result.
+    Predictions from one ODesign sampling call.
 
     Args:
-        candidates: Candidates ordered by seed, backbone, then sequence.
-        num_seeds: Number of generation seeds.
-        num_backbones: Number of sampled backbones per seed.
-        num_sequences: Number of sequence variants per backbone. Zero denotes a
-            backbone-only result.
+        coordinates: Sampled atom coordinates with shape ``(K, B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape
+            ``(K, B, N, N, D)``.
+        token_bond_type_logits: Token-pair bond-type logits with shape
+            ``(K, B, N, N, D_b)``.
     """
 
-    candidates: tuple[ODesignDesignCandidate, ...]
-    num_seeds: int
-    num_backbones: int
-    num_sequences: int
-
-    def best(self, score: str) -> ODesignDesignCandidate:
-        r"""
-        Return the earliest best candidate under a named score.
-
-        Args:
-            score: Comparable score name present on every candidate.
-
-        Returns:
-            The best candidate, with generation order breaking ties.
-        """
-
-        return best(self.candidates, score)
+    coordinates: Tensor
+    distogram_logits: Tensor
+    token_bond_type_logits: Tensor

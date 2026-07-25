@@ -1459,9 +1459,6 @@ class ProteinMpnnOutput:
     def log_probabilities(self) -> Tensor:
         r"""
         Return vocabulary log probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.log_softmax(dim=-1)
@@ -1470,9 +1467,6 @@ class ProteinMpnnOutput:
     def probabilities(self) -> Tensor:
         r"""
         Return vocabulary probabilities.
-
-        Returns:
-            A tensor with the same shape as ``logits``.
         """
 
         return self.logits.softmax(dim=-1)
@@ -1488,8 +1482,7 @@ class ProteinMpnnSamplingOutput:
             ``(num_samples, num_residues)``.
         log_probabilities: Model log probabilities with shape
             ``(num_samples, num_residues, vocabulary_size)``.
-        sampling_probabilities: Sampling distribution used at each position, with the
-            same shape as ``log_probabilities``.
+        sampling_probabilities: Sampling distribution used at each position.
         decoding_ranks: Autoregressive ranks with shape
             ``(num_samples, num_residues)``.
     """

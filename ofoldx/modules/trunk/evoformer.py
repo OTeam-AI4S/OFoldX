@@ -275,7 +275,7 @@ class EvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.outer_product_mean = AlphaFold2OuterProductMean(
+        self.outer_product_mean = EvoformerOuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
@@ -341,7 +341,7 @@ class ExtraMsaEvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.outer_product_mean = AlphaFold2OuterProductMean(
+        self.outer_product_mean = EvoformerOuterProductMean(
             msa_size=msa_size,
             pair_size=pair_size,
             hidden_size=outer_product_hidden_size,
@@ -518,25 +518,25 @@ class EvoformerPairBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.triangle_multiplication_outgoing = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_outgoing = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=True,
             backend=backend,
         )
-        self.triangle_multiplication_incoming = AlphaFold2TriangleMultiplication(
+        self.triangle_multiplication_incoming = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
             outgoing=False,
             backend=backend,
         )
-        self.triangle_attention_starting_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_starting_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.triangle_attention_ending_node = AlphaFold2TriangleAttention(
+        self.triangle_attention_ending_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
             num_attention_heads=num_triangle_attention_heads,
@@ -816,9 +816,9 @@ class EvoformerTransition(nn.Module):
         return output * mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
-class AlphaFold2OuterProductMean(OuterProductMean):
+class EvoformerOuterProductMean(OuterProductMean):
     r"""
-    AlphaFold 2 outer-product mean with biased left and right MSA projections.
+    Evoformer outer-product mean with biased left and right MSA projections.
 
     It uses pre-normalization, divides by ``count + eps`` after projection, and
     returns an additive pair update.
@@ -852,9 +852,9 @@ class AlphaFold2OuterProductMean(OuterProductMean):
         self.right_projection = nn.Linear(msa_size, hidden_size)
 
 
-class AlphaFold2TriangleMultiplication(TriangleMultiplication):
+class EvoformerTriangleMultiplication(TriangleMultiplication):
     r"""
-    AlphaFold 2 triangle multiplication with biased value, gate, and output projections.
+    Evoformer triangle multiplication with biased value, gate, and output projections.
 
     The outgoing and incoming contractions are ``"...ikh,...jkh->...ijh"`` and
     ``"...kih,...kjh->...ijh"``, respectively. The left operand owns output row
@@ -890,9 +890,9 @@ class AlphaFold2TriangleMultiplication(TriangleMultiplication):
         self.gate_projection = nn.Linear(pair_size, pair_size)
 
 
-class AlphaFold2TriangleAttention(TriangleAttention):
+class EvoformerTriangleAttention(TriangleAttention):
     r"""
-    AlphaFold 2 triangle self-attention with biased output and gate projections.
+    Evoformer triangle self-attention with biased output and gate projections.
 
     A gate bias of ``1.0`` opens the output gate near initialization. The caller
     selects starting- or ending-node attention by orienting ``pair``; this module

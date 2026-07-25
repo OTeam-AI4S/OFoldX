@@ -15,7 +15,7 @@ from typing_extensions import Self
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io import read_mpnn_pdb
+from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...results import DesignResult, MpnnProbabilityResult, PackResult
 from .model import LigandMpnnModel
@@ -53,7 +53,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Design LigandMPNN sequences with ligand and residue context.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -78,8 +78,9 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             Candidates follow sampling order. ``seed`` and ``generator`` are mutually exclusive.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             conditions=conditions,
             tied_weights=tied_weights,
@@ -117,7 +118,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Compute sequence-conditioned LigandMPNN autoregressive probabilities.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -138,8 +139,9 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             conditions=conditions,
             use_atom_context=use_atom_context,
@@ -172,7 +174,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Compute sequence-free LigandMPNN autoregressive probabilities.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences treated as designable. ``None`` selects every
                 valid protein occurrence.
             conditions: Tied-identity conditions applied to decoding order.
@@ -193,8 +195,9 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             conditions=conditions,
             use_atom_context=use_atom_context,
@@ -226,7 +229,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Compute target-last conditional probabilities for every residue row.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
@@ -247,8 +250,9 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
@@ -279,7 +283,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Compute target-first unconditional probabilities for every residue row.
 
         Args:
-            input: A ``Structure`` or local PDB path.
+            input: A ``Structure`` or local structure path.
             design_positions: Residue occurrences marked as designable in the returned carrier.
                 ``None`` selects every valid protein occurrence.
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
@@ -300,8 +304,9 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
         """
 
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(
-            input,
+            structure,
             design_positions=design_positions,
             use_atom_context=use_atom_context,
             filter_by_occupancy=filter_by_occupancy,
@@ -382,7 +387,7 @@ class LigandMpnnDesignAndPackPipeline:
         Design LigandMPNN sequences and pack every resulting candidate.
 
         Args:
-            input: A ``Structure`` or local PDB path, parsed once for both stages.
+            input: A ``Structure`` or local structure path, parsed once for both stages.
             design_positions: Protein residue occurrences to design. ``None`` selects every
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
@@ -414,8 +419,8 @@ class LigandMpnnDesignAndPackPipeline:
             packing-sample order. ``seed`` and ``generator`` are mutually exclusive.
         """
 
-        structure = read_mpnn_pdb(input) if isinstance(input, (str, PathLike)) else input
-        model_input = self.designer.processor.process_structure(
+        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
+        model_input = self.designer.processor(
             structure,
             design_positions=design_positions,
             conditions=conditions,

@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from torch import Tensor, nn
 
 from ..backend import resolve_config_backend
-from ..backend.attention import gated_multihead_attention
+from ..backend.attention import gated_multihead_attention, projected_attention as dispatch_projected_attention
 
 
 class GatedMultiheadAttention(nn.Module):
@@ -104,6 +104,77 @@ class GatedMultiheadAttention(nn.Module):
             attention_mask=attention_mask,
             projection=self.projection,
             backend=self.backend,
+        )
+
+
+class ProjectedAttention(nn.Module):
+    r"""
+    Scaled dot-product attention over already projected head-major tensors.
+
+    This parameter-free Module keeps layout construction and learned projections at
+    their mathematical owner while moving the attention core behind the common
+    backend policy. The eager implementation accumulates logits and weighted values
+    in float32, returns the value dtype, and zeros query rows with no valid key.
+
+    Args:
+        dropout: Dropout probability applied to attention weights while training.
+        backend: Operator provider; attention uses SDPA as its default PyTorch
+            implementation.
+    """
+
+    backend: str
+
+    def __init__(self, dropout: float = 0.0, *, backend: str = "auto") -> None:
+        super().__init__()
+        self.dropout = dropout
+        self.backend = resolve_config_backend(
+            backend,
+            supported=("oops", "sdpa", "eager"),
+            public_default="sdpa",
+        )
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        *,
+        biases: Sequence[Tensor] | None = None,
+        attention_mask: Tensor | None = None,
+        scale: float | None = None,
+    ) -> Tensor:
+        r"""
+        Attend from projected queries to projected keys and values.
+
+        Args:
+            query: Head-major query tensor
+                ``(..., num_heads, num_query_tokens, head_size)``.
+            key: Head-major key tensor
+                ``(..., num_heads, num_key_tokens, head_size)``.
+            value: Head-major value tensor
+                ``(..., num_heads, num_key_tokens, value_size)``.
+            biases: Optional additive biases broadcastable to
+                ``(..., num_heads, num_query_tokens, num_key_tokens)``.
+            attention_mask: Optional boolean keep-mask. A full-rank mask
+                includes the head axis, one fewer axis omits it, and a
+                shorter mask supplies only key validity.
+            scale: Optional multiplier applied to query-key logits. ``None`` uses
+                ``head_size ** -0.5``.
+
+        Returns:
+            Head-major attention values with shape
+            ``(..., num_heads, num_query_tokens, value_size)``.
+        """
+
+        return dispatch_projected_attention(
+            query,
+            key,
+            value,
+            biases=biases,
+            attention_mask=attention_mask,
+            backend=self.backend,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale=scale,
         )
 
 

@@ -13,6 +13,7 @@ from ...data import PlacementSpec
 from ...data.conditions import Hotspot
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
+from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from .model import PxDesignDesignResult, PxDesignModel
 from .processor import PxDesignProcessor
@@ -55,6 +56,8 @@ class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
             sampling order. Coordinates are in angstroms.
         """
 
+        if isinstance(input, str | PathLike):
+            input = read_structure(input)
         model_input = self.processor(input, placement=placement, conditions=conditions)
         generator = resolve_generator(seed, generator, device=model_input.reference_positions.device)
         return self.model.design(

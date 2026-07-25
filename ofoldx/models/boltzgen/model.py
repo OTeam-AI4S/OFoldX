@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...data.bonds import SymbolicBond
-from ...data.conditions import Endpoint, Hotspot
+from ...data.conditions import Contact, Hotspot
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.placement import (
     PlacementMap,
@@ -21,11 +21,13 @@ from ...data.placement import (
     SymbolicResidueSite,
     validate_placement,
 )
-from ...data.structure import Structure
 from ...model import Model
-from ...modules.atom.encoders import PackedAtomAttention
+from ...modules.atom import (
+    PackedAtomToTokenEncoder,
+    PackedDenoisingAtomToTokenEncoder,
+    PackedTokenToAtomDecoder,
+)
 from ...modules.atom.pair_encoding import encode_atom_pair
-from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
 from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention
 from ...modules.backend import LayerNorm
@@ -40,8 +42,8 @@ from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import PairSymmetrizedDistogramHead
 from ...modules.transformer import (
-    ConditionedTransformer,
-    ConditionedTransformerBlock,
+    ConditionedTransformerEncoder,
+    ConditionedTransformerEncoderBlock,
     TripleProductConditionedTransition,
 )
 from ...modules.transition import ConditionedTransition, Transition
@@ -52,7 +54,6 @@ from ...modules.trunk.msa import (
     TrianglePairUpdateBlock,
 )
 from ...modules.trunk.pairformer import PairformerStack
-from ...results import Metric, PairMetric, Score, best
 from .config import BoltzGenConfig, BoltzGenInverseFoldingConfig
 
 _NUM_BOND_TYPES = 6
@@ -387,7 +388,7 @@ class BoltzGenModel(Model):
         generator: torch.Generator | None = None,
         step_scale: float | None = None,
         noise_scale: float | None = None,
-    ) -> BoltzGenOutput:
+    ) -> BoltzGenDesignOutput:
         r"""
         Sample atom coordinates for a processed design problem.
 
@@ -408,7 +409,7 @@ class BoltzGenModel(Model):
                 value.
 
         Returns:
-            A [`BoltzGenOutput`][] with ``coordinates`` of shape
+            A [`BoltzGenDesignOutput`][] with ``coordinates`` of shape
             ``(B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
             ``(B, N, N, D)``, and ``bfactor_logits`` of shape
             ``(B, S, N, D_b)``.
@@ -435,7 +436,7 @@ class BoltzGenModel(Model):
         generator: torch.Generator | None = None,
         step_scale: float | None = None,
         noise_scale: float | None = None,
-    ) -> BoltzGenOutput:
+    ) -> BoltzGenDesignOutput:
         r"""
         Draw reverse-diffusion structure samples from a preprocessed input.
 
@@ -475,7 +476,7 @@ class BoltzGenModel(Model):
             token_mask=input.token_mask,
         )
         batch_size = input.token_mask.shape[0]
-        return BoltzGenOutput(
+        return BoltzGenDesignOutput(
             coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
             distogram_logits=trunk.distogram_logits,
             bfactor_logits=self.bfactor_head(trunk.single).unsqueeze(1).expand(-1, num_samples, -1, -1),
@@ -506,7 +507,7 @@ class BoltzGenModel(Model):
             atom_mask=input.atom_mask,
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
-            residue_type=input.residue_type,
+            residue_type_features=input.residue_type_features,
             msa_profile=input.msa_profile,
             deletion_mean=input.deletion_mean,
             method_feature=input.method_feature,
@@ -554,7 +555,7 @@ class BoltzGenModel(Model):
                         relative_position_encoding,
                         pair_mask=pair_mask,
                     )
-                if input.template_residue_type is not None:
+                if input.template_residue_type_features is not None:
                     pair = pair + self.template_embedder(pair, input, pair_mask=pair_mask)
                 if input.msa_tokens is not None:
                     pair = pair + self.msa_trunk(
@@ -666,7 +667,7 @@ class BoltzGenInverseFoldingModel(Model):
             atom_mask=input.atom_mask,
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
-            residue_type=input.residue_type,
+            residue_type_features=input.residue_type_features,
             msa_profile=input.msa_profile,
             deletion_mean=input.deletion_mean,
             method_feature=input.method_feature,
@@ -687,7 +688,7 @@ class BoltzGenInverseFoldingModel(Model):
         inverse_fold_restriction: tuple[str, ...] = (),
         tie_symmetric_sequences: bool = False,
         generator: torch.Generator | None = None,
-    ) -> BoltzGenInverseFoldingOutput:
+    ) -> BoltzGenInverseFoldingDesignOutput:
         r"""
         Sample residue identities for a fixed structure.
 
@@ -701,7 +702,7 @@ class BoltzGenInverseFoldingModel(Model):
             generator: Random generator used for decode order and categorical sampling.
 
         Returns:
-            A [`BoltzGenInverseFoldingOutput`][] with ``logits`` of shape
+            A [`BoltzGenInverseFoldingDesignOutput`][] with ``logits`` of shape
             ``(B, N, V)`` and sampled ``tokens`` of shape ``(B, N)``.
         """
 
@@ -722,7 +723,7 @@ class BoltzGenInverseFoldingModel(Model):
         inverse_fold_restriction: tuple[str, ...] = (),
         tie_symmetric_sequences: bool = False,
         generator: torch.Generator | None = None,
-    ) -> BoltzGenInverseFoldingOutput:
+    ) -> BoltzGenInverseFoldingDesignOutput:
         r"""
         Autoregressively design residue tokens from the conditioned structure.
 
@@ -743,7 +744,7 @@ class BoltzGenInverseFoldingModel(Model):
             atom_mask=input.atom_mask,
             reference_space_id=input.reference_space_id,
             atom_to_token=input.atom_to_token,
-            residue_type=input.residue_type,
+            residue_type_features=input.residue_type_features,
             msa_profile=input.msa_profile,
             deletion_mean=input.deletion_mean,
             method_feature=input.method_feature,
@@ -763,7 +764,7 @@ class BoltzGenInverseFoldingModel(Model):
             tie_symmetric_sequences=tie_symmetric_sequences,
             generator=generator,
         )
-        return BoltzGenInverseFoldingOutput(
+        return BoltzGenInverseFoldingDesignOutput(
             logits=logits,
             tokens=residue_type.argmax(dim=-1),
         )
@@ -806,17 +807,19 @@ class BoltzGenInputEmbeddings(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
-        self.atom_pair_bias_projection = nn.Sequential(
-            LayerNorm(atom_pair_hidden_size, backend=backend),
-            nn.Linear(atom_pair_hidden_size, num_atom_encoder_blocks * num_atom_encoder_attention_heads, bias=False),
+        self.atom_pair_norm = LayerNorm(atom_pair_hidden_size, backend=backend)
+        self.atom_pair_bias_projection = nn.Linear(
+            atom_pair_hidden_size,
+            num_atom_encoder_blocks * num_atom_encoder_attention_heads,
+            bias=False,
         )
-        self.atom_attention_encoder = BoltzGenAtomAttentionEncoder(
+        self.atom_attention_encoder = PackedAtomToTokenEncoder(
             atom_hidden_size=atom_hidden_size,
-            single_size=single_size,
+            token_hidden_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            num_atom_encoder_blocks=num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
             backend=backend,
         )
 
@@ -863,7 +866,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         atom_mask: Tensor,
         reference_space_id: Tensor,
         atom_to_token: Tensor,
-        residue_type: Tensor,
+        residue_type_features: Tensor,
         msa_profile: Tensor,
         deletion_mean: Tensor,
         method_feature: Tensor | None = None,
@@ -877,13 +880,18 @@ class BoltzGenInputEmbeddings(nn.Module):
         atom_query, atom_conditioning, atom_pair = self.atom_encoder(
             atom_features, reference_positions, atom_mask, reference_space_id
         )
-        atom_pair_bias = self.atom_pair_bias_projection(atom_pair)
+        atom_pair_bias = self.atom_pair_bias_projection(self.atom_pair_norm(atom_pair))
         token_from_atom = self.atom_attention_encoder(
-            atom_query, atom_conditioning, atom_pair_bias, atom_mask, atom_to_token, residue_type.shape[-2]
+            atom_query,
+            atom_conditioning,
+            atom_pair_bias,
+            atom_mask,
+            atom_to_token,
+            residue_type_features.shape[-2],
         )
 
         single = token_from_atom
-        single = single + self.residue_type_projection(residue_type.to(single.dtype))
+        single = single + self.residue_type_projection(residue_type_features.to(single.dtype))
         msa_features = torch.cat([msa_profile, deletion_mean.unsqueeze(-1)], dim=-1)
         single = single + self.msa_profile_projection(msa_features.to(single.dtype))
 
@@ -926,22 +934,36 @@ class BoltzGenAtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.left_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.left_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.right_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.right_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.feed_forward = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        pair = self.feed_forward_input_projection(F.relu(pair))
+        pair = self.feed_forward_hidden_projection(F.relu(pair))
+        return self.feed_forward_output_projection(F.relu(pair))
 
     def forward(
         self,
@@ -990,7 +1012,7 @@ class BoltzGenAtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        single_windows = pad_atoms(atom_single)
+        single_windows = F.relu(pad_atoms(atom_single))
         atom_pair = encode_atom_pair(
             self,
             distance_vectors,
@@ -1027,29 +1049,44 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.single_trunk_projection = nn.Sequential(
-            LayerNorm(single_size), nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.single_trunk_norm = LayerNorm(single_size)
+        self.single_trunk_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.pair_trunk_norm = LayerNorm(pair_size)
+        self.pair_trunk_projection = nn.Linear(
+            pair_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.pair_trunk_projection = nn.Sequential(
-            LayerNorm(pair_size),
-            nn.Linear(pair_size, atom_pair_hidden_size, bias=False),
+        self.left_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.left_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.right_atom_projection = nn.Linear(
+            atom_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.right_atom_projection = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_input_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
-        self.feed_forward = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
-            nn.ReLU(),
-            nn.Linear(atom_pair_hidden_size, atom_pair_hidden_size, bias=False),
+        self.feed_forward_hidden_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
         )
+        self.feed_forward_output_projection = nn.Linear(
+            atom_pair_hidden_size,
+            atom_pair_hidden_size,
+            bias=False,
+        )
+
+    def feed_forward(self, pair: Tensor) -> Tensor:
+        pair = self.feed_forward_input_projection(F.relu(pair))
+        pair = self.feed_forward_hidden_projection(F.relu(pair))
+        return self.feed_forward_output_projection(F.relu(pair))
 
     def forward(
         self,
@@ -1091,11 +1128,11 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
         uid_keys = to_keys(space_id.unsqueeze(-1)).view(batch, num_windows, 1, num_key_atoms)
         valid = (mask_queries & mask_keys & (uid_queries == uid_keys)).to(distance_vectors.dtype).unsqueeze(-1)
 
-        single_proj = self.single_trunk_projection(single_trunk)
+        single_proj = self.single_trunk_projection(self.single_trunk_norm(single_trunk))
         atom_single = atom_single + single_proj.gather(
             1, atom_to_token.unsqueeze(-1).expand(-1, -1, single_proj.shape[-1])
         )
-        pair_from_trunk = self.pair_trunk_projection(pair_trunk)
+        pair_from_trunk = self.pair_trunk_projection(self.pair_trunk_norm(pair_trunk))
         token_windows = pad_atoms(atom_to_token)
         query_token = token_windows.view(batch, num_windows, num_query_atoms)
         key_token = to_keys(token_windows.unsqueeze(-1)).reshape(batch, num_windows, num_key_atoms)
@@ -1103,7 +1140,7 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
         pair_gathered = pair_from_trunk[batch_index, query_token[:, :, :, None], key_token[:, :, None, :]]
         pair_bias = pair_gathered * mask_keys.unsqueeze(-1).to(distance_vectors.dtype)
 
-        single_windows = pad_atoms(atom_single)
+        single_windows = F.relu(pad_atoms(atom_single))
         atom_pair = encode_atom_pair(
             self,
             distance_vectors,
@@ -1116,171 +1153,6 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
             prefix_ndim=1,
         )
         return atom_query, atom_single, atom_pair
-
-
-class BoltzGenAtomAttentionEncoder(nn.Module):
-    r"""
-    Windowed atom-attention encoder with an atom-to-token mean pool.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_encoder_blocks,
-                num_attention_heads=num_atom_encoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, single_size, bias=False), nn.ReLU())
-
-    def forward(
-        self,
-        atom_single: Tensor,
-        atom_conditioning: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-    ) -> Tensor:
-        atom_query = self.atom_transformer(
-            atom_single,
-            atom_conditioning,
-            atom_pair_bias,
-            atom_mask=atom_mask.bool(),
-            attention_layout="local",
-        )
-        token_from_atom = self.token_projection(atom_query)
-        return dense_mean_to_tokens(token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6)
-
-
-class BoltzGenDenoiserAtomAttentionEncoder(nn.Module):
-    r"""
-    Encode noisy atom states and pool them into denoiser token states.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_encoder_blocks,
-                num_attention_heads=num_atom_encoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.token_projection = nn.Sequential(nn.Linear(atom_hidden_size, 2 * single_size, bias=False), nn.ReLU())
-
-    def forward(
-        self,
-        atom_single: Tensor,
-        atom_conditioning: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        num_tokens: int,
-        noisy_positions: Tensor,
-        multiplicity: int = 1,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        atom_query = atom_single.repeat_interleave(multiplicity, 0)
-        atom_query = atom_query + self.noisy_position_projection(noisy_positions)
-        conditioning = atom_conditioning.repeat_interleave(multiplicity, 0)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
-        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
-        atom_query = self.atom_transformer(
-            atom_query,
-            conditioning,
-            atom_pair_bias,
-            atom_mask=atom_mask.bool(),
-            attention_layout="local",
-        )
-        token_from_atom = self.token_projection(atom_query)
-        token_repr = dense_mean_to_tokens(
-            token_from_atom, atom_to_token, num_tokens, atom_mask=atom_mask, count_eps=1e-6
-        )
-        return token_repr, atom_query, conditioning
-
-
-class BoltzGenAtomAttentionDecoder(nn.Module):
-    r"""
-    Broadcast token activations back to atoms and predict a per-atom position update.
-    """
-
-    def __init__(
-        self,
-        atom_hidden_size: int = 128,
-        single_size: int = 384,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.token_projection = nn.Linear(2 * single_size, atom_hidden_size, bias=False)
-        self.atom_transformer = PackedAtomAttention(
-            ConditionedTransformer(
-                num_blocks=num_atom_decoder_blocks,
-                num_attention_heads=num_atom_decoder_attention_heads,
-                hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                backend=backend,
-            ),
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.position_update = nn.Sequential(
-            LayerNorm(atom_hidden_size, backend=backend), nn.Linear(atom_hidden_size, 3, bias=False)
-        )
-
-    def forward(
-        self,
-        token_repr: Tensor,
-        atom_skip: Tensor,
-        conditioning_skip: Tensor,
-        atom_pair_bias: Tensor,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        multiplicity: int = 1,
-    ) -> Tensor:
-        token_index = atom_to_token.repeat_interleave(multiplicity, 0)
-        token_proj = self.token_projection(token_repr)
-        atom_query = atom_skip + token_proj.gather(1, token_index.unsqueeze(-1).expand(-1, -1, token_proj.shape[-1]))
-        mask = atom_mask.repeat_interleave(multiplicity, 0)
-        atom_query = self.atom_transformer(
-            atom_query,
-            conditioning_skip,
-            atom_pair_bias,
-            atom_mask=mask.bool(),
-            attention_layout="local",
-        )
-        return self.position_update(atom_query)
 
 
 class BoltzGenInverseFoldingEncoder(nn.Module):
@@ -1574,7 +1446,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
             # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
             rand = torch.rand(node.shape[0], device=node.device, generator=generator)
             visibility = rand[src] < rand[dst]
-            known = input.residue_type.bool()[valid_mask][src] * visibility[:, None]
+            known = input.residue_type_features.bool()[valid_mask][src] * visibility[:, None]
             known = known.to(edge.dtype)
         residue_rep = self.residue_type_projection(known)
         neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
@@ -1619,7 +1491,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
 
         order = torch.randperm(num_nodes, device=node.device, generator=generator).tolist()
         if (~design_mask).any():
-            known = input.residue_type[valid_mask][~design_mask].to(decoded.dtype)
+            known = input.residue_type_features[valid_mask][~design_mask].to(decoded.dtype)
             decoded[~design_mask] = known
             logits[~design_mask] = known
             fixed = set(torch.where(~design_mask)[0].tolist())
@@ -1871,7 +1743,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         )
 
     def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
-        residue_type = cast(Tensor, input.template_residue_type)
+        residue_type_features = cast(Tensor, input.template_residue_type_features)
         frame_mask = cast(Tensor, input.template_frame_mask)
         frame_rotations = cast(Tensor, input.template_frame_rotations)
         frame_translations = cast(Tensor, input.template_frame_translations)
@@ -1882,7 +1754,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         visibility_index = cast(Tensor, input.template_visibility_index)
         present = template_mask.any(dim=2).float()
         count = present.sum(dim=1).clamp(min=1)
-        batch_size, num_templates, num_tokens = residue_type.shape[:3]
+        batch_size, num_templates, num_tokens = residue_type_features.shape[:3]
 
         pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
         pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
@@ -1920,8 +1792,8 @@ class BoltzGenTemplateEmbedder(nn.Module):
             dim=-1,
         )
         geometry = geometry * same_visibility.unsqueeze(-1)
-        residue = residue_type.to(pair.dtype)
-        feature_value = self.template_feature_projection(geometry.to(pair.dtype), residue)
+        template_residue_features = residue_type_features.to(pair.dtype)
+        feature_value = self.template_feature_projection(geometry.to(pair.dtype), template_residue_features)
         value = self.pair_projection(self.pair_norm(pair[:, None])) + feature_value
         value = value.reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
         if pair_mask is not None:
@@ -2357,26 +2229,25 @@ class BoltzGenDenoiserConditioning(nn.Module):
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
+        self.atom_encoder_pair_norms = nn.ModuleList(
+            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_encoder_blocks)
+        )
         self.atom_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, backend=backend),
-                nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False),
-            )
+            nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False)
             for _ in range(num_atom_encoder_blocks)
         )
+        self.atom_decoder_pair_norms = nn.ModuleList(
+            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_decoder_blocks)
+        )
         self.atom_decoder_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(atom_pair_hidden_size, backend=backend),
-                nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False),
-            )
+            nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False)
             for _ in range(num_atom_decoder_blocks)
         )
-        self.token_transformer_pair_bias_projections = nn.ModuleList(
-            nn.Sequential(
-                LayerNorm(pair_size, backend=backend),
-                nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False),
-            )
-            for _ in range(num_token_encoder_blocks)
+        self.token_encoder_pair_norms = nn.ModuleList(
+            LayerNorm(pair_size, backend=backend) for _ in range(num_token_encoder_blocks)
+        )
+        self.token_encoder_pair_bias_projections = nn.ModuleList(
+            nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False) for _ in range(num_token_encoder_blocks)
         )
 
     def forward(
@@ -2401,15 +2272,42 @@ class BoltzGenDenoiserConditioning(nn.Module):
             single_trunk=single_trunk,
             pair_trunk=pair,
         )
-        atom_enc_bias = torch.cat([layer(atom_pair) for layer in self.atom_encoder_pair_bias_projections], dim=-1)
-        atom_dec_bias = torch.cat([layer(atom_pair) for layer in self.atom_decoder_pair_bias_projections], dim=-1)
-        token_trans_bias = torch.cat([layer(pair) for layer in self.token_transformer_pair_bias_projections], dim=-1)
+        atom_enc_bias = torch.cat(
+            [
+                projection(norm(atom_pair))
+                for norm, projection in zip(
+                    self.atom_encoder_pair_norms,
+                    self.atom_encoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
+        atom_dec_bias = torch.cat(
+            [
+                projection(norm(atom_pair))
+                for norm, projection in zip(
+                    self.atom_decoder_pair_norms,
+                    self.atom_decoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
+        token_encoder_bias = torch.cat(
+            [
+                projection(norm(pair))
+                for norm, projection in zip(
+                    self.token_encoder_pair_norms,
+                    self.token_encoder_pair_bias_projections,
+                )
+            ],
+            dim=-1,
+        )
         return {
             "atom_query": atom_query,
             "atom_conditioning": atom_conditioning,
             "atom_enc_bias": atom_enc_bias,
             "atom_dec_bias": atom_dec_bias,
-            "token_trans_bias": token_trans_bias,
+            "token_encoder_bias": token_encoder_bias,
         }
 
 
@@ -2442,17 +2340,18 @@ class BoltzGenDenoiser(nn.Module):
             num_transitions=num_conditioning_transitions,
             backend=backend,
         )
-        self.atom_attention_encoder = BoltzGenDenoiserAtomAttentionEncoder(
+        self.atom_attention_encoder = PackedDenoisingAtomToTokenEncoder(
             atom_hidden_size=atom_hidden_size,
-            single_size=single_size,
+            token_hidden_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            num_atom_encoder_blocks=num_atom_encoder_blocks,
-            num_atom_encoder_attention_heads=num_atom_encoder_attention_heads,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
             backend=backend,
         )
-        self.single_to_token = nn.Sequential(LayerNorm(hidden, backend=backend), nn.Linear(hidden, hidden, bias=False))
-        self.token_transformer = ConditionedTransformer(
+        self.single_to_token_norm = LayerNorm(hidden, backend=backend)
+        self.single_to_token_projection = nn.Linear(hidden, hidden, bias=False)
+        self.token_encoder = ConditionedTransformerEncoder(
             num_blocks=num_token_encoder_blocks,
             num_attention_heads=num_token_encoder_attention_heads,
             hidden_size=hidden,
@@ -2460,13 +2359,13 @@ class BoltzGenDenoiser(nn.Module):
             backend=backend,
         )
         self.token_norm = LayerNorm(hidden, backend=backend)
-        self.atom_attention_decoder = BoltzGenAtomAttentionDecoder(
+        self.atom_attention_decoder = PackedTokenToAtomDecoder(
             atom_hidden_size=atom_hidden_size,
-            single_size=single_size,
+            token_hidden_size=single_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            num_atom_decoder_blocks=num_atom_decoder_blocks,
-            num_atom_decoder_attention_heads=num_atom_decoder_attention_heads,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
             backend=backend,
         )
 
@@ -2499,12 +2398,12 @@ class BoltzGenDenoiser(nn.Module):
             noisy_positions=noisy_positions,
             multiplicity=multiplicity,
         )
-        token_repr = token_repr + self.single_to_token(single)
+        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
 
-        token_repr = self.token_transformer(
+        token_repr = self.token_encoder(
             token_repr,
             single,
-            conditioning["token_trans_bias"].repeat_interleave(multiplicity, 0),
+            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
             token_mask.repeat_interleave(multiplicity, 0).float(),
         )
         token_repr = self.token_norm(token_repr)
@@ -2858,21 +2757,20 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
     """
 
     for child in module.modules():
-        if isinstance(child, BoltzGenAtomEncoder):
-            if child.single_trunk_projection is not None:
-                nn.init.zeros_(child.single_trunk_projection[1].weight)
-            if child.pair_trunk_projection is not None:
-                nn.init.zeros_(child.pair_trunk_projection[1].weight)
-            nn.init.zeros_(child.left_atom_projection[1].weight)
-            nn.init.zeros_(child.right_atom_projection[1].weight)
-            nn.init.zeros_(child.feed_forward[5].weight)
-        elif isinstance(child, BoltzGenAtomAttentionEncoder) and child.noisy_position_projection is not None:
+        if isinstance(child, (BoltzGenAtomEncoder, BoltzGenDenoiserAtomEncoder)):
+            if isinstance(child, BoltzGenDenoiserAtomEncoder):
+                nn.init.zeros_(child.single_trunk_projection.weight)
+                nn.init.zeros_(child.pair_trunk_projection.weight)
+            nn.init.zeros_(child.left_atom_projection.weight)
+            nn.init.zeros_(child.right_atom_projection.weight)
+            nn.init.zeros_(child.feed_forward_output_projection.weight)
+        elif isinstance(child, PackedDenoisingAtomToTokenEncoder):
             nn.init.zeros_(child.noisy_position_projection.weight)
-        elif isinstance(child, BoltzGenAtomAttentionDecoder):
+        elif isinstance(child, PackedTokenToAtomDecoder):
             nn.init.zeros_(child.token_projection.weight)
-            nn.init.zeros_(child.position_update[1].weight)
+            nn.init.zeros_(child.position_update_projection.weight)
         elif isinstance(child, BoltzGenDenoiser):
-            nn.init.zeros_(child.single_to_token[1].weight)
+            nn.init.zeros_(child.single_to_token_projection.weight)
         elif isinstance(child, BoltzGenBidirectionalTriangleMultiplication):
             nn.init.zeros_(child.input_gate_projection.weight)
             nn.init.zeros_(child.output_projection.weight)
@@ -2881,7 +2779,7 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
             nn.init.zeros_(child.feed_forward.output_projection.weight)
         elif isinstance(child, GatedMultiheadAttention):
             nn.init.zeros_(child.projection.output_projection.weight)
-        elif isinstance(child, ConditionedTransformerBlock):
+        elif isinstance(child, ConditionedTransformerEncoderBlock):
             nn.init.zeros_(child.output_gate_projection.weight)
             if child.output_gate_projection.bias is not None:
                 nn.init.constant_(child.output_gate_projection.bias, -2.0)
@@ -2951,25 +2849,6 @@ def _scatter_softmax(src: Tensor, index: Tensor, dim_size: int, dim: int = 0) ->
     exp = centered.exp()
     denom = _scatter_sum(exp, index, dim=dim, dim_size=dim_size).gather(0, expanded.expand_as(src))
     return exp / (denom + 1e-16)
-
-
-def _mlp(sizes: list[int]) -> nn.Sequential:
-    r"""
-    Build a GELU-activated MLP from consecutive ``sizes`` (linear layers with GELU between, none after the last).
-
-    Args:
-        sizes: Layer widths; ``len(sizes) - 1`` linear layers are created.
-
-    Returns:
-        The MLP as an ``nn.Sequential``.
-    """
-
-    layers: list[nn.Module] = []
-    for i in range(len(sizes) - 1):
-        layers.append(nn.Linear(sizes[i], sizes[i + 1]))
-        if i < len(sizes) - 2:
-            layers.append(nn.GELU())
-    return nn.Sequential(*layers)
 
 
 def _build_constraint_logit_mask(
@@ -3146,24 +3025,40 @@ class BoltzGenResidueConstraint:
     allowed: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class BoltzGenContact:
+@dataclass(frozen=True, eq=False)
+class BoltzGenDirectionalContact:
     r"""
-    Declare a symmetric or directional contact between endpoint sets.
+    Add BoltzGen's directional pocket/binder meaning to a shared contact.
 
-    The sides are ordered for the directional pocket-to-binder modes.
+    The shared [`Contact`][] owns the endpoints, cutoff, and symmetric proximity
+    meaning. This wrapper owns only which ordered side is the pocket.
 
     Args:
-        side_a: Endpoints on the first side of the contact.
-        side_b: Endpoints on the second side of the contact.
-        cutoff_angstrom: Maximum contact distance in angstroms.
-        kind: Symmetric contact or direction of the pocket-to-binder relation.
+        contact: Shared two-sided proximity condition.
+        direction: Direction of the pocket-to-binder relation across the contact's
+            declared ``side_a`` and ``side_b``.
     """
 
-    side_a: tuple[Endpoint, ...]
-    side_b: tuple[Endpoint, ...]
-    cutoff_angstrom: float
-    kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
+    contact: Contact
+    direction: Literal["pocket>binder", "binder>pocket"]
+
+    def _identity(self) -> tuple[object, ...]:
+        contact = self.contact
+        return (
+            contact.side_a,
+            contact.side_b,
+            contact.cutoff_angstrom,
+            contact.tolerance_angstrom,
+            self.direction,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, BoltzGenDirectionalContact):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
 
 
 @dataclass(frozen=True)
@@ -3195,13 +3090,14 @@ BoltzGenSchema = (
     | BoltzGenBinding
     | BoltzGenSecondaryStructure
     | BoltzGenStructureGroup
-    | BoltzGenContact
+    | Contact
+    | BoltzGenDirectionalContact
     | BoltzGenCovalentBond
     | BoltzGenSymmetry
 )
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class BoltzGenInput:
     r"""
     Input tensors consumed by BoltzGen design models.
@@ -3221,7 +3117,7 @@ class BoltzGenInput:
         representative_atom_mask: Mask selecting the distogram representative atom per token.
         atom_token_index: Per-token atom offset for each atom.
         token_to_rep_atom: Distogram representative atom index for each token.
-        residue_type: Query residue type one-hot features.
+        residue_type_features: Query residue type one-hot features.
         msa_profile: Single-sequence MSA profile features.
         deletion_mean: Per-token deletion mean features.
         token_bonds: Token-level covalent adjacency ``(B, N, N, 1)`` (trailing singleton per the featurizer).
@@ -3247,7 +3143,7 @@ class BoltzGenInput:
         deletion_value: Optional MSA deletion values.
         msa_paired: Optional paired-MSA flags.
         msa_mask: Optional MSA validity mask.
-        template_residue_type: Optional template residue-type features.
+        template_residue_type_features: Optional template residue-type features.
         template_frame_rotations: Optional template frame rotations.
         template_frame_translations: Optional template frame translations.
         template_frame_mask: Optional template frame validity mask.
@@ -3277,7 +3173,7 @@ class BoltzGenInput:
     representative_atom_mask: Tensor
     atom_token_index: Tensor
     token_to_rep_atom: Tensor
-    residue_type: Tensor
+    residue_type_features: Tensor
     msa_profile: Tensor
     deletion_mean: Tensor
     token_bonds: Tensor
@@ -3301,7 +3197,7 @@ class BoltzGenInput:
     deletion_value: Tensor | None = None
     msa_paired: Tensor | None = None
     msa_mask: Tensor | None = None
-    template_residue_type: Tensor | None = None
+    template_residue_type_features: Tensor | None = None
     template_frame_rotations: Tensor | None = None
     template_frame_translations: Tensor | None = None
     template_frame_mask: Tensor | None = None
@@ -3317,7 +3213,7 @@ class BoltzGenInput:
     layout: BoltzGenLayout | None = None
 
 
-@dataclass(kw_only=True)
+@dataclass(kw_only=True, eq=False)
 class BoltzGenInverseFoldingInput:
     r"""
     Tensor and molecular-layout input for BoltzGen inverse folding.
@@ -3334,7 +3230,7 @@ class BoltzGenInverseFoldingInput:
         reference_positions: Reference conformer coordinates with shape
             ``(B, A, 3)`` in angstroms.
         reference_space_id: Reference conformer group IDs with shape ``(B, A)``.
-        residue_type: Residue-type features with shape ``(B, N, C_residue)``.
+        residue_type_features: Residue-type features with shape ``(B, N, C_residue)``.
         msa_profile: Per-token MSA profile with shape ``(B, N, C_msa)``.
         deletion_mean: Per-token mean deletion values with shape ``(B, N)``.
         token_bonds: Token-level bond adjacency with shape ``(B, N, N, 1)``.
@@ -3360,7 +3256,7 @@ class BoltzGenInverseFoldingInput:
     atom_mask: Tensor
     reference_positions: Tensor
     reference_space_id: Tensor
-    residue_type: Tensor
+    residue_type_features: Tensor
     msa_profile: Tensor
     deletion_mean: Tensor
     token_bonds: Tensor
@@ -3395,79 +3291,63 @@ class _BoltzGenTrunkOutput:
 @dataclass(eq=False)
 class BoltzGenOutput:
     r"""
-    Predictions from one BoltzGen structure-design pass.
+    Predictions from one BoltzGen training denoising pass.
 
     Args:
-        coordinates: Denoised atom coordinates in angstroms. The training
-            [`forward`][BoltzGenModel.forward] returns shape ``(B, A, 3)``;
-            [`design`][BoltzGenModel.design] returns ``(B, S, A, 3)``.
+        coordinates: Denoised atom coordinates with shape ``(B, A, 3)`` in
+            angstroms.
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
-        bfactor_logits: Optional per-token B-factor logits with shape
-            ``(B, N, D_b)`` for ``forward`` or ``(B, S, N, D_b)`` for ``design``.
-        augmented_target_coordinates: Optional training target coordinates after
+        bfactor_logits: Per-token B-factor logits with shape ``(B, N, D_b)``.
+        augmented_target_coordinates: Training target coordinates after
             rigid augmentation, with shape ``(B, A, 3)`` in angstroms.
-        noise_level: Optional sampled diffusion noise levels with shape ``(B,)``.
+        noise_level: Sampled diffusion noise levels with shape ``(B,)``.
     """
 
     coordinates: Tensor
     distogram_logits: Tensor
-    bfactor_logits: Tensor | None = None
-    augmented_target_coordinates: Tensor | None = None
-    noise_level: Tensor | None = None
+    bfactor_logits: Tensor
+    augmented_target_coordinates: Tensor
+    noise_level: Tensor
+
+
+@dataclass(eq=False)
+class BoltzGenDesignOutput:
+    r"""
+    Predictions from one BoltzGen structure-design pass.
+
+    Args:
+        coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)`` in
+            angstroms.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        bfactor_logits: Per-token B-factor logits with shape ``(B, S, N, D_b)``.
+    """
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    bfactor_logits: Tensor
 
 
 @dataclass(eq=False)
 class BoltzGenInverseFoldingOutput:
     r"""
-    Sequence predictions from BoltzGen inverse folding.
+    Logit predictions from one BoltzGen inverse-folding forward pass.
 
     Args:
         logits: Per-token amino-acid logits with shape ``(B, N, V)``.
-        tokens: Optional sampled amino-acid token IDs with shape ``(B, N)``.
     """
 
     logits: Tensor
-    tokens: Tensor | None = None
 
 
 @dataclass(eq=False)
-class BoltzGenDesignCandidate:
+class BoltzGenInverseFoldingDesignOutput:
     r"""
-    One designed assembly and its aligned scientific values.
+    Predictions from one BoltzGen inverse-folding design pass.
 
     Args:
-        structure: Designed structure after inverse folding and optional refolding.
-        scores: Scalar scores keyed by stable scientific names.
-        metrics: One-axis metrics keyed by stable scientific names.
-        pair_metrics: Two-axis metrics keyed by stable scientific names.
+        logits: Per-token amino-acid logits with shape ``(B, N, V)``.
+        tokens: Sampled amino-acid token IDs with shape ``(B, N)``.
     """
 
-    structure: Structure
-    scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
-    pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
-
-
-@dataclass(eq=False)
-class BoltzGenDesignResult:
-    r"""
-    A generation-ordered collection of BoltzGen designs.
-
-    Args:
-        candidates: Designed assemblies in generation order.
-    """
-
-    candidates: tuple[BoltzGenDesignCandidate, ...]
-
-    def best(self, score: str) -> BoltzGenDesignCandidate:
-        r"""
-        Return the earliest best candidate under a named score.
-
-        Args:
-            score: Comparable score name present on every candidate.
-
-        Returns:
-            The best candidate, with generation order breaking ties.
-        """
-
-        return best(self.candidates, score)
+    logits: Tensor
+    tokens: Tensor

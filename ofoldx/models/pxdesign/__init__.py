@@ -24,16 +24,12 @@ from .model import (
 from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.pxdesign",
     model=PxDesignModel,
     processor=PxDesignProcessor,
-    processor_config=PxDesignProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.pxdesign",
     pipeline=PxDesignPipeline,
-    tasks=("design",),
-    architectures=("ofoldx.pxdesign",),
 )

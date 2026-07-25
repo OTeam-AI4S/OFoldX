@@ -14,7 +14,7 @@ from ..atom import LocalAtomGeometry
 from ..embedding.position import RelativePositionBuckets
 
 
-@dataclass
+@dataclass(eq=False)
 class CoordinateDenoisingInput:
     r"""
     Inputs for one coordinate-denoising step.

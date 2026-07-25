@@ -80,7 +80,7 @@ class CompositePipeline:
         dtype: torch.dtype | None = None,
     ) -> Self:
         r"""
-        Move every bound model and processor to one device and dtype.
+        Move every present owned pair or wrapped pipeline to one device and dtype.
 
         Args:
             device: Destination device. ``None`` preserves each component's current device.
@@ -93,6 +93,9 @@ class CompositePipeline:
         for pair in self.pair_layout:
             source = self._composite_pair_source(pair)
             if source is None:
+                continue
+            if pair.wrap is not None:
+                getattr(self, pair.model_attribute).to(device=device, dtype=dtype)
                 continue
             model, processor = source
             model.to(device=device, dtype=dtype)
@@ -177,7 +180,7 @@ class CompositePipeline:
     @classmethod
     def from_repository(
         cls,
-        directory: str | PathLike[str],
+        repository: str | PathLike[str],
         *,
         revision: str | None = None,
         token: str | None = None,
@@ -190,7 +193,7 @@ class CompositePipeline:
         Missing optional pairs are skipped; missing required pairs raise ``ValueError``.
 
         Args:
-            directory: Local directory or Hub repository id.
+            repository: Local directory or Hub repository ID.
             revision: Optional Hub revision.
             token: Optional Hub authentication token.
             device: Device for loaded models and processors.
@@ -200,7 +203,7 @@ class CompositePipeline:
             A pipeline assembled from the repository's declared pairs.
         """
 
-        resolved = resolve_repository(directory, revision=revision, token=token)
+        resolved = resolve_repository(repository, revision=revision, token=token)
         arguments: dict[str, object] = {}
         for pair in cls.pair_layout:
             subrepository = ResolvedRepository(_pair_directory(resolved.path, pair.subdirectory))
@@ -212,8 +215,8 @@ class CompositePipeline:
             model = load_model(subrepository, device=device, dtype=dtype)
             processor = load_processor(
                 subrepository,
-                device=model.device,
-                dtype=model.dtype,
+                device=device,
+                dtype=dtype,
             )
             if pair.wrap is not None:
                 arguments[pair.model_attribute] = pair.wrap(model=model, processor=processor)

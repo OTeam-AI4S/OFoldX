@@ -17,16 +17,12 @@ from .model import (
 from .pipeline import LigandMpnnDesignAndPackPipeline, LigandMpnnPipeline
 from .processor import LigandMpnnProcessor
 
-_MODELS.register_model(
+_MODELS.register(
     "ofoldx.ligandmpnn",
     model=LigandMpnnModel,
     processor=LigandMpnnProcessor,
-    processor_config=LigandMpnnProcessorConfig,
-    standard_tasks=(),
 )
-_PIPELINES.register_pipeline(
+_PIPELINES.register(
     "ofoldx.ligandmpnn",
     pipeline=LigandMpnnPipeline,
-    tasks=("design",),
-    architectures=("ofoldx.ligandmpnn",),
 )

@@ -601,9 +601,18 @@ def _atom_encoder_ref(rest: str, *, base: str, stack: str, include_trunk: bool) 
         "atom_pair_encoder.right_atom_projection.weight": _ref(
             _k(f"{base}_single_to_pair_cond_col_1", "weights"), "linear"
         ),
-        "atom_pair_encoder.feed_forward.1.weight": _ref(_k(f"{base}_pair_mlp_1", "weights"), "linear"),
-        "atom_pair_encoder.feed_forward.3.weight": _ref(_k(f"{base}_pair_mlp_2", "weights"), "linear"),
-        "atom_pair_encoder.feed_forward.5.weight": _ref(_k(f"{base}_pair_mlp_3", "weights"), "linear"),
+        "atom_pair_encoder.feed_forward_input_projection.weight": _ref(
+            _k(f"{base}_pair_mlp_1", "weights"),
+            "linear",
+        ),
+        "atom_pair_encoder.feed_forward_hidden_projection.weight": _ref(
+            _k(f"{base}_pair_mlp_2", "weights"),
+            "linear",
+        ),
+        "atom_pair_encoder.feed_forward_output_projection.weight": _ref(
+            _k(f"{base}_pair_mlp_3", "weights"),
+            "linear",
+        ),
         "token_projection.weight": _ref(_k(f"{base}_project_atom_features_for_aggr", "weights"), "linear"),
     }
     if include_trunk:

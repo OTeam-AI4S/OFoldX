@@ -72,7 +72,7 @@ def convert_alphafold3_checkpoint(
     )
     AlphaFold3Pipeline(
         model=model,
-        processor=AlphaFold3Processor(AlphaFold3ProcessorConfig()),
+        processor=AlphaFold3Processor(AlphaFold3ProcessorConfig(), dtype=dtype),
     ).save(
         output_dir,
         repo_id=repo_id,

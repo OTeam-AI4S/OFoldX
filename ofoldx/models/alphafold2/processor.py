@@ -5,21 +5,16 @@ Prepare monomer protein, MSA, and template features for AlphaFold 2.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from os import PathLike
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from multimolecule.io import read_fasta_records
 from torch import Tensor
 
 from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
 from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io.msa import read_msa
 from ...modules import residue_constants
 from ...processor import Processor
-from ...references import classify_reference
 from .config import AlphaFold2ProcessorConfig
 from .model import AlphaFold2Input, AlphaFold2Layout
 
@@ -84,6 +79,8 @@ class AlphaFold2Processor(Processor):
         dtype: Floating-point dtype for produced tensors.
     """
 
+    config_class = AlphaFold2ProcessorConfig
+
     def __init__(
         self,
         config: AlphaFold2ProcessorConfig | None = None,
@@ -96,18 +93,18 @@ class AlphaFold2Processor(Processor):
 
     def __call__(
         self,
-        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        msa: MSA | MSACollection | None = None,
         templates: Sequence[Template] = (),
     ) -> AlphaFold2Input:
         r"""
         Prepare model features for one protein monomer.
 
         Args:
-            input: Inline sequence, FASTA path, protein sequence, molecular system, or structure
-                topology containing exactly one protein instance.
-            msa: Optional monomer MSA value or alignment path.
+            input: Protein sequence, molecular system, or structure topology
+                containing exactly one protein instance.
+            msa: Optional monomer MSA value.
             templates: Template structures with explicit target alignments.
 
         Returns:
@@ -115,21 +112,9 @@ class AlphaFold2Processor(Processor):
             features are in angstroms. This method performs no random sampling.
         """
 
-        if isinstance(input, str | PathLike):
-            classified = classify_reference(input)
-            if isinstance(classified, Path) and not {
-                ".fa",
-                ".faa",
-                ".fasta",
-                ".seq",
-            }.intersection(suffix.lower() for suffix in classified.suffixes):
-                raise ValueError(
-                    "AlphaFold 2 monomer cannot consume a coordinate-bearing structure path; use a FASTA path, "
-                    "input.system, or templates="
-                )
         topology = input.system if isinstance(input, Structure) else input
-        system = topology if isinstance(topology, MolecularSystem) else _molecular_system(topology)
-        target, instance_id = _protein_monomer(system)
+        system = topology if isinstance(topology, MolecularSystem) else monomer_system_from_sequences(topology)
+        target, instance_id = protein_monomer(system)
         target_entity_id = system.instances[instance_id]
         normalized_msa = _normalize_msa(msa, system, target)
         normalized_templates = _normalize_templates(
@@ -151,24 +136,14 @@ class AlphaFold2Processor(Processor):
         )
 
 
-def _molecular_system(
-    input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence],
+def monomer_system_from_sequences(
+    input: PolymerSequence | Sequence[PolymerSequence],
 ) -> MolecularSystem:
     r"""
     Construct the one-polymer convenience input accepted by monomer AlphaFold 2.
     """
 
-    if isinstance(input, str | PathLike):
-        classified = classify_reference(input)
-        if isinstance(classified, Path):
-            records = read_fasta_records(classified)
-            named = [
-                (record.id or "protein", PolymerSequence.from_one_letter(record.sequence.strip().upper()))
-                for record in records
-            ]
-        else:
-            named = [("protein", PolymerSequence.from_one_letter(classified.strip().upper()))]
-    elif isinstance(input, PolymerSequence):
+    if isinstance(input, PolymerSequence):
         named = [("protein", input)]
     else:
         named = [("protein", sequence) for sequence in input]
@@ -181,7 +156,7 @@ def _molecular_system(
     )
 
 
-def _protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
+def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
     r"""
     Return the single protein target and its instance id.
     """
@@ -200,7 +175,7 @@ def _protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
 
 
 def _normalize_msa(
-    msa: MSA | MSACollection | str | PathLike[str] | None,
+    msa: MSA | MSACollection | None,
     system: MolecularSystem,
     target: PolymerSequence,
 ) -> MSA | None:
@@ -208,26 +183,19 @@ def _normalize_msa(
     Bind one monomer alignment to the exact target sequence.
 
     An [`MSA`][] names its entity by ``entity_id``; the Processor resolves that
-    entity against ``system`` and verifies the query width. Path inputs are
-    projected to the entity query axis by [`io.msa.read_msa`][].
+    entity against ``system`` and verifies the query width.
     """
 
     if msa is None:
         return None
     if isinstance(msa, MSACollection):
         raise ValueError("AlphaFold 2 monomer accepts an entity-bound MSA, not a multimer MSACollection")
-    if isinstance(msa, MSA):
-        entity = system.entities.get(msa.entity_id)
-        if not isinstance(entity, PolymerSequence) or entity != target:
-            raise ValueError("MSA entity disagrees with the AlphaFold 2 target")
-        if len(msa.unpaired_sequences[0]) != len(target):
-            raise ValueError("MSA query length disagrees with the AlphaFold 2 target")
-        return msa
-    entity_id = next(iter(system.entities))
-    parsed = read_msa(Path(msa).expanduser(), entity_id=entity_id)
-    if len(parsed.unpaired_sequences[0]) != len(target):
+    entity = system.entities.get(msa.entity_id)
+    if not isinstance(entity, PolymerSequence) or entity != target:
+        raise ValueError("MSA entity disagrees with the AlphaFold 2 target")
+    if len(msa.unpaired_sequences[0]) != len(target):
         raise ValueError("MSA query length disagrees with the AlphaFold 2 target")
-    return parsed
+    return msa
 
 
 def _normalize_templates(
@@ -248,7 +216,7 @@ def _normalize_templates(
     for template in templates:
         if not isinstance(template, Template):
             raise TypeError("AlphaFold 2 templates must be explicit Template values with canonical alignments")
-        _select_template_alignment(
+        select_template_alignment(
             template,
             target_length=len(target),
             target_entity_id=target_entity_id,
@@ -258,7 +226,7 @@ def _normalize_templates(
     return tuple(normalized)
 
 
-def _select_template_alignment(
+def select_template_alignment(
     template: Template,
     *,
     target_length: int,
@@ -308,13 +276,13 @@ def _prepare_alphafold2_features(
     and full-pool HHblits profile.
     """
 
-    residue_type = torch.tensor(
+    residue_type_ids = torch.tensor(
         [RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
     )
     token_features = torch.cat(
         [
             torch.zeros(len(target), 1),
-            F.one_hot(residue_type, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
+            F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
         ],
         dim=-1,
     ).to(torch.float32)
@@ -342,9 +310,9 @@ def _prepare_alphafold2_features(
     for name, value in zip(names, template_values[1:], strict=True):
         floating[name] = value
     placed = {name: value.to(device=device, dtype=dtype).unsqueeze(0) for name, value in floating.items()}
-    template_residue_type = template_values[0]
+    template_residue_type_ids = template_values[0]
     return AlphaFold2Input(
-        residue_type=residue_type.to(device=device).unsqueeze(0),
+        residue_type_ids=residue_type_ids.to(device=device).unsqueeze(0),
         residue_index=torch.arange(len(target), device=device).unsqueeze(0),
         msa_tokens=msa_tokens.to(device=device).unsqueeze(0),
         layout=AlphaFold2Layout(
@@ -353,7 +321,7 @@ def _prepare_alphafold2_features(
             msa=msa,
             templates=templates,
         ),
-        template_residue_type=template_residue_type.to(device=device).unsqueeze(0),
+        template_residue_type_ids=template_residue_type_ids.to(device=device).unsqueeze(0),
         **placed,
     )
 
@@ -414,11 +382,11 @@ def _template_features(
             torch.zeros(1, target_length, 7, 2),
             torch.zeros(1, target_length, 7),
         )
-    template_residue_types: list[Tensor] = []
+    template_residue_type_ids: list[Tensor] = []
     template_positions: list[Tensor] = []
     template_masks: list[Tensor] = []
     for template in templates:
-        alignment = _select_template_alignment(
+        alignment = select_template_alignment(
             template,
             target_length=target_length,
             target_entity_id=target_entity_id,
@@ -430,12 +398,14 @@ def _template_features(
         if not isinstance(template_entity, PolymerSequence) or template_entity.polymer_type != "protein":
             raise ValueError("AlphaFold 2 templates must align a protein instance")
         sites = {site: index for index, site in enumerate(structure.sites)}
-        residue_type = torch.full((target_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
+        residue_type_ids = torch.full((target_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
         positions = torch.zeros(target_length, residue_constants.atom_type_num, 3)
         masks = torch.zeros(target_length, residue_constants.atom_type_num)
         for target_index, template_index in alignment.residue_pairs:
             component_id = template_entity.components[template_index].component_id
-            residue_type[target_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
+            residue_type_ids[target_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(
+                component_id, UNKNOWN_RESIDUE_TYPE_INDEX
+            )
             for atom_name, atom_index in residue_constants.atom_order.items():
                 site = AtomSite(alignment.template_instance_id, template_index, atom_name)
                 coordinate_index = sites.get(site)
@@ -443,19 +413,19 @@ def _template_features(
                     continue
                 positions[target_index, atom_index] = torch.from_numpy(structure.coordinates[coordinate_index].copy())
                 masks[target_index, atom_index] = 1.0
-        template_residue_types.append(residue_type)
+        template_residue_type_ids.append(residue_type_ids)
         template_positions.append(positions)
         template_masks.append(masks)
-    residue_type = torch.stack(template_residue_types)
+    residue_type_ids = torch.stack(template_residue_type_ids)
     positions = torch.stack(template_positions)
     masks = torch.stack(template_masks)
     torsion, alternative_torsion, torsion_mask = _atom37_to_torsion_angles(
-        residue_type,
+        residue_type_ids,
         positions,
         masks,
     )
     return (
-        residue_type,
+        residue_type_ids,
         torch.ones(len(templates)),
         positions,
         masks,
@@ -466,7 +436,7 @@ def _template_features(
 
 
 def _atom37_to_torsion_angles(
-    residue_type: Tensor,
+    residue_type_ids: Tensor,
     positions: Tensor,
     atom_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -483,23 +453,23 @@ def _atom37_to_torsion_angles(
     phi_mask = previous_mask[..., 2] * atom_mask[..., :3].prod(dim=-1)
     psi_mask = atom_mask[..., :3].prod(dim=-1) * atom_mask[..., 4]
 
-    chi_indices = torch.zeros(21, 4, 4, dtype=torch.long, device=residue_type.device)
+    chi_indices = torch.zeros(21, 4, 4, dtype=torch.long, device=residue_type_ids.device)
     for residue_type_index, letter in enumerate(residue_constants.AMINO_ACID_ONE_LETTER_CODES):
         for chi_index, atom_names in enumerate(
             residue_constants.chi_angles_atoms[residue_constants.AMINO_ACID_ONE_TO_THREE[letter]]
         ):
             chi_indices[residue_type_index, chi_index] = torch.tensor(
                 [residue_constants.atom_order[name] for name in atom_names],
-                device=residue_type.device,
+                device=residue_type_ids.device,
             )
-    selected_indices = chi_indices[residue_type.clamp(max=20)]
+    selected_indices = chi_indices[residue_type_ids.clamp(max=20)]
     expanded = selected_indices.unsqueeze(-1).expand(*selected_indices.shape, 3)
     chi_positions = positions.unsqueeze(-3).expand(*positions.shape[:-2], 4, *positions.shape[-2:]).gather(-2, expanded)
     chi_atom_mask = (
         atom_mask.unsqueeze(-2).expand(*atom_mask.shape[:-1], 4, atom_mask.shape[-1]).gather(-1, selected_indices)
     )
     chi_exists = atom_mask.new_tensor((*residue_constants.chi_angles_mask, (0.0, 0.0, 0.0, 0.0)))[
-        residue_type.clamp(max=20)
+        residue_type_ids.clamp(max=20)
     ]
     chi_mask = chi_atom_mask.prod(dim=-1) * chi_exists
     torsion_atoms = torch.cat(
@@ -532,6 +502,6 @@ def _atom37_to_torsion_angles(
     angle_norm = torch.sqrt(sine.square() + cosine.square() + 1e-8)
     angles = torch.stack((sine / angle_norm, cosine / angle_norm), dim=-1)
     angles = angles * angles.new_tensor((1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0))[..., None]
-    periodic = angles.new_tensor(_CHI_PI_PERIODIC)[residue_type.clamp(max=20)]
+    periodic = angles.new_tensor(_CHI_PI_PERIODIC)[residue_type_ids.clamp(max=20)]
     mirror = torch.cat([torch.ones_like(periodic[..., :3]), 1.0 - 2.0 * periodic], dim=-1)
     return angles, angles * mirror.unsqueeze(-1), torsion_mask
