@@ -413,6 +413,11 @@ def _apply_atom_layout(structure: Structure, atom_layout: str) -> Structure:
     if source_occupancy is not None:
         dtype = source_occupancy.dtype if np.issubdtype(source_occupancy.dtype, np.floating) else np.float64
         occupancy = np.full(len(sites), np.nan, dtype=dtype)
+    source_b_factor = structure.b_factor
+    b_factor = None
+    if source_b_factor is not None:
+        dtype = source_b_factor.dtype if np.issubdtype(source_b_factor.dtype, np.floating) else np.float64
+        b_factor = np.full(len(sites), np.nan, dtype=dtype)
     for index, site in enumerate(sites):
         source_index = source_indices.get(site)
         if source_index is None:
@@ -421,7 +426,17 @@ def _apply_atom_layout(structure: Structure, atom_layout: str) -> Structure:
         coordinate_mask[index] = structure.coordinate_mask[source_index]
         if occupancy is not None and source_occupancy is not None:
             occupancy[index] = source_occupancy[source_index]
-    return Structure(system, sites, coordinates, coordinate_mask, occupancy, structure.residue_numbers)
+        if b_factor is not None and source_b_factor is not None:
+            b_factor[index] = source_b_factor[source_index]
+    return Structure(
+        system=system,
+        sites=sites,
+        coordinates=coordinates,
+        coordinate_mask=coordinate_mask,
+        occupancy=occupancy,
+        b_factor=b_factor,
+        residue_numbers=structure.residue_numbers,
+    )
 
 
 def _build_structure(
@@ -656,6 +671,7 @@ def _build_structure(
     occupancy = (
         np.full(len(sites), np.nan, dtype=np.float32) if any(row.occupancy is not None for row in rows) else None
     )
+    b_factor = np.full(len(sites), np.nan, dtype=np.float32) if any(row.b_factor is not None for row in rows) else None
     for row in rows:
         site = site_by_row_index[row.row_index]
         index = site_indices[site]
@@ -663,12 +679,15 @@ def _build_structure(
         coordinate_mask[index] = row.coordinate_present
         if occupancy is not None and row.occupancy is not None:
             occupancy[index] = row.occupancy
+        if b_factor is not None and row.b_factor is not None:
+            b_factor[index] = row.b_factor
     return Structure(
         system=system,
         sites=sites,
         coordinates=coordinates,
         coordinate_mask=coordinate_mask,
         occupancy=occupancy,
+        b_factor=b_factor,
         residue_numbers=residue_numbers or None,
     )
 

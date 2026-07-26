@@ -62,6 +62,7 @@ def test_observed_structure_retains_arrays_by_reference() -> None:
     coordinates = np.array([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]], dtype=np.float32)
     mask = np.array([True, False], dtype=np.bool_)
     occupancy = np.array([1.0, np.nan], dtype=np.float32)
+    b_factor = np.array([0.0, np.nan], dtype=np.float32)
     system = _molecule_system()
     sites = _system_sites(system)
 
@@ -71,14 +72,17 @@ def test_observed_structure_retains_arrays_by_reference() -> None:
         coordinates=coordinates,
         coordinate_mask=mask,
         occupancy=occupancy,
+        b_factor=b_factor,
     )
 
     assert structure.coordinates is coordinates
     assert structure.coordinate_mask is mask
     assert structure.occupancy is occupancy
+    assert structure.b_factor is b_factor
     coordinates[0, 0] = -1.0
     assert structure.coordinates[0, 0] == -1.0
     assert np.isnan(structure.occupancy[1])  # type: ignore[index]
+    assert structure.b_factor[0] == 0.0  # type: ignore[index]
 
 
 def test_structure_obeys_explicit_dtypes_without_coercion() -> None:
@@ -143,12 +147,11 @@ def test_residue_numbers_pass_through_without_validation() -> None:
     assert passthrough.residue_numbers is unchecked
 
 
-def test_removed_carrier_fields_are_absent() -> None:
-    # §3.5.1 removed atom_layout, b_factor, altloc_ids, and source_identities (plus the
-    # SourceAtomIdentity class); none may be reintroduced without a proven released-family
-    # input consumer. Assert they are absent from both the instance and the module.
+def test_unjustified_carrier_fields_are_absent() -> None:
+    # §3.5.1 retains B factor for BoltzGen training, while the other generic
+    # source-identity carriers remain unsupported.
     structure = _observed_structure()
-    for removed in ("atom_layout", "b_factor", "altloc_ids", "source_identities"):
+    for removed in ("atom_layout", "altloc_ids", "source_identities"):
         assert not hasattr(structure, removed)
     assert not hasattr(structure_module, "SourceAtomIdentity")
     with pytest.raises(TypeError):
@@ -162,9 +165,11 @@ def test_removed_carrier_fields_are_absent() -> None:
         ({"coordinate_mask": np.ones(1, dtype=np.bool_)}, ValueError, "coordinate_mask must have shape"),
         ({"coordinate_mask": np.zeros(2, dtype=np.bool_)}, ValueError, "at least one observed"),
         ({"occupancy": np.ones(1, dtype=np.float32)}, ValueError, "occupancy must have shape"),
+        ({"b_factor": np.ones(1, dtype=np.float32)}, ValueError, "b_factor must have shape"),
         ({"coordinates": np.zeros((2, 3), dtype=np.bool_)}, TypeError, "coordinates must have a real numerical dtype"),
         ({"coordinate_mask": np.zeros(2, dtype=np.int64)}, TypeError, "coordinate_mask must have boolean dtype"),
         ({"occupancy": np.zeros(2, dtype=np.bool_)}, TypeError, "occupancy must have a real numerical dtype"),
+        ({"b_factor": np.zeros(2, dtype=np.bool_)}, TypeError, "b_factor must have a real numerical dtype"),
     ],
 )
 def test_structure_rejects_invalid_arrays(overrides: dict[str, Any], error: type[Exception], message: str) -> None:

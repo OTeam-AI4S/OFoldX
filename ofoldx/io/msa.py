@@ -4,7 +4,9 @@ MSA file input projected to the query axis of a named entity.
 
 from __future__ import annotations
 
+import operator
 import os
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +17,12 @@ from ..data.evidence import MSA
 _ANNOTATION_PREFIXES = ("ss_", "sa_", "aa_")
 
 
-def read_msa(path: str | os.PathLike[str], *, entity_id: str) -> MSA:
+def read_msa(
+    path: str | os.PathLike[str],
+    *,
+    entity_id: str,
+    max_rows: int | None = None,
+) -> MSA:
     r"""
     Read an A3M or aligned FASTA file as MSA evidence.
 
@@ -26,6 +33,8 @@ def read_msa(path: str | os.PathLike[str], *, entity_id: str) -> MSA:
         path: MSA path. ``.a3m`` selects A3M parsing; supported FASTA suffixes
             select aligned FASTA parsing.
         entity_id: Target entity ID stored with the alignment.
+        max_rows: Optional maximum number of biological rows to read, including
+            the query row.
 
     Returns:
         An MSA whose unpaired pool contains the projected rows and whose paired
@@ -44,13 +53,20 @@ def read_msa(path: str | os.PathLike[str], *, entity_id: str) -> MSA:
     else:
         raise ValueError(f"unsupported MSA filename suffix: {suffix or '<none>'}")
 
-    records = [
+    biological_records = (
         record
         for record in read_fasta_records(path)
         if not (
             record.id is not None and (record.id.startswith(_ANNOTATION_PREFIXES) or record.id.endswith("_consensus"))
         )
-    ]
+    )
+    if max_rows is None:
+        records = list(biological_records)
+    else:
+        max_rows = operator.index(max_rows)
+        if max_rows < 1:
+            raise ValueError("max_rows must be positive")
+        records = list(islice(biological_records, max_rows))
     if not records:
         raise ValueError("MSA contains no biological sequence records")
 

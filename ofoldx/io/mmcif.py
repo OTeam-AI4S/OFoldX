@@ -194,6 +194,7 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     coordinates_key = payload.get("coordinates")
     coordinate_mask_key = payload.get("coordinate_mask")
     occupancy_key = payload.get("occupancy")
+    b_factor_key = payload.get("b_factor")
     if not isinstance(coordinates_key, str) or not coordinates_key:
         raise ValueError("canonical mmCIF payload has invalid coordinates array reference")
     if not isinstance(coordinate_mask_key, str) or not coordinate_mask_key:
@@ -204,6 +205,8 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     coordinate_dtype = np.dtype(coordinate_dtype_value)
     occupancy_dtype_value = payload.get("occupancy_dtype")
     occupancy_dtype = None if occupancy_dtype_value is None else np.dtype(occupancy_dtype_value)
+    b_factor_dtype_value = payload.get("b_factor_dtype")
+    b_factor_dtype = None if b_factor_dtype_value is None else np.dtype(b_factor_dtype_value)
     arrays: dict[str, np.ndarray] = {
         coordinates_key: np.asarray([row.coordinates for row in rows], dtype=coordinate_dtype),
         coordinate_mask_key: np.asarray([row.coordinate_present for row in rows], dtype=np.bool_),
@@ -217,7 +220,15 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
             [np.nan if row.occupancy is None else row.occupancy for row in rows],
             dtype=occupancy_dtype,
         )
-    # Structure has no per-site B-factor field, so canonical payloads do not retain it.
+    if b_factor_key is not None:
+        if not isinstance(b_factor_key, str) or not b_factor_key:
+            raise ValueError("canonical mmCIF payload has invalid b_factor array reference")
+        if b_factor_dtype is None:
+            raise ValueError("canonical mmCIF B-factor dtype is missing")
+        arrays[b_factor_key] = np.asarray(
+            [np.nan if row.b_factor is None else row.b_factor for row in rows],
+            dtype=b_factor_dtype,
+        )
     structure = decode_structure(payload, arrays)
     row_sites = tuple(row.canonical_site for row in rows)
     if any(site is None for site in row_sites) or row_sites != structure.sites:
@@ -598,14 +609,14 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         path: Destination mmCIF path.
 
     Raises:
-        ValueError: If coordinates or occupancy values are not finite.
+        ValueError: If present coordinates, occupancy values, or B factors are not
+            finite.
     """
 
     from biotite.structure.io.pdbx import CIFBlock, CIFCategory, CIFFile
 
     payload, _ = encode_structure(structure, array_prefix="atom_site")
-    # Structure has no source-identity, alternate-location, or B-factor fields. The
-    # writer derives identity columns, emits one conformer, and writes B factor 0.
+    # The writer derives source-identity columns and emits one conformer.
     residue_numbers = structure.residue_numbers or {}
     label_asym_by_instance: dict[str, str] = {}
     used_label_asym_ids: set[str] = set()
@@ -676,7 +687,13 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         )
         if occupancy != "." and not np.isfinite(occupancy):
             raise ValueError("mmCIF cannot represent non-finite occupancy")
-        b_factor = "."
+        b_factor = (
+            "."
+            if structure.b_factor is None or np.isnan(structure.b_factor[index])
+            else float(structure.b_factor[index])
+        )
+        if b_factor != "." and not np.isfinite(b_factor):
+            raise ValueError("mmCIF cannot represent non-finite B factor")
         altloc = "."
         values = {
             "group_PDB": group,

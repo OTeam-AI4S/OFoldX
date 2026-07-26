@@ -129,11 +129,9 @@ def test_from_one_letter_rejects_hybrid_and_non_audited_targets() -> None:
         PolymerSequence.from_one_letter("B")  # unknown letter
 
 
-def test_from_one_letter_ambiguity_symbols_are_currently_unmapped() -> None:
-    # DIVERGENCE (DESIGN §3.3): protein X->UNK, RNA N->N, DNA N->DN are required
-    # audited ambiguity resolutions, but the shipped ``_ONE_LETTER_COMPONENTS``
-    # map omits these keys, so they currently raise ValueError.  This test pins
-    # the real behavior; it must be updated when the map is corrected.
+def test_from_one_letter_strict_policy_rejects_ambiguity_symbols() -> None:
+    # from_one_letter uses the strict component policy; ambiguity symbols require
+    # the separate permissive parser path rather than becoming canonical components.
     with pytest.raises(ValueError):
         PolymerSequence.from_one_letter("X")  # protein
     with pytest.raises(ValueError):

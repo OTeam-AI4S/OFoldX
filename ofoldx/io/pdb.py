@@ -276,12 +276,11 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
         Prepared atom rows, dropped field tokens, and rewritten field tokens.
 
     Raises:
-        ValueError: If PDB chain, serial, atom-name, coordinate, or occupancy limits
-            cannot represent the structure.
+        ValueError: If PDB chain, serial, atom-name, coordinate, occupancy, or B-factor
+            limits cannot represent the structure.
     """
 
-    # Structure has no source-identity, alternate-location, or B-factor fields. The
-    # writer derives identity columns, emits one conformer, and writes B factor 0.
+    # The writer derives source-identity columns and emits one conformer.
     residue_numbers = structure.residue_numbers or {}
     dropped: set[str] = set()
     rewritten: set[str] = set()
@@ -308,6 +307,8 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
     for site_index, site in enumerate(structure.sites):
         if not bool(structure.coordinate_mask[site_index]):
             dropped.add("structure.coordinate_mask")
+            if structure.b_factor is not None and not np.isnan(structure.b_factor[site_index]):
+                dropped.add("structure.b_factor")
             continue
         if len(atoms) >= 99999:
             raise ValueError("PDB atom serial limit of 99999 was exceeded")
@@ -368,7 +369,15 @@ def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], 
                 raise ValueError("PDB occupancy field range was exceeded")
             if np.float32(round(occupancy, 2)) != structure.occupancy[site_index]:
                 rewritten.add("structure.occupancy")
-        b_factor = 0.0
+        if structure.b_factor is None or np.isnan(structure.b_factor[site_index]):
+            b_factor = 0.0
+            rewritten.add("structure.b_factor")
+        else:
+            b_factor = float(structure.b_factor[site_index])
+            if not np.isfinite(b_factor) or len(f"{b_factor:6.2f}") > 6:
+                raise ValueError("PDB B-factor field range was exceeded")
+            if np.float32(round(b_factor, 2)) != structure.b_factor[site_index]:
+                rewritten.add("structure.b_factor")
         chemical_atom = structure.system.atom(site)
         charge = chemical_atom.formal_charge or 0
         if abs(charge) > 9:

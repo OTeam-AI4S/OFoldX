@@ -41,6 +41,3 @@ released capability.
 - `evidence.py` — MSA and template evidence.
 - `conditions.py` — the two frozen plain identity-condition records above.
 - `placement.py` — the frozen placement core (generation-topology identity).
-
-See [`DESIGN.md`](../../DESIGN.md) for current normative contracts and
-[`REVIEW.md`](../../REVIEW.md) for high-impact decisions still under owner review.

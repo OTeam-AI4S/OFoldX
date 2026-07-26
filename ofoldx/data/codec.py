@@ -132,6 +132,10 @@ def encode_structure(
     if structure.occupancy is not None:
         occupancy_key = f"{array_prefix}.occupancy"
         arrays[occupancy_key] = structure.occupancy
+    b_factor_key: str | None = None
+    if structure.b_factor is not None:
+        b_factor_key = f"{array_prefix}.b_factor"
+        arrays[b_factor_key] = structure.b_factor
     return (
         {
             "kind": "structure",
@@ -142,6 +146,8 @@ def encode_structure(
             "coordinate_mask": coordinate_mask_key,
             "occupancy": occupancy_key,
             "occupancy_dtype": None if structure.occupancy is None else structure.occupancy.dtype.str,
+            "b_factor": b_factor_key,
+            "b_factor_dtype": None if structure.b_factor is None else structure.b_factor.dtype.str,
             "residue_numbers": _encode_residue_numbers(structure.residue_numbers),
         },
         arrays,
@@ -171,6 +177,8 @@ def decode_structure(value: object, arrays: Mapping[str, NDArray]) -> Structure:
             "coordinate_mask",
             "occupancy",
             "occupancy_dtype",
+            "b_factor",
+            "b_factor_dtype",
             "residue_numbers",
         },
         owner="Structure",
@@ -180,6 +188,7 @@ def decode_structure(value: object, arrays: Mapping[str, NDArray]) -> Structure:
     sites = _expect_list(data["sites"], "Structure.sites")
     coordinates = _read_array(arrays, data["coordinates"], "Structure.coordinates")
     occupancy = _read_optional_array(arrays, data["occupancy"], "Structure.occupancy")
+    b_factor = _read_optional_array(arrays, data["b_factor"], "Structure.b_factor")
     if coordinates.dtype != np.dtype(_expect_str(data["coordinates_dtype"], "Structure.coordinates_dtype")):
         raise ValueError("Structure.coordinates dtype disagrees with its metadata")
     occupancy_dtype = data["occupancy_dtype"]
@@ -188,12 +197,19 @@ def decode_structure(value: object, arrays: Mapping[str, NDArray]) -> Structure:
             raise ValueError("Structure.occupancy_dtype must be null when occupancy is null")
     elif occupancy.dtype != np.dtype(_expect_str(occupancy_dtype, "Structure.occupancy_dtype")):
         raise ValueError("Structure.occupancy dtype disagrees with its metadata")
+    b_factor_dtype = data["b_factor_dtype"]
+    if b_factor is None:
+        if b_factor_dtype is not None:
+            raise ValueError("Structure.b_factor_dtype must be null when b_factor is null")
+    elif b_factor.dtype != np.dtype(_expect_str(b_factor_dtype, "Structure.b_factor_dtype")):
+        raise ValueError("Structure.b_factor dtype disagrees with its metadata")
     return Structure(
         system=decode_system(data["system"]),
         sites=tuple(_decode_site(item) for item in sites),
         coordinates=coordinates,
         coordinate_mask=_read_array(arrays, data["coordinate_mask"], "Structure.coordinate_mask"),
         occupancy=occupancy,
+        b_factor=b_factor,
         residue_numbers=_decode_residue_numbers(data["residue_numbers"]),
     )
 

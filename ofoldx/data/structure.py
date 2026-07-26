@@ -31,7 +31,8 @@ class Structure:
     Coordinates for selected atom occurrences in a molecular system.
 
     ``sites[i]`` identifies the atom represented by ``coordinates[i]``,
-    ``coordinate_mask[i]``, and, when present, ``occupancy[i]``.
+    ``coordinate_mask[i]``, and, when present, ``occupancy[i]`` and
+    ``b_factor[i]``.
 
     Args:
         system: Coordinate-free molecular system containing every referenced atom.
@@ -41,6 +42,8 @@ class Structure:
         coordinate_mask: Boolean array with shape ``(num_atoms,)`` indicating observed
             coordinates. At least one coordinate must be observed.
         occupancy: Optional real array with shape ``(num_atoms,)``.
+        b_factor: Optional real array with shape ``(num_atoms,)`` containing isotropic
+            B factors.
         residue_numbers: Optional source numbering keyed by exact component occurrence.
 
     Raises:
@@ -55,6 +58,7 @@ class Structure:
     coordinates: NDArray
     coordinate_mask: NDArray[np.bool_]
     occupancy: NDArray | None
+    b_factor: NDArray | None
     residue_numbers: dict[ComponentReference, ResidueNumber] | None
 
     def __init__(
@@ -64,6 +68,7 @@ class Structure:
         coordinates: NDArray,
         coordinate_mask: NDArray[np.bool_],
         occupancy: NDArray | None = None,
+        b_factor: NDArray | None = None,
         residue_numbers: dict[ComponentReference, ResidueNumber] | None = None,
     ) -> None:
         self.system = system
@@ -71,6 +76,7 @@ class Structure:
         self.coordinates = coordinates
         self.coordinate_mask = coordinate_mask
         self.occupancy = occupancy
+        self.b_factor = b_factor
         self.residue_numbers = residue_numbers
 
         count = len(self.sites)
@@ -86,6 +92,10 @@ class Structure:
             raise ValueError(f"occupancy must have shape {(count,)}, got {self.occupancy.shape}")
         if self.occupancy is not None and self.occupancy.dtype.kind not in "iuf":
             raise TypeError("occupancy must have a real numerical dtype")
+        if self.b_factor is not None and self.b_factor.shape != (count,):
+            raise ValueError(f"b_factor must have shape {(count,)}, got {self.b_factor.shape}")
+        if self.b_factor is not None and self.b_factor.dtype.kind not in "iuf":
+            raise TypeError("b_factor must have a real numerical dtype")
         if len(self.sites) != len(set(self.sites)):
             raise ValueError("structure sites must be unique")
         for site in self.sites:

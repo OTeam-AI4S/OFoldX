@@ -12,7 +12,7 @@ from ofoldx.data import (
 )
 from ofoldx.data.components import _BUILTIN_COMPONENTS
 
-# DESIGN.md 3.2.1: the package-audited set is exactly 31 IDs -- the 21 protein components
+# The package-audited set is exactly 31 IDs -- the 21 protein components
 # (the 20 standard residues plus the wwPDB CCD ``UNK`` placeholder) and 10 nucleic
 # components (8 standard CCD graphs plus the ``N`` / ``DN`` generated placeholders).
 _BUILTIN_PROTEIN_IDS = frozenset(
