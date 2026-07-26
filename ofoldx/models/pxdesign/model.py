@@ -12,13 +12,15 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ...data import Hotspot, PlacementMap, PlacementSpec
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.atom import NormalizedKeyAtomToTokenEncoder
 from ...modules.denoiser import CoordinateDenoiser
-from ...modules.diffusion import CoordinateDenoiseContext, EdmScheduler
+from ...modules.diffusion import (
+    CoordinateDenoiseContext,
+    EdmScheduler,
+)
 from ...modules.embedding import RelativePositionBuckets, generate_relative_position_features
 from ...modules.geometry import uniform_random_rotation
 from .config import PxDesignConfig
@@ -245,7 +247,8 @@ class PxDesignModel(Model):
             atom_mask=input.atom_mask,
             token_embedding=token_embedding,
             single=single,
-            pair=pair,
+            conditioning_single=single,
+            conditioning_pair=pair,
             relative_features=relative_features,
             local_geometry=local_geometry,
         )
@@ -511,10 +514,6 @@ def _augment_reference_conformers(
 # ============================================================================
 # PxDesign tensor inputs and outputs
 # ============================================================================
-# ``PlacementSpec`` and ``PlacementMap`` are shared records in ``ofoldx.data``. ``Hotspot`` is
-# the shared distance-free per-residue label consumed by PxDesign.
-
-
 @dataclass(frozen=True)
 class PxDesignLayout:
     r"""
@@ -523,16 +522,10 @@ class PxDesignLayout:
     Args:
         system: Molecular system represented by the tensors.
         sites: Atom occurrences aligned to the atom axis.
-        placement: Placement declaration used to build the output.
-        conditions: Hotspot conditions applied to the design.
-        placement_map: Realized component occurrences for every placement.
     """
 
     system: MolecularSystem
     sites: tuple[AtomSite, ...]
-    placement: PlacementSpec
-    conditions: tuple[Hotspot, ...]
-    placement_map: PlacementMap
 
 
 @dataclass(kw_only=True, eq=False)
@@ -562,7 +555,7 @@ class PxDesignInput:
         hotspot: Per-token hotspot condition with shape ``(B, N, 1)``.
         template_distance_bins: Template distance features aligned to token pairs.
         template_pair_mask: Valid-template-pair mask aligned to token pairs.
-        layout: Molecular identities and conditions aligned to the tensor axes.
+        layout: Molecular identities aligned to the tensor axes.
     """
 
     residue_index: Tensor

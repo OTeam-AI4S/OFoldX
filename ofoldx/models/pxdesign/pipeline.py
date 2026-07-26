@@ -24,6 +24,8 @@ class PxDesignPipeline(PairedPipeline[PxDesignModel, PxDesignProcessor]):
     Protein backbone design pipeline for PXDesign.
     """
 
+    model_architecture = "pxdesign"
+
     def design(
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None = None,

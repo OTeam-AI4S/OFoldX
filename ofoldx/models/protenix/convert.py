@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, BinaryIO, TypeAlias, cast, get_args
 
 import torch
 from torch import Tensor, nn
+
+from .config import ProtenixVariant
 
 if TYPE_CHECKING:
     from .model import ProtenixModel
@@ -26,6 +28,20 @@ _DTYPES = {
 
 _ReferenceKey: TypeAlias = str | tuple[str, ...]
 _ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
+_PROTENIX_VARIANTS = get_args(ProtenixVariant)
+_ESM_VARIANTS = frozenset(
+    {
+        "protenix_mini_esm_v0.5.0",
+        "protenix_mini_ism_v0.5.0",
+    }
+)
+_TEMPLATE_VARIANTS = frozenset(
+    {
+        "protenix_base_default_v1.0.0",
+        "protenix_base_20250630_v1.0.0",
+        "protenix-v2",
+    }
+)
 _INERT_V05_TEMPLATE_KEYS = frozenset(
     {
         "template_embedder.linear_no_bias_z.weight",
@@ -39,7 +55,11 @@ _INERT_V05_TEMPLATE_KEYS = frozenset(
 )
 
 
-def load_reference_state(checkpoint_path: str | Any, *, map_location: str | Any = "cpu") -> dict[str, Tensor]:
+def load_reference_state(
+    checkpoint_path: str | PathLike[str] | BinaryIO,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Tensor]:
     r"""
     Load a reference checkpoint's tensor state, unwrapping the ``model`` container and ``module.`` prefixes.
 
@@ -67,10 +87,41 @@ def load_reference_state(checkpoint_path: str | Any, *, map_location: str | Any 
     return reference_state
 
 
+def load_esm_reference_state(
+    checkpoint_path: str | PathLike[str] | BinaryIO,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Tensor]:
+    r"""
+    Load the tensor state from an official fair-esm companion checkpoint.
+
+    The released companion stores an ``argparse.Namespace`` configuration
+    beside the tensor state. That exact metadata type is allow-listed while the
+    tensor-only unpickler remains enabled.
+    """
+
+    with torch.serialization.safe_globals([argparse.Namespace]):
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    state = checkpoint.get("model") if isinstance(checkpoint, Mapping) else None
+    if not isinstance(state, Mapping):
+        raise TypeError("an ESM companion checkpoint must contain a model state mapping")
+    reference_state: dict[str, Tensor] = {}
+    for source_key, value in state.items():
+        if not torch.is_tensor(value):
+            continue
+        key = source_key.removeprefix("module.")
+        if key in reference_state:
+            raise ValueError(f"multiple ESM source tensors normalize to {key!r}")
+        reference_state[key] = value
+    return reference_state
+
+
 def translate_reference_state(
     model: nn.Module,
     reference_state: Mapping[str, Tensor],
     key_fn: Callable[[str], _ReferenceKey],
+    *,
+    model_keys: Iterable[str] | None = None,
 ) -> dict[str, Tensor]:
     r"""
     Translate every target and require every source tensor to participate.
@@ -78,7 +129,8 @@ def translate_reference_state(
 
     translated: dict[str, Tensor] = {}
     consumed: set[str] = set()
-    for model_key in model.state_dict():
+    target_keys = model.state_dict() if model_keys is None else model_keys
+    for model_key in target_keys:
         reference_key = key_fn(model_key)
         reference_value = _lookup_reference_value(reference_state, reference_key)
         translated[model_key] = _transform_reference_value(model_key, reference_value)
@@ -91,33 +143,88 @@ def translate_reference_state(
     if unconsumed:
         preview = ", ".join(repr(key) for key in unconsumed[:20])
         suffix = "" if len(unconsumed) <= 20 else f", ... ({len(unconsumed)} total)"
-        raise ValueError(f"unconsumed Protenix source tensors: {preview}{suffix}")
+        raise ValueError(f"unconsumed source tensors: {preview}{suffix}")
     return translated
 
 
-def translate_protenix_state(model: nn.Module, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+def translate_protenix_state(model: ProtenixModel, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
     r"""
-    Translate every live tensor in one released Protenix v0.5 graph.
+    Translate every live tensor in one released Protenix graph.
 
-    The v0.5 source constructor serializes seven template projection/norm
-    tensors even though its configured zero-block template path is unsupported
-    and unreachable. Only those exact inert tensors are omitted.
+    The pre-template source constructors serialize seven template
+    projection/norm tensors even though their configured zero-block path is
+    unreachable. Those exact tensors are omitted only when the target graph has
+    no template path. ESM child tensors are translated separately from their
+    companion checkpoint.
     """
 
-    live_reference_state = {key: value for key, value in reference_state.items() if key not in _INERT_V05_TEMPLATE_KEYS}
-    return translate_reference_state(model, live_reference_state, _protenix_reference_key)
+    model_keys = tuple(key for key in model.state_dict() if not key.startswith("esm_encoder."))
+    has_template = any(key.startswith("template_embedder.") for key in model_keys)
+    live_reference_state = (
+        dict(reference_state)
+        if has_template
+        else {key: value for key, value in reference_state.items() if key not in _INERT_V05_TEMPLATE_KEYS}
+    )
+    msa_final_block = model.msa_trunk.num_blocks - 1
+
+    def reference_key(model_key: str) -> _ReferenceKey:
+        return _protenix_reference_key(model_key, msa_final_block=msa_final_block)
+
+    return translate_reference_state(
+        model,
+        live_reference_state,
+        reference_key,
+        model_keys=model_keys,
+    )
+
+
+def translate_esm_state(model: nn.Module, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    r"""
+    Translate the exact fair-esm ESM2 t36 encoder into the packaged child.
+
+    The masked-language-model head is not executed by Protenix, and the
+    separately released contact-regression head is not part of the companion
+    file or the target graph.
+    """
+
+    normalized: dict[str, Tensor] = {}
+    for source_key, value in reference_state.items():
+        key = source_key
+        for prefix in ("encoder.sentence_encoder.", "encoder."):
+            if key.startswith(prefix):
+                key = key.removeprefix(prefix)
+                break
+        if key.startswith(("lm_head.", "contact_head.")):
+            continue
+        if key in normalized:
+            raise ValueError(f"multiple ESM source tensors normalize to {key!r}")
+        normalized[key] = value
+
+    model_keys = tuple(key for key in model.state_dict() if key.startswith("esm_encoder."))
+    return translate_reference_state(
+        model,
+        normalized,
+        _esm_reference_key,
+        model_keys=model_keys,
+    )
 
 
 def convert_protenix_checkpoint(
     checkpoint_path: str | Path,
     *,
+    variant: ProtenixVariant,
+    esm_checkpoint_path: str | Path | None = None,
     dtype: torch.dtype | None = None,
 ) -> ProtenixModel:
     r"""
-    Convert a Protenix base checkpoint into a strict-loaded native model.
+    Convert one explicitly selected released Protenix checkpoint.
 
     Args:
-        checkpoint_path: Path to the released Protenix base checkpoint.
+        checkpoint_path: Path to the released Protenix checkpoint.
+        variant: Exact released variant name. It is never inferred from the
+            filename or tensor graph.
+        esm_checkpoint_path: Official ESM2 companion path, required only for
+            mini ESM and mini ISM.
         dtype: Optional floating-point dtype for converted weights.
 
     Returns:
@@ -128,14 +235,33 @@ def convert_protenix_checkpoint(
     from .config import ProtenixConfig, ProtenixConstraintConfig
     from .model import ProtenixConstraintModel, ProtenixModel
 
+    needs_esm = variant in _ESM_VARIANTS
+    if needs_esm and esm_checkpoint_path is None:
+        raise ValueError(f"{variant!r} requires its released ESM2 companion checkpoint")
+    if not needs_esm and esm_checkpoint_path is not None:
+        raise ValueError(f"{variant!r} has no ESM2 companion checkpoint")
+
+    config = ProtenixConfig.from_variant(variant)
+    model: ProtenixModel
+    with torch.device("meta"):
+        if variant == "protenix_base_constraint_v0.5.0":
+            model = ProtenixConstraintModel(cast(ProtenixConstraintConfig, config))
+        else:
+            model = ProtenixModel(config)
     reference_state = load_reference_state(Path(checkpoint_path))
-    if "constraint_embedder.pocket_z_embedder.weight" in reference_state:
-        model: ProtenixModel = ProtenixConstraintModel(ProtenixConstraintConfig())
-    else:
-        model = ProtenixModel(ProtenixConfig())
+    translated = translate_protenix_state(model, reference_state)
+    if esm_checkpoint_path is not None:
+        translated.update(
+            translate_esm_state(
+                model,
+                load_esm_reference_state(Path(esm_checkpoint_path)),
+            )
+        )
     if dtype is not None:
-        model.to(dtype=dtype)
-    model.load_state_dict(translate_protenix_state(model, reference_state), strict=True)
+        translated = {
+            key: value.to(dtype=dtype) if value.is_floating_point() else value for key, value in translated.items()
+        }
+    model.load_state_dict(translated, strict=True, assign=True)
     model.eval()
     return model
 
@@ -144,22 +270,17 @@ def save_protenix_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
+    variant: ProtenixVariant,
+    esm_checkpoint_path: str | PathLike[str] | None = None,
     dtype: torch.dtype | None = None,
     repo_id: str | None = None,
     token: str | None = None,
     private: bool = False,
 ) -> None:
     r"""
-    Convert a Protenix checkpoint and write a routable OFoldX repository.
-
-    Strict-loads the checkpoint via
-    [`convert_protenix_checkpoint`][ofoldx.models.protenix.convert.convert_protenix_checkpoint] — which
-    auto-selects the default [`ProtenixModel`][] or the constraint
-    [`ProtenixConstraintModel`][] from the checkpoint tensors — pairs it with the matching processor,
-    and writes a self-contained ``model.json`` / ``processor.json`` / safetensors
-    repository marked with the matching concrete Pipeline. The constraint Pipeline's
-    ``fold`` accepts and forwards the released ``atom_contacts`` / ``token_contacts`` /
-    ``pocket`` channels.
+    Convert an explicitly selected Protenix checkpoint and write a routable
+    OFoldX repository. ESM and ISM companion weights are stored in the ordinary
+    Model artifact.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
@@ -167,15 +288,25 @@ def save_protenix_checkpoint(
     """
 
     from .model import ProtenixConstraintModel
-    from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline
-    from .processor import ProtenixConstraintProcessor, ProtenixProcessor
+    from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline, ProtenixTemplatePipeline
+    from .processor import ProtenixConstraintProcessor, ProtenixProcessor, ProtenixTemplateProcessor
 
-    model = convert_protenix_checkpoint(Path(checkpoint_path).expanduser(), dtype=dtype)
-    pipeline: ProtenixPipeline | ProtenixConstraintPipeline
-    if isinstance(model, ProtenixConstraintModel):
+    model = convert_protenix_checkpoint(
+        Path(checkpoint_path).expanduser(),
+        variant=variant,
+        esm_checkpoint_path=None if esm_checkpoint_path is None else Path(esm_checkpoint_path).expanduser(),
+        dtype=dtype,
+    )
+    pipeline: ProtenixPipeline | ProtenixTemplatePipeline | ProtenixConstraintPipeline
+    if variant == "protenix_base_constraint_v0.5.0":
         pipeline = ProtenixConstraintPipeline(
-            model=model,
+            model=cast(ProtenixConstraintModel, model),
             processor=ProtenixConstraintProcessor(dtype=dtype),
+        )
+    elif variant in _TEMPLATE_VARIANTS:
+        pipeline = ProtenixTemplatePipeline(
+            model=model,
+            processor=ProtenixTemplateProcessor(dtype=dtype),
         )
     else:
         pipeline = ProtenixPipeline(
@@ -199,9 +330,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "checkpoint",
         type=Path,
-        help="released Protenix base checkpoint (e.g. protenix_base_default_v0.5.0.pt)",
+        help="released Protenix checkpoint",
     )
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--variant", choices=_PROTENIX_VARIANTS, required=True)
+    parser.add_argument(
+        "--esm-checkpoint",
+        type=Path,
+        default=None,
+        help="official ESM2 companion; required only for mini ESM/ISM",
+    )
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
     parser.add_argument(
         "--repo-id",
@@ -214,6 +352,8 @@ def main(argv: list[str] | None = None) -> None:
     save_protenix_checkpoint(
         args.checkpoint,
         args.output_dir,
+        variant=args.variant,
+        esm_checkpoint_path=args.esm_checkpoint,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
         repo_id=args.repo_id,
         token=args.token,
@@ -221,15 +361,57 @@ def main(argv: list[str] | None = None) -> None:
     )
 
 
-def _protenix_reference_key(model_key: str) -> _ReferenceKey:
+def _esm_reference_key(model_key: str) -> _ReferenceKey:
+    r"""
+    Return the fair-esm ESM2 t36 key for one packaged encoder key.
+    """
+
+    key = model_key.removeprefix("esm_encoder.")
+    if key == "embeddings.word_embeddings.weight":
+        return "embed_tokens.weight"
+    if key.startswith("encoder.emb_layer_norm_after."):
+        return "emb_layer_norm_after." + key.removeprefix("encoder.emb_layer_norm_after.")
+    if key == "rotary_embeddings.inv_freq":
+        return tuple(f"layers.{index}.self_attn.rot_emb.inv_freq" for index in range(36))
+
+    rotary_match = re.fullmatch(
+        r"encoder\.layer\.(\d+)\.attention\.self\.rotary_embeddings\.inv_freq",
+        key,
+    )
+    if rotary_match is not None:
+        return f"layers.{rotary_match.group(1)}.self_attn.rot_emb.inv_freq"
+
+    layer_match = re.fullmatch(r"encoder\.layer\.(\d+)\.(.+)", key)
+    if layer_match is None:
+        raise KeyError(f"unsupported packaged ESM2 key: {model_key!r}")
+    layer_index, suffix = layer_match.groups()
+    source_suffix = _replace_many(
+        suffix,
+        {
+            "attention.self.query.": "self_attn.q_proj.",
+            "attention.self.key.": "self_attn.k_proj.",
+            "attention.self.value.": "self_attn.v_proj.",
+            "attention.output.dense.": "self_attn.out_proj.",
+            "attention.LayerNorm.": "self_attn_layer_norm.",
+            "intermediate.dense.": "fc1.",
+            "output.dense.": "fc2.",
+            "LayerNorm.": "final_layer_norm.",
+        },
+    )
+    return f"layers.{layer_index}.{source_suffix}"
+
+
+def _protenix_reference_key(model_key: str, *, msa_final_block: int) -> _ReferenceKey:
+    if model_key.startswith("msa_trunk.final_pair_update."):
+        model_key = f"msa_trunk.blocks.{msa_final_block}." + model_key.removeprefix("msa_trunk.final_pair_update.")
     if model_key.startswith("constraint_embeddings."):
         relative_key = model_key.removeprefix("constraint_embeddings.")
-        transformer_match = re.fullmatch(
-            r"substructure_embeddings\.transformer\.blocks\.(\d+)\.(.+)",
+        encoder_match = re.fullmatch(
+            r"substructure_embeddings\.encoder\.blocks\.(\d+)\.(.+)",
             relative_key,
         )
-        if transformer_match is not None:
-            block_index, suffix = transformer_match.groups()
+        if encoder_match is not None:
+            block_index, suffix = encoder_match.groups()
             source_suffix = {
                 "attention.query_projection.weight": "self_attn.in_proj_weight",
                 "attention.query_projection.bias": "self_attn.in_proj_bias",
@@ -298,11 +480,16 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
     """
 
     if isinstance(reference_value, tuple):
+        if model_key == "esm_encoder.rotary_embeddings.inv_freq":
+            first = reference_value[0]
+            if any(not torch.equal(first, value) for value in reference_value[1:]):
+                raise ValueError("fair-esm ESM2 layers do not share one rotary inverse-frequency buffer")
+            return first
         if model_key.endswith(".conditioning_projection.weight"):
             return torch.cat(reference_value, dim=0)
         raise RuntimeError(f"unexpected multi-tensor reference mapping for {model_key}")
 
-    if model_key.startswith("constraint_embeddings.substructure_embeddings.transformer.blocks."):
+    if model_key.startswith("constraint_embeddings.substructure_embeddings.encoder.blocks."):
         projection_index = {
             ".attention.query_projection.": 0,
             ".attention.key_projection.": 1,
@@ -340,6 +527,13 @@ def _remap_token_transformer_blocks(key: str) -> str:
 
 def _replace_top_level(key: str) -> str:
     replacements = {
+        "esm_projection": "input_embedder.linear_esm",
+        "template_embedder.pair_norm": "template_embedder.layernorm_z",
+        "template_embedder.pair_projection": "template_embedder.linear_no_bias_z",
+        "template_embedder.template_projection": "template_embedder.linear_no_bias_a",
+        "template_embedder.blocks": "template_embedder.pairformer_stack.blocks",
+        "template_embedder.hidden_norm": "template_embedder.layernorm_v",
+        "template_embedder.output_projection": "template_embedder.linear_no_bias_u",
         "relative_position_embedder": "relative_position_encoding",
         "single_init_projection": "linear_no_bias_sinit",
         "pair_left_projection": "linear_no_bias_zinit1",
@@ -475,6 +669,12 @@ def _replace_atom_key(key: str) -> str:
 
 
 def _replace_pairformer_key(key: str) -> str:
+    if key.startswith("template_embedder.pairformer_stack.blocks."):
+        key = re.sub(
+            r"(template_embedder\.pairformer_stack\.blocks\.\d+)\.transition\.",
+            r"\1.pair_transition.",
+            key,
+        )
     return _replace_many(
         key,
         {

@@ -19,7 +19,8 @@ pipeline_tag: other
 
 Protenix is OFoldX's AlphaFold 3-shaped all-atom structure-prediction family for
 proteins, nucleic acids, small molecules, and their complexes. OFoldX exposes
-the default and constraint graphs as distinct Model/Processor/Pipeline pairs.
+all nine released checkpoint variants through three exact
+Model/Processor/Pipeline pairs.
 
 ## Disclaimer
 
@@ -40,17 +41,36 @@ coordinate diffusion, and distogram and confidence heads. The constraint variant
 adds learned pair biases for atom contacts, token contacts, pockets, and
 substructures.
 
-### Variants
+### Released Variants
 
-- **[oteam/protenix-base](https://huggingface.co/oteam/protenix-base)**: General biomolecular structure prediction.
-- **[oteam/protenix-constraint](https://huggingface.co/oteam/protenix-constraint)**: Structure prediction with contact, pocket, and substructure conditioning.
+Conversion requires one of these exact identifiers; OFoldX does not infer the
+variant from a filename or tensor shape:
 
-### Model Specification
+- `protenix_base_default_v0.5.0`
+- `protenix_base_constraint_v0.5.0`
+- `protenix_mini_default_v0.5.0`
+- `protenix_tiny_default_v0.5.0`
+- `protenix_mini_esm_v0.5.0`
+- `protenix_mini_ism_v0.5.0`
+- `protenix_base_default_v1.0.0`
+- `protenix_base_20250630_v1.0.0`
+- `protenix-v2`
 
-| Variant    | Pairformer Blocks | Denoiser Blocks | Confidence Blocks | Token Size | Single Size | Pair Size | Recycling Passes | Num Parameters (M) | FLOPs (G) |
-| ---------- | ----------------- | --------------- | ----------------- | ---------- | ----------- | --------- | ---------------- | ------------------ | --------- |
-| Base       | 48                | 24              | 4                 | 449        | 384         | 128       | 10               | 368.088            | 1329.532  |
-| Constraint | 48                | 24              | 4                 | 449        | 384         | 128       | 10               | 368.304            | 1473.988  |
+The variants map to ordinary registered pairs:
+
+| Pair                               | Model, Processor, Pipeline                                                             | Released variants                                                     |
+| ---------------------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Default (`protenix`)               | `ProtenixModel`, `ProtenixProcessor`, `ProtenixPipeline`                               | base default v0.5, mini default, tiny default, mini ESM, and mini ISM |
+| Template (`protenix_template`)     | `ProtenixModel`, `ProtenixTemplateProcessor`, `ProtenixTemplatePipeline`               | both base v1 releases and `protenix-v2`                               |
+| Constraint (`protenix_constraint`) | `ProtenixConstraintModel`, `ProtenixConstraintProcessor`, `ProtenixConstraintPipeline` | base constraint v0.5                                                  |
+
+The two v1 releases share one graph and differ in weights. Mini ESM and mini ISM
+also share one graph and package their selected ESM2 companion weights inside the
+model artifact. The template pair owns the released template and RNA-MSA input
+paths. The constraint pair exposes atom-contact, token-contact, and pocket
+controls. Its fourth learned branch accepts a `Structure` through
+`substructure=` and digitizes resolved token-center distances into the released
+four-channel representation.
 
 ### Links
 
@@ -71,28 +91,60 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load any converted repository through the standard folding API:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("input.cif", model="oteam/protenix-base")
+output = ofoldx.fold(
+    "input.cif",
+    model="/path/to/converted-protenix",
+)
 ```
+
+Template variants additionally accept `templates=`. Constraint repositories
+route to `ProtenixConstraintPipeline`, whose concrete `fold` method accepts
+`atom_contacts`, `token_contacts`, and `pocket`. Direct
+`ProtenixConstraintProcessor` use additionally accepts the released
+`substructure` coordinate condition.
+
+Training-free chemical guidance is a sampling-time operation. Pass the released
+enabled configuration explicitly:
+
+```python
+import ofoldx
+
+from ofoldx.models.protenix import ProtenixTfgGuidance
+
+pipeline = ofoldx.pipeline(
+    "fold",
+    model="/path/to/converted-protenix",
+)
+output = pipeline.fold(
+    "input.cif",
+    tfg_guidance=ProtenixTfgGuidance(),
+)
+```
+
+Leaving `tfg_guidance` as `None` disables guidance. The guidance value exposes
+the eight named chemical terms, schedules, Monte Carlo smoothing, and iteration
+counts; setting one term to `None` removes that term. TFG is family-specific, so
+it is passed to the concrete Pipeline rather than the common `ofoldx.fold` task.
 
 ## Training Details
 
-### Training Data
+`ProtenixProcessor.process_training(structure, ...)` returns a
+`ProtenixInput` and separate `ProtenixStructureTarget`. Calling the model with
+those values runs one differentiable stochastic denoising pass and returns
+denoised coordinates, augmented target coordinates, sampled noise levels, the
+distogram, and all four confidence logits. `model.denoise(...)` retains the
+explicit noisy-coordinate operation, while `model.sample(...)` exposes raw
+reverse-diffusion output and `model.fold(...)` decodes it.
 
-The released model reports a 2021-09-30 training-data cutoff. Its data pipeline
-covers wwPDB/mmCIF bioassemblies, MSAs, CCD cache data, and RCSB sequence
-clusters.
-
-### Training Procedure
-
-Protenix trains the trunk, distogram, confidence, and coordinate-denoising graph
-jointly. The diffusion objective denoises noised ground-truth coordinates, while
-the auxiliary heads supervise geometry and confidence. The constraint variant
-additionally trains all four pair-bias embedders.
+OFoldX reproduces the complete released Model graph, not Protenix's complete
+four-stage training program. Dataset policy, objectives, stage weights,
+condition-dropout curriculum, optimizer, and training runner remain the
+responsibility of the training application.
 
 ## Citation
 

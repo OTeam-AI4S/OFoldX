@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from ...data.evidence import MSA, MSACollection
+from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io import read_fasta_records, read_msa, read_structure
@@ -22,11 +22,13 @@ from .model import (
     ProtenixConstraintModel,
     ProtenixModel,
     ProtenixPocket,
+    ProtenixTfgGuidance,
     ProtenixTokenContact,
 )
 from .processor import (
     ProtenixConstraintProcessor,
     ProtenixProcessor,
+    ProtenixTemplateProcessor,
     molecular_system_from_input,
     molecular_system_from_named_sequences,
 )
@@ -39,6 +41,8 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
     Structure prediction pipeline for Protenix.
     """
 
+    model_architecture = "protenix"
+
     def fold(
         self,
         input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
@@ -49,6 +53,7 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
         Predict structures for one molecular assembly with Protenix.
@@ -65,6 +70,8 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            tfg_guidance: Training-free chemical guidance. ``None`` disables it;
+                ``ProtenixTfgGuidance()`` uses the released enabled defaults.
 
         Returns:
             Generation-ordered structure predictions. Structure, PAE, PDE, and gPDE
@@ -77,6 +84,7 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         model_input = self.processor(
             canonical_input,
             msa=_canonical_msa(msa, system),
+            tfg_guidance=tfg_guidance,
             generator=generator,
         )
         return self.model.fold(
@@ -85,6 +93,69 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            tfg_guidance=tfg_guidance,
+        )
+
+
+class ProtenixTemplatePipeline(PairedPipeline[ProtenixModel, ProtenixTemplateProcessor]):
+    r"""
+    Template- and RNA-MSA-capable structure prediction pipeline for Protenix v1 and v2.
+    """
+
+    model_architecture = "protenix_template"
+
+    def fold(
+        self,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        *,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
+        num_samples: int | None = None,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+        num_sampling_steps: int | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = None,
+    ) -> FoldResult:
+        r"""
+        Predict structures with the released Protenix v1/v2 template and RNA-MSA path.
+
+        Args:
+            input: Inline sequence, FASTA or structure path, polymer sequence collection,
+                molecular system, or structure topology.
+            msa: Optional protein/RNA MSA value, collection, or alignment path.
+            templates: Protein templates aligned to target chains.
+            num_samples: Number of structure predictions. ``None`` uses five.
+            seed: Optional seed for preprocessing, MSA subsampling, and diffusion.
+                Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by preprocessing and folding.
+                Mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations.
+            num_sampling_steps: Number of diffusion steps.
+            tfg_guidance: Training-free chemical guidance. ``None`` disables it;
+                ``ProtenixTfgGuidance()`` uses the released enabled defaults.
+
+        Returns:
+            Generation-ordered structure predictions.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
+        canonical_input = _canonical_input(input)
+        system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
+        model_input = self.processor(
+            canonical_input,
+            msa=_canonical_template_msa(msa, system),
+            templates=templates,
+            tfg_guidance=tfg_guidance,
+            generator=generator,
+        )
+        return self.model.fold(
+            model_input,
+            num_samples=num_samples,
+            generator=generator,
+            recycling_steps=recycling_steps,
+            num_sampling_steps=num_sampling_steps,
+            tfg_guidance=tfg_guidance,
         )
 
 
@@ -92,6 +163,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
     r"""
     Constrained structure prediction pipeline for Protenix.
     """
+
+    model_architecture = "protenix_constraint"
 
     def fold(
         self,
@@ -106,6 +179,7 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
         Predict constrained structures for one molecular assembly with Protenix.
@@ -125,6 +199,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            tfg_guidance: Training-free chemical guidance. ``None`` disables it;
+                ``ProtenixTfgGuidance()`` uses the released enabled defaults.
 
         Returns:
             Generation-ordered structure predictions. Structure, PAE, PDE, and gPDE
@@ -140,6 +216,7 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             token_contacts=token_contacts,
             pocket=pocket,
             msa=_canonical_msa(msa, system),
+            tfg_guidance=tfg_guidance,
             generator=generator,
         )
         return self.model.fold(
@@ -148,6 +225,7 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            tfg_guidance=tfg_guidance,
         )
 
 
@@ -196,3 +274,23 @@ def _canonical_msa(
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")
     return read_msa(Path(msa).expanduser(), entity_id=proteins[0])
+
+
+def _canonical_template_msa(
+    msa: MSA | MSACollection | str | PathLike[str] | None,
+    system: MolecularSystem,
+) -> MSA | MSACollection | None:
+    r"""
+    Read a path MSA against the only unambiguous protein or RNA entity.
+    """
+
+    if not isinstance(msa, str | PathLike):
+        return msa
+    candidates = [
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, PolymerSequence) and entity.polymer_type in {"protein", "rna"}
+    ]
+    if len(candidates) != 1:
+        raise ValueError("an aligned FASTA MSA is unambiguous only for one protein or RNA entity")
+    return read_msa(Path(msa).expanduser(), entity_id=candidates[0])

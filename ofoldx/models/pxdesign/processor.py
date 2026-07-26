@@ -304,11 +304,6 @@ class PxDesignProcessor(Processor):
             layout=PxDesignLayout(
                 system=system,
                 sites=sites,
-                placement=placement,
-                conditions=condition_values,
-                # The generated binder placement maps to every realized residue in
-                # offset order. Existing target spans retain source identities.
-                placement_map={generated_group: {generated_id: tuple(generated_map.values())}},
             ),
         )
 
@@ -388,6 +383,7 @@ def _canonicalize_modified_polymers(
         structure.coordinates,
         structure.coordinate_mask,
         structure.occupancy,
+        structure.b_factor,
         structure.residue_numbers,
     )
     return new_system, new_structure

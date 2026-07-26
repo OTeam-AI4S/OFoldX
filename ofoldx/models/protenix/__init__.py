@@ -10,35 +10,71 @@ from .config import (
     ProtenixConfig,
     ProtenixConstraintConfig,
     ProtenixConstraintProcessorConfig,
+    ProtenixEsmConfig,
     ProtenixProcessorConfig,
+    ProtenixTemplateConfig,
+    ProtenixTrunkConfig,
+    ProtenixVariant,
 )
 from .model import (
     ProtenixAtomContact,
+    ProtenixChiralAtomPotential,
+    ProtenixChiralAtomTerm,
     ProtenixConstraintModel,
+    ProtenixExperimentalTorsionPotential,
+    ProtenixExperimentalTorsionTerm,
+    ProtenixExponentialInterpolation,
     ProtenixInput,
+    ProtenixInterchainBondPotential,
+    ProtenixInterchainBondTerm,
+    ProtenixLinearBondPotential,
+    ProtenixLinearBondTerm,
     ProtenixModel,
     ProtenixOutput,
+    ProtenixPairwiseDistancePotential,
+    ProtenixPairwiseDistanceTerm,
+    ProtenixPlanarImproperPotential,
+    ProtenixPlanarImproperTerm,
     ProtenixPocket,
+    ProtenixRawOutput,
+    ProtenixStereoBondPotential,
+    ProtenixStereoBondTerm,
+    ProtenixStructureTarget,
+    ProtenixTemplateFeatures,
+    ProtenixTfgFeatures,
+    ProtenixTfgGuidance,
+    ProtenixTfgPotential,
     ProtenixTokenContact,
+    ProtenixVinaStericPotential,
+    ProtenixVinaStericTerm,
 )
-from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline
-from .processor import ProtenixConstraintProcessor, ProtenixProcessor
+from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline, ProtenixTemplatePipeline
+from .processor import ProtenixConstraintProcessor, ProtenixProcessor, ProtenixTemplateProcessor
 
 _MODELS.register(
-    "ofoldx.protenix",
+    "protenix",
     model=ProtenixModel,
     processor=ProtenixProcessor,
 )
 _MODELS.register(
-    "ofoldx.protenix_constraint",
+    "protenix_template",
+    model=ProtenixModel,
+    processor=ProtenixTemplateProcessor,
+)
+_MODELS.register(
+    "protenix_constraint",
     model=ProtenixConstraintModel,
     processor=ProtenixConstraintProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.protenix",
+    "protenix",
     pipeline=ProtenixPipeline,
 )
 _PIPELINES.register(
-    "ofoldx.protenix_constraint",
+    "protenix_template",
+    pipeline=ProtenixTemplatePipeline,
+)
+_PIPELINES.register(
+    "protenix_constraint",
     pipeline=ProtenixConstraintPipeline,
 )

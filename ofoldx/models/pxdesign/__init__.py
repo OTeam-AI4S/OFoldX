@@ -25,11 +25,11 @@ from .pipeline import PxDesignPipeline
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
 _MODELS.register(
-    "ofoldx.pxdesign",
+    "pxdesign",
     model=PxDesignModel,
     processor=PxDesignProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.pxdesign",
+    "pxdesign",
     pipeline=PxDesignPipeline,
 )
