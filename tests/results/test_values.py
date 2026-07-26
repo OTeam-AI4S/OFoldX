@@ -1,5 +1,5 @@
 r"""
-Tests for the frozen Section 5 scientific result carriers in values.py.
+Tests for the public scientific result carriers in values.py.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def _design_candidate(
 
 
 # --------------------------------------------------------------------------- #
-# Section 5.1 shared scientific values
+# Shared scientific values
 # --------------------------------------------------------------------------- #
 
 
@@ -163,7 +163,7 @@ def test_metric_and_pair_metric_carry_arrays_without_scanning() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Section 5.2 FoldResult
+# FoldResult
 # --------------------------------------------------------------------------- #
 
 
@@ -250,7 +250,7 @@ def test_fold_best_matches_scopes_as_unordered_frozensets() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Section 5.3.1 DesignResult
+# DesignResult
 # --------------------------------------------------------------------------- #
 
 
@@ -294,7 +294,7 @@ def test_design_best_shares_fold_best_ranking_behavior() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Section 5.4.1 ScoreResult
+# ScoreResult
 # --------------------------------------------------------------------------- #
 
 
@@ -313,7 +313,7 @@ def test_score_result_binds_scores_and_metrics_to_its_target() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Section 5.5 PackResult
+# PackResult
 # --------------------------------------------------------------------------- #
 
 
@@ -329,7 +329,7 @@ def test_pack_carriers_group_metrics_without_scores_or_ranking() -> None:
     result = PackResult((prediction,))
     assert result.predictions == (prediction,)
 
-    # Section 5.5: PackPrediction has no scores and PackResult defines no best().
+    # PackPrediction has no scores and PackResult defines no ranking operation.
     assert {field.name for field in fields(PackPrediction)} == {"structure", "metrics"}
     assert {field.name for field in fields(PackResult)} == {"predictions"}
     assert not hasattr(PackResult, "best")
