@@ -18,11 +18,11 @@ from .pipeline import LigandMpnnDesignAndPackPipeline, LigandMpnnPipeline
 from .processor import LigandMpnnProcessor
 
 _MODELS.register(
-    "ofoldx.ligandmpnn",
+    "ligandmpnn",
     model=LigandMpnnModel,
     processor=LigandMpnnProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.ligandmpnn",
+    "ligandmpnn",
     pipeline=LigandMpnnPipeline,
 )

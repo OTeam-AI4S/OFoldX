@@ -67,12 +67,13 @@ pip install ofoldx
 
 ### Sequence Design
 
-Use the high-level `design` API:
+Load the concrete design Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.design("backbone.cif", model="oteam/proteinmpnn")
+pipeline = ofoldx.pipeline("design", model="oteam/proteinmpnn")
+output = pipeline.design("backbone.cif")
 ```
 
 ## Training Details
@@ -88,6 +89,9 @@ proteins, while the CA-only variant uses reduced backbone geometry.
 ProteinMPNN uses an autoregressive sequence-recovery objective with coordinate
 perturbations for robustness. `ProteinMpnnModel.forward` is
 differentiable and exposes the logits needed to train or fine-tune the model.
+`ofoldx.models.proteinmpnn.objectives` exposes the released unreduced
+`nll_loss` and 21-class `smoothed_loss`; masking and reduction remain
+caller-owned.
 
 ## Citation
 

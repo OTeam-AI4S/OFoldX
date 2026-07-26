@@ -205,6 +205,7 @@ class ProteinMpnnProcessor(Processor):
             structure.coordinates[index_array],
             structure.coordinate_mask[index_array],
             None if structure.occupancy is None else structure.occupancy[index_array],
+            None if structure.b_factor is None else structure.b_factor[index_array],
             structure.residue_numbers,
         )
         return structure, system
@@ -673,5 +674,6 @@ def _select_protein_instances(
         structure.coordinates[index_array],
         structure.coordinate_mask[index_array],
         None if structure.occupancy is None else structure.occupancy[index_array],
+        None if structure.b_factor is None else structure.b_factor[index_array],
         residue_numbers=residue_numbers,
     )

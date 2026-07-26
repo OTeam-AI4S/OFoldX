@@ -15,15 +15,16 @@ from .model import (
     ProteinMpnnOutput,
     ProteinMpnnSamplingOutput,
 )
+from .objectives import nll_loss, smoothed_loss
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
 _MODELS.register(
-    "ofoldx.proteinmpnn",
+    "proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.proteinmpnn",
+    "proteinmpnn",
     pipeline=ProteinMpnnPipeline,
 )

@@ -54,7 +54,7 @@ class MpnnPackerModel(Model):
         config = MpnnPackerConfig() if config is None else config
         super().__init__(config)
         self.num_mix = config.num_mix
-        self.feature_encoder = MpnnPackerFeatures(
+        self.feature_encoder = MpnnPackerFeatureEncoder(
             node_size=config.hidden_size,
             edge_size=config.edge_size,
             num_positional_embeddings=config.num_positional_embeddings,
@@ -601,7 +601,7 @@ class MpnnPackerModel(Model):
         return PackResult(predictions=predictions)
 
 
-class MpnnPackerFeatures(nn.Module):
+class MpnnPackerFeatureEncoder(nn.Module):
     r"""
     Build residue-graph and atom-context features for MPNN Packer.
 
@@ -861,203 +861,6 @@ class MpnnPackerFeatures(nn.Module):
         return sidechain_nodes, decode_edges
 
 
-def _knn(points: Tensor, mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
-    r"""
-    Find the ``num_neighbors`` nearest residues by CA distance, after every valid pair.
-
-    Args:
-        points: Reference (CA) coordinates `[B, L, 3]`.
-        mask: Valid-residue mask `[B, L]`.
-        num_neighbors: Number of neighbors to keep (capped at ``L``).
-        eps: Numerical floor under the distance square root.
-
-    Returns:
-        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
-    """
-
-    pair_mask = mask[:, None, :] & mask[:, :, None]
-    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
-    adjusted = torch.where(pair_mask, distances, torch.inf)
-    return torch.topk(adjusted, min(num_neighbors, points.shape[1]), dim=-1, largest=False)
-
-
-def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
-    r"""
-    Compute every ordered atom-pair distance along the residue neighbor graph.
-
-    Args:
-        atoms: Per-residue atom coordinates `[B, L, A, 3]`.
-        neighbor_idx: Neighbor indices `[B, L, K]`.
-
-    Returns:
-        Distances `[B, L, K, A, A]`, with source atom before target atom.
-    """
-
-    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
-    neighbors = atoms[batch, neighbor_idx]
-    distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
-    return distances
-
-
-def _sample_von_mises_mixture(
-    mean: Tensor,
-    concentration: Tensor,
-    mix_logits: Tensor,
-    *,
-    num_samples: int,
-    generator: torch.Generator | None,
-) -> Tensor:
-    r"""
-    Match PyTorch's mixture/Von-Mises sampling while accepting a Generator.
-    """
-
-    probabilities = mix_logits.softmax(dim=-1).reshape(-1, mix_logits.shape[-1])
-    mixture_indices = torch.multinomial(
-        probabilities,
-        num_samples,
-        replacement=True,
-        generator=generator,
-    ).T.reshape(num_samples, *mix_logits.shape[:-1])
-
-    loc = mean.to(torch.double)
-    kappa = concentration.to(torch.double)
-    tau = 1 + torch.sqrt(1 + 4 * kappa**2)
-    rho = (tau - torch.sqrt(2 * tau)) / (2 * kappa)
-    proposal = (1 + rho**2) / (2 * rho)
-    proposal = torch.where(kappa < 1e-5, 1 / kappa + kappa, proposal)
-    shape = (num_samples, *mean.shape)
-    component_samples = torch.empty(shape, dtype=torch.double, device=mean.device)
-    done = torch.zeros(shape, dtype=torch.bool, device=mean.device)
-    while not bool(done.all()):
-        uniform = torch.rand((3, *shape), dtype=torch.double, device=mean.device, generator=generator)
-        first, second, third = uniform.unbind()
-        z = torch.cos(math.pi * first)
-        f = (1 + proposal * z) / (proposal + z)
-        c = kappa * (proposal - f)
-        accept = ((c * (2 - c) - second) > 0) | ((c / second).log() + 1 - c >= 0)
-        component_samples = torch.where(accept, (third - 0.5).sign() * f.acos(), component_samples)
-        done = done | accept
-    component_samples = ((component_samples + math.pi + loc) % (2 * math.pi) - math.pi).to(mean.dtype)
-    return torch.gather(component_samples, -1, mixture_indices.unsqueeze(-1)).squeeze(-1)
-
-
-def pack_candidate(
-    input: MpnnPackerInput,
-    packed: MpnnPackerSamplingOutput,
-) -> PackPrediction:
-    r"""
-    Decode one sampled atom14 state into a packed structure.
-
-    Args:
-        input: Processor output describing the source structure and selected residues.
-        packed: Sampled atom14 coordinates, masks, and torsions.
-
-    Returns:
-        A packed structure containing sampled atoms only at selected residues.
-    """
-
-    structure = input.structure
-    source_index = {site: index for index, site in enumerate(structure.sites)}
-    selected = input.pack_positions[0].detach().cpu().tolist()
-    selected_references = {
-        reference for reference, is_selected in zip(input.component_references, selected) if is_selected
-    }
-    component_ids = {
-        reference: AMINO_ACID_COMPONENT_IDS[int(token)]
-        for reference, token, is_selected in zip(
-            input.component_references,
-            input.sequence_tokens[0].detach().cpu().tolist(),
-            selected,
-        )
-        if is_selected
-    }
-    expected_atoms = {
-        reference: frozenset(filter(None, rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]]))
-        for reference in selected_references
-    }
-    site_list = [
-        site
-        for site in structure.sites
-        if (site.instance_id, site.component_index) not in selected_references
-        or (
-            (site.instance_id, site.component_index) in selected_references
-            and (site.atom_id in expected_atoms[(site.instance_id, site.component_index)] or site.atom_id == "OXT")
-        )
-    ]
-    retained_sites = set(site_list)
-    for reference, is_selected in zip(input.component_references, selected):
-        if not is_selected:
-            continue
-        for atom_name in rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:]:
-            if not atom_name:
-                continue
-            site = AtomSite(reference[0], reference[1], atom_name)
-            if site not in retained_sites:
-                site_list.append(site)
-                retained_sites.add(site)
-    sites = tuple(site_list)
-    output_index = {site: index for index, site in enumerate(sites)}
-    atom14 = packed.atom14_coordinates[0].detach().cpu().numpy()
-    coordinate_dtype = np.result_type(structure.coordinates.dtype, atom14.dtype)
-    coordinates = np.zeros((len(sites), 3), dtype=coordinate_dtype)
-    coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
-    source_occupancy = structure.occupancy
-    occupancy = (
-        None
-        if source_occupancy is None
-        else np.full(
-            len(sites),
-            np.nan,
-            dtype=np.result_type(source_occupancy.dtype, np.float32),
-        )
-    )
-    for index, site in enumerate(sites):
-        source = source_index.get(site)
-        if source is None:
-            continue
-        coordinates[index] = structure.coordinates[source]
-        coordinate_mask[index] = structure.coordinate_mask[source]
-        if occupancy is not None and source_occupancy is not None:
-            occupancy[index] = source_occupancy[source]
-
-    atom14_mask = packed.atom14_mask[0].detach().cpu().numpy()
-    for row, (reference, is_selected) in enumerate(zip(input.component_references, selected)):
-        if not is_selected:
-            continue
-        for atom, atom_name in enumerate(rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:], start=4):
-            if not atom_name:
-                continue
-            index = output_index[AtomSite(reference[0], reference[1], atom_name)]
-            coordinates[index] = atom14[row, atom]
-            coordinate_mask[index] = atom14_mask[row, atom]
-            if occupancy is not None:
-                occupancy[index] = np.nan
-
-    realized = Structure(
-        structure.system,
-        sites,
-        coordinates,
-        coordinate_mask,
-        occupancy,
-        structure.residue_numbers,
-    )
-    metrics: dict[str, Metric] = {}
-    chi_log_densities = packed.chi_log_densities[0].detach().cpu().numpy()
-    for chi_index in range(4):
-        rows = tuple(
-            row
-            for row, (reference, is_selected) in enumerate(zip(input.component_references, selected))
-            if is_selected and len(rc.chi_angles_atoms[component_ids[reference]]) > chi_index
-        )
-        if rows:
-            metrics[f"chi{chi_index + 1}_log_density"] = Metric(
-                values=chi_log_densities[rows, chi_index],
-                axis=tuple(input.component_references[row] for row in rows),
-                unit="nat/radian",
-            )
-    return PackPrediction(structure=realized, metrics=metrics)
-
-
 class MpnnPackerFrame:
     r"""
     Rigid frame stored as a rotation matrix and translation.
@@ -1243,6 +1046,218 @@ class MpnnPackerFrame:
 
         rotation = (n_rot @ c_rots).transpose(-1, -2)
         return MpnnPackerFrame(rotation, -translation)
+
+
+def _knn(points: Tensor, mask: Tensor, num_neighbors: int, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
+    r"""
+    Find the ``num_neighbors`` nearest residues by CA distance, after every valid pair.
+
+    Args:
+        points: Reference (CA) coordinates `[B, L, 3]`.
+        mask: Valid-residue mask `[B, L]`.
+        num_neighbors: Number of neighbors to keep (capped at ``L``).
+        eps: Numerical floor under the distance square root.
+
+    Returns:
+        Tuple ``(distances, neighbor_idx)`` of the top-k nearest neighbors, each `[B, L, k]`.
+    """
+
+    pair_mask = mask[:, None, :] & mask[:, :, None]
+    distances = torch.sqrt(torch.sum((points[:, :, None] - points[:, None, :]) ** 2, dim=-1) + eps)
+    adjusted = torch.where(pair_mask, distances, torch.inf)
+    return torch.topk(adjusted, min(num_neighbors, points.shape[1]), dim=-1, largest=False)
+
+
+def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
+    r"""
+    Compute every ordered atom-pair distance along the residue neighbor graph.
+
+    Args:
+        atoms: Per-residue atom coordinates `[B, L, A, 3]`.
+        neighbor_idx: Neighbor indices `[B, L, K]`.
+
+    Returns:
+        Distances `[B, L, K, A, A]`, with source atom before target atom.
+    """
+
+    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
+    neighbors = atoms[batch, neighbor_idx]
+    distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
+    return distances
+
+
+def _sample_von_mises_mixture(
+    mean: Tensor,
+    concentration: Tensor,
+    mix_logits: Tensor,
+    *,
+    num_samples: int,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Match PyTorch's mixture/Von-Mises sampling while accepting a Generator.
+    """
+
+    probabilities = mix_logits.softmax(dim=-1).reshape(-1, mix_logits.shape[-1])
+    mixture_indices = torch.multinomial(
+        probabilities,
+        num_samples,
+        replacement=True,
+        generator=generator,
+    ).T.reshape(num_samples, *mix_logits.shape[:-1])
+
+    loc = mean.to(torch.double)
+    kappa = concentration.to(torch.double)
+    tau = 1 + torch.sqrt(1 + 4 * kappa**2)
+    rho = (tau - torch.sqrt(2 * tau)) / (2 * kappa)
+    proposal = (1 + rho**2) / (2 * rho)
+    proposal = torch.where(kappa < 1e-5, 1 / kappa + kappa, proposal)
+    shape = (num_samples, *mean.shape)
+    component_samples = torch.empty(shape, dtype=torch.double, device=mean.device)
+    done = torch.zeros(shape, dtype=torch.bool, device=mean.device)
+    while not bool(done.all()):
+        uniform = torch.rand((3, *shape), dtype=torch.double, device=mean.device, generator=generator)
+        first, second, third = uniform.unbind()
+        z = torch.cos(math.pi * first)
+        f = (1 + proposal * z) / (proposal + z)
+        c = kappa * (proposal - f)
+        accept = ((c * (2 - c) - second) > 0) | ((c / second).log() + 1 - c >= 0)
+        component_samples = torch.where(accept, (third - 0.5).sign() * f.acos(), component_samples)
+        done = done | accept
+    component_samples = ((component_samples + math.pi + loc) % (2 * math.pi) - math.pi).to(mean.dtype)
+    return torch.gather(component_samples, -1, mixture_indices.unsqueeze(-1)).squeeze(-1)
+
+
+def pack_candidate(
+    input: MpnnPackerInput,
+    packed: MpnnPackerSamplingOutput,
+) -> PackPrediction:
+    r"""
+    Decode one sampled atom14 state into a packed structure.
+
+    Args:
+        input: Processor output describing the source structure and selected residues.
+        packed: Sampled atom14 coordinates, masks, and torsions.
+
+    Returns:
+        A packed structure containing sampled atoms only at selected residues.
+    """
+
+    structure = input.structure
+    source_index = {site: index for index, site in enumerate(structure.sites)}
+    selected = input.pack_positions[0].detach().cpu().tolist()
+    selected_references = {
+        reference for reference, is_selected in zip(input.component_references, selected) if is_selected
+    }
+    component_ids = {
+        reference: AMINO_ACID_COMPONENT_IDS[int(token)]
+        for reference, token, is_selected in zip(
+            input.component_references,
+            input.sequence_tokens[0].detach().cpu().tolist(),
+            selected,
+        )
+        if is_selected
+    }
+    expected_atoms = {
+        reference: frozenset(filter(None, rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]]))
+        for reference in selected_references
+    }
+    site_list = [
+        site
+        for site in structure.sites
+        if (site.instance_id, site.component_index) not in selected_references
+        or (
+            (site.instance_id, site.component_index) in selected_references
+            and (site.atom_id in expected_atoms[(site.instance_id, site.component_index)] or site.atom_id == "OXT")
+        )
+    ]
+    retained_sites = set(site_list)
+    for reference, is_selected in zip(input.component_references, selected):
+        if not is_selected:
+            continue
+        for atom_name in rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:]:
+            if not atom_name:
+                continue
+            site = AtomSite(reference[0], reference[1], atom_name)
+            if site not in retained_sites:
+                site_list.append(site)
+                retained_sites.add(site)
+    sites = tuple(site_list)
+    output_index = {site: index for index, site in enumerate(sites)}
+    atom14 = packed.atom14_coordinates[0].detach().cpu().numpy()
+    coordinate_dtype = np.result_type(structure.coordinates.dtype, atom14.dtype)
+    coordinates = np.zeros((len(sites), 3), dtype=coordinate_dtype)
+    coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
+    source_occupancy = structure.occupancy
+    occupancy = (
+        None
+        if source_occupancy is None
+        else np.full(
+            len(sites),
+            np.nan,
+            dtype=np.result_type(source_occupancy.dtype, np.float32),
+        )
+    )
+    source_b_factor = structure.b_factor
+    b_factor = (
+        None
+        if source_b_factor is None
+        else np.full(
+            len(sites),
+            np.nan,
+            dtype=np.result_type(source_b_factor.dtype, np.float32),
+        )
+    )
+    for index, site in enumerate(sites):
+        source = source_index.get(site)
+        if source is None:
+            continue
+        coordinates[index] = structure.coordinates[source]
+        coordinate_mask[index] = structure.coordinate_mask[source]
+        if occupancy is not None and source_occupancy is not None:
+            occupancy[index] = source_occupancy[source]
+        if b_factor is not None and source_b_factor is not None:
+            b_factor[index] = source_b_factor[source]
+
+    atom14_mask = packed.atom14_mask[0].detach().cpu().numpy()
+    for row, (reference, is_selected) in enumerate(zip(input.component_references, selected)):
+        if not is_selected:
+            continue
+        for atom, atom_name in enumerate(rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:], start=4):
+            if not atom_name:
+                continue
+            index = output_index[AtomSite(reference[0], reference[1], atom_name)]
+            coordinates[index] = atom14[row, atom]
+            coordinate_mask[index] = atom14_mask[row, atom]
+            if occupancy is not None:
+                occupancy[index] = np.nan
+            if b_factor is not None:
+                b_factor[index] = np.nan
+
+    realized = Structure(
+        structure.system,
+        sites,
+        coordinates,
+        coordinate_mask,
+        occupancy,
+        b_factor,
+        structure.residue_numbers,
+    )
+    metrics: dict[str, Metric] = {}
+    chi_log_densities = packed.chi_log_densities[0].detach().cpu().numpy()
+    for chi_index in range(4):
+        rows = tuple(
+            row
+            for row, (reference, is_selected) in enumerate(zip(input.component_references, selected))
+            if is_selected and len(rc.chi_angles_atoms[component_ids[reference]]) > chi_index
+        )
+        if rows:
+            metrics[f"chi{chi_index + 1}_log_density"] = Metric(
+                values=chi_log_densities[rows, chi_index],
+                axis=tuple(input.component_references[row] for row in rows),
+                unit="nat/radian",
+            )
+    return PackPrediction(structure=realized, metrics=metrics)
 
 
 def _rotate(rotation: Tensor, points: Tensor) -> Tensor:

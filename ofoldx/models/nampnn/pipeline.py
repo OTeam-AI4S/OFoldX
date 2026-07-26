@@ -25,6 +25,8 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
     Protein and nucleic-acid sequence design pipeline for NA-MPNN.
     """
 
+    model_architecture = "nampnn"
+
     def design(
         self,
         input: Structure | str | PathLike[str],
@@ -93,48 +95,14 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         num_decoding_orders: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> ScoreResult:
-        r"""
-        Score a mixed-polymer sequence over independently drawn decoding orders.
-
-        Args:
-            input: A ``Structure`` or local structure path.
-            sequence: Optional replacement sequence to evaluate.
-            design_positions: Residue occurrences included in the designed-sequence score.
-            num_decoding_orders: Number of independently sampled decoding orders.
-            seed: Optional integer seed; mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
-
-        Returns:
-            A ``ScoreResult`` containing designed and global sequence NLL scores.
-        """
-
-        structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
-        model_input = self.processor(structure, sequence=sequence, design_positions=design_positions)
-        generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
-        return self.model.score(
-            model_input,
-            num_decoding_orders=num_decoding_orders,
-            generator=generator,
-        )
-
-    def autoregressive_probabilities(
-        self,
-        input: Structure | str | PathLike[str],
-        *,
-        sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-        design_positions: Sequence[ComponentReference] | None = None,
-        num_decoding_orders: int = 1,
-        seed: int | None = None,
-        generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
-        Return sequence-conditioned autoregressive probabilities over decoding orders.
+        Score a mixed-polymer sequence with autoregressive probabilities.
 
         Args:
             input: A ``Structure`` or local structure path.
             sequence: Optional replacement sequence to evaluate.
-            design_positions: Residue occurrences included in the probability evaluation.
+            design_positions: Residue occurrences evaluated after fixed sequence context.
             num_decoding_orders: Number of independently sampled decoding orders.
             seed: Optional integer seed; mutually exclusive with ``generator``.
             generator: Optional PyTorch random generator; mutually exclusive with ``seed``.
@@ -146,7 +114,7 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(structure, sequence=sequence, design_positions=design_positions)
         generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
-        return self.model.autoregressive_probabilities(
+        return self.model.score(
             model_input,
             num_decoding_orders=num_decoding_orders,
             generator=generator,

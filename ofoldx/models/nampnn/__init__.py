@@ -23,17 +23,17 @@ from .model import (
     NaMpnnModel,
     NaMpnnOutput,
     NaMpnnSamplingOutput,
-    nampnn_polymer_label_smoothed_nll_loss,
 )
+from .objectives import nll_loss, smoothed_loss
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
 _MODELS.register(
-    "ofoldx.nampnn",
+    "nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.nampnn",
+    "nampnn",
     pipeline=NaMpnnPipeline,
 )

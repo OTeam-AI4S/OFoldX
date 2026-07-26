@@ -44,7 +44,7 @@ def convert_ligandmpnn_checkpoint(
     Derives every live architecture fact from the checkpoint, strict-loads the flat Model with
     ``assign=True`` to preserve the serialized dtype, writes ``num_context_atoms`` to the paired Processor
     config, and saves the paired concrete [`LigandMpnnPipeline`]
-    [ofoldx.models.ligandmpnn.pipeline.LigandMpnnPipeline] artifact under the exact ``ofoldx.ligandmpnn`` ID.
+    [ofoldx.models.ligandmpnn.pipeline.LigandMpnnPipeline] artifact under the exact ``ligandmpnn`` ID.
 
     Saving is local-only by default. When ``repo_id`` is given, the converted repository is also
     uploaded to that Hub repo via the paired Pipeline's ``save``; no organization or token is assumed

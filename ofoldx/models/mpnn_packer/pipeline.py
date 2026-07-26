@@ -23,6 +23,8 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
     Side-chain packing pipeline for MPNN Packer.
     """
 
+    model_architecture = "mpnn_packer"
+
     def pack(
         self,
         input: Structure | str | PathLike[str],
@@ -119,6 +121,8 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             )
             for sequence in sequences
         )
+        if not inputs:
+            return ()
         generator = resolve_generator(seed, generator, device=inputs[0].sequence_tokens.device)
         if len(inputs) == 1:
             return (

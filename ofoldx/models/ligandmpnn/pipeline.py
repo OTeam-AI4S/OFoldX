@@ -30,6 +30,8 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
     Protein sequence design pipeline for LigandMPNN.
     """
 
+    model_architecture = "ligandmpnn"
+
     def design(
         self,
         input: Structure | str | PathLike[str],

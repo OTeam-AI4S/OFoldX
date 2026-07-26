@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
@@ -108,9 +109,14 @@ class NaMpnnProcessor(Processor):
 
         if not isinstance(structure, Structure):
             raise TypeError("NaMpnnProcessor requires a Structure")
-        rows = self._lower_rows(structure)
         if sequence is not None:
-            return self._process_score(structure, rows, sequence=sequence, design_positions=design_positions)
+            structure = self._resolve_score_target(structure, sequence)
+            return self._process_score(
+                structure,
+                self._lower_rows(structure),
+                design_positions=design_positions,
+            )
+        rows = self._lower_rows(structure)
         return self._process_design(
             structure,
             rows,
@@ -286,17 +292,15 @@ class NaMpnnProcessor(Processor):
         structure: Structure,
         rows: list[_Row],
         *,
-        sequence: str | Mapping[str, str | Sequence[str]],
         design_positions: Sequence[ComponentReference] | None,
     ) -> NaMpnnInput:
         r"""
         Lower an explicit observed sequence for autoregressive scoring.
         """
 
-        overrides = self._resolve_sequence_override(structure.system, rows, sequence)
         sequence_tokens = [
             (
-                self._component_token(overrides.get(row[0], row[1]), row[2])
+                self._component_token(row[1], row[2])
                 if row[7]
                 else NA_MPNN_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
             )
@@ -323,44 +327,79 @@ class NaMpnnProcessor(Processor):
             conditions=(),
         )
 
-    def _resolve_sequence_override(
+    def _resolve_score_target(
         self,
-        system: MolecularSystem,
-        rows: list[_Row],
+        structure: Structure,
         sequence: str | Mapping[str, str | Sequence[str]],
-    ) -> dict[ComponentReference, str]:
-        polymer_instances = [
-            instance_id
-            for instance_id, entity_id in system.instances.items()
-            if isinstance(system.entities[entity_id], PolymerSequence)
-        ]
+    ) -> Structure:
+        r"""
+        Apply an explicit scoring sequence and retain its compatible coordinates.
+        """
+
+        system = structure.system
+        polymer_instances: list[tuple[str, PolymerSequence]] = []
+        for instance_id, entity_id in system.instances.items():
+            entity = system.entities[entity_id]
+            if isinstance(entity, PolymerSequence):
+                polymer_instances.append((instance_id, entity))
         if isinstance(sequence, str):
             if len(polymer_instances) != 1:
                 raise ValueError("a bare NA-MPNN sequence requires exactly one polymer instance")
-            sequence = {polymer_instances[0]: sequence}
-        length_by_instance: dict[str, int] = {}
-        for reference, *_ in rows:
-            length_by_instance[reference[0]] = length_by_instance.get(reference[0], 0) + 1
-        overrides: dict[ComponentReference, str] = {}
+            sequence = {polymer_instances[0][0]: sequence}
+
+        target_components = {instance_id: entity.components for instance_id, entity in polymer_instances}
         for instance_id, value in sequence.items():
             entity = system.entities[system.instances[instance_id]]
             if not isinstance(entity, PolymerSequence):
                 raise ValueError(f"NA-MPNN sequence instance {instance_id!r} is not a polymer")
             if isinstance(value, str):
-                component_ids = tuple(
-                    component.component_id
-                    for component in PolymerSequence.from_one_letter(value, polymer_type=entity.polymer_type).components
-                )
+                requested = PolymerSequence.from_one_letter(value, polymer_type=entity.polymer_type).components
             else:
-                component_ids = tuple(value)
-            if len(component_ids) != len(entity):
+                requested = tuple(get_component(component_id) for component_id in value)
+            if len(requested) != len(entity):
                 raise ValueError(
                     f"NA-MPNN sequence for instance {instance_id!r} has length "
-                    f"{len(component_ids)}, expected {len(entity)}"
+                    f"{len(requested)}, expected {len(entity)}"
                 )
-            for component_index, component_id in enumerate(component_ids):
-                overrides[(instance_id, component_index)] = component_id
-        return overrides
+            target_components[instance_id] = tuple(
+                original if original.component_id == replacement.component_id else replacement
+                for original, replacement in zip(entity.components, requested)
+            )
+
+        changed_references = {
+            (instance_id, component_index)
+            for instance_id, entity in polymer_instances
+            for component_index, (original, target) in enumerate(zip(entity.components, target_components[instance_id]))
+            if original.component_id != target.component_id
+        }
+        if not changed_references:
+            return structure
+
+        replacements = {reference: target_components[reference[0]][reference[1]] for reference in changed_references}
+        replacement_atom_ids = {
+            reference: frozenset(atom.atom_id for atom in component.atoms)
+            for reference, component in replacements.items()
+        }
+        system = system.replace_components(replacements)
+        indices: list[int] = []
+        for index, site in enumerate(structure.sites):
+            reference = (site.instance_id, site.component_index)
+            if reference in changed_references and (
+                site.atom_id not in NA_MPNN_ATOM_NAMES or site.atom_id not in replacement_atom_ids[reference]
+            ):
+                continue
+            system.atom(site)
+            indices.append(index)
+        index_array = np.asarray(indices, dtype=np.int64)
+        return Structure(
+            system,
+            tuple(structure.sites[index] for index in indices),
+            structure.coordinates[index_array],
+            structure.coordinate_mask[index_array],
+            None if structure.occupancy is None else structure.occupancy[index_array],
+            None if structure.b_factor is None else structure.b_factor[index_array],
+            structure.residue_numbers,
+        )
 
     # ------------------------------------------------------------------
     # Design / probability arm.

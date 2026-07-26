@@ -9,7 +9,7 @@ from ..registry import MODELS as _MODELS
 from . import pdb as _pdb_io
 from .config import MpnnPackerConfig, MpnnPackerProcessorConfig
 from .model import (
-    MpnnPackerFeatures,
+    MpnnPackerFeatureEncoder,
     MpnnPackerFrame,
     MpnnPackerInput,
     MpnnPackerModel,
@@ -22,11 +22,11 @@ from .processor import MpnnPackerProcessor
 write_pdb = _pdb_io.write_pdb
 
 _MODELS.register(
-    "ofoldx.mpnn_packer",
+    "mpnn_packer",
     model=MpnnPackerModel,
     processor=MpnnPackerProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.mpnn_packer",
+    "mpnn_packer",
     pipeline=MpnnPackerPipeline,
 )

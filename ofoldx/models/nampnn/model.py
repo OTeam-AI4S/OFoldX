@@ -481,8 +481,7 @@ class NaMpnnModel(Model):
     # ------------------------------------------------------------------
     # Probability operations.
     # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def autoregressive_probabilities(
+    def score(
         self,
         input: NaMpnnInput,
         *,
@@ -491,7 +490,7 @@ class NaMpnnModel(Model):
         generator: torch.Generator | None = None,
     ) -> MpnnProbabilityResult:
         r"""
-        Evaluate sequence-conditioned probabilities over decoding orders.
+        Score a sequence with autoregressive probabilities over decoding orders.
 
         Args:
             input: One processed mixed-polymer target.
@@ -526,84 +525,6 @@ class NaMpnnModel(Model):
         )
         return self._probability_result(input, logits, decoding_ranks)
 
-    @torch.inference_mode()
-    def score(
-        self,
-        input: NaMpnnInput,
-        *,
-        num_decoding_orders: int = 1,
-        decoding_ranks: Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> ScoreResult:
-        r"""
-        Score the observed sequence over one or more decoding orders.
-
-        Args:
-            input: One processed mixed-polymer target.
-            num_decoding_orders: Number of decoding orders to evaluate.
-            decoding_ranks: Optional ranks with shape
-                ``(num_decoding_orders, num_residues)``.
-            generator: Random generator used to draw decoding orders.
-
-        Returns:
-            Designed-position and whole-sequence negative log-likelihood scores.
-        """
-
-        probabilities = self.autoregressive_probabilities(
-            input,
-            num_decoding_orders=num_decoding_orders,
-            decoding_ranks=decoding_ranks,
-            generator=generator,
-        )
-        evaluation_count = probabilities.logits.shape[0]
-        losses = -torch.gather(
-            probabilities.log_probabilities,
-            -1,
-            input.sequence_tokens[0].expand(evaluation_count, -1).unsqueeze(-1),
-        ).squeeze(-1)
-        valid = input.residue_mask[0].to(dtype=losses.dtype)
-        designed = (input.residue_mask[0] & input.design_positions[0]).to(dtype=losses.dtype)
-        designed_evaluations = ((losses * designed).sum(dim=-1) / designed.sum()).detach().cpu().numpy()
-        global_evaluations = ((losses * valid).sum(dim=-1) / valid.sum()).detach().cpu().numpy()
-        references = input.component_references[0]
-        designed_scope = frozenset(
-            reference
-            for reference, selected, present in zip(
-                references,
-                input.design_positions[0].detach().cpu().tolist(),
-                input.residue_mask[0].detach().cpu().tolist(),
-            )
-            if reference is not None and selected and present
-        )
-        global_scope = frozenset(
-            reference
-            for reference, present in zip(
-                references,
-                input.residue_mask[0].detach().cpu().tolist(),
-            )
-            if reference is not None and present
-        )
-        return ScoreResult(
-            target=input.structures[0],
-            scores={
-                "designed_sequence_nll": Score(
-                    value=float(designed_evaluations.mean()),
-                    unit="nat/residue",
-                    preferred="lower",
-                    scope=designed_scope,
-                    evaluations=designed_evaluations,
-                ),
-                "global_sequence_nll": Score(
-                    value=float(global_evaluations.mean()),
-                    unit="nat/residue",
-                    preferred="lower",
-                    scope=global_scope,
-                    evaluations=global_evaluations,
-                ),
-            },
-        )
-
-    @torch.inference_mode()
     def unconditional_probabilities(
         self,
         input: NaMpnnInput,
@@ -1222,80 +1143,6 @@ def _component_from_token(token: int, polymer_type: str) -> str:
     if 26 <= token <= 29:
         return ("A", "C", "G", "U")[token - 26]
     raise RuntimeError(f"NA-MPNN sampled non-RNA token {token} for an RNA residue")
-
-
-# Differentiable training objectives published by NA-MPNN.
-#
-# The NA-MPNN training surface owns two ordinary per-token losses over the
-# 33-class protein/DNA/RNA vocabulary. Both consume ``[B, L]`` sequence tokens and
-# ``[B, L, 33]`` vocabulary log probabilities and return the unreduced per-row loss
-# with shape ``sequence_tokens.shape``. The polymer-specific label smoothing
-# distributes its mass only over each row's own polymer residue-type set. Masked mean,
-# accuracy, PPM injection, and the training command's fixed token aggregate belong
-# to a later Runner and are deliberately excluded here.
-
-# Contiguous vocabulary spans of the 33-token alphabet. Protein occupies
-# tokens 0..20 (twenty amino acids plus UNK), DNA tokens 21..25 (DA/DC/DG/DT/DX),
-# and RNA tokens 26..30 (A/C/G/U/RX); MAS and PAD are never smoothing targets.
-_PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
-_DNA_RESIDUE_TYPE_SPAN = (21, 26)
-_RNA_RESIDUE_TYPE_SPAN = (26, 31)
-_POLYMER_PROTEIN = 0
-_POLYMER_DNA = 1
-_POLYMER_RNA = 2
-
-
-def nampnn_polymer_label_smoothed_nll_loss(
-    sequence_tokens: Tensor,
-    log_probabilities: Tensor,
-    polymer_type_index: Tensor,
-    *,
-    weight: float = 0.1,
-) -> Tensor:
-    r"""
-    Compute polymer-specific label-smoothed cross entropy.
-
-    Args:
-        sequence_tokens: Target token IDs with shape ``(..., L)``.
-        log_probabilities: Vocabulary log probabilities with shape ``(..., L, V)``.
-        polymer_type_index: Protein, DNA, or RNA category IDs with shape ``(..., L)``.
-        weight: Smoothing mass distributed over tokens of the same polymer type.
-
-    Returns:
-        Per-residue losses with shape ``(..., L)``.
-    """
-
-    num_classes = log_probabilities.shape[-1]
-    device = log_probabilities.device
-    dtype = log_probabilities.dtype
-    target = F.one_hot(sequence_tokens, num_classes).to(dtype)
-
-    def span_mask(span: tuple[int, int]) -> Tensor:
-        mask = torch.zeros(num_classes, device=device, dtype=dtype)
-        mask[span[0] : span[1]] = 1.0
-        return mask
-
-    protein_set = span_mask(_PROTEIN_RESIDUE_TYPE_SPAN)
-    dna_set = span_mask(_DNA_RESIDUE_TYPE_SPAN)
-    rna_set = span_mask(_RNA_RESIDUE_TYPE_SPAN)
-    residue_type_mask = protein_set + dna_set + rna_set
-
-    target = target * torch.where(
-        residue_type_mask.bool(),
-        1.0 - weight,
-        torch.ones((), device=device, dtype=dtype),
-    )
-
-    protein_rows = (polymer_type_index == _POLYMER_PROTEIN).to(dtype).unsqueeze(-1)
-    dna_rows = (polymer_type_index == _POLYMER_DNA).to(dtype).unsqueeze(-1)
-    rna_rows = (polymer_type_index == _POLYMER_RNA).to(dtype).unsqueeze(-1)
-    eps = (
-        protein_rows * protein_set * (weight / (_PROTEIN_RESIDUE_TYPE_SPAN[1] - _PROTEIN_RESIDUE_TYPE_SPAN[0]))
-        + dna_rows * dna_set * (weight / (_DNA_RESIDUE_TYPE_SPAN[1] - _DNA_RESIDUE_TYPE_SPAN[0]))
-        + rna_rows * rna_set * (weight / (_RNA_RESIDUE_TYPE_SPAN[1] - _RNA_RESIDUE_TYPE_SPAN[0]))
-    )
-    target = target + eps
-    return -(target * log_probabilities).sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
     Protein sequence design pipeline for ProteinMPNN.
     """
 
+    model_architecture = "proteinmpnn"
+
     def design(
         self,
         input: Structure | str | PathLike[str],

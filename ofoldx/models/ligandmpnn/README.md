@@ -62,12 +62,13 @@ pip install ofoldx
 
 ### Sequence Design
 
-Use the high-level `design` API:
+Load the concrete design Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.design("complex.cif", model="oteam/ligandmpnn")
+pipeline = ofoldx.pipeline("design", model="oteam/ligandmpnn")
+output = pipeline.design("complex.cif")
 ```
 
 ## Training Details

@@ -63,12 +63,13 @@ pip install ofoldx
 
 ### Sequence Design
 
-Use the high-level `design` API:
+Load the concrete design Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.design("complex.cif", model="oteam/nampnn")
+pipeline = ofoldx.pipeline("design", model="oteam/nampnn")
+output = pipeline.design("complex.cif")
 ```
 
 ## Training Details
@@ -82,8 +83,11 @@ specificity, respectively.
 ### Training Procedure
 
 `NaMpnnModel.forward` supports protein, DNA, and RNA coordinate
-noise and optional protein-first decoding. OFoldX also exposes the
-label-smoothed sequence objective used by the model.
+noise and optional protein-first decoding.
+`ofoldx.models.nampnn.objectives` exposes the released unreduced `nll_loss`
+and polymer-specific `smoothed_loss`. The latter supports both shared and
+separate DNA/RNA token layouts and the released aligned target-probability rows;
+masking and reduction remain caller-owned.
 
 ## Citation
 

@@ -229,6 +229,7 @@ class MpnnPackerProcessor(Processor):
                 structure.coordinates[np.asarray(indices)],
                 structure.coordinate_mask[np.asarray(indices)],
                 None if structure.occupancy is None else structure.occupancy[np.asarray(indices)],
+                None if structure.b_factor is None else structure.b_factor[np.asarray(indices)],
                 structure.residue_numbers,
             )
 
@@ -283,6 +284,7 @@ class MpnnPackerProcessor(Processor):
                 structure.coordinates,
                 structure.coordinate_mask,
                 structure.occupancy,
+                structure.b_factor,
                 structure.residue_numbers,
             )
 
