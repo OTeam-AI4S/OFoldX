@@ -259,7 +259,7 @@ def _normalize_triangle_multiplication_key(rest: str, *, outgoing: bool) -> str:
     # column ``j``) and uses the canonical incoming einsum ``"...kih,...kjh->...ijh"``. OpenFold's
     # ``a``/``b`` factors map straight through for the outgoing update, but the incoming update must
     # swap ``a`` (left) <-> ``b`` (right) — value and gate together — so the canonical einsum
-    # reproduces DeepMind's ``"...kjc,...kic->..."`` incoming contraction. See TRUNK_EINSUM_LOCK.md.
+    # reproduces DeepMind's ``"...kjc,...kic->..."`` incoming contraction.
     if outgoing:
         left_value, right_value = "left_projection.", "right_projection."
         left_gate, right_gate = "left_gate_projection.", "right_gate_projection."
@@ -285,7 +285,7 @@ def _normalize_triangle_multiplication_key(rest: str, *, outgoing: bool) -> str:
 def _normalize_triangle_attention_key(rest: str) -> str:
     # The unified TriangleAttention (shared bias-free module + the AlphaFold 2 subclass) registers its
     # pre-attention LayerNorm as ``pair_norm`` and its per-head triangle-bias projection as
-    # ``bias_projection`` (the OpenFold names are ``layer_norm``/``linear``). See TRUNK_EINSUM_LOCK.md.
+    # ``bias_projection`` (the OpenFold names are ``layer_norm``/``linear``).
     if rest.startswith("layer_norm."):
         return "pair_norm." + rest.removeprefix("layer_norm.")
     if rest.startswith("linear."):

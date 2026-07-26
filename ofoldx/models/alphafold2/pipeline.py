@@ -29,6 +29,8 @@ class AlphaFold2Pipeline(PairedPipeline[AlphaFold2Model, AlphaFold2Processor]):
     Structure prediction pipeline for AlphaFold 2.
     """
 
+    model_architecture = "alphafold2"
+
     def fold(
         self,
         input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
@@ -81,6 +83,8 @@ class AlphaFold2MultimerPipeline(PairedPipeline[AlphaFold2MultimerModel, AlphaFo
     r"""
     Multimer structure prediction pipeline for AlphaFold-Multimer.
     """
+
+    model_architecture = "alphafold2_multimer"
 
     def fold(
         self,

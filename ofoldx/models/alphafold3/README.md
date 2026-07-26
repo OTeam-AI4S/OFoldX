@@ -45,7 +45,7 @@ ipTM, disorder, and ranking scores.
 
 | Pairformer Blocks | Template Blocks | Denoiser Blocks | Single Size | Pair Size | Recycling Steps | Sampling Steps | Num Parameters (M) | FLOPs (G) |
 | ----------------- | --------------- | --------------- | ----------- | --------- | --------------- | -------------- | ------------------ | --------- |
-| 48                | 2               | 24              | 384         | 128       | 4               | 200            | 368.317            | 1226.198  |
+| 48                | 2               | 24              | 384         | 128       | 11              | 200            | 368.317            | 1226.198  |
 
 ### Links
 
@@ -73,6 +73,10 @@ import ofoldx
 
 output = ofoldx.fold("input.cif", model="oteam/alphafold3")
 ```
+
+`AlphaFold3Model.sample` exposes the raw final single and pair representations,
+coordinate samples, distogram logits, and confidence logits. The high-level
+`fold` API decodes those predictions into a `FoldResult`.
 
 ## Training Details
 

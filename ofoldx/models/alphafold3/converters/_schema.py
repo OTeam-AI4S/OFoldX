@@ -39,6 +39,7 @@ class AF3Node:
 
 _MSA_UPDATE_PREFIX = "msa_update."
 _PAIRFORMER_BLOCK = re.compile(r"blocks\.(\d+)\.(.+)")
+_MSA_FINAL_BLOCK = 3
 
 
 def resolve(model_key: str) -> AF3Node | None:
@@ -85,6 +86,23 @@ def resolve(model_key: str) -> AF3Node | None:
 def _resolve_msa(rest: str) -> AF3Node | None:
     if rest in ("msa_projection.weight", "token_projection.weight"):
         return AF3Node("msa", "", rest, None)
+    if rest.startswith("final_pair_update."):
+        inner = rest.removeprefix("final_pair_update.")
+        if inner.startswith("outer_product_mean."):
+            return AF3Node(
+                "msa_outer_product_mean",
+                "",
+                inner.removeprefix("outer_product_mean."),
+                _MSA_FINAL_BLOCK,
+            )
+        if inner.startswith("triangle_pair_update."):
+            return AF3Node(
+                "pairformer",
+                "msa_pair",
+                inner.removeprefix("triangle_pair_update."),
+                _MSA_FINAL_BLOCK,
+            )
+        return None
     match = _PAIRFORMER_BLOCK.fullmatch(rest)
     if match is None:
         return None

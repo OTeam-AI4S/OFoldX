@@ -33,7 +33,19 @@ from torch import Tensor
 from ..config import AlphaFold2Config
 from ..model import AlphaFold2Model
 
-_MODEL_NAME_RE = re.compile(r"^model_[1-5](?:_ptm|_multimer(?:_v[123])?)?$")
+_MODEL_NAME_RE = re.compile(r"^model_[1-5](?:_ptm|_multimer(?:_v[23])?)?$")
+_MONOMER_MSA_LIMITS = {
+    "model_1": (508, 5120),
+    "model_2": (508, 1024),
+    "model_3": (512, 5120),
+    "model_4": (512, 5120),
+    "model_5": (512, 1024),
+    "model_1_ptm": (508, 5120),
+    "model_2_ptm": (508, 1024),
+    "model_3_ptm": (512, 5120),
+    "model_4_ptm": (512, 5120),
+    "model_5_ptm": (512, 1024),
+}
 _PARAMETER_NAME_MAP = {
     "weights": ("weight",),
     "scale": ("weight",),
@@ -446,7 +458,7 @@ def _rename_outer_product_mean_norm(normalized: list[str]) -> list[str]:
 # ``left_gate``/``right_gate``/``gating_linear``). For the *incoming* update the shared module fixes the
 # canonical einsum ``"...kih,...kjh->...ijh"`` (left owns row ``i``, right owns column ``j``), so the
 # left/right value and gate projections must swap to reproduce DeepMind's own ``"...kjc,...kic->..."``
-# incoming contraction. Outgoing loads straight through. See TRUNK_EINSUM_LOCK.md.
+# incoming contraction. Outgoing loads straight through.
 _TRIANGLE_MULTIPLICATION_CHILD_MAP = {
     "layer_norm_input": "input_norm",
     "center_layer_norm": "output_norm",
@@ -697,8 +709,13 @@ def _model_family(model_name: str) -> str:
 def _model_config_overrides(model_name: str) -> dict[str, object]:
     pae_enabled = _model_family(model_name) != "monomer"
     template_enabled = _model_index(model_name) <= 2
+    max_msa_clusters, max_extra_msa = _MONOMER_MSA_LIMITS[model_name]
     return {
         "heads": {"predicted_aligned_error": {"enabled": pae_enabled}},
+        "msa": {
+            "max_msa_clusters": max_msa_clusters,
+            "max_extra_msa": max_extra_msa,
+        },
         "template": {"enabled": template_enabled},
     }
 

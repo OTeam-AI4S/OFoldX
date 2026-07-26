@@ -6,7 +6,13 @@ from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
-from .config import AlphaFold3Config, AlphaFold3ProcessorConfig
+from .config import (
+    AlphaFold3ConfidenceConfig,
+    AlphaFold3Config,
+    AlphaFold3ProcessorConfig,
+    AlphaFold3TemplateConfig,
+    AlphaFold3TrunkConfig,
+)
 from .model import (
     AlphaFold3Input,
     AlphaFold3Model,
@@ -24,12 +30,12 @@ from .pipeline import AlphaFold3Pipeline
 from .processor import AlphaFold3Processor
 
 _MODELS.register(
-    "ofoldx.alphafold3",
+    "alphafold3",
     model=AlphaFold3Model,
     processor=AlphaFold3Processor,
 )
 
 _PIPELINES.register(
-    "ofoldx.alphafold3",
+    "alphafold3",
     pipeline=AlphaFold3Pipeline,
 )

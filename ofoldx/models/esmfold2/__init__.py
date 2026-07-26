@@ -48,23 +48,23 @@ from .processor import (
 )
 
 _MODELS.register(
-    "ofoldx.esmfold2",
+    "esmfold2",
     model=EsmFold2Model,
     processor=EsmFold2Processor,
 )
 
 _MODELS.register(
-    "ofoldx.esmfold2_experimental",
+    "esmfold2_experimental",
     model=EsmFold2ExperimentalModel,
     processor=EsmFold2ExperimentalProcessor,
 )
 
 _PIPELINES.register(
-    "ofoldx.esmfold2",
+    "esmfold2",
     pipeline=EsmFold2Pipeline,
 )
 
 _PIPELINES.register(
-    "ofoldx.esmfold2_design",
+    "esmfold2_design",
     pipeline=EsmFold2DesignPipeline,
 )

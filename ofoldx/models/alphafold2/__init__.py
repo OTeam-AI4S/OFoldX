@@ -39,20 +39,20 @@ from .pipeline import AlphaFold2MultimerPipeline, AlphaFold2Pipeline
 from .processor import AlphaFold2Processor
 
 _MODELS.register(
-    "ofoldx.alphafold2",
+    "alphafold2",
     model=AlphaFold2Model,
     processor=AlphaFold2Processor,
 )
 _MODELS.register(
-    "ofoldx.alphafold2_multimer",
+    "alphafold2_multimer",
     model=AlphaFold2MultimerModel,
     processor=AlphaFold2MultimerProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.alphafold2",
+    "alphafold2",
     pipeline=AlphaFold2Pipeline,
 )
 _PIPELINES.register(
-    "ofoldx.alphafold2_multimer",
+    "alphafold2_multimer",
     pipeline=AlphaFold2MultimerPipeline,
 )

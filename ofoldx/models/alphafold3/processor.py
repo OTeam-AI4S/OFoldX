@@ -509,8 +509,8 @@ def _features(
         reference_mask=integer(reference_mask),
         reference_charges=floating(reference_charges[:, None]),
         token_bonds=floating(token_bonds),
-        msa_features=None if msa_features is None else floating(msa_features),
-        msa_mask=None if msa_mask is None else floating(msa_mask),
+        msa_features=floating(msa_features),
+        msa_mask=floating(msa_mask),
         template_features=(
             None if template_features is None else _template_to(template_features, device=device, dtype=dtype)
         ),
@@ -664,9 +664,10 @@ def _msa_rows_and_deletions(
             instance_id = cast(str, token["instance_id"])
             monomer_index = cast(int | None, token["monomer_index"])
             selected = select_msa_binding(bindings, entity_id, instance_id)
-            if query or selected is None or _msa_polymer_type(system, entity_id) != "protein":
-                rows[row_index, token_index] = cast(int, token["residue_type"])
-            elif selected[0] not in descriptor:
+            polymer_type = _msa_polymer_type(system, entity_id)
+            if query:
+                rows[row_index, token_index] = _GAP if polymer_type is None else cast(int, token["residue_type"])
+            elif selected is None or polymer_type != "protein" or selected[0] not in descriptor:
                 rows[row_index, token_index] = _GAP
             else:
                 key, value = selected
@@ -685,13 +686,11 @@ def _msa_features(
     system: MolecularSystem,
     *,
     max_rows: int,
-) -> tuple[Tensor | None, Tensor | None]:
+) -> tuple[Tensor, Tensor]:
     r"""
     Build the AlphaFold 3 ``msa_features`` = one-hot(32) + has_deletion + deletion_value.
     """
 
-    if msa is None:
-        return None, None
     rows, deletions = _msa_rows_and_deletions(msa, tokens, system, max_rows=max_rows)
     has_deletion = deletions.clamp(0.0, 1.0)
     deletion_value = torch.atan(deletions / 3.0) * (2.0 / math.pi)
@@ -718,8 +717,9 @@ def _profile_features(
         instance_id = cast(str, token["instance_id"])
         monomer_index = cast(int | None, token["monomer_index"])
         selected = select_msa_binding(bindings, entity_id, instance_id)
-        if selected is None or _msa_polymer_type(system, entity_id) != "protein":
-            profile[token_index, cast(int, token["residue_type"])] = 1
+        polymer_type = _msa_polymer_type(system, entity_id)
+        if selected is None or polymer_type != "protein":
+            profile[token_index, _GAP if polymer_type is None else cast(int, token["residue_type"])] = 1
             continue
         _key, value = selected
         column = cast(int, monomer_index)

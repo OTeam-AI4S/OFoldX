@@ -32,6 +32,8 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
     Structure prediction pipeline for AlphaFold 3.
     """
 
+    model_architecture = "alphafold3"
+
     def fold(
         self,
         input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
@@ -54,9 +56,9 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
             templates: Template structures aligned to target polymers.
             num_samples: Number of diffusion samples. ``None`` uses five.
             seed: Optional diffusion seed, mutually exclusive with ``generator``.
-            generator: Optional generator for initial coordinates, churn, and rigid
-                augmentations. Mutually exclusive with ``seed``.
-            recycling_steps: Number of representation recycling iterations. ``None`` uses the
+            generator: Optional generator for per-recycle MSA permutations, initial
+                coordinates, churn, and rigid augmentations. Mutually exclusive with ``seed``.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
 

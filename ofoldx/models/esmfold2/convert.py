@@ -361,7 +361,7 @@ def _translate_biohub_state_key(name: str) -> str:
         (".atom_norm.", ".input_norm."),
         (".atom_to_token_linear.", ".token_projection."),
         (".token_to_atom_linear.", ".token_projection."),
-        (".atom_transformer.", ".transformer."),
+        (".atom_transformer.", ".encoder."),
         (".coords_linear.", ".coordinate_projection."),
         (".atom_decoder.norm.", ".atom_decoder.output_norm."),
         (".atom_decoder.output_linear.", ".atom_decoder.coordinate_projection."),
@@ -385,7 +385,7 @@ def _translate_biohub_state_key(name: str) -> str:
         (".msa_pair_weighted_averaging.compute_bias.0.", ".msa_pair_weighted_averaging.pair_norm."),
         (
             ".msa_pair_weighted_averaging.compute_bias.1.",
-            ".msa_pair_weighted_averaging.pair_bias_projection.",
+            ".msa_pair_weighted_averaging.pair_projection.",
         ),
         (".msa_pair_weighted_averaging.Wv.", ".msa_pair_weighted_averaging.value_projection."),
         (".msa_pair_weighted_averaging.Wgate.", ".msa_pair_weighted_averaging.gate_projection."),
@@ -745,7 +745,7 @@ def save_experimental_esmfold2_checkpoint(
     ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
     MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
     [`EsmFold2DesignPipeline`][], whose save contract persists them under ``esmc/`` and
-    writes the ``ofoldx.esmfold2_design`` root marker only after the complete artifact.
+    writes the ``esmfold2_design`` root marker only after the complete artifact.
     The resulting repository is routed through
     ``ofoldx.pipeline("design", model=...)``, which delegates loading to
     [`EsmFold2DesignPipeline.from_repository`][].

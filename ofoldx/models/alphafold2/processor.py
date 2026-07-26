@@ -319,8 +319,6 @@ def _prepare_alphafold2_features(
         layout=AlphaFold2Layout(
             system=system,
             residue_sites=tuple((instance_id, index) for index in range(len(target))),
-            msa=msa,
-            templates=templates,
         ),
         template_residue_type_ids=template_residue_type_ids.to(device=device).unsqueeze(0),
         **placed,

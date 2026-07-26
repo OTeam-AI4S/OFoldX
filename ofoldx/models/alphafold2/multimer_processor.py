@@ -167,7 +167,7 @@ def multimer_chains(system: MolecularSystem) -> tuple[MultimerChain, ...]:
     """
 
     if len(system.instances) < 2:
-        raise ValueError("AlphaFold-Multimer requires at least two chain instances; use ofoldx.alphafold2 for monomers")
+        raise ValueError("AlphaFold-Multimer requires at least two chain instances; use alphafold2 for monomers")
     grouped: dict[tuple[object, ...], list[tuple[str, str, PolymerSequence]]] = {}
     for instance_id, entity_id in system.instances.items():
         entity = system.entities[entity_id]
@@ -309,8 +309,6 @@ def prepare_multimer_features(
             system=system,
             residue_sites=residue_sites,
             chain_boundaries=chain_boundaries,
-            msa=msa,
-            templates=templates,
         ),
         **placed,
         **placed_integral,

@@ -446,7 +446,6 @@ def _prepare_esmfold2_features(
             system=system,
             atom_sites=atom_sites,
             token_sites=tuple(token_sites),
-            msa=msa,
         ),
     )
 

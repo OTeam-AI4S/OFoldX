@@ -36,6 +36,23 @@ _MULTIMER_INPUT_EMBEDDING_SCOPE_MAP = {
     "left_single": "pair_left_projection",
     "right_single": "pair_right_projection",
 }
+_MULTIMER_MSA_LIMITS = {
+    "model_1_multimer": (252, 1152),
+    "model_2_multimer": (252, 1152),
+    "model_3_multimer": (252, 1152),
+    "model_4_multimer": (252, 1152),
+    "model_5_multimer": (252, 1152),
+    "model_1_multimer_v2": (252, 1152),
+    "model_2_multimer_v2": (252, 1152),
+    "model_3_multimer_v2": (252, 1152),
+    "model_4_multimer_v2": (252, 1152),
+    "model_5_multimer_v2": (252, 1152),
+    "model_1_multimer_v3": (508, 2048),
+    "model_2_multimer_v3": (508, 2048),
+    "model_3_multimer_v3": (508, 2048),
+    "model_4_multimer_v3": (508, 1152),
+    "model_5_multimer_v3": (508, 1152),
+}
 
 
 def convert_deepmind_multimer_checkpoint(
@@ -49,7 +66,7 @@ def convert_deepmind_multimer_checkpoint(
     """
 
     converted = convert_official_multimer_state_dict(params, dtype=dtype)
-    model_config = AlphaFold2MultimerConfig(_multimer_config_overrides())
+    model_config = AlphaFold2MultimerConfig(_multimer_config_overrides(model_name))
     with torch.device("meta"):
         model = AlphaFold2MultimerModel(model_config)
     model.load_state_dict(converted, strict=True, assign=True)
@@ -98,7 +115,7 @@ def convert_official_multimer_state_dict(
 # ``projection``/``gate`` split ``proj[:c]`` = operand ``a`` and ``proj[c:]`` = operand ``b``; the
 # outgoing update loads ``a``->left, ``b``->right, while the incoming update swaps ``a``->right,
 # ``b``->left (value and gate together) to reproduce DeepMind's ``"...kjc,...kic->..."`` incoming
-# contraction. See TRUNK_EINSUM_LOCK.md.
+# contraction.
 _TRIANGLE_MULTIPLICATION_SCOPES = (
     "triangle_multiplication_outgoing",
     "triangle_multiplication_incoming",
@@ -210,12 +227,17 @@ def normalize_multimer_param_key(key: str) -> str:
     return normalized
 
 
-def _multimer_config_overrides() -> dict[str, object]:
+def _multimer_config_overrides(model_name: str) -> dict[str, object]:
     r"""
-    AF-Multimer v3 always carries templates and the interface-TM head.
+    Return the released MSA limits, template path, and interface-TM head.
     """
 
+    max_msa_clusters, max_extra_msa = _MULTIMER_MSA_LIMITS[model_name]
     return {
         "heads": {"predicted_aligned_error": {"enabled": True}},
+        "msa": {
+            "max_msa_clusters": max_msa_clusters,
+            "max_extra_msa": max_extra_msa,
+        },
         "template": {"enabled": True},
     }

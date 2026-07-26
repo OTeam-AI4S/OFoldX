@@ -23,7 +23,16 @@ from ...artifacts import save_model
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import AMINO_ACID_THREE_TO_ONE, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...hub import resolve_repository, upload_repository
+from ...hub import (
+    MIRROR_REPOSITORY,
+    PROCESSOR_METADATA,
+    hydrate_weights,
+    load_registered_model,
+    load_registered_processor,
+    model_values,
+    resolve_repository,
+    upload_repository,
+)
 from ...io import read_fasta_records, read_msa
 from ...pipelines import PIPELINES, PairedPipeline, resolve_generator
 from ...references import classify_reference
@@ -87,12 +96,23 @@ _TEMPERATURE_MIN = 1e-2
 _ESMC_MASK_FRACTION = 0.15
 _LM_MASK_PASSES = 4
 _LM_LOSS_CHUNK = 128
+_ESMC_METADATA = (
+    "config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.txt",
+)
+_DESIGN_REPOSITORY_METADATA = (*PROCESSOR_METADATA, *(f"esmc/{filename}" for filename in _ESMC_METADATA))
+_DESIGN_REPOSITORY_MIRROR = (*MIRROR_REPOSITORY, *_DESIGN_REPOSITORY_METADATA)
 
 
 class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
     r"""
     Structure prediction pipeline for ESMFold 2.
     """
+
+    model_architecture = "esmfold2"
 
     def fold(
         self,
@@ -178,6 +198,8 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
     Binder sequence design pipeline for experimental ESMFold 2.
     """
 
+    model_architecture = "esmfold2_experimental"
+
     @classmethod
     def from_repository(
         cls,
@@ -202,21 +224,86 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             An ``EsmFold2DesignPipeline`` with the masked-LM child attached.
         """
 
-        from multimolecule import AutoTokenizer, ProteinTokenizer
-        from transformers import AutoModelForMaskedLM
+        from multimolecule import AutoTokenizer, EsmCConfig, EsmCForMaskedLM, ProteinTokenizer
+        from transformers import AutoConfig, AutoModelForMaskedLM
 
-        root = resolve_repository(repository, revision=revision, token=token).path
-        pipeline = super().from_repository(root, token=token, device=device, dtype=dtype)
-        esmc_repository = root / "esmc"
-        pipeline.processor.tokenizer = cast(
-            ProteinTokenizer,
-            AutoTokenizer.from_pretrained(esmc_repository, local_files_only=True),
+        metadata_repository = resolve_repository(
+            repository,
+            revision=revision,
+            allow_patterns=_DESIGN_REPOSITORY_METADATA,
+            token=token,
         )
-        esmc = AutoModelForMaskedLM.from_pretrained(esmc_repository, local_files_only=True, dtype=dtype)
+        registration, values = model_values(metadata_repository.path)
+        if registration.id != cls.model_architecture:
+            raise ValueError(
+                f"{cls.__name__} requires architecture {cls.model_architecture!r}; "
+                f"repository declares {registration.id!r}"
+            )
+        config = registration.model_config(values)
+        with torch.device("meta"):
+            model = registration.model(config)
+        processor = load_registered_processor(
+            metadata_repository,
+            registration,
+            device=device,
+            dtype=dtype,
+        )
+
+        esmc_metadata = metadata_repository.path / "esmc"
+        esmc_config = AutoConfig.from_pretrained(esmc_metadata, local_files_only=True)
+        if type(esmc_config) is not EsmCConfig:
+            raise ValueError(f"{cls.__name__} requires an ESMC child; repository declares {esmc_config.model_type!r}")
+        tokenizer = cast(
+            ProteinTokenizer,
+            AutoTokenizer.from_pretrained(
+                esmc_metadata,
+                config=esmc_config,
+                local_files_only=True,
+            ),
+        )
+        with torch.device("meta"):
+            esmc_graph = AutoModelForMaskedLM.from_config(esmc_config)
+        del esmc_graph
+
+        root_repository = hydrate_weights(metadata_repository, token=token)
+        model = load_registered_model(
+            root_repository,
+            model,
+            device=device,
+            dtype=dtype,
+        )
+        if metadata_repository.repository is None:
+            esmc = cast(
+                EsmCForMaskedLM,
+                AutoModelForMaskedLM.from_pretrained(
+                    metadata_repository.path / "esmc",
+                    config=esmc_config,
+                    local_files_only=True,
+                    dtype=dtype,
+                ),
+            )
+        else:
+            esmc = cast(
+                EsmCForMaskedLM,
+                AutoModelForMaskedLM.from_pretrained(
+                    metadata_repository.repository,
+                    revision=metadata_repository.commit,
+                    subfolder="esmc",
+                    token=token,
+                    config=esmc_config,
+                    dtype=dtype,
+                ),
+            )
         if device is not None:
             esmc.to(device=device)
-        pipeline.model.load_esmc(esmc)
-        return pipeline
+        experimental_processor = cast(EsmFold2ExperimentalProcessor, processor)
+        experimental_processor.tokenizer = tokenizer
+        experimental_model = cast(EsmFold2ExperimentalModel, model)
+        experimental_model.load_esmc(esmc)
+        return cls(
+            model=experimental_model,
+            processor=experimental_processor,
+        )
 
     def save(
         self,
@@ -245,6 +332,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
         pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is None:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
+        self._validate_pair(self.model, self.processor)
         esmc = self.model.esmc
         lm_head = self.model.esmc_lm_head
         if esmc is None or lm_head is None:
@@ -266,6 +354,8 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
 
         esmc_destination = destination / "esmc"
         esmc_destination.mkdir(parents=True, exist_ok=True)
+        for filename in _ESMC_METADATA:
+            (esmc_destination / filename).unlink(missing_ok=True)
         esmc.config.save_pretrained(esmc_destination)
         esmc_state = {f"model.{name}": value for name, value in esmc.state_dict().items()}
         esmc_state.update({f"lm_head.{name}": value for name, value in lm_head.state_dict().items()})
@@ -286,6 +376,7 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
                 token=token,
                 private=private,
                 commit_message=commit_message,
+                delete_patterns=_DESIGN_REPOSITORY_MIRROR,
             )
 
     def design(
@@ -520,6 +611,10 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
             "iptm": Score(float(confidence.iptm[0].item()), preferred="higher"),
             "ptm": Score(float(confidence.ptm[0].item()), preferred="higher"),
             "mean_plddt": Score(float(confidence.mean_plddt[0].item()) * 100.0, preferred="higher"),
+            "complex_iplddt": Score(
+                float(confidence.complex_iplddt[0].item()) * 100.0,
+                preferred="higher",
+            ),
             "distogram_iptm_proxy": Score(proxy, preferred="higher"),
         }
         layout = batch.layout
@@ -533,13 +628,23 @@ class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2E
                 values=confidence.plddt_per_atom[0, :atom_count].float().cpu().numpy() * 100.0,
                 axis=layout.atom_sites,
             ),
+            "plddt_ca": Metric(
+                values=confidence.plddt_ca[0].float().cpu().numpy() * 100.0,
+                axis=layout.token_sites,
+            ),
         }
+        chain_axis = tuple(layout.system.instances)
         pair_metrics = {
             "pae": PairMetric(
                 values=confidence.pae[0].float().cpu().numpy(),
                 row_axis=layout.token_sites,
                 column_axis=layout.token_sites,
                 unit="angstrom",
+            ),
+            "chain_pair_iptm": PairMetric(
+                values=confidence.chain_pair_iptm[0].float().cpu().numpy(),
+                row_axis=chain_axis,
+                column_axis=chain_axis,
             ),
         }
         return EsmFold2DesignCandidate(structure=structure, scores=scores, metrics=metrics, pair_metrics=pair_metrics)

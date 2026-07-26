@@ -15,14 +15,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import AtomSite, MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules import residue_constants
 from ...modules.attention import GatedMultiheadAttention
 from ...modules.backend import LayerNorm
-from ...modules.dropout import RowwiseDropout
+from ...modules.dropout import StructuredDropout
 from ...modules.head import DistogramHead, tm_bin_weights
 from ...modules.trunk.evoformer import (
     EvoformerStack,
@@ -250,10 +249,16 @@ class AlphaFold2Model(Model):
             single=single,
             pair=pair,
             frames=structure.traj,
+            atom14_positions=structure.atom14_positions,
+            sidechain_frames=structure.sidechain_frames,
             final_atom_positions=structure.final_atom_positions,
             final_atom_mask=structure.final_atom_mask,
+            final_atom14_positions=structure.final_atom14_positions,
+            final_atom14_mask=structure.final_atom14_mask,
             sidechain_angles=structure.sidechain_angles,
             sidechain_unnormalized_angles=structure.sidechain_unnormalized_angles,
+            true_msa=realized.true_msa,
+            bert_mask=realized.bert_mask,
             distogram_logits=distogram_logits,
             masked_msa_logits=masked_msa_logits,
             plddt_logits=plddt_logits,
@@ -461,28 +466,32 @@ class AlphaFold2Model(Model):
 
         device = input.token_features.device
         dtype = input.token_features.dtype
-        (
-            msa_features,
-            msa_mask,
-            extra_msa_features,
-            extra_msa_mask,
-            bert_mask,
-            true_msa,
-        ) = self._realize_msa_features(
-            input.msa_tokens[0],
-            input.msa_deletions[0],
-            input.msa_profile[0],
-            generator=generator,
-            device=device,
-            dtype=dtype,
+        realized_batch = [
+            self._realize_msa_features(
+                msa_tokens,
+                msa_deletions,
+                msa_profile,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            for msa_tokens, msa_deletions, msa_profile in zip(
+                input.msa_tokens,
+                input.msa_deletions,
+                input.msa_profile,
+                strict=True,
+            )
+        ]
+        msa_features, msa_mask, extra_msa_features, extra_msa_mask, bert_mask, true_msa = (
+            torch.stack(values) for values in zip(*realized_batch, strict=True)
         )
         realized = copy(input)
-        realized.msa_features = msa_features.unsqueeze(0)
-        realized.msa_mask = msa_mask.unsqueeze(0)
-        realized.extra_msa_features = extra_msa_features.unsqueeze(0)
-        realized.extra_msa_mask = extra_msa_mask.unsqueeze(0)
-        realized.bert_mask = bert_mask.unsqueeze(0)
-        realized.true_msa = true_msa.unsqueeze(0)
+        realized.msa_features = msa_features
+        realized.msa_mask = msa_mask
+        realized.extra_msa_features = extra_msa_features
+        realized.extra_msa_mask = extra_msa_mask
+        realized.bert_mask = bert_mask
+        realized.true_msa = true_msa
         return realized
 
     def _realize_msa_features(
@@ -950,8 +959,12 @@ class AlphaFold2StructureModule(nn.Module):
         affine = AlphaFold2QuatAffine.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
 
         affines = []
+        atom14_trajectory = []
+        sidechain_frame_trajectory = []
+        sidechain_angle_trajectory = []
+        sidechain_unnormalized_angle_trajectory = []
         for _ in range(self.num_blocks):
-            act, affine, angles, unnormalized_angles, atom14_positions, raw_affine = self.block(
+            act, affine, angles, unnormalized_angles, sidechain_frames, atom14_positions, raw_affine = self.block(
                 act=act,
                 pair=pair,
                 mask=sequence_mask,
@@ -960,8 +973,19 @@ class AlphaFold2StructureModule(nn.Module):
                 residue_type_ids=residue_type_ids,
             )
             affines.append(raw_affine.to_tensor())
+            atom14_trajectory.append(atom14_positions)
+            sidechain_frame_trajectory.append(sidechain_frames.to_tensor4x4())
+            sidechain_angle_trajectory.append(angles)
+            sidechain_unnormalized_angle_trajectory.append(unnormalized_angles)
 
         traj = torch.stack(affines, dim=0)
+        atom14_trajectory_tensor = torch.stack(atom14_trajectory, dim=0)
+        sidechain_frame_trajectory_tensor = torch.stack(sidechain_frame_trajectory, dim=0)
+        sidechain_angle_trajectory_tensor = torch.stack(sidechain_angle_trajectory, dim=0)
+        sidechain_unnormalized_angle_trajectory_tensor = torch.stack(
+            sidechain_unnormalized_angle_trajectory,
+            dim=0,
+        )
         traj_scale = traj.new_tensor(
             [1.0, 1.0, 1.0, 1.0, self.position_scale, self.position_scale, self.position_scale],
         )
@@ -976,8 +1000,10 @@ class AlphaFold2StructureModule(nn.Module):
             final_atom14_mask=atom14_mask,
             final_affines=traj[-1],
             traj=traj,
-            sidechain_angles=angles,
-            sidechain_unnormalized_angles=unnormalized_angles,
+            atom14_positions=atom14_trajectory_tensor,
+            sidechain_frames=sidechain_frame_trajectory_tensor,
+            sidechain_angles=sidechain_angle_trajectory_tensor,
+            sidechain_unnormalized_angles=sidechain_unnormalized_angle_trajectory_tensor,
         )
 
 
@@ -1035,8 +1061,12 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         rigid = AlphaFold2Rigid.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
 
         frames = []
+        atom14_trajectory = []
+        sidechain_frame_trajectory = []
+        sidechain_angle_trajectory = []
+        sidechain_unnormalized_angle_trajectory = []
         for _ in range(self.num_blocks):
-            act, rigid, angles, unnormalized_angles, atom14_positions = self.block(
+            act, rigid, angles, unnormalized_angles, sidechain_frames, atom14_positions = self.block(
                 act=act,
                 pair=pair,
                 mask=sequence_mask,
@@ -1048,8 +1078,19 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             frames.append(
                 torch.cat([scaled.rotation.reshape(*scaled.rotation.shape[:-2], 9), scaled.translation], dim=-1)
             )
+            atom14_trajectory.append(atom14_positions)
+            sidechain_frame_trajectory.append(sidechain_frames.to_tensor4x4())
+            sidechain_angle_trajectory.append(angles)
+            sidechain_unnormalized_angle_trajectory.append(unnormalized_angles)
 
         traj = torch.stack(frames, dim=0)
+        atom14_trajectory_tensor = torch.stack(atom14_trajectory, dim=0)
+        sidechain_frame_trajectory_tensor = torch.stack(sidechain_frame_trajectory, dim=0)
+        sidechain_angle_trajectory_tensor = torch.stack(sidechain_angle_trajectory, dim=0)
+        sidechain_unnormalized_angle_trajectory_tensor = torch.stack(
+            sidechain_unnormalized_angle_trajectory,
+            dim=0,
+        )
         atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
         atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, sequence_mask)
         return AlphaFold2StructureModuleOutput(
@@ -1060,8 +1101,10 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             final_atom14_mask=atom14_mask,
             final_affines=traj[-1],
             traj=traj,
-            sidechain_angles=angles,
-            sidechain_unnormalized_angles=unnormalized_angles,
+            atom14_positions=atom14_trajectory_tensor,
+            sidechain_frames=sidechain_frame_trajectory_tensor,
+            sidechain_angles=sidechain_angle_trajectory_tensor,
+            sidechain_unnormalized_angles=sidechain_unnormalized_angle_trajectory_tensor,
         )
 
 
@@ -1780,11 +1823,11 @@ class AlphaFold2TemplatePairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
-        pair = pair + self.rowwise_dropout(self._ending_node(pair, pair_mask))
+        pair = pair + self._ending_node(pair, pair_mask)
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
         return pair + self.transition(pair, pair_mask)
@@ -1793,7 +1836,8 @@ class AlphaFold2TemplatePairBlock(nn.Module):
         # TriangleAttention preserves the input residue-axis orientation. Ending-node attention
         # therefore transposes the pair and mask residue axes around the call, then restores them.
         end_pair_mask = pair_mask.transpose(-2, -1)
-        return self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
+        ending_update = self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask)
+        return self.rowwise_dropout(ending_update).transpose(-3, -2)
 
 
 class AlphaFold2MultimerTemplatePairStack(nn.Module):
@@ -1878,16 +1922,15 @@ class AlphaFold2MultimerTemplatePairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask))
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
         end_pair_mask = pair_mask.transpose(-2, -1)
-        pair = pair + self.rowwise_dropout(
-            self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2)
-        )
+        ending_update = self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask)
+        pair = pair + self.rowwise_dropout(ending_update).transpose(-3, -2)
         return pair + self.transition(pair, pair_mask)
 
 
@@ -1948,17 +1991,25 @@ class AlphaFold2StructureModuleBlock(nn.Module):
         affine: AlphaFold2QuatAffine,
         initial_act: Tensor,
         residue_type_ids: Tensor,
-    ) -> tuple[Tensor, AlphaFold2QuatAffine, Tensor, Tensor, Tensor, AlphaFold2QuatAffine]:
+    ) -> tuple[Tensor, AlphaFold2QuatAffine, Tensor, Tensor, AlphaFold2Rigid, Tensor, AlphaFold2QuatAffine]:
         attn = self.invariant_point_attention(inputs_1d=act, inputs_2d=pair, mask=mask, affine=affine)
         act = self.attention_norm(act + self.dropout(attn))
         act = self.transition_norm(act + self.dropout(self.transition(act)))
         affine = affine.pre_compose(self.backbone_update(act))
-        angles, unnormalized_angles, atom14_positions = self.sidechain(
+        angles, unnormalized_angles, sidechain_frames, atom14_positions = self.sidechain(
             affine.scale_translation(self.position_scale),
             (act, initial_act),
             residue_type_ids,
         )
-        return act, affine.detach_rotation(), angles, unnormalized_angles, atom14_positions, affine
+        return (
+            act,
+            affine.detach_rotation(),
+            angles,
+            unnormalized_angles,
+            sidechain_frames,
+            atom14_positions,
+            affine,
+        )
 
 
 class AlphaFold2MultimerStructureModuleBlock(nn.Module):
@@ -2016,18 +2067,18 @@ class AlphaFold2MultimerStructureModuleBlock(nn.Module):
         rigid: AlphaFold2Rigid,
         initial_act: Tensor,
         residue_type_ids: Tensor,
-    ) -> tuple[Tensor, AlphaFold2Rigid, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, AlphaFold2Rigid, Tensor, Tensor, AlphaFold2Rigid, Tensor]:
         attn = self.invariant_point_attention(single=act, pair=pair, mask=mask, rigid=rigid)
         act = self.attention_norm(act + self.dropout(attn))
         act = self.transition_norm(act + self.dropout(self.transition(act)))
         rigid = rigid.compose(self.backbone_update(act))
-        angles, unnormalized_angles, atom14_positions = self.sidechain(
+        angles, unnormalized_angles, sidechain_frames, atom14_positions = self.sidechain(
             rigid.scale_translation(self.position_scale),
             (act, initial_act),
             residue_type_ids,
         )
         rigid_next = AlphaFold2Rigid(rotation=rigid.rotation.detach(), translation=rigid.translation)
-        return act, rigid_next, angles, unnormalized_angles, atom14_positions
+        return act, rigid_next, angles, unnormalized_angles, sidechain_frames, atom14_positions
 
 
 class AlphaFold2InvariantPointAttention(nn.Module):
@@ -2310,7 +2361,7 @@ class AlphaFold2Sidechain(nn.Module):
         affine: AlphaFold2QuatAffine,
         representations: tuple[Tensor, Tensor],
         residue_type_ids: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, AlphaFold2Rigid, Tensor]:
         act = sum(proj(F.relu(rep)) for proj, rep in zip(self.input_projections, representations, strict=True))
         for block in self.blocks:
             act = block(act)
@@ -2318,7 +2369,7 @@ class AlphaFold2Sidechain(nn.Module):
         angles = F.normalize(unnormalized_angles, dim=-1)
         frames = _torsion_angles_to_frames(residue_type_ids, affine.to_rigid(), angles)
         atom_pos = _frames_and_literature_positions_to_atom14_pos(residue_type_ids, frames)
-        return angles, unnormalized_angles, atom_pos
+        return angles, unnormalized_angles, frames, atom_pos
 
 
 class AlphaFold2SidechainBlock(nn.Module):
@@ -2357,6 +2408,17 @@ class AlphaFold2Rigid:
 
     def apply(self, points: Tensor) -> Tensor:
         return torch.matmul(self.rotation, points.unsqueeze(-1)).squeeze(-1) + self.translation
+
+    def to_tensor4x4(self) -> Tensor:
+        top = torch.cat([self.rotation, self.translation.unsqueeze(-1)], dim=-1)
+        bottom = torch.cat(
+            [
+                self.translation.new_zeros((*self.translation.shape[:-1], 1, 3)),
+                self.translation.new_ones((*self.translation.shape[:-1], 1, 1)),
+            ],
+            dim=-1,
+        )
+        return torch.cat([top, bottom], dim=-2)
 
     def compose(self, other: AlphaFold2Rigid) -> AlphaFold2Rigid:
         rotation = self.rotation @ other.rotation
@@ -3606,9 +3668,14 @@ class AlphaFold2StructureModuleOutput:
             monomer models or ``(B, N, 12)`` for multimer models.
         traj: Backbone-frame trajectory with shape ``(K, B, N, 7)`` for
             monomer models or ``(K, B, N, 12)`` for multimer models.
-        sidechain_angles: Normalized torsion angles with shape ``(B, N, 7, 2)``.
+        atom14_positions: Atom14 coordinate trajectory with shape
+            ``(K, B, N, 14, 3)``.
+        sidechain_frames: Rigid-group frame trajectory with shape
+            ``(K, B, N, 8, 4, 4)``.
+        sidechain_angles: Normalized torsion angles with shape
+            ``(K, B, N, 7, 2)``.
         sidechain_unnormalized_angles: Unnormalized torsion vectors with shape
-            ``(B, N, 7, 2)``.
+            ``(K, B, N, 7, 2)``.
     """
 
     final_atom_positions: Tensor
@@ -3618,6 +3685,8 @@ class AlphaFold2StructureModuleOutput:
     final_atom14_mask: Tensor
     final_affines: Tensor
     traj: Tensor
+    atom14_positions: Tensor
+    sidechain_frames: Tensor
     sidechain_angles: Tensor
     sidechain_unnormalized_angles: Tensor
 
@@ -3693,8 +3762,6 @@ class AlphaFold2Layout:
 
     system: MolecularSystem
     residue_sites: tuple[tuple[str, int], ...]
-    msa: MSA | None
-    templates: tuple[Template, ...]
 
 
 @dataclass(kw_only=True, eq=False)
@@ -3725,7 +3792,7 @@ class AlphaFold2Input:
             angles with shape ``(B, T, N, 7, 2)``.
         template_torsion_angles_mask: Template torsion validity mask with shape
             ``(B, T, N, 7)``.
-        layout: Molecular identities and evidence aligned to the residue axis.
+        layout: Molecular identities aligned to the residue axis.
         msa_features: Optional realized clustered-MSA features with shape
             ``(B, M_clustered, N, 49)``.
         msa_mask: Optional clustered-MSA validity mask with shape
@@ -3773,12 +3840,25 @@ class AlphaFold2Output:
         pair: Pair representation with shape ``(B, N, N, C_pair)``.
         frames: Backbone-frame trajectory with shape ``(K, B, N, 7)`` for
             monomer models or ``(K, B, N, 12)`` for multimer models.
+        atom14_positions: Atom14 coordinate trajectory with shape
+            ``(K, B, N, 14, 3)``.
+        sidechain_frames: Rigid-group frame trajectory with shape
+            ``(K, B, N, 8, 4, 4)``.
         final_atom_positions: Predicted atom37 coordinates with shape
             ``(B, N, 37, 3)`` in angstroms.
         final_atom_mask: Predicted atom37 validity mask with shape ``(B, N, 37)``.
-        sidechain_angles: Normalized torsion angles with shape ``(B, N, 7, 2)``.
+        final_atom14_positions: Final atom14 coordinates with shape
+            ``(B, N, 14, 3)`` in angstroms.
+        final_atom14_mask: Final atom14 existence mask with shape
+            ``(B, N, 14)``.
+        sidechain_angles: Normalized torsion trajectory with shape
+            ``(K, B, N, 7, 2)``.
         sidechain_unnormalized_angles: Unnormalized torsion vectors with shape
-            ``(B, N, 7, 2)``.
+            ``(K, B, N, 7, 2)``.
+        true_msa: Realized uncorrupted clustered-MSA tokens with shape
+            ``(B, M, N)``, or ``None`` for precomputed MSA features.
+        bert_mask: Realized masked-MSA objective mask with shape ``(B, M, N)``,
+            or ``None`` for precomputed MSA features.
         distogram_logits: Distance-bin logits with shape ``(B, N, N, D)``.
         masked_msa_logits: MSA token logits with shape ``(B, M, N, V)``.
         plddt_logits: Per-residue pLDDT logits with shape ``(B, N, D_plddt)``.
@@ -3790,10 +3870,16 @@ class AlphaFold2Output:
     single: Tensor
     pair: Tensor
     frames: Tensor
+    atom14_positions: Tensor
+    sidechain_frames: Tensor
     final_atom_positions: Tensor
     final_atom_mask: Tensor
+    final_atom14_positions: Tensor
+    final_atom14_mask: Tensor
     sidechain_angles: Tensor
     sidechain_unnormalized_angles: Tensor
+    true_msa: Tensor | None
+    bert_mask: Tensor | None
     distogram_logits: Tensor
     masked_msa_logits: Tensor
     plddt_logits: Tensor
@@ -3810,8 +3896,6 @@ class AlphaFold2MultimerLayout:
     system: MolecularSystem
     residue_sites: tuple[tuple[str, int], ...]
     chain_boundaries: tuple[tuple[str, int, int], ...]
-    msa: MSACollection | None
-    templates: tuple[Template, ...]
 
 
 @dataclass(kw_only=True, eq=False)
@@ -3847,7 +3931,7 @@ class AlphaFold2MultimerInput:
             ``(B, T, N, 4, 4)``.
         template_backbone_frame_mask: Template backbone-frame validity mask with
             shape ``(B, T, N)``.
-        layout: Molecular identities and evidence aligned to the residue axis.
+        layout: Molecular identities aligned to the residue axis.
         msa_features: Optional realized clustered-MSA features with shape
             ``(B, M_clustered, N, 49)``.
         msa_mask: Optional clustered-MSA validity mask with shape
