@@ -55,7 +55,7 @@ class DiffusionObjective:
 
         # The loss mask is atom-aligned ``(B, A)``; repeat it per drawn sample to match ``B*S``.
         target_mask: Tensor | None = getattr(batch, "target_mask", None)
-        loss_mask = getattr(batch, "atom_mask", None) if target_mask is None else target_mask
+        loss_mask: Tensor = batch.atom_mask if target_mask is None else target_mask
         samples = weighted_error.shape[0] // loss_mask.shape[0]
         mask = loss_mask.to(weighted_error.dtype).repeat_interleave(samples, dim=0)  # (B*S, A)
         denominator = mask.sum().clamp_min(torch.finfo(weighted_error.dtype).tiny)

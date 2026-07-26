@@ -1,20 +1,19 @@
 r"""
-The four standard one-shot tasks and their repository-backed factory.
+Repository-backed Pipeline selection and the shared one-shot tasks.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from os import PathLike
-from typing import Any, Literal, TypeAlias, cast
+from typing import Any, Literal, TypeAlias
 
 import torch
 
-from ..data.conditions import AllowedResidueIdentities, TiedResidueIdentities
 from ..data.evidence import MSA, MSACollection, Template
 from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
 from ..data.structure import Structure
-from ..hub import load_json_object, resolve_hub_repository, resolve_repository
+from ..hub import load_json_object, resolve_repository
 from ..pipelines.registry import PIPELINES
 
 #: Standard task name understood by the high-level task API.
@@ -24,15 +23,13 @@ TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
 
 #: Inputs accepted by the high-level [`fold`][] task.
 FoldInput: TypeAlias = str | PathLike[str] | PolymerSequence | MolecularSystem | Structure
-#: Inputs accepted by the high-level [`design`][] task.
-DesignInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str] | None
 #: Inputs accepted by the high-level [`score`][] task.
 ScoreInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str]
 #: Inputs accepted by the high-level [`pack`][] task.
 PackInput: TypeAlias = Structure | str | PathLike[str]
-#: MSA evidence accepted by folding and design tasks.
+#: MSA evidence accepted by the high-level folding task.
 MSAInput: TypeAlias = MSA | MSACollection
-#: Template evidence accepted by folding and design tasks.
+#: Template evidence accepted by the high-level folding task.
 TemplateInput: TypeAlias = Template
 
 
@@ -76,21 +73,21 @@ def pipeline(
         allow_patterns=("pipeline.json",),
     )
     marker = metadata_repository.path / "pipeline.json"
-    pipeline_id = cast(str, load_json_object(marker)["pipeline"])
+    pipeline_id = load_json_object(marker).get("pipeline")
+    if not isinstance(pipeline_id, str):
+        raise TypeError("pipeline.json pipeline must be a string")
     selected_pipeline_class: Any = PIPELINES.lookup_pipeline(pipeline_id)
     if not callable(getattr(selected_pipeline_class, task, None)):
         raise ValueError(f"pipeline {pipeline_id!r} does not support {task}")
 
-    snapshot = metadata_repository.path
+    selected_repository: str | PathLike[str] = metadata_repository.path
+    selected_revision: str | None = None
     if metadata_repository.repository is not None:
-        snapshot = resolve_hub_repository(
-            metadata_repository.repository,
-            revision=metadata_repository.commit,
-            allow_patterns=None,
-            token=token,
-        ).path
+        selected_repository = metadata_repository.repository
+        selected_revision = metadata_repository.commit
     return selected_pipeline_class.from_repository(
-        snapshot,
+        selected_repository,
+        revision=selected_revision,
         token=token,
         device=device,
         dtype=dtype,
@@ -149,66 +146,6 @@ def fold(
     if generator is not None:
         arguments["generator"] = generator
     return fold_pipeline.fold(input, **arguments)
-
-
-def design(
-    input: DesignInput,
-    *,
-    model: str | PathLike[str],
-    revision: str | None = None,
-    token: str | None = None,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype | None = None,
-    msa: MSAInput | None = None,
-    templates: Sequence[TemplateInput] = (),
-    conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
-    num_candidates: int = 1,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-) -> Any:
-    r"""
-    Generate molecular design candidates with a repository-backed pipeline.
-
-    Args:
-        input: Molecular system, structure, or supported input file.
-        model: Local model repository or Hugging Face Hub repository ID.
-        revision: Hub revision to load.
-        token: Hugging Face access token used for private repositories.
-        device: Device onto which model parameters are loaded.
-        dtype: Floating-point dtype used for inference.
-        msa: Optional MSA evidence.
-        templates: Optional structural templates.
-        conditions: Allowed or tied residue-identity constraints.
-        num_candidates: Number of independently generated candidates.
-        seed: Seed for stochastic inference.
-        generator: PyTorch random generator for stochastic inference.
-
-    Returns:
-        The design result produced by the selected pipeline.
-    """
-
-    design_pipeline = pipeline(
-        "design",
-        model=model,
-        revision=revision,
-        token=token,
-        device=device,
-        dtype=dtype,
-    )
-    arguments: dict[str, object] = {}
-    if num_candidates != 1:
-        arguments["num_candidates"] = num_candidates
-    if msa is not None:
-        arguments["msa"] = msa
-    if templates:
-        arguments["templates"] = templates
-    if conditions:
-        arguments["conditions"] = conditions
-    if seed is not None:
-        arguments["seed"] = seed
-    if generator is not None:
-        arguments["generator"] = generator
-    return design_pipeline.design(input, **arguments)
 
 
 def score(

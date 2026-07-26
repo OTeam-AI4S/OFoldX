@@ -11,7 +11,6 @@ from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
 
-import chanfig
 import torch
 
 from .model import Model
@@ -236,13 +235,15 @@ def upload_repository(
 def hydrate_weights(
     repository: ResolvedRepository,
     *,
+    subdirectory: str = "",
     token: str | None = None,
 ) -> ResolvedRepository:
     r"""
     Download all weight files from the commit that supplied repository metadata.
 
     Args:
-        repository: Resolved local repository or Hub metadata snapshot.
+        repository: Resolved local repository or Hub metadata snapshot root.
+        subdirectory: Fixed repository-relative directory containing the pair.
         token: Hugging Face access token used for private repositories.
 
     Returns:
@@ -252,15 +253,22 @@ def hydrate_weights(
         ValueError: If weight metadata is missing or ambiguous.
     """
 
-    hydrated = (
+    prefix = PurePosixPath(subdirectory)
+    weight_patterns = tuple(str(prefix / filename) for filename in MODEL_WEIGHT_METADATA)
+    hydrated_root = (
         repository
         if repository.repository is None
         else resolve_hub_repository(
             repository.repository,
             revision=repository.commit,
-            allow_patterns=MODEL_WEIGHT_METADATA,
+            allow_patterns=weight_patterns,
             token=token,
         )
+    )
+    hydrated = ResolvedRepository(
+        hydrated_root.path / subdirectory,
+        hydrated_root.repository,
+        hydrated_root.commit,
     )
     single = (hydrated.path / "model.safetensors").exists()
     index_path = hydrated.path / "model.safetensors.index.json"
@@ -276,7 +284,7 @@ def hydrate_weights(
     for filename in filenames:
         hf_hub_download(
             repo_id=repository.repository,
-            filename=filename,
+            filename=str(prefix / filename),
             revision=repository.commit,
             token=token,
         )
@@ -323,10 +331,12 @@ def load_model(
     """
 
     registration, values = model_values(repository.path)
+    config = registration.model_config(values)
+    with torch.device("meta"):
+        model = registration.model(config)
     return load_registered_model(
         hydrate_weights(repository, token=token),
-        registration,
-        registration.model_config(values),
+        model,
         device=device,
         dtype=dtype,
     )
@@ -334,19 +344,17 @@ def load_model(
 
 def load_registered_model(
     repository: ResolvedRepository,
-    registration: ModelRegistration,
-    config: chanfig.Config,
+    model: Model,
     *,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> Model:
     r"""
-    Instantiate a registered architecture and load its state dictionary.
+    Load a registered architecture's state dictionary into its meta instance.
 
     Args:
         repository: Local repository containing complete safetensors weights.
-        registration: Architecture registration to instantiate.
-        config: Architecture configuration.
+        model: Exact architecture instance constructed on the meta device.
         device: Device onto which model parameters are loaded.
         dtype: Floating-point dtype applied after loading.
 
@@ -358,9 +366,6 @@ def load_registered_model(
 
     single_path = repository.path / "model.safetensors"
     index_path = repository.path / "model.safetensors.index.json"
-
-    with torch.device("meta"):
-        model = registration.model(config)
 
     if single_path.exists():
         state_dict = load_file(single_path, device="cpu")

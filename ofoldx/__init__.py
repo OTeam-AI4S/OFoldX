@@ -5,7 +5,7 @@ Public models, processors, task pipelines, and scientific results.
 from __future__ import annotations
 
 from ._version import __version__, version
-from .api import TASKS, Task, design, fold, pack, pipeline, score
+from .api import TASKS, Task, fold, pack, pipeline, score
 from .artifacts import save_model
 from .auto import AutoModel, AutoProcessor
 from .data.conditions import Contact, Hotspot

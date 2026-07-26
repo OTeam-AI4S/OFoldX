@@ -16,9 +16,18 @@ import torch
 from typing_extensions import Self
 
 from ..artifacts import save_model
-from ..hub import ResolvedRepository, load_model, load_processor, resolve_repository
+from ..hub import (
+    PROCESSOR_METADATA,
+    ResolvedRepository,
+    hydrate_weights,
+    load_registered_model,
+    load_registered_processor,
+    model_values,
+    resolve_repository,
+)
 from ..model import Model
 from ..processor import Processor
+from .paired import PairedPipeline, _require_pair_identity
 from .registry import PIPELINES
 
 
@@ -28,6 +37,7 @@ class CompositePair(NamedTuple):
 
     Attributes:
         subdirectory: Repository-relative location; ``""`` selects the root.
+        architecture: Expected registered Model architecture.
         model_attribute: Model or wrapped pipeline constructor attribute.
         processor_attribute: Processor attribute, or ``None`` for a wrapped pair.
         wrap: Optional pipeline class used to wrap a loaded pair.
@@ -35,6 +45,7 @@ class CompositePair(NamedTuple):
     """
 
     subdirectory: str
+    architecture: str
     model_attribute: str
     processor_attribute: str | None
     wrap: type | None = None
@@ -65,14 +76,43 @@ class CompositePipeline:
         if pair.wrap is not None:
             if bound is None:
                 return None
-            return cast(Model, bound.model), cast(Processor, bound.processor)
-        processor = cast(Processor | None, getattr(self, cast(str, pair.processor_attribute)))
+            if type(bound) is not pair.wrap:
+                location = pair.subdirectory or "root"
+                raise TypeError(
+                    f"{type(self).__name__} {location} requires {pair.wrap.__name__}; " f"got {type(bound).__name__}"
+                )
+            wrapped = cast(PairedPipeline[Model, Processor], bound)
+            model = wrapped.model
+            processor = wrapped.processor
+            _require_pair_identity(
+                f"{type(self).__name__} {pair.subdirectory or 'root'}",
+                pair.architecture,
+                model,
+                processor,
+            )
+            return model, processor
+        processor_attribute = pair.processor_attribute
+        assert processor_attribute is not None
+        processor = getattr(self, processor_attribute)
         if (bound is None) != (processor is None):
             location = pair.subdirectory or "root"
             raise ValueError(f"{location} model and processor must either both be present or both be absent")
         if bound is None:
             return None
-        return cast(Model, bound), cast(Processor, processor)
+        _require_pair_identity(
+            f"{type(self).__name__} {pair.subdirectory or 'root'}",
+            pair.architecture,
+            bound,
+            processor,
+        )
+        return bound, processor
+
+    def _validate_components(self) -> None:
+        for pair in self.pair_layout:
+            source = self._composite_pair_source(pair)
+            if source is None and pair.required:
+                location = pair.subdirectory or "root"
+                raise ValueError(f"{type(self).__name__} requires the {location} pair")
 
     def to(
         self,
@@ -129,6 +169,7 @@ class CompositePipeline:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
 
         destination = Path(directory).expanduser()
+        self._validate_components()
 
         # Resolve every slot's source first so a missing required pair aborts the save
         # before the destination is mutated.
@@ -136,9 +177,6 @@ class CompositePipeline:
         for pair in self.pair_layout:
             pair_directory = _pair_directory(destination, pair.subdirectory)
             source = self._composite_pair_source(pair)
-            if source is None and pair.required:
-                location = pair.subdirectory or "root"
-                raise ValueError(f"cannot save {type(self).__name__}: required {location} pair is missing")
             plan.append((pair, pair_directory, source))
 
         for pair, pair_directory, source in plan:
@@ -203,8 +241,18 @@ class CompositePipeline:
             A pipeline assembled from the repository's declared pairs.
         """
 
-        resolved = resolve_repository(repository, revision=revision, token=token)
-        arguments: dict[str, object] = {}
+        metadata_patterns = tuple(
+            str(PurePosixPath(pair.subdirectory) / filename)
+            for pair in cls.pair_layout
+            for filename in PROCESSOR_METADATA
+        )
+        resolved = resolve_repository(
+            repository,
+            revision=revision,
+            allow_patterns=metadata_patterns,
+            token=token,
+        )
+        components: list[tuple[CompositePair, Model, Processor]] = []
         for pair in cls.pair_layout:
             subrepository = ResolvedRepository(_pair_directory(resolved.path, pair.subdirectory))
             if not (subrepository.path / "model.json").exists():
@@ -212,9 +260,36 @@ class CompositePipeline:
                     location = pair.subdirectory or "root"
                     raise ValueError(f"repository is missing the {location} pair required by {cls.__name__}")
                 continue
-            model = load_model(subrepository, device=device, dtype=dtype)
-            processor = load_processor(
+            if not (subrepository.path / "processor.json").exists():
+                location = pair.subdirectory or "root"
+                raise ValueError(f"repository is missing processor.json for the {location} pair")
+            registration, values = model_values(subrepository.path)
+            if registration.id != pair.architecture:
+                raise ValueError(
+                    f"{cls.__name__} {pair.subdirectory or 'root'} requires architecture {pair.architecture!r}; "
+                    f"repository declares {registration.id!r}"
+                )
+            config = registration.model_config(values)
+            with torch.device("meta"):
+                model = registration.model(config)
+            processor = load_registered_processor(
                 subrepository,
+                registration,
+                device=device,
+                dtype=dtype,
+            )
+            components.append((pair, model, processor))
+
+        arguments: dict[str, object] = {}
+        for pair, model, processor in components:
+            subrepository = hydrate_weights(
+                resolved,
+                subdirectory=pair.subdirectory,
+                token=token,
+            )
+            model = load_registered_model(
+                subrepository,
+                model,
                 device=device,
                 dtype=dtype,
             )
@@ -222,5 +297,7 @@ class CompositePipeline:
                 arguments[pair.model_attribute] = pair.wrap(model=model, processor=processor)
             else:
                 arguments[pair.model_attribute] = model
-                arguments[cast(str, pair.processor_attribute)] = processor
+                processor_attribute = pair.processor_attribute
+                assert processor_attribute is not None
+                arguments[processor_attribute] = processor
         return cls(**arguments)

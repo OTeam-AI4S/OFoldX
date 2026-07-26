@@ -47,7 +47,7 @@ dependencies = [
   "abnumber>=0.4.4",
   "anarci>=2026.2.13.2",
   "biotite>=1.7",
-  "chanfig",
+  "chanfig>=0.0.117",
   "chembl-structure-pipeline",
   "danling>=0.4.2",
   "huggingface-hub>=0.24",

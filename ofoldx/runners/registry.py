@@ -22,12 +22,12 @@ OBJECTIVES: chanfig.Registry = chanfig.Registry()
 
 # Architecture ID to default objective name.
 ARCHITECTURE_OBJECTIVES: dict[str, str] = {
-    "ofoldx.proteinmpnn": "mpnn",
-    "ofoldx.ligandmpnn": "mpnn",
-    "ofoldx.nampnn": "mpnn",
-    "ofoldx.boltz1": "diffusion",
-    "ofoldx.boltz2": "diffusion",
-    "ofoldx.boltzgen": "diffusion",
-    "ofoldx.protenix": "diffusion",
-    "ofoldx.odesign": "denoiser",
+    "proteinmpnn": "mpnn",
+    "ligandmpnn": "mpnn",
+    "nampnn": "mpnn",
+    "boltz1": "diffusion",
+    "boltz2": "diffusion",
+    "boltzgen": "diffusion",
+    "protenix": "diffusion",
+    "odesign": "denoiser",
 }

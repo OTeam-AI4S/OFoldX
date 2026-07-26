@@ -6,20 +6,47 @@ from __future__ import annotations
 
 from os import PathLike
 from pathlib import Path
-from typing import Generic, TypeVar, cast
+from typing import ClassVar, Generic, TypeVar, cast
 
 import chanfig
 import torch
 from typing_extensions import Self
 
 from ..artifacts import save_model
-from ..hub import load_model, load_processor, resolve_repository
+from ..hub import PROCESSOR_METADATA, load_model, load_processor, model_values, resolve_repository
 from ..model import Model
+from ..models.registry import MODELS
 from ..processor import Processor
 from .registry import PIPELINES
 
 _ModelT = TypeVar("_ModelT", bound=Model)
 _ProcessorT = TypeVar("_ProcessorT", bound=Processor)
+
+
+def _require_pair_identity(
+    owner: str,
+    architecture: str,
+    model: Model,
+    processor: Processor,
+) -> None:
+    registration = MODELS.lookup_model(architecture)
+    if type(model) is registration.model and type(processor) is registration.processor:
+        return
+    raise TypeError(
+        f"{owner} requires architecture {architecture!r} "
+        f"({registration.model.__name__}, {registration.processor.__name__}); "
+        f"got ({type(model).__name__}, {type(processor).__name__})"
+    )
+
+
+def _require_repository_architecture(
+    owner: str,
+    architecture: str,
+    directory: Path,
+) -> None:
+    registration, _ = model_values(directory)
+    if registration.id != architecture:
+        raise ValueError(f"{owner} requires architecture {architecture!r}; " f"repository declares {registration.id!r}")
 
 
 class PairedPipeline(Generic[_ModelT, _ProcessorT]):
@@ -31,9 +58,16 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         processor: Processor that converts user inputs into model inputs.
     """
 
+    model_architecture: ClassVar[str]
+
     def __init__(self, *, model: _ModelT, processor: _ProcessorT) -> None:
+        self._validate_pair(model, processor)
         self.model = model
         self.processor = processor
+
+    @classmethod
+    def _validate_pair(cls, model: Model, processor: Processor) -> None:
+        _require_pair_identity(cls.__name__, cls.model_architecture, model, processor)
 
     @classmethod
     def from_repository(
@@ -59,7 +93,17 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
             A pipeline bound to the loaded pair.
         """
 
-        resolved = resolve_repository(repository, revision=revision, token=token)
+        resolved = resolve_repository(
+            repository,
+            revision=revision,
+            allow_patterns=PROCESSOR_METADATA,
+            token=token,
+        )
+        _require_repository_architecture(
+            cls.__name__,
+            cls.model_architecture,
+            resolved.path,
+        )
         processor = load_processor(resolved, device=device, dtype=dtype)
         model = load_model(resolved, device=device, dtype=dtype, token=token)
         return cls(
@@ -112,6 +156,7 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is None:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
+        self._validate_pair(self.model, self.processor)
         save_model(
             directory,
             model=self.model,

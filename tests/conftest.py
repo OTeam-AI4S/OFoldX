@@ -102,6 +102,8 @@ def _dummy_model_input(
         atom_token_index=atom_token_index,
         token_to_rep_atom=token_to_rep_atom_1d.expand(batch_size, num_tokens).clone(),
         token_bonds=torch.zeros(batch_size, num_tokens, num_tokens),
+        msa_features=torch.zeros(batch_size, 1, num_tokens, 34),
+        msa_mask=torch.ones(batch_size, 1, num_tokens),
     )
 
 
