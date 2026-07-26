@@ -13,7 +13,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -370,6 +370,7 @@ _DTYPES = {
 def convert_boltz1_state_dict(
     state_dict: Mapping[str, Tensor],
     *,
+    config: Boltz1Config | None = None,
     dtype: torch.dtype | None = None,
 ) -> dict[str, Tensor]:
     r"""
@@ -381,6 +382,7 @@ def convert_boltz1_state_dict(
 
     Args:
         state_dict: The source Boltz-1 parameter mapping (checkpoint ``state_dict``).
+        config: Source architecture reconstructed from checkpoint hyperparameters.
         dtype: Optional dtype to cast floating-point tensors to; leaves them unchanged when ``None``.
 
     Returns:
@@ -390,10 +392,11 @@ def convert_boltz1_state_dict(
         KeyError: If a source key is unmapped.
     """
 
+    config = Boltz1Config() if config is None else config
     converted: dict[str, Tensor] = {}
     for source_key, value in state_dict.items():
         key = source_key.removeprefix("module.")
-        items = convert_boltz1_key(key, value)
+        items = convert_boltz1_key(key, value, config=config)
         if not items and not is_tied_output_projection(key):
             raise KeyError(f"unmapped Boltz-1 checkpoint key: {key}")
         for packed_key, packed_value in items:
@@ -421,7 +424,12 @@ def _pack_conditioned_adaptive_norms(state_dict: dict[str, Tensor]) -> None:
         state_dict[prefix + "conditioning_scale_bias"] = scale_bias
 
 
-def convert_boltz1_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+def convert_boltz1_key(
+    key: str,
+    tensor: Tensor,
+    *,
+    config: Boltz1Config | None = None,
+) -> list[tuple[str, Tensor]]:
     r"""
     Route one Boltz-1 checkpoint key to zero or more OFoldX keys.
 
@@ -432,11 +440,13 @@ def convert_boltz1_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     Args:
         key: A single Boltz-1 checkpoint key, already stripped of any ``module.`` prefix.
         tensor: The associated parameter value, passed through to the emitted target key(s).
+        config: Source architecture used to route full versus pair-only stacks.
 
     Returns:
         List of ``(target_key, value)`` pairs; empty when no rule matches this key.
     """
 
+    config = Boltz1Config() if config is None else config
     if key.startswith("input_embedder."):
         input_inner = convert_input_embedder_key(key[len("input_embedder.") :], tensor)
         return [] if input_inner is None else [(input_inner[0], input_inner[1])]
@@ -445,10 +455,14 @@ def convert_boltz1_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
         return [(f"msa_trunk.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = _convert_pairformer_layer(remainder, tensor)
-        return [
-            (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
-        ]
+        update_single = config.trunk.update_single
+        pairformer_items = (
+            _convert_pairformer_layer(remainder, tensor)
+            if update_single
+            else _convert_pair_only_layer(remainder, tensor)
+        )
+        target = "pairformer_stack" if update_single else "pair_update_stack"
+        return [(f"{target}.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)]
     if key.startswith("distogram_module."):
         new_key = convert_keys(key[len("distogram_module.") :], DISTOGRAM_RULES)
         return [] if new_key is None else [(f"distogram_head.{new_key}", tensor)]
@@ -457,7 +471,14 @@ def convert_boltz1_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
     if key.startswith("structure_module.out_token_feat_update."):
         return convert_output_token_feature_update_key(key[len("structure_module.out_token_feat_update.") :], tensor)
     if key.startswith("confidence_module."):
-        confidence_items = convert_confidence_module_key(key[len("confidence_module.") :], tensor)
+        confidence_items = convert_confidence_module_key(
+            key[len("confidence_module.") :],
+            tensor,
+            imitate_trunk=config.confidence.imitate_trunk,
+            update_single=(
+                config.trunk.update_single if config.confidence.imitate_trunk else config.confidence.update_single
+            ),
+        )
         return [(f"confidence_head.{new_key}", value) for new_key, value in confidence_items]
     if key in _TRUNK_FLAT:
         return [(_TRUNK_FLAT[key], tensor)]
@@ -538,8 +559,8 @@ def convert_score_model_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]
             key,
             old_prefix="token_transformer.layers.",
             block_prefix=score_prefix + "token_encoder.blocks.",
-            pair_norm_prefix="denoiser_conditioning.token_encoder_pair_norms.",
-            pair_bias_projection_prefix="denoiser_conditioning.token_encoder_pair_bias_projections.",
+            pair_norm_prefix="denoiser_conditioning.token_encoder_pair_bias_projection.pair_norms.",
+            pair_bias_projection_prefix=("denoiser_conditioning.token_encoder_pair_bias_projection.bias_projections."),
             tensor=tensor,
         )
         return [] if routed is None else [routed]
@@ -579,7 +600,13 @@ def convert_output_token_feature_update_key(key: str, tensor: Tensor) -> list[tu
     return []
 
 
-def convert_confidence_module_key(key: str, tensor: Tensor) -> list[tuple[str, Tensor]]:
+def convert_confidence_module_key(
+    key: str,
+    tensor: Tensor,
+    *,
+    imitate_trunk: bool = True,
+    update_single: bool = True,
+) -> list[tuple[str, Tensor]]:
     r"""
     Convert one ``confidence_module.*`` key from the official Boltz-1 confidence module.
 
@@ -590,6 +617,8 @@ def convert_confidence_module_key(key: str, tensor: Tensor) -> list[tuple[str, T
     Args:
         key: The ``confidence_module``-relative key (leading ``confidence_module.`` already removed).
         tensor: The associated parameter value.
+        imitate_trunk: Whether the source confidence head contains a copied trunk.
+        update_single: Whether its Pairformer contains single-update parameters.
 
     Returns:
         List of ``(target_key, value)`` pairs; empty when no rule matches this key.
@@ -603,22 +632,37 @@ def convert_confidence_module_key(key: str, tensor: Tensor) -> list[tuple[str, T
         return [(f"msa_trunk.{new_key}", value) for new_key, value in msa_items]
     if key.startswith("pairformer_module.layers."):
         index, _, remainder = key[len("pairformer_module.layers.") :].partition(".")
-        pairformer_items = _convert_pairformer_layer(remainder, tensor)
-        return [
-            (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
-        ]
+        pairformer_items = (
+            _convert_pairformer_layer(remainder, tensor)
+            if update_single
+            else _convert_pair_only_layer(remainder, tensor)
+        )
+        target = "pairformer_stack" if update_single else "pair_update_stack"
+        return [(f"{target}.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)]
     if key.startswith("pairformer_stack.layers."):
         index, _, remainder = key[len("pairformer_stack.layers.") :].partition(".")
-        pairformer_items = _convert_pairformer_layer(remainder, tensor)
-        return [
-            (f"pairformer_stack.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)
-        ]
+        pairformer_items = (
+            _convert_pairformer_layer(remainder, tensor)
+            if update_single
+            else _convert_pair_only_layer(remainder, tensor)
+        )
+        target = "pairformer_stack" if update_single else "pair_update_stack"
+        return [(f"{target}.blocks.{new_key}", value) for new_key, value in _prefix_index(index, pairformer_items)]
     if key.startswith("confidence_heads."):
         confidence_key = _convert_boltz1_confidence_head_key(key[len("confidence_heads.") :])
         return [] if confidence_key is None else [(f"output_head.{confidence_key}", tensor)]
     if key.startswith("transition_block."):
         transition_key = _convert_conditioned_transition_key(key[len("transition_block.") :])
         return [] if transition_key is None else [(f"transition_block.{transition_key}", tensor)]
+    if not imitate_trunk:
+        for old, new in (
+            ("s_norm.", "single_norm."),
+            ("z_norm.", "pair_norm."),
+            ("rel_pos.linear_layer.", "relative_position_embedder.output_projection."),
+            ("token_bonds.", "token_bond_projection."),
+        ):
+            if key.startswith(old):
+                return [(key.replace(old, new, 1), tensor)]
     flat = _CONFIDENCE_FLAT.get(key)
     if flat is not None:
         return [(flat, tensor)]
@@ -626,6 +670,99 @@ def convert_confidence_module_key(key: str, tensor: Tensor) -> list[tuple[str, T
         if key.startswith(old):
             return [(key.replace(old, new, 1), tensor)]
     return []
+
+
+def boltz1_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> Boltz1Config:
+    r"""
+    Reconstruct the Boltz-1 architecture and training equations from Lightning hyperparameters.
+    """
+
+    hyperparameters: Mapping[str, Any] = checkpoint["hyper_parameters"]
+    state: Mapping[str, Tensor] = checkpoint["state_dict"]
+    training_args: Mapping[str, Any] = hyperparameters["training_args"]
+    embedder_args: Mapping[str, Any] = hyperparameters["embedder_args"]
+    msa_args: Mapping[str, Any] = hyperparameters["msa_args"]
+    pairformer_args: Mapping[str, Any] = hyperparameters["pairformer_args"]
+    score_model_args: Mapping[str, Any] = hyperparameters["score_model_args"]
+    diffusion_process_args: Mapping[str, Any] = hyperparameters["diffusion_process_args"]
+    confidence_model_args: Mapping[str, Any] = hyperparameters["confidence_model_args"]
+
+    config = Boltz1Config()
+    config.single_size = hyperparameters["token_s"]
+    config.pair_size = hyperparameters["token_z"]
+    config.atom_hidden_size = hyperparameters["atom_s"]
+    config.atom_pair_hidden_size = hyperparameters["atom_z"]
+    config.atom_feature_size = hyperparameters["atom_feature_dim"]
+    config.num_distogram_bins = hyperparameters["num_bins"]
+    config.fourier_embedding_size = score_model_args["dim_fourier"]
+    config.recycling_steps = training_args["recycling_steps"] + 1
+    config.use_msa = not hyperparameters.get("no_msa", False)
+
+    config.input_embeddings.num_atom_encoder_blocks = embedder_args["atom_encoder_depth"]
+    config.input_embeddings.num_atom_encoder_attention_heads = embedder_args["atom_encoder_heads"]
+    config.input_embeddings.use_atom_encoder = not hyperparameters.get("no_atom_encoder", False)
+
+    config.trunk.num_pairformer_blocks = pairformer_args["num_blocks"]
+    config.trunk.num_pair_attention_heads = pairformer_args["num_heads"]
+    config.trunk.num_msa_blocks = msa_args["msa_blocks"]
+    config.trunk.msa_size = msa_args["msa_s"]
+    config.trunk.msa_triangle_attention_hidden_size = msa_args.get("pairwise_head_width", 32)
+    config.trunk.num_msa_triangle_attention_heads = msa_args.get("pairwise_num_heads", 4)
+    config.trunk.triangle_attention_hidden_size = pairformer_args.get("pairwise_head_width", 32)
+    config.trunk.num_triangle_attention_heads = pairformer_args.get("pairwise_num_heads", 4)
+    config.trunk.use_paired_feature = msa_args.get("use_paired_feature", False)
+    config.trunk.pair_dropout = pairformer_args["dropout"]
+    config.trunk.msa_dropout = msa_args["msa_dropout"]
+    config.trunk.msa_pair_dropout = msa_args["z_dropout"]
+    config.trunk.update_single = not pairformer_args.get("no_update_s", False)
+
+    config.denoiser.num_token_encoder_blocks = score_model_args["token_transformer_depth"]
+    config.denoiser.num_token_encoder_attention_heads = score_model_args["token_transformer_heads"]
+    config.denoiser.num_atom_encoder_blocks = score_model_args["atom_encoder_depth"]
+    config.denoiser.num_atom_decoder_blocks = score_model_args["atom_decoder_depth"]
+    config.denoiser.num_atom_attention_heads = score_model_args["atom_encoder_heads"]
+    config.denoiser.atom_hidden_size = config.atom_hidden_size
+    config.denoiser.atom_pair_hidden_size = config.atom_pair_hidden_size
+    config.denoiser.num_query_atoms = hyperparameters["atoms_per_window_queries"]
+    config.denoiser.num_key_atoms = hyperparameters["atoms_per_window_keys"]
+    config.denoiser.num_conditioning_transitions = score_model_args["conditioning_transition_layers"]
+    config.denoiser.sigma_data = score_model_args["sigma_data"]
+    config.denoiser.alignment_reverse_diff = diffusion_process_args["alignment_reverse_diff"]
+
+    confidence = config.confidence
+    confidence.enabled = hyperparameters["confidence_prediction"]
+    confidence.imitate_trunk = hyperparameters["confidence_imitate_trunk"]
+    confidence.compute_pae = hyperparameters["alpha_pae"] > 0
+    confidence.num_distogram_bins = confidence_model_args["num_dist_bins"]
+    confidence.max_distance = confidence_model_args["max_dist"]
+    confidence.add_single_to_pair_product = confidence_model_args["add_s_to_z_prod"]
+    confidence.add_single_input_to_single = confidence_model_args["add_s_input_to_s"]
+    confidence.add_pair_input_to_pair = confidence_model_args["add_z_input_to_z"]
+    confidence.use_single_diffusion = confidence_model_args["use_s_diffusion"]
+    confidence_args: Mapping[str, Any] = confidence_model_args["confidence_args"]
+    confidence.num_plddt_bins = confidence_args["num_plddt_bins"]
+    confidence.num_pde_bins = confidence_args["num_pde_bins"]
+    confidence.num_pae_bins = confidence_args["num_pae_bins"]
+    if confidence.imitate_trunk:
+        confidence.num_pairformer_blocks = config.trunk.num_pairformer_blocks
+        confidence.num_pair_attention_heads = config.trunk.num_pair_attention_heads
+        confidence.triangle_attention_hidden_size = config.trunk.triangle_attention_hidden_size
+        confidence.num_triangle_attention_heads = config.trunk.num_triangle_attention_heads
+        confidence.pair_dropout = config.trunk.pair_dropout
+        confidence.update_single = config.trunk.update_single
+    else:
+        confidence_pairformer: Mapping[str, Any] = confidence_model_args["pairformer_args"]
+        confidence.num_pairformer_blocks = confidence_pairformer["num_blocks"]
+        confidence.num_pair_attention_heads = confidence_pairformer["num_heads"]
+        confidence.triangle_attention_hidden_size = confidence_pairformer.get("pairwise_head_width", 32)
+        confidence.num_triangle_attention_heads = confidence_pairformer.get("pairwise_num_heads", 4)
+        confidence.pair_dropout = confidence_pairformer["dropout"]
+        confidence.update_single = not confidence_pairformer.get("no_update_s", False)
+
+    # The presence of the accumulator, rather than a historical config default,
+    # is the exact checkpoint evidence for diffusion-single confidence.
+    confidence.use_single_diffusion = any(key.startswith("structure_module.out_token_feat_update.") for key in state)
+    return config
 
 
 def convert_boltz1_checkpoint(
@@ -656,7 +793,8 @@ def convert_boltz1_checkpoint(
     """
 
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
-    converted = convert_boltz1_state_dict(checkpoint["state_dict"], dtype=dtype)
+    config = boltz1_config_from_checkpoint(checkpoint) if config is None else config
+    converted = convert_boltz1_state_dict(checkpoint["state_dict"], config=config, dtype=dtype)
     with torch.device("meta"):
         model = Boltz1Model(config)
     model.load_state_dict(converted, strict=True, assign=True)
@@ -724,8 +862,8 @@ def _convert_score_atom_encoder_key(key: str, tensor: Tensor) -> list[tuple[str,
         key,
         old_prefix="atom_encoder.diffusion_transformer.layers.",
         block_prefix="coordinate_diffusion.denoiser.atom_attention_encoder.atom_transformer.transformer.blocks.",
-        pair_norm_prefix="denoiser_conditioning.atom_encoder_pair_norms.",
-        pair_bias_projection_prefix="denoiser_conditioning.atom_encoder_pair_bias_projections.",
+        pair_norm_prefix="denoiser_conditioning.atom_encoder_pair_bias_projection.pair_norms.",
+        pair_bias_projection_prefix="denoiser_conditioning.atom_encoder_pair_bias_projection.bias_projections.",
         tensor=tensor,
     )
     if routed is not None:
@@ -750,8 +888,8 @@ def _convert_score_atom_decoder_key(key: str, tensor: Tensor) -> list[tuple[str,
         key,
         old_prefix="atom_decoder.diffusion_transformer.layers.",
         block_prefix="coordinate_diffusion.denoiser.atom_attention_decoder.atom_transformer.transformer.blocks.",
-        pair_norm_prefix="denoiser_conditioning.atom_decoder_pair_norms.",
-        pair_bias_projection_prefix="denoiser_conditioning.atom_decoder_pair_bias_projections.",
+        pair_norm_prefix="denoiser_conditioning.atom_decoder_pair_bias_projection.pair_norms.",
+        pair_bias_projection_prefix="denoiser_conditioning.atom_decoder_pair_bias_projection.bias_projections.",
         tensor=tensor,
     )
     if routed is not None:

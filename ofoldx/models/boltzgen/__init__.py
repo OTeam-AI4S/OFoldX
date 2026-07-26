@@ -1,5 +1,5 @@
 r"""
-BoltzGen structure-design and inverse-folding implementations.
+BoltzGen structure-design, confidence, and inverse-folding implementations.
 """
 
 from __future__ import annotations
@@ -7,6 +7,8 @@ from __future__ import annotations
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .config import (
+    BoltzGenConfidenceConfig,
+    BoltzGenConfidenceHeadConfig,
     BoltzGenConfig,
     BoltzGenDenoiserConfig,
     BoltzGenInputEmbeddingsConfig,
@@ -19,6 +21,10 @@ from .config import (
 )
 from .model import (
     BoltzGenBinding,
+    BoltzGenConfidenceDesignOutput,
+    BoltzGenConfidenceModel,
+    BoltzGenConfidenceOutput,
+    BoltzGenCovalentBond,
     BoltzGenDesignMask,
     BoltzGenDesignOutput,
     BoltzGenDirectionalContact,
@@ -34,7 +40,26 @@ from .model import (
     BoltzGenSchema,
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
+    BoltzGenStructureTarget,
     BoltzGenSymmetry,
+)
+from .objectives import (
+    BoltzGenConfidenceLoss,
+    BoltzGenDiffusionLoss,
+    b_factor_loss,
+    bond_loss,
+    confidence_loss,
+    diffusion_loss,
+    distogram_loss,
+    pae_loss,
+    pae_regression_loss,
+    pde_loss,
+    pde_regression_loss,
+    plddt_loss,
+    plddt_regression_loss,
+    residue_type_loss,
+    resolved_loss,
+    smooth_lddt_loss,
 )
 from .pipeline import BoltzGenDesignCandidate, BoltzGenDesignResult, BoltzGenPipeline
 from .processor import (
@@ -46,16 +71,21 @@ from .processor import (
 )
 
 _MODELS.register(
-    "ofoldx.boltzgen",
+    "boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
 )
 _MODELS.register(
-    "ofoldx.boltzgen_ifold",
+    "boltzgen_confidence",
+    model=BoltzGenConfidenceModel,
+    processor=BoltzGenProcessor,
+)
+_MODELS.register(
+    "boltzgen_ifold",
     model=BoltzGenInverseFoldingModel,
     processor=BoltzGenInverseFoldingProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.boltzgen",
+    "boltzgen",
     pipeline=BoltzGenPipeline,
 )

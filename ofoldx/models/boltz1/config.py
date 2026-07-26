@@ -35,30 +35,36 @@ class Boltz1TrunkConfig(Config):
         num_pair_attention_heads: Head count for the single-track pair-biased attention.
         num_msa_blocks: Number of MSA-module blocks.
         msa_size: Width of the MSA representation channel.
-        msa_feature_size: Width of the raw per-MSA feature vector (one-hot + deletion + pairing flags).
         msa_head_dim: Per-head dimension inside the MSA attention.
         num_msa_attention_heads: Head count for the MSA pair-weighted-averaging.
         outer_product_hidden_size: Hidden width of the MSA outer-product-mean projection.
+        msa_triangle_attention_hidden_size: Per-head width of the MSA triangle attention.
+        num_msa_triangle_attention_heads: Head count for the MSA triangle attention.
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Head count for the triangle attention.
         use_paired_feature: Whether the MSA carries the cross-chain pairing feature.
         pair_dropout: Dropout applied to the Pairformer pair track.
         msa_dropout: Dropout applied inside the MSA trunk.
+        msa_pair_dropout: Pair-track dropout applied inside the MSA trunk.
+        update_single: Whether the Pairformer trunk updates the single track.
     """
 
     num_pairformer_blocks: int = 48
     num_pair_attention_heads: int = 16
     num_msa_blocks: int = 4
     msa_size: int = 64
-    msa_feature_size: int = 35
     msa_head_dim: int = 32
     num_msa_attention_heads: int = 8
     outer_product_hidden_size: int = 32
+    msa_triangle_attention_hidden_size: int = 32
+    num_msa_triangle_attention_heads: int = 4
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
     use_paired_feature: bool = False
-    pair_dropout: float = 0.0
-    msa_dropout: float = 0.0
+    pair_dropout: float = 0.25
+    msa_dropout: float = 0.15
+    msa_pair_dropout: float = 0.25
+    update_single: bool = True
 
 
 class Boltz1DenoiserConfig(Config):
@@ -110,13 +116,13 @@ class Boltz1SamplerConfig(Config):
     """
 
     num_sampling_steps: int = 200
-    rho: float = 7.0
+    rho: float = 8.0
     max_noise_level: float = 160.0
     min_noise_level: float = 4e-4
-    churn_rate: float = 0.8
-    min_churn_noise_level: float = 1.0
-    noise_scale: float = 1.0
-    step_scale: float = 1.0
+    churn_rate: float = 0.605
+    min_churn_noise_level: float = 1.107
+    noise_scale: float = 0.901
+    step_scale: float = 1.638
 
 
 class Boltz1ConfidenceConfig(Config):
@@ -129,6 +135,8 @@ class Boltz1ConfidenceConfig(Config):
         compute_pae: Whether to emit PAE logits and pTM/ipTM ranking metrics.
         num_pairformer_blocks: Number of Pairformer blocks inside the confidence head.
         num_pair_attention_heads: Head count for the confidence-head pair-biased attention.
+        triangle_attention_hidden_size: Per-head width of the confidence triangle attention.
+        num_triangle_attention_heads: Confidence triangle-attention head count.
         num_distogram_bins: Number of bins for the confidence distance embedding.
         max_distance: Upper distance bound (Angstrom) for the confidence distogram binning.
         num_plddt_bins: Number of pLDDT output bins.
@@ -138,6 +146,8 @@ class Boltz1ConfidenceConfig(Config):
         add_single_input_to_single: Whether to inject the single-input representation into the single track.
         add_pair_input_to_pair: Whether to inject relative-position and bond features into the pair track.
         use_single_diffusion: Whether to condition on the accumulated final diffusion token representation.
+        pair_dropout: Pair-track dropout for a trunk-reuse confidence head.
+        update_single: Whether a trunk-reuse confidence head updates the single track.
         ranking_plddt_weight: Weight on complex pLDDT when forming the combined ranking score.
         ranking_ptm_weight: Weight on pTM/ipTM when forming the combined ranking score.
     """
@@ -147,6 +157,8 @@ class Boltz1ConfidenceConfig(Config):
     compute_pae: bool = True
     num_pairformer_blocks: int = 48
     num_pair_attention_heads: int = 16
+    triangle_attention_hidden_size: int = 32
+    num_triangle_attention_heads: int = 4
     num_distogram_bins: int = 64
     max_distance: float = 22.0
     num_plddt_bins: int = 50
@@ -156,6 +168,8 @@ class Boltz1ConfidenceConfig(Config):
     add_single_input_to_single: bool = True
     add_pair_input_to_pair: bool = True
     use_single_diffusion: bool = True
+    pair_dropout: float = 0.25
+    update_single: bool = True
     ranking_plddt_weight: float = 4.0
     ranking_ptm_weight: float = 1.0
 

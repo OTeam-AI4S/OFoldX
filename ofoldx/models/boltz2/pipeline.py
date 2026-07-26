@@ -22,6 +22,7 @@ from .model import (
     Boltz2Contact,
     Boltz2Model,
     Boltz2Pocket,
+    Boltz2Template,
 )
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
@@ -31,19 +32,34 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
     Structure prediction pipeline for Boltz 2.
     """
 
+    model_architecture = "boltz2"
+
     def fold(
         self,
         input: MolecularSystem | Structure | str | PathLike[str],
         *,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template] = (),
+        templates: Sequence[Template | Boltz2Template] = (),
         contacts: Sequence[Boltz2Contact] = (),
         pockets: Sequence[Boltz2Pocket] = (),
+        method: str = "x-ray diffraction",
         num_samples: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        max_msa_rows: int | None = 8192,
         num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        max_parallel_samples: int | None = None,
+        use_potentials: bool = False,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        contact_guidance: bool = True,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
     ) -> FoldResult:
         r"""
         Predict structures for one molecular system with Boltz 2.
@@ -54,6 +70,7 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
             templates: Structural protein templates with canonical residue alignments.
             contacts: Learned pairwise contact conditions.
             pockets: Learned binder-to-pocket conditions.
+            method: Experimental method used by the learned method embedding.
             num_samples: Number of structure predictions to generate.
             seed: Optional seed for reference-conformer augmentation and
                 coordinate sampling. Mutually exclusive with ``generator``.
@@ -61,7 +78,25 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
                 sampling. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
+            msa_max_depth: Optional rows independently sampled for each MSA-module
+                invocation. ``None`` retains all rows.
+            max_msa_rows: Optional cap applied only while reading an MSA path.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
+            max_parallel_samples: Maximum samples evaluated by one denoiser call.
+            use_potentials: Enable the released Feynman--Kac and physical-guidance
+                preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            contact_guidance: Whether forced contact, pocket, and template
+                conditions apply their potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Feynman--Kac energy-log-weight scale.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
 
         Returns:
             Generation-ordered structure predictions. Structure, PAE, and PDE values
@@ -70,13 +105,18 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
         input = _read_boltz2_input(input)
-        msa = _read_boltz2_msa(msa, input.system if isinstance(input, Structure) else input)
+        msa = _read_boltz2_msa(
+            msa,
+            input.system if isinstance(input, Structure) else input,
+            max_msa_rows=max_msa_rows,
+        )
         features = self.processor(
             input,
             msa=msa,
             templates=templates,
             contacts=contacts,
             pockets=pockets,
+            method=method,
             generator=generator,
         )
         return self.model.fold(
@@ -84,7 +124,18 @@ class Boltz2Pipeline(PairedPipeline[Boltz2Model, Boltz2Processor]):
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            max_parallel_samples=max_parallel_samples,
+            use_potentials=use_potentials,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            contact_guidance=contact_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
         )
 
 
@@ -107,8 +158,8 @@ class Boltz2AffinityPipeline(CompositePipeline):
     # The affinity pass owns the repository root; the structure/confidence pair is stored in
     # the fixed ``structure/`` subdirectory.
     pair_layout = (
-        CompositePair("", "model", "processor"),
-        CompositePair("structure", "structure_model", "structure_processor"),
+        CompositePair("", "boltz2_affinity", "model", "processor"),
+        CompositePair("structure", "boltz2", "structure_model", "structure_processor"),
     )
 
     def __init__(
@@ -123,6 +174,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
         self.processor = processor
         self.structure_model = structure_model
         self.structure_processor = structure_processor
+        self._validate_components()
 
     def score(
         self,
@@ -130,13 +182,27 @@ class Boltz2AffinityPipeline(CompositePipeline):
         *,
         ligand: str | None = None,
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        templates: Sequence[Template] = (),
+        templates: Sequence[Template | Boltz2Template] = (),
         contacts: Sequence[Boltz2Contact] = (),
         pockets: Sequence[Boltz2Pocket] = (),
+        method: str = "x-ray diffraction",
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        max_parallel_samples: int | None = None,
+        use_potentials: bool = False,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        contact_guidance: bool = True,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
         affinity_num_samples: int = 5,
         affinity_num_sampling_steps: int | None = None,
+        affinity_step_scale: float | None = None,
+        msa_max_depth: int | None = None,
+        max_msa_rows: int | None = 8192,
         molecular_weight_correction: bool = False,
         seed: int | None = None,
         generator: torch.Generator | None = None,
@@ -152,10 +218,31 @@ class Boltz2AffinityPipeline(CompositePipeline):
             templates: Structural protein templates used by the first structure pass.
             contacts: Learned pairwise contact conditions used by both passes.
             pockets: Learned binder-to-pocket conditions used by both passes.
+            method: Experimental method used by the first structure pass.
             num_samples: Number of first-pass structure samples.
             num_sampling_steps: Number of first-pass diffusion transitions.
+            step_scale: Optional first-pass reverse-diffusion Euler-step scale.
+            max_parallel_samples: Maximum first-pass samples evaluated by one
+                denoiser call.
+            use_potentials: Enable the released first-pass Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether the first pass uses particle resampling.
+            physical_guidance: Whether the first pass applies physical-potential
+                gradients.
+            contact_guidance: Whether forced first-pass contact, pocket, and
+                template conditions apply their potential gradients.
+            num_particles: Number of first-pass particles per requested sample.
+            feynman_kac_lambda: First-pass Feynman--Kac energy-log-weight scale.
+            feynman_kac_resampling_interval: First-pass reverse-diffusion step
+                interval between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                first-pass reverse-diffusion step.
             affinity_num_samples: Number of second-pass candidate samples.
             affinity_num_sampling_steps: Number of second-pass diffusion transitions.
+            affinity_step_scale: Optional second-pass reverse-diffusion Euler-step scale.
+            msa_max_depth: Optional rows independently sampled for every MSA-module
+                invocation in both passes. ``None`` retains all rows.
+            max_msa_rows: Optional cap applied only while reading an MSA path.
             molecular_weight_correction: Whether to apply molecular-weight calibration.
             seed: Optional seed shared by preprocessing and both model passes; mutually exclusive with
                 ``generator``.
@@ -173,7 +260,11 @@ class Boltz2AffinityPipeline(CompositePipeline):
         generator = resolve_generator(seed, generator, device=self.structure_processor.device)
 
         input = _read_boltz2_input(input)
-        msa = _read_boltz2_msa(msa, input.system if isinstance(input, Structure) else input)
+        msa = _read_boltz2_msa(
+            msa,
+            input.system if isinstance(input, Structure) else input,
+            max_msa_rows=max_msa_rows,
+        )
 
         # The structure and affinity passes use independent sampling counts.
         fold_batch = self.structure_processor(
@@ -182,6 +273,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
             templates=templates,
             contacts=contacts,
             pockets=pockets,
+            method=method,
             generator=generator,
         )
 
@@ -189,6 +281,17 @@ class Boltz2AffinityPipeline(CompositePipeline):
             fold_batch,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            msa_max_depth=msa_max_depth,
+            max_parallel_samples=max_parallel_samples,
+            use_potentials=use_potentials,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            contact_guidance=contact_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
             generator=generator,
         )
 
@@ -210,12 +313,15 @@ class Boltz2AffinityPipeline(CompositePipeline):
             msa=msa,
             contacts=contacts,
             pockets=pockets,
+            method="other",
             generator=generator,
         )
         score_result = self.model.score(
             affinity_batch,
             num_samples=affinity_num_samples,
             num_sampling_steps=affinity_num_sampling_steps,
+            step_scale=affinity_step_scale,
+            msa_max_depth=msa_max_depth,
             molecular_weight_correction=molecular_weight_correction,
             generator=generator,
         )
@@ -259,6 +365,8 @@ def _read_boltz2_input(
 def _read_boltz2_msa(
     msa: MSA | MSACollection | str | PathLike[str] | None,
     system: MolecularSystem,
+    *,
+    max_msa_rows: int | None,
 ) -> MSA | MSACollection | None:
     if not isinstance(msa, str | PathLike):
         return msa
@@ -269,4 +377,4 @@ def _read_boltz2_msa(
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")
-    return read_msa(msa, entity_id=proteins[0])
+    return read_msa(msa, entity_id=proteins[0], max_rows=max_msa_rows)

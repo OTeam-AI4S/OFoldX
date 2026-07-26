@@ -1,9 +1,10 @@
 r"""
-BoltzGen structure-design and inverse-folding models with their typed tensor contracts.
+BoltzGen structure-design, confidence, and inverse-folding models with typed tensor contracts.
 """
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal, cast
@@ -23,19 +24,27 @@ from ...data.placement import (
 )
 from ...model import Model
 from ...modules.atom import (
+    PackedAtomAttention,
     PackedAtomToTokenEncoder,
     PackedDenoisingAtomToTokenEncoder,
     PackedReferenceAtomEncoder,
     PackedTokenToAtomDecoder,
 )
 from ...modules.atom.pair_encoding import encode_atom_pair
+from ...modules.atom.transfer import dense_mean_to_tokens
 from ...modules.atom.window import gather_key_windows
-from ...modules.attention import GatedMultiheadAttention, PairBiasedSelfAttention
+from ...modules.attention import (
+    GatedMultiheadAttention,
+    PairBiasedSelfAttention,
+    PerBlockPairBiasProjection,
+    TriangleAttention,
+    TriangleMultiplication,
+)
 from ...modules.backend import LayerNorm
 from ...modules.contact import BoltzContactConditioning
-from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
+from ...modules.diffusion.conditioning import PairwiseConditioning
 from ...modules.diffusion.edm import EdmPreconditioner
-from ...modules.dropout import RowwiseDropout
+from ...modules.dropout import StructuredDropout
 from ...modules.embedding.factorized import FactorizedPairLinear
 from ...modules.embedding.fourier import FrozenFourierEmbedding
 from ...modules.embedding.position import RelativePositionEmbedder, generate_relative_position_features
@@ -43,6 +52,7 @@ from ...modules.feed_forward import SwiGluFeedForward
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import PairSymmetrizedDistogramHead
+from ...modules.head.tm import tm_weight_from_pae
 from ...modules.transformer import (
     ConditionedTransformerEncoder,
     ConditionedTransformerEncoderBlock,
@@ -50,13 +60,10 @@ from ...modules.transformer import (
 )
 from ...modules.transition import ConditionedTransition, Transition
 from ...modules.trunk.msa import (
-    CategoricalMsaTrunk,
     MsaPairWeightedAveraging,
     OuterProductMean,
-    TrianglePairUpdateBlock,
 )
-from ...modules.trunk.pairformer import PairformerStack
-from .config import BoltzGenConfig, BoltzGenInverseFoldingConfig
+from .config import BoltzGenConfidenceConfig, BoltzGenConfig, BoltzGenInverseFoldingConfig
 
 _NUM_BOND_TYPES = 6
 
@@ -70,7 +77,7 @@ _CANONICALS_OFFSET = 2  # const.canonicals_offset: the 20 canonical amino acids 
 NUM_CANONICAL_TOKENS = 20  # len(const.canonical_tokens)
 
 # The 20 canonical amino acids (three-letter CCD codes) in vocabulary order (residue-token ids ``[2, 22)``);
-# matches ``const.canonical_tokens``. Indexed by ``inverse_fold_restriction`` and ``aa_constraint_mask``.
+# matches ``const.canonical_tokens`` and is indexed by ``aa_constraint_mask``.
 CANONICAL_TOKENS: tuple[str, ...] = (
     "ALA",
     "ARG",
@@ -95,18 +102,14 @@ CANONICAL_TOKENS: tuple[str, ...] = (
 )
 
 
-class BoltzGenModel(Model):
+class _BoltzGenStructureModel(Model):
     r"""
-    Generate conditioned biomolecular structures with BoltzGen.
-
-    Accepts [`BoltzGenInput`][ofoldx.models.boltzgen.model.BoltzGenInput] and returns
-    [`BoltzGenOutput`][ofoldx.models.boltzgen.model.BoltzGenOutput].
+    Own the common BoltzGen structure trunk, denoiser, sampler, and heads.
 
     Args:
         config: Model architecture and inference configuration.
     """
 
-    config_class = BoltzGenConfig
     config: BoltzGenConfig
 
     def __init__(
@@ -138,7 +141,12 @@ class BoltzGenModel(Model):
             msa_profile_size=input_embeddings_config.msa_profile_size,
             num_method_types=input_embeddings_config.num_method_types,
             num_molecule_types=input_embeddings_config.num_molecule_types,
+            add_method_conditioning=input_embeddings_config.add_method_conditioning,
+            add_modified_flag=input_embeddings_config.add_modified_flag,
+            add_cyclic_flag=input_embeddings_config.add_cyclic_flag,
+            add_molecule_type_feature=input_embeddings_config.add_molecule_type_feature,
             add_binding_specification=input_embeddings_config.add_binding_specification,
+            add_design_mask=input_embeddings_config.add_design_mask,
             add_ss_specification=input_embeddings_config.add_ss_specification,
             backend="auto",
         )
@@ -159,54 +167,84 @@ class BoltzGenModel(Model):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        template_embedder_type = (
-            BoltzGenMiniformerTemplateEmbedder if config.template.miniformer_blocks else BoltzGenTemplateEmbedder
-        )
-        self.template_embedder = template_embedder_type(
-            pair_size=pair_size,
-            template_size=design.template_size,
-            num_blocks=design.num_template_blocks,
-            vocab_size=input_embeddings_config.vocab_size,
-            num_bins=config.template.num_distogram_bins,
-            min_dist=config.template.min_distance,
-            max_dist=config.template.max_distance,
-            triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
-            num_triangle_attention_heads=config.template.num_triangle_attention_heads,
-            backend="auto",
-        )
-        self.token_distance_embedder = (
-            BoltzGenTokenDistanceEmbedder(
+        # Token-distance conditioning precedes template conditioning in the released constructor.
+        token_distance_embedder: BoltzGenTokenDistanceEmbedder | None = None
+        if design.use_token_distance:
+            if design.token_distance_miniformer_blocks:
+                token_distance_embedder = BoltzGenMiniformerTokenDistanceEmbedder(
+                    pair_size=pair_size,
+                    token_distance_size=design.token_distance_size,
+                    num_blocks=design.num_token_distance_blocks,
+                    num_bins=config.template.num_distogram_bins,
+                    distance_gaussian_dim=design.distance_gaussian_dim,
+                    min_dist=config.template.min_distance,
+                    max_dist=config.template.max_distance,
+                    dropout=design.token_distance_dropout,
+                    post_layer_norm=design.token_distance_post_layer_norm,
+                    use_token_distance_features=design.use_token_distance_features,
+                    backend="auto",
+                )
+            else:
+                token_distance_embedder = BoltzGenTokenDistanceEmbedder(
+                    pair_size=pair_size,
+                    token_distance_size=design.token_distance_size,
+                    num_blocks=design.num_token_distance_blocks,
+                    num_bins=config.template.num_distogram_bins,
+                    distance_gaussian_dim=design.distance_gaussian_dim,
+                    min_dist=config.template.min_distance,
+                    max_dist=config.template.max_distance,
+                    triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
+                    num_triangle_attention_heads=config.template.num_triangle_attention_heads,
+                    dropout=design.token_distance_dropout,
+                    use_token_distance_features=design.use_token_distance_features,
+                    backend="auto",
+                )
+        self.token_distance_embedder = token_distance_embedder
+
+        if design.template_miniformer_blocks:
+            template_embedder: BoltzGenTemplateEmbedder = BoltzGenMiniformerTemplateEmbedder(
                 pair_size=pair_size,
-                token_distance_size=design.token_distance_size,
-                num_blocks=design.num_token_distance_blocks,
+                template_size=design.template_size,
+                num_blocks=design.num_template_blocks,
+                vocab_size=input_embeddings_config.vocab_size,
                 num_bins=config.template.num_distogram_bins,
-                distance_gaussian_dim=design.distance_gaussian_dim,
+                min_dist=config.template.min_distance,
+                max_dist=config.template.max_distance,
+                dropout=design.template_dropout,
+                post_layer_norm=design.template_post_layer_norm,
+                backend="auto",
+            )
+        else:
+            template_embedder = BoltzGenTemplateEmbedder(
+                pair_size=pair_size,
+                template_size=design.template_size,
+                num_blocks=design.num_template_blocks,
+                vocab_size=input_embeddings_config.vocab_size,
+                num_bins=config.template.num_distogram_bins,
                 min_dist=config.template.min_distance,
                 max_dist=config.template.max_distance,
                 triangle_attention_hidden_size=config.template.triangle_attention_hidden_size,
                 num_triangle_attention_heads=config.template.num_triangle_attention_heads,
+                dropout=design.template_dropout,
                 backend="auto",
             )
-            if design.use_token_distance
-            else None
-        )
+        self.template_embedder = template_embedder
 
         self.msa_trunk = (
-            CategoricalMsaTrunk(
+            BoltzGenMsaTrunk(
                 single_size=single_size,
                 pair_size=pair_size,
                 msa_size=trunk.msa_size,
-                msa_feature_size=trunk.msa_feature_size,
                 num_blocks=trunk.num_msa_blocks,
                 vocab_size=input_embeddings_config.vocab_size,
                 use_paired_feature=trunk.use_paired_feature,
                 outer_product_hidden_size=trunk.outer_product_hidden_size,
                 msa_dropout=trunk.msa_dropout,
-                pair_dropout=trunk.pair_dropout,
+                pair_dropout=trunk.msa_pair_dropout,
                 num_msa_attention_heads=trunk.num_msa_attention_heads,
                 msa_head_dim=trunk.msa_head_dim,
-                triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
-                num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                triangle_attention_hidden_size=trunk.msa_triangle_attention_hidden_size,
+                num_triangle_attention_heads=trunk.num_msa_triangle_attention_heads,
                 backend="auto",
             )
             if not trunk.msa_miniformer_blocks
@@ -214,13 +252,12 @@ class BoltzGenModel(Model):
                 single_size=single_size,
                 pair_size=pair_size,
                 msa_size=trunk.msa_size,
-                msa_feature_size=trunk.msa_feature_size,
                 num_blocks=trunk.num_msa_blocks,
                 vocab_size=input_embeddings_config.vocab_size,
                 use_paired_feature=trunk.use_paired_feature,
                 outer_product_hidden_size=trunk.outer_product_hidden_size,
                 msa_dropout=trunk.msa_dropout,
-                pair_dropout=trunk.pair_dropout,
+                pair_dropout=trunk.msa_pair_dropout,
                 num_msa_attention_heads=trunk.num_msa_attention_heads,
                 msa_head_dim=trunk.msa_head_dim,
                 backend="auto",
@@ -233,10 +270,12 @@ class BoltzGenModel(Model):
                 pair_size=pair_size,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.pair_dropout,
+                post_layer_norm=trunk.post_layer_norm,
+                use_single_to_pair=trunk.use_single_to_pair,
                 backend="auto",
             )
             if trunk.use_miniformer
-            else PairformerStack(
+            else BoltzGenPairformerStack(
                 num_blocks=trunk.num_trunk_blocks,
                 single_size=single_size,
                 pair_size=pair_size,
@@ -244,6 +283,7 @@ class BoltzGenModel(Model):
                 num_triangle_attention_heads=trunk.num_triangle_attention_heads,
                 num_pair_attention_heads=trunk.num_pair_attention_heads,
                 dropout=trunk.pair_dropout,
+                post_layer_norm=trunk.post_layer_norm,
                 backend="auto",
             )
         )
@@ -278,6 +318,12 @@ class BoltzGenModel(Model):
             num_atom_decoder_blocks=denoiser_config.num_atom_decoder_blocks,
             num_atom_decoder_attention_heads=denoiser_config.num_atom_attention_heads,
             num_conditioning_transitions=denoiser_config.num_conditioning_transitions,
+            transformer_size=denoiser_config.transformer_size,
+            post_layer_norm=denoiser_config.post_layer_norm,
+            use_qk_norm=denoiser_config.use_qk_norm,
+            gaussian_random_3d_encoding_dim=denoiser_config.gaussian_random_3d_encoding_dim,
+            predict_residue_type=denoiser_config.predict_residue_type,
+            num_residue_types=input_embeddings_config.vocab_size,
             backend="auto",
         )
         self.coordinate_diffusion = BoltzGenCoordinateDiffusion(
@@ -306,127 +352,6 @@ class BoltzGenModel(Model):
 
         _zero_initialize_boltzgen_updates(self)
 
-    def forward(
-        self,
-        input: BoltzGenInput,
-        *,
-        recycling_steps: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> BoltzGenOutput:
-        r"""
-        Run one stochastic denoising step for structure training.
-
-        ``B`` is batch size, ``N`` token count, and ``A`` atom count.
-
-        Args:
-            input: Model input with ``target_positions`` of shape ``(B, A, 3)`` in
-                angstroms. ``atom_mask`` controls coordinate centering; ``target_mask``
-                identifies resolved target atoms for the training objective.
-            recycling_steps: Number of trunk recycling passes. ``None`` uses the
-                configured value.
-            generator: Random generator used for rigid augmentation, noise-level
-                sampling, and coordinate noise.
-
-        Returns:
-            A [`BoltzGenOutput`][] with denoised ``coordinates`` of shape
-            ``(B, A, 3)``, ``distogram_logits`` of shape ``(B, N, N, D)``,
-            per-token ``bfactor_logits`` of shape ``(B, N, D_b)``, augmented
-            targets of shape ``(B, A, 3)``, and one ``noise_level`` per batch item.
-        """
-
-        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
-        conditioning = self.denoiser_conditioning(
-            trunk.single,
-            trunk.pair,
-            trunk.relative_position_encoding,
-            atom_features=input.atom_features,
-            reference_positions=input.reference_positions,
-            atom_mask=input.atom_mask,
-            reference_space_id=input.reference_space_id,
-            atom_to_token=input.atom_to_token,
-        )
-        target = cast(Tensor, input.target_positions)
-        atom_mask = input.atom_mask
-        augmented_target_coordinates = _center_random_augmentation(target, atom_mask, generator=generator)
-        sigmas = self.coordinate_diffusion.noise_distribution(
-            atom_mask.shape[0],
-            device=augmented_target_coordinates.device,
-            dtype=augmented_target_coordinates.dtype,
-            generator=generator,
-        )
-        noise = torch.randn(
-            augmented_target_coordinates.shape,
-            device=augmented_target_coordinates.device,
-            dtype=augmented_target_coordinates.dtype,
-            generator=generator,
-        )
-        noisy_coordinates = augmented_target_coordinates + sigmas.reshape(-1, 1, 1) * noise
-        denoised_coordinates = self.coordinate_diffusion.preconditioned_network_forward(
-            noisy_coordinates,
-            sigmas,
-            multiplicity=1,
-            atom_mask=atom_mask,
-            single_inputs=trunk.single_inputs,
-            single_trunk=trunk.single,
-            conditioning=conditioning,
-            atom_to_token=input.atom_to_token,
-            token_mask=input.token_mask,
-        )
-        return BoltzGenOutput(
-            coordinates=denoised_coordinates,
-            distogram_logits=trunk.distogram_logits,
-            bfactor_logits=self.bfactor_head(trunk.single),
-            augmented_target_coordinates=augmented_target_coordinates,
-            noise_level=sigmas,
-        )
-
-    def design(
-        self,
-        input: BoltzGenInput,
-        *,
-        num_samples: int = 1,
-        num_sampling_steps: int | None = None,
-        recycling_steps: int | None = None,
-        generator: torch.Generator | None = None,
-        step_scale: float | None = None,
-        noise_scale: float | None = None,
-    ) -> BoltzGenDesignOutput:
-        r"""
-        Sample atom coordinates for a processed design problem.
-
-        ``B`` is batch size, ``S`` is ``num_samples``, ``N`` is token count, and
-        ``A`` is atom count.
-
-        Args:
-            input: Processed structure-design input.
-            num_samples: Number of coordinate samples.
-            num_sampling_steps: Number of EDM sampling steps. ``None`` uses the
-                configured value.
-            recycling_steps: Number of trunk recycling passes. ``None`` uses the
-                configured value.
-            generator: Random generator used by coordinate sampling.
-            step_scale: Sampler step-size multiplier. ``None`` uses the configured
-                value.
-            noise_scale: Sampler noise multiplier. ``None`` uses the configured
-                value.
-
-        Returns:
-            A [`BoltzGenDesignOutput`][] with ``coordinates`` of shape
-            ``(B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
-            ``(B, N, N, D)``, and ``bfactor_logits`` of shape
-            ``(B, S, N, D_b)``.
-        """
-
-        return self._design(
-            input,
-            recycling_steps=recycling_steps,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            generator=generator,
-            step_scale=step_scale,
-            noise_scale=noise_scale,
-        )
-
     @torch.no_grad()
     def _design(
         self,
@@ -436,34 +361,26 @@ class BoltzGenModel(Model):
         num_samples: int = 1,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
-        step_scale: float | None = None,
-        noise_scale: float | None = None,
+        step_scale: float | Tensor | None = None,
+        noise_scale: float | Tensor | None = None,
     ) -> BoltzGenDesignOutput:
         r"""
         Draw reverse-diffusion structure samples from a preprocessed input.
 
         Args:
             input: Typed model input.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
+                configured value.
             num_samples: Number of reverse-diffusion samples to draw.
             num_sampling_steps: Optional number of EDM sampling steps. Defaults to the sampler config value.
             generator: Optional PyTorch random generator for diffusion noise.
-            step_scale: Optional per-call sampler step-scale override.
-            noise_scale: Optional per-call sampler noise-scale override.
+            step_scale: Optional scalar or per-sample step-scale override.
+            noise_scale: Optional scalar or per-sample noise-scale override.
 
         """
 
         trunk = self._run_trunk(input, recycling_steps=recycling_steps)
-        conditioning = self.denoiser_conditioning(
-            trunk.single,
-            trunk.pair,
-            trunk.relative_position_encoding,
-            atom_features=input.atom_features,
-            reference_positions=input.reference_positions,
-            atom_mask=input.atom_mask,
-            reference_space_id=input.reference_space_id,
-            atom_to_token=input.atom_to_token,
-        )
+        conditioning = self._build_denoiser_conditioning(trunk, input)
         coordinates = self.coordinate_diffusion.sample(
             input.atom_mask,
             num_sampling_steps=num_sampling_steps,
@@ -495,14 +412,17 @@ class BoltzGenModel(Model):
 
         Args:
             input: Typed model input.
-            recycling_steps: Optional number of recycling passes. Defaults to the config value.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
+                configured value.
 
         Returns:
             Trunk representations and distogram logits.
 
         """
 
-        steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        steps = operator.index(self._recycling_steps if recycling_steps is None else recycling_steps)
+        if steps < 1:
+            raise ValueError("recycling_steps must be positive")
         single_inputs = self.input_embeddings(
             atom_features=input.atom_features,
             reference_positions=input.reference_positions,
@@ -545,8 +465,8 @@ class BoltzGenModel(Model):
         pair_mask = pair_mask_from_token_mask(token_mask)
         single = torch.zeros_like(single_init)
         pair = torch.zeros_like(pair_init)
-        for cycle in range(steps + 1):
-            grad_enabled = torch.is_grad_enabled() and cycle == steps
+        for cycle in range(steps):
+            grad_enabled = torch.is_grad_enabled() and cycle == steps - 1
             with torch.set_grad_enabled(grad_enabled):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
@@ -578,6 +498,331 @@ class BoltzGenModel(Model):
             pair=pair,
             relative_position_encoding=relative_position_encoding,
             distogram_logits=self.distogram_head(pair),
+        )
+
+    def _build_denoiser_conditioning(
+        self,
+        trunk: _BoltzGenTrunkOutput,
+        input: BoltzGenInput,
+    ) -> dict[str, Tensor]:
+        r"""
+        Precompute the per-structure diffusion conditioning reused by denoising.
+        """
+
+        return self.denoiser_conditioning(
+            trunk.single,
+            trunk.pair,
+            trunk.relative_position_encoding,
+            atom_features=input.atom_features,
+            reference_positions=input.reference_positions,
+            atom_mask=input.atom_mask,
+            reference_space_id=input.reference_space_id,
+            atom_to_token=input.atom_to_token,
+        )
+
+
+class BoltzGenModel(_BoltzGenStructureModel):
+    r"""
+    Generate conditioned biomolecular structures with BoltzGen.
+
+    Accepts [`BoltzGenInput`][ofoldx.models.boltzgen.model.BoltzGenInput] and returns
+    [`BoltzGenOutput`][ofoldx.models.boltzgen.model.BoltzGenOutput].
+    """
+
+    config_class = BoltzGenConfig
+    config: BoltzGenConfig
+
+    def forward(
+        self,
+        input: BoltzGenInput,
+        target: BoltzGenStructureTarget,
+        *,
+        num_samples: int = 1,
+        synchronize_noise_levels: bool = False,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenOutput:
+        r"""
+        Run stochastic denoising samples for structure training.
+
+        ``B`` is batch size, ``S`` is ``num_samples``, ``N`` is token count,
+        and ``A`` is atom count.
+
+        Args:
+            input: Inference features and molecular layout.
+            target: Structure-training labels with one or ``S`` conformers.
+            num_samples: Number of independent noisy denoising samples per batch item.
+            synchronize_noise_levels: Whether all samples of one batch item share
+                one sampled noise level.
+            coordinate_augmentation: Whether to apply a random rigid transform to
+                each repeated target after centering.
+            augmentation_translation_scale: Standard deviation of augmentation
+                translations in angstroms.
+            noise_log_mean: Mean of the log-normal noise distribution.
+            noise_log_std: Standard deviation of the log-normal noise distribution.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
+                configured value.
+            generator: Random generator used for rigid augmentation, noise-level
+                sampling, and coordinate noise.
+
+        Returns:
+            A [`BoltzGenOutput`][] with denoised ``coordinates`` of shape
+            ``(B, S, A, 3)``, ``distogram_logits`` of shape ``(B, N, N, D)``,
+            per-token ``bfactor_logits`` of shape ``(B, N, D_b)``, augmented
+            targets of shape ``(B, S, A, 3)``, and noise levels of shape
+            ``(B, S)``.
+        """
+
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
+        conditioning = self._build_denoiser_conditioning(trunk, input)
+        batch_size, conformers = target.coordinates.shape[:2]
+        atom_index = target.atom_index.long()
+        valid_atom_index = atom_index >= 0
+        safe_atom_index = atom_index.clamp_min(0)
+        target_coordinates = target.coordinates.gather(
+            2,
+            safe_atom_index[:, None, :, None].expand(
+                -1,
+                conformers,
+                -1,
+                target.coordinates.shape[-1],
+            ),
+        )
+        target_coordinates = target_coordinates.masked_fill(
+            ~valid_atom_index[:, None, :, None],
+            0,
+        )
+        target_atom_mask = (
+            target.coordinate_mask.gather(
+                1,
+                safe_atom_index,
+            )
+            & valid_atom_index
+        )
+        target_atom_mask = target_atom_mask & input.atom_mask.bool()
+        target_coordinates = target_coordinates.masked_fill(
+            ~target_atom_mask[:, None, :, None],
+            0,
+        )
+        atom_count = atom_index.shape[1]
+        (
+            denoised_coordinates,
+            augmented_target_coordinates,
+            noise_level,
+            residue_type_logits,
+        ) = self.coordinate_diffusion.denoise_training(
+            target_coordinates,
+            input.atom_mask,
+            target_mask=target_atom_mask,
+            multiplicity=num_samples,
+            synchronize_noise_levels=synchronize_noise_levels,
+            coordinate_augmentation=coordinate_augmentation,
+            augmentation_translation_scale=augmentation_translation_scale,
+            noise_log_mean=noise_log_mean,
+            noise_log_std=noise_log_std,
+            generator=generator,
+            single_inputs=trunk.single_inputs,
+            single_trunk=trunk.single,
+            conditioning=conditioning,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
+        )
+        coordinates = denoised_coordinates.reshape(batch_size, num_samples, atom_count, 3)
+        augmented_target_coordinates = augmented_target_coordinates.reshape(
+            batch_size,
+            num_samples,
+            atom_count,
+            3,
+        )
+        noise_level = noise_level.reshape(batch_size, num_samples)
+        if residue_type_logits is not None:
+            residue_type_logits = residue_type_logits.reshape(
+                batch_size,
+                num_samples,
+                *residue_type_logits.shape[1:],
+            )
+        return BoltzGenOutput(
+            coordinates=coordinates,
+            distogram_logits=trunk.distogram_logits,
+            bfactor_logits=self.bfactor_head(trunk.single),
+            augmented_target_coordinates=augmented_target_coordinates,
+            noise_level=noise_level,
+            residue_type_logits=residue_type_logits,
+        )
+
+    def design(
+        self,
+        input: BoltzGenInput,
+        *,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+        step_scale: float | Tensor | None = None,
+        noise_scale: float | Tensor | None = None,
+    ) -> BoltzGenDesignOutput:
+        r"""
+        Sample atom coordinates for a processed design problem.
+
+        ``B`` is batch size, ``S`` is ``num_samples``, ``N`` is token count, and
+        ``A`` is atom count.
+
+        Args:
+            input: Processed structure-design input.
+            num_samples: Number of coordinate samples.
+            num_sampling_steps: Number of EDM sampling steps. ``None`` uses the
+                configured value.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
+                configured value.
+            generator: Random generator used by coordinate sampling.
+            step_scale: Sampler step-size multiplier, either scalar or one value
+                per expanded batch sample. ``None`` uses the configured value.
+            noise_scale: Sampler noise multiplier, either scalar or one value per
+                expanded batch sample. ``None`` uses the configured value.
+
+        Returns:
+            A [`BoltzGenDesignOutput`][] with ``coordinates`` of shape
+            ``(B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
+            ``(B, N, N, D)``, and ``bfactor_logits`` of shape
+            ``(B, S, N, D_b)``.
+        """
+
+        return self._design(
+            input,
+            recycling_steps=recycling_steps,
+            num_samples=num_samples,
+            num_sampling_steps=num_sampling_steps,
+            generator=generator,
+            step_scale=step_scale,
+            noise_scale=noise_scale,
+        )
+
+
+class BoltzGenConfidenceModel(_BoltzGenStructureModel):
+    r"""
+    Score explicit or newly sampled structures with the BoltzGen confidence equation.
+
+    The model owns the ordinary BoltzGen structure trunk and sampler plus the
+    independently parameterized confidence head. Its raw ``forward`` consumes
+    explicit ``(B, S, A, 3)`` coordinates; ``design`` samples and scores from one
+    shared trunk execution.
+    """
+
+    config_class = BoltzGenConfidenceConfig
+    config: BoltzGenConfidenceConfig
+
+    def __init__(self, config: BoltzGenConfidenceConfig | None = None) -> None:
+        config = BoltzGenConfidenceConfig() if config is None else config
+        super().__init__(config)
+        confidence = config.confidence
+        self.confidence_head = BoltzGenConfidenceHead(
+            single_size=config.single_size,
+            pair_size=config.pair_size,
+            num_blocks=confidence.num_pairformer_blocks,
+            num_pair_attention_heads=confidence.num_pair_attention_heads,
+            triangle_attention_hidden_size=confidence.triangle_attention_hidden_size,
+            num_triangle_attention_heads=confidence.num_triangle_attention_heads,
+            pair_dropout=confidence.pair_dropout,
+            post_layer_norm=confidence.post_layer_norm,
+            num_distogram_bins=confidence.num_distogram_bins,
+            max_distance=confidence.max_distance,
+            token_level_confidence=confidence.token_level_confidence,
+            add_single_input=confidence.add_single_input,
+            add_single_to_pair_product=confidence.add_single_to_pair_product,
+            use_separate_heads=confidence.use_separate_heads,
+            num_plddt_bins=confidence.num_plddt_bins,
+            num_pae_bins=confidence.num_pae_bins,
+            num_pde_bins=confidence.num_pde_bins,
+            return_latent_features=confidence.return_latent_features,
+            backend="auto",
+        )
+        _zero_initialize_boltzgen_updates(self.confidence_head)
+
+    def forward(
+        self,
+        input: BoltzGenInput,
+        *,
+        coordinates: Tensor,
+        recycling_steps: int | None = None,
+    ) -> BoltzGenConfidenceOutput:
+        r"""
+        Score explicit sampled coordinates.
+
+        Args:
+            input: Processed BoltzGen structure input.
+            coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)``.
+            recycling_steps: Number of complete trunk passes. ``None`` uses the
+                configured value.
+
+        Returns:
+            Complete learned logits and derived confidence tensors.
+        """
+
+        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
+        return self._score_confidence(input, trunk=trunk, coordinates=coordinates)
+
+    @torch.no_grad()
+    def design(
+        self,
+        input: BoltzGenInput,
+        *,
+        num_samples: int = 1,
+        num_sampling_steps: int | None = None,
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+        step_scale: float | Tensor | None = None,
+        noise_scale: float | Tensor | None = None,
+    ) -> BoltzGenConfidenceDesignOutput:
+        r"""
+        Sample coordinates and score them without recomputing the structure trunk.
+        """
+
+        trunk = self._run_trunk(input, recycling_steps=recycling_steps)
+        conditioning = self._build_denoiser_conditioning(trunk, input)
+        coordinates = self.coordinate_diffusion.sample(
+            input.atom_mask,
+            num_sampling_steps=num_sampling_steps,
+            multiplicity=num_samples,
+            generator=generator,
+            step_scale=step_scale,
+            noise_scale=noise_scale,
+            single_inputs=trunk.single_inputs,
+            single_trunk=trunk.single,
+            conditioning=conditioning,
+            atom_to_token=input.atom_to_token,
+            token_mask=input.token_mask,
+        )
+        batch_size = input.token_mask.shape[0]
+        coordinates = coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:])
+        confidence = self._score_confidence(input, trunk=trunk, coordinates=coordinates)
+        return BoltzGenConfidenceDesignOutput(
+            coordinates=coordinates,
+            distogram_logits=trunk.distogram_logits,
+            bfactor_logits=self.bfactor_head(trunk.single).unsqueeze(1).expand(-1, num_samples, -1, -1),
+            confidence=confidence,
+        )
+
+    def _score_confidence(
+        self,
+        input: BoltzGenInput,
+        *,
+        trunk: _BoltzGenTrunkOutput,
+        coordinates: Tensor,
+    ) -> BoltzGenConfidenceOutput:
+        return self.confidence_head(
+            trunk.single_inputs.detach(),
+            trunk.single.detach(),
+            trunk.pair.detach(),
+            coordinates.detach(),
+            input=input,
+            pred_distogram_logits=trunk.distogram_logits.detach(),
         )
 
 
@@ -612,6 +857,13 @@ class BoltzGenInverseFoldingModel(Model):
             msa_profile_size=config.input_embeddings.msa_profile_size,
             num_method_types=config.input_embeddings.num_method_types,
             num_molecule_types=config.input_embeddings.num_molecule_types,
+            add_method_conditioning=config.input_embeddings.add_method_conditioning,
+            add_modified_flag=config.input_embeddings.add_modified_flag,
+            add_cyclic_flag=config.input_embeddings.add_cyclic_flag,
+            add_molecule_type_feature=config.input_embeddings.add_molecule_type_feature,
+            add_binding_specification=config.input_embeddings.add_binding_specification,
+            add_design_mask=config.input_embeddings.add_design_mask,
+            add_ss_specification=config.input_embeddings.add_ss_specification,
             backend="auto",
         )
         self.inverse_folding_encoder = BoltzGenInverseFoldingEncoder(
@@ -647,6 +899,7 @@ class BoltzGenInverseFoldingModel(Model):
     def forward(
         self,
         input: BoltzGenInverseFoldingInput,
+        target_residue_type: Tensor,
         *,
         generator: torch.Generator | None = None,
     ) -> BoltzGenInverseFoldingOutput:
@@ -656,6 +909,8 @@ class BoltzGenInverseFoldingModel(Model):
         Args:
             input: Processed inverse-folding input with ``B`` batch items and ``N``
                 tokens.
+            target_residue_type: Unmasked residue distributions with shape
+                ``(B, N, V)`` used only for stochastic teacher forcing.
             generator: Random generator used for teacher-forcing visibility.
 
         Returns:
@@ -679,16 +934,23 @@ class BoltzGenInverseFoldingModel(Model):
         )
         edge_index, valid_mask, node, edge = self.inverse_folding_encoder(input, single_inputs=single_inputs)
         return BoltzGenInverseFoldingOutput(
-            logits=self.inverse_folding_decoder(node, edge, edge_index, valid_mask, input, generator=generator),
+            logits=self.inverse_folding_decoder(
+                node,
+                edge,
+                edge_index,
+                valid_mask,
+                target_residue_type,
+                generator=generator,
+            ),
         )
 
+    @torch.no_grad()
     def design(
         self,
         input: BoltzGenInverseFoldingInput,
         *,
-        temperature: float | None = None,
-        inverse_fold_restriction: tuple[str, ...] = (),
-        tie_symmetric_sequences: bool = False,
+        temperature: float | None = 0.1,
+        tie_symmetric_sequences: bool = True,
         generator: torch.Generator | None = None,
     ) -> BoltzGenInverseFoldingDesignOutput:
         r"""
@@ -699,45 +961,12 @@ class BoltzGenInverseFoldingModel(Model):
                 tokens.
             temperature: Categorical sampling temperature. ``None`` selects the
                 highest-logit residue at each decoded position.
-            inverse_fold_restriction: Canonical amino acids to exclude from this call.
             tie_symmetric_sequences: Whether symmetric copies share one sample.
             generator: Random generator used for decode order and categorical sampling.
 
         Returns:
             A [`BoltzGenInverseFoldingDesignOutput`][] with ``logits`` of shape
             ``(B, N, V)`` and sampled ``tokens`` of shape ``(B, N)``.
-        """
-
-        return self._design(
-            input,
-            temperature=temperature,
-            inverse_fold_restriction=inverse_fold_restriction,
-            tie_symmetric_sequences=tie_symmetric_sequences,
-            generator=generator,
-        )
-
-    @torch.no_grad()
-    def _design(
-        self,
-        input: BoltzGenInverseFoldingInput,
-        *,
-        temperature: float | None = None,
-        inverse_fold_restriction: tuple[str, ...] = (),
-        tie_symmetric_sequences: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> BoltzGenInverseFoldingDesignOutput:
-        r"""
-        Autoregressively design residue tokens from the conditioned structure.
-
-        Args:
-            input: Typed model input.
-            temperature: Optional categorical sampling temperature. ``None`` selects argmax decoding.
-            inverse_fold_restriction: Canonical amino acids to exclude from this design call.
-            tie_symmetric_sequences: Whether matching positions across symmetric copies share one sample.
-            generator: Optional PyTorch random generator for decode order and categorical sampling.
-
-        Returns:
-            Design-generator output carrying sampled sequence tokens and logits.
         """
 
         single_inputs = self.input_embeddings(
@@ -762,7 +991,6 @@ class BoltzGenInverseFoldingModel(Model):
             valid_mask,
             input,
             temperature=temperature,
-            inverse_fold_restriction=inverse_fold_restriction,
             tie_symmetric_sequences=tie_symmetric_sequences,
             generator=generator,
         )
@@ -794,8 +1022,9 @@ class BoltzGenInputEmbeddings(nn.Module):
         add_method_conditioning: bool = True,
         add_modified_flag: bool = True,
         add_cyclic_flag: bool = True,
-        add_mol_type_feat: bool = True,
+        add_molecule_type_feature: bool = True,
         add_binding_specification: bool = False,
+        add_design_mask: bool = False,
         add_ss_specification: bool = False,
         num_binding_types: int = 3,
         num_ss_types: int = 4,
@@ -840,10 +1069,11 @@ class BoltzGenInputEmbeddings(nn.Module):
             self.modified_embedding = nn.Embedding(2, single_size)
         if add_cyclic_flag:
             self.cyclic_projection = nn.Linear(1, single_size, bias=False)
-        if add_mol_type_feat:
+        if add_molecule_type_feature:
             self.molecule_type_embedding = nn.Embedding(num_molecule_types, single_size)
         if add_binding_specification:
             self.binding_specification_embedding = nn.Embedding(num_binding_types, single_size)
+        if add_design_mask:
             self.design_mask_embedding = nn.Embedding(2, single_size)
         if add_ss_specification:
             self.ss_specification_embedding = nn.Embedding(num_ss_types, single_size)
@@ -914,6 +1144,1874 @@ class BoltzGenInputEmbeddings(nn.Module):
         if self.ss_specification_embedding is not None:
             single = single + self.ss_specification_embedding(cast(Tensor, ss_type))
         return single
+
+
+class BoltzGenTemplateEmbedder(nn.Module):
+    r"""
+    Embed template geometry as an additive pair update.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        template_size: int = 64,
+        num_blocks: int = 2,
+        vocab_size: int = 33,
+        num_bins: int = 38,
+        min_dist: float = 3.25,
+        max_dist: float = 50.75,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+        self.num_bins = num_bins
+        self.relu = nn.ReLU()
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
+        self.template_feature_projection = FactorizedPairLinear(
+            pair_size=num_bins + 5,
+            token_size=vocab_size,
+            output_size=template_size,
+            bias=False,
+            backend=backend,
+        )
+        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
+        self.blocks = nn.ModuleList(
+            BoltzGenTrianglePairUpdateBlock(
+                pair_size=template_size,
+                triangle_multiplication_hidden_size=template_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                dropout=dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
+        residue_type_features = cast(Tensor, input.template_residue_type_features)
+        frame_mask = cast(Tensor, input.template_frame_mask)
+        frame_rotations = cast(Tensor, input.template_frame_rotations)
+        frame_translations = cast(Tensor, input.template_frame_translations)
+        beta_carbon_positions = cast(Tensor, input.template_beta_carbon_positions)
+        alpha_carbon_positions = cast(Tensor, input.template_alpha_carbon_positions)
+        beta_carbon_mask = cast(Tensor, input.template_beta_carbon_mask)
+        template_mask = cast(Tensor, input.template_mask)
+        visibility_index = cast(Tensor, input.template_visibility_index)
+        present = template_mask.any(dim=2).float()
+        count = present.sum(dim=1).clamp(min=1)
+        batch_size, num_templates, num_tokens = residue_type_features.shape[:3]
+
+        pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
+        pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
+        same_visibility = (visibility_index[..., :, None] == visibility_index[..., None, :]).float()
+
+        beta_carbon_distances = torch.cdist(
+            beta_carbon_positions,
+            beta_carbon_positions,
+        )
+        boundaries = torch.linspace(
+            self.min_dist,
+            self.max_dist,
+            self.num_bins - 1,
+            device=beta_carbon_distances.device,
+        )
+        distogram = F.one_hot(
+            (beta_carbon_distances[..., None] > boundaries).sum(dim=-1).long(),
+            num_classes=self.num_bins,
+        )
+
+        rotation = frame_rotations.unsqueeze(2).transpose(-1, -2)
+        translation = frame_translations.unsqueeze(2).unsqueeze(-1)
+        targets = alpha_carbon_positions.unsqueeze(3).unsqueeze(-1)
+        vector = torch.matmul(rotation, targets - translation)
+        norm = torch.norm(vector, dim=-1, keepdim=True)
+        unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
+
+        geometry = torch.cat(
+            [
+                distogram.to(pair.dtype),
+                pair_beta_carbon_mask,
+                unit_vector,
+                pair_frame_mask,
+            ],
+            dim=-1,
+        )
+        geometry = geometry * same_visibility.unsqueeze(-1)
+        template_residue_features = residue_type_features.to(pair.dtype)
+        feature_value = self.template_feature_projection(geometry.to(pair.dtype), template_residue_features)
+        value = self.pair_projection(self.pair_norm(pair[:, None])) + feature_value
+        value = value.reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
+        if pair_mask is not None:
+            pair_mask = (
+                pair_mask[:, None]
+                .expand(-1, num_templates, -1, -1)
+                .reshape(batch_size * num_templates, num_tokens, num_tokens)
+            )
+        refined = value
+        for block in self.blocks:
+            refined = block(refined, pair_mask=pair_mask)
+        value = self.hidden_norm(value + refined).reshape(batch_size, num_templates, num_tokens, num_tokens, -1)
+
+        aggregated = (value * present[:, :, None, None, None]).sum(dim=1) / count[:, None, None, None].to(value.dtype)
+        return self.output_projection(self.relu(aggregated))
+
+
+class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
+    r"""
+    Embed template geometry with homogeneous BoltzGen Miniformer pair updates.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        template_size: int = 64,
+        num_blocks: int = 2,
+        vocab_size: int = 33,
+        num_bins: int = 38,
+        min_dist: float = 3.25,
+        max_dist: float = 50.75,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+        self.num_bins = num_bins
+        self.relu = nn.ReLU()
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
+        self.template_feature_projection = FactorizedPairLinear(
+            pair_size=num_bins + 5,
+            token_size=vocab_size,
+            output_size=template_size,
+            bias=False,
+            backend=backend,
+        )
+        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
+        self.blocks = nn.ModuleList(
+            BoltzGenMiniTrianglePairUpdateBlock(
+                pair_size=template_size,
+                dropout=dropout,
+                post_layer_norm=post_layer_norm,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+
+class BoltzGenTokenDistanceEmbedder(nn.Module):
+    r"""
+    Encode inter-token backbone geometry into an additive pair update.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_distance_size: int = 64,
+        num_blocks: int = 2,
+        num_bins: int = 38,
+        min_dist: float = 3.25,
+        max_dist: float = 50.75,
+        distance_gaussian_dim: int = 32,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        dropout: float = 0.25,
+        use_token_distance_features: bool = True,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+        self.num_bins = num_bins
+        self.use_token_distance_features = use_token_distance_features
+        self.relu = nn.ReLU()
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
+        self.distance_feature_projection = nn.Linear(
+            num_bins + (4 * pair_size if use_token_distance_features else 0),
+            token_distance_size,
+            bias=False,
+        )
+        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
+        self.blocks = nn.ModuleList(
+            BoltzGenTrianglePairUpdateBlock(
+                pair_size=token_distance_size,
+                triangle_multiplication_hidden_size=token_distance_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                dropout=dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+        self.distance_encoder = (
+            BoltzGenDistanceTokenEncoder(
+                distance_gaussian_dim=distance_gaussian_dim,
+                pair_size=pair_size,
+                output_size=pair_size,
+            )
+            if use_token_distance_features
+            else None
+        )
+
+    def forward(
+        self,
+        pair: Tensor,
+        input: BoltzGenInput,
+        relative_position_encoding: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        coords = input.center_coordinates
+        distances = torch.cdist(coords, coords)
+        boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1, device=distances.device)
+        distogram = F.one_hot((distances[..., None] > boundaries).sum(dim=-1).long(), num_classes=self.num_bins)
+
+        distance_features = (
+            torch.cat(
+                [
+                    distogram,
+                    cast(BoltzGenDistanceTokenEncoder, self.distance_encoder)(
+                        relative_position_encoding,
+                        input,
+                    ),
+                ],
+                dim=-1,
+            )
+            if self.use_token_distance_features
+            else distogram
+        )
+        distance_features = distance_features * input.token_distance_mask.unsqueeze(-1)
+        value = self.pair_projection(self.pair_norm(pair)) + self.distance_feature_projection(
+            distance_features.to(pair.dtype)
+        )
+        refined = value
+        for block in self.blocks:
+            refined = block(refined, pair_mask=pair_mask)
+        value = self.hidden_norm(value + refined)  # one outer residual around the (internally-residual) stack
+        return self.output_projection(self.relu(value))
+
+
+class BoltzGenMiniformerTokenDistanceEmbedder(BoltzGenTokenDistanceEmbedder):
+    r"""
+    Encode inter-token backbone geometry with homogeneous Miniformer pair updates.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        token_distance_size: int = 64,
+        num_blocks: int = 2,
+        num_bins: int = 38,
+        min_dist: float = 3.25,
+        max_dist: float = 50.75,
+        distance_gaussian_dim: int = 32,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        use_token_distance_features: bool = True,
+        backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+        self.num_bins = num_bins
+        self.use_token_distance_features = use_token_distance_features
+        self.relu = nn.ReLU()
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
+        self.distance_feature_projection = nn.Linear(
+            num_bins + (4 * pair_size if use_token_distance_features else 0),
+            token_distance_size,
+            bias=False,
+        )
+        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
+        self.blocks = nn.ModuleList(
+            BoltzGenMiniTrianglePairUpdateBlock(
+                pair_size=token_distance_size,
+                dropout=dropout,
+                post_layer_norm=post_layer_norm,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+        self.distance_encoder = (
+            BoltzGenDistanceTokenEncoder(
+                distance_gaussian_dim=distance_gaussian_dim,
+                pair_size=pair_size,
+                output_size=pair_size,
+            )
+            if use_token_distance_features
+            else None
+        )
+
+
+class BoltzGenDistanceTokenEncoder(nn.Module):
+    r"""
+    Per-backbone-atom pairwise distance features conditioned on the relative-position encoding.
+    """
+
+    def __init__(self, distance_gaussian_dim: int = 32, pair_size: int = 128, output_size: int = 128) -> None:
+        super().__init__()
+        self.distance_smearing = BoltzGenBroadcastGaussianSmearing(
+            start=0.0,
+            stop=2.0,
+            num_gaussians=distance_gaussian_dim,
+        )
+        input_size = distance_gaussian_dim + 1 + pair_size
+        self.distance_norm = LayerNorm(input_size)
+        self.distance_feed_forward = SwiGluFeedForward(
+            input_size,
+            pair_size,
+            output_size,
+        )
+
+    def forward(self, relative_position_encoding: Tensor, input: BoltzGenInput) -> Tensor:
+        batch_size, num_tokens = relative_position_encoding.shape[:2]
+        backbone = _gather_backbone4(
+            input.token_to_bb4_atoms,
+            input.atom_coordinates,
+            batch_size,
+            num_tokens,
+        ).permute(0, 2, 1, 3)
+        distance = (backbone.unsqueeze(-2) - backbone.unsqueeze(-3)).norm(dim=-1).unsqueeze(-1)  # (B, 4, N, N, 1)
+        gaussian = self.distance_smearing(distance)  # (B, 4, N, N, gaussians)
+        relative = relative_position_encoding.view(batch_size, 1, num_tokens, num_tokens, -1).expand(-1, 4, -1, -1, -1)
+        bias_input = torch.cat([gaussian, distance, relative], dim=-1)
+        bias = self.distance_feed_forward(self.distance_norm(bias_input))
+        bias = bias.permute(0, 2, 3, 4, 1).reshape(batch_size, num_tokens, num_tokens, -1)
+        return bias
+
+
+class BoltzGenBroadcastGaussianSmearing(nn.Module):
+    r"""
+    Radial-basis distance features ``exp(coeff (d - offset)^2)`` broadcasting over a trailing singleton.
+    """
+
+    def __init__(self, start: float = 0.0, stop: float = 2.0, num_gaussians: int = 32) -> None:
+        super().__init__()
+        offset = torch.linspace(start, stop, num_gaussians)
+        # Derive the RBF width from the materialized float32 center spacing. This preserves the distance-feature
+        # arithmetic and avoids calling ``.item()`` on an unmaterialized meta tensor.
+        spacing = torch.linspace(start, stop, num_gaussians, device="cpu")
+        self.coeff = -0.5 / (spacing[1] - spacing[0]).item() ** 2
+        self.register_buffer("offset", offset)
+
+    def forward(self, distance: Tensor) -> Tensor:
+        return torch.exp(self.coeff * (distance - self.offset.view(1, 1, 1, -1)).pow(2))
+
+
+class BoltzGenMsaTrunk(nn.Module):
+    r"""
+    Build BoltzGen MSA features and refine the pair representation.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        msa_size: int = 64,
+        num_blocks: int = 4,
+        vocab_size: int = 33,
+        use_paired_feature: bool = True,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.use_paired_feature = use_paired_feature
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
+        self.msa_projection = nn.Linear(
+            vocab_size + 2 + int(use_paired_feature),
+            msa_size,
+            bias=False,
+        )
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            BoltzGenMsaBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                num_msa_attention_heads=num_msa_attention_heads,
+                msa_head_dim=msa_head_dim,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(
+        self,
+        pair: Tensor,
+        single_inputs: Tensor,
+        *,
+        msa_tokens: Tensor,
+        has_deletion: Tensor,
+        deletion_value: Tensor,
+        is_paired: Tensor,
+        msa_mask: Tensor,
+        token_mask: Tensor,
+    ) -> Tensor:
+        features = [
+            F.one_hot(msa_tokens, num_classes=self.vocab_size).to(pair.dtype),
+            has_deletion.unsqueeze(-1).to(pair.dtype),
+            deletion_value.unsqueeze(-1).to(pair.dtype),
+        ]
+        if self.use_paired_feature:
+            features.append(is_paired.unsqueeze(-1).to(pair.dtype))
+        msa = self.msa_projection(torch.cat(features, dim=-1))
+        msa = msa + self.token_projection(single_inputs).unsqueeze(1)
+        pair_mask = pair_mask_from_token_mask(token_mask)
+        for block in self.blocks:
+            pair, msa = block(pair, msa, pair_mask, msa_mask)
+        return pair
+
+
+class BoltzGenMsaBlock(nn.Module):
+    r"""
+    One BoltzGen MSA block with scalar dropout per MSA row.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_weighted_averaging = MsaPairWeightedAveraging(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            head_dim=msa_head_dim,
+            backend=backend,
+        )
+        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
+        self.outer_product_mean = OuterProductMean(
+            msa_size=msa_size,
+            hidden_size=outer_product_hidden_size,
+            pair_size=pair_size,
+            backend=backend,
+        )
+        self.triangle_pair_update = BoltzGenTrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
+
+    def forward(
+        self,
+        pair: Tensor,
+        msa: Tensor,
+        pair_mask: Tensor,
+        msa_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        msa = msa + self.msa_dropout(self.pair_weighted_averaging(msa, pair, pair_mask=pair_mask))
+        msa = msa + self.msa_transition(msa)
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
+        return pair, msa
+
+
+class BoltzGenPairformerStack(nn.Module):
+    r"""
+    Homogeneous stack of BoltzGen Pairformer blocks.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            BoltzGenPairformerBlock(
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                post_layer_norm=post_layer_norm,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            single, pair = block(single, pair, pair_mask=pair_mask)
+        return single, pair
+
+
+class BoltzGenPairformerBlock(nn.Module):
+    r"""
+    One BoltzGen Pairformer block.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_update = BoltzGenTrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            backend=backend,
+        )
+        self.pair_attention = PairBiasedSelfAttention(
+            hidden_size=single_size,
+            pair_size=pair_size,
+            num_attention_heads=num_pair_attention_heads,
+            backend=backend,
+        )
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
+        self.single_post_norm = LayerNorm(single_size, backend=backend) if post_layer_norm else nn.Identity()
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        pair = self.pair_update(pair, pair_mask=pair_mask)
+        single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
+        single = single + self.single_transition(single)
+        return self.single_post_norm(single), pair
+
+
+class BoltzGenTrianglePairUpdateBlock(nn.Module):
+    r"""
+    BoltzGen pair update with one dropout scalar per pair row or column.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication_outgoing = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
+            backend=backend,
+        )
+        self.triangle_multiplication_incoming = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            backend=backend,
+        )
+        self.triangle_attention_starting_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
+        self.triangle_attention_ending_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
+        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
+        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
+        ending_update = self.triangle_attention_ending_node(
+            pair.transpose(-3, -2),
+            pair_mask=end_pair_mask,
+        ).transpose(-3, -2)
+        pair = pair + self.columnwise_dropout(ending_update)
+        return pair + self.transition(pair)
+
+
+class BoltzGenConfidenceHead(nn.Module):
+    r"""
+    BoltzGen confidence trunk and complete learned output heads.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_blocks: int = 8,
+        num_pair_attention_heads: int = 16,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        pair_dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        num_distogram_bins: int = 64,
+        max_distance: float = 22.0,
+        token_level_confidence: bool = True,
+        add_single_input: bool = False,
+        add_single_to_pair_product: bool = False,
+        use_separate_heads: bool = False,
+        num_plddt_bins: int = 50,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+        return_latent_features: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.token_level_confidence = token_level_confidence
+        self.add_single_input = add_single_input
+        self.add_single_to_pair_product = add_single_to_pair_product
+        self.return_latent_features = return_latent_features
+
+        self.register_buffer(
+            "boundaries",
+            torch.linspace(2.0, max_distance, num_distogram_bins - 1),
+        )
+        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
+        self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
+        if add_single_to_pair_product:
+            self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
+            self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
+            self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
+        if add_single_input:
+            self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
+        self.input_single_norm = LayerNorm(single_size, backend=backend)
+        self.single_norm = LayerNorm(single_size, backend=backend)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pairformer_stack = BoltzGenPairformerStack(
+            num_blocks=num_blocks,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            dropout=pair_dropout,
+            post_layer_norm=post_layer_norm,
+            backend=backend,
+        )
+        self.output_head = BoltzGenConfidenceOutputHead(
+            single_size=single_size,
+            pair_size=pair_size,
+            token_level_confidence=token_level_confidence,
+            use_separate_heads=use_separate_heads,
+            num_plddt_bins=num_plddt_bins,
+            num_pae_bins=num_pae_bins,
+            num_pde_bins=num_pde_bins,
+        )
+
+        nn.init.zeros_(self.distance_embedding.weight)
+        nn.init.zeros_(self.single_to_pair_row.weight)
+        nn.init.zeros_(self.single_to_pair_col.weight)
+        if add_single_to_pair_product:
+            nn.init.zeros_(self.single_to_pair_product_out.weight)
+        if add_single_input:
+            nn.init.zeros_(self.input_single_projection.weight)
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        coordinates: Tensor,
+        *,
+        input: BoltzGenInput,
+        pred_distogram_logits: Tensor,
+    ) -> BoltzGenConfidenceOutput:
+        batch_size, num_samples, num_atoms, _ = coordinates.shape
+        flat_coordinates = coordinates.reshape(batch_size * num_samples, num_atoms, 3)
+
+        single_inputs = self.input_single_norm(single_inputs)
+        single = self.single_norm(single)
+        if self.add_single_input:
+            single = single + self.input_single_projection(single_inputs)
+        pair = (
+            self.pair_norm(pair)
+            + self.single_to_pair_row(single_inputs).unsqueeze(-2)
+            + self.single_to_pair_col(single_inputs).unsqueeze(-3)
+        )
+        if self.add_single_to_pair_product:
+            pair = pair + self.single_to_pair_product_out(
+                self.single_to_pair_product_left(single_inputs).unsqueeze(-2)
+                * self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
+            )
+
+        single = single.repeat_interleave(num_samples, dim=0)
+        pair = pair.repeat_interleave(num_samples, dim=0)
+        representative_atom_index = input.token_center_atom_index.repeat_interleave(num_samples, dim=0).long()
+        representative_coordinates = flat_coordinates.gather(
+            1,
+            representative_atom_index.unsqueeze(-1).expand(-1, -1, 3),
+        )
+        representative_distances = torch.cdist(representative_coordinates, representative_coordinates)
+        distance_bins = (representative_distances.unsqueeze(-1) > self.boundaries).sum(dim=-1)
+        pair = pair + self.distance_embedding(distance_bins)
+
+        token_mask = input.token_mask.repeat_interleave(num_samples, dim=0)
+        pair_mask = pair_mask_from_token_mask(token_mask)
+        single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        pae_logits, pde_logits, plddt_logits, resolved_logits = self.output_head(
+            single,
+            pair,
+            input=input,
+            multiplicity=num_samples,
+        )
+        return _boltzgen_confidence_output(
+            pae_logits=pae_logits,
+            pde_logits=pde_logits,
+            plddt_logits=plddt_logits,
+            resolved_logits=resolved_logits,
+            confidence_single=single if self.return_latent_features else None,
+            confidence_pair=pair if self.return_latent_features else None,
+            coordinates=flat_coordinates,
+            representative_distances=representative_distances,
+            pred_distogram_logits=pred_distogram_logits,
+            input=input,
+            multiplicity=num_samples,
+            token_level_confidence=self.token_level_confidence,
+        )
+
+
+class BoltzGenConfidenceOutputHead(nn.Module):
+    r"""
+    Project confidence representations to PAE, PDE, pLDDT, and resolved logits.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        token_level_confidence: bool = True,
+        use_separate_heads: bool = False,
+        num_plddt_bins: int = 50,
+        num_pae_bins: int = 64,
+        num_pde_bins: int = 64,
+    ) -> None:
+        super().__init__()
+        self.token_level_confidence = token_level_confidence
+        self.use_separate_heads = use_separate_heads
+        if use_separate_heads:
+            self.pae_intra_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+            self.pae_inter_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+            self.pde_intra_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+            self.pde_inter_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+        else:
+            self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+            self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
+        plddt_size = num_plddt_bins if token_level_confidence else 23 * num_plddt_bins
+        resolved_size = 2 if token_level_confidence else 23 * 2
+        self.plddt_projection = nn.Linear(single_size, plddt_size, bias=False)
+        self.resolved_projection = nn.Linear(single_size, resolved_size, bias=False)
+
+    def forward(
+        self,
+        single: Tensor,
+        pair: Tensor,
+        *,
+        input: BoltzGenInput,
+        multiplicity: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        chain_index = input.chain_index.repeat_interleave(multiplicity, dim=0)
+        if self.use_separate_heads:
+            same_chain = (chain_index.unsqueeze(-1) == chain_index.unsqueeze(-2)).to(pair).unsqueeze(-1)
+            different_chain = 1.0 - same_chain
+            pae_logits = (
+                self.pae_intra_projection(pair) * same_chain + self.pae_inter_projection(pair) * different_chain
+            )
+            symmetric_pair = pair + pair.transpose(-3, -2)
+            pde_logits = (
+                self.pde_intra_projection(symmetric_pair) * same_chain
+                + self.pde_inter_projection(symmetric_pair) * different_chain
+            )
+        else:
+            pae_logits = self.pae_projection(pair)
+            pde_logits = self.pde_projection(pair + pair.transpose(-3, -2))
+
+        plddt_logits = self.plddt_projection(single)
+        resolved_logits = self.resolved_projection(single)
+        if self.token_level_confidence:
+            return pae_logits, pde_logits, plddt_logits, resolved_logits
+
+        num_bins = plddt_logits.shape[-1] // 23
+        plddt_slots = plddt_logits.reshape(*plddt_logits.shape[:-1], 23, num_bins)
+        resolved_slots = resolved_logits.reshape(*resolved_logits.shape[:-1], 23, 2)
+        atom_to_token = input.atom_to_token.repeat_interleave(multiplicity, dim=0).long()
+        atom_token_index = input.atom_token_index.repeat_interleave(multiplicity, dim=0).long()
+        batch_index = torch.arange(single.shape[0], device=single.device).unsqueeze(-1)
+        plddt_logits = plddt_slots[batch_index, atom_to_token, atom_token_index]
+        resolved_logits = resolved_slots[batch_index, atom_to_token, atom_token_index]
+        atom_mask = input.atom_mask.repeat_interleave(multiplicity, dim=0).to(plddt_logits)
+        plddt_logits = plddt_logits * atom_mask.unsqueeze(-1)
+        resolved_logits = resolved_logits * atom_mask.unsqueeze(-1)
+        return pae_logits, pde_logits, plddt_logits, resolved_logits
+
+
+class BoltzGenMiniformerMsaTrunk(nn.Module):
+    r"""
+    MSA-module variant whose pair track uses compact pair-only Miniformer blocks.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        msa_size: int = 64,
+        num_blocks: int = 3,
+        vocab_size: int = 33,
+        use_paired_feature: bool = True,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.vocab_size = vocab_size
+        self.use_paired_feature = use_paired_feature
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
+        self.msa_projection = nn.Linear(
+            vocab_size + 2 + int(use_paired_feature),
+            msa_size,
+            bias=False,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                BoltzGenMiniformerMsaBlock(
+                    msa_size=msa_size,
+                    pair_size=pair_size,
+                    outer_product_hidden_size=outer_product_hidden_size,
+                    msa_dropout=msa_dropout,
+                    pair_dropout=pair_dropout,
+                    num_msa_attention_heads=num_msa_attention_heads,
+                    msa_head_dim=msa_head_dim,
+                    expansion=expansion,
+                    backend=backend,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(
+        self,
+        pair: Tensor,
+        single_inputs: Tensor,
+        *,
+        msa_tokens: Tensor,
+        has_deletion: Tensor,
+        deletion_value: Tensor,
+        is_paired: Tensor,
+        msa_mask: Tensor,
+        token_mask: Tensor,
+    ) -> Tensor:
+        features = [
+            F.one_hot(msa_tokens.long(), num_classes=self.vocab_size).to(pair.dtype),
+            has_deletion.unsqueeze(-1).to(pair.dtype),
+            deletion_value.unsqueeze(-1).to(pair.dtype),
+        ]
+        if self.use_paired_feature:
+            features.append(is_paired.unsqueeze(-1).to(pair.dtype))
+        msa_representation = self.msa_projection(torch.cat(features, dim=-1))
+        msa_representation = msa_representation + self.token_projection(single_inputs).unsqueeze(1)
+        pair_mask = pair_mask_from_token_mask(token_mask)
+        for block in self.blocks:
+            pair, msa_representation = block(pair, msa_representation, pair_mask, msa_mask)
+        return pair
+
+
+class BoltzGenMiniformerMsaBlock(nn.Module):
+    r"""
+    Update MSA and pair features in a Miniformer block.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_weighted_averaging = MsaPairWeightedAveraging(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            head_dim=msa_head_dim,
+            backend=backend,
+        )
+        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
+        self.outer_product_mean = OuterProductMean(
+            msa_size=msa_size,
+            hidden_size=outer_product_hidden_size,
+            pair_size=pair_size,
+            backend=backend,
+        )
+        self.triangle_pair_update = BoltzGenMiniTrianglePairUpdateBlock(
+            pair_size=pair_size,
+            expansion=expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
+
+    def forward(
+        self,
+        pair: Tensor,
+        msa_representation: Tensor,
+        pair_mask: Tensor,
+        msa_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        msa_representation = msa_representation + self.msa_dropout(
+            self.pair_weighted_averaging(msa_representation, pair, pair_mask=pair_mask)
+        )
+        msa_representation = msa_representation + self.msa_transition(msa_representation)
+        pair = pair + self.outer_product_mean(msa_representation, msa_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
+        return pair, msa_representation
+
+
+class BoltzGenMiniformerStack(nn.Module):
+    r"""
+    Stack of BoltzGen Miniformer blocks (the trunk variant selected by ``use_miniformer``).
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 12,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_pair_attention_heads: int = 16,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        use_single_to_pair: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            [
+                BoltzGenMiniformerBlock(
+                    single_size=single_size,
+                    pair_size=pair_size,
+                    num_pair_attention_heads=num_pair_attention_heads,
+                    dropout=dropout,
+                    post_layer_norm=post_layer_norm,
+                    use_single_to_pair=use_single_to_pair,
+                    backend=backend,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            single, pair = block(single, pair, pair_mask=pair_mask)
+        return single, pair
+
+
+class BoltzGenMiniformerBlock(nn.Module):
+    r"""
+    BoltzGen Miniformer block: compact pair update plus pair-biased single attention.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        use_single_to_pair: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
+        self.single_to_pair_left_projection = (
+            nn.Linear(single_size, pair_size, bias=False) if use_single_to_pair else None
+        )
+        self.single_to_pair_right_projection = (
+            nn.Linear(single_size, pair_size, bias=False) if use_single_to_pair else None
+        )
+        self.attention = PairBiasedSelfAttention(
+            hidden_size=single_size,
+            pair_size=pair_size,
+            num_attention_heads=num_pair_attention_heads,
+            backend=backend,
+        )
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
+        self.single_post_norm = LayerNorm(single_size, backend=backend) if post_layer_norm else nn.Identity()
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if pair_mask is None:
+            pair_mask = pair.new_ones(pair.shape[:-1])
+        left_projection = self.single_to_pair_left_projection
+        right_projection = self.single_to_pair_right_projection
+        if left_projection is not None and right_projection is not None:
+            pair = pair + left_projection(single).unsqueeze(-2) + right_projection(single).unsqueeze(-3)
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
+        pair = pair + self.pair_transition(pair)
+        single = single + self.attention(single, pair, pair_mask=pair_mask)
+        single = single + self.single_transition(single)
+        return self.single_post_norm(single), pair
+
+
+class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
+    r"""
+    Pair-only Miniformer block used in structure-trained-small MSA / template stacks.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        post_layer_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
+        self.pair_post_norm = LayerNorm(pair_size, backend=backend) if post_layer_norm else nn.Identity()
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        if pair_mask is None:
+            pair_mask = pair.new_ones(pair.shape[:-1])
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
+        pair = pair + self.pair_transition(pair)
+        return self.pair_post_norm(pair)
+
+
+class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
+    r"""
+    Compact bidirectional triangular update used by BoltzGen Miniformer artifacts.
+    """
+
+    def __init__(self, pair_size: int = 128) -> None:
+        super().__init__()
+        self.input_norm = LayerNorm(pair_size, eps=1e-5)
+        self.input_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.input_gate_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.output_norm = LayerNorm(pair_size // 2)
+        self.output_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
+        self.output_gate_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        normalized = self.input_norm(pair)
+        update = self.input_projection(normalized) * torch.sigmoid(self.input_gate_projection(normalized))
+        if pair_mask is not None:
+            update = update * pair_mask.unsqueeze(-1).to(dtype=update.dtype, device=update.device)
+        with torch.autocast("cuda", enabled=False):
+            left_out, right_out, left_in, right_in = torch.chunk(update.float(), 4, dim=-1)
+            outgoing = torch.einsum("...ikd,...jkd->...ijd", left_out, right_out)
+            incoming = torch.einsum("...kid,...kjd->...ijd", left_in, right_in)
+            update = torch.cat((outgoing, incoming), dim=-1).to(pair.dtype)
+        update = self.output_norm(update)
+        return self.output_projection(update) * torch.sigmoid(self.output_gate_projection(update))
+
+
+class BoltzGenDenoiserConditioning(nn.Module):
+    r"""
+    Precompute the diffusion conditioning shared across denoiser calls.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        atom_feature_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        num_atom_decoder_blocks: int = 3,
+        num_atom_decoder_attention_heads: int = 4,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 16,
+        num_conditioning_transitions: int = 2,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pairwise_conditioner = PairwiseConditioning(
+            pair_size=pair_size,
+            relative_position_size=pair_size,
+            num_transitions=num_conditioning_transitions,
+            backend=backend,
+        )
+        self.atom_encoder = BoltzGenDenoiserAtomEncoder(
+            atom_feature_size=atom_feature_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.atom_encoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
+            backend=backend,
+        )
+        self.atom_decoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
+            backend=backend,
+        )
+        self.token_encoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=pair_size,
+            num_blocks=num_token_encoder_blocks,
+            num_attention_heads=num_token_encoder_attention_heads,
+            backend=backend,
+        )
+
+    def forward(
+        self,
+        single_trunk: Tensor,
+        pair_trunk: Tensor,
+        relative_position_encoding: Tensor,
+        *,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+        atom_to_token: Tensor,
+    ) -> dict[str, Tensor]:
+        pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
+        atom_query, atom_conditioning, atom_pair = self.atom_encoder(
+            atom_features,
+            reference_positions,
+            atom_mask,
+            reference_space_id,
+            atom_to_token=atom_to_token,
+            single_trunk=single_trunk,
+            pair_trunk=pair,
+        )
+        atom_enc_bias = self.atom_encoder_pair_bias_projection(atom_pair)
+        atom_dec_bias = self.atom_decoder_pair_bias_projection(atom_pair)
+        token_encoder_bias = self.token_encoder_pair_bias_projection(pair)
+        return {
+            "atom_query": atom_query,
+            "atom_conditioning": atom_conditioning,
+            "atom_enc_bias": atom_enc_bias,
+            "atom_dec_bias": atom_dec_bias,
+            "token_encoder_bias": token_encoder_bias,
+        }
+
+
+class BoltzGenGaussianRandom3DEncoding(nn.Module):
+    r"""
+    Frozen Gaussian features around randomly initialized three-dimensional centers.
+    """
+
+    def __init__(self, output_size: int) -> None:
+        super().__init__()
+        self.output_size = output_size
+        self.register_buffer("center", torch.randn(output_size, 3))
+        self.register_buffer("std", torch.rand(output_size))
+
+    def forward(self, coordinates: Tensor) -> Tensor:
+        squared_distance = (
+            (coordinates.unsqueeze(-2) - self.center.view(*(1,) * (coordinates.dim() - 1), self.output_size, 3))
+            .square()
+            .sum(dim=-1)
+        )
+        return torch.exp(-squared_distance / (2 * self.std.view(*(1,) * (coordinates.dim() - 1), self.output_size)))
+
+
+class BoltzGenGaussianDenoisingAtomToTokenEncoder(nn.Module):
+    r"""
+    Denoising atom encoder with frozen random Gaussian coordinate features.
+    """
+
+    def __init__(
+        self,
+        gaussian_encoding_size: int,
+        atom_hidden_size: int = 128,
+        transformer_size: int = 768,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        post_layer_norm: bool = False,
+        use_qk_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.position_encoding = BoltzGenGaussianRandom3DEncoding(gaussian_encoding_size)
+        self.noisy_position_projection = nn.Linear(3 + gaussian_encoding_size, atom_hidden_size, bias=False)
+        self.atom_transformer = PackedAtomAttention(
+            ConditionedTransformerEncoder(
+                num_blocks=num_blocks,
+                num_attention_heads=num_attention_heads,
+                hidden_size=atom_hidden_size,
+                conditioning_size=atom_hidden_size,
+                post_layer_norm=post_layer_norm,
+                use_qk_norm=use_qk_norm,
+                backend=backend,
+            ),
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, transformer_size, bias=False)
+        self.token_activation = nn.ReLU()
+
+    def forward(
+        self,
+        atom_single: Tensor,
+        atom_conditioning: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        noisy_positions: Tensor,
+        multiplicity: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        atom_query = atom_single.repeat_interleave(multiplicity, 0)
+        position_features = torch.cat((noisy_positions, self.position_encoding(noisy_positions)), dim=-1)
+        atom_query = atom_query + self.noisy_position_projection(position_features)
+        conditioning = atom_conditioning.repeat_interleave(multiplicity, 0)
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+        atom_query = self.atom_transformer(
+            atom_query,
+            conditioning,
+            atom_pair_bias,
+            atom_mask=atom_mask.bool(),
+            attention_layout="local",
+        )
+        token_from_atom = self.token_activation(self.token_projection(atom_query))
+        token_repr = dense_mean_to_tokens(
+            token_from_atom,
+            atom_to_token,
+            num_tokens,
+            atom_mask=atom_mask,
+            count_eps=1e-6,
+        )
+        return token_repr, atom_query, conditioning
+
+
+class BoltzGenResidueTypeTokenToAtomDecoder(PackedTokenToAtomDecoder):
+    r"""
+    Decode atom coordinate updates and summed per-token residue-type logits.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_residue_types: int,
+        transformer_size: int,
+        token_hidden_size: int = 384,
+        atom_hidden_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        use_qk_norm: bool = False,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__(
+            token_hidden_size=token_hidden_size,
+            atom_hidden_size=atom_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            transformer_size=transformer_size,
+            use_qk_norm=use_qk_norm,
+            backend=backend,
+        )
+        self.residue_type_projection = nn.Linear(atom_hidden_size, num_residue_types)
+
+    def forward(
+        self,
+        token_repr: Tensor,
+        atom_skip: Tensor,
+        conditioning_skip: Tensor,
+        atom_pair_bias: Tensor,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        multiplicity: int = 1,
+    ) -> tuple[Tensor, Tensor]:
+        token_index = atom_to_token.repeat_interleave(multiplicity, 0)
+        token_projection = self.token_projection(token_repr)
+        atom_query = atom_skip + token_projection.gather(
+            1,
+            token_index.unsqueeze(-1).expand(-1, -1, token_projection.shape[-1]),
+        )
+        mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_query = self.atom_transformer(
+            atom_query,
+            conditioning_skip,
+            atom_pair_bias,
+            atom_mask=mask.bool(),
+            attention_layout="local",
+        )
+        num_tokens = token_repr.shape[-2]
+        token_sum = torch.zeros(
+            atom_query.shape[0],
+            num_tokens,
+            atom_query.shape[-1],
+            device=atom_query.device,
+            dtype=atom_query.dtype,
+        )
+        token_sum.scatter_add_(
+            1,
+            token_index.unsqueeze(-1).expand_as(atom_query),
+            atom_query * mask.unsqueeze(-1).to(atom_query.dtype),
+        )
+        return (
+            self.position_update_projection(self.position_norm(atom_query)),
+            self.residue_type_projection(token_sum),
+        )
+
+
+class BoltzGenDenoiser(nn.Module):
+    r"""
+    Predict per-atom position updates for EDM sampling.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        atom_hidden_size: int = 128,
+        fourier_embedding_size: int = 256,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 16,
+        num_atom_decoder_blocks: int = 3,
+        num_atom_decoder_attention_heads: int = 4,
+        num_conditioning_transitions: int = 2,
+        transformer_size: int | None = None,
+        post_layer_norm: bool = False,
+        use_qk_norm: bool = False,
+        gaussian_random_3d_encoding_dim: int = 0,
+        predict_residue_type: bool = False,
+        num_residue_types: int = _NUM_RESIDUE_TYPES,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        transformer_size = 2 * single_size if transformer_size is None else transformer_size
+        self.predict_residue_type = predict_residue_type
+        self.single_conditioner = BoltzGenSingleConditioning(
+            single_size=single_size,
+            transformer_size=transformer_size,
+            fourier_embedding_size=fourier_embedding_size,
+            num_transitions=num_conditioning_transitions,
+            backend=backend,
+        )
+        self.atom_attention_encoder = (
+            BoltzGenGaussianDenoisingAtomToTokenEncoder(
+                gaussian_encoding_size=gaussian_random_3d_encoding_dim,
+                atom_hidden_size=atom_hidden_size,
+                transformer_size=transformer_size,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                num_blocks=num_atom_encoder_blocks,
+                num_attention_heads=num_atom_encoder_attention_heads,
+                post_layer_norm=post_layer_norm,
+                use_qk_norm=use_qk_norm,
+                backend=backend,
+            )
+            if gaussian_random_3d_encoding_dim > 0
+            else PackedDenoisingAtomToTokenEncoder(
+                atom_hidden_size=atom_hidden_size,
+                token_hidden_size=single_size,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                num_blocks=num_atom_encoder_blocks,
+                num_attention_heads=num_atom_encoder_attention_heads,
+                transformer_size=transformer_size,
+                post_layer_norm=post_layer_norm,
+                use_qk_norm=use_qk_norm,
+                backend=backend,
+            )
+        )
+        self.single_to_token_norm = LayerNorm(transformer_size, backend=backend)
+        self.single_to_token_projection = nn.Linear(transformer_size, transformer_size, bias=False)
+        self.token_encoder = ConditionedTransformerEncoder(
+            num_blocks=num_token_encoder_blocks,
+            num_attention_heads=num_token_encoder_attention_heads,
+            hidden_size=transformer_size,
+            conditioning_size=transformer_size,
+            use_qk_norm=use_qk_norm,
+            backend=backend,
+        )
+        self.token_norm = LayerNorm(transformer_size, backend=backend)
+        self.atom_attention_decoder = (
+            BoltzGenResidueTypeTokenToAtomDecoder(
+                num_residue_types=num_residue_types,
+                transformer_size=transformer_size,
+                atom_hidden_size=atom_hidden_size,
+                token_hidden_size=single_size,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                num_blocks=num_atom_decoder_blocks,
+                num_attention_heads=num_atom_decoder_attention_heads,
+                use_qk_norm=use_qk_norm,
+                backend=backend,
+            )
+            if predict_residue_type
+            else PackedTokenToAtomDecoder(
+                atom_hidden_size=atom_hidden_size,
+                token_hidden_size=single_size,
+                num_query_atoms=num_query_atoms,
+                num_key_atoms=num_key_atoms,
+                num_blocks=num_atom_decoder_blocks,
+                num_attention_heads=num_atom_decoder_attention_heads,
+                transformer_size=transformer_size,
+                use_qk_norm=use_qk_norm,
+                backend=backend,
+            )
+        )
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single_trunk: Tensor,
+        noisy_positions: Tensor,
+        noise_level: Tensor,
+        conditioning: dict[str, Tensor],
+        *,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        token_mask: Tensor,
+        multiplicity: int = 1,
+    ) -> tuple[Tensor, Tensor | None]:
+        single, _ = self.single_conditioner(
+            noise_level,
+            single_trunk.repeat_interleave(multiplicity, 0),
+            single_inputs.repeat_interleave(multiplicity, 0),
+        )
+
+        token_repr, atom_skip, conditioning_skip = self.atom_attention_encoder(
+            conditioning["atom_query"],
+            conditioning["atom_conditioning"],
+            conditioning["atom_enc_bias"].repeat_interleave(multiplicity, 0),
+            atom_mask,
+            atom_to_token,
+            token_mask.shape[-1],
+            noisy_positions=noisy_positions,
+            multiplicity=multiplicity,
+        )
+        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
+
+        token_repr = self.token_encoder(
+            token_repr,
+            single,
+            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
+            token_mask.repeat_interleave(multiplicity, 0).float(),
+        )
+        token_repr = self.token_norm(token_repr)
+
+        atom_pair_bias = conditioning["atom_dec_bias"].repeat_interleave(multiplicity, 0)
+        if self.predict_residue_type:
+            return cast(BoltzGenResidueTypeTokenToAtomDecoder, self.atom_attention_decoder)(
+                token_repr,
+                atom_skip,
+                conditioning_skip,
+                atom_pair_bias,
+                atom_mask,
+                atom_to_token,
+                multiplicity=multiplicity,
+            )
+        coordinate_update = cast(PackedTokenToAtomDecoder, self.atom_attention_decoder)(
+            token_repr,
+            atom_skip,
+            conditioning_skip,
+            atom_pair_bias,
+            atom_mask,
+            atom_to_token,
+            multiplicity=multiplicity,
+        )
+        return coordinate_update, None
+
+
+class BoltzGenCoordinateDiffusion(nn.Module):
+    r"""
+    EDM sampler wrapping a [`BoltzGenDenoiser`][ofoldx.models.boltzgen.model.BoltzGenDenoiser].
+    """
+
+    def __init__(
+        self,
+        denoiser: BoltzGenDenoiser,
+        sigma_data: float = 16.0,
+        min_noise_level: float = 4e-4,
+        max_noise_level: float = 160.0,
+        rho: float = 7.0,
+        churn_rate: float = 0.8,
+        min_churn_noise_level: float = 1.0,
+        noise_scale: float = 0.95,
+        step_scale: float = 1.8,
+        num_sampling_steps: int = 200,
+        alignment_reverse_diff: bool = True,
+        sampling_schedule: str = "dilated",
+        time_dilation: float = 2.667,
+        time_dilation_start: float = 0.6,
+        time_dilation_end: float = 0.8,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+    ) -> None:
+        super().__init__()
+        self.denoiser = denoiser
+        self.sigma_data = sigma_data
+        self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.min_noise_level = min_noise_level
+        self.max_noise_level = max_noise_level
+        self.rho = rho
+        self.churn_rate = churn_rate
+        self.min_churn_noise_level = min_churn_noise_level
+        self.noise_scale = noise_scale
+        self.step_scale = step_scale
+        self.noise_log_mean = noise_log_mean
+        self.noise_log_std = noise_log_std
+        self.num_sampling_steps = num_sampling_steps
+        self.alignment_reverse_diff = alignment_reverse_diff
+        self.sampling_schedule = sampling_schedule
+        self.time_dilation = time_dilation
+        self.time_dilation_start = time_dilation_start
+        self.time_dilation_end = time_dilation_end
+
+    def preconditioned_network_forward(
+        self, noisy_coordinates: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
+    ) -> tuple[Tensor, Tensor | None]:
+        batch = noisy_coordinates.shape[0]
+        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
+        padded = sigma.reshape(batch, 1, 1)
+        update, residue_type_logits = self.denoiser(
+            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
+            noise_level=self.preconditioner.c_noise(sigma),
+            multiplicity=multiplicity,
+            **conditioning,
+        )
+        coordinates = (
+            self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
+        )
+        return coordinates, residue_type_logits
+
+    def noise_distribution(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        log_mean: float | None = None,
+        log_std: float | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        log_mean = self.noise_log_mean if log_mean is None else log_mean
+        log_std = self.noise_log_std if log_std is None else log_std
+        noise = torch.randn((batch_size,), device=device, dtype=dtype, generator=generator)
+        return self.sigma_data * (log_mean + log_std * noise).exp()
+
+    def denoise_training(
+        self,
+        target_coordinates: Tensor,
+        atom_mask: Tensor,
+        *,
+        target_mask: Tensor,
+        multiplicity: int = 1,
+        synchronize_noise_levels: bool = False,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        generator: torch.Generator | None = None,
+        single_inputs: Tensor,
+        single_trunk: Tensor,
+        conditioning: dict[str, Tensor],
+        atom_to_token: Tensor,
+        token_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        r"""
+        Corrupt target conformers and run one preconditioned denoising step.
+
+        A singleton conformer is repeated for every sample; otherwise the
+        conformer count must equal ``multiplicity``. Returned coordinate tensors
+        and noise levels keep the flattened ``B * multiplicity`` sample axis.
+        """
+
+        device, dtype = single_trunk.device, single_trunk.dtype
+        target_coordinates = target_coordinates.to(device=device, dtype=dtype)
+        target_mask = target_mask.to(device=device, dtype=dtype)
+        batch_size, conformers, atom_count = target_coordinates.shape[:3]
+        if conformers == 1:
+            target_coordinates = target_coordinates.expand(
+                -1,
+                multiplicity,
+                -1,
+                -1,
+            )
+        elif conformers != multiplicity:
+            raise ValueError(
+                "BoltzGen target conformer count must be one or equal num_samples, "
+                f"got {conformers} and {multiplicity}"
+            )
+        target_coordinates = target_coordinates.reshape(
+            batch_size * multiplicity,
+            atom_count,
+            3,
+        )
+        target_mask = target_mask.repeat_interleave(multiplicity, dim=0)
+        augmented_target_coordinates = _center_random_augmentation(
+            target_coordinates,
+            target_mask,
+            augmentation=coordinate_augmentation,
+            translation_scale=augmentation_translation_scale,
+            generator=generator,
+        )
+        noise_count = batch_size if synchronize_noise_levels else batch_size * multiplicity
+        noise_level = self.noise_distribution(
+            noise_count,
+            device=augmented_target_coordinates.device,
+            dtype=augmented_target_coordinates.dtype,
+            log_mean=noise_log_mean,
+            log_std=noise_log_std,
+            generator=generator,
+        )
+        if synchronize_noise_levels:
+            noise_level = noise_level.repeat_interleave(multiplicity)
+        noise = torch.randn(
+            augmented_target_coordinates.shape,
+            device=augmented_target_coordinates.device,
+            dtype=augmented_target_coordinates.dtype,
+            generator=generator,
+        )
+        noisy_coordinates = augmented_target_coordinates + noise_level.reshape(-1, 1, 1) * noise
+        denoised_coordinates, residue_type_logits = self.preconditioned_network_forward(
+            noisy_coordinates,
+            noise_level,
+            multiplicity=multiplicity,
+            atom_mask=atom_mask,
+            single_inputs=single_inputs,
+            single_trunk=single_trunk,
+            conditioning=conditioning,
+            atom_to_token=atom_to_token,
+            token_mask=token_mask,
+        )
+        return (
+            denoised_coordinates,
+            augmented_target_coordinates,
+            noise_level,
+            residue_type_logits,
+        )
+
+    def loss_weight(self, sigma: Tensor) -> Tensor:
+        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
+
+    def sample_schedule_karras(
+        self,
+        num_sampling_steps: int | None = None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        steps = operator.index(self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps)
+        if steps < 1:
+            raise ValueError("num_sampling_steps must be positive")
+        inv_rho = 1 / self.rho
+        ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
+        sigmas = (
+            self.max_noise_level**inv_rho + ramp * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
+        ) ** self.rho
+        sigmas = sigmas * self.sigma_data
+        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
+
+    def sample_schedule_dilated(
+        self,
+        num_sampling_steps: int | None = None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        steps = operator.index(self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps)
+        if steps < 1:
+            raise ValueError("num_sampling_steps must be positive")
+        inv_rho = 1 / self.rho
+        ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
+        dilated = _dilate_time(
+            ramp,
+            start=self.time_dilation_start,
+            end=self.time_dilation_end,
+            dilation=self.time_dilation,
+        )
+        sigmas = (
+            self.max_noise_level**inv_rho + dilated * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
+        ) ** self.rho
+        sigmas = sigmas * self.sigma_data
+        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
+
+    def sample_schedule(
+        self,
+        num_sampling_steps: int | None = None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        if self.sampling_schedule == "af3":
+            return self.sample_schedule_karras(num_sampling_steps, device=device, dtype=dtype)
+        if self.sampling_schedule == "dilated":
+            return self.sample_schedule_dilated(num_sampling_steps, device=device, dtype=dtype)
+        raise ValueError(f"unknown BoltzGen sampling_schedule: {self.sampling_schedule!r}")
+
+    @torch.no_grad()
+    def sample(
+        self,
+        atom_mask: Tensor,
+        *,
+        num_sampling_steps: int | None = None,
+        multiplicity: int = 1,
+        generator: torch.Generator | None = None,
+        step_scale: float | Tensor | None = None,
+        noise_scale: float | Tensor | None = None,
+        **conditioning: object,
+    ) -> Tensor:
+        single_trunk = cast(Tensor, conditioning["single_trunk"])
+        device, dtype = single_trunk.device, single_trunk.dtype
+        base_atom_mask = atom_mask
+        expanded_atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        shape = (*expanded_atom_mask.shape, 3)
+        sigmas = self.sample_schedule(num_sampling_steps, device=device, dtype=dtype)
+        gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
+        step_scale_value = torch.as_tensor(
+            self.step_scale if step_scale is None else step_scale,
+            device=device,
+            dtype=sigmas.dtype,
+        )
+        noise_scale_value = torch.as_tensor(
+            self.noise_scale if noise_scale is None else noise_scale,
+            device=device,
+            dtype=sigmas.dtype,
+        )
+        if step_scale_value.ndim:
+            step_scale_value = step_scale_value.reshape(-1, 1, 1)
+        if noise_scale_value.ndim:
+            noise_scale_value = noise_scale_value.reshape(-1, 1, 1)
+
+        def randn() -> Tensor:
+            r"""
+            Draw standard Gaussian noise of the expanded coordinate shape ``(B*multiplicity, N_atom, 3)``.
+            """
+            return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+
+        coords = sigmas[0] * randn()
+        denoised = None
+        # The loop owns the squared-noise-scale churn factor, optional mid-step alignment, dilated Karras schedule,
+        # rigid augmentation, and random draws as one sampling algorithm.
+        # The fixed Python loop controls denoiser invocation; schedule values stay as tensors so sampling does not
+        # synchronize them to the host on every step.
+        for index in range(len(sigmas) - 1):
+            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
+            rotation = uniform_random_rotation(
+                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
+            )
+            translation = torch.randn(
+                expanded_atom_mask.shape[0],
+                1,
+                3,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            coords = torch.einsum("bmd,bds->bms", coords - coords.mean(-2, keepdim=True), rotation) + translation
+            if denoised is not None:
+                denoised = (
+                    torch.einsum("bmd,bds->bms", denoised - denoised.mean(-2, keepdim=True), rotation) + translation
+                )
+
+            sigma_hat = sigma_current * (1 + gamma)
+            noise_var = noise_scale_value**2 * (sigma_hat**2 - sigma_current**2)
+            noisy = coords + noise_scale_value * torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
+            denoised, _ = self.preconditioned_network_forward(
+                noisy, sigma_hat, multiplicity=multiplicity, atom_mask=base_atom_mask, **conditioning
+            )
+            if self.alignment_reverse_diff:
+                noisy = weighted_rigid_align(
+                    source=noisy,
+                    target=denoised,
+                    weight=expanded_atom_mask,
+                )
+            derivative = (noisy - denoised) / sigma_hat
+            coords = noisy + step_scale_value * (sigma_next - sigma_hat) * derivative
+        return coords
 
 
 class BoltzGenDenoiserAtomEncoder(nn.Module):
@@ -1044,6 +3142,46 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
         return atom_query, atom_single, atom_pair
 
 
+class BoltzGenSingleConditioning(nn.Module):
+    r"""
+    Condition the concatenated trunk and input single representation on the diffusion noise level.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        transformer_size: int | None = None,
+        fourier_embedding_size: int = 256,
+        num_transitions: int = 2,
+        transition_expansion: int = 2,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        input_size = 2 * single_size
+        transformer_size = input_size if transformer_size is None else transformer_size
+        self.single_norm = LayerNorm(input_size, backend=backend)
+        self.input_projection = nn.Linear(input_size, transformer_size) if transformer_size != input_size else None
+        self.single_projection = nn.Linear(transformer_size, transformer_size)
+        self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
+        self.fourier_norm = LayerNorm(fourier_embedding_size, backend=backend)
+        self.fourier_projection = nn.Linear(fourier_embedding_size, transformer_size, bias=False)
+        self.transitions = nn.ModuleList(
+            Transition(transformer_size, expansion=transition_expansion, backend=backend)
+            for _ in range(num_transitions)
+        )
+
+    def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
+        single = self.single_norm(torch.cat((single_trunk, single_inputs), dim=-1))
+        if self.input_projection is not None:
+            single = self.input_projection(single)
+        single = self.single_projection(single)
+        normed_noise = self.fourier_norm(self.noise_fourier(noise_level).to(single.dtype))
+        single = single + self.fourier_projection(normed_noise).unsqueeze(-2)
+        for transition in self.transitions:
+            single = single + transition(single)
+        return single, normed_noise
+
+
 class BoltzGenInverseFoldingEncoder(nn.Module):
     r"""
     kNN-graph encoder over tokens (BoltzGen inverse folding).
@@ -1090,7 +3228,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
 
     @torch.no_grad()
     def build_knn_graph(self, input: BoltzGenInverseFoldingInput) -> tuple[Tensor, Tensor, Tensor]:
-        valid_mask = input.token_mask.bool()
+        valid_mask = input.token_mask.bool() & input.token_resolved_mask.bool()
         batch_size, num_tokens = valid_mask.shape
         valid_pair = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
         packed_index = (valid_mask.flatten().cumsum(dim=0) - 1).view(batch_size, num_tokens)
@@ -1164,75 +3302,215 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         return edge_index, valid_mask, node, edge
 
 
-class BoltzGenInverseFoldingGraphFeedForward(nn.Module):
+class BoltzGenInverseFoldingDecoder(nn.Module):
     r"""
-    GELU feed-forward computation for packed inverse-folding graph features.
+    Graph decoder predicting residue-type logits (BoltzGen inverse folding).
     """
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        num_hidden_layers: int = 1,
+        node_size: int = 128,
+        edge_size: int = 128,
+        hidden_size: int = 128,
+        num_blocks: int = 3,
+        num_attention_heads: int = 4,
+        vocab_size: int = _NUM_RESIDUE_TYPES,
+        dropout: float = 0.1,
+        softmax_dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.input_projection = nn.Linear(input_size, hidden_size)
-        self.hidden_projections = nn.ModuleList(
-            nn.Linear(hidden_size, hidden_size) for _ in range(num_hidden_layers - 1)
+        self.num_blocks = num_blocks
+        self.vocab_size = vocab_size
+        # Each block's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
+        decoder_edge_size = edge_size + node_size
+        self.blocks = nn.ModuleList(
+            BoltzGenInverseFoldingGraphDecoderBlock(
+                node_size=node_size,
+                edge_size=decoder_edge_size,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                dropout=dropout,
+                softmax_dropout=softmax_dropout,
+            )
+            for _ in range(num_blocks)
         )
-        self.output_projection = nn.Linear(hidden_size, output_size)
-        self.activation = nn.GELU()
+        self.residue_type_projection = nn.Linear(vocab_size, node_size)
+        self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
 
-    def forward(self, features: Tensor) -> Tensor:
-        hidden = self.activation(self.input_projection(features))
-        for projection in self.hidden_projections:
-            hidden = self.activation(projection(hidden))
-        return self.output_projection(hidden)
-
-
-class BoltzGenInverseFoldingGraphAttention(nn.Module):
-    r"""
-    Aggregate packed edge context with destination-grouped attention.
-    """
-
-    def __init__(
+    def forward(
         self,
-        node_size: int,
-        context_size: int,
-        hidden_size: int,
-        num_attention_heads: int,
-        softmax_dropout: float,
-    ) -> None:
-        super().__init__()
-        self.softmax_dropout = softmax_dropout
-        self.weight_feed_forward = BoltzGenInverseFoldingGraphFeedForward(
-            node_size + context_size,
-            hidden_size,
-            num_attention_heads,
-            num_hidden_layers=2,
-        )
-        self.value_feed_forward = BoltzGenInverseFoldingGraphFeedForward(
-            context_size,
-            hidden_size,
-            node_size,
-            num_hidden_layers=2,
-        )
-        self.output_projection = nn.Linear(node_size * num_attention_heads, node_size)
+        node: Tensor,
+        edge: Tensor,
+        edge_index: Tensor,
+        valid_mask: Tensor,
+        target_residue_type: Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        src, dst = edge_index[0], edge_index[1]
+        with torch.no_grad():
+            # Teacher forcing with random per-edge visibility: an edge reveals its source residue type only when
+            # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
+            rand = torch.rand(node.shape[0], device=node.device, generator=generator)
+            visibility = rand[src] < rand[dst]
+            known = target_residue_type.bool()[valid_mask][src] * visibility[:, None]
+            known = known.to(edge.dtype)
+        residue_rep = self.residue_type_projection(known)
+        neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
 
-    def forward(self, node: Tensor, context: Tensor, destination_index: Tensor) -> Tensor:
-        weight = self.weight_feed_forward(torch.cat([node[destination_index], context], dim=1))
-        value = self.value_feed_forward(context)
-        if self.training and self.softmax_dropout > 0:
-            weight = _softmax_dropout(weight, destination_index, node.shape[0], self.softmax_dropout)
-        weight = _scatter_softmax(weight, destination_index, dim=0, dim_size=node.shape[0])
-        message = _scatter_sum(
-            weight.unsqueeze(-1) * value.unsqueeze(1),
-            destination_index,
-            dim=0,
-            dim_size=node.shape[0],
-        ).flatten(start_dim=1)
-        return self.output_projection(message)
+        for block in self.blocks:
+            node = block(node, neighbours, edge_index)
+
+        logits = self.residue_type_head(node)
+        batch_size, num_tokens = valid_mask.shape
+        dense = logits.new_zeros(batch_size, num_tokens, self.vocab_size)
+        dense[valid_mask] = logits
+        return dense
+
+    @torch.no_grad()
+    def sample(
+        self,
+        node: Tensor,
+        edge: Tensor,
+        edge_index: Tensor,
+        valid_mask: Tensor,
+        input: BoltzGenInverseFoldingInput,
+        *,
+        temperature: float | None = 0.1,
+        tie_symmetric_sequences: bool = True,
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        src, dst = edge_index[0], edge_index[1]
+        num_nodes = node.shape[0]
+        design_mask = input.design_mask.bool()[valid_mask]
+        decoded = node.new_zeros(num_nodes, self.vocab_size)
+        logits = node.new_zeros(num_nodes, self.vocab_size)
+
+        blocked = input.aa_constraint_mask[valid_mask].to(device=node.device) > 0
+        all_blocked = blocked[design_mask].all(dim=-1)
+        if all_blocked.any():
+            design_positions = torch.where(design_mask)[0]
+            raise ValueError(
+                "inverse folding has no valid amino acids at positions " f"{design_positions[all_blocked].tolist()}"
+            )
+
+        order = torch.randperm(num_nodes, device=node.device, generator=generator).tolist()
+        if (~design_mask).any():
+            known = input.residue_type_features[valid_mask][~design_mask].to(decoded.dtype)
+            decoded[~design_mask] = known
+            logits[~design_mask] = known
+            fixed = set(torch.where(~design_mask)[0].tolist())
+            order = [position for position in order if position not in fixed]
+
+        symmetry_groups, position_to_group = (
+            self._build_symmetric_groups(input, valid_mask) if tie_symmetric_sequences else ({}, {})
+        )
+        group_anchors: dict[int, int] = {}
+        for anchor_group_id, group_positions in symmetry_groups.items():
+            fixed_positions = [position for position in group_positions if not bool(design_mask[position])]
+            if not fixed_positions:
+                continue
+            identities = decoded[fixed_positions].argmax(dim=-1).unique()
+            if identities.numel() != 1:
+                raise ValueError(
+                    "inverse-folding symmetry group has conflicting fixed identities at positions " f"{fixed_positions}"
+                )
+            identity = int(identities.item())
+            canonical_identity = identity - _CANONICALS_OFFSET
+            if not 0 <= canonical_identity < NUM_CANONICAL_TOKENS:
+                raise ValueError(
+                    "inverse-folding symmetry group has a noncanonical fixed identity at positions "
+                    f"{fixed_positions}"
+                )
+            group_anchors[anchor_group_id] = canonical_identity
+
+        sampled: set[int] = set()
+
+        for position in order:
+            if position in sampled:
+                continue
+            group_id = position_to_group.get(position)
+            positions = (
+                [member for member in symmetry_groups[group_id] if bool(design_mask[member])]
+                if group_id is not None
+                else [position]
+            )
+
+            aggregated_logits: Tensor | None = None
+            for pos in positions:
+                incoming = dst == pos
+                neighbours = torch.cat(
+                    [edge[incoming], node[src[incoming]] + self.residue_type_projection(decoded[src[incoming]])],
+                    dim=-1,
+                )
+                state = node[pos : pos + 1]
+                for block in self.blocks:
+                    state = block.sample(state, neighbours)
+                position_logits = self.residue_type_head(state)
+                aggregated_logits = (
+                    position_logits if aggregated_logits is None else aggregated_logits + position_logits
+                )
+            aggregated_logits = cast(Tensor, aggregated_logits) / len(positions)
+
+            shared_blocked = blocked[positions].any(dim=0, keepdim=True)
+            if bool(shared_blocked.all()):
+                raise ValueError(f"inverse-folding symmetry group has no shared amino acid at positions {positions}")
+            canonical = (
+                aggregated_logits[:, _CANONICALS_OFFSET : _CANONICALS_OFFSET + NUM_CANONICAL_TOKENS]
+                + shared_blocked.to(dtype=node.dtype) * -1e6
+            )
+            anchor = group_anchors.get(group_id) if group_id is not None else None
+            if anchor is not None:
+                if bool(shared_blocked[0, anchor]):
+                    raise ValueError(
+                        "inverse-folding symmetry-group constraints exclude its fixed identity at "
+                        f"positions {positions}"
+                    )
+                chosen = canonical.new_tensor([anchor], dtype=torch.long)
+            elif temperature is None:
+                chosen = canonical.argmax(dim=-1)
+            else:
+                chosen = torch.multinomial(
+                    torch.softmax(canonical / temperature, dim=-1),
+                    num_samples=1,
+                    generator=generator,
+                ).squeeze(-1)
+            one_hot = torch.nn.functional.one_hot(chosen + _CANONICALS_OFFSET, self.vocab_size).to(decoded.dtype)
+            for pos in positions:
+                decoded[pos] = one_hot
+                logits[pos] = aggregated_logits
+                sampled.add(pos)
+
+        batch_size, num_tokens = valid_mask.shape
+        dense_logits = logits.new_zeros(batch_size, num_tokens, self.vocab_size)
+        dense_logits[valid_mask] = logits
+        dense_res_type = decoded.new_zeros(batch_size, num_tokens, self.vocab_size)
+        dense_res_type[valid_mask] = decoded
+        return dense_logits, dense_res_type
+
+    def _build_symmetric_groups(
+        self,
+        input: BoltzGenInverseFoldingInput,
+        valid_mask: Tensor,
+    ) -> tuple[dict[int, list[int]], dict[int, int]]:
+        batch_indices = valid_mask.nonzero(as_tuple=False)[:, 0].tolist()
+        group_indices = input.symmetric_group[valid_mask].tolist()
+        key_to_positions: dict[tuple[int, int], list[int]] = {}
+        for position, (batch_index, group) in enumerate(zip(batch_indices, group_indices, strict=True)):
+            if group <= 0:  # 0 = no symmetry group.
+                continue
+            key_to_positions.setdefault((batch_index, group), []).append(position)
+
+        groups: dict[int, list[int]] = {}
+        position_to_group: dict[int, int] = {}
+        group_id = 0
+        for positions in key_to_positions.values():
+            if len(positions) > 1:
+                groups[group_id] = positions
+                for position in positions:
+                    position_to_group[position] = group_id
+                group_id += 1
+        return groups, position_to_group
 
 
 class BoltzGenInverseFoldingGraphEncoderBlock(nn.Module):
@@ -1284,192 +3562,6 @@ class BoltzGenInverseFoldingGraphEncoderBlock(nn.Module):
         return node + self.node_norm(self.node_dropout(feed_forward_update)), edge
 
 
-class BoltzGenInverseFoldingDecoder(nn.Module):
-    r"""
-    Graph decoder predicting residue-type logits (BoltzGen inverse folding).
-    """
-
-    def __init__(
-        self,
-        node_size: int = 128,
-        edge_size: int = 128,
-        hidden_size: int = 128,
-        num_blocks: int = 3,
-        num_attention_heads: int = 4,
-        vocab_size: int = _NUM_RESIDUE_TYPES,
-        dropout: float = 0.1,
-        softmax_dropout: float = 0.2,
-    ) -> None:
-        super().__init__()
-        self.num_blocks = num_blocks
-        self.vocab_size = vocab_size
-        # Each block's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
-        decoder_edge_size = edge_size + node_size
-        self.blocks = nn.ModuleList(
-            BoltzGenInverseFoldingGraphDecoderBlock(
-                node_size=node_size,
-                edge_size=decoder_edge_size,
-                hidden_size=hidden_size,
-                num_attention_heads=num_attention_heads,
-                dropout=dropout,
-                softmax_dropout=softmax_dropout,
-            )
-            for _ in range(num_blocks)
-        )
-        self.residue_type_projection = nn.Linear(vocab_size, node_size)
-        self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
-
-    def forward(
-        self,
-        node: Tensor,
-        edge: Tensor,
-        edge_index: Tensor,
-        valid_mask: Tensor,
-        input: BoltzGenInverseFoldingInput,
-        *,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        src, dst = edge_index[0], edge_index[1]
-        with torch.no_grad():
-            # Teacher forcing with random per-edge visibility: an edge reveals its source residue type only when
-            # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
-            rand = torch.rand(node.shape[0], device=node.device, generator=generator)
-            visibility = rand[src] < rand[dst]
-            known = input.residue_type_features.bool()[valid_mask][src] * visibility[:, None]
-            known = known.to(edge.dtype)
-        residue_rep = self.residue_type_projection(known)
-        neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
-
-        for block in self.blocks:
-            node = block(node, neighbours, edge_index)
-
-        logits = self.residue_type_head(node)
-        batch_size, num_tokens = valid_mask.shape
-        dense = logits.new_zeros(batch_size, num_tokens, self.vocab_size)
-        dense[valid_mask] = logits
-        return dense
-
-    @torch.no_grad()
-    def sample(
-        self,
-        node: Tensor,
-        edge: Tensor,
-        edge_index: Tensor,
-        valid_mask: Tensor,
-        input: BoltzGenInverseFoldingInput,
-        *,
-        temperature: float | None = None,
-        inverse_fold_restriction: tuple[str, ...] = (),
-        tie_symmetric_sequences: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        src, dst = edge_index[0], edge_index[1]
-        num_nodes = node.shape[0]
-        design_mask = cast(Tensor, input.design_mask).bool()[valid_mask]
-        decoded = node.new_zeros(num_nodes, self.vocab_size)
-        logits = node.new_zeros(num_nodes, self.vocab_size)
-
-        constraint_mask = None if input.aa_constraint_mask is None else input.aa_constraint_mask[valid_mask]
-        per_residue_mask = _build_constraint_logit_mask(
-            num_nodes=num_nodes,
-            aa_constraint_mask=constraint_mask,
-            inverse_fold_restriction=inverse_fold_restriction,
-            device=node.device,
-            dtype=node.dtype,
-        )
-
-        order = torch.randperm(num_nodes, device=node.device, generator=generator).tolist()
-        if (~design_mask).any():
-            known = input.residue_type_features[valid_mask][~design_mask].to(decoded.dtype)
-            decoded[~design_mask] = known
-            logits[~design_mask] = known
-            fixed = set(torch.where(~design_mask)[0].tolist())
-            order = [position for position in order if position not in fixed]
-
-        symmetry_groups, position_to_group = (
-            self._build_symmetric_groups(input, valid_mask, design_mask)
-            if tie_symmetric_sequences and input.symmetric_group is not None
-            else ({}, {})
-        )
-        sampled: set[int] = set()
-
-        for position in order:
-            if position in sampled:
-                continue
-            positions = (
-                symmetry_groups.get(position_to_group[position], [position])
-                if position in position_to_group
-                else [position]
-            )
-
-            aggregated_logits: Tensor | None = None
-            for pos in positions:
-                incoming = dst == pos
-                neighbours = torch.cat(
-                    [edge[incoming], node[src[incoming]] + self.residue_type_projection(decoded[src[incoming]])],
-                    dim=-1,
-                )
-                state = node[pos : pos + 1]
-                for block in self.blocks:
-                    state = block.sample(state, neighbours)
-                position_logits = self.residue_type_head(state)
-                aggregated_logits = (
-                    position_logits if aggregated_logits is None else aggregated_logits + position_logits
-                )
-            aggregated_logits = cast(Tensor, aggregated_logits) / len(positions)
-
-            canonical = (
-                aggregated_logits[:, _CANONICALS_OFFSET : _CANONICALS_OFFSET + NUM_CANONICAL_TOKENS]
-                + per_residue_mask[position : position + 1]
-            )
-            if temperature is None or temperature == 0:
-                chosen = canonical.argmax(dim=-1)
-            else:
-                chosen = torch.multinomial(
-                    torch.softmax(canonical / temperature, dim=-1),
-                    num_samples=1,
-                    generator=generator,
-                ).squeeze(-1)
-            one_hot = torch.nn.functional.one_hot(chosen + _CANONICALS_OFFSET, self.vocab_size).to(decoded.dtype)
-            for pos in positions:
-                decoded[pos] = one_hot
-                logits[pos] = aggregated_logits
-                sampled.add(pos)
-
-        batch_size, num_tokens = valid_mask.shape
-        dense_logits = logits.new_zeros(batch_size, num_tokens, self.vocab_size)
-        dense_logits[valid_mask] = logits
-        dense_res_type = decoded.new_zeros(batch_size, num_tokens, self.vocab_size)
-        dense_res_type[valid_mask] = decoded
-        return dense_logits, dense_res_type
-
-    def _build_symmetric_groups(
-        self, input: BoltzGenInverseFoldingInput, valid_mask: Tensor, design_mask: Tensor
-    ) -> tuple[dict[int, list[int]], dict[int, int]]:
-        metadata = torch.stack(
-            [design_mask, cast(Tensor, input.symmetric_group)[valid_mask], input.residue_index[valid_mask]], dim=-1
-        ).tolist()
-        key_to_positions: dict[tuple[int, int], list[int]] = {}
-        for position, (designable, group, residue_index) in enumerate(metadata):
-            if not designable:
-                continue
-            if group <= 0:  # 0 = no symmetry group.
-                continue
-            key = (group, residue_index)
-            key_to_positions.setdefault(key, []).append(position)
-
-        groups: dict[int, list[int]] = {}
-        position_to_group: dict[int, int] = {}
-        group_id = 0
-        for positions in key_to_positions.values():
-            if len(positions) > 1:
-                groups[group_id] = positions
-                for position in positions:
-                    position_to_group[position] = group_id
-                group_id += 1
-        return groups, position_to_group
-
-
 class BoltzGenInverseFoldingGraphDecoderBlock(nn.Module):
     r"""
     One MLP-attention GNN decoder block updating nodes only.
@@ -1516,968 +3608,75 @@ class BoltzGenInverseFoldingGraphDecoderBlock(nn.Module):
         return node + self.node_norm(self.node_dropout(feed_forward_update))
 
 
-class BoltzGenTokenDistanceEmbedder(nn.Module):
+class BoltzGenInverseFoldingGraphAttention(nn.Module):
     r"""
-    Encode inter-token backbone geometry into an additive pair update.
+    Aggregate packed edge context with destination-grouped attention.
     """
 
     def __init__(
         self,
-        pair_size: int = 128,
-        token_distance_size: int = 64,
-        num_blocks: int = 2,
-        num_bins: int = 38,
-        min_dist: float = 3.25,
-        max_dist: float = 50.75,
-        distance_gaussian_dim: int = 32,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        backend: str = "auto",
+        node_size: int,
+        context_size: int,
+        hidden_size: int,
+        num_attention_heads: int,
+        softmax_dropout: float,
     ) -> None:
         super().__init__()
-        self.num_blocks = num_blocks
-        self.min_dist = min_dist
-        self.max_dist = max_dist
-        self.num_bins = num_bins
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
-        self.distance_feature_projection = nn.Linear(num_bins + 4 * pair_size, token_distance_size, bias=False)
-        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
-        self.blocks = nn.ModuleList(
-            TrianglePairUpdateBlock(
-                pair_size=token_distance_size,
-                triangle_multiplication_hidden_size=token_distance_size,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
-                backend=backend,
-            )
-            for _ in range(num_blocks)
+        self.softmax_dropout = softmax_dropout
+        self.weight_feed_forward = BoltzGenInverseFoldingGraphFeedForward(
+            node_size + context_size,
+            hidden_size,
+            num_attention_heads,
+            num_hidden_layers=2,
         )
-        self.distance_encoder = BoltzGenDistanceTokenEncoder(
-            distance_gaussian_dim=distance_gaussian_dim,
-            pair_size=pair_size,
-            output_size=pair_size,
+        self.value_feed_forward = BoltzGenInverseFoldingGraphFeedForward(
+            context_size,
+            hidden_size,
+            node_size,
+            num_hidden_layers=2,
         )
+        self.output_projection = nn.Linear(node_size * num_attention_heads, node_size)
 
-    def forward(
-        self,
-        pair: Tensor,
-        input: BoltzGenInput,
-        relative_position_encoding: Tensor,
-        pair_mask: Tensor | None = None,
-    ) -> Tensor:
-        coords = input.center_coordinates
-        distances = torch.cdist(coords, coords)
-        boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1, device=distances.device)
-        distogram = F.one_hot((distances[..., None] > boundaries).sum(dim=-1).long(), num_classes=self.num_bins)
-
-        distance_features = torch.cat([distogram, self.distance_encoder(relative_position_encoding, input)], dim=-1)
-        distance_features = distance_features * input.token_distance_mask.unsqueeze(-1)
-        value = self.pair_projection(self.pair_norm(pair)) + self.distance_feature_projection(
-            distance_features.to(pair.dtype)
-        )
-        refined = value
-        for block in self.blocks:
-            refined = block(refined, pair_mask=pair_mask)
-        value = self.hidden_norm(value + refined)  # one outer residual around the (internally-residual) stack
-        return self.output_projection(self.relu(value))
+    def forward(self, node: Tensor, context: Tensor, destination_index: Tensor) -> Tensor:
+        weight = self.weight_feed_forward(torch.cat([node[destination_index], context], dim=1))
+        value = self.value_feed_forward(context)
+        if self.training and self.softmax_dropout > 0:
+            weight = _softmax_dropout(weight, destination_index, node.shape[0], self.softmax_dropout)
+        weight = _scatter_softmax(weight, destination_index, dim=0, dim_size=node.shape[0])
+        message = _scatter_sum(
+            weight.unsqueeze(-1) * value.unsqueeze(1),
+            destination_index,
+            dim=0,
+            dim_size=node.shape[0],
+        ).flatten(start_dim=1)
+        return self.output_projection(message)
 
 
-class BoltzGenTemplateEmbedder(nn.Module):
+class BoltzGenInverseFoldingGraphFeedForward(nn.Module):
     r"""
-    Embed template geometry as an additive pair update.
+    GELU feed-forward computation for packed inverse-folding graph features.
     """
 
     def __init__(
         self,
-        pair_size: int = 128,
-        template_size: int = 64,
-        num_blocks: int = 2,
-        vocab_size: int = 33,
-        num_bins: int = 38,
-        min_dist: float = 3.25,
-        max_dist: float = 50.75,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        backend: str = "auto",
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        num_hidden_layers: int = 1,
     ) -> None:
         super().__init__()
-        self.num_blocks = num_blocks
-        self.min_dist = min_dist
-        self.max_dist = max_dist
-        self.num_bins = num_bins
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(template_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
-        self.template_feature_projection = FactorizedPairLinear(
-            pair_size=num_bins + 5,
-            token_size=vocab_size,
-            output_size=template_size,
-            bias=False,
-            backend=backend,
+        self.input_projection = nn.Linear(input_size, hidden_size)
+        self.hidden_projections = nn.ModuleList(
+            nn.Linear(hidden_size, hidden_size) for _ in range(num_hidden_layers - 1)
         )
-        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
-        self.blocks = nn.ModuleList(
-            TrianglePairUpdateBlock(
-                pair_size=template_size,
-                triangle_multiplication_hidden_size=template_size,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
-                backend=backend,
-            )
-            for _ in range(num_blocks)
-        )
-
-    def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
-        residue_type_features = cast(Tensor, input.template_residue_type_features)
-        frame_mask = cast(Tensor, input.template_frame_mask)
-        frame_rotations = cast(Tensor, input.template_frame_rotations)
-        frame_translations = cast(Tensor, input.template_frame_translations)
-        beta_carbon_positions = cast(Tensor, input.template_beta_carbon_positions)
-        alpha_carbon_positions = cast(Tensor, input.template_alpha_carbon_positions)
-        beta_carbon_mask = cast(Tensor, input.template_beta_carbon_mask)
-        template_mask = cast(Tensor, input.template_mask)
-        visibility_index = cast(Tensor, input.template_visibility_index)
-        present = template_mask.any(dim=2).float()
-        count = present.sum(dim=1).clamp(min=1)
-        batch_size, num_templates, num_tokens = residue_type_features.shape[:3]
-
-        pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
-        pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
-        same_visibility = (visibility_index[..., :, None] == visibility_index[..., None, :]).float()
-
-        beta_carbon_distances = torch.cdist(
-            beta_carbon_positions,
-            beta_carbon_positions,
-        )
-        boundaries = torch.linspace(
-            self.min_dist,
-            self.max_dist,
-            self.num_bins - 1,
-            device=beta_carbon_distances.device,
-        )
-        distogram = F.one_hot(
-            (beta_carbon_distances[..., None] > boundaries).sum(dim=-1).long(),
-            num_classes=self.num_bins,
-        )
-
-        rotation = frame_rotations.unsqueeze(2).transpose(-1, -2)
-        translation = frame_translations.unsqueeze(2).unsqueeze(-1)
-        targets = alpha_carbon_positions.unsqueeze(3).unsqueeze(-1)
-        vector = torch.matmul(rotation, targets - translation)
-        norm = torch.norm(vector, dim=-1, keepdim=True)
-        unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
-
-        geometry = torch.cat(
-            [
-                distogram.to(pair.dtype),
-                pair_beta_carbon_mask,
-                unit_vector,
-                pair_frame_mask,
-            ],
-            dim=-1,
-        )
-        geometry = geometry * same_visibility.unsqueeze(-1)
-        template_residue_features = residue_type_features.to(pair.dtype)
-        feature_value = self.template_feature_projection(geometry.to(pair.dtype), template_residue_features)
-        value = self.pair_projection(self.pair_norm(pair[:, None])) + feature_value
-        value = value.reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
-        if pair_mask is not None:
-            pair_mask = (
-                pair_mask[:, None]
-                .expand(-1, num_templates, -1, -1)
-                .reshape(batch_size * num_templates, num_tokens, num_tokens)
-            )
-        refined = value
-        for block in self.blocks:
-            refined = block(refined, pair_mask=pair_mask)
-        value = self.hidden_norm(value + refined).reshape(batch_size, num_templates, num_tokens, num_tokens, -1)
-
-        aggregated = (value * present[:, :, None, None, None]).sum(dim=1) / count[:, None, None, None].to(value.dtype)
-        return self.output_projection(self.relu(aggregated))
-
-
-class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
-    r"""
-    Embed template geometry with homogeneous BoltzGen Miniformer pair updates.
-    """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        template_size: int = 64,
-        num_blocks: int = 2,
-        vocab_size: int = 33,
-        num_bins: int = 38,
-        min_dist: float = 3.25,
-        max_dist: float = 50.75,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.num_blocks = num_blocks
-        self.min_dist = min_dist
-        self.max_dist = max_dist
-        self.num_bins = num_bins
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(template_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
-        self.template_feature_projection = FactorizedPairLinear(
-            pair_size=num_bins + 5,
-            token_size=vocab_size,
-            output_size=template_size,
-            bias=False,
-            backend=backend,
-        )
-        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
-        self.blocks = nn.ModuleList(
-            BoltzGenMiniTrianglePairUpdateBlock(pair_size=template_size, backend=backend) for _ in range(num_blocks)
-        )
-
-
-class BoltzGenDistanceTokenEncoder(nn.Module):
-    r"""
-    Per-backbone-atom pairwise distance features conditioned on the relative-position encoding.
-    """
-
-    def __init__(self, distance_gaussian_dim: int = 32, pair_size: int = 128, output_size: int = 128) -> None:
-        super().__init__()
-        self.distance_smearing = BoltzGenBroadcastGaussianSmearing(
-            start=0.0,
-            stop=2.0,
-            num_gaussians=distance_gaussian_dim,
-        )
-        input_size = distance_gaussian_dim + 1 + pair_size
-        self.distance_norm = LayerNorm(input_size)
-        self.distance_feed_forward = SwiGluFeedForward(
-            input_size,
-            pair_size,
-            output_size,
-        )
-
-    def forward(self, relative_position_encoding: Tensor, input: BoltzGenInput) -> Tensor:
-        batch_size, num_tokens = relative_position_encoding.shape[:2]
-        backbone = _gather_backbone4(
-            input.token_to_bb4_atoms,
-            input.atom_coordinates,
-            batch_size,
-            num_tokens,
-        ).permute(0, 2, 1, 3)
-        distance = (backbone.unsqueeze(-2) - backbone.unsqueeze(-3)).norm(dim=-1).unsqueeze(-1)  # (B, 4, N, N, 1)
-        gaussian = self.distance_smearing(distance)  # (B, 4, N, N, gaussians)
-        relative = relative_position_encoding.view(batch_size, 1, num_tokens, num_tokens, -1).expand(-1, 4, -1, -1, -1)
-        bias_input = torch.cat([gaussian, distance, relative], dim=-1)
-        bias = self.distance_feed_forward(self.distance_norm(bias_input))
-        bias = bias.permute(0, 2, 3, 4, 1).reshape(batch_size, num_tokens, num_tokens, -1)
-        return bias
-
-
-class BoltzGenMiniformerMsaTrunk(nn.Module):
-    r"""
-    MSA-module variant whose pair track uses compact pair-only Miniformer blocks.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        msa_size: int = 64,
-        msa_feature_size: int = 36,
-        num_blocks: int = 3,
-        vocab_size: int = 33,
-        use_paired_feature: bool = True,
-        outer_product_hidden_size: int = 32,
-        msa_dropout: float = 0.15,
-        pair_dropout: float = 0.25,
-        num_msa_attention_heads: int = 8,
-        msa_head_dim: int = 32,
-        expansion: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.num_blocks = num_blocks
-        self.vocab_size = vocab_size
-        self.use_paired_feature = use_paired_feature
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
-        self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
-        self.blocks = nn.ModuleList(
-            [
-                BoltzGenMiniformerMsaBlock(
-                    msa_size=msa_size,
-                    pair_size=pair_size,
-                    outer_product_hidden_size=outer_product_hidden_size,
-                    msa_dropout=msa_dropout,
-                    pair_dropout=pair_dropout,
-                    num_msa_attention_heads=num_msa_attention_heads,
-                    msa_head_dim=msa_head_dim,
-                    expansion=expansion,
-                    backend=backend,
-                )
-                for _ in range(num_blocks)
-            ]
-        )
-
-    def forward(
-        self,
-        pair: Tensor,
-        single_inputs: Tensor,
-        *,
-        msa_tokens: Tensor,
-        has_deletion: Tensor,
-        deletion_value: Tensor,
-        is_paired: Tensor,
-        msa_mask: Tensor,
-        token_mask: Tensor,
-    ) -> Tensor:
-        features = [
-            F.one_hot(msa_tokens.long(), num_classes=self.vocab_size).to(pair.dtype),
-            has_deletion.unsqueeze(-1).to(pair.dtype),
-            deletion_value.unsqueeze(-1).to(pair.dtype),
-        ]
-        if self.use_paired_feature:
-            features.append(is_paired.unsqueeze(-1).to(pair.dtype))
-        msa_representation = self.msa_projection(torch.cat(features, dim=-1))
-        msa_representation = msa_representation + self.token_projection(single_inputs).unsqueeze(1)
-        pair_mask = pair_mask_from_token_mask(token_mask)
-        for block in self.blocks:
-            pair, msa_representation = block(pair, msa_representation, pair_mask, msa_mask)
-        return pair
-
-
-class BoltzGenMiniformerMsaBlock(nn.Module):
-    r"""
-    Update MSA and pair features in a Miniformer block.
-    """
-
-    def __init__(
-        self,
-        msa_size: int = 64,
-        pair_size: int = 128,
-        outer_product_hidden_size: int = 32,
-        msa_dropout: float = 0.15,
-        pair_dropout: float = 0.25,
-        num_msa_attention_heads: int = 8,
-        msa_head_dim: int = 32,
-        expansion: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.pair_weighted_averaging = MsaPairWeightedAveraging(
-            msa_size=msa_size,
-            pair_size=pair_size,
-            num_attention_heads=num_msa_attention_heads,
-            head_dim=msa_head_dim,
-            backend=backend,
-        )
-        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
-        self.outer_product_mean = OuterProductMean(
-            msa_size=msa_size,
-            hidden_size=outer_product_hidden_size,
-            pair_size=pair_size,
-            divide_before_projection=True,
-            backend=backend,
-        )
-        self.triangle_pair_update = BoltzGenMiniTrianglePairUpdateBlock(
-            pair_size=pair_size,
-            expansion=expansion,
-            dropout=pair_dropout,
-            backend=backend,
-        )
-        self.msa_dropout = RowwiseDropout(msa_dropout)
-
-    def forward(
-        self,
-        pair: Tensor,
-        msa_representation: Tensor,
-        pair_mask: Tensor,
-        msa_mask: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        msa_representation = msa_representation + self.msa_dropout(
-            self.pair_weighted_averaging(msa_representation, pair, pair_mask=pair_mask)
-        )
-        msa_representation = msa_representation + self.msa_transition(msa_representation)
-        pair = pair + self.outer_product_mean(msa_representation, msa_mask)
-        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
-        return pair, msa_representation
-
-
-class BoltzGenMiniformerStack(nn.Module):
-    r"""
-    Stack of BoltzGen Miniformer blocks (the trunk variant selected by ``use_miniformer``).
-    """
-
-    def __init__(
-        self,
-        num_blocks: int = 12,
-        single_size: int = 384,
-        pair_size: int = 128,
-        num_pair_attention_heads: int = 16,
-        dropout: float = 0.25,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.num_blocks = num_blocks
-        self.blocks = nn.ModuleList(
-            [
-                BoltzGenMiniformerBlock(
-                    single_size=single_size,
-                    pair_size=pair_size,
-                    num_pair_attention_heads=num_pair_attention_heads,
-                    dropout=dropout,
-                    backend=backend,
-                )
-                for _ in range(num_blocks)
-            ]
-        )
-
-    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
-        return single, pair
-
-
-class BoltzGenMiniformerBlock(nn.Module):
-    r"""
-    BoltzGen Miniformer block: compact pair update plus pair-biased single attention.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        num_pair_attention_heads: int = 16,
-        expansion: int = 4,
-        dropout: float = 0.25,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
-        self.rowwise_dropout = RowwiseDropout(dropout)
-        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
-        self.attention = PairBiasedSelfAttention(
-            hidden_size=single_size,
-            pair_size=pair_size,
-            num_attention_heads=num_pair_attention_heads,
-            backend=backend,
-        )
-        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
-
-    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        if pair_mask is None:
-            pair_mask = pair.new_ones(pair.shape[:-1])
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
-        pair = pair + self.pair_transition(pair)
-        single = single + self.attention(single, pair, pair_mask=pair_mask)
-        return single + self.single_transition(single), pair
-
-
-class BoltzGenMiniTrianglePairUpdateBlock(nn.Module):
-    r"""
-    Pair-only Miniformer block used in structure-trained-small MSA / template stacks.
-    """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        expansion: int = 4,
-        dropout: float = 0.25,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
-        self.rowwise_dropout = RowwiseDropout(dropout)
-        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
-
-    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        if pair_mask is None:
-            pair_mask = pair.new_ones(pair.shape[:-1])
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication(pair, pair_mask=pair_mask))
-        return pair + self.pair_transition(pair)
-
-
-class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
-    r"""
-    Compact bidirectional triangular update used by BoltzGen Miniformer artifacts.
-    """
-
-    def __init__(self, pair_size: int = 128) -> None:
-        super().__init__()
-        self.input_norm = LayerNorm(pair_size, eps=1e-5)
-        self.input_projection = nn.Linear(pair_size, pair_size, bias=False)
-        self.input_gate_projection = nn.Linear(pair_size, pair_size, bias=False)
-        self.output_norm = LayerNorm(pair_size // 2)
-        self.output_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
-        self.output_gate_projection = nn.Linear(pair_size // 2, pair_size, bias=False)
-
-    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        normalized = self.input_norm(pair)
-        update = self.input_projection(normalized) * torch.sigmoid(self.input_gate_projection(normalized))
-        if pair_mask is not None:
-            update = update * pair_mask.unsqueeze(-1).to(dtype=update.dtype, device=update.device)
-        with torch.autocast("cuda", enabled=False):
-            left_out, right_out, left_in, right_in = torch.chunk(update.float(), 4, dim=-1)
-            outgoing = torch.einsum("...ikd,...jkd->...ijd", left_out, right_out)
-            incoming = torch.einsum("...kid,...kjd->...ijd", left_in, right_in)
-            update = torch.cat((outgoing, incoming), dim=-1).to(pair.dtype)
-        update = self.output_norm(update)
-        return self.output_projection(update) * torch.sigmoid(self.output_gate_projection(update))
-
-
-class BoltzGenDenoiserConditioning(nn.Module):
-    r"""
-    Precompute the diffusion conditioning shared across denoiser calls.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        atom_hidden_size: int = 128,
-        atom_pair_hidden_size: int = 16,
-        atom_feature_size: int = 128,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        num_token_encoder_blocks: int = 24,
-        num_token_encoder_attention_heads: int = 16,
-        num_conditioning_transitions: int = 2,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.pairwise_conditioner = PairwiseConditioning(
-            pair_size=pair_size,
-            relative_position_size=pair_size,
-            num_transitions=num_conditioning_transitions,
-            backend=backend,
-        )
-        self.atom_encoder = BoltzGenDenoiserAtomEncoder(
-            atom_feature_size=atom_feature_size,
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            single_size=single_size,
-            pair_size=pair_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.atom_encoder_pair_norms = nn.ModuleList(
-            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_encoder_blocks)
-        )
-        self.atom_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False)
-            for _ in range(num_atom_encoder_blocks)
-        )
-        self.atom_decoder_pair_norms = nn.ModuleList(
-            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_decoder_blocks)
-        )
-        self.atom_decoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False)
-            for _ in range(num_atom_decoder_blocks)
-        )
-        self.token_encoder_pair_norms = nn.ModuleList(
-            LayerNorm(pair_size, backend=backend) for _ in range(num_token_encoder_blocks)
-        )
-        self.token_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False) for _ in range(num_token_encoder_blocks)
-        )
-
-    def forward(
-        self,
-        single_trunk: Tensor,
-        pair_trunk: Tensor,
-        relative_position_encoding: Tensor,
-        *,
-        atom_features: Tensor,
-        reference_positions: Tensor,
-        atom_mask: Tensor,
-        reference_space_id: Tensor,
-        atom_to_token: Tensor,
-    ) -> dict[str, Tensor]:
-        pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
-        atom_query, atom_conditioning, atom_pair = self.atom_encoder(
-            atom_features,
-            reference_positions,
-            atom_mask,
-            reference_space_id,
-            atom_to_token=atom_to_token,
-            single_trunk=single_trunk,
-            pair_trunk=pair,
-        )
-        atom_enc_bias = torch.cat(
-            [
-                projection(norm(atom_pair))
-                for norm, projection in zip(
-                    self.atom_encoder_pair_norms,
-                    self.atom_encoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        atom_dec_bias = torch.cat(
-            [
-                projection(norm(atom_pair))
-                for norm, projection in zip(
-                    self.atom_decoder_pair_norms,
-                    self.atom_decoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        token_encoder_bias = torch.cat(
-            [
-                projection(norm(pair))
-                for norm, projection in zip(
-                    self.token_encoder_pair_norms,
-                    self.token_encoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        return {
-            "atom_query": atom_query,
-            "atom_conditioning": atom_conditioning,
-            "atom_enc_bias": atom_enc_bias,
-            "atom_dec_bias": atom_dec_bias,
-            "token_encoder_bias": token_encoder_bias,
-        }
-
-
-class BoltzGenDenoiser(nn.Module):
-    r"""
-    Predict per-atom position updates for EDM sampling.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        atom_hidden_size: int = 128,
-        fourier_embedding_size: int = 256,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        num_token_encoder_blocks: int = 24,
-        num_token_encoder_attention_heads: int = 16,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        num_conditioning_transitions: int = 2,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        hidden = 2 * single_size
-        self.single_conditioner = BoltzGenSingleConditioning(
-            single_size=single_size,
-            fourier_embedding_size=fourier_embedding_size,
-            num_transitions=num_conditioning_transitions,
-            backend=backend,
-        )
-        self.atom_attention_encoder = PackedDenoisingAtomToTokenEncoder(
-            atom_hidden_size=atom_hidden_size,
-            token_hidden_size=single_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            num_blocks=num_atom_encoder_blocks,
-            num_attention_heads=num_atom_encoder_attention_heads,
-            backend=backend,
-        )
-        self.single_to_token_norm = LayerNorm(hidden, backend=backend)
-        self.single_to_token_projection = nn.Linear(hidden, hidden, bias=False)
-        self.token_encoder = ConditionedTransformerEncoder(
-            num_blocks=num_token_encoder_blocks,
-            num_attention_heads=num_token_encoder_attention_heads,
-            hidden_size=hidden,
-            conditioning_size=hidden,
-            backend=backend,
-        )
-        self.token_norm = LayerNorm(hidden, backend=backend)
-        self.atom_attention_decoder = PackedTokenToAtomDecoder(
-            atom_hidden_size=atom_hidden_size,
-            token_hidden_size=single_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            num_blocks=num_atom_decoder_blocks,
-            num_attention_heads=num_atom_decoder_attention_heads,
-            backend=backend,
-        )
-
-    def forward(
-        self,
-        single_inputs: Tensor,
-        single_trunk: Tensor,
-        noisy_positions: Tensor,
-        noise_level: Tensor,
-        conditioning: dict[str, Tensor],
-        *,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        token_mask: Tensor,
-        multiplicity: int = 1,
-    ) -> Tensor:
-        single, _ = self.single_conditioner(
-            noise_level,
-            single_trunk.repeat_interleave(multiplicity, 0),
-            single_inputs.repeat_interleave(multiplicity, 0),
-        )
-
-        token_repr, atom_skip, conditioning_skip = self.atom_attention_encoder(
-            conditioning["atom_query"],
-            conditioning["atom_conditioning"],
-            conditioning["atom_enc_bias"].repeat_interleave(multiplicity, 0),
-            atom_mask,
-            atom_to_token,
-            token_mask.shape[-1],
-            noisy_positions=noisy_positions,
-            multiplicity=multiplicity,
-        )
-        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
-
-        token_repr = self.token_encoder(
-            token_repr,
-            single,
-            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
-            token_mask.repeat_interleave(multiplicity, 0).float(),
-        )
-        token_repr = self.token_norm(token_repr)
-
-        return self.atom_attention_decoder(
-            token_repr,
-            atom_skip,
-            conditioning_skip,
-            conditioning["atom_dec_bias"].repeat_interleave(multiplicity, 0),
-            atom_mask,
-            atom_to_token,
-            multiplicity=multiplicity,
-        )
-
-
-class BoltzGenSingleConditioning(nn.Module):
-    r"""
-    Condition the concatenated trunk and input single representation on the diffusion noise level.
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        fourier_embedding_size: int = 256,
-        num_transitions: int = 2,
-        transition_expansion: int = 2,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        hidden = 2 * single_size
-        self.single_norm = LayerNorm(hidden, backend=backend)
-        self.single_projection = nn.Linear(hidden, hidden)
-        self.noise_fourier = FrozenFourierEmbedding(fourier_embedding_size)
-        self.fourier_norm = LayerNorm(fourier_embedding_size, backend=backend)
-        self.fourier_projection = nn.Linear(fourier_embedding_size, hidden, bias=False)
-        self.transitions = nn.ModuleList(
-            Transition(hidden, expansion=transition_expansion, backend=backend) for _ in range(num_transitions)
-        )
-
-    def forward(self, noise_level: Tensor, single_trunk: Tensor, single_inputs: Tensor) -> tuple[Tensor, Tensor]:
-        return condition_single(
-            single_trunk,
-            single_inputs,
-            noise_level,
-            norm=self.single_norm,
-            projection=self.single_projection,
-            noise_fourier=self.noise_fourier,
-            noise_norm=self.fourier_norm,
-            noise_projection=self.fourier_projection,
-            transitions=self.transitions,
-            sample_axis=False,
-        )
-
-
-class BoltzGenCoordinateDiffusion(nn.Module):
-    r"""
-    EDM sampler wrapping a [`BoltzGenDenoiser`][ofoldx.models.boltzgen.model.BoltzGenDenoiser].
-    """
-
-    def __init__(
-        self,
-        denoiser: BoltzGenDenoiser,
-        sigma_data: float = 16.0,
-        min_noise_level: float = 4e-4,
-        max_noise_level: float = 160.0,
-        rho: float = 7.0,
-        churn_rate: float = 0.8,
-        min_churn_noise_level: float = 1.0,
-        noise_scale: float = 0.95,
-        step_scale: float = 1.8,
-        num_sampling_steps: int = 200,
-        alignment_reverse_diff: bool = True,
-        sampling_schedule: str = "dilated",
-        time_dilation: float = 2.667,
-        time_dilation_start: float = 0.6,
-        time_dilation_end: float = 0.8,
-        noise_log_mean: float = -1.2,
-        noise_log_std: float = 1.5,
-    ) -> None:
-        super().__init__()
-        self.denoiser = denoiser
-        self.sigma_data = sigma_data
-        self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
-        self.min_noise_level = min_noise_level
-        self.max_noise_level = max_noise_level
-        self.rho = rho
-        self.churn_rate = churn_rate
-        self.min_churn_noise_level = min_churn_noise_level
-        self.noise_scale = noise_scale
-        self.step_scale = step_scale
-        self.noise_log_mean = noise_log_mean
-        self.noise_log_std = noise_log_std
-        self.num_sampling_steps = num_sampling_steps
-        self.alignment_reverse_diff = alignment_reverse_diff
-        self.sampling_schedule = sampling_schedule
-        self.time_dilation = time_dilation
-        self.time_dilation_start = time_dilation_start
-        self.time_dilation_end = time_dilation_end
-
-    def preconditioned_network_forward(
-        self, noisy_coordinates: Tensor, sigma: Tensor | float, *, multiplicity: int = 1, **conditioning: object
-    ) -> Tensor:
-        batch = noisy_coordinates.shape[0]
-        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
-        padded = sigma.reshape(batch, 1, 1)
-        update = self.denoiser(
-            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
-            noise_level=self.preconditioner.c_noise(sigma),
-            multiplicity=multiplicity,
-            **conditioning,
-        )
-        return self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
-
-    def noise_distribution(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        noise = torch.randn((batch_size,), device=device, dtype=dtype, generator=generator)
-        return self.sigma_data * (self.noise_log_mean + self.noise_log_std * noise).exp()
-
-    def loss_weight(self, sigma: Tensor) -> Tensor:
-        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
-
-    def sample_schedule_karras(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-        inv_rho = 1 / self.rho
-        ramp = torch.arange(steps, device=device, dtype=torch.float32) / max(steps - 1, 1)
-        sigmas = (
-            self.max_noise_level**inv_rho + ramp * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
-        ) ** self.rho
-        sigmas = sigmas * self.sigma_data
-        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
-
-    def sample_schedule_dilated(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-        inv_rho = 1 / self.rho
-        ramp = torch.arange(steps, device=device, dtype=torch.float32) / max(steps - 1, 1)
-        dilated = _dilate_time(
-            ramp,
-            start=self.time_dilation_start,
-            end=self.time_dilation_end,
-            dilation=self.time_dilation,
-        )
-        sigmas = (
-            self.max_noise_level**inv_rho + dilated * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
-        ) ** self.rho
-        sigmas = sigmas * self.sigma_data
-        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
-
-    def sample_schedule(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        if self.sampling_schedule == "af3":
-            return self.sample_schedule_karras(num_sampling_steps, device=device)
-        if self.sampling_schedule == "dilated":
-            return self.sample_schedule_dilated(num_sampling_steps, device=device)
-        raise ValueError(f"unknown BoltzGen sampling_schedule: {self.sampling_schedule!r}")
-
-    @torch.no_grad()
-    def sample(
-        self,
-        atom_mask: Tensor,
-        *,
-        num_sampling_steps: int | None = None,
-        multiplicity: int = 1,
-        generator: torch.Generator | None = None,
-        step_scale: float | None = None,
-        noise_scale: float | None = None,
-        **conditioning: object,
-    ) -> Tensor:
-        device = atom_mask.device
-        base_atom_mask = atom_mask
-        expanded_atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
-        shape = (*expanded_atom_mask.shape, 3)
-        sigmas = self.sample_schedule(num_sampling_steps, device=device)
-        gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
-        step_scale_value = self.step_scale if step_scale is None else step_scale
-        noise_scale_value = self.noise_scale if noise_scale is None else noise_scale
-
-        def randn() -> Tensor:
-            r"""
-            Draw standard Gaussian noise of the expanded coordinate shape ``(B*multiplicity, N_atom, 3)``.
-            """
-            return torch.randn(shape, device=device, generator=generator)
-
-        coords = sigmas[0] * randn()
-        denoised = None
-        # The loop owns the squared-noise-scale churn factor, optional mid-step alignment, dilated Karras schedule,
-        # rigid augmentation, and random draws as one sampling algorithm.
-        # The fixed Python loop controls denoiser invocation; schedule values stay as tensors so sampling does not
-        # synchronize them to the host on every step.
-        for index in range(len(sigmas) - 1):
-            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
-            rotation = uniform_random_rotation(
-                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
-            )
-            translation = torch.randn(expanded_atom_mask.shape[0], 1, 3, device=device, generator=generator)
-            coords = torch.einsum("bmd,bds->bms", coords - coords.mean(-2, keepdim=True), rotation) + translation
-            if denoised is not None:
-                denoised = (
-                    torch.einsum("bmd,bds->bms", denoised - denoised.mean(-2, keepdim=True), rotation) + translation
-                )
-
-            sigma_hat = sigma_current * (1 + gamma)
-            noise_var = noise_scale_value**2 * (sigma_hat**2 - sigma_current**2)
-            noisy = coords + noise_scale_value * torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
-            denoised = self.preconditioned_network_forward(
-                noisy, sigma_hat, multiplicity=multiplicity, atom_mask=base_atom_mask, **conditioning
-            )
-            if self.alignment_reverse_diff:
-                noisy = weighted_rigid_align(
-                    source=noisy.float(), target=denoised.float(), weight=expanded_atom_mask.float()
-                ).to(denoised)
-            derivative = (noisy - denoised) / sigma_hat
-            coords = noisy + step_scale_value * (sigma_next - sigma_hat) * derivative
-        return coords
-
-
-class BoltzGenBroadcastGaussianSmearing(nn.Module):
-    r"""
-    Radial-basis distance features ``exp(coeff (d - offset)^2)`` broadcasting over a trailing singleton.
-    """
-
-    def __init__(self, start: float = 0.0, stop: float = 2.0, num_gaussians: int = 32) -> None:
-        super().__init__()
-        offset = torch.linspace(start, stop, num_gaussians)
-        # Derive the RBF width from the materialized float32 center spacing. This preserves the distance-feature
-        # arithmetic and avoids calling ``.item()`` on an unmaterialized meta tensor.
-        spacing = torch.linspace(start, stop, num_gaussians, device="cpu")
-        self.coeff = -0.5 / (spacing[1] - spacing[0]).item() ** 2
-        self.register_buffer("offset", offset)
-
-    def forward(self, distance: Tensor) -> Tensor:
-        return torch.exp(self.coeff * (distance - self.offset.view(1, 1, 1, -1)).pow(2))
+        self.output_projection = nn.Linear(hidden_size, output_size)
+        self.activation = nn.GELU()
+
+    def forward(self, features: Tensor) -> Tensor:
+        hidden = self.activation(self.input_projection(features))
+        for projection in self.hidden_projections:
+            hidden = self.activation(projection(hidden))
+        return self.output_projection(hidden)
 
 
 class BoltzGenGaussianSmearing(nn.Module):
@@ -2503,6 +3702,484 @@ class BoltzGenGaussianSmearing(nn.Module):
 
 
 # Scoring heads are optional so the design-only generator keeps its base parameter count.
+
+
+def _boltzgen_confidence_output(
+    *,
+    pae_logits: Tensor,
+    pde_logits: Tensor,
+    plddt_logits: Tensor,
+    resolved_logits: Tensor,
+    confidence_single: Tensor | None,
+    confidence_pair: Tensor | None,
+    coordinates: Tensor,
+    representative_distances: Tensor,
+    pred_distogram_logits: Tensor,
+    input: BoltzGenInput,
+    multiplicity: int,
+    token_level_confidence: bool,
+) -> BoltzGenConfidenceOutput:
+    r"""
+    Derive the complete released BoltzGen confidence tensor set.
+    """
+
+    batch_size = input.token_mask.shape[0]
+    token_mask = input.token_mask.repeat_interleave(multiplicity, dim=0).to(pae_logits)
+    chain_index = input.chain_index.repeat_interleave(multiplicity, dim=0)
+    molecule_type = input.molecule_type.repeat_interleave(multiplicity, dim=0)
+    is_ligand_token = (molecule_type == 3).to(pae_logits)
+    is_protein_token = (molecule_type == 0).to(pae_logits)
+
+    plddt = _boltzgen_expected_metric(plddt_logits)
+    if token_level_confidence:
+        confidence_mask = token_mask
+        complex_plddt = (plddt * confidence_mask).sum(dim=-1) / confidence_mask.sum(dim=-1)
+        token_interface_mask = (
+            (representative_distances < 8)
+            & (chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2))
+            & ~is_ligand_token.bool().unsqueeze(-1)
+        ).any(dim=-1)
+        non_interface_mask = ~token_interface_mask & ~is_ligand_token.bool()
+        iplddt_weight = is_ligand_token * 20.0 + token_interface_mask.to(plddt) * 10.0 + non_interface_mask.to(plddt)
+    else:
+        atom_mask = input.atom_mask.repeat_interleave(multiplicity, dim=0).to(plddt)
+        confidence_mask = atom_mask
+        complex_plddt = (plddt * confidence_mask).sum(dim=-1) / confidence_mask.sum(dim=-1)
+        atom_to_token = input.atom_to_token.repeat_interleave(multiplicity, dim=0).long()
+        atom_molecule_type = molecule_type.gather(1, atom_to_token)
+        atom_chain_index = chain_index.gather(1, atom_to_token)
+        is_ligand_atom = atom_molecule_type == 3
+        atom_interface_mask = (
+            (torch.cdist(coordinates, coordinates) < 8)
+            & (atom_chain_index.unsqueeze(-1) != atom_chain_index.unsqueeze(-2))
+            & ~is_ligand_atom.unsqueeze(-1)
+        ).any(dim=-1)
+        non_interface_mask = ~atom_interface_mask & ~is_ligand_atom
+        iplddt_weight = (
+            is_ligand_atom.to(plddt) * 20.0 + atom_interface_mask.to(plddt) * 10.0 + non_interface_mask.to(plddt)
+        )
+    complex_iplddt = (plddt * confidence_mask * iplddt_weight).sum(dim=-1) / (confidence_mask * iplddt_weight).sum(
+        dim=-1
+    )
+
+    pde = _boltzgen_expected_metric(pde_logits, end=32.0)
+    pae = _boltzgen_expected_metric(pae_logits, end=32.0)
+    pred_distogram_probability = pred_distogram_logits.softmax(dim=-1).repeat_interleave(
+        multiplicity,
+        dim=0,
+    )
+    contact_probability = pred_distogram_probability[..., :20].sum(dim=-1)
+    eye = torch.eye(token_mask.shape[-1], device=token_mask.device, dtype=torch.bool).unsqueeze(0)
+    token_pair_mask = token_mask.bool().unsqueeze(-1) & token_mask.bool().unsqueeze(-2) & ~eye
+
+    selected_ligand_mask = is_ligand_token.bool() & (chain_index == 1)
+    protein_pair_mask = token_pair_mask & is_protein_token.bool().unsqueeze(-1) & is_protein_token.bool().unsqueeze(-2)
+    ligand_pair_mask = token_pair_mask & selected_ligand_mask.unsqueeze(-1) & selected_ligand_mask.unsqueeze(-2)
+    interface_protein_mask = (
+        (representative_distances < 8) & is_protein_token.bool().unsqueeze(-1) & selected_ligand_mask.unsqueeze(-2)
+    ).any(dim=-1)
+    protein_ligand_interface_pair_mask = (
+        token_pair_mask
+        & interface_protein_mask.unsqueeze(-1)
+        & selected_ligand_mask.unsqueeze(-2)
+        & (representative_distances < 8)
+    )
+
+    def pae_average(mask: Tensor, *, contact_weighted: bool) -> Tensor:
+        weight = mask.to(pae)
+        if contact_weighted:
+            weight = weight * contact_probability
+        return (pae * weight).sum(dim=(1, 2)) / (weight.sum(dim=(1, 2)) + 1e-5)
+
+    protein_pae_value_weighted = pae_average(protein_pair_mask, contact_weighted=True)
+    protein_pae_value_unweighted = pae_average(protein_pair_mask, contact_weighted=False)
+    ligand_pae_value_weighted = pae_average(ligand_pair_mask, contact_weighted=True)
+    ligand_pae_value_unweighted = pae_average(ligand_pair_mask, contact_weighted=False)
+    interface_pae_value_weighted = pae_average(protein_ligand_interface_pair_mask, contact_weighted=True)
+    interface_pae_value_unweighted = pae_average(protein_ligand_interface_pair_mask, contact_weighted=False)
+
+    contact_pair_weight = token_pair_mask.to(pde) * contact_probability
+    complex_pde = (pde * contact_pair_weight).sum(dim=(1, 2)) / contact_pair_weight.sum(dim=(1, 2))
+    interface_pair_weight = contact_pair_weight * (chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2)).to(pde)
+    complex_ipde = (pde * interface_pair_weight).sum(dim=(1, 2)) / (interface_pair_weight.sum(dim=(1, 2)) + 1e-5)
+
+    design_mask = cast(Tensor, input.design_mask).bool()
+    chain_design_mask = cast(Tensor, input.chain_design_mask).bool()
+    has_design = design_mask.any(dim=-1, keepdim=True)
+    pae_chain_design_mask = torch.where(has_design, chain_design_mask, design_mask)
+    pae_target_mask = torch.where(has_design, ~chain_design_mask, design_mask)
+    pae_chain_design_mask = pae_chain_design_mask.repeat_interleave(multiplicity, dim=0)
+    pae_target_mask = pae_target_mask.repeat_interleave(multiplicity, dim=0)
+    design_mask_repeated = design_mask.repeat_interleave(multiplicity, dim=0)
+    has_design_repeated = has_design.repeat_interleave(multiplicity, dim=0).squeeze(-1)
+
+    chain_design_target_mask = token_pair_mask & (
+        (pae_chain_design_mask.unsqueeze(-1) & pae_target_mask.unsqueeze(-2))
+        | (pae_target_mask.unsqueeze(-1) & pae_chain_design_mask.unsqueeze(-2))
+    )
+    design_target_mask = token_pair_mask & (
+        (design_mask_repeated.unsqueeze(-1) & pae_target_mask.unsqueeze(-2))
+        | (pae_target_mask.unsqueeze(-1) & design_mask_repeated.unsqueeze(-2))
+    )
+    interaction_pae = (pae * design_target_mask).sum(dim=(1, 2)) / (design_target_mask.sum(dim=(1, 2)) + 1e-5)
+    min_interaction_pae = pae.masked_fill(~chain_design_target_mask, 100000.0).amin(dim=(1, 2))
+    min_design_to_target_pae = pae.masked_fill(~design_target_mask, 100000.0).amin(dim=(1, 2))
+    min_design_to_target_pae = torch.where(
+        has_design_repeated,
+        min_design_to_target_pae,
+        min_design_to_target_pae.new_full(min_design_to_target_pae.shape, torch.nan),
+    )
+
+    tm_scores = _boltzgen_ptm_scores(
+        pae_logits,
+        coordinates=coordinates,
+        input=input,
+        multiplicity=multiplicity,
+        chain_design_mask=chain_design_mask,
+    )
+    ranking_tm = torch.where(
+        torch.isclose(tm_scores["iptm"], torch.zeros_like(tm_scores["iptm"])).all(),
+        tm_scores["ptm"],
+        tm_scores["iptm"],
+    )
+    confidence_score = (4 * complex_plddt + ranking_tm) / 5
+
+    def unflatten(value: Tensor) -> Tensor:
+        return value.reshape(batch_size, multiplicity, *value.shape[1:])
+
+    return BoltzGenConfidenceOutput(
+        pae_logits=unflatten(pae_logits),
+        pde_logits=unflatten(pde_logits),
+        plddt_logits=unflatten(plddt_logits),
+        resolved_logits=unflatten(resolved_logits),
+        pae=unflatten(pae),
+        pde=unflatten(pde),
+        plddt=unflatten(plddt),
+        complex_plddt=unflatten(complex_plddt),
+        complex_iplddt=unflatten(complex_iplddt),
+        confidence_score=unflatten(confidence_score),
+        complex_pde=unflatten(complex_pde),
+        complex_ipde=unflatten(complex_ipde),
+        interaction_pae=unflatten(interaction_pae),
+        min_design_to_target_pae=unflatten(min_design_to_target_pae),
+        min_interaction_pae=unflatten(min_interaction_pae),
+        protein_pae_value_weighted=unflatten(protein_pae_value_weighted),
+        ligand_pae_value_weighted=unflatten(ligand_pae_value_weighted),
+        interface_pae_value_weighted=unflatten(interface_pae_value_weighted),
+        protein_pae_value_unweighted=unflatten(protein_pae_value_unweighted),
+        ligand_pae_value_unweighted=unflatten(ligand_pae_value_unweighted),
+        interface_pae_value_unweighted=unflatten(interface_pae_value_unweighted),
+        ptm=unflatten(tm_scores["ptm"]),
+        iptm=unflatten(tm_scores["iptm"]),
+        ligand_iptm=unflatten(tm_scores["ligand_iptm"]),
+        protein_iptm=unflatten(tm_scores["protein_iptm"]),
+        chain_pair_iptm=unflatten(tm_scores["chain_pair_iptm"]),
+        design_to_target_iptm=unflatten(tm_scores["design_to_target_iptm"]),
+        design_residue_iptm=unflatten(tm_scores["design_residue_iptm"]),
+        design_iptm=unflatten(tm_scores["design_iptm"]),
+        design_iiptm=unflatten(tm_scores["design_iiptm"]),
+        target_ptm=unflatten(tm_scores["target_ptm"]),
+        design_ptm=unflatten(tm_scores["design_ptm"]),
+        design_ipsae_min=unflatten(tm_scores["design_ipsae_min"]),
+        design_to_target_ipsae=unflatten(tm_scores["design_to_target_ipsae"]),
+        target_to_design_ipsae=unflatten(tm_scores["target_to_design_ipsae"]),
+        chain_pair_ipsae=unflatten(tm_scores["chain_pair_ipsae"]),
+        confidence_single=None if confidence_single is None else unflatten(confidence_single),
+        confidence_pair=None if confidence_pair is None else unflatten(confidence_pair),
+    )
+
+
+def _boltzgen_expected_metric(logits: Tensor, *, end: float = 1.0) -> Tensor:
+    num_bins = logits.shape[-1]
+    bin_width = end / num_bins
+    centers = torch.arange(
+        start=0.5 * bin_width,
+        end=end,
+        step=bin_width,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    return (logits.softmax(dim=-1) * centers).sum(dim=-1)
+
+
+def _boltzgen_ptm_scores(
+    pae_logits: Tensor,
+    *,
+    coordinates: Tensor,
+    input: BoltzGenInput,
+    multiplicity: int,
+    chain_design_mask: Tensor,
+) -> dict[str, Tensor]:
+    r"""
+    Compute the released pTM, interface, design, chain-pair, and ipSAE values.
+    """
+
+    token_mask = input.token_mask.repeat_interleave(multiplicity, dim=0).to(pae_logits)
+    frame_mask = _boltzgen_predicted_frame_mask(
+        coordinates,
+        input=input,
+        multiplicity=multiplicity,
+    ).to(pae_logits)
+    chain_index = input.chain_index.repeat_interleave(multiplicity, dim=0)
+    pair_mask_ptm = frame_mask.unsqueeze(-1) * token_mask.unsqueeze(-2) * token_mask.unsqueeze(-1)
+    different_chain = chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2)
+    pair_mask_iptm = pair_mask_ptm * different_chain.to(pae_logits)
+
+    num_bins = pae_logits.shape[-1]
+    bin_width = 32.0 / num_bins
+    pae_centers = torch.arange(
+        start=0.5 * bin_width,
+        end=32.0,
+        step=bin_width,
+        device=pae_logits.device,
+        dtype=pae_logits.dtype,
+    )
+    num_residues = token_mask.sum(dim=-1, keepdim=True)
+    tm_expected = tm_weight_from_pae(
+        pae_logits,
+        num_residues.unsqueeze(-1),
+        bin_centers=pae_centers,
+    )
+
+    def aggregate(mask: Tensor) -> Tensor:
+        return torch.max(
+            (tm_expected * mask).sum(dim=-1) / (mask.sum(dim=-1) + 1e-5),
+            dim=1,
+        ).values
+
+    molecule_type = input.molecule_type.repeat_interleave(multiplicity, dim=0)
+    is_ligand = (molecule_type == 3).to(pae_logits)
+    is_protein = (molecule_type == 0).to(pae_logits)
+    ligand_iptm_mask = pair_mask_iptm * (
+        is_ligand.unsqueeze(-1) * is_protein.unsqueeze(-2) + is_protein.unsqueeze(-1) * is_ligand.unsqueeze(-2)
+    )
+    protein_iptm_mask = pair_mask_iptm * is_protein.unsqueeze(-1) * is_protein.unsqueeze(-2)
+
+    design_mask = cast(Tensor, input.design_mask).bool()
+    has_design = design_mask.any(dim=-1, keepdim=True)
+    chain_design_mask = torch.where(has_design, chain_design_mask, design_mask)
+    target_mask = ~chain_design_mask
+    chain_design_mask = chain_design_mask.repeat_interleave(multiplicity, dim=0)
+    target_mask = target_mask.repeat_interleave(multiplicity, dim=0)
+    design_mask = design_mask.repeat_interleave(multiplicity, dim=0)
+
+    design_iptm_mask = pair_mask_ptm * (
+        (chain_design_mask.unsqueeze(-1) & target_mask.unsqueeze(-2))
+        | (target_mask.unsqueeze(-1) & chain_design_mask.unsqueeze(-2))
+    ).to(pae_logits)
+    design_to_target_iptm_mask = pair_mask_ptm * (
+        (design_mask.unsqueeze(-1) & target_mask.unsqueeze(-2))
+        | (target_mask.unsqueeze(-1) & design_mask.unsqueeze(-2))
+    ).to(pae_logits)
+    design_residue_iptm_mask = (
+        pair_mask_ptm
+        * different_chain.to(pae_logits)
+        * (design_mask.unsqueeze(-1).to(pae_logits) + design_mask.unsqueeze(-2).to(pae_logits)).clamp(max=1)
+    )
+    design_ptm_mask = pair_mask_ptm * (chain_design_mask.unsqueeze(-1) & chain_design_mask.unsqueeze(-2)).to(pae_logits)
+    target_ptm_mask = pair_mask_ptm * (target_mask.unsqueeze(-1) & target_mask.unsqueeze(-2)).to(pae_logits)
+
+    num_chains = int(input.chain_index.max().item()) + 1
+    chain_pair_iptm = tm_expected.new_zeros(tm_expected.shape[0], num_chains, num_chains)
+    for row in range(num_chains):
+        for column in range(num_chains):
+            chain_pair_mask = (
+                pair_mask_ptm
+                * (chain_index.unsqueeze(-1) == row).to(pae_logits)
+                * (chain_index.unsqueeze(-2) == column).to(pae_logits)
+            )
+            chain_pair_iptm[:, row, column] = aggregate(chain_pair_mask)
+
+    interaction_mask = _boltzgen_design_interaction_mask(
+        coordinates,
+        input=input,
+        multiplicity=multiplicity,
+        chain_design_mask=chain_design_mask,
+    )
+    design_iiptm_mask = pair_mask_ptm * (
+        (interaction_mask.unsqueeze(-1) & target_mask.unsqueeze(-2))
+        | (target_mask.unsqueeze(-1) & interaction_mask.unsqueeze(-2))
+    ).to(pae_logits)
+
+    expected_pae = (pae_logits.softmax(dim=-1) * pae_centers).sum(dim=-1)
+    design_to_target_ipsae = _boltzgen_ipsae_score(
+        chain_design_mask,
+        target_mask,
+        expected_pae,
+        frame_mask,
+        token_mask,
+    )
+    target_to_design_ipsae = _boltzgen_ipsae_score(
+        target_mask,
+        chain_design_mask,
+        expected_pae,
+        frame_mask,
+        token_mask,
+    )
+    chain_pair_ipsae = tm_expected.new_zeros(tm_expected.shape[0], num_chains, num_chains)
+    for row in range(num_chains):
+        for column in range(num_chains):
+            if row != column:
+                chain_pair_ipsae[:, row, column] = _boltzgen_ipsae_score(
+                    chain_index == row,
+                    chain_index == column,
+                    expected_pae,
+                    frame_mask,
+                    token_mask,
+                )
+
+    return {
+        "ptm": aggregate(pair_mask_ptm),
+        "iptm": aggregate(pair_mask_iptm),
+        "ligand_iptm": aggregate(ligand_iptm_mask),
+        "protein_iptm": aggregate(protein_iptm_mask),
+        "chain_pair_iptm": chain_pair_iptm,
+        "design_to_target_iptm": aggregate(design_to_target_iptm_mask),
+        "design_residue_iptm": aggregate(design_residue_iptm_mask),
+        "design_iptm": aggregate(design_iptm_mask),
+        "design_iiptm": aggregate(design_iiptm_mask),
+        "target_ptm": aggregate(target_ptm_mask),
+        "design_ptm": aggregate(design_ptm_mask),
+        "design_ipsae_min": torch.minimum(design_to_target_ipsae, target_to_design_ipsae),
+        "design_to_target_ipsae": design_to_target_ipsae,
+        "target_to_design_ipsae": target_to_design_ipsae,
+        "chain_pair_ipsae": chain_pair_ipsae,
+    }
+
+
+def _boltzgen_predicted_frame_mask(
+    coordinates: Tensor,
+    *,
+    input: BoltzGenInput,
+    multiplicity: int,
+) -> Tensor:
+    return _boltzgen_coordinate_frames(
+        coordinates,
+        input=input,
+        multiplicity=multiplicity,
+    )[1]
+
+
+def _boltzgen_coordinate_frames(
+    coordinates: Tensor,
+    *,
+    input: BoltzGenInput,
+    multiplicity: int,
+    atom_mask: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Construct coordinate-dependent token frames and their geometry mask.
+
+    Polymer frame indices come from the Processor. Non-polymer atom-token
+    frames use the two nearest eligible atoms around each center atom, matching
+    the confidence metric and PAE-target equations.
+    """
+
+    frame_index = cast(Tensor, input.frame_atom_index).repeat_interleave(multiplicity, dim=0).long().clone()
+    chain_index = input.chain_index
+    molecule_type = input.molecule_type
+    atom_to_token = input.atom_to_token.long()
+    atom_chain_index = chain_index.gather(1, atom_to_token)
+    structural_atom_mask = input.atom_mask.bool()
+    if atom_mask is None:
+        atom_mask = structural_atom_mask.repeat_interleave(multiplicity, dim=0)
+    else:
+        atom_mask = atom_mask.bool()
+
+    for batch_index in range(input.token_mask.shape[0]):
+        ligand_chains = torch.unique(
+            chain_index[batch_index][input.token_mask[batch_index].bool() & (molecule_type[batch_index] == 3)]
+        ).tolist()
+        for chain in ligand_chains:
+            chain_tokens = torch.nonzero(
+                input.token_mask[batch_index].bool()
+                & (molecule_type[batch_index] == 3)
+                & (chain_index[batch_index] == chain),
+                as_tuple=False,
+            ).flatten()
+            chain_atoms = torch.nonzero(
+                structural_atom_mask[batch_index] & (atom_chain_index[batch_index] == chain),
+                as_tuple=False,
+            ).flatten()
+            if len(chain_atoms) < 3:
+                continue
+            for sample_index in range(multiplicity):
+                row = batch_index * multiplicity + sample_index
+                distances = torch.cdist(coordinates[row, chain_atoms], coordinates[row, chain_atoms])
+                resolved = atom_mask[row, chain_atoms]
+                resolved_pair = resolved.unsqueeze(-1) & resolved.unsqueeze(-2)
+                nearest = distances.masked_fill(~resolved_pair, torch.inf).argsort(dim=-1)[:, :3]
+                frame_index[row, chain_tokens] = chain_atoms[nearest][:, (1, 0, 2)]
+
+    flat_index = frame_index.reshape(frame_index.shape[0], -1)
+    frames = coordinates.gather(1, flat_index.unsqueeze(-1).expand(-1, -1, 3))
+    frames = frames.reshape(*frame_index.shape, 3)
+    frame_resolved = atom_mask.gather(1, flat_index).reshape(frame_index.shape).all(dim=-1)
+    first = frames[..., 1, :] - frames[..., 0, :]
+    second = frames[..., 1, :] - frames[..., 2, :]
+    first_norm = torch.linalg.norm(first, dim=-1)
+    second_norm = torch.linalg.norm(second, dim=-1)
+    first_direction = first / (first_norm.unsqueeze(-1) + 1e-6)
+    second_direction = second / (second_norm.unsqueeze(-1) + 1e-6)
+    cosine = (first_direction * second_direction).sum(dim=-1)
+    valid_geometry = (cosine.abs() < 0.9063) & (first_norm > 1e-2) & (second_norm > 1e-2)
+    valid_geometry = valid_geometry & frame_resolved & input.token_mask.repeat_interleave(multiplicity, dim=0).bool()
+    return frame_index, valid_geometry
+
+
+def _boltzgen_design_interaction_mask(
+    coordinates: Tensor,
+    *,
+    input: BoltzGenInput,
+    multiplicity: int,
+    chain_design_mask: Tensor,
+) -> Tensor:
+    atom_to_token = input.atom_to_token.repeat_interleave(multiplicity, dim=0).long()
+    atom_mask = input.atom_mask.repeat_interleave(multiplicity, dim=0).bool()
+    atom_chain_design_mask = chain_design_mask.gather(1, atom_to_token) & atom_mask
+    interaction_mask = chain_design_mask.new_zeros(chain_design_mask.shape)
+    for sample_index in range(coordinates.shape[0]):
+        design_atoms = atom_chain_design_mask[sample_index]
+        target_atoms = atom_mask[sample_index] & ~design_atoms
+        if design_atoms.any() and target_atoms.any():
+            interacting_atoms = (
+                torch.cdist(
+                    coordinates[sample_index, design_atoms],
+                    coordinates[sample_index, target_atoms],
+                ).amin(dim=-1)
+                < 8
+            )
+            interacting_tokens = atom_to_token[sample_index, design_atoms][interacting_atoms]
+            interaction_mask[sample_index].scatter_(
+                0,
+                interacting_tokens,
+                torch.ones_like(interacting_tokens, dtype=torch.bool),
+            )
+    return interaction_mask
+
+
+def _boltzgen_ipsae_score(
+    source_mask: Tensor,
+    target_mask: Tensor,
+    pae: Tensor,
+    frame_mask: Tensor,
+    token_mask: Tensor,
+    cutoff: float = 15.0,
+) -> Tensor:
+    pair_mask = (
+        frame_mask.unsqueeze(-1)
+        * token_mask.unsqueeze(-2)
+        * token_mask.unsqueeze(-1)
+        * source_mask.unsqueeze(-1).to(pae)
+        * target_mask.unsqueeze(-2).to(pae)
+    )
+    valid_pae = (pae < cutoff).to(pae) * pair_mask
+    num_valid = valid_pae.sum(dim=-1)
+    d0 = 1.24 * (num_valid.clamp(min=19) - 15).pow(1.0 / 3.0) - 1.8
+    d0 = d0.clamp(min=1.0)
+    terms = 1.0 / (1.0 + (pae / d0.unsqueeze(-1)).square())
+    per_source = (terms * valid_pae).sum(dim=-1) / (num_valid + 1e-5)
+    return (per_source * source_mask.to(per_source)).max(dim=-1).values
 
 
 def _dilate_time(ts: Tensor, *, start: float, end: float, dilation: float) -> Tensor:
@@ -2536,6 +4213,7 @@ def _center_random_augmentation(
     coords: Tensor,
     atom_mask: Tensor,
     *,
+    augmentation: bool = True,
     translation_scale: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
@@ -2546,6 +4224,8 @@ def _center_random_augmentation(
     mask = atom_mask.unsqueeze(-1).to(coords.dtype)
     centroid = (coords * mask).sum(dim=-2, keepdim=True) / mask.sum(dim=-2, keepdim=True).clamp(min=1.0)
     centered = coords - centroid
+    if not augmentation:
+        return centered
     rotation = uniform_random_rotation(coords.shape[0], device=coords.device, dtype=coords.dtype, generator=generator)
     rotated = torch.einsum("bmd,bds->bms", centered, rotation)
     translation = (
@@ -2589,7 +4269,10 @@ def _zero_initialize_boltzgen_updates(module: nn.Module) -> None:
             nn.init.zeros_(child.left_atom_projection.weight)
             nn.init.zeros_(child.right_atom_projection.weight)
             nn.init.zeros_(child.feed_forward_output_projection.weight)
-        elif isinstance(child, PackedDenoisingAtomToTokenEncoder):
+        elif isinstance(
+            child,
+            (PackedDenoisingAtomToTokenEncoder, BoltzGenGaussianDenoisingAtomToTokenEncoder),
+        ):
             nn.init.zeros_(child.noisy_position_projection.weight)
         elif isinstance(child, PackedTokenToAtomDecoder):
             nn.init.zeros_(child.token_projection.weight)
@@ -2676,53 +4359,6 @@ def _scatter_softmax(src: Tensor, index: Tensor, dim_size: int, dim: int = 0) ->
     return exp / (denom + 1e-16)
 
 
-def _build_constraint_logit_mask(
-    num_nodes: int,
-    aa_constraint_mask: Tensor | None,
-    inverse_fold_restriction: tuple[str, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    r"""
-    Build the additive per-position canonical-amino-acid logit mask for constrained inverse folding.
-
-    Combines a per-residue block mask (``aa_constraint_mask``, ``(num_nodes, 20)``, ``> 0`` = blocked) with a
-    global block list (``inverse_fold_restriction``, three-letter CCD codes blocked everywhere). A position with no
-    allowed amino acid raises instead of silently relaxing the explicit per-residue constraints.
-
-    Args:
-        num_nodes: Number of packed valid tokens.
-        aa_constraint_mask: Optional per-residue block mask ``(num_nodes, 20)``; ``None`` = no per-residue blocks.
-        inverse_fold_restriction: Canonical amino acids (three-letter codes) to block at every position.
-        device: Device for the returned mask.
-        dtype: Floating dtype for the returned additive mask.
-
-    Returns:
-        Additive logit bias ``(num_nodes, 20)``: ``0.0`` where allowed, ``-1e6`` where blocked.
-
-    Raises:
-        ValueError: If the combined restrictions block every identity at a position.
-    """
-
-    num_aa = NUM_CANONICAL_TOKENS
-    if aa_constraint_mask is None:
-        per_residue_blocked = torch.zeros(num_nodes, num_aa, dtype=torch.bool, device=device)
-    else:
-        per_residue_blocked = aa_constraint_mask > 0
-
-    global_blocked = torch.zeros(num_aa, dtype=torch.bool, device=device)
-    for residue_type in inverse_fold_restriction:
-        global_blocked[CANONICAL_TOKENS.index(residue_type)] = True
-
-    combined = per_residue_blocked | global_blocked.unsqueeze(0)
-    all_blocked = combined.all(dim=1)
-    if all_blocked.any():
-        raise ValueError(
-            f"inverse folding has no valid amino acids at positions {torch.where(all_blocked)[0].tolist()}"
-        )
-    return combined.to(dtype=dtype) * -1e6
-
-
 # ---------------------------------------------------------------------------
 # Canonical identity layouts.
 #
@@ -2739,7 +4375,7 @@ class BoltzGenLayout:
     """
 
     system: MolecularSystem | None
-    atom_sites: tuple[AtomSite, ...]
+    atom_sites: tuple[AtomSite | None, ...]
     token_sites: tuple[AtomSite | tuple[str, int], ...]
     output_residues: tuple[ComponentReference | SymbolicResidueSite, ...]
     output_instance_ids: tuple[str, ...]
@@ -2923,6 +4559,54 @@ BoltzGenSchema = (
 
 
 @dataclass(kw_only=True, eq=False)
+class BoltzGenStructureTarget:
+    r"""
+    Structure-training labels aligned to one [`BoltzGenInput`][].
+
+    Args:
+        coordinates: Complete-assembly target coordinates with shape
+            ``(B, K, T, 3)``.
+        coordinate_mask: Resolved complete-assembly mask with shape ``(B, T)``.
+        atom_index: Current model-atom to truth-pool mapping with shape
+            ``(B, A)`` and ``-1`` padding.
+        chain_span: Half-open truth-pool chain spans with shape ``(B, C, 2)``.
+        chain_equivalence_index: Entity-and-layout equivalence ids with shape
+            ``(B, C)``.
+        symmetry_atom_index: Current-axis atoms in each local symmetry group
+            with shape ``(B, G, W)`` and ``-1`` padding.
+        symmetry_permutation: Complete carried permutations with shape
+            ``(B, G, P, W)`` and ``-1`` padding.
+        distogram_coordinates: Target token-representative coordinates with
+            shape ``(B, K, N, 3)``.
+        distogram_mask: Valid distogram-token mask with shape ``(B, N)``.
+        residue_type: Unmasked target residue distributions with shape
+            ``(B, N, V)``.
+        fake_atom_mask: Mask selecting synthetic design atom slots with shape
+            ``(B, A)``.
+        b_factor: Optional token-center B factors with shape ``(B, N)``; NaN
+            denotes a missing individual value.
+        bond_atom_index: Optional inter-residue atom endpoints with shape
+            ``(B, E, 2)``.
+        bond_mask: Optional valid-edge mask with shape ``(B, E)``.
+    """
+
+    coordinates: Tensor
+    coordinate_mask: Tensor
+    atom_index: Tensor
+    chain_span: Tensor
+    chain_equivalence_index: Tensor
+    symmetry_atom_index: Tensor
+    symmetry_permutation: Tensor
+    distogram_coordinates: Tensor
+    distogram_mask: Tensor
+    residue_type: Tensor
+    fake_atom_mask: Tensor
+    b_factor: Tensor | None = None
+    bond_atom_index: Tensor | None = None
+    bond_mask: Tensor | None = None
+
+
+@dataclass(kw_only=True, eq=False)
 class BoltzGenInput:
     r"""
     Input tensors consumed by BoltzGen design models.
@@ -2939,9 +4623,8 @@ class BoltzGenInput:
         atom_mask: Boolean atom validity mask.
         reference_positions: Centered reference-conformer atom coords.
         reference_space_id: Reference-conformer group id for each atom.
-        representative_atom_mask: Mask selecting the distogram representative atom per token.
         atom_token_index: Per-token atom offset for each atom.
-        token_to_rep_atom: Distogram representative atom index for each token.
+        token_center_atom_index: Center atom index for each token.
         residue_type_features: Query residue type one-hot features.
         msa_profile: Single-sequence MSA profile features.
         deletion_mean: Per-token deletion mean features.
@@ -2954,12 +4637,7 @@ class BoltzGenInput:
         token_to_bb4_atoms: Per-token ``(N, CA, C, O)`` atom indices.
         atom_coordinates: Atom coordinates used by geometric conditioning features; never a training-label fallback.
         token_distance_mask: Pairwise token-distance conditioning mask.
-        target_positions: Experimental atom coords consumed exclusively by the training forward. It is optional
-            on the shared input because ``design`` does not consume a training target.
-        target_mask: Resolved experimental-coordinate mask consumed by the training objective. It is distinct
-            from ``atom_mask`` and does not define the centroid of the rigid augmentation.
         frame_atom_index: Optional frame atom indices for frame-aligned losses.
-        frame_mask: Optional frame validity mask.
         method_feature: Optional experimental-method ids.
         modified: Optional modified-residue flags.
         cyclic_period: Optional cyclic-position periods.
@@ -2979,6 +4657,8 @@ class BoltzGenInput:
         template_visibility_index: Optional template visibility-group indices.
         binding_type: Optional binding conditioning ids.
         design_mask: Optional token mask selecting designable positions.
+        chain_design_mask: Optional token mask selecting the complete covalently
+            connected design component. Confidence inputs must provide it.
         ss_type: Optional secondary-structure conditioning ids.
         layout: Optional molecular identities aligned to token and atom rows. The
             model graph does not consume it; result decoding requires it.
@@ -2995,9 +4675,8 @@ class BoltzGenInput:
     atom_mask: Tensor
     reference_positions: Tensor
     reference_space_id: Tensor
-    representative_atom_mask: Tensor
     atom_token_index: Tensor
-    token_to_rep_atom: Tensor
+    token_center_atom_index: Tensor
     residue_type_features: Tensor
     msa_profile: Tensor
     deletion_mean: Tensor
@@ -3010,10 +4689,7 @@ class BoltzGenInput:
     token_to_bb4_atoms: Tensor
     atom_coordinates: Tensor
     token_distance_mask: Tensor
-    target_positions: Tensor | None = None
-    target_mask: Tensor | None = None
     frame_atom_index: Tensor | None = None
-    frame_mask: Tensor | None = None
     method_feature: Tensor | None = None
     modified: Tensor | None = None
     cyclic_period: Tensor | None = None
@@ -3033,6 +4709,7 @@ class BoltzGenInput:
     template_visibility_index: Tensor | None = None
     binding_type: Tensor | None = None
     design_mask: Tensor | None = None
+    chain_design_mask: Tensor | None = None
     ss_type: Tensor | None = None
     # Molecular identities aligned to tensor rows for result decoding.
     layout: BoltzGenLayout | None = None
@@ -3064,12 +4741,15 @@ class BoltzGenInverseFoldingInput:
         center_coordinates: Representative token coordinates with shape ``(B, N, 3)``.
         token_to_bb4_atoms: Backbone atom indices with shape ``(B, N, 4)``.
         atom_coordinates: Atom coordinates with shape ``(B, A, 3)`` in angstroms.
+        token_resolved_mask: Mask selecting tokens whose representative atom is
+            resolved in the fixed structure.
         method_feature: Optional experimental-method features.
         modified: Optional modified-residue flags.
         cyclic_period: Optional cyclic-position periods.
-        design_mask: Optional mask selecting positions to redesign.
-        aa_constraint_mask: Optional amino-acid allowance mask.
-        symmetric_group: Optional sequence-symmetry group IDs.
+        design_mask: Mask selecting positions to redesign.
+        aa_constraint_mask: Amino-acid block mask with shape ``(B, N, 20)``.
+        symmetric_group: Sequence-symmetry group IDs with shape ``(B, N)``;
+            zero means untied.
         layout: Molecular identities aligned to the token and atom axes.
     """
 
@@ -3090,12 +4770,13 @@ class BoltzGenInverseFoldingInput:
     center_coordinates: Tensor
     token_to_bb4_atoms: Tensor
     atom_coordinates: Tensor
+    token_resolved_mask: Tensor
+    design_mask: Tensor
+    aa_constraint_mask: Tensor
+    symmetric_group: Tensor
     method_feature: Tensor | None = None
     modified: Tensor | None = None
     cyclic_period: Tensor | None = None
-    design_mask: Tensor | None = None
-    aa_constraint_mask: Tensor | None = None
-    symmetric_group: Tensor | None = None
     # Molecular identities aligned to inverse-folding rows for result decoding.
     layout: BoltzGenInverseFoldingLayout | None = None
 
@@ -3119,13 +4800,15 @@ class BoltzGenOutput:
     Predictions from one BoltzGen training denoising pass.
 
     Args:
-        coordinates: Denoised atom coordinates with shape ``(B, A, 3)`` in
+        coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
             angstroms.
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
         bfactor_logits: Per-token B-factor logits with shape ``(B, N, D_b)``.
         augmented_target_coordinates: Training target coordinates after
-            rigid augmentation, with shape ``(B, A, 3)`` in angstroms.
-        noise_level: Sampled diffusion noise levels with shape ``(B,)``.
+            rigid augmentation, with shape ``(B, S, A, 3)`` in angstroms.
+        noise_level: Sampled diffusion noise levels with shape ``(B, S)``.
+        residue_type_logits: Optional residue-type logits with shape
+            ``(B, S, N, V)``.
     """
 
     coordinates: Tensor
@@ -3133,6 +4816,58 @@ class BoltzGenOutput:
     bfactor_logits: Tensor
     augmented_target_coordinates: Tensor
     noise_level: Tensor
+    residue_type_logits: Tensor | None
+
+
+@dataclass(eq=False)
+class BoltzGenConfidenceOutput:
+    r"""
+    Complete raw and derived outputs from the BoltzGen confidence equation.
+
+    Leading dimensions are ``(B, S)``. ``plddt_logits``, ``resolved_logits``,
+    and ``plddt`` use the token axis when token-level confidence is configured
+    and the realized atom axis for the released 23-slot atom projection.
+    Chain-pair tensors use dense zero-based input chain indices.
+    """
+
+    pae_logits: Tensor
+    pde_logits: Tensor
+    plddt_logits: Tensor
+    resolved_logits: Tensor
+    pae: Tensor
+    pde: Tensor
+    plddt: Tensor
+    complex_plddt: Tensor
+    complex_iplddt: Tensor
+    confidence_score: Tensor
+    complex_pde: Tensor
+    complex_ipde: Tensor
+    interaction_pae: Tensor
+    min_design_to_target_pae: Tensor
+    min_interaction_pae: Tensor
+    protein_pae_value_weighted: Tensor
+    ligand_pae_value_weighted: Tensor
+    interface_pae_value_weighted: Tensor
+    protein_pae_value_unweighted: Tensor
+    ligand_pae_value_unweighted: Tensor
+    interface_pae_value_unweighted: Tensor
+    ptm: Tensor
+    iptm: Tensor
+    ligand_iptm: Tensor
+    protein_iptm: Tensor
+    chain_pair_iptm: Tensor
+    design_to_target_iptm: Tensor
+    design_residue_iptm: Tensor
+    design_iptm: Tensor
+    design_iiptm: Tensor
+    target_ptm: Tensor
+    design_ptm: Tensor
+    design_ipsae_min: Tensor
+    design_to_target_ipsae: Tensor
+    target_to_design_ipsae: Tensor
+    chain_pair_ipsae: Tensor
+    confidence_single: Tensor | None
+    confidence_pair: Tensor | None
 
 
 @dataclass(eq=False)
@@ -3150,6 +4885,18 @@ class BoltzGenDesignOutput:
     coordinates: Tensor
     distogram_logits: Tensor
     bfactor_logits: Tensor
+
+
+@dataclass(eq=False)
+class BoltzGenConfidenceDesignOutput:
+    r"""
+    Coordinate samples and confidence values produced from one trunk execution.
+    """
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    bfactor_logits: Tensor
+    confidence: BoltzGenConfidenceOutput
 
 
 @dataclass(eq=False)

@@ -45,31 +45,36 @@ class Boltz2TrunkConfig(Config):
         num_pair_attention_heads: Head count for the trunk pair-biased attention.
         num_msa_blocks: Number of MSA-module blocks.
         msa_size: Width of the MSA representation channel.
-        msa_feature_size: Width of the per-column MSA input features
-            (one_hot(33) + has_deletion + deletion_value + is_paired).
         msa_head_dim: Per-head dimension of the MSA attention.
         num_msa_attention_heads: Pair-weighted-averaging head count.
         outer_product_hidden_size: Hidden width of the outer-product-mean block.
+        msa_triangle_attention_hidden_size: Per-head width of the MSA triangle attention.
+        num_msa_triangle_attention_heads: Head count for the MSA triangle attention.
         triangle_attention_hidden_size: Per-head width of the triangle attention.
         num_triangle_attention_heads: Triangle-attention head count.
         use_paired_feature: Whether the paired-MSA feature is consumed.
         pair_dropout: Pair-track dropout for the Pairformer.
         msa_dropout: Dropout applied inside the MSA trunk.
+        msa_pair_dropout: Pair-track dropout applied inside the MSA trunk.
+        post_layer_norm: Whether each Pairformer block normalizes its updated single track.
     """
 
     num_pairformer_blocks: int = 64
     num_pair_attention_heads: int = 16
     num_msa_blocks: int = 4
     msa_size: int = 64
-    msa_feature_size: int = 36
     msa_head_dim: int = 32
     num_msa_attention_heads: int = 8
     outer_product_hidden_size: int = 32
+    msa_triangle_attention_hidden_size: int = 32
+    num_msa_triangle_attention_heads: int = 4
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
     use_paired_feature: bool = True
     pair_dropout: float = 0.25
     msa_dropout: float = 0.15
+    msa_pair_dropout: float = 0.25
+    post_layer_norm: bool = False
 
 
 class Boltz2TemplateConfig(Config):
@@ -84,6 +89,7 @@ class Boltz2TemplateConfig(Config):
         expansion: Transition expansion factor.
         triangle_attention_hidden_size: Per-head width of the template triangle attention.
         num_triangle_attention_heads: Template triangle-attention head count.
+        dropout: Dropout probability in the template pair-update stack.
         min_distance: Lower edge of the distogram binning range, in angstroms.
         max_distance: Upper edge of the distogram binning range, in angstroms.
     """
@@ -95,6 +101,7 @@ class Boltz2TemplateConfig(Config):
     expansion: int = 4
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4
+    dropout: float = 0.25
     min_distance: float = 3.25
     max_distance: float = 50.75
 
@@ -109,6 +116,7 @@ class Boltz2DenoiserConfig(Config):
         num_atom_encoder_blocks: Number of atom-attention encoder blocks in the score model.
         num_atom_decoder_blocks: Number of atom-attention decoder blocks in the score model.
         num_atom_attention_heads: Head count shared by the atom encoder and decoder.
+        post_layer_norm: Whether denoiser atom-encoder blocks apply post-layer normalization.
         atom_hidden_size: Width of the atom single channel.
         atom_pair_hidden_size: Width of the atom pair channel.
         num_query_atoms: Query-window size for windowed atom attention.
@@ -123,6 +131,7 @@ class Boltz2DenoiserConfig(Config):
     num_atom_encoder_blocks: int = 3
     num_atom_decoder_blocks: int = 3
     num_atom_attention_heads: int = 4
+    post_layer_norm: bool = False
     atom_hidden_size: int = 128
     atom_pair_hidden_size: int = 16
     num_query_atoms: int = 32
@@ -162,20 +171,30 @@ class Boltz2ConfidenceConfig(Config):
     Args:
         num_pairformer_blocks: Number of Pairformer blocks in the confidence head.
         num_pair_attention_heads: Head count for the confidence pair-biased attention.
+        triangle_attention_hidden_size: Per-head width of the confidence triangle attention.
+        num_triangle_attention_heads: Confidence triangle-attention head count.
         num_distogram_bins: Number of distogram bins used to bin representative-atom distances.
         max_distance: Upper edge of the distogram binning range, in angstroms.
         num_plddt_bins: Number of pLDDT output bins.
         num_pae_bins: Number of predicted-aligned-error output bins.
         num_pde_bins: Number of predicted-distance-error output bins.
+        pair_dropout: Pair-track dropout for the confidence Pairformer.
+        post_layer_norm: Whether each confidence Pairformer block normalizes its updated single track.
+        normalize_single_input: Whether to normalize the incoming trunk single representation.
     """
 
     num_pairformer_blocks: int = 8
     num_pair_attention_heads: int = 16
+    triangle_attention_hidden_size: int = 32
+    num_triangle_attention_heads: int = 4
     num_distogram_bins: int = 64
     max_distance: float = 22.0
     num_plddt_bins: int = 50
     num_pae_bins: int = 64
     num_pde_bins: int = 64
+    pair_dropout: float = 0.25
+    post_layer_norm: bool = False
+    normalize_single_input: bool = True
 
 
 class Boltz2AffinityHeadConfig(Config):

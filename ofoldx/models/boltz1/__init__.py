@@ -15,21 +15,23 @@ from .config import (
     Boltz1TrunkConfig,
 )
 from .model import (
+    Boltz1ConfidenceOutput,
     Boltz1Input,
     Boltz1Model,
     Boltz1Output,
     Boltz1Pocket,
     Boltz1Representations,
+    Boltz1StructureTarget,
 )
 from .pipeline import Boltz1Pipeline
 from .processor import Boltz1Processor
 
 _MODELS.register(
-    "ofoldx.boltz1",
+    "boltz1",
     model=Boltz1Model,
     processor=Boltz1Processor,
 )
 _PIPELINES.register(
-    "ofoldx.boltz1",
+    "boltz1",
     pipeline=Boltz1Pipeline,
 )

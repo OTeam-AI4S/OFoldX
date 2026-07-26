@@ -25,6 +25,8 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
     Structure prediction pipeline for Boltz 1.
     """
 
+    model_architecture = "boltz1"
+
     def fold(
         self,
         input: MolecularSystem | Structure | str | PathLike[str],
@@ -35,7 +37,10 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         seed: int | None = None,
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        max_msa_rows: int | None = 8192,
         num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
     ) -> FoldResult:
@@ -53,7 +58,11 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
                 sampling. Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
+            msa_max_depth: Optional rows independently sampled for each MSA-module
+                invocation. ``None`` retains all rows.
+            max_msa_rows: Optional cap applied only while reading an MSA path.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
             use_potentials: Whether to apply configured physical-potential guidance.
             steering_args: Optional potential-guidance controls.
 
@@ -74,14 +83,16 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
             ]
             if len(proteins) != 1:
                 raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")
-            msa = read_msa(msa, entity_id=proteins[0])
+            msa = read_msa(msa, entity_id=proteins[0], max_rows=max_msa_rows)
         batch = self.processor(input, msa=msa, pocket=pocket, generator=generator)
         return self.model.fold(
             batch,
             num_samples=num_samples,
             generator=generator,
             recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
             use_potentials=use_potentials,
             steering_args=steering_args,
         )

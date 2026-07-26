@@ -12,7 +12,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -80,6 +80,7 @@ CONDITIONED_TRANSFORMER_ENCODER_BLOCK_RULES: list[Rule] = compile_rules(
         (r"^pair_bias_attn\.proj_o\.", "attention.projection.output_projection."),
         (r"^output_projection_linear\.", "output_gate_projection."),
         (r"^output_projection\.0\.", None),
+        (r"^post_lnorm\.", "post_norm."),
     ]
 )
 
@@ -155,18 +156,18 @@ def _convert_diffusion_conditioning(key: str) -> str | None:
     for boltz, norm_house, projection_house in (
         (
             "atom_enc_proj_z.",
-            "atom_encoder_pair_norms.",
-            "atom_encoder_pair_bias_projections.",
+            "atom_encoder_pair_bias_projection.pair_norms.",
+            "atom_encoder_pair_bias_projection.bias_projections.",
         ),
         (
             "atom_dec_proj_z.",
-            "atom_decoder_pair_norms.",
-            "atom_decoder_pair_bias_projections.",
+            "atom_decoder_pair_bias_projection.pair_norms.",
+            "atom_decoder_pair_bias_projection.bias_projections.",
         ),
         (
             "token_trans_proj_z.",
-            "token_encoder_pair_norms.",
-            "token_encoder_pair_bias_projections.",
+            "token_encoder_pair_bias_projection.pair_norms.",
+            "token_encoder_pair_bias_projection.bias_projections.",
         ),
     ):
         if key.startswith(boltz):
@@ -288,6 +289,7 @@ PAIRFORMER_LAYER_RULES: list[Rule] = compile_rules(
         (r"^attention\.proj_o\.", "pair_attention.attention.projection.output_projection."),
         (r"^attention\.proj_z\.0\.", "pair_attention.pair_norm."),
         (r"^attention\.proj_z\.1\.", "pair_attention.bias_projection."),
+        (r"^s_post_norm\.", "single_post_norm."),
         *_triangle_multiplication_rules("tri_mul_out", "pair_update.triangle_multiplication_outgoing"),
         *_triangle_multiplication_rules("tri_mul_in", "pair_update.triangle_multiplication_incoming"),
         *_triangle_attention_rules("tri_att_start", "pair_update.triangle_attention_starting_node"),
@@ -845,6 +847,102 @@ def _pack_conditioned_adaptive_norms(state_dict: dict[str, torch.Tensor]) -> Non
         state_dict[prefix + "conditioning_scale_bias"] = scale_bias
 
 
+def boltz2_config_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    affinity: bool = False,
+) -> Boltz2Config:
+    r"""
+    Reconstruct a released Boltz-2 architecture and its independent training equations.
+    """
+
+    hyperparameters: Mapping[str, Any] = checkpoint["hyper_parameters"]
+    state: Mapping[str, Tensor] = checkpoint["state_dict"]
+    training_args: Mapping[str, Any] = hyperparameters["training_args"]
+    embedder_args: Mapping[str, Any] = hyperparameters["embedder_args"]
+    msa_args: Mapping[str, Any] = hyperparameters["msa_args"]
+    pairformer_args: Mapping[str, Any] = hyperparameters["pairformer_args"]
+    score_model_args: Mapping[str, Any] = hyperparameters["score_model_args"]
+    diffusion_process_args: Mapping[str, Any] = hyperparameters["diffusion_process_args"]
+    confidence_model_args: Mapping[str, Any] = hyperparameters["confidence_model_args"]
+
+    config: Boltz2Config = Boltz2AffinityConfig() if affinity else Boltz2Config()
+    config.single_size = hyperparameters["token_s"]
+    config.pair_size = hyperparameters["token_z"]
+    config.atom_hidden_size = hyperparameters["atom_s"]
+    config.atom_pair_hidden_size = hyperparameters["atom_z"]
+    config.atom_feature_size = hyperparameters["atom_feature_dim"]
+    config.num_distogram_bins = hyperparameters["num_bins"]
+    config.fourier_embedding_size = score_model_args["dim_fourier"]
+    config.recycling_steps = training_args["recycling_steps"] + 1
+    config.use_templates = hyperparameters["use_templates"]
+    config.predict_bfactor = hyperparameters["predict_bfactor"]
+    config.conditioning_cutoff_min = hyperparameters["conditioning_cutoff_min"]
+    config.conditioning_cutoff_max = hyperparameters["conditioning_cutoff_max"]
+
+    config.input_embeddings.num_atom_encoder_blocks = embedder_args["atom_encoder_depth"]
+    config.input_embeddings.num_atom_encoder_attention_heads = embedder_args["atom_encoder_heads"]
+    config.input_embeddings.add_method_conditioning = "input_embedder.method_conditioning_init.weight" in state
+    config.input_embeddings.add_modified_flag = "input_embedder.modified_conditioning_init.weight" in state
+    config.input_embeddings.add_cyclic_flag = "input_embedder.cyclic_conditioning_init.weight" in state
+    config.input_embeddings.add_mol_type_feat = "input_embedder.mol_type_conditioning_init.weight" in state
+
+    config.trunk.num_pairformer_blocks = pairformer_args["num_blocks"]
+    config.trunk.num_pair_attention_heads = pairformer_args["num_heads"]
+    config.trunk.num_msa_blocks = msa_args["msa_blocks"]
+    config.trunk.msa_size = msa_args["msa_s"]
+    config.trunk.msa_triangle_attention_hidden_size = msa_args.get("pairwise_head_width", 32)
+    config.trunk.num_msa_triangle_attention_heads = msa_args.get("pairwise_num_heads", 4)
+    config.trunk.triangle_attention_hidden_size = pairformer_args.get("pairwise_head_width", 32)
+    config.trunk.num_triangle_attention_heads = pairformer_args.get("pairwise_num_heads", 4)
+    config.trunk.use_paired_feature = msa_args["use_paired_feature"]
+    config.trunk.pair_dropout = pairformer_args["dropout"]
+    config.trunk.msa_dropout = msa_args["msa_dropout"]
+    config.trunk.msa_pair_dropout = msa_args["z_dropout"]
+    config.trunk.post_layer_norm = pairformer_args.get("post_layer_norm", False)
+
+    template_args = hyperparameters.get("template_args")
+    if template_args is not None:
+        config.template.hidden_size = template_args["template_dim"]
+        config.template.num_blocks = template_args["template_blocks"]
+        config.template.num_distogram_bins = template_args["num_bins"]
+        config.template.dropout = template_args.get("dropout", 0.25)
+        config.template.min_distance = template_args.get("min_dist", 3.25)
+        config.template.max_distance = template_args.get("max_dist", 50.75)
+        config.template.triangle_attention_hidden_size = template_args.get("pairwise_head_width", 32)
+        config.template.num_triangle_attention_heads = template_args.get("pairwise_num_heads", 4)
+
+    config.denoiser.num_token_encoder_blocks = score_model_args["token_transformer_depth"]
+    config.denoiser.num_token_encoder_attention_heads = score_model_args["token_transformer_heads"]
+    config.denoiser.num_atom_encoder_blocks = score_model_args["atom_encoder_depth"]
+    config.denoiser.num_atom_decoder_blocks = score_model_args["atom_decoder_depth"]
+    config.denoiser.num_atom_attention_heads = score_model_args["atom_encoder_heads"]
+    config.denoiser.post_layer_norm = score_model_args.get("transformer_post_ln", False)
+    config.denoiser.atom_hidden_size = config.atom_hidden_size
+    config.denoiser.atom_pair_hidden_size = config.atom_pair_hidden_size
+    config.denoiser.num_query_atoms = hyperparameters["atoms_per_window_queries"]
+    config.denoiser.num_key_atoms = hyperparameters["atoms_per_window_keys"]
+    config.denoiser.num_conditioning_transitions = score_model_args["conditioning_transition_layers"]
+    config.denoiser.sigma_data = score_model_args["sigma_data"]
+    config.denoiser.alignment_reverse_diff = diffusion_process_args["alignment_reverse_diff"]
+
+    confidence_pairformer: Mapping[str, Any] = confidence_model_args["pairformer_args"]
+    confidence_args: Mapping[str, Any] = confidence_model_args["confidence_args"]
+    config.confidence.num_pairformer_blocks = confidence_pairformer["num_blocks"]
+    config.confidence.num_pair_attention_heads = confidence_pairformer["num_heads"]
+    config.confidence.triangle_attention_hidden_size = confidence_pairformer.get("pairwise_head_width", 32)
+    config.confidence.num_triangle_attention_heads = confidence_pairformer.get("pairwise_num_heads", 4)
+    config.confidence.pair_dropout = confidence_pairformer["dropout"]
+    config.confidence.post_layer_norm = confidence_pairformer.get("post_layer_norm", False)
+    config.confidence.normalize_single_input = not confidence_pairformer.get("no_update_s", False)
+    config.confidence.num_distogram_bins = confidence_model_args["num_dist_bins"]
+    config.confidence.max_distance = confidence_model_args["max_dist"]
+    config.confidence.num_plddt_bins = confidence_args["num_plddt_bins"]
+    config.confidence.num_pae_bins = confidence_args["num_pae_bins"]
+    config.confidence.num_pde_bins = confidence_args["num_pde_bins"]
+    return config
+
+
 def convert_boltz2_checkpoint(
     checkpoint_path: str | PathLike[str],
     *,
@@ -856,6 +954,7 @@ def convert_boltz2_checkpoint(
     """
 
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    config = boltz2_config_from_checkpoint(checkpoint) if config is None else config
     converted = _cast_floating_tensors(convert_trunk(checkpoint["state_dict"]), dtype)
     with torch.device("meta"):
         model = Boltz2Model(config)
@@ -874,6 +973,11 @@ def convert_boltz2_affinity_checkpoint(
     """
 
     checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    config = (
+        cast(Boltz2AffinityConfig, boltz2_config_from_checkpoint(checkpoint, affinity=True))
+        if config is None
+        else config
+    )
     state = checkpoint["state_dict"]
     converted = convert_trunk(state, allow_affinity=True)
     converted.update(convert_affinity_modules(state))

@@ -20,28 +20,34 @@ from .config import (
 )
 from .model import (
     Boltz2AffinityModel,
+    Boltz2AffinityOutput,
+    Boltz2ConfidenceOutput,
+    Boltz2Contact,
     Boltz2Input,
     Boltz2Model,
     Boltz2Output,
+    Boltz2Pocket,
+    Boltz2StructureTarget,
+    Boltz2Template,
 )
 from .pipeline import Boltz2AffinityPipeline, Boltz2AffinityResult, Boltz2Pipeline
 from .processor import Boltz2AffinityProcessor, Boltz2Processor
 
 _MODELS.register(
-    "ofoldx.boltz2",
+    "boltz2",
     model=Boltz2Model,
     processor=Boltz2Processor,
 )
 _MODELS.register(
-    "ofoldx.boltz2_affinity",
+    "boltz2_affinity",
     model=Boltz2AffinityModel,
     processor=Boltz2AffinityProcessor,
 )
 _PIPELINES.register(
-    "ofoldx.boltz2",
+    "boltz2",
     pipeline=Boltz2Pipeline,
 )
 _PIPELINES.register(
-    "ofoldx.boltz2_affinity",
+    "boltz2_affinity",
     pipeline=Boltz2AffinityPipeline,
 )

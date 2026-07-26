@@ -20,7 +20,7 @@ from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...pipelines import CompositePair, CompositePipeline, resolve_generator
-from ...results import Metric, Score
+from ...results import Score
 from ...results.values import best
 from ..boltz2.model import Boltz2AffinityModel, Boltz2Model
 from ..boltz2.processor import Boltz2AffinityProcessor, Boltz2Processor
@@ -28,12 +28,14 @@ from .model import (
     BoltzGenInput,
     BoltzGenInverseFoldingDesignOutput,
     BoltzGenInverseFoldingInput,
+    BoltzGenInverseFoldingLayout,
     BoltzGenInverseFoldingModel,
     BoltzGenLayout,
     BoltzGenModel,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
     BoltzGenSchema,
+    BoltzGenSymmetry,
 )
 from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 
@@ -45,8 +47,14 @@ class BoltzGenPipeline(CompositePipeline):
     Args:
         design_model: Structure design model.
         design_processor: Processor for structure design.
-        inverse_folding_model: Sequence design model.
-        inverse_folding_processor: Processor for sequence design.
+        inverse_folding_model: Optional sequence design model. Required by
+            [`design`][ofoldx.models.boltzgen.pipeline.BoltzGenPipeline.design]
+            and
+            [`inverse_fold`][ofoldx.models.boltzgen.pipeline.BoltzGenPipeline.inverse_fold],
+            but not by
+            [`design_backbones`][ofoldx.models.boltzgen.pipeline.BoltzGenPipeline.design_backbones].
+        inverse_folding_processor: Processor paired with
+            ``inverse_folding_model``.
         fold: Optional Boltz-2 structure prediction model.
         fold_processor: Boltz-2 Processor paired with ``fold``.
         affinity: Optional Boltz-2 affinity model.
@@ -54,10 +62,22 @@ class BoltzGenPipeline(CompositePipeline):
     """
 
     pair_layout = (
-        CompositePair("", "design_model", "design_processor"),
-        CompositePair("ifold", "inverse_folding_model", "inverse_folding_processor"),
-        CompositePair("fold", "fold", "fold_processor", required=False),
-        CompositePair("affinity", "affinity", "affinity_processor", required=False),
+        CompositePair("", "boltzgen", "design_model", "design_processor"),
+        CompositePair(
+            "ifold",
+            "boltzgen_ifold",
+            "inverse_folding_model",
+            "inverse_folding_processor",
+            required=False,
+        ),
+        CompositePair("fold", "boltz2", "fold", "fold_processor", required=False),
+        CompositePair(
+            "affinity",
+            "boltz2_affinity",
+            "affinity",
+            "affinity_processor",
+            required=False,
+        ),
     )
 
     def __init__(
@@ -65,17 +85,13 @@ class BoltzGenPipeline(CompositePipeline):
         *,
         design_model: BoltzGenModel,
         design_processor: BoltzGenProcessor,
-        inverse_folding_model: BoltzGenInverseFoldingModel,
-        inverse_folding_processor: BoltzGenInverseFoldingProcessor,
+        inverse_folding_model: BoltzGenInverseFoldingModel | None = None,
+        inverse_folding_processor: BoltzGenInverseFoldingProcessor | None = None,
         fold: Boltz2Model | None = None,
         fold_processor: Boltz2Processor | None = None,
         affinity: Boltz2AffinityModel | None = None,
         affinity_processor: Boltz2AffinityProcessor | None = None,
     ) -> None:
-        if (fold is None) != (fold_processor is None):
-            raise ValueError("fold and fold_processor must either both be present or both be absent")
-        if (affinity is None) != (affinity_processor is None):
-            raise ValueError("affinity and affinity_processor must either both be present or both be absent")
         self.design_model = design_model
         self.design_processor = design_processor
         self.inverse_folding_model = inverse_folding_model
@@ -84,6 +100,68 @@ class BoltzGenPipeline(CompositePipeline):
         self.fold_processor = fold_processor
         self.affinity = affinity
         self.affinity_processor = affinity_processor
+        self._validate_components()
+
+    def design_backbones(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str] | None = None,
+        *,
+        placement: BoltzGenPlacements | None = None,
+        total_len: int | None = None,
+        conditions: Sequence[BoltzGenSchema] = (),
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        templates: Sequence[Template] = (),
+        num_candidates: int = 1,
+        num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        noise_scale: float | None = None,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> BoltzGenDesignResult:
+        r"""
+        Generate backbone assemblies without assigning designed sequences.
+
+        Args:
+            input: Optional target or context system, structure, or local structure
+                path. ``None`` requests a fully generated assembly.
+            placement: Optional topology of existing and generated molecular
+                segments.
+            total_len: Total token budget used to realize generated segments.
+            conditions: BoltzGen conditioning records.
+            msa: Optional MSA evidence or alignment path.
+            templates: Optional structural templates.
+            num_candidates: Number of backbone candidates.
+            num_sampling_steps: Number of coordinate-diffusion steps. ``None``
+                uses the model configuration.
+            step_scale: Optional coordinate-sampler step scale. ``None`` uses the
+                released four-quarter candidate schedule.
+            noise_scale: Optional coordinate-sampler noise scale. ``None`` uses
+                the released four-quarter candidate schedule.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
+
+        Returns:
+            A [`BoltzGenDesignResult`][] containing backbone candidates in
+            generation order.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.design_processor.device)
+        _, _, backbones = self._generate_backbones(
+            input,
+            placement=placement,
+            total_len=total_len,
+            conditions=conditions,
+            msa=msa,
+            templates=templates,
+            num_candidates=num_candidates,
+            num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            noise_scale=noise_scale,
+            generator=generator,
+        )
+        return BoltzGenDesignResult(
+            candidates=tuple(BoltzGenDesignCandidate(structure=backbone) for backbone in backbones)
+        )
 
     def design(
         self,
@@ -95,8 +173,14 @@ class BoltzGenPipeline(CompositePipeline):
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
         templates: Sequence[Template] = (),
         num_candidates: int = 1,
+        num_sequences_per_backbone: int = 1,
         num_sampling_steps: int | None = None,
-        temperature: float | None = None,
+        step_scale: float | None = None,
+        noise_scale: float | None = None,
+        temperature: float | None = 0.1,
+        global_omit_tokens: Sequence[str] = (),
+        aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
+        tie_symmetric_sequences: bool = True,
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> BoltzGenDesignResult:
@@ -111,60 +195,94 @@ class BoltzGenPipeline(CompositePipeline):
             conditions: BoltzGen conditioning records.
             msa: Optional MSA evidence or alignment path.
             templates: Optional structural templates.
-            num_candidates: Number of structure and sequence candidates.
+            num_candidates: Number of backbone candidates.
+            num_sequences_per_backbone: Number of sequences sampled for each
+                backbone.
             num_sampling_steps: Number of coordinate-diffusion steps. ``None`` uses
                 the model configuration.
+            step_scale: Optional coordinate-sampler step scale. ``None`` uses the
+                released four-quarter candidate schedule.
+            noise_scale: Optional coordinate-sampler noise scale. ``None`` uses
+                the released four-quarter candidate schedule.
             temperature: Inverse-folding sampling temperature. ``None`` selects the
                 highest-logit residue at each decoded position.
+            global_omit_tokens: Three-letter canonical amino-acid component IDs
+                excluded from every designed position.
+            aa_constraints: Per-residue allowed amino-acid constraints applied
+                during inverse folding.
+            tie_symmetric_sequences: Whether corresponding positions declared by
+                [`BoltzGenSymmetry`][] conditions share one sequence sample.
             seed: Integer seed, mutually exclusive with ``generator``.
             generator: PyTorch random generator, mutually exclusive with ``seed``.
 
         Returns:
-            A [`BoltzGenDesignResult`][] containing candidates in generation order.
-            Each candidate contains the sequence-assigned structure and any scores or
-            metrics produced by configured fold and affinity stages.
+            A [`BoltzGenDesignResult`][] ordered first by backbone and then by
+            sequence sample. Each candidate contains the sequence-assigned
+            structure and any scores produced by configured fold and affinity
+            stages.
         """
 
+        inverse_folding_model = self.inverse_folding_model
+        inverse_folding_processor = self.inverse_folding_processor
+        if inverse_folding_model is None or inverse_folding_processor is None:
+            raise ValueError("BoltzGenPipeline.design requires the ifold pair; use design_backbones without it")
+        if num_sequences_per_backbone <= 0:
+            raise ValueError("num_sequences_per_backbone must be positive")
         generator = resolve_generator(seed, generator, device=self.design_processor.device)
-        canonical_input = _resolve_structure_reference(input)
-        plan = self.design_processor._plan(
-            canonical_input,
+        design_batch, condition_values, backbones = self._generate_backbones(
+            input,
             placement=placement,
             total_len=total_len,
-            conditions=tuple(conditions),
-        )
-        canonical_msa = _resolve_msa_reference(msa, plan.system)
-        design_batch = self.design_processor._lower(
-            plan,
-            canonical_msa,
+            conditions=conditions,
+            msa=msa,
             templates=templates,
-            generator=generator,
-        )
-        design_output = self.design_model.design(
-            design_batch,
-            num_samples=num_candidates,
+            num_candidates=num_candidates,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            noise_scale=noise_scale,
             generator=generator,
         )
 
         # The generated positions marked by structure design become the inverse-fold design mask
         # and drive sequence remapping during analysis.
         design_references = _design_references(design_batch)
+        layout = cast(BoltzGenLayout, design_batch.layout)
+        assert layout.system is not None
+        sequence_symmetry = _protein_sequence_symmetry(layout.system, condition_values)
 
-        candidates: list[BoltzGenDesignCandidate] = []
-        for sample_index in range(num_candidates):
-            backbone = _decode_structure(design_batch, design_output.coordinates[0, sample_index])
-            inverse_folding_input = self.inverse_folding_processor(backbone, design=design_references)
-            inverse_folding_output = self.inverse_folding_model.design(
-                inverse_folding_input, temperature=temperature, generator=generator
-            )
-            candidate = self._analyze(
+        inverse_folding_samples: list[
+            tuple[Structure, BoltzGenInverseFoldingInput, BoltzGenInverseFoldingDesignOutput]
+        ] = []
+        for backbone in backbones:
+            for _ in range(num_sequences_per_backbone):
+                inverse_folding_input = inverse_folding_processor(
+                    backbone,
+                    design=design_references,
+                    global_omit_tokens=global_omit_tokens,
+                    aa_constraints=aa_constraints,
+                    symmetry=sequence_symmetry,
+                    generator=generator,
+                )
+                inverse_folding_output = inverse_folding_model.design(
+                    inverse_folding_input,
+                    temperature=temperature,
+                    tie_symmetric_sequences=tie_symmetric_sequences,
+                    generator=generator,
+                )
+                inverse_folding_samples.append((backbone, inverse_folding_input, inverse_folding_output))
+
+        candidates = [
+            self._decode_candidate(
                 backbone=backbone,
                 inverse_folding_input=inverse_folding_input,
                 inverse_folding_output=inverse_folding_output,
-                generator=generator,
             )
-            candidates.append(candidate)
+            for backbone, inverse_folding_input, inverse_folding_output in inverse_folding_samples
+        ]
+        if self.fold is not None and self.fold_processor is not None:
+            candidates = [self._fold_candidate(candidate, generator=generator) for candidate in candidates]
+        if self.affinity is not None and self.affinity_processor is not None:
+            candidates = [self._score_candidate(candidate, generator=generator) for candidate in candidates]
         return BoltzGenDesignResult(candidates=tuple(candidates))
 
     def inverse_fold(
@@ -175,7 +293,9 @@ class BoltzGenPipeline(CompositePipeline):
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
         msa: MSA | MSACollection | str | PathLike[str] | None = None,
-        temperature: float | None = None,
+        temperature: float | None = 0.1,
+        global_omit_tokens: Sequence[str] = (),
+        tie_symmetric_sequences: bool = True,
         num_sequences: int = 1,
         generator: torch.Generator | None = None,
     ) -> BoltzGenDesignResult:
@@ -190,6 +310,10 @@ class BoltzGenPipeline(CompositePipeline):
             msa: Optional MSA evidence or alignment path.
             temperature: Categorical sampling temperature. ``None`` selects the
                 highest-logit residue at each decoded position.
+            global_omit_tokens: Three-letter canonical amino-acid component IDs
+                excluded from every designed position.
+            tie_symmetric_sequences: Whether each declared symmetry group shares
+                one sequence sample.
             num_sequences: Number of sequences to sample.
             generator: Random generator used for decode order and residue sampling.
 
@@ -198,82 +322,170 @@ class BoltzGenPipeline(CompositePipeline):
             sampling order.
         """
 
+        inverse_folding_model = self.inverse_folding_model
+        inverse_folding_processor = self.inverse_folding_processor
+        if inverse_folding_model is None or inverse_folding_processor is None:
+            raise ValueError("BoltzGenPipeline.inverse_fold requires the ifold pair")
         if num_sequences <= 0:
             raise ValueError("num_sequences must be positive")
         backbone = cast(Structure, _resolve_structure_reference(input))
         canonical_msa = _resolve_msa_reference(msa, backbone.system)
-        inverse_folding_input = self.inverse_folding_processor(
-            backbone,
-            design=design,
-            aa_constraints=aa_constraints,
-            symmetry=symmetry,
-            msa=canonical_msa,
-        )
-        candidates: list[BoltzGenDesignCandidate] = []
+        inverse_folding_samples: list[tuple[BoltzGenInverseFoldingInput, BoltzGenInverseFoldingDesignOutput]] = []
         for _ in range(num_sequences):
-            inverse_folding_output = self.inverse_folding_model.design(
-                inverse_folding_input, temperature=temperature, generator=generator
+            inverse_folding_input = inverse_folding_processor(
+                backbone,
+                design=design,
+                global_omit_tokens=global_omit_tokens,
+                aa_constraints=aa_constraints,
+                symmetry=symmetry,
+                msa=canonical_msa,
+                generator=generator,
             )
-            candidates.append(
-                self._analyze(
-                    backbone=backbone,
-                    inverse_folding_input=inverse_folding_input,
-                    inverse_folding_output=inverse_folding_output,
-                    generator=generator,
-                )
+            inverse_folding_output = inverse_folding_model.design(
+                inverse_folding_input,
+                temperature=temperature,
+                tie_symmetric_sequences=tie_symmetric_sequences,
+                generator=generator,
             )
+            inverse_folding_samples.append((inverse_folding_input, inverse_folding_output))
+
+        candidates = [
+            self._decode_candidate(
+                backbone=backbone,
+                inverse_folding_input=inverse_folding_input,
+                inverse_folding_output=inverse_folding_output,
+            )
+            for inverse_folding_input, inverse_folding_output in inverse_folding_samples
+        ]
+        if self.fold is not None and self.fold_processor is not None:
+            candidates = [self._fold_candidate(candidate, generator=generator) for candidate in candidates]
+        if self.affinity is not None and self.affinity_processor is not None:
+            candidates = [self._score_candidate(candidate, generator=generator) for candidate in candidates]
         return BoltzGenDesignResult(candidates=tuple(candidates))
 
-    def _analyze(
+    def _generate_backbones(
+        self,
+        input: MolecularSystem | Structure | str | PathLike[str] | None,
+        *,
+        placement: BoltzGenPlacements | None,
+        total_len: int | None,
+        conditions: Sequence[BoltzGenSchema],
+        msa: MSA | MSACollection | str | PathLike[str] | None,
+        templates: Sequence[Template],
+        num_candidates: int,
+        num_sampling_steps: int | None,
+        step_scale: float | None,
+        noise_scale: float | None,
+        generator: torch.Generator | None,
+    ) -> tuple[BoltzGenInput, tuple[BoltzGenSchema, ...], tuple[Structure, ...]]:
+        r"""
+        Lower one design problem and generate its backbone candidates.
+        """
+
+        if num_candidates <= 0:
+            raise ValueError("num_candidates must be positive")
+        canonical_input = _resolve_structure_reference(input)
+        condition_values = tuple(conditions)
+        plan = self.design_processor._plan(
+            canonical_input,
+            placement=placement,
+            total_len=total_len,
+            conditions=condition_values,
+        )
+        canonical_msa = _resolve_msa_reference(msa, plan.system)
+        design_batch, _ = self.design_processor._lower(
+            plan,
+            canonical_msa,
+            templates=templates,
+            generator=generator,
+        )
+
+        quarter = torch.arange(num_candidates, device=design_batch.atom_mask.device) * 4 // num_candidates
+        if step_scale is None:
+            step_scale_value: float | torch.Tensor = torch.tensor(
+                (1.8, 2.0, 1.8, 2.0),
+                device=quarter.device,
+                dtype=torch.float32,
+            )[quarter]
+        else:
+            step_scale_value = step_scale
+        if noise_scale is None:
+            noise_scale_value: float | torch.Tensor = torch.tensor(
+                (0.95, 0.88, 0.95, 0.88),
+                device=quarter.device,
+                dtype=torch.float32,
+            )[quarter]
+        else:
+            noise_scale_value = noise_scale
+
+        design_output = self.design_model.design(
+            design_batch,
+            num_samples=num_candidates,
+            num_sampling_steps=num_sampling_steps,
+            generator=generator,
+            step_scale=step_scale_value,
+            noise_scale=noise_scale_value,
+        )
+        backbones = tuple(
+            _decode_structure(design_batch, design_output.coordinates[0, sample_index])
+            for sample_index in range(num_candidates)
+        )
+        return design_batch, condition_values, backbones
+
+    def _decode_candidate(
         self,
         *,
         backbone: Structure,
         inverse_folding_input: BoltzGenInverseFoldingInput,
         inverse_folding_output: BoltzGenInverseFoldingDesignOutput,
+    ) -> BoltzGenDesignCandidate:
+        r"""
+        Remap one sampled inverse-folding sequence onto its generated backbone.
+        """
+
+        return BoltzGenDesignCandidate(
+            structure=_remap_designed_sequence(
+                backbone,
+                inverse_folding_input,
+                inverse_folding_output,
+            )
+        )
+
+    def _fold_candidate(
+        self,
+        candidate: BoltzGenDesignCandidate,
+        *,
         generator: torch.Generator | None,
     ) -> BoltzGenDesignCandidate:
         r"""
-        Remap the designed sequence and attach per-residue NLL and optional stage scores.
+        Evaluate one sequence-assigned design by independent structure prediction.
         """
 
-        layout = inverse_folding_input.layout
-        assert layout is not None
-        scores: dict[str, Score] = {}
-        metrics: dict[str, Metric] = {}
+        assert self.fold is not None and self.fold_processor is not None
+        fold_batch = self.fold_processor(candidate.structure, generator=generator)
+        prediction = self.fold.fold(fold_batch, num_samples=1, generator=generator).predictions[0]
+        scores = dict(candidate.scores)
+        for name in ("plddt", "ptm", "iptm"):
+            if name in prediction.scores:
+                scores[name] = prediction.scores[name]
+        return BoltzGenDesignCandidate(structure=candidate.structure, scores=scores)
 
-        logits = inverse_folding_output.logits
-        log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-        tokens = inverse_folding_output.tokens
-        axis = tuple(layout.output_residues)
-        per_residue_nll = -log_probs.gather(-1, tokens[0].long().unsqueeze(-1)).squeeze(-1)
-        metrics["per_residue_nll"] = Metric(
-            values=per_residue_nll.detach().cpu().numpy().astype(np.float32),
-            axis=axis,
-            unit="nats",
-        )
+    def _score_candidate(
+        self,
+        candidate: BoltzGenDesignCandidate,
+        *,
+        generator: torch.Generator | None,
+    ) -> BoltzGenDesignCandidate:
+        r"""
+        Evaluate one sequence-assigned design with the independent affinity model.
+        """
 
-        # Write inverse-fold identities into the candidate before optional refolding.
-        structure = _remap_designed_sequence(backbone, inverse_folding_input, inverse_folding_output)
-        # Composition IS the switch: refold runs iff a fold Model+Processor is composed in, affinity
-        # runs iff a score Model+Processor is composed in. No mode flags.
-        if self.fold is not None and self.fold_processor is not None:
-            fold_batch = self.fold_processor(structure, generator=generator)
-            fold_result = self.fold.fold(fold_batch, num_samples=1, generator=generator)
-            prediction = fold_result.predictions[0]
-            structure = prediction.structure
-            for name in ("plddt", "ptm", "iptm"):
-                if name in prediction.scores:
-                    scores[name] = prediction.scores[name]
-
-        if self.affinity is not None and self.affinity_processor is not None:
-            affinity_batch = self.affinity_processor(structure, generator=generator)
-            affinity_result = self.affinity.score(affinity_batch, generator=generator)
-            if "binding_affinity" in affinity_result.scores:
-                scores["binding_affinity"] = affinity_result.scores["binding_affinity"]
-            if "binding_probability" in affinity_result.scores:
-                scores["binding_probability"] = affinity_result.scores["binding_probability"]
-
-        return BoltzGenDesignCandidate(structure=structure, scores=scores, metrics=metrics)
+        assert self.affinity is not None and self.affinity_processor is not None
+        affinity_batch = self.affinity_processor(candidate.structure, generator=generator)
+        affinity_result = self.affinity.score(affinity_batch, generator=generator)
+        scores = dict(candidate.scores)
+        scores.update(affinity_result.scores)
+        return BoltzGenDesignCandidate(structure=candidate.structure, scores=scores)
 
 
 @dataclass(eq=False)
@@ -282,14 +494,12 @@ class BoltzGenDesignCandidate:
     One designed assembly and its aligned scientific values.
 
     Args:
-        structure: Designed structure after inverse folding and optional refolding.
+        structure: Generated backbone or sequence-assigned design structure.
         scores: Scalar scores keyed by stable scientific names.
-        metrics: One-axis metrics keyed by stable scientific names.
     """
 
     structure: Structure
     scores: dict[str, Score] = field(default_factory=dict)
-    metrics: dict[str, Metric] = field(default_factory=dict)
 
 
 @dataclass(eq=False)
@@ -298,7 +508,7 @@ class BoltzGenDesignResult:
     A generation-ordered collection of BoltzGen designs.
 
     Args:
-        candidates: Designed assemblies in generation order.
+        candidates: Generated assemblies in generation order.
     """
 
     candidates: tuple[BoltzGenDesignCandidate, ...]
@@ -333,12 +543,14 @@ def _decode_structure(input: BoltzGenInput, coords: torch.Tensor) -> Structure:
     complete_index = {site: index for index, site in enumerate(complete_sites)}
     coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
     coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-    model_coords = coords.float().cpu().numpy()
-    if len(model_coords) != len(layout.atom_sites):
+    if coords.shape[0] < len(layout.atom_sites):
         raise ValueError(
-            f"BoltzGen returned {len(model_coords)} atom coordinates for a {len(layout.atom_sites)}-atom layout"
+            f"BoltzGen returned {coords.shape[0]} atom coordinates for a " f"{len(layout.atom_sites)}-atom layout"
         )
+    model_coords = coords[: len(layout.atom_sites)].float().cpu().numpy()
     for site, values in zip(layout.atom_sites, model_coords, strict=True):
+        if site is None:
+            continue
         index = complete_index[site]
         coordinates[index] = values
         coordinate_mask[index] = True
@@ -401,17 +613,49 @@ def _design_references(design_batch: BoltzGenInput) -> tuple[ComponentReference,
     r"""
     The concrete design (generated) residue references the design step marked.
 
-    Read off ``design_batch.design_mask`` over ``layout.output_residues``; only concrete
-    [`ComponentReference`][ofoldx.data.molecular.ComponentReference] rows are returned (a symbolic generated row
-    from a not-yet-materialized assembly is skipped — the decode path always materializes first).
+    Read off ``design_batch.design_mask`` over ``layout.output_residues``. Only
+    protein residues enter the amino-acid inverse decoder; generated nucleic-acid
+    identities remain fixed.
     """
 
     layout = cast(BoltzGenLayout, design_batch.layout)
     mask = cast(torch.Tensor, design_batch.design_mask)
     flags = mask[0].bool().tolist()
+    molecule_types = design_batch.molecule_type[0].tolist()
     return tuple(
-        reference for reference, flag in zip(layout.output_residues, flags) if flag and isinstance(reference, tuple)
+        reference
+        for reference, flag, molecule_type in zip(
+            layout.output_residues,
+            flags,
+            molecule_types,
+            strict=True,
+        )
+        if flag and molecule_type == 0 and isinstance(reference, tuple)
     )
+
+
+def _protein_sequence_symmetry(
+    system: MolecularSystem,
+    conditions: tuple[BoltzGenSchema, ...],
+) -> tuple[tuple[ComponentReference, ...], ...]:
+    r"""
+    Transpose structure-copy units into protein-only sequence-identity groups.
+    """
+
+    groups: list[tuple[ComponentReference, ...]] = []
+    for condition in conditions:
+        if not isinstance(condition, BoltzGenSymmetry):
+            continue
+        for group in zip(*condition.units, strict=True):
+            protein_group = tuple(reference for reference in group if _is_protein_reference(system, reference))
+            if len(protein_group) > 1:
+                groups.append(protein_group)
+    return tuple(groups)
+
+
+def _is_protein_reference(system: MolecularSystem, reference: ComponentReference) -> bool:
+    entity = system.entities[system.instances[reference[0]]]
+    return isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
 
 
 def _remap_designed_sequence(
@@ -428,7 +672,7 @@ def _remap_designed_sequence(
     are carried unchanged.
     """
 
-    layout = cast(BoltzGenLayout, inverse_folding_input.layout)
+    layout = cast(BoltzGenInverseFoldingLayout, inverse_folding_input.layout)
     tokens = inverse_folding_output.tokens
     design_mask = cast(torch.Tensor, inverse_folding_input.design_mask)
 

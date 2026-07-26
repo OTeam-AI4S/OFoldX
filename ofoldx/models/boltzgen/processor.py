@@ -16,7 +16,15 @@ from torch import Tensor
 from ...data.components import get_component
 from ...data.conditions import Contact, Endpoint
 from ...data.evidence import MSA, MSACollection, Template
-from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, Molecule, PolymerSequence, PolymerType
+from ...data.molecular import (
+    AtomSite,
+    ChemicalComponent,
+    ComponentReference,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+    PolymerType,
+)
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
@@ -47,6 +55,7 @@ from .model import (
     BoltzGenSchema,
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
+    BoltzGenStructureTarget,
     BoltzGenSymmetry,
 )
 
@@ -130,7 +139,39 @@ class BoltzGenProcessor(Processor):
             total_len=total_len,
             conditions=conditions,
         )
-        return self._lower(plan, msa, templates=templates, generator=generator)
+        processed, _ = self._lower(plan, msa, templates=templates, generator=generator)
+        return processed
+
+    def process_training(
+        self,
+        input: Structure,
+        *,
+        conditions: Sequence[BoltzGenSchema] = (),
+        msa: MSA | MSACollection | None = None,
+        templates: Sequence[Template] = (),
+        generator: torch.Generator | None = None,
+    ) -> tuple[BoltzGenInput, BoltzGenStructureTarget]:
+        r"""
+        Lower one complete structure into masked Model input and separate truth.
+
+        Structure training redesigns residues already present in ``input``; generated
+        placements have no target coordinates and therefore belong to inference.
+        """
+
+        plan = self._plan(
+            input,
+            placement=None,
+            total_len=None,
+            conditions=conditions,
+        )
+        processed, target = self._lower(
+            plan,
+            msa,
+            templates=templates,
+            generator=generator,
+        )
+        assert target is not None
+        return processed, target
 
     def _plan(
         self,
@@ -199,7 +240,7 @@ class BoltzGenProcessor(Processor):
         *,
         templates: Sequence[Template] = (),
         generator: torch.Generator | None = None,
-    ) -> BoltzGenInput:
+    ) -> tuple[BoltzGenInput, BoltzGenStructureTarget | None]:
         r"""
         Validate canonical evidence and lower one materialized plan to tensors.
         """
@@ -209,27 +250,8 @@ class BoltzGenProcessor(Processor):
             raise ValueError("BoltzGen requires at least one molecular instance")
         msa = _validate_msa(msa, system)
         # Generated protein placeholders use backbone-only GLY reference coordinates.
-        tokens, atom_sites = _build_tokens(system, generated_residues=plan.generated_residues)
+        tokens, _ = _build_tokens(system, generated_residues=plan.generated_residues)
         token_count = len(tokens)
-        (
-            atom_features,
-            reference_positions,
-            reference_space_id,
-            atom_mask,
-            atom_to_token,
-            atom_token_index,
-            atom_coordinates,
-            resolved,
-            center_coordinates,
-            site_to_atom,
-        ) = _build_atom_features(
-            system,
-            tokens,
-            atom_sites,
-            plan.source_structure,
-            generated_residues=plan.generated_residues,
-            generator=generator,
-        )
         site_to_token = {
             site: token_index
             for token_index, token in enumerate(tokens)
@@ -240,30 +262,7 @@ class BoltzGenProcessor(Processor):
             for token_index, token in enumerate(tokens)
             if token["monomer_index"] is not None
         }
-
-        token_to_rep_atom = torch.tensor(
-            [site_to_atom[cast(AtomSite, token["distogram_site"])] for token in tokens], dtype=torch.long
-        )
-        representative_atom_mask = torch.zeros(atom_features.shape[0], dtype=torch.bool)
-        representative_atom_mask[token_to_rep_atom] = True
         token_bonds = _token_bond_indicator(system, site_to_token, token_count)
-        msa_values = _msa_features(msa, tokens, system)
-        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
-        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
-        cyclic_period = torch.tensor(
-            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
-        )
-
-        # token_to_bb4_atoms (N, CA, C, O), used by the token-distance embedder.
-        token_to_bb4 = torch.stack(
-            [
-                torch.tensor(
-                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])], dtype=torch.long
-                )
-                for token in tokens
-            ]
-        )
-        # BoltzGen conditioning channels realized from the request records.
         contact_conditioning, contact_threshold = _contact_channels(
             plan.spatial_conditions,
             token_index_by_residue,
@@ -277,6 +276,58 @@ class BoltzGenProcessor(Processor):
             token_index_by_residue,
             token_count,
             plan.generated_residues,
+        )
+        _validate_structure_design_rows(
+            system,
+            tokens,
+            design_mask,
+            plan.generated_residues,
+        )
+        (
+            atom_values,
+            model_atom_sites,
+            target_source_sites,
+            site_to_atom,
+        ) = _build_structure_design_atom_features(
+            system,
+            tokens,
+            plan.source_structure,
+            design_mask,
+            generated_residues=plan.generated_residues,
+            generator=generator,
+        )
+        token_center_atom_index = torch.tensor(
+            [site_to_atom[cast(AtomSite, token["center_site"])] for token in tokens],
+            dtype=torch.long,
+        )
+        token_to_bb4 = torch.stack(
+            [
+                torch.tensor(
+                    [site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["bb4_sites"])],
+                    dtype=torch.long,
+                )
+                for token in tokens
+            ]
+        )
+        frame_atom_index = _frame_atom_indices(tokens, site_to_atom)
+        msa_values = _mask_structure_design_msa(
+            _msa_features(msa, tokens, system),
+            design_mask,
+        )
+        residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
+        target_residue_type = torch.nn.functional.one_hot(residue_types, 33).float()
+        residue_type_features = target_residue_type.clone()
+        residue_type_features[design_mask] = 0
+        residue_type_features[design_mask, _UNKNOWN_RESIDUE_TYPES["protein"]] = 1
+        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
+        cyclic_period = torch.tensor(
+            [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens],
+            dtype=torch.float32,
+        )
+        chain_design_mask = _chain_design_mask(
+            design_mask,
+            torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
+            token_bonds,
         )
         binding_type = _binding_ids(
             plan.spatial_conditions,
@@ -307,33 +358,32 @@ class BoltzGenProcessor(Processor):
             "entity_index": torch.tensor([cast(int, token["entity_index"]) for token in tokens]),
             "symmetry_index": symmetry_index,
             "token_index": torch.arange(token_count),
-            "atom_features": atom_features,
-            "atom_to_token": atom_to_token,
-            "atom_mask": atom_mask,
-            "reference_positions": reference_positions,
-            "reference_space_id": reference_space_id,
-            "representative_atom_mask": representative_atom_mask,
-            "atom_token_index": atom_token_index,
-            "token_to_rep_atom": token_to_rep_atom,
-            "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "atom_features": atom_values["atom_features"],
+            "atom_to_token": atom_values["atom_to_token"],
+            "atom_mask": atom_values["atom_mask"],
+            "reference_positions": atom_values["reference_positions"],
+            "reference_space_id": atom_values["reference_space_id"],
+            "atom_token_index": atom_values["atom_token_index"],
+            "token_center_atom_index": token_center_atom_index,
+            "residue_type_features": residue_type_features,
             "msa_profile": msa_values.pop("msa_profile"),
             "deletion_mean": msa_values.pop("deletion_mean"),
             "token_bonds": token_bonds,
             "type_bonds": torch.zeros(token_count, token_count, dtype=torch.long),
             "contact_conditioning": contact_conditioning,
             "contact_threshold": contact_threshold,
-            "center_coordinates": center_coordinates,
+            "center_coordinates": atom_values["center_coordinates"],
             "token_to_bb4_atoms": token_to_bb4,
-            "atom_coordinates": atom_coordinates,
+            "atom_coordinates": atom_values["atom_coordinates"],
             "token_distance_mask": token_distance_mask,
-            "target_positions": atom_coordinates.clone(),
-            "target_mask": resolved,
+            "frame_atom_index": frame_atom_index,
             "molecule_type": molecule_types,
             "cyclic_period": cyclic_period,
             "method_feature": torch.zeros(token_count, dtype=torch.long),
             "modified": torch.zeros(token_count, dtype=torch.long),
             "binding_type": binding_type,
             "design_mask": design_mask,
+            "chain_design_mask": chain_design_mask,
             "ss_type": ss_type,
             **msa_values,
             **(template_values or {}),
@@ -348,14 +398,78 @@ class BoltzGenProcessor(Processor):
         }
         layout = BoltzGenLayout(
             system=system,
-            atom_sites=atom_sites,
+            atom_sites=model_atom_sites,
             token_sites=tuple(cast("AtomSite | tuple[str, int]", token["token_site"]) for token in tokens),
             output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
             placement_map=plan.placement_map,
             instance_of=plan.instance_of,
         )
-        return BoltzGenInput(**{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout)
+        processed = BoltzGenInput(
+            **{name: value.unsqueeze(0) for name, value in placed.items()},
+            layout=layout,
+        )
+        if plan.source_structure is None:
+            return processed, None
+
+        source = plan.source_structure
+        truth_values = _truth_pool_features(
+            system,
+            tokens,
+            source,
+            target_source_sites,
+            atom_values["atom_mask"].shape[0],
+            site_to_atom,
+        )
+        target_b_factor = _token_b_factors(source, tokens)
+        bond_atom_index = _inter_residue_bond_atom_index(system, site_to_atom)
+        center_pool_index = truth_values["atom_index"][token_center_atom_index]
+        target_values: dict[str, Tensor] = {
+            **truth_values,
+            "distogram_coordinates": truth_values["coordinates"][center_pool_index],
+            "distogram_mask": truth_values["coordinate_mask"][center_pool_index],
+            "residue_type": target_residue_type,
+            "fake_atom_mask": atom_values["fake_atom_mask"],
+        }
+        if target_b_factor is not None:
+            target_values["b_factor"] = target_b_factor
+        if bond_atom_index is not None:
+            target_values["bond_atom_index"] = bond_atom_index
+            atom_index = truth_values["atom_index"]
+            valid_atom_index = atom_index >= 0
+            atom_coordinate_mask = truth_values["coordinate_mask"].gather(
+                0,
+                atom_index.clamp_min(0),
+            )
+            atom_coordinate_mask = atom_coordinate_mask & valid_atom_index
+            target_values["bond_mask"] = atom_coordinate_mask[bond_atom_index].all(dim=-1)
+        placed_target = {
+            name: (
+                value.to(device=self.device, dtype=self.dtype)
+                if value.is_floating_point()
+                else value.to(device=self.device)
+            )
+            for name, value in target_values.items()
+        }
+        target = BoltzGenStructureTarget(
+            coordinates=placed_target["coordinates"].unsqueeze(0).unsqueeze(0),
+            coordinate_mask=placed_target["coordinate_mask"].unsqueeze(0),
+            atom_index=placed_target["atom_index"].unsqueeze(0),
+            chain_span=placed_target["chain_span"].unsqueeze(0),
+            chain_equivalence_index=placed_target["chain_equivalence_index"].unsqueeze(0),
+            symmetry_atom_index=placed_target["symmetry_atom_index"].unsqueeze(0),
+            symmetry_permutation=placed_target["symmetry_permutation"].unsqueeze(0),
+            distogram_coordinates=placed_target["distogram_coordinates"].unsqueeze(0).unsqueeze(0),
+            distogram_mask=placed_target["distogram_mask"].unsqueeze(0),
+            residue_type=placed_target["residue_type"].unsqueeze(0),
+            fake_atom_mask=placed_target["fake_atom_mask"].unsqueeze(0),
+            b_factor=(placed_target["b_factor"].unsqueeze(0) if "b_factor" in placed_target else None),
+            bond_atom_index=(
+                placed_target["bond_atom_index"].unsqueeze(0) if "bond_atom_index" in placed_target else None
+            ),
+            bond_mask=(placed_target["bond_mask"].unsqueeze(0) if "bond_mask" in placed_target else None),
+        )
+        return processed, target
 
 
 class BoltzGenInverseFoldingProcessor(Processor):
@@ -375,9 +489,11 @@ class BoltzGenInverseFoldingProcessor(Processor):
         input: Structure,
         *,
         design: Sequence[ComponentReference] = (),
+        global_omit_tokens: Sequence[str] = (),
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
         msa: MSA | MSACollection | None = None,
+        generator: torch.Generator | None = None,
     ) -> BoltzGenInverseFoldingInput:
         r"""
         Build inverse-folding inputs for one fixed structure.
@@ -385,9 +501,12 @@ class BoltzGenInverseFoldingProcessor(Processor):
         Args:
             input: Fixed canonical structure.
             design: Residue occurrences whose identities may change.
+            global_omit_tokens: Three-letter canonical amino-acid component IDs
+                excluded from every designed position.
             aa_constraints: Per-residue amino-acid constraints.
             symmetry: Residue groups sharing one sequence identity.
             msa: Optional canonical MSA evidence.
+            generator: Random generator used for reference-conformer augmentation.
 
         Returns:
             A [`BoltzGenInverseFoldingInput`][] with batch size one and aligned
@@ -401,12 +520,50 @@ class BoltzGenInverseFoldingProcessor(Processor):
             raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
 
         normalized_msa = _validate_msa(msa, system)
+        processed, _ = self._prepare(
+            input,
+            msa=normalized_msa,
+            design=tuple(design),
+            global_omit_tokens=tuple(global_omit_tokens),
+            aa_constraints=tuple(aa_constraints),
+            symmetry=tuple(tuple(unit) for unit in symmetry),
+            generator=generator,
+        )
+        return processed
+
+    def process_training(
+        self,
+        input: Structure,
+        *,
+        design: Sequence[ComponentReference] = (),
+        global_omit_tokens: Sequence[str] = (),
+        aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
+        symmetry: Sequence[Sequence[ComponentReference]] = (),
+        msa: MSA | MSACollection | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[BoltzGenInverseFoldingInput, Tensor]:
+        r"""
+        Lower one inverse-folding example and its unmasked residue target.
+
+        The returned input masks every design position to the released unknown
+        protein token. The aligned target remains separate for teacher forcing
+        and the residue objective.
+        """
+
+        if not isinstance(input, Structure):
+            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure")
+        system = input.system
+        if not system.instances:
+            raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
+        normalized_msa = _validate_msa(msa, system)
         return self._prepare(
             input,
             msa=normalized_msa,
             design=tuple(design),
+            global_omit_tokens=tuple(global_omit_tokens),
             aa_constraints=tuple(aa_constraints),
             symmetry=tuple(tuple(unit) for unit in symmetry),
+            generator=generator,
         )
 
     def _prepare(
@@ -415,14 +572,40 @@ class BoltzGenInverseFoldingProcessor(Processor):
         *,
         msa: MSA | MSACollection | None,
         design: tuple[ComponentReference, ...],
+        global_omit_tokens: tuple[str, ...],
         aa_constraints: tuple[BoltzGenResidueConstraint, ...],
         symmetry: tuple[tuple[ComponentReference, ...], ...],
-    ) -> BoltzGenInverseFoldingInput:
+        generator: torch.Generator | None,
+    ) -> tuple[BoltzGenInverseFoldingInput, Tensor]:
         system = structure.system
         # Generated ``UNK`` protein residues use backbone-only GLY reference coordinates.
         generated_residues = _generated_placeholder_residues(system)
         tokens, atom_sites = _build_tokens(system, generated_residues=generated_residues)
         token_count = len(tokens)
+        token_index_by_residue = {
+            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
+            for token_index, token in enumerate(tokens)
+            if token["monomer_index"] is not None
+        }
+        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
+        for reference in design:
+            _require_protein_reference(reference, token_index_by_residue, molecule_types, "design")
+        for constraint in aa_constraints:
+            _require_protein_reference(
+                constraint.position,
+                token_index_by_residue,
+                molecule_types,
+                "amino-acid constraint",
+            )
+        for group in symmetry:
+            for reference in group:
+                _require_protein_reference(
+                    reference,
+                    token_index_by_residue,
+                    molecule_types,
+                    "sequence-symmetry group",
+                )
+
         (
             atom_features,
             reference_positions,
@@ -431,7 +614,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             atom_to_token,
             atom_token_index,
             atom_coordinates,
-            _,
+            resolved,
             center_coordinates,
             site_to_atom,
         ) = _build_atom_features(
@@ -440,22 +623,16 @@ class BoltzGenInverseFoldingProcessor(Processor):
             atom_sites,
             structure,
             generated_residues=generated_residues,
+            generator=generator,
         )
         site_to_token = {
             site: token_index
             for token_index, token in enumerate(tokens)
             for site in cast(tuple[AtomSite, ...], token["atom_sites"])
         }
-        token_index_by_residue = {
-            (cast(str, token["instance_id"]), cast(int, token["residue_index"])): token_index
-            for token_index, token in enumerate(tokens)
-            if token["monomer_index"] is not None
-        }
-
         token_bonds = _token_bond_indicator(system, site_to_token, token_count)
         msa_values = _msa_features(msa, tokens, system)
         residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
-        molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
         cyclic_period = torch.tensor(
             [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens], dtype=torch.float32
         )
@@ -468,10 +645,22 @@ class BoltzGenInverseFoldingProcessor(Processor):
             ]
         )
         design_mask = _design_mask_from_positions(design, token_index_by_residue, token_count)
-        aa_constraint_mask = _aa_constraint_mask(aa_constraints, token_index_by_residue, token_count)
-        symmetric_group = _symmetry_index(
-            (BoltzGenSymmetry(units=symmetry),) if symmetry else (), token_index_by_residue, tokens
+        target_residue_type = torch.nn.functional.one_hot(residue_types, 33).float()
+        residue_type_features = target_residue_type.clone()
+        residue_type_features[design_mask] = 0
+        residue_type_features[design_mask, _UNKNOWN_RESIDUE_TYPES["protein"]] = 1
+        token_center_atom_index = torch.tensor(
+            [site_to_atom[cast(AtomSite, token["center_site"])] for token in tokens],
+            dtype=torch.long,
         )
+        token_resolved_mask = resolved[token_center_atom_index]
+        aa_constraint_mask = _aa_constraint_mask(
+            global_omit_tokens,
+            aa_constraints,
+            token_index_by_residue,
+            token_count,
+        )
+        symmetric_group = _sequence_symmetry_index(symmetry, token_index_by_residue, token_count)
 
         tensor_values: dict[str, Tensor] = {
             "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -482,7 +671,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             "atom_mask": atom_mask,
             "reference_positions": reference_positions,
             "reference_space_id": reference_space_id,
-            "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
+            "residue_type_features": residue_type_features,
             "msa_profile": msa_values["msa_profile"],
             "deletion_mean": msa_values["deletion_mean"],
             "token_bonds": token_bonds,
@@ -491,6 +680,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             "center_coordinates": center_coordinates,
             "token_to_bb4_atoms": token_to_bb4,
             "atom_coordinates": atom_coordinates,
+            "token_resolved_mask": token_resolved_mask,
             "cyclic_period": cyclic_period,
             "method_feature": torch.zeros(token_count, dtype=torch.long),
             "modified": torch.zeros(token_count, dtype=torch.long),
@@ -513,8 +703,12 @@ class BoltzGenInverseFoldingProcessor(Processor):
             output_residues=tuple(cast("ComponentReference", token["reference"]) for token in tokens),
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
         )
-        return BoltzGenInverseFoldingInput(
-            **{name: value.unsqueeze(0) for name, value in placed.items()}, layout=layout
+        return (
+            BoltzGenInverseFoldingInput(
+                **{name: value.unsqueeze(0) for name, value in placed.items()},
+                layout=layout,
+            ),
+            target_residue_type.to(device=self.device, dtype=self.dtype).unsqueeze(0),
         )
 
 
@@ -999,7 +1193,7 @@ def _build_tokens(
     generated_residues: frozenset[ComponentReference] = frozenset(),
 ) -> tuple[list[dict[str, object]], tuple[AtomSite, ...]]:
     r"""
-    Build per-token records and the flat model atom order.
+    Build per-token records and their natural heavy-atom order.
 
     Polymer residues each occupy one token; non-polymer atoms each occupy one token, matching the
     Boltz tokenization scheme.
@@ -1047,18 +1241,13 @@ def _build_tokens(
                 by_name = {site.atom_id: site for site in atom_sites}
                 if entity.polymer_type == "protein":
                     center_name = "CA"
-                    distogram_name = "CA" if component_id == "GLY" else "CB"
                     bb4_names = ("N", "CA", "C", "O")
+                    frame_names = ("N", "CA", "C")
                 else:
                     center_name = "C1'"
-                    distogram_name = (
-                        "C4"
-                        if component_id in {"A", "G", "DA", "DG"}
-                        else "C2" if component_id in {"C", "U", "DC", "DT"} else "C1'"
-                    )
                     bb4_names = ("C1'", "C3'", "C4'", "C1'")
+                    frame_names = ("C1'", "C3'", "C4'")
                 center_site = by_name.get(center_name, atom_sites[0])
-                distogram_site = by_name.get(distogram_name, center_site)
                 tokens.append(
                     {
                         "atom_sites": atom_sites,
@@ -1074,8 +1263,8 @@ def _build_tokens(
                         "molecule_type": molecule_type,
                         "residue_type": residue_type,
                         "center_site": center_site,
-                        "distogram_site": distogram_site,
                         "bb4_sites": tuple(by_name.get(name, center_site) for name in bb4_names),
+                        "frame_sites": tuple(by_name.get(name, atom_sites[0]) for name in frame_names),
                     }
                 )
         else:
@@ -1104,13 +1293,500 @@ def _build_tokens(
                         "molecule_type": 3,
                         "residue_type": 22,
                         "center_site": site,
-                        "distogram_site": site,
                         "bb4_sites": (site, site, site, site),
+                        "frame_sites": (site, site, site),
                     }
                 )
 
     atom_sites = tuple(site for token in tokens for site in cast(tuple[AtomSite, ...], token["atom_sites"]))
     return tokens, atom_sites
+
+
+_PROTEIN_ATOM14_NAMES = {
+    "GLY": ("N", "CA", "C", "O"),
+    "ALA": ("N", "CA", "C", "O", "CB"),
+    "CYS": ("N", "CA", "C", "O", "CB", "SG"),
+    "SER": ("N", "CA", "C", "O", "CB", "OG"),
+    "PRO": ("N", "CA", "C", "O", "CB", "CG", "CD"),
+    "THR": ("N", "CA", "C", "O", "CB", "OG1", "CG2"),
+    "VAL": ("N", "CA", "C", "O", "CB", "CG1", "CG2"),
+    "ASN": ("N", "CA", "C", "O", "CB", "CG", "OD1", "ND2"),
+    "ASP": ("N", "CA", "C", "O", "CB", "CG", "OD1", "OD2"),
+    "ILE": ("N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1"),
+    "LEU": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2"),
+    "MET": ("N", "CA", "C", "O", "CB", "CG", "SD", "CE"),
+    "GLN": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2"),
+    "GLU": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2"),
+    "LYS": ("N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ"),
+    "HIS": ("N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2"),
+    "PHE": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ"),
+    "ARG": ("N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2"),
+    "TYR": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH"),
+    "TRP": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"),
+}
+
+_PROTEIN_ATOM14_FAKE_SOURCE = {
+    "GLY": ("O",) * 10,
+    "ALA": ("O",) * 9,
+    "CYS": ("O",) * 8,
+    "SER": ("N",) * 8,
+    "PRO": ("O",) * 7,
+    "THR": ("N", "N", "N", "O", "O", "O", "O"),
+    "VAL": ("N",) * 7,
+    "ASN": ("N", "O", "O", "O", "O", "O"),
+    "ASP": ("N", "N", "O", "O", "O", "O"),
+    "ILE": ("O",) * 6,
+    "LEU": ("N", "N", "N", "N", "O", "O"),
+    "MET": ("N",) * 6,
+    "GLN": ("O",) * 5,
+    "GLU": ("N", "N", "O", "O", "O"),
+    "LYS": ("N",) * 5,
+    "HIS": ("O",) * 4,
+    "PHE": ("O",) * 3,
+    "ARG": ("N",) * 3,
+    "TYR": ("O", "O"),
+    "TRP": (),
+}
+
+_STANDARD_LOCAL_SYMMETRY_ATOMS = {
+    "ASP": (("OD1", "OD2"), ("OD2", "OD1")),
+    "GLU": (("OE1", "OE2"), ("OE2", "OE1")),
+    "PHE": (
+        ("CD1", "CD2", "CE1", "CE2"),
+        ("CD2", "CD1", "CE2", "CE1"),
+    ),
+    "TYR": (
+        ("CD1", "CD2", "CE1", "CE2"),
+        ("CD2", "CD1", "CE2", "CE1"),
+    ),
+    "A": (("OP1", "OP2"), ("OP2", "OP1")),
+    "C": (("OP1", "OP2"), ("OP2", "OP1")),
+    "G": (("OP1", "OP2"), ("OP2", "OP1")),
+    "U": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DA": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DC": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DG": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DT": (("OP1", "OP2"), ("OP2", "OP1")),
+}
+
+
+def _validate_structure_design_rows(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    design_mask: Tensor,
+    generated_residues: frozenset[ComponentReference],
+) -> None:
+    r"""
+    Require the released structure-design domain: standard protein rows only.
+    """
+
+    for token, designed in zip(tokens, design_mask.tolist(), strict=True):
+        if not designed:
+            continue
+        reference = cast(ComponentReference, token["reference"])
+        entity = system.entities[system.instances[reference[0]]]
+        if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+            raise ValueError(
+                "BoltzGen structure design supports protein rows only; " "DNA and RNA may be supplied as fixed context"
+            )
+        component_id = system.component(reference).component_id
+        if reference not in generated_residues and component_id not in _PROTEIN_ATOM14_NAMES:
+            raise ValueError(
+                "BoltzGen structure design requires a standard amino-acid row, "
+                f"got {component_id!r} at {reference!r}"
+            )
+
+
+def _build_structure_design_atom_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    structure: Structure | None,
+    design_mask: Tensor,
+    *,
+    generated_residues: frozenset[ComponentReference] = frozenset(),
+    generator: torch.Generator | None = None,
+) -> tuple[
+    dict[str, Tensor],
+    tuple[AtomSite | None, ...],
+    tuple[AtomSite, ...],
+    dict[AtomSite, int],
+]:
+    r"""
+    Lower the released protein-atom14 design rows and natural fixed-context rows.
+
+    Synthetic rows have no canonical `AtomSite`. Their target coordinates copy
+    the residue-specific N/O source, while every design row is already masked to
+    the exact features visible to the Model.
+    """
+
+    from rdkit.Chem import GetPeriodicTable
+
+    model_atom_sites: list[AtomSite | None] = []
+    target_source_sites: list[AtomSite] = []
+    reference_source_sites: list[AtomSite] = []
+    atom_to_token_rows: list[int] = []
+    atom_token_indices: list[int] = []
+    design_atom_rows: list[bool] = []
+    design_backbone_rows: list[bool] = []
+    reference_space_ids: list[int] = []
+    fake_rows: list[bool] = []
+    reference_space_by_component: dict[ComponentReference, int] = {}
+
+    for token_index, (token, designed) in enumerate(zip(tokens, design_mask.tolist(), strict=True)):
+        natural_sites = cast(tuple[AtomSite, ...], token["atom_sites"])
+        reference = cast(ComponentReference, token["reference"])
+        space_id = reference_space_by_component.setdefault(reference, len(reference_space_by_component))
+        if designed:
+            component_id = "GLY" if reference in generated_residues else system.component(reference).component_id
+            atom_names = _PROTEIN_ATOM14_NAMES[component_id]
+            by_name = {site.atom_id: site for site in natural_sites}
+            missing = [name for name in atom_names if name not in by_name]
+            if missing:
+                raise ValueError(f"BoltzGen atom14 row {reference!r} is missing canonical atoms {missing!r}")
+            real_sites = tuple(by_name[name] for name in atom_names)
+            ca_site = by_name["CA"]
+            for slot, site in enumerate(real_sites):
+                model_atom_sites.append(site)
+                target_source_sites.append(site)
+                reference_source_sites.append(site)
+                atom_to_token_rows.append(token_index)
+                atom_token_indices.append(slot)
+                design_atom_rows.append(True)
+                design_backbone_rows.append(slot < 4)
+                reference_space_ids.append(space_id)
+                fake_rows.append(False)
+            for slot, source_name in enumerate(
+                _PROTEIN_ATOM14_FAKE_SOURCE[component_id],
+                start=len(real_sites),
+            ):
+                model_atom_sites.append(None)
+                target_source_sites.append(by_name[source_name])
+                reference_source_sites.append(ca_site)
+                atom_to_token_rows.append(token_index)
+                atom_token_indices.append(slot)
+                design_atom_rows.append(True)
+                design_backbone_rows.append(False)
+                reference_space_ids.append(space_id)
+                fake_rows.append(True)
+            continue
+
+        for slot, site in enumerate(natural_sites):
+            model_atom_sites.append(site)
+            target_source_sites.append(site)
+            reference_source_sites.append(site)
+            atom_to_token_rows.append(token_index)
+            atom_token_indices.append(slot)
+            design_atom_rows.append(False)
+            design_backbone_rows.append(False)
+            reference_space_ids.append(space_id)
+            fake_rows.append(False)
+
+    atom_count = len(model_atom_sites)
+    padded_atom_count = max(32, math.ceil(atom_count / 32) * 32)
+    site_to_atom = {site: atom_index for atom_index, site in enumerate(model_atom_sites) if site is not None}
+    if len(site_to_atom) != sum(site is not None for site in model_atom_sites):
+        raise ValueError("BoltzGen model atom rows contain a duplicate canonical atom occurrence")
+
+    reference_coordinates = _generated_reference_coordinates(
+        system,
+        tuple(reference_source_sites),
+        generated_residues,
+    )
+    coordinate_index = {site: index for index, site in enumerate(structure.sites)} if structure is not None else {}
+    target_coordinates = torch.zeros(padded_atom_count, 3)
+    coordinate_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
+    for atom_index, source_site in enumerate(target_source_sites):
+        source_index = coordinate_index.get(source_site)
+        if source_index is not None:
+            assert structure is not None
+            target_coordinates[atom_index] = torch.as_tensor(
+                structure.coordinates[source_index],
+                dtype=target_coordinates.dtype,
+            )
+            coordinate_mask[atom_index] = bool(structure.coordinate_mask[source_index])
+        elif (source_site.instance_id, source_site.component_index) in generated_residues:
+            coordinate_mask[atom_index] = True
+
+    atom_coordinates = target_coordinates.clone()
+    valid_coordinates = coordinate_mask[:atom_count]
+    center = (atom_coordinates[:atom_count] * valid_coordinates[:, None]).sum(dim=0) / valid_coordinates.sum().clamp(
+        min=1
+    )
+    atom_coordinates[:atom_count] -= center
+    center_atom_indices = torch.tensor(
+        [site_to_atom[cast(AtomSite, token["center_site"])] for token in tokens],
+        dtype=torch.long,
+    )
+    center_coordinates = target_coordinates[center_atom_indices]
+
+    reference_positions = torch.zeros(padded_atom_count, 3)
+    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
+    _augment_reference_positions(
+        reference_positions[:atom_count],
+        reference_space_id[:atom_count],
+        valid_coordinates,
+        generator=generator,
+    )
+    design_atom_mask = torch.tensor(design_atom_rows, dtype=torch.bool)
+    reference_positions[:atom_count] = reference_positions[:atom_count].masked_fill(
+        design_atom_mask[:, None],
+        0,
+    )
+
+    real_sites = tuple(site for site in model_atom_sites if site is not None)
+    model_names = dict(zip(real_sites, _model_atom_names(system, real_sites), strict=True))
+    periodic_table = GetPeriodicTable()
+    atomic_number = torch.zeros(padded_atom_count, dtype=torch.long)
+    reference_charges = torch.zeros(padded_atom_count)
+    atom_name_characters = torch.zeros(padded_atom_count, 4, dtype=torch.long)
+    atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
+    atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
+    atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
+    for atom_index, model_site in enumerate(model_atom_sites):
+        token_slot = atom_token_indices[atom_index]
+        if design_atom_rows[atom_index] and not design_backbone_rows[atom_index]:
+            atom_name = f"FL{token_slot}"
+            atomic_number[atom_index] = 114
+        else:
+            assert model_site is not None
+            atom = system.atom(model_site)
+            atom_name = model_names[model_site]
+            atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
+            reference_charges[atom_index] = 0 if atom.formal_charge is None else atom.formal_charge
+        atom_name_characters[atom_index] = torch.tensor(
+            [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
+        )
+        atom_mask[atom_index] = True
+        atom_to_token[atom_index] = atom_to_token_rows[atom_index]
+        atom_token_index[atom_index] = token_slot
+
+    atom_features = torch.cat(
+        (
+            reference_positions,
+            reference_charges.unsqueeze(-1),
+            torch.nn.functional.one_hot(atomic_number, 128).float(),
+            torch.nn.functional.one_hot(atom_name_characters, 64).reshape(padded_atom_count, 256).float(),
+        ),
+        dim=-1,
+    )
+    fake_atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
+    fake_atom_mask[:atom_count] = torch.tensor(fake_rows, dtype=torch.bool)
+    return (
+        {
+            "atom_features": atom_features,
+            "reference_positions": reference_positions,
+            "reference_space_id": reference_space_id,
+            "atom_mask": atom_mask,
+            "atom_to_token": atom_to_token,
+            "atom_token_index": atom_token_index,
+            "atom_coordinates": atom_coordinates,
+            "center_coordinates": center_coordinates,
+            "fake_atom_mask": fake_atom_mask,
+        },
+        tuple(model_atom_sites),
+        tuple(target_source_sites),
+        site_to_atom,
+    )
+
+
+def _truth_pool_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    structure: Structure,
+    target_source_sites: tuple[AtomSite, ...],
+    padded_atom_count: int,
+    site_to_atom: dict[AtomSite, int],
+) -> dict[str, Tensor]:
+    r"""
+    Lower complete-assembly truth and its current-atom/symmetry mappings.
+
+    The pool follows the natural model-visible atom order before synthetic
+    atom14 rows are added. Unresolved atoms retain their pool rows.
+    """
+
+    pool_sites = tuple(site for token in tokens for site in cast(tuple[AtomSite, ...], token["atom_sites"]))
+    pool_index = {site: index for index, site in enumerate(pool_sites)}
+    coordinate_index = {site: index for index, site in enumerate(structure.sites)}
+    coordinates = torch.zeros(len(pool_sites), 3)
+    coordinate_mask = torch.zeros(len(pool_sites), dtype=torch.bool)
+    for index, site in enumerate(pool_sites):
+        source_index = coordinate_index.get(site)
+        if source_index is None or not structure.coordinate_mask[source_index]:
+            continue
+        coordinates[index] = torch.as_tensor(
+            structure.coordinates[source_index],
+            dtype=coordinates.dtype,
+        )
+        coordinate_mask[index] = True
+
+    atom_index = torch.full((padded_atom_count,), -1, dtype=torch.long)
+    atom_index[: len(target_source_sites)] = torch.tensor(
+        [pool_index[site] for site in target_source_sites],
+        dtype=torch.long,
+    )
+
+    chain_spans: list[tuple[int, int]] = []
+    chain_equivalence: list[int] = []
+    equivalence_index: dict[tuple[str, tuple[tuple[int, str], ...]], int] = {}
+    start = 0
+    for instance_id, entity_id in system.instances.items():
+        stop = start
+        while stop < len(pool_sites) and pool_sites[stop].instance_id == instance_id:
+            stop += 1
+        chain_spans.append((start, stop))
+        layout = tuple((site.component_index, site.atom_id) for site in pool_sites[start:stop])
+        key = (entity_id, layout)
+        chain_equivalence.append(equivalence_index.setdefault(key, len(equivalence_index)))
+        start = stop
+
+    symmetry_atom_index, symmetry_permutation = _local_symmetry_features(
+        system,
+        tokens,
+        site_to_atom,
+    )
+    return {
+        "coordinates": coordinates,
+        "coordinate_mask": coordinate_mask,
+        "atom_index": atom_index,
+        "chain_span": torch.tensor(chain_spans, dtype=torch.long),
+        "chain_equivalence_index": torch.tensor(
+            chain_equivalence,
+            dtype=torch.long,
+        ),
+        "symmetry_atom_index": symmetry_atom_index,
+        "symmetry_permutation": symmetry_permutation,
+    }
+
+
+def _local_symmetry_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    site_to_atom: dict[AtomSite, int],
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Carry exact standard swaps and the available stereochemical self-matches.
+    """
+
+    groups: list[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
+    for token in tokens:
+        reference = cast(ComponentReference, token["reference"])
+        component_id = system.component(reference).component_id
+        atom_permutations = _STANDARD_LOCAL_SYMMETRY_ATOMS.get(component_id)
+        if atom_permutations is None:
+            continue
+        permutations = tuple(
+            tuple(site_to_atom[AtomSite(reference[0], reference[1], atom_id)] for atom_id in atom_names)
+            for atom_names in atom_permutations
+        )
+        groups.append((permutations[0], permutations))
+
+    boundary_sites: set[AtomSite] = set()
+    for bond in system.iter_bonds():
+        reference_a = (bond.site_a.instance_id, bond.site_a.component_index)
+        reference_b = (bond.site_b.instance_id, bond.site_b.component_index)
+        if reference_a != reference_b:
+            boundary_sites.add(bond.site_a)
+            boundary_sites.add(bond.site_b)
+
+    for instance_id, entity_id in system.instances.items():
+        entity = system.entities[entity_id]
+        for component_index, component in enumerate(entity.components):
+            if any(component.component_id in standards for standards in _STANDARD_COMPONENTS.values()):
+                continue
+            group = _component_self_match_group(
+                component,
+                instance_id,
+                component_index,
+                site_to_atom,
+                boundary_sites,
+            )
+            if group is not None:
+                groups.append(group)
+
+    if not groups:
+        return (
+            torch.empty(0, 0, dtype=torch.long),
+            torch.empty(0, 0, 0, dtype=torch.long),
+        )
+
+    max_width = max(len(atom_indices) for atom_indices, _ in groups)
+    max_permutations = max(len(permutations) for _, permutations in groups)
+    atom_index = torch.full((len(groups), max_width), -1, dtype=torch.long)
+    permutation = torch.full(
+        (len(groups), max_permutations, max_width),
+        -1,
+        dtype=torch.long,
+    )
+    for group_index, (atom_indices, permutations) in enumerate(groups):
+        width = len(atom_indices)
+        atom_index[group_index, :width] = torch.tensor(atom_indices)
+        for permutation_index, values in enumerate(permutations):
+            permutation[group_index, permutation_index, :width] = torch.tensor(values)
+    return atom_index, permutation
+
+
+def _component_self_match_group(
+    component: ChemicalComponent,
+    instance_id: str,
+    component_index: int,
+    site_to_atom: dict[AtomSite, int],
+    boundary_sites: set[AtomSite],
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]] | None:
+    r"""
+    Return the carried RDKit automorphism candidates for one occurrence.
+    """
+
+    visible = tuple(
+        (
+            local_index,
+            site_to_atom[site],
+            site,
+        )
+        for local_index, atom in enumerate(component.atoms)
+        if (site := AtomSite(instance_id, component_index, atom.atom_id)) in site_to_atom
+    )
+    if len(visible) < 2:
+        return None
+
+    molecule = _canonical_rdkit_molecule(Molecule((component,)))
+    model_index = {local_index: atom_index for local_index, atom_index, _ in visible}
+    fixed = {local_index for local_index, _atom_index, site in visible if site in boundary_sites}
+    candidates = {
+        tuple(model_index[match[local_index]] for local_index in model_index)
+        for match in molecule.GetSubstructMatches(
+            molecule,
+            uniquify=False,
+            useChirality=True,
+            maxMatches=1000,
+        )
+        if all(match[local_index] in model_index for local_index in model_index)
+        and all(match[local_index] == local_index for local_index in fixed)
+    }
+    identity = tuple(atom_index for _local_index, atom_index, _site in visible)
+    candidates.add(identity)
+    if len(candidates) == 1:
+        return None
+    return identity, (identity, *sorted(candidates - {identity}))
+
+
+def _frame_atom_indices(
+    tokens: list[dict[str, object]],
+    site_to_atom: dict[AtomSite, int],
+) -> Tensor:
+    r"""
+    Lower prediction-independent polymer confidence-frame atom indices.
+
+    Non-polymer entries are placeholders: confidence equations replace them
+    from each prediction or matched target because their frames depend on the
+    corresponding coordinates and resolved mask.
+    """
+
+    return torch.tensor(
+        [[site_to_atom[site] for site in cast(tuple[AtomSite, ...], token["frame_sites"])] for token in tokens],
+        dtype=torch.long,
+    )
 
 
 def _build_atom_features(
@@ -1364,6 +2040,35 @@ def _design_mask(
     return _design_mask_from_positions(tuple(positions), token_index_by_residue, token_count)
 
 
+def _chain_design_mask(
+    design_mask: Tensor,
+    chain_index: Tensor,
+    token_bonds: Tensor,
+) -> Tensor:
+    r"""
+    Propagate design membership over whole chains and covalently linked chains.
+
+    This is a connected-component lowering over two edge kinds: tokens in the
+    same molecular instance and explicit inter-token covalent bonds.
+    """
+
+    connections: dict[int, set[int]] = {int(chain): set() for chain in torch.unique(chain_index).tolist()}
+    for source, target in torch.nonzero(token_bonds[..., 0], as_tuple=False).tolist():
+        source_chain = int(chain_index[source])
+        target_chain = int(chain_index[target])
+        connections[source_chain].add(target_chain)
+        connections[target_chain].add(source_chain)
+
+    selected = {int(chain) for chain in chain_index[design_mask.bool()].tolist()}
+    pending = list(selected)
+    while pending:
+        chain = pending.pop()
+        for connected in connections[chain] - selected:
+            selected.add(connected)
+            pending.append(connected)
+    return torch.tensor([int(chain) in selected for chain in chain_index], dtype=torch.bool)
+
+
 def _structure_group_ids(
     conditions: tuple[BoltzGenSchema, ...],
     token_index_by_residue: dict[tuple[str, int], int],
@@ -1500,22 +2205,89 @@ def _symmetry_index(
     return ids
 
 
+def _sequence_symmetry_index(
+    groups: tuple[tuple[ComponentReference, ...], ...],
+    token_index_by_residue: dict[tuple[str, int], int],
+    token_count: int,
+) -> Tensor:
+    r"""
+    Realize inverse-folding identity groups into positive ``[N]`` group IDs.
+
+    Unlike structure-design ``symmetry_index``, whose zero-based values identify
+    copy offsets for relative-position features, inverse folding reserves zero for
+    an untied position.
+    """
+
+    ids = torch.zeros(token_count, dtype=torch.long)
+    parents: dict[int, int] = {}
+
+    def find(token: int) -> int:
+        root = token
+        while parents[root] != root:
+            root = parents[root]
+        while parents[token] != token:
+            parent = parents[token]
+            parents[token] = root
+            token = parent
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for group in groups:
+        tokens = [_component_reference_to_token(reference, token_index_by_residue) for reference in group]
+        if not tokens:
+            continue
+        for token in tokens:
+            parents.setdefault(token, token)
+        for token in tokens[1:]:
+            union(tokens[0], token)
+
+    root_to_group: dict[int, int] = {}
+    for token in parents:
+        root = find(token)
+        ids[token] = root_to_group.setdefault(root, len(root_to_group) + 1)
+    return ids
+
+
+def _require_protein_reference(
+    reference: ComponentReference,
+    token_index_by_residue: dict[tuple[str, int], int],
+    molecule_types: Tensor,
+    role: str,
+) -> int:
+    r"""
+    Resolve an inverse-folding residue reference and require a protein token.
+    """
+
+    token = _component_reference_to_token(reference, token_index_by_residue)
+    if int(molecule_types[token].item()) != _MOLECULE_TYPES["protein"]:
+        raise ValueError(f"BoltzGen inverse-folding {role} must reference a protein residue: {reference!r}")
+    return token
+
+
 def _aa_constraint_mask(
+    global_omit_tokens: tuple[str, ...],
     aa_constraints: tuple[BoltzGenResidueConstraint, ...],
     token_index_by_residue: dict[tuple[str, int], int],
     token_count: int,
 ) -> Tensor:
     r"""
-    Realize per-residue AA constraints into the ``[N, 20]`` canonical-AA block mask.
+    Realize global and per-residue constraints into the ``[N, 20]`` canonical-AA block mask.
 
     The ``[N, 20]`` mask follows ``CANONICAL_TOKENS`` order, where ``0`` is allowed and ``1`` disallowed;
-    the default is all-zero (unconstrained). ``BoltzGenInverseFoldingModel._build_constraint_logit_mask``
-    consumes it as ``> 0`` -> ``-1e6`` additive logit bias. Each ``allowed`` whitelist blocks every
-    canonical AA except the listed codes, accumulated with ``max`` so overlapping constraints
-    intersect (only AAs allowed by every covering constraint survive).
+    the default is all-zero (unconstrained). Global omissions block one vocabulary
+    column everywhere. Each ``allowed`` whitelist blocks every canonical AA except
+    the listed codes, accumulated with ``max`` so overlapping constraints intersect
+    (only AAs allowed by every covering constraint survive).
     """
 
     mask = torch.zeros(token_count, NUM_CANONICAL_TOKENS, dtype=torch.float32)
+    for code in global_omit_tokens:
+        mask[:, CANONICAL_TOKENS.index(code)] = 1.0
     for constraint in aa_constraints:
         token = _component_reference_to_token(constraint.position, token_index_by_residue)
         block = torch.ones(NUM_CANONICAL_TOKENS, dtype=torch.float32)
@@ -1838,6 +2610,33 @@ def _token_bond_indicator(
     return token_bonds.unsqueeze(-1)
 
 
+def _inter_residue_bond_atom_index(
+    system: MolecularSystem,
+    site_to_atom: dict[AtomSite, int],
+) -> Tensor | None:
+    r"""
+    Return unique known covalent edges whose endpoints belong to different residues.
+    """
+
+    edges: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for bond in system.iter_bonds():
+        left, right = bond.site_a, bond.site_b
+        if left.instance_id == right.instance_id and left.component_index == right.component_index:
+            continue
+        if left not in site_to_atom or right not in site_to_atom:
+            continue
+        left_index, right_index = sorted((site_to_atom[left], site_to_atom[right]))
+        endpoints = (left_index, right_index)
+        if endpoints in seen:
+            continue
+        seen.add(endpoints)
+        edges.append(endpoints)
+    if not edges:
+        return None
+    return torch.tensor(edges, dtype=torch.long)
+
+
 def _msa_features(
     msa: MSA | MSACollection | None,
     tokens: list[dict[str, object]],
@@ -1919,6 +2718,43 @@ def _msa_features(
     }
 
 
+def _mask_structure_design_msa(values: dict[str, Tensor], design_mask: Tensor) -> dict[str, Tensor]:
+    r"""
+    Remove designed residue identity from every model-visible MSA channel.
+    """
+
+    if not bool(design_mask.any()):
+        return values
+    unknown = _UNKNOWN_RESIDUE_TYPES["protein"]
+    values["msa_tokens"][:, design_mask] = unknown
+    values["has_deletion"][:, design_mask] = False
+    values["deletion_value"][:, design_mask] = 0
+    values["msa_paired"][:, design_mask] = 0
+    values["msa_profile"][design_mask] = 0
+    values["msa_profile"][design_mask, unknown] = 1
+    values["deletion_mean"][design_mask] = 0
+    return values
+
+
+def _token_b_factors(
+    structure: Structure,
+    tokens: list[dict[str, object]],
+) -> Tensor | None:
+    r"""
+    Gather optional per-site B factors at each token center.
+    """
+
+    if structure.b_factor is None:
+        return None
+    source_index = {site: index for index, site in enumerate(structure.sites)}
+    values = torch.full((len(tokens),), float("nan"))
+    for token_index, token in enumerate(tokens):
+        index = source_index.get(cast(AtomSite, token["center_site"]))
+        if index is not None:
+            values[token_index] = float(structure.b_factor[index])
+    return values
+
+
 def _reference_coordinates(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> list[tuple[float, float, float]]:
     generated: dict[str, dict[tuple[int, str], tuple[float, float, float]]] = {}
     coordinates: list[tuple[float, float, float]] = []
@@ -1985,12 +2821,13 @@ def _augment_reference_positions(
             continue
         values = positions[included]
         center = (values * mask[:, None]).sum(dim=0, keepdim=True) / mask.sum()
+        random_device = generator.device if generator is not None else values.device
         quaternion = torch.randn(
             4,
             dtype=values.dtype,
-            device=values.device,
+            device=random_device,
             generator=generator,
-        )
+        ).to(values.device)
         norm = torch.sqrt((quaternion * quaternion).sum())
         quaternion = quaternion / torch.copysign(norm, quaternion[0])
         real, i, j, k = quaternion
@@ -2008,13 +2845,14 @@ def _augment_reference_positions(
                 1 - two * (i * i + j * j),
             )
         ).reshape(3, 3)
-        positions[included] = (values - center) @ rotation + torch.randn(
+        translation = torch.randn(
             1,
             3,
             dtype=values.dtype,
-            device=values.device,
+            device=random_device,
             generator=generator,
-        )
+        ).to(values.device)
+        positions[included] = (values - center) @ rotation + translation
 
 
 def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> list[str]:
@@ -2042,17 +2880,26 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
 
     editable = Chem.RWMol()
     atom_index: dict[tuple[int, str], int] = {}
+    atom_stereo: dict[int, str] = {}
     for component_index, component in enumerate(molecule.components):
         for atom in component.atoms:
             rdkit_atom = Chem.Atom(atom.element)
             if atom.isotope is not None:
                 rdkit_atom.SetIsotope(atom.isotope)
-            rdkit_atom.SetFormalCharge(atom.formal_charge)
-            rdkit_atom.SetNumRadicalElectrons(atom.radical_electrons)
-            rdkit_atom.SetNumExplicitHs(atom.explicit_hydrogens)
-            rdkit_atom.SetNoImplicit(not atom.implicit_hydrogens_allowed)
-            rdkit_atom.SetIsAromatic(atom.aromatic)
-            atom_index[(component_index, atom.atom_id)] = editable.AddAtom(rdkit_atom)
+            if atom.formal_charge is not None:
+                rdkit_atom.SetFormalCharge(atom.formal_charge)
+            if atom.radical_electrons is not None:
+                rdkit_atom.SetNumRadicalElectrons(atom.radical_electrons)
+            if atom.explicit_hydrogens is not None:
+                rdkit_atom.SetNumExplicitHs(atom.explicit_hydrogens)
+            if atom.implicit_hydrogens_allowed is not None:
+                rdkit_atom.SetNoImplicit(not atom.implicit_hydrogens_allowed)
+            if atom.aromatic is not None:
+                rdkit_atom.SetIsAromatic(atom.aromatic)
+            index = editable.AddAtom(rdkit_atom)
+            atom_index[(component_index, atom.atom_id)] = index
+            if atom.stereo is not None:
+                atom_stereo[index] = atom.stereo.upper()
 
     bond_types = {
         1.0: Chem.BondType.SINGLE,
@@ -2061,24 +2908,107 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
         3.0: Chem.BondType.TRIPLE,
         4.0: Chem.BondType.QUADRUPLE,
     }
+    bond_stereo: list[tuple[int, str, tuple[int, int] | None]] = []
     for component_index, component in enumerate(molecule.components):
-        for component_bond in component.bonds or ():
+        component_bonds = sorted(
+            component.bonds or (),
+            key=lambda bond: (
+                atom_index[(component_index, bond.atom_a)],
+                atom_index[(component_index, bond.atom_b)],
+            ),
+        )
+        for component_bond in component_bonds:
             editable.AddBond(
                 atom_index[(component_index, component_bond.atom_a)],
                 atom_index[(component_index, component_bond.atom_b)],
                 bond_types[component_bond.order],
             )
-            editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(component_bond.aromatic)
-    for molecule_bond in molecule.bonds:
+            bond_index = editable.GetNumBonds() - 1
+            editable.GetBondWithIdx(bond_index).SetIsAromatic(component_bond.aromatic)
+            if component_bond.stereo is not None:
+                stereo_atoms = (
+                    tuple(atom_index[(component_index, atom_id)] for atom_id in component_bond.stereo_atoms)
+                    if component_bond.stereo_atoms is not None
+                    else None
+                )
+                bond_stereo.append(
+                    (
+                        bond_index,
+                        component_bond.stereo,
+                        cast(tuple[int, int] | None, stereo_atoms),
+                    )
+                )
+    molecule_bonds = sorted(
+        molecule.bonds,
+        key=lambda bond: (
+            atom_index[(bond.component_a, bond.atom_a)],
+            atom_index[(bond.component_b, bond.atom_b)],
+        ),
+    )
+    for molecule_bond in molecule_bonds:
         editable.AddBond(
             atom_index[(molecule_bond.component_a, molecule_bond.atom_a)],
             atom_index[(molecule_bond.component_b, molecule_bond.atom_b)],
             bond_types[molecule_bond.order],
         )
-        editable.GetBondWithIdx(editable.GetNumBonds() - 1).SetIsAromatic(molecule_bond.aromatic)
+        bond_index = editable.GetNumBonds() - 1
+        editable.GetBondWithIdx(bond_index).SetIsAromatic(molecule_bond.aromatic)
+        if molecule_bond.stereo is not None:
+            stereo_atoms = (
+                tuple(atom_index[site] for site in molecule_bond.stereo_atoms)
+                if molecule_bond.stereo_atoms is not None
+                else None
+            )
+            bond_stereo.append(
+                (
+                    bond_index,
+                    molecule_bond.stereo,
+                    cast(tuple[int, int] | None, stereo_atoms),
+                )
+            )
 
     value = editable.GetMol()
     Chem.SanitizeMol(value)
+    for index in atom_stereo:
+        value.GetAtomWithIdx(index).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
+    for index, desired in atom_stereo.items():
+        atom = value.GetAtomWithIdx(index)
+        assigned = atom.GetProp("_CIPCode").upper() if atom.HasProp("_CIPCode") else ""
+        if assigned != desired:
+            atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
+
+    stereo_types = {
+        "E": Chem.BondStereo.STEREOE,
+        "TRANS": Chem.BondStereo.STEREOE,
+        "Z": Chem.BondStereo.STEREOZ,
+        "CIS": Chem.BondStereo.STEREOZ,
+    }
+    for index, stereo, stereo_atoms in bond_stereo:
+        bond = value.GetBondWithIdx(index)
+        if stereo_atoms is None:
+            begin = bond.GetBeginAtomIdx()
+            end = bond.GetEndAtomIdx()
+            begin_neighbors = [
+                neighbor for neighbor in value.GetAtomWithIdx(begin).GetNeighbors() if neighbor.GetIdx() != end
+            ]
+            end_neighbors = [
+                neighbor for neighbor in value.GetAtomWithIdx(end).GetNeighbors() if neighbor.GetIdx() != begin
+            ]
+            stereo_atoms = (
+                max(
+                    begin_neighbors,
+                    key=lambda atom: int(atom.GetProp("_CIPRank")),
+                ).GetIdx(),
+                max(
+                    end_neighbors,
+                    key=lambda atom: int(atom.GetProp("_CIPRank")),
+                ).GetIdx(),
+            )
+        bond.SetStereoAtoms(*stereo_atoms)
+        bond.SetStereo(stereo_types[stereo.upper()])
+    Chem.AssignStereochemistry(value, force=True, cleanIt=True)
     return value
 
 

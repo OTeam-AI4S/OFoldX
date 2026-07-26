@@ -26,19 +26,33 @@ from ...modules.atom import (
 )
 from ...modules.atom.pair_encoding import encode_atom_pair
 from ...modules.atom.window import gather_key_windows
+from ...modules.attention import (
+    PairBiasedSelfAttention,
+    PerBlockPairBiasProjection,
+    TriangleAttention,
+    TriangleMultiplication,
+)
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
 from ...modules.diffusion.edm import EdmPreconditioner
+from ...modules.dropout import StructuredDropout
 from ...modules.embedding.fourier import FrozenFourierEmbedding
 from ...modules.embedding.position import RelativePositionEmbedder, generate_relative_position_features
 from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation, weighted_rigid_align
 from ...modules.head.distogram import PairSymmetrizedDistogramHead
 from ...modules.head.tm import tm_weight_from_pae
+from ...modules.potential import (
+    indexed_distance,
+    indexed_distance_with_gradient,
+    indexed_signed_dihedral,
+    indexed_signed_dihedral_with_gradient,
+    linear_flat_bottom_derivative,
+    linear_flat_bottom_energy,
+)
 from ...modules.transformer import ConditionedTransformerEncoder, TripleProductConditionedTransition
 from ...modules.transition import Transition
-from ...modules.trunk.msa import CategoricalMsaTrunk
-from ...modules.trunk.pairformer import PairformerStack
+from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import Boltz1Config
 
@@ -47,8 +61,8 @@ class Boltz1Model(Model):
     r"""
     Predict biomolecular complex structures with Boltz 1.
 
-    Accepts [`Boltz1Input`][ofoldx.models.boltz1.model.Boltz1Input] and returns
-    [`Boltz1Output`][ofoldx.models.boltz1.model.Boltz1Output].
+    Structure training consumes separate [`Boltz1Input`][] and
+    [`Boltz1StructureTarget`][] values. ``fold`` consumes inference Input only.
 
     Args:
         config: Model architecture and inference configuration.
@@ -97,35 +111,46 @@ class Boltz1Model(Model):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        self.msa_trunk: CategoricalMsaTrunk | None = None
+        self.msa_trunk: Boltz1MsaTrunk | None = None
         if config.use_msa:
-            self.msa_trunk = CategoricalMsaTrunk(
+            self.msa_trunk = Boltz1MsaTrunk(
                 single_size=input_size,
                 pair_size=pair_size,
                 msa_size=trunk.msa_size,
-                msa_feature_size=trunk.msa_feature_size,
                 num_blocks=trunk.num_msa_blocks,
                 vocab_size=input_embeddings_config.vocab_size,
                 use_paired_feature=trunk.use_paired_feature,
                 outer_product_hidden_size=trunk.outer_product_hidden_size,
                 msa_dropout=trunk.msa_dropout,
-                pair_dropout=trunk.pair_dropout,
+                pair_dropout=trunk.msa_pair_dropout,
                 num_msa_attention_heads=trunk.num_msa_attention_heads,
                 msa_head_dim=trunk.msa_head_dim,
-                triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
-                num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                triangle_attention_hidden_size=trunk.msa_triangle_attention_hidden_size,
+                num_triangle_attention_heads=trunk.num_msa_triangle_attention_heads,
                 backend="auto",
             )
-        self.pairformer_stack = PairformerStack(
-            num_blocks=trunk.num_pairformer_blocks,
-            single_size=single_size,
-            pair_size=pair_size,
-            triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
-            num_triangle_attention_heads=trunk.num_triangle_attention_heads,
-            num_pair_attention_heads=trunk.num_pair_attention_heads,
-            dropout=trunk.pair_dropout,
-            backend="auto",
-        )
+        self.pairformer_stack: Boltz1PairformerStack | None = None
+        self.pair_update_stack: Boltz1TrianglePairUpdateStack | None = None
+        if trunk.update_single:
+            self.pairformer_stack = Boltz1PairformerStack(
+                num_blocks=trunk.num_pairformer_blocks,
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
+                num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                num_pair_attention_heads=trunk.num_pair_attention_heads,
+                dropout=trunk.pair_dropout,
+                backend="auto",
+            )
+        else:
+            self.pair_update_stack = Boltz1TrianglePairUpdateStack(
+                num_blocks=trunk.num_pairformer_blocks,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
+                num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                dropout=trunk.pair_dropout,
+                backend="auto",
+            )
         self.distogram_head = PairSymmetrizedDistogramHead(
             pair_size=pair_size,
             num_bins=config.num_distogram_bins,
@@ -196,8 +221,8 @@ class Boltz1Model(Model):
                     num_key_atoms=denoiser_config.num_key_atoms,
                     num_atom_encoder_blocks=input_embeddings_config.num_atom_encoder_blocks,
                     num_atom_encoder_attention_heads=input_embeddings_config.num_atom_encoder_attention_heads,
-                    num_blocks=confidence.num_pairformer_blocks,
-                    num_pair_attention_heads=confidence.num_pair_attention_heads,
+                    num_blocks=trunk.num_pairformer_blocks,
+                    num_pair_attention_heads=trunk.num_pair_attention_heads,
                     num_distogram_bins=confidence.num_distogram_bins,
                     max_distance=confidence.max_distance,
                     num_plddt_bins=confidence.num_plddt_bins,
@@ -211,15 +236,18 @@ class Boltz1Model(Model):
                     use_atom_encoder=input_embeddings_config.use_atom_encoder,
                     use_msa=config.use_msa,
                     msa_size=trunk.msa_size,
-                    msa_feature_size=trunk.msa_feature_size,
                     vocab_size=input_embeddings_config.vocab_size,
-                    num_msa_blocks=trunk.num_msa_blocks,
                     use_paired_feature=trunk.use_paired_feature,
+                    num_msa_blocks=trunk.num_msa_blocks,
                     outer_product_hidden_size=trunk.outer_product_hidden_size,
                     msa_dropout=trunk.msa_dropout,
+                    msa_pair_dropout=trunk.msa_pair_dropout,
                     pair_dropout=trunk.pair_dropout,
+                    update_single=trunk.update_single,
                     num_msa_attention_heads=trunk.num_msa_attention_heads,
                     msa_head_dim=trunk.msa_head_dim,
+                    msa_triangle_attention_hidden_size=trunk.msa_triangle_attention_hidden_size,
+                    num_msa_triangle_attention_heads=trunk.num_msa_triangle_attention_heads,
                     triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
                     num_triangle_attention_heads=trunk.num_triangle_attention_heads,
                     relative_position_size=config.relative_position_size,
@@ -232,6 +260,8 @@ class Boltz1Model(Model):
                     pair_size=pair_size,
                     num_blocks=confidence.num_pairformer_blocks,
                     num_pair_attention_heads=confidence.num_pair_attention_heads,
+                    triangle_attention_hidden_size=confidence.triangle_attention_hidden_size,
+                    num_triangle_attention_heads=confidence.num_triangle_attention_heads,
                     num_distogram_bins=confidence.num_distogram_bins,
                     max_distance=confidence.max_distance,
                     num_plddt_bins=confidence.num_plddt_bins,
@@ -244,9 +274,8 @@ class Boltz1Model(Model):
                     use_single_diffusion=confidence.use_single_diffusion,
                     ranking_plddt_weight=confidence.ranking_plddt_weight,
                     ranking_ptm_weight=confidence.ranking_ptm_weight,
-                    pair_dropout=trunk.pair_dropout,
-                    triangle_attention_hidden_size=trunk.triangle_attention_hidden_size,
-                    num_triangle_attention_heads=trunk.num_triangle_attention_heads,
+                    pair_dropout=confidence.pair_dropout,
+                    update_single=confidence.update_single,
                     relative_position_size=config.relative_position_size,
                     backend="auto",
                 )
@@ -255,36 +284,69 @@ class Boltz1Model(Model):
     def forward(
         self,
         input: Boltz1Input,
+        target: Boltz1StructureTarget,
         *,
-        recycling_steps: int | None = None,
         num_samples: int = 1,
+        synchronize_noise_levels: bool = True,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Boltz1Output:
         r"""
         Denoise randomly corrupted target coordinates for diffusion training.
 
         Args:
-            input: Features with ``target_positions`` shaped ``(B, A, 3)`` in
-                angstroms and ``target_mask`` shaped ``(B, A)`` when provided.
+            input: Model-visible structure and evidence features.
+            target: Complete pre-crop structure truth.
+            num_samples: Number ``S`` of independently corrupted copies per input.
+            synchronize_noise_levels: Whether samples from one example share sigma.
+            coordinate_augmentation: Whether to apply random rigid augmentation.
+            augmentation_translation_scale: Standard deviation of augmentation
+                translations in angstroms.
+            noise_log_mean: Mean of the log-normal noise distribution.
+            noise_log_std: Standard deviation of the log-normal noise distribution.
             recycling_steps: Number of trunk recycling iterations. ``None`` uses
                 the configured value.
-            num_samples: Number ``S`` of independently corrupted copies per input.
-            generator: Optional generator for rigid augmentation, log-normal noise
-                levels, and Gaussian coordinate noise.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
+            generator: Optional generator for MSA row sampling, rigid
+                augmentation, log-normal noise levels, and Gaussian coordinate
+                noise.
 
         Returns:
-            Denoised and augmented target coordinates with shape ``(B*S, A, 3)``,
-            noise levels with shape ``(B*S,)`` in angstroms, and distogram logits
+            Denoised and augmented target coordinates with shape ``(B, S, A, 3)``,
+            noise levels with shape ``(B, S)`` in angstroms, and distogram logits
             with shape ``(B, N, N, D)``.
         """
 
-        representations = self._trunk(input, recycling_steps=recycling_steps)
-        conditioning = self._denoiser_conditioning(representations, input)
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        representations = self._run_trunk(
+            input,
+            recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
+        )
+        conditioning = self._build_denoiser_conditioning(representations, input)
+        target_coordinates, target_mask = _gather_boltz1_structure_target(
+            target,
+            input,
+        )
         denoised_coordinates, augmented_target_coordinates, noise_level = self.coordinate_diffusion.denoise_training(
-            input.target_positions,
+            target_coordinates,
             input.atom_mask,
-            target_mask=input.target_mask,
+            target_mask=target_mask,
             multiplicity=num_samples,
+            synchronize_noise_levels=synchronize_noise_levels,
+            coordinate_augmentation=coordinate_augmentation,
+            augmentation_translation_scale=augmentation_translation_scale,
+            noise_log_mean=noise_log_mean,
+            noise_log_std=noise_log_std,
             generator=generator,
             single_inputs=representations.single_inputs,
             single_trunk=representations.single,
@@ -292,11 +354,63 @@ class Boltz1Model(Model):
             atom_to_token=input.atom_to_token,
             token_mask=input.token_mask,
         )
+        batch_size = input.token_mask.shape[0]
         return Boltz1Output(
-            coordinates=denoised_coordinates,
+            coordinates=_unflatten_sample_axis(
+                denoised_coordinates,
+                batch_size,
+                num_samples,
+            ),
             distogram_logits=representations.distogram_logits,
-            augmented_target_coordinates=augmented_target_coordinates,
-            noise_level=noise_level,
+            augmented_target_coordinates=_unflatten_sample_axis(
+                augmented_target_coordinates,
+                batch_size,
+                num_samples,
+            ),
+            noise_level=noise_level.reshape(batch_size, num_samples),
+        )
+
+    def confidence(
+        self,
+        input: Boltz1Input,
+        *,
+        num_samples: int = 1,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Boltz1ConfidenceOutput:
+        r"""
+        Sample coordinates and return raw confidence logits with explicit sample axes.
+
+        The score-network and coordinate trajectory are detached. When configured,
+        the diffusion token accumulator remains differentiable into the confidence
+        head.
+        """
+
+        if self.confidence_head is None:
+            raise AttributeError("this Boltz1Model has no confidence head")
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        output = self._predict(
+            input,
+            recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
+            num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            num_samples=num_samples,
+            generator=generator,
+            compute_confidence_scores=False,
+        )
+        return Boltz1ConfidenceOutput(
+            coordinates=output.coordinates,
+            distogram_logits=output.distogram_logits,
+            plddt_logits=cast(Tensor, output.plddt_logits),
+            pae_logits=output.pae_logits,
+            pde_logits=cast(Tensor, output.pde_logits),
+            resolved_logits=cast(Tensor, output.resolved_logits),
         )
 
     @torch.inference_mode()
@@ -307,7 +421,9 @@ class Boltz1Model(Model):
         num_samples: int = 1,
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
         num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
     ) -> FoldResult:
@@ -318,12 +434,16 @@ class Boltz1Model(Model):
             input: Processor output for one system, with batch size ``B = 1`` and
                 molecular identities aligned to its atom and token axes.
             num_samples: Number of coordinate samples.
-            generator: Optional generator for initial coordinates, churn noise,
-                rigid augmentations, and potential-guided resampling.
+            generator: Optional generator for MSA row sampling, initial
+                coordinates, churn noise, rigid augmentations, and
+                potential-guided resampling.
             recycling_steps: Number of trunk recycling iterations. ``None`` uses
                 the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
             num_sampling_steps: Number of diffusion transitions. ``None`` uses the
                 configured value.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
             use_potentials: Whether to enable physical-potential guidance.
             steering_args: Optional guidance and particle-sampling settings.
 
@@ -347,7 +467,9 @@ class Boltz1Model(Model):
         output = self._predict(
             input,
             recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
             num_samples=num_samples,
             generator=generator,
             use_potentials=use_potentials,
@@ -360,6 +482,8 @@ class Boltz1Model(Model):
         input: Boltz1Input,
         *,
         recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> Boltz1Representations:
         r"""
         Return the final single and pair trunk representations.
@@ -368,6 +492,9 @@ class Boltz1Model(Model):
             input: Model features with token axis length ``N``.
             recycling_steps: Number of trunk recycling iterations. ``None`` uses
                 the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
+            generator: Optional generator advanced by MSA row sampling.
 
         Returns:
             Single representations with shape ``(B, N, C_single)`` and pair
@@ -375,7 +502,12 @@ class Boltz1Model(Model):
             retained when autograd is enabled.
         """
 
-        representations = self._trunk(input, recycling_steps=recycling_steps)
+        representations = self._run_trunk(
+            input,
+            recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
+        )
         return Boltz1Representations(single=representations.single, pair=representations.pair)
 
     def _predict(
@@ -383,11 +515,14 @@ class Boltz1Model(Model):
         input: Boltz1Input,
         *,
         recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
         num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
         num_samples: int = 1,
         generator: torch.Generator | None = None,
         use_potentials: bool = False,
         steering_args: Mapping[str, object] | None = None,
+        compute_confidence_scores: bool = True,
     ) -> _Boltz1FoldOutput:
         r"""
         Run the trunk and sampler and return the full Boltz-1 output.
@@ -400,11 +535,15 @@ class Boltz1Model(Model):
         Args:
             input: The Boltz-1 input batch.
             recycling_steps: Total number of trunk passes; defaults to the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation.
             num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
             num_samples: Number of reverse-diffusion samples to draw per input.
             generator: Optional RNG for reproducible sampling noise.
             use_potentials: Whether to enable Boltz-1x physical-potential steering.
             steering_args: Optional overrides merged onto the configured steering flags.
+            compute_confidence_scores: Whether to derive inference metrics from logits.
 
         Returns:
             A [`_Boltz1FoldOutput`][ofoldx.models.boltz1.model._Boltz1FoldOutput]
@@ -413,11 +552,18 @@ class Boltz1Model(Model):
 
         """
 
-        representations = self._trunk(input, recycling_steps=recycling_steps)
+        with torch.no_grad():
+            representations = self._run_trunk(
+                input,
+                recycling_steps=recycling_steps,
+                msa_max_depth=msa_max_depth,
+                generator=generator,
+            )
         diffusion_coords, diffusion_token_repr = self._sample_diffusion(
             representations,
             input,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
             num_samples=num_samples,
             generator=generator,
             use_potentials=use_potentials,
@@ -434,26 +580,34 @@ class Boltz1Model(Model):
         confidence_head = self.confidence_head
         if confidence_head is not None:
             confidence = confidence_head(
-                representations.single_inputs,
-                representations.single,
-                representations.pair,
-                diffusion_coords,
+                representations.single_inputs.detach(),
+                representations.single.detach(),
+                representations.pair.detach(),
+                diffusion_coords.detach(),
                 input=input,
-                pred_distogram_logits=representations.distogram_logits,
+                pred_distogram_logits=representations.distogram_logits.detach(),
                 single_diffusion=diffusion_token_repr,
                 multiplicity=num_samples,
+                msa_max_depth=msa_max_depth,
+                generator=generator,
+                compute_scores=compute_confidence_scores,
             )
             confidence_logits = {
                 name: confidence.get(name) for name in ("plddt_logits", "pae_logits", "pde_logits", "resolved_logits")
             }
-            confidence_scores = {
-                name: _unflatten_sample_axis(value, batch_size, num_samples)
-                for name, value in confidence.items()
-                if name not in confidence_logits
-            }
+            if compute_confidence_scores:
+                confidence_scores = {
+                    name: _unflatten_sample_axis(value, batch_size, num_samples)
+                    for name, value in confidence.items()
+                    if name not in confidence_logits
+                }
         return _Boltz1FoldOutput(
-            coordinates=_unflatten_sample_axis(diffusion_coords, batch_size, num_samples),
-            distogram_logits=representations.distogram_logits,
+            coordinates=_unflatten_sample_axis(
+                diffusion_coords.detach(),
+                batch_size,
+                num_samples,
+            ),
+            distogram_logits=representations.distogram_logits.detach(),
             plddt_logits=_unflatten_optional_sample_axis(
                 cast(Tensor | None, confidence_logits["plddt_logits"]), batch_size, num_samples
             ),
@@ -469,7 +623,14 @@ class Boltz1Model(Model):
             confidence_scores=confidence_scores,
         )
 
-    def _trunk(self, input: Boltz1Input, *, recycling_steps: int | None = None) -> _Boltz1TrunkOutput:
+    def _run_trunk(
+        self,
+        input: Boltz1Input,
+        *,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> _Boltz1TrunkOutput:
         r"""
         Iterate the recycling loop: recycle-project the running single/pair, fold in the MSA module (when
         present), and run the Pairformer for ``recycling_steps`` total passes.
@@ -477,6 +638,9 @@ class Boltz1Model(Model):
         Args:
             input: The Boltz-1 input batch.
             recycling_steps: Total number of trunk passes; defaults to the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation.
+            generator: Optional generator advanced by each MSA row sample.
 
         Returns:
             The final trunk [`_Boltz1TrunkOutput`][ofoldx.models.boltz1.model._Boltz1TrunkOutput].
@@ -499,7 +663,7 @@ class Boltz1Model(Model):
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
                 if input.msa_tokens is not None:
-                    pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
+                    pair = pair + cast(Boltz1MsaTrunk, self.msa_trunk)(
                         pair,
                         single_inputs,
                         msa_tokens=input.msa_tokens,
@@ -508,8 +672,16 @@ class Boltz1Model(Model):
                         is_paired=cast(Tensor, input.msa_paired),
                         msa_mask=cast(Tensor, input.msa_mask),
                         token_mask=token_mask,
+                        msa_max_depth=msa_max_depth,
+                        generator=generator,
                     )
-                single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+                if self.pairformer_stack is not None:
+                    single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+                else:
+                    pair = cast(Boltz1TrianglePairUpdateStack, self.pair_update_stack)(
+                        pair,
+                        pair_mask=pair_mask,
+                    )
 
         return _Boltz1TrunkOutput(
             single_inputs=single_inputs,
@@ -570,6 +742,7 @@ class Boltz1Model(Model):
         input: Boltz1Input,
         *,
         num_sampling_steps: int | None,
+        step_scale: float | None,
         num_samples: int,
         generator: torch.Generator | None,
         use_potentials: bool = False,
@@ -580,9 +753,10 @@ class Boltz1Model(Model):
 
         Args:
             representations: The trunk representations from
-                [`_trunk`][ofoldx.models.boltz1.model.Boltz1Model._trunk].
+                [`_run_trunk`][ofoldx.models.boltz1.model.Boltz1Model._run_trunk].
             input: The Boltz-1 input batch.
             num_sampling_steps: Number of reverse-diffusion steps; defaults to the sampler config.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
             num_samples: Number of samples (sampler ``multiplicity``).
             generator: Optional RNG for reproducible sampling noise.
             use_potentials: Whether to enable Boltz-1x physical-potential steering.
@@ -592,7 +766,11 @@ class Boltz1Model(Model):
             Sampled coords and, when confidence single-diffusion is enabled, the accumulated token representation.
         """
 
-        conditioning = self._denoiser_conditioning(representations, input)
+        with torch.no_grad():
+            conditioning = self._build_denoiser_conditioning(
+                representations,
+                input,
+            )
         steering = {} if steering_args is None else dict(steering_args)
         if use_potentials:
             steering["fk_steering"] = True
@@ -607,6 +785,7 @@ class Boltz1Model(Model):
         sample = self.coordinate_diffusion._sample(
             input.atom_mask,
             num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
             multiplicity=num_samples,
             generator=generator,
             return_token_repr=return_token_repr,
@@ -622,7 +801,11 @@ class Boltz1Model(Model):
             return cast(tuple[Tensor, Tensor], sample)
         return cast(Tensor, sample), None
 
-    def _denoiser_conditioning(self, representations: _Boltz1TrunkOutput, input: Boltz1Input) -> dict[str, Tensor]:
+    def _build_denoiser_conditioning(
+        self,
+        representations: _Boltz1TrunkOutput,
+        input: Boltz1Input,
+    ) -> dict[str, Tensor]:
         r"""
         Precompute the per-structure diffusion conditioning reused by every denoiser call.
 
@@ -631,7 +814,7 @@ class Boltz1Model(Model):
 
         Args:
             representations: The trunk representations from
-                [`_trunk`][ofoldx.models.boltz1.model.Boltz1Model._trunk].
+                [`_run_trunk`][ofoldx.models.boltz1.model.Boltz1Model._run_trunk].
             input: The Boltz-1 input batch.
 
         Returns:
@@ -674,7 +857,7 @@ class Boltz1InputEmbeddings(nn.Module):
         self.input_size = input_size
         self.single_size = single_size
         self.atom_encoder: Boltz1AtomEncoder | None = None
-        self.atom_pair_bias_projection: Boltz1PerBlockPairBiasProjection | None = None
+        self.atom_pair_bias_projection: PerBlockPairBiasProjection | None = None
         self.atom_attention_encoder: PackedAtomToTokenEncoder | None = None
         if use_atom_encoder:
             self.atom_encoder = Boltz1AtomEncoder(
@@ -684,10 +867,11 @@ class Boltz1InputEmbeddings(nn.Module):
                 num_query_atoms=num_query_atoms,
                 num_key_atoms=num_key_atoms,
             )
-            self.atom_pair_bias_projection = Boltz1PerBlockPairBiasProjection(
+            self.atom_pair_bias_projection = PerBlockPairBiasProjection(
                 pair_size=atom_pair_hidden_size,
                 num_blocks=num_atom_encoder_blocks,
                 num_attention_heads=num_atom_encoder_attention_heads,
+                backend=backend,
             )
             self.atom_attention_encoder = PackedAtomToTokenEncoder(
                 atom_hidden_size=atom_hidden_size,
@@ -731,7 +915,7 @@ class Boltz1InputEmbeddings(nn.Module):
             token_from_atom = cast(PackedAtomToTokenEncoder, atom_attention_encoder)(
                 atom_query,
                 atom_conditioning,
-                cast(Boltz1PerBlockPairBiasProjection, atom_pair_bias_projection)(atom_pair),
+                cast(PerBlockPairBiasProjection, atom_pair_bias_projection)(atom_pair),
                 atom_mask,
                 atom_to_token,
                 residue_type_features.shape[-2],
@@ -751,6 +935,333 @@ class Boltz1InputEmbeddings(nn.Module):
             dim=-1,
         )
         return single
+
+
+class Boltz1MsaTrunk(nn.Module):
+    r"""
+    Build Boltz-1 MSA features and refine the pair representation.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        msa_size: int = 64,
+        num_blocks: int = 4,
+        vocab_size: int = 33,
+        use_paired_feature: bool = False,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.use_paired_feature = use_paired_feature
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
+        self.msa_projection = nn.Linear(
+            vocab_size + 2 + int(use_paired_feature),
+            msa_size,
+            bias=False,
+        )
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            Boltz1MsaBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                num_msa_attention_heads=num_msa_attention_heads,
+                msa_head_dim=msa_head_dim,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(
+        self,
+        pair: Tensor,
+        single_inputs: Tensor,
+        *,
+        msa_tokens: Tensor,
+        has_deletion: Tensor,
+        deletion_value: Tensor,
+        is_paired: Tensor,
+        msa_mask: Tensor,
+        token_mask: Tensor,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        if msa_max_depth is not None:
+            msa_max_depth = operator.index(msa_max_depth)
+            if msa_max_depth < 1:
+                raise ValueError("msa_max_depth must be positive")
+            indices = torch.randperm(
+                msa_tokens.shape[1],
+                device=msa_tokens.device,
+                generator=generator,
+            )[:msa_max_depth]
+            msa_tokens = msa_tokens[:, indices]
+            has_deletion = has_deletion[:, indices]
+            deletion_value = deletion_value[:, indices]
+            is_paired = is_paired[:, indices]
+            msa_mask = msa_mask[:, indices]
+        features = [
+            F.one_hot(msa_tokens, num_classes=self.vocab_size).to(pair.dtype),
+            has_deletion.unsqueeze(-1).to(pair.dtype),
+            deletion_value.unsqueeze(-1).to(pair.dtype),
+        ]
+        if self.use_paired_feature:
+            features.append(is_paired.unsqueeze(-1).to(pair.dtype))
+        msa = self.msa_projection(torch.cat(features, dim=-1))
+        msa = msa + self.token_projection(single_inputs).unsqueeze(1)
+        pair_mask = pair_mask_from_token_mask(token_mask)
+        for block in self.blocks:
+            pair, msa = block(pair, msa, pair_mask, msa_mask)
+        return pair
+
+
+class Boltz1MsaBlock(nn.Module):
+    r"""
+    One Boltz-1 MSA block with scalar dropout per MSA row.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        outer_product_hidden_size: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
+        num_msa_attention_heads: int = 8,
+        msa_head_dim: int = 32,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_weighted_averaging = MsaPairWeightedAveraging(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_msa_attention_heads,
+            head_dim=msa_head_dim,
+            backend=backend,
+        )
+        self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
+        self.outer_product_mean = OuterProductMean(
+            msa_size=msa_size,
+            hidden_size=outer_product_hidden_size,
+            pair_size=pair_size,
+            backend=backend,
+        )
+        self.triangle_pair_update = Boltz1TrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=pair_dropout,
+            backend=backend,
+        )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
+
+    def forward(
+        self,
+        pair: Tensor,
+        msa: Tensor,
+        pair_mask: Tensor,
+        msa_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        msa = msa + self.msa_dropout(self.pair_weighted_averaging(msa, pair, pair_mask=pair_mask))
+        msa = msa + self.msa_transition(msa)
+        pair = pair + self.outer_product_mean(msa, msa_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
+        return pair, msa
+
+
+class Boltz1PairformerStack(nn.Module):
+    r"""
+    Homogeneous stack of Boltz-1 Pairformer blocks.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            Boltz1PairformerBlock(
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            single, pair = block(single, pair, pair_mask=pair_mask)
+        return single, pair
+
+
+class Boltz1PairformerBlock(nn.Module):
+    r"""
+    One Boltz-1 Pairformer block.
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pair_update = Boltz1TrianglePairUpdateBlock(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            backend=backend,
+        )
+        self.pair_attention = PairBiasedSelfAttention(
+            hidden_size=single_size,
+            pair_size=pair_size,
+            num_attention_heads=num_pair_attention_heads,
+            backend=backend,
+        )
+        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
+
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        pair = self.pair_update(pair, pair_mask=pair_mask)
+        single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
+        single = single + self.single_transition(single)
+        return single, pair
+
+
+class Boltz1TrianglePairUpdateStack(nn.Module):
+    r"""
+    Homogeneous stack of Boltz-1 pair-only triangle update blocks.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            Boltz1TrianglePairUpdateBlock(
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                expansion=expansion,
+                dropout=dropout,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        for block in self.blocks:
+            pair = block(pair, pair_mask=pair_mask)
+        return pair
+
+
+class Boltz1TrianglePairUpdateBlock(nn.Module):
+    r"""
+    Boltz-1 pair update with one dropout scalar per pair row or column.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.triangle_multiplication_outgoing = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
+            backend=backend,
+        )
+        self.triangle_multiplication_incoming = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            backend=backend,
+        )
+        self.triangle_attention_starting_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
+        self.triangle_attention_ending_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
+        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
+        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
+        ending_update = self.triangle_attention_ending_node(
+            pair.transpose(-3, -2),
+            pair_mask=end_pair_mask,
+        ).transpose(-3, -2)
+        pair = pair + self.columnwise_dropout(ending_update)
+        return pair + self.transition(pair)
 
 
 class Boltz1AtomEncoder(nn.Module):
@@ -865,6 +1376,598 @@ class Boltz1AtomEncoder(nn.Module):
             prefix_ndim=1,
         )
         return atom_query, atom_single, atom_pair
+
+
+class Boltz1DenoiserConditioning(nn.Module):
+    r"""
+    Precompute the diffusion conditioning shared across denoiser calls (Boltz DiffusionConditioning).
+    """
+
+    def __init__(
+        self,
+        single_size: int = 384,
+        pair_size: int = 128,
+        atom_hidden_size: int = 128,
+        atom_pair_hidden_size: int = 16,
+        atom_feature_size: int = 128,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        num_atom_decoder_blocks: int = 3,
+        num_atom_decoder_attention_heads: int = 4,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 16,
+        num_conditioning_transitions: int = 2,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.pairwise_conditioner = PairwiseConditioning(
+            pair_size=pair_size,
+            relative_position_size=pair_size,
+            num_transitions=num_conditioning_transitions,
+            backend=backend,
+        )
+        self.atom_encoder = Boltz1DenoiserAtomEncoder(
+            atom_feature_size=atom_feature_size,
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            single_size=single_size,
+            pair_size=pair_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.atom_encoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
+            backend=backend,
+        )
+        self.atom_decoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
+            backend=backend,
+        )
+        self.token_encoder_pair_bias_projection = PerBlockPairBiasProjection(
+            pair_size=pair_size,
+            num_blocks=num_token_encoder_blocks,
+            num_attention_heads=num_token_encoder_attention_heads,
+            backend=backend,
+        )
+
+    def forward(
+        self,
+        single_trunk: Tensor,
+        pair_trunk: Tensor,
+        relative_position_encoding: Tensor,
+        *,
+        atom_features: Tensor,
+        reference_positions: Tensor,
+        atom_mask: Tensor,
+        reference_space_id: Tensor,
+        atom_to_token: Tensor,
+    ) -> dict[str, Tensor]:
+        pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
+        atom_query, atom_conditioning, atom_pair = self.atom_encoder(
+            atom_features,
+            reference_positions,
+            atom_mask,
+            reference_space_id,
+            atom_to_token=atom_to_token,
+            single_trunk=single_trunk,
+            pair_trunk=pair,
+        )
+        atom_enc_bias = self.atom_encoder_pair_bias_projection(atom_pair)
+        atom_dec_bias = self.atom_decoder_pair_bias_projection(atom_pair)
+        token_encoder_bias = self.token_encoder_pair_bias_projection(pair)
+        return {
+            "atom_query": atom_query,
+            "atom_conditioning": atom_conditioning,
+            "atom_enc_bias": atom_enc_bias,
+            "atom_dec_bias": atom_dec_bias,
+            "token_encoder_bias": token_encoder_bias,
+        }
+
+
+class Boltz1Denoiser(nn.Module):
+    r"""
+    Boltz-1 EDM score network with the wider Boltz-1 ``s_inputs`` conditioning width.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_size: int,
+        single_size: int = 384,
+        atom_hidden_size: int = 128,
+        fourier_embedding_size: int = 256,
+        num_query_atoms: int = 32,
+        num_key_atoms: int = 128,
+        num_atom_encoder_blocks: int = 3,
+        num_atom_encoder_attention_heads: int = 4,
+        num_token_encoder_blocks: int = 24,
+        num_token_encoder_attention_heads: int = 8,
+        num_atom_decoder_blocks: int = 3,
+        num_atom_decoder_attention_heads: int = 4,
+        num_conditioning_transitions: int = 2,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        hidden = 2 * single_size
+        self.single_conditioner = Boltz1SingleConditioning(
+            input_size=input_size,
+            single_size=single_size,
+            fourier_embedding_size=fourier_embedding_size,
+            num_conditioning_transitions=num_conditioning_transitions,
+            backend=backend,
+        )
+        self.atom_attention_encoder = PackedDenoisingAtomToTokenEncoder(
+            atom_hidden_size=atom_hidden_size,
+            token_hidden_size=single_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            num_blocks=num_atom_encoder_blocks,
+            num_attention_heads=num_atom_encoder_attention_heads,
+            backend=backend,
+        )
+        self.single_to_token_norm = LayerNorm(hidden, backend=backend)
+        self.single_to_token_projection = nn.Linear(hidden, hidden, bias=False)
+        self.token_encoder = ConditionedTransformerEncoder(
+            num_blocks=num_token_encoder_blocks,
+            num_attention_heads=num_token_encoder_attention_heads,
+            hidden_size=hidden,
+            conditioning_size=hidden,
+            backend=backend,
+        )
+        self.token_norm = LayerNorm(hidden, backend=backend)
+        self.atom_attention_decoder = PackedTokenToAtomDecoder(
+            atom_hidden_size=atom_hidden_size,
+            token_hidden_size=single_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            num_blocks=num_atom_decoder_blocks,
+            num_attention_heads=num_atom_decoder_attention_heads,
+            backend=backend,
+        )
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single_trunk: Tensor,
+        noisy_positions: Tensor,
+        noise_level: Tensor,
+        conditioning: dict[str, Tensor],
+        *,
+        atom_mask: Tensor,
+        atom_to_token: Tensor,
+        token_mask: Tensor,
+        multiplicity: int = 1,
+        return_token_repr: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        single, _ = self.single_conditioner(
+            noise_level,
+            single_trunk.repeat_interleave(multiplicity, 0),
+            single_inputs.repeat_interleave(multiplicity, 0),
+        )
+        token_repr, atom_skip, conditioning_skip = self.atom_attention_encoder(
+            conditioning["atom_query"],
+            conditioning["atom_conditioning"],
+            conditioning["atom_enc_bias"].repeat_interleave(multiplicity, 0),
+            atom_mask,
+            atom_to_token,
+            token_mask.shape[-1],
+            noisy_positions=noisy_positions,
+            multiplicity=multiplicity,
+        )
+        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
+        token_repr = self.token_encoder(
+            token_repr,
+            single,
+            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
+            token_mask.repeat_interleave(multiplicity, 0).float(),
+        )
+        token_repr = self.token_norm(token_repr)
+        coordinate_update = self.atom_attention_decoder(
+            token_repr,
+            atom_skip,
+            conditioning_skip,
+            conditioning["atom_dec_bias"].repeat_interleave(multiplicity, 0),
+            atom_mask,
+            atom_to_token,
+            multiplicity=multiplicity,
+        )
+        if return_token_repr:
+            return coordinate_update, token_repr
+        return coordinate_update
+
+
+class Boltz1CoordinateDiffusion(nn.Module):
+    r"""
+    Boltz-1 EDM sampler that can accumulate and surface the final diffusion token representation.
+    """
+
+    def __init__(
+        self,
+        denoiser: Boltz1Denoiser,
+        sigma_data: float = 16.0,
+        min_noise_level: float = 4e-4,
+        max_noise_level: float = 160.0,
+        rho: float = 8.0,
+        churn_rate: float = 0.605,
+        min_churn_noise_level: float = 1.107,
+        noise_scale: float = 0.901,
+        step_scale: float = 1.638,
+        num_sampling_steps: int = 200,
+        alignment_reverse_diff: bool = True,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        *,
+        accumulate_token_repr: bool = False,
+        token_size: int = 384,
+        fourier_embedding_size: int = 256,
+    ) -> None:
+        super().__init__()
+        self.denoiser = denoiser
+        self.sigma_data = sigma_data
+        self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.min_noise_level = min_noise_level
+        self.max_noise_level = max_noise_level
+        self.rho = rho
+        self.churn_rate = churn_rate
+        self.min_churn_noise_level = min_churn_noise_level
+        self.noise_scale = noise_scale
+        self.step_scale = step_scale
+        self.num_sampling_steps = num_sampling_steps
+        self.alignment_reverse_diff = alignment_reverse_diff
+        self.noise_log_mean = noise_log_mean
+        self.noise_log_std = noise_log_std
+        self.output_token_feature_update: Boltz1OutputTokenFeatureUpdate | None = None
+        if accumulate_token_repr:
+            self.output_token_feature_update = Boltz1OutputTokenFeatureUpdate(
+                token_size=token_size, fourier_embedding_size=fourier_embedding_size
+            )
+
+    def noise_distribution(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        log_mean: float | None = None,
+        log_std: float | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        log_mean = self.noise_log_mean if log_mean is None else log_mean
+        log_std = self.noise_log_std if log_std is None else log_std
+        normal = torch.empty(batch_size, device=device, dtype=dtype).normal_(generator=generator)
+        return self.sigma_data * (log_mean + log_std * normal).exp()
+
+    def loss_weight(self, sigma: Tensor) -> Tensor:
+        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
+
+    def sample_schedule(
+        self,
+        num_sampling_steps: int | None = None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        steps = operator.index(self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps)
+        if steps < 1:
+            raise ValueError("num_sampling_steps must be positive")
+        inv_rho = 1 / self.rho
+        # `steps` is the number of sampling steps (transitions); the trailing pad adds the final sigma=0.
+        # Clamp the divisor so a single step mirrors the AF3 scheduler (ramp [0] -> a lone max_noise_level, then 0)
+        # instead of dividing by zero; for steps >= 2 the divisor is steps - 1 exactly, so the schedule is unchanged.
+        ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
+        sigmas = (
+            self.max_noise_level**inv_rho + ramp * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
+        ) ** self.rho
+        sigmas = sigmas * self.sigma_data
+        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
+
+    def preconditioned_network_forward(
+        self,
+        noisy_coordinates: Tensor,
+        sigma: Tensor | float,
+        *,
+        multiplicity: int = 1,
+        return_token_repr: bool = False,
+        **conditioning: object,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        batch = noisy_coordinates.shape[0]
+        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
+        padded = sigma.reshape(batch, 1, 1)
+        update = self.denoiser(
+            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
+            noise_level=self.preconditioner.c_noise(sigma),
+            multiplicity=multiplicity,
+            return_token_repr=return_token_repr,
+            **conditioning,
+        )
+        if return_token_repr:
+            update, token_repr = cast(tuple[Tensor, Tensor], update)
+        else:
+            update = cast(Tensor, update)
+        denoised = self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
+        if return_token_repr:
+            return denoised, token_repr
+        return denoised
+
+    def denoise_training(
+        self,
+        target_coordinates: Tensor,
+        atom_mask: Tensor,
+        *,
+        target_mask: Tensor,
+        multiplicity: int = 1,
+        synchronize_noise_levels: bool = True,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        generator: torch.Generator | None = None,
+        single_inputs: Tensor,
+        single_trunk: Tensor,
+        conditioning: dict[str, Tensor],
+        atom_to_token: Tensor,
+        token_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        dtype, device = single_trunk.dtype, single_trunk.device
+        target = target_coordinates.to(dtype=dtype, device=device).repeat_interleave(
+            multiplicity,
+            0,
+        )
+        resolved = target_mask.to(dtype=dtype, device=device)
+        resolved = resolved.repeat_interleave(multiplicity, 0)
+        sample_batch_size = target.shape[0]
+        noise_batch_size = target_coordinates.shape[0] if synchronize_noise_levels else sample_batch_size
+        noise_level = self.noise_distribution(
+            noise_batch_size,
+            device=device,
+            dtype=dtype,
+            log_mean=noise_log_mean,
+            log_std=noise_log_std,
+            generator=generator,
+        )
+        if synchronize_noise_levels:
+            noise_level = noise_level.repeat_interleave(multiplicity)
+        augmented_target_coordinates = self._augment_target(
+            target,
+            resolved,
+            coordinate_augmentation=coordinate_augmentation,
+            translation_scale=augmentation_translation_scale,
+            generator=generator,
+        )
+        noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * noise
+        denoised_coordinates = self.preconditioned_network_forward(
+            noisy_coordinates,
+            noise_level,
+            multiplicity=multiplicity,
+            atom_mask=atom_mask,
+            return_token_repr=False,
+            single_inputs=single_inputs,
+            single_trunk=single_trunk,
+            conditioning=conditioning,
+            atom_to_token=atom_to_token,
+            token_mask=token_mask,
+        )
+        return cast(Tensor, denoised_coordinates), augmented_target_coordinates, noise_level
+
+    def _augment_target(
+        self,
+        coords: Tensor,
+        mask: Tensor,
+        *,
+        coordinate_augmentation: bool,
+        translation_scale: float,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        weight = mask[..., None]
+        centroid = (coords * weight).sum(-2, keepdim=True) / weight.sum(-2, keepdim=True).clamp_min(1.0)
+        coords = coords - centroid
+        if not coordinate_augmentation:
+            return coords
+        rotation = uniform_random_rotation(
+            coords.shape[0], device=coords.device, dtype=coords.dtype, generator=generator
+        )
+        translation = torch.empty(coords.shape[0], 1, 3, device=coords.device, dtype=coords.dtype).normal_(
+            generator=generator
+        )
+        return torch.einsum("bmd,bds->bms", coords, rotation) + translation_scale * translation
+
+    def _sample(
+        self,
+        atom_mask: Tensor,
+        *,
+        num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        multiplicity: int = 1,
+        generator: torch.Generator | None = None,
+        return_token_repr: bool = False,
+        steering_args: Mapping[str, object],
+        **conditioning: object,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        single_trunk = cast(Tensor, conditioning["single_trunk"])
+        device, dtype = single_trunk.device, single_trunk.dtype
+        step_scale = self.step_scale if step_scale is None else step_scale
+        feats = cast(dict[str, Tensor] | None, conditioning.pop("feats", None))
+        steering = dict(steering_args)
+        potentials = (
+            _boltz1_potentials(steering)
+            if bool(steering["fk_steering"] or steering["physical_guidance_update"])
+            else ()
+        )
+        num_particles = int(cast(float | int | str, steering["num_particles"]))
+        requested_multiplicity = multiplicity
+        effective_multiplicity = multiplicity * num_particles if bool(steering["fk_steering"]) else multiplicity
+        base_atom_mask = atom_mask
+        expanded_atom_mask = atom_mask.repeat_interleave(effective_multiplicity, 0)
+        shape = (*expanded_atom_mask.shape, 3)
+        sigmas = self.sample_schedule(num_sampling_steps, device=device, dtype=dtype)
+        gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
+
+        def randn() -> Tensor:
+            r"""
+            Draw standard-normal noise of the expanded coordinate ``shape`` on the sampler device/generator.
+            """
+
+            return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+
+        coords = sigmas[0] * randn()
+        if bool(steering["fk_steering"]):
+            num_groups = atom_mask.shape[0] * requested_multiplicity
+            energy_traj = torch.empty((expanded_atom_mask.shape[0], 0), device=device, dtype=dtype)
+            resample_weights = torch.ones(num_groups, num_particles, device=device, dtype=dtype)
+        else:
+            energy_traj = torch.empty((0, 0), device=device, dtype=dtype)
+            resample_weights = torch.empty((0, 0), device=device, dtype=dtype)
+        if bool(steering["physical_guidance_update"]):
+            scaled_guidance_update = torch.zeros(shape, dtype=dtype, device=device)
+        else:
+            scaled_guidance_update = None
+        denoised = None
+        token_repr = None
+        token_a = None
+        # Potential guidance interleaves particle resampling, coordinate updates,
+        # and token-feature accumulation with the reverse-diffusion steps.
+        # Keep the schedule scalars as tensors. The Python loop fixes the number of denoising calls, while the
+        # per-step tensor math remains free of host synchronizations on the ordinary (unsteered) sampling path.
+        for index in range(len(sigmas) - 1):
+            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
+            rotation = uniform_random_rotation(
+                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
+            )
+            translation = torch.randn(
+                expanded_atom_mask.shape[0],
+                1,
+                3,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            coords = torch.einsum("bmd,bds->bms", coords - coords.mean(-2, keepdim=True), rotation) + translation
+            if denoised is not None:
+                denoised = (
+                    torch.einsum("bmd,bds->bms", denoised - denoised.mean(-2, keepdim=True), rotation) + translation
+                )
+            if scaled_guidance_update is not None:
+                scaled_guidance_update = torch.einsum("bmd,bds->bms", scaled_guidance_update, rotation)
+
+            sigma_hat = sigma_current * (1 + gamma)
+            steering_t = 1.0 - (index / max(len(sigmas) - 1, 1))
+            # Compute schedule-derived churn and reverse-step scalars in float64 to prevent cumulative rounding
+            # drift. The score network still receives float32 ``sigma_hat``; scalar tensors stay on-device so the
+            # sampling loop remains graph-break-free.
+            sigma_current_hp = sigma_current.double()
+            sigma_hat_hp = sigma_current_hp * (1 + gamma.double())
+            sigma_next_hp = sigma_next.double()
+            noise_var = self.noise_scale**2 * (sigma_hat_hp**2 - sigma_current_hp**2)
+            noisy = coords + torch.sqrt(torch.clamp(noise_var, min=0.0)).to(coords.dtype) * randn()
+            with torch.no_grad():
+                denoised_out = self.preconditioned_network_forward(
+                    noisy,
+                    sigma_hat,
+                    multiplicity=effective_multiplicity,
+                    atom_mask=base_atom_mask,
+                    return_token_repr=return_token_repr,
+                    **conditioning,
+                )
+            if return_token_repr:
+                denoised, token_a = cast(tuple[Tensor, Tensor], denoised_out)
+                token_a = token_a.detach()
+            else:
+                denoised = cast(Tensor, denoised_out)
+
+            should_resample = bool(steering["fk_steering"]) and (
+                (index % int(cast(float | int | str, steering["fk_resampling_interval"])) == 0 and noise_var > 0)
+                or index == len(sigmas) - 2
+            )
+            if should_resample:
+                energy = torch.zeros(denoised.shape[0], device=device, dtype=denoised.dtype)
+                for potential in potentials:
+                    parameters = potential.compute_parameters(steering_t)
+                    if float(parameters["resampling_weight"]) > 0:
+                        energy = energy + float(parameters["resampling_weight"]) * potential.compute(
+                            denoised,
+                            cast(dict[str, Tensor], feats),
+                            parameters,
+                        )
+                energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
+                log_g = -energy if energy_traj.shape[1] == 1 else energy_traj[:, -2] - energy_traj[:, -1]
+                if scaled_guidance_update is not None and noise_var > 0:
+                    ll_difference = ((noisy - coords) ** 2 - (noisy - coords + scaled_guidance_update) ** 2).sum(
+                        dim=(-1, -2)
+                    ) / (2 * noise_var)
+                else:
+                    ll_difference = torch.zeros_like(energy)
+                resample_weights = torch.softmax(
+                    (ll_difference + float(cast(float | int | str, steering["fk_lambda"])) * log_g).reshape(
+                        -1, num_particles
+                    ),
+                    dim=1,
+                )
+
+            if bool(steering["physical_guidance_update"]) and index < len(sigmas) - 2:
+                guidance_update = torch.zeros_like(denoised)
+                for guidance_step in range(int(cast(float | int | str, steering["num_gd_steps"]))):
+                    energy_gradient = torch.zeros_like(denoised)
+                    for potential in potentials:
+                        parameters = potential.compute_parameters(steering_t)
+                        interval = max(int(parameters["guidance_interval"]), 1)
+                        if float(parameters["guidance_weight"]) > 0 and guidance_step % interval == 0:
+                            energy_gradient = energy_gradient + float(
+                                parameters["guidance_weight"]
+                            ) * potential.compute_gradient(
+                                denoised + guidance_update, cast(dict[str, Tensor], feats), parameters
+                            )
+                    guidance_update = guidance_update - energy_gradient
+                denoised = denoised + guidance_update
+                scaled_guidance_update = guidance_update * -step_scale * (sigma_next - sigma_hat) / sigma_hat
+
+            if should_resample:
+                sample_count = num_particles if index < len(sigmas) - 2 else 1
+                resample_indices = (
+                    torch.multinomial(resample_weights, sample_count, replacement=True, generator=generator)
+                    + num_particles * torch.arange(resample_weights.shape[0], device=device).unsqueeze(-1)
+                ).flatten()
+                coords = coords[resample_indices]
+                noisy = noisy[resample_indices]
+                expanded_atom_mask = expanded_atom_mask[resample_indices]
+                denoised = denoised[resample_indices]
+                energy_traj = energy_traj[resample_indices]
+                if scaled_guidance_update is not None:
+                    scaled_guidance_update = scaled_guidance_update[resample_indices]
+                if token_repr is not None:
+                    token_repr = token_repr[resample_indices]
+                if token_a is not None:
+                    token_a = token_a[resample_indices]
+                if index == len(sigmas) - 2:
+                    effective_multiplicity = requested_multiplicity
+            output_token_feature_update = self.output_token_feature_update
+            if output_token_feature_update is not None:
+                if token_repr is None:
+                    token_repr = torch.zeros_like(cast(Tensor, token_a))
+                token_a = cast(Tensor, token_a)
+                sigma = torch.full((token_a.shape[0],), sigma_hat, device=token_a.device, dtype=token_a.dtype)
+                token_repr = output_token_feature_update(
+                    noise_level=self.preconditioner.c_noise(sigma),
+                    accumulated=token_repr,
+                    next_repr=token_a,
+                )
+            elif token_a is not None:
+                token_repr = token_a
+            if self.alignment_reverse_diff:
+                noisy = weighted_rigid_align(
+                    source=noisy,
+                    target=denoised,
+                    weight=expanded_atom_mask,
+                )
+            derivative = (noisy - denoised) / sigma_hat_hp
+            coords = (noisy + step_scale * (sigma_next_hp - sigma_hat_hp) * derivative).to(coords.dtype)
+        return (coords, token_repr) if return_token_repr else coords
 
 
 class Boltz1DenoiserAtomEncoder(nn.Module):
@@ -995,258 +2098,6 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
         return atom_query, atom_single, atom_pair
 
 
-class Boltz1DenoiserConditioning(nn.Module):
-    r"""
-    Precompute the diffusion conditioning shared across denoiser calls (Boltz DiffusionConditioning).
-    """
-
-    def __init__(
-        self,
-        single_size: int = 384,
-        pair_size: int = 128,
-        atom_hidden_size: int = 128,
-        atom_pair_hidden_size: int = 16,
-        atom_feature_size: int = 128,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        num_token_encoder_blocks: int = 24,
-        num_token_encoder_attention_heads: int = 16,
-        num_conditioning_transitions: int = 2,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.pairwise_conditioner = PairwiseConditioning(
-            pair_size=pair_size,
-            relative_position_size=pair_size,
-            num_transitions=num_conditioning_transitions,
-            backend=backend,
-        )
-        self.atom_encoder = Boltz1DenoiserAtomEncoder(
-            atom_feature_size=atom_feature_size,
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            single_size=single_size,
-            pair_size=pair_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.atom_encoder_pair_norms = nn.ModuleList(
-            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_encoder_blocks)
-        )
-        self.atom_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(atom_pair_hidden_size, num_atom_encoder_attention_heads, bias=False)
-            for _ in range(num_atom_encoder_blocks)
-        )
-        self.atom_decoder_pair_norms = nn.ModuleList(
-            LayerNorm(atom_pair_hidden_size, backend=backend) for _ in range(num_atom_decoder_blocks)
-        )
-        self.atom_decoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(atom_pair_hidden_size, num_atom_decoder_attention_heads, bias=False)
-            for _ in range(num_atom_decoder_blocks)
-        )
-        self.token_encoder_pair_norms = nn.ModuleList(
-            LayerNorm(pair_size, backend=backend) for _ in range(num_token_encoder_blocks)
-        )
-        self.token_encoder_pair_bias_projections = nn.ModuleList(
-            nn.Linear(pair_size, num_token_encoder_attention_heads, bias=False) for _ in range(num_token_encoder_blocks)
-        )
-
-    def forward(
-        self,
-        single_trunk: Tensor,
-        pair_trunk: Tensor,
-        relative_position_encoding: Tensor,
-        *,
-        atom_features: Tensor,
-        reference_positions: Tensor,
-        atom_mask: Tensor,
-        reference_space_id: Tensor,
-        atom_to_token: Tensor,
-    ) -> dict[str, Tensor]:
-        pair = self.pairwise_conditioner(pair_trunk, relative_position_encoding)
-        atom_query, atom_conditioning, atom_pair = self.atom_encoder(
-            atom_features,
-            reference_positions,
-            atom_mask,
-            reference_space_id,
-            atom_to_token=atom_to_token,
-            single_trunk=single_trunk,
-            pair_trunk=pair,
-        )
-        atom_enc_bias = torch.cat(
-            [
-                projection(norm(atom_pair))
-                for norm, projection in zip(
-                    self.atom_encoder_pair_norms,
-                    self.atom_encoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        atom_dec_bias = torch.cat(
-            [
-                projection(norm(atom_pair))
-                for norm, projection in zip(
-                    self.atom_decoder_pair_norms,
-                    self.atom_decoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        token_encoder_bias = torch.cat(
-            [
-                projection(norm(pair))
-                for norm, projection in zip(
-                    self.token_encoder_pair_norms,
-                    self.token_encoder_pair_bias_projections,
-                )
-            ],
-            dim=-1,
-        )
-        return {
-            "atom_query": atom_query,
-            "atom_conditioning": atom_conditioning,
-            "atom_enc_bias": atom_enc_bias,
-            "atom_dec_bias": atom_dec_bias,
-            "token_encoder_bias": token_encoder_bias,
-        }
-
-
-class Boltz1PerBlockPairBiasProjection(nn.Module):
-    r"""
-    Project a raw pair representation to one packed per-block/head attention bias tensor.
-    """
-
-    def __init__(self, *, pair_size: int, num_blocks: int, num_attention_heads: int) -> None:
-        super().__init__()
-        self.pair_norms = nn.ModuleList(LayerNorm(pair_size) for _ in range(num_blocks))
-        self.bias_projections = nn.ModuleList(
-            nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
-        )
-
-    def forward(self, pair: Tensor) -> Tensor:
-        return torch.cat(
-            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
-            dim=-1,
-        )
-
-
-class Boltz1Denoiser(nn.Module):
-    r"""
-    Boltz-1 EDM score network with the wider Boltz-1 ``s_inputs`` conditioning width.
-    """
-
-    def __init__(
-        self,
-        *,
-        input_size: int,
-        single_size: int = 384,
-        atom_hidden_size: int = 128,
-        fourier_embedding_size: int = 256,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        num_atom_encoder_blocks: int = 3,
-        num_atom_encoder_attention_heads: int = 4,
-        num_token_encoder_blocks: int = 24,
-        num_token_encoder_attention_heads: int = 8,
-        num_atom_decoder_blocks: int = 3,
-        num_atom_decoder_attention_heads: int = 4,
-        num_conditioning_transitions: int = 2,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        hidden = 2 * single_size
-        self.single_conditioner = Boltz1SingleConditioning(
-            input_size=input_size,
-            single_size=single_size,
-            fourier_embedding_size=fourier_embedding_size,
-            num_conditioning_transitions=num_conditioning_transitions,
-            backend=backend,
-        )
-        self.atom_attention_encoder = PackedDenoisingAtomToTokenEncoder(
-            atom_hidden_size=atom_hidden_size,
-            token_hidden_size=single_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            num_blocks=num_atom_encoder_blocks,
-            num_attention_heads=num_atom_encoder_attention_heads,
-            backend=backend,
-        )
-        self.single_to_token_norm = LayerNorm(hidden, backend=backend)
-        self.single_to_token_projection = nn.Linear(hidden, hidden, bias=False)
-        self.token_encoder = ConditionedTransformerEncoder(
-            num_blocks=num_token_encoder_blocks,
-            num_attention_heads=num_token_encoder_attention_heads,
-            hidden_size=hidden,
-            conditioning_size=hidden,
-            backend=backend,
-        )
-        self.token_norm = LayerNorm(hidden, backend=backend)
-        self.atom_attention_decoder = PackedTokenToAtomDecoder(
-            atom_hidden_size=atom_hidden_size,
-            token_hidden_size=single_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            num_blocks=num_atom_decoder_blocks,
-            num_attention_heads=num_atom_decoder_attention_heads,
-            backend=backend,
-        )
-
-    def forward(
-        self,
-        single_inputs: Tensor,
-        single_trunk: Tensor,
-        noisy_positions: Tensor,
-        noise_level: Tensor,
-        conditioning: dict[str, Tensor],
-        *,
-        atom_mask: Tensor,
-        atom_to_token: Tensor,
-        token_mask: Tensor,
-        multiplicity: int = 1,
-        return_token_repr: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
-        single, _ = self.single_conditioner(
-            noise_level,
-            single_trunk.repeat_interleave(multiplicity, 0),
-            single_inputs.repeat_interleave(multiplicity, 0),
-        )
-        token_repr, atom_skip, conditioning_skip = self.atom_attention_encoder(
-            conditioning["atom_query"],
-            conditioning["atom_conditioning"],
-            conditioning["atom_enc_bias"].repeat_interleave(multiplicity, 0),
-            atom_mask,
-            atom_to_token,
-            token_mask.shape[-1],
-            noisy_positions=noisy_positions,
-            multiplicity=multiplicity,
-        )
-        token_repr = token_repr + self.single_to_token_projection(self.single_to_token_norm(single))
-        token_repr = self.token_encoder(
-            token_repr,
-            single,
-            conditioning["token_encoder_bias"].repeat_interleave(multiplicity, 0),
-            token_mask.repeat_interleave(multiplicity, 0).float(),
-        )
-        token_repr = self.token_norm(token_repr)
-        coordinate_update = self.atom_attention_decoder(
-            token_repr,
-            atom_skip,
-            conditioning_skip,
-            conditioning["atom_dec_bias"].repeat_interleave(multiplicity, 0),
-            atom_mask,
-            atom_to_token,
-            multiplicity=multiplicity,
-        )
-        if return_token_repr:
-            return coordinate_update, token_repr
-        return coordinate_update
-
-
 class Boltz1SingleConditioning(nn.Module):
     r"""
     Noise-condition the concatenated trunk-single and single-input representation for Boltz-1.
@@ -1308,366 +2159,6 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
         fourier = fourier.unsqueeze(1).expand(-1, next_repr.shape[1], -1)
         conditioning = torch.cat([accumulated, fourier], dim=-1)
         return accumulated + self.transition(next_repr, conditioning)
-
-
-class _Boltz1CoordinateDiffusionBase(nn.Module):
-    r"""
-    EDM (Karras) reverse-diffusion sampler wrapped around a Boltz diffusion score model.
-    """
-
-    def __init__(
-        self,
-        denoiser: Boltz1Denoiser,
-        sigma_data: float = 16.0,
-        min_noise_level: float = 4e-4,
-        max_noise_level: float = 160.0,
-        rho: float = 7.0,
-        churn_rate: float = 0.8,
-        min_churn_noise_level: float = 1.0,
-        noise_scale: float = 1.003,
-        step_scale: float = 1.5,
-        num_sampling_steps: int = 200,
-        alignment_reverse_diff: bool = True,
-        noise_log_mean: float = -1.2,
-        noise_log_std: float = 1.5,
-    ) -> None:
-        super().__init__()
-        self.denoiser = denoiser
-        self.sigma_data = sigma_data
-        self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
-        self.min_noise_level = min_noise_level
-        self.max_noise_level = max_noise_level
-        self.rho = rho
-        self.churn_rate = churn_rate
-        self.min_churn_noise_level = min_churn_noise_level
-        self.noise_scale = noise_scale
-        self.step_scale = step_scale
-        self.num_sampling_steps = num_sampling_steps
-        self.alignment_reverse_diff = alignment_reverse_diff
-        self.noise_log_mean = noise_log_mean
-        self.noise_log_std = noise_log_std
-
-    def noise_distribution(
-        self,
-        batch_size: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        generator: torch.Generator | None = None,
-    ) -> Tensor:
-        normal = torch.empty(batch_size, device=device, dtype=dtype).normal_(generator=generator)
-        return self.sigma_data * (self.noise_log_mean + self.noise_log_std * normal).exp()
-
-    def loss_weight(self, sigma: Tensor) -> Tensor:
-        return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
-
-    def sample_schedule(self, num_sampling_steps: int | None = None, *, device: torch.device) -> Tensor:
-        steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-        inv_rho = 1 / self.rho
-        # `steps` is the number of sampling steps (transitions); the trailing pad adds the final sigma=0.
-        # Clamp the divisor so a single step mirrors the AF3 scheduler (ramp [0] -> a lone max_noise_level, then 0)
-        # instead of dividing by zero; for steps >= 2 the divisor is steps - 1 exactly, so the schedule is unchanged.
-        ramp = torch.arange(steps, device=device, dtype=torch.float32) / max(steps - 1, 1)
-        sigmas = (
-            self.max_noise_level**inv_rho + ramp * (self.min_noise_level**inv_rho - self.max_noise_level**inv_rho)
-        ) ** self.rho
-        sigmas = sigmas * self.sigma_data
-        return torch.nn.functional.pad(sigmas, (0, 1), value=0.0)
-
-
-class Boltz1CoordinateDiffusion(_Boltz1CoordinateDiffusionBase):
-    r"""
-    Boltz-1 EDM sampler that can accumulate and surface the final diffusion token representation.
-    """
-
-    def __init__(
-        self,
-        denoiser: Boltz1Denoiser,
-        sigma_data: float = 16.0,
-        min_noise_level: float = 4e-4,
-        max_noise_level: float = 160.0,
-        rho: float = 7.0,
-        churn_rate: float = 0.8,
-        min_churn_noise_level: float = 1.0,
-        noise_scale: float = 1.003,
-        step_scale: float = 1.5,
-        num_sampling_steps: int = 200,
-        alignment_reverse_diff: bool = True,
-        noise_log_mean: float = -1.2,
-        noise_log_std: float = 1.5,
-        *,
-        accumulate_token_repr: bool = False,
-        token_size: int = 384,
-        fourier_embedding_size: int = 256,
-    ) -> None:
-        super().__init__(
-            denoiser=denoiser,
-            sigma_data=sigma_data,
-            min_noise_level=min_noise_level,
-            max_noise_level=max_noise_level,
-            rho=rho,
-            churn_rate=churn_rate,
-            min_churn_noise_level=min_churn_noise_level,
-            noise_scale=noise_scale,
-            step_scale=step_scale,
-            num_sampling_steps=num_sampling_steps,
-            alignment_reverse_diff=alignment_reverse_diff,
-            noise_log_mean=noise_log_mean,
-            noise_log_std=noise_log_std,
-        )
-        self.output_token_feature_update: Boltz1OutputTokenFeatureUpdate | None = None
-        if accumulate_token_repr:
-            self.output_token_feature_update = Boltz1OutputTokenFeatureUpdate(
-                token_size=token_size, fourier_embedding_size=fourier_embedding_size
-            )
-
-    def preconditioned_network_forward(
-        self,
-        noisy_coordinates: Tensor,
-        sigma: Tensor | float,
-        *,
-        multiplicity: int = 1,
-        return_token_repr: bool = False,
-        **conditioning: object,
-    ) -> Tensor | tuple[Tensor, Tensor]:
-        batch = noisy_coordinates.shape[0]
-        sigma = torch.as_tensor(sigma, device=noisy_coordinates.device, dtype=noisy_coordinates.dtype).expand(batch)
-        padded = sigma.reshape(batch, 1, 1)
-        update = self.denoiser(
-            noisy_positions=self.preconditioner.c_in(padded) * noisy_coordinates,
-            noise_level=self.preconditioner.c_noise(sigma),
-            multiplicity=multiplicity,
-            return_token_repr=return_token_repr,
-            **conditioning,
-        )
-        if return_token_repr:
-            update, token_repr = cast(tuple[Tensor, Tensor], update)
-        else:
-            update = cast(Tensor, update)
-        denoised = self.preconditioner.c_skip(padded) * noisy_coordinates + self.preconditioner.c_out(padded) * update
-        if return_token_repr:
-            return denoised, token_repr
-        return denoised
-
-    def denoise_training(
-        self,
-        target_coords: Tensor | None,
-        atom_mask: Tensor,
-        *,
-        target_mask: Tensor | None = None,
-        multiplicity: int = 1,
-        generator: torch.Generator | None = None,
-        **conditioning: object,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        single_trunk = cast(Tensor, conditioning["single_trunk"])
-        dtype, device = single_trunk.dtype, single_trunk.device
-        target = cast(Tensor, target_coords).to(dtype=dtype, device=device).repeat_interleave(multiplicity, 0)
-        resolved = (target_mask if target_mask is not None else atom_mask).to(dtype=dtype, device=device)
-        resolved = resolved.repeat_interleave(multiplicity, 0)
-        augmented_target_coordinates = self._augment_target(target, resolved, generator=generator)
-        batch_size = augmented_target_coordinates.shape[0]
-        noise_level = self.noise_distribution(batch_size, device=device, dtype=dtype, generator=generator)
-        noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
-        noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * noise
-        denoised_coordinates = self.preconditioned_network_forward(
-            noisy_coordinates,
-            noise_level,
-            multiplicity=multiplicity,
-            atom_mask=atom_mask,
-            return_token_repr=False,
-            **conditioning,
-        )
-        return cast(Tensor, denoised_coordinates), augmented_target_coordinates, noise_level
-
-    def _augment_target(self, coords: Tensor, mask: Tensor, *, generator: torch.Generator | None) -> Tensor:
-        weight = mask[..., None]
-        centroid = (coords * weight).sum(-2, keepdim=True) / weight.sum(-2, keepdim=True).clamp_min(1.0)
-        coords = coords - centroid
-        rotation = uniform_random_rotation(
-            coords.shape[0], device=coords.device, dtype=coords.dtype, generator=generator
-        )
-        translation = torch.empty(coords.shape[0], 1, 3, device=coords.device, dtype=coords.dtype).normal_(
-            generator=generator
-        )
-        return torch.einsum("bmd,bds->bms", coords, rotation) + translation
-
-    @torch.no_grad()
-    def _sample(
-        self,
-        atom_mask: Tensor,
-        *,
-        num_sampling_steps: int | None = None,
-        multiplicity: int = 1,
-        generator: torch.Generator | None = None,
-        return_token_repr: bool = False,
-        steering_args: Mapping[str, object],
-        **conditioning: object,
-    ) -> Tensor | tuple[Tensor, Tensor]:
-        device = atom_mask.device
-        feats = cast(dict[str, Tensor] | None, conditioning.pop("feats", None))
-        steering = dict(steering_args)
-        potentials = (
-            _boltz1_potentials(steering)
-            if bool(steering["fk_steering"] or steering["physical_guidance_update"])
-            else ()
-        )
-        num_particles = int(cast(float | int | str, steering["num_particles"]))
-        requested_multiplicity = multiplicity
-        effective_multiplicity = multiplicity * num_particles if bool(steering["fk_steering"]) else multiplicity
-        base_atom_mask = atom_mask
-        expanded_atom_mask = atom_mask.repeat_interleave(effective_multiplicity, 0)
-        shape = (*expanded_atom_mask.shape, 3)
-        sigmas = self.sample_schedule(num_sampling_steps, device=device)
-        gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
-
-        def randn() -> Tensor:
-            r"""
-            Draw standard-normal noise of the expanded coordinate ``shape`` on the sampler device/generator.
-            """
-
-            return torch.randn(shape, device=device, generator=generator)
-
-        coords = sigmas[0] * randn()
-        if bool(steering["fk_steering"]):
-            num_groups = atom_mask.shape[0] * requested_multiplicity
-            energy_traj = torch.empty((expanded_atom_mask.shape[0], 0), device=device)
-            resample_weights = torch.ones(num_groups, num_particles, device=device)
-        else:
-            energy_traj = torch.empty((0, 0), device=device)
-            resample_weights = torch.empty((0, 0), device=device)
-        if bool(steering["physical_guidance_update"]):
-            scaled_guidance_update = torch.zeros(shape, dtype=torch.float32, device=device)
-        else:
-            scaled_guidance_update = None
-        denoised = None
-        token_repr = None
-        token_a = None
-        # Potential guidance interleaves particle resampling, coordinate updates,
-        # and token-feature accumulation with the reverse-diffusion steps.
-        # Keep the schedule scalars as tensors. The Python loop fixes the number of denoising calls, while the
-        # per-step tensor math remains free of host synchronizations on the ordinary (unsteered) sampling path.
-        for index in range(len(sigmas) - 1):
-            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
-            rotation = uniform_random_rotation(
-                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
-            )
-            translation = torch.randn(expanded_atom_mask.shape[0], 1, 3, device=device, generator=generator)
-            coords = torch.einsum("bmd,bds->bms", coords - coords.mean(-2, keepdim=True), rotation) + translation
-            if denoised is not None:
-                denoised = (
-                    torch.einsum("bmd,bds->bms", denoised - denoised.mean(-2, keepdim=True), rotation) + translation
-                )
-            if scaled_guidance_update is not None:
-                scaled_guidance_update = torch.einsum("bmd,bds->bms", scaled_guidance_update, rotation)
-
-            sigma_hat = sigma_current * (1 + gamma)
-            steering_t = 1.0 - (index / max(len(sigmas) - 1, 1))
-            # Compute schedule-derived churn and reverse-step scalars in float64 to prevent cumulative rounding
-            # drift. The score network still receives float32 ``sigma_hat``; scalar tensors stay on-device so the
-            # sampling loop remains graph-break-free.
-            sigma_current_hp = sigma_current.double()
-            sigma_hat_hp = sigma_current_hp * (1 + gamma.double())
-            sigma_next_hp = sigma_next.double()
-            noise_var = self.noise_scale**2 * (sigma_hat_hp**2 - sigma_current_hp**2)
-            noisy = coords + torch.sqrt(torch.clamp(noise_var, min=0.0)).to(coords.dtype) * randn()
-            denoised_out = self.preconditioned_network_forward(
-                noisy,
-                sigma_hat,
-                multiplicity=effective_multiplicity,
-                atom_mask=base_atom_mask,
-                return_token_repr=return_token_repr,
-                **conditioning,
-            )
-            if return_token_repr:
-                denoised, token_a = cast(tuple[Tensor, Tensor], denoised_out)
-            else:
-                denoised = cast(Tensor, denoised_out)
-
-            should_resample = bool(steering["fk_steering"]) and (
-                (index % int(cast(float | int | str, steering["fk_resampling_interval"])) == 0 and noise_var > 0)
-                or index == len(sigmas) - 2
-            )
-            if should_resample:
-                energy = torch.zeros(denoised.shape[0], device=device, dtype=denoised.dtype)
-                for potential in potentials:
-                    parameters = potential.compute_parameters(steering_t)
-                    if float(parameters["resampling_weight"]) > 0:
-                        energy = energy + float(parameters["resampling_weight"]) * potential.compute(
-                            denoised,
-                            cast(dict[str, Tensor], feats),
-                            parameters,
-                        )
-                energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
-                log_g = -energy if energy_traj.shape[1] == 1 else energy_traj[:, -2] - energy_traj[:, -1]
-                if scaled_guidance_update is not None and noise_var > 0:
-                    ll_difference = ((noisy - coords) ** 2 - (noisy - coords + scaled_guidance_update) ** 2).sum(
-                        dim=(-1, -2)
-                    ) / (2 * noise_var)
-                else:
-                    ll_difference = torch.zeros_like(energy)
-                resample_weights = torch.softmax(
-                    (ll_difference + float(cast(float | int | str, steering["fk_lambda"])) * log_g).reshape(
-                        -1, num_particles
-                    ),
-                    dim=1,
-                )
-
-            if bool(steering["physical_guidance_update"]) and index < len(sigmas) - 2:
-                guidance_update = torch.zeros_like(denoised)
-                for guidance_step in range(int(cast(float | int | str, steering["num_gd_steps"]))):
-                    energy_gradient = torch.zeros_like(denoised)
-                    for potential in potentials:
-                        parameters = potential.compute_parameters(steering_t)
-                        interval = max(int(parameters["guidance_interval"]), 1)
-                        if float(parameters["guidance_weight"]) > 0 and guidance_step % interval == 0:
-                            energy_gradient = energy_gradient + float(
-                                parameters["guidance_weight"]
-                            ) * potential.compute_gradient(
-                                denoised + guidance_update, cast(dict[str, Tensor], feats), parameters
-                            )
-                    guidance_update = guidance_update - energy_gradient
-                denoised = denoised + guidance_update
-                scaled_guidance_update = guidance_update * -self.step_scale * (sigma_next - sigma_hat) / sigma_hat
-
-            if should_resample:
-                sample_count = num_particles if index < len(sigmas) - 2 else 1
-                resample_indices = (
-                    torch.multinomial(resample_weights, sample_count, replacement=True, generator=generator)
-                    + num_particles * torch.arange(resample_weights.shape[0], device=device).unsqueeze(-1)
-                ).flatten()
-                coords = coords[resample_indices]
-                noisy = noisy[resample_indices]
-                expanded_atom_mask = expanded_atom_mask[resample_indices]
-                denoised = denoised[resample_indices]
-                energy_traj = energy_traj[resample_indices]
-                if scaled_guidance_update is not None:
-                    scaled_guidance_update = scaled_guidance_update[resample_indices]
-                if token_repr is not None:
-                    token_repr = token_repr[resample_indices]
-                if token_a is not None:
-                    token_a = token_a[resample_indices]
-                if index == len(sigmas) - 2:
-                    effective_multiplicity = requested_multiplicity
-            output_token_feature_update = self.output_token_feature_update
-            if output_token_feature_update is not None:
-                if token_repr is None:
-                    token_repr = torch.zeros_like(cast(Tensor, token_a))
-                token_a = cast(Tensor, token_a)
-                sigma = torch.full((token_a.shape[0],), sigma_hat, device=token_a.device, dtype=token_a.dtype)
-                token_repr = output_token_feature_update(
-                    noise_level=self.preconditioner.c_noise(sigma),
-                    accumulated=token_repr,
-                    next_repr=token_a,
-                )
-            elif token_a is not None:
-                token_repr = token_a
-            if self.alignment_reverse_diff:
-                noisy = weighted_rigid_align(
-                    source=noisy.float(), target=denoised.float(), weight=expanded_atom_mask.float()
-                ).to(denoised)
-            derivative = (noisy - denoised) / sigma_hat_hp
-            coords = (noisy + self.step_scale * (sigma_next_hp - sigma_hat_hp) * derivative).to(coords.dtype)
-        return (coords, token_repr) if return_token_repr else coords
 
 
 class _Boltz1ConfidenceHead(nn.Module):
@@ -1743,6 +2234,9 @@ class _Boltz1ConfidenceHead(nn.Module):
         pred_distogram_logits: Tensor,
         single_diffusion: Tensor | None = None,
         multiplicity: int = 1,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+        compute_scores: bool = True,
     ) -> dict[str, Tensor]:
         single_inputs, single, pair = self._prepare_representations(single_inputs, single, pair, input=input)
 
@@ -1766,7 +2260,10 @@ class _Boltz1ConfidenceHead(nn.Module):
                 * self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
             )
 
-        representative_atom_index = input.token_to_rep_atom.repeat_interleave(multiplicity, 0)
+        representative_atom_index = input.token_distogram_atom_index.repeat_interleave(
+            multiplicity,
+            0,
+        )
         representative_coordinates = coordinates.gather(
             1,
             representative_atom_index.unsqueeze(-1).expand(-1, -1, coordinates.shape[-1]),
@@ -1783,19 +2280,23 @@ class _Boltz1ConfidenceHead(nn.Module):
             single_inputs=single_inputs,
             input=input,
             pair_mask=confidence_pair_mask,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
         )
         logits = self.output_head(single, pair)
-        scores = _boltz1_confidence_scores(
-            logits,
-            distances=distances,
-            input=input,
-            pred_distogram_logits=pred_distogram_logits,
-            coordinates=coordinates,
-            multiplicity=multiplicity,
-            ranking_plddt_weight=self.ranking_plddt_weight,
-            ranking_ptm_weight=self.ranking_ptm_weight,
-        )
-        logits.update(scores)
+        if compute_scores:
+            logits.update(
+                _boltz1_confidence_scores(
+                    logits,
+                    distances=distances,
+                    input=input,
+                    pred_distogram_logits=pred_distogram_logits,
+                    coordinates=coordinates,
+                    multiplicity=multiplicity,
+                    ranking_plddt_weight=self.ranking_plddt_weight,
+                    ranking_ptm_weight=self.ranking_ptm_weight,
+                )
+            )
         return logits
 
     def _prepare_representations(
@@ -1816,6 +2317,8 @@ class _Boltz1ConfidenceHead(nn.Module):
         single_inputs: Tensor,
         input: Boltz1Input,
         pair_mask: Tensor,
+        msa_max_depth: int | None,
+        generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor]:
         raise NotImplementedError
 
@@ -1853,15 +2356,18 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
         use_atom_encoder: bool = True,
         use_msa: bool = True,
         msa_size: int = 64,
-        msa_feature_size: int = 36,
         vocab_size: int = 33,
+        use_paired_feature: bool = False,
         num_msa_blocks: int = 4,
-        use_paired_feature: bool = True,
         outer_product_hidden_size: int = 32,
-        msa_dropout: float = 0.0,
-        pair_dropout: float = 0.0,
+        msa_dropout: float = 0.15,
+        msa_pair_dropout: float = 0.25,
+        pair_dropout: float = 0.25,
+        update_single: bool = True,
         num_msa_attention_heads: int = 8,
         msa_head_dim: int = 32,
+        msa_triangle_attention_hidden_size: int = 32,
+        num_msa_triangle_attention_heads: int = 4,
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,
         relative_position_size: int = 139,
@@ -1907,35 +2413,46 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
             backend=backend,
         )
 
-        self.msa_trunk: CategoricalMsaTrunk | None = None
+        self.msa_trunk: Boltz1MsaTrunk | None = None
         if use_msa:
-            self.msa_trunk = CategoricalMsaTrunk(
+            self.msa_trunk = Boltz1MsaTrunk(
                 single_size=input_size,
                 pair_size=pair_size,
                 msa_size=msa_size,
-                msa_feature_size=msa_feature_size,
                 num_blocks=num_msa_blocks,
                 vocab_size=vocab_size,
                 use_paired_feature=use_paired_feature,
                 outer_product_hidden_size=outer_product_hidden_size,
                 msa_dropout=msa_dropout,
-                pair_dropout=pair_dropout,
+                pair_dropout=msa_pair_dropout,
                 num_msa_attention_heads=num_msa_attention_heads,
                 msa_head_dim=msa_head_dim,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
+                triangle_attention_hidden_size=msa_triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_msa_triangle_attention_heads,
                 backend=backend,
             )
-        self.pairformer_stack = PairformerStack(
-            num_blocks=num_blocks,
-            single_size=single_size,
-            pair_size=pair_size,
-            triangle_attention_hidden_size=triangle_attention_hidden_size,
-            num_triangle_attention_heads=num_triangle_attention_heads,
-            num_pair_attention_heads=num_pair_attention_heads,
-            dropout=pair_dropout,
-            backend=backend,
-        )
+        self.pairformer_stack: Boltz1PairformerStack | None = None
+        self.pair_update_stack: Boltz1TrianglePairUpdateStack | None = None
+        if update_single:
+            self.pairformer_stack = Boltz1PairformerStack(
+                num_blocks=num_blocks,
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                dropout=pair_dropout,
+                backend=backend,
+            )
+        else:
+            self.pair_update_stack = Boltz1TrianglePairUpdateStack(
+                num_blocks=num_blocks,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                dropout=pair_dropout,
+                backend=backend,
+            )
         self.final_single_norm = LayerNorm(single_size, backend=backend)
         self.final_pair_norm = LayerNorm(pair_size, backend=backend)
         self.output_head = Boltz1ConfidenceOutputHead(
@@ -1993,9 +2510,11 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
         single_inputs: Tensor,
         input: Boltz1Input,
         pair_mask: Tensor,
+        msa_max_depth: int | None,
+        generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor]:
         if input.msa_tokens is not None:
-            pair = pair + cast(CategoricalMsaTrunk, self.msa_trunk)(
+            pair = pair + cast(Boltz1MsaTrunk, self.msa_trunk)(
                 pair,
                 single_inputs,
                 msa_tokens=input.msa_tokens,
@@ -2004,8 +2523,16 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
                 is_paired=cast(Tensor, input.msa_paired),
                 msa_mask=cast(Tensor, input.msa_mask),
                 token_mask=input.token_mask,
+                msa_max_depth=msa_max_depth,
+                generator=generator,
             )
-        single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        if self.pairformer_stack is not None:
+            single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        else:
+            pair = cast(Boltz1TrianglePairUpdateStack, self.pair_update_stack)(
+                pair,
+                pair_mask=pair_mask,
+            )
         return self.final_single_norm(single), self.final_pair_norm(pair)
 
 
@@ -2022,6 +2549,8 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
         pair_size: int = 128,
         num_blocks: int = 48,
         num_pair_attention_heads: int = 16,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
         num_distogram_bins: int = 64,
         max_distance: float = 22.0,
         num_plddt_bins: int = 50,
@@ -2034,9 +2563,8 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
         use_single_diffusion: bool = True,
         ranking_plddt_weight: float = 4.0,
         ranking_ptm_weight: float = 1.0,
-        pair_dropout: float = 0.0,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
+        pair_dropout: float = 0.25,
+        update_single: bool = True,
         relative_position_size: int = 139,
         backend: str = "auto",
     ) -> None:
@@ -2048,7 +2576,9 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
             ranking_ptm_weight=ranking_ptm_weight,
         )
         self.input_single_norm = LayerNorm(input_size, backend=backend)
-        self.single_norm = LayerNorm(single_size, backend=backend)
+        self.single_norm: LayerNorm | None = None
+        if update_single:
+            self.single_norm = LayerNorm(single_size, backend=backend)
         self.input_single_projection: nn.Linear | None = None
         if add_single_input_to_single:
             self.input_single_projection = nn.Linear(input_size, single_size, bias=False)
@@ -2067,16 +2597,28 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
             backend=backend,
         )
 
-        self.pairformer_stack = PairformerStack(
-            num_blocks=num_blocks,
-            single_size=single_size,
-            pair_size=pair_size,
-            triangle_attention_hidden_size=triangle_attention_hidden_size,
-            num_triangle_attention_heads=num_triangle_attention_heads,
-            num_pair_attention_heads=num_pair_attention_heads,
-            dropout=pair_dropout,
-            backend=backend,
-        )
+        self.pairformer_stack: Boltz1PairformerStack | None = None
+        self.pair_update_stack: Boltz1TrianglePairUpdateStack | None = None
+        if update_single:
+            self.pairformer_stack = Boltz1PairformerStack(
+                num_blocks=num_blocks,
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                dropout=pair_dropout,
+                backend=backend,
+            )
+        else:
+            self.pair_update_stack = Boltz1TrianglePairUpdateStack(
+                num_blocks=num_blocks,
+                pair_size=pair_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                dropout=pair_dropout,
+                backend=backend,
+            )
         self.output_head = Boltz1ConfidenceOutputHead(
             single_size=single_size,
             pair_size=pair_size,
@@ -2095,7 +2637,8 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
         input: Boltz1Input,
     ) -> tuple[Tensor, Tensor, Tensor]:
         normalized_inputs = self.input_single_norm(single_inputs)
-        single = self.single_norm(single)
+        if self.single_norm is not None:
+            single = self.single_norm(single)
         if self.input_single_projection is not None:
             single = single + self.input_single_projection(normalized_inputs)
         pair = self.pair_norm(pair)
@@ -2122,8 +2665,16 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
         single_inputs: Tensor,
         input: Boltz1Input,
         pair_mask: Tensor,
+        msa_max_depth: int | None,
+        generator: torch.Generator | None,
     ) -> tuple[Tensor, Tensor]:
-        return self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        if self.pairformer_stack is not None:
+            return self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        pair = cast(Boltz1TrianglePairUpdateStack, self.pair_update_stack)(
+            pair,
+            pair_mask=pair_mask,
+        )
+        return single, pair
 
 
 class Boltz1ConfidenceOutputHead(nn.Module):
@@ -2362,17 +2913,10 @@ class Boltz1FlatBottomPotential(Boltz1Potential):
         lower_bounds = lower_bounds.to(device=value.device, dtype=value.dtype)
         upper_bounds = upper_bounds.to(device=value.device, dtype=value.dtype)
         k = k.to(device=value.device, dtype=value.dtype)
-        negative = value < lower_bounds
-        positive = value > upper_bounds
-        energy = torch.zeros_like(value)
-        energy[negative] = (k * (lower_bounds - value))[negative]
-        energy[positive] = (k * (value - upper_bounds))[positive]
+        energy = linear_flat_bottom_energy(value, k, lower_bounds, upper_bounds)
         if not compute_derivative:
             return energy
-        derivative = torch.zeros_like(value)
-        derivative[negative] = -k.expand_as(value)[negative]
-        derivative[positive] = k.expand_as(value)[positive]
-        return energy, derivative
+        return energy, linear_flat_bottom_derivative(value, k, lower_bounds, upper_bounds)
 
 
 class Boltz1DistancePotential(Boltz1Potential):
@@ -2383,12 +2927,9 @@ class Boltz1DistancePotential(Boltz1Potential):
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        delta = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
-        distance = torch.linalg.norm(delta, dim=-1)
         if not compute_gradient:
-            return distance
-        direction = delta / distance.unsqueeze(-1)
-        return distance, torch.stack((direction, -direction), dim=1)
+            return indexed_distance(coords, index)
+        return indexed_distance_with_gradient(coords, index)
 
 
 class Boltz1DihedralPotential(Boltz1Potential):
@@ -2399,26 +2940,9 @@ class Boltz1DihedralPotential(Boltz1Potential):
     def compute_variable(
         self, coords: Tensor, index: Tensor, *, compute_gradient: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        r_ij = coords.index_select(-2, index[0]) - coords.index_select(-2, index[1])
-        r_kj = coords.index_select(-2, index[2]) - coords.index_select(-2, index[1])
-        r_kl = coords.index_select(-2, index[2]) - coords.index_select(-2, index[3])
-        n_ijk = torch.cross(r_ij, r_kj, dim=-1)
-        n_jkl = torch.cross(r_kj, r_kl, dim=-1)
-        r_kj_norm = torch.linalg.norm(r_kj, dim=-1)
-        n_ijk_norm = torch.linalg.norm(n_ijk, dim=-1)
-        n_jkl_norm = torch.linalg.norm(n_jkl, dim=-1)
-        sign_phi = torch.sign(r_kj.unsqueeze(-2) @ torch.cross(n_ijk, n_jkl, dim=-1).unsqueeze(-1)).squeeze(-1, -2)
-        cosine = (n_ijk.unsqueeze(-2) @ n_jkl.unsqueeze(-1)).squeeze(-1, -2) / (n_ijk_norm * n_jkl_norm)
-        phi = sign_phi * torch.arccos(torch.clamp(cosine, -1 + 1e-8, 1 - 1e-8))
         if not compute_gradient:
-            return phi
-        a = ((r_ij.unsqueeze(-2) @ r_kj.unsqueeze(-1)).squeeze(-1, -2) / (r_kj_norm**2)).unsqueeze(-1)
-        b = ((r_kl.unsqueeze(-2) @ r_kj.unsqueeze(-1)).squeeze(-1, -2) / (r_kj_norm**2)).unsqueeze(-1)
-        grad_i = n_ijk * (r_kj_norm / n_ijk_norm**2).unsqueeze(-1)
-        grad_l = -n_jkl * (r_kj_norm / n_jkl_norm**2).unsqueeze(-1)
-        grad_j = (a - 1) * grad_i - b * grad_l
-        grad_k = (b - 1) * grad_l - a * grad_i
-        return phi, torch.stack((grad_i, grad_j, grad_k, grad_l), dim=1)
+            return indexed_signed_dihedral(coords, index)
+        return indexed_signed_dihedral_with_gradient(coords, index)
 
 
 class Boltz1AbsoluteDihedralPotential(Boltz1DihedralPotential):
@@ -2971,7 +3495,13 @@ def _compute_boltz1_ptm_scores(
     """
 
     token_mask = input.token_mask.repeat_interleave(multiplicity, 0).to(pae_logits)
-    frame_mask = _predicted_frame_mask(coordinates, input=input, multiplicity=multiplicity).to(pae_logits)
+    frame_mask = _boltz1_coordinate_frames(
+        coordinates,
+        input=input,
+        multiplicity=multiplicity,
+    )[
+        1
+    ].to(pae_logits)
     chain_index = input.chain_index.repeat_interleave(multiplicity, 0)
     pair_mask_ptm = frame_mask[:, :, None] * token_mask[:, None, :] * token_mask[:, :, None]
     pair_mask_iptm = pair_mask_ptm * (chain_index[:, None, :] != chain_index[:, :, None]).to(pae_logits)
@@ -3040,38 +3570,117 @@ def _compute_boltz1_ptm_scores(
     }
 
 
-def _predicted_frame_mask(coordinates: Tensor, *, input: Boltz1Input, multiplicity: int) -> Tensor:
+def _boltz1_coordinate_frames(
+    coordinates: Tensor,
+    *,
+    input: Boltz1Input,
+    multiplicity: int,
+    atom_mask: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
     r"""
-    Mask tokens whose predicted three-atom frame is valid (present and non-collinear).
+    Construct canonical polymer and coordinate-dependent nonpolymer frames.
 
     Args:
-        coordinates: `[B*mult, M, 3]` sampled coordinates.
-        input: The Boltz-1 input batch (source of frame atom indices and frame mask).
+        coordinates: `[B*mult, M, 3]` coordinate realizations.
+        input: The Boltz-1 input batch.
         multiplicity: Number of samples per input.
+        atom_mask: Optional realization-specific resolved-atom mask.
 
     Returns:
-        A `[B*mult, N]` mask of tokens with a usable frame.
-
-    Raises:
-        ValueError: If either required frame field is absent.
+        Frame indices `[B*mult, N, 3]` and valid-frame mask `[B*mult, N]`.
     """
 
-    if input.frame_atom_index is None or input.frame_mask is None:
-        raise ValueError("Boltz-1 confidence scoring requires both frame_atom_index and frame_mask")
-    frame_index = input.frame_atom_index.repeat_interleave(multiplicity, 0).to(
-        device=coordinates.device, dtype=torch.long
+    frame_index = (
+        input.frame_atom_index.repeat_interleave(
+            multiplicity,
+            0,
+        )
+        .to(
+            device=coordinates.device,
+            dtype=torch.long,
+        )
+        .clone()
     )
-    frame_mask = input.frame_mask.repeat_interleave(multiplicity, 0).to(device=coordinates.device)
+    chain_index = input.chain_index
+    molecule_type = input.molecule_type
+    atom_to_token = input.atom_to_token.long()
+    atom_chain_index = chain_index.gather(1, atom_to_token)
+    structural_atom_mask = input.atom_mask.bool()
+    if atom_mask is None:
+        atom_mask = structural_atom_mask.repeat_interleave(
+            multiplicity,
+            0,
+        )
+    else:
+        atom_mask = atom_mask.to(device=coordinates.device, dtype=torch.bool)
+
+    for batch_index in range(input.token_mask.shape[0]):
+        ligand_chains = torch.unique(
+            chain_index[batch_index][input.token_mask[batch_index].bool() & (molecule_type[batch_index] == 3)]
+        ).tolist()
+        for chain in ligand_chains:
+            chain_tokens = torch.nonzero(
+                input.token_mask[batch_index].bool()
+                & (molecule_type[batch_index] == 3)
+                & (chain_index[batch_index] == chain),
+                as_tuple=False,
+            ).flatten()
+            chain_atoms = torch.nonzero(
+                structural_atom_mask[batch_index] & (atom_chain_index[batch_index] == chain),
+                as_tuple=False,
+            ).flatten()
+            if len(chain_atoms) < 3:
+                continue
+            for sample_index in range(multiplicity):
+                row = batch_index * multiplicity + sample_index
+                distances = torch.cdist(
+                    coordinates[row, chain_atoms],
+                    coordinates[row, chain_atoms],
+                )
+                resolved = atom_mask[row, chain_atoms]
+                resolved_pair = resolved.unsqueeze(-1) & resolved.unsqueeze(-2)
+                nearest = distances.masked_fill(
+                    ~resolved_pair,
+                    torch.inf,
+                ).argsort(
+                    dim=-1
+                )[:, :3]
+                frame_index[row, chain_tokens] = chain_atoms[nearest][:, (1, 0, 2)]
+
     flat_index = frame_index.reshape(frame_index.shape[0], -1)
-    frames = coordinates.gather(1, flat_index.unsqueeze(-1).expand(-1, -1, 3))
+    frames = coordinates.gather(
+        1,
+        flat_index.unsqueeze(-1).expand(-1, -1, 3),
+    )
     frames = frames.reshape(*frame_index.shape, 3)
+    frame_resolved = atom_mask.gather(1, flat_index).reshape(frame_index.shape).all(dim=-1)
+    center_index = input.token_center_atom_index.repeat_interleave(
+        multiplicity,
+        0,
+    ).to(
+        device=coordinates.device,
+        dtype=torch.long,
+    )
+    center_resolved = atom_mask.gather(1, center_index)
     first = frames[..., 1, :] - frames[..., 0, :]
     second = frames[..., 1, :] - frames[..., 2, :]
     first_norm = torch.linalg.norm(first, dim=-1)
     second_norm = torch.linalg.norm(second, dim=-1)
-    cross_norm = torch.linalg.norm(torch.cross(first, second, dim=-1), dim=-1)
-    non_collinear = (first_norm > 1e-6) & (second_norm > 1e-6) & (cross_norm > 1e-6)
-    return frame_mask & non_collinear & input.token_mask.repeat_interleave(multiplicity, 0).to(frame_mask.device)
+    first_direction = first / (first_norm.unsqueeze(-1) + 1e-6)
+    second_direction = second / (second_norm.unsqueeze(-1) + 1e-6)
+    cosine = (first_direction * second_direction).sum(dim=-1)
+    valid_geometry = (
+        (cosine.abs() < 0.9063)
+        & (first_norm > 1e-2)
+        & (second_norm > 1e-2)
+        & frame_resolved
+        & center_resolved
+        & input.token_mask.repeat_interleave(multiplicity, 0).to(
+            device=coordinates.device,
+            dtype=torch.bool,
+        )
+    )
+    return frame_index, valid_geometry
 
 
 def _molecule_type_for_confidence(input: Boltz1Input, multiplicity: int, device: torch.device) -> Tensor:
@@ -3209,6 +3818,27 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
     return FoldResult(predictions=tuple(predictions))
 
 
+def _gather_boltz1_structure_target(
+    target: Boltz1StructureTarget,
+    input: Boltz1Input,
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Gather complete-pool truth onto the current padded atom axis.
+    """
+
+    atom_index = target.atom_index.long()
+    valid = atom_index >= 0
+    gather_index = atom_index.clamp_min(0)
+    coordinates = target.coordinates.gather(
+        1,
+        gather_index.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    mask = target.coordinate_mask.gather(1, gather_index)
+    mask = mask & valid & input.atom_mask.bool()
+    coordinates = coordinates.masked_fill(~mask.unsqueeze(-1), 0)
+    return coordinates, mask
+
+
 def _unflatten_optional_sample_axis(tensor: Tensor | None, batch_size: int, multiplicity: int) -> Tensor | None:
     r"""
     Unflatten the leading sample axis of an optional tensor, passing ``None`` through unchanged.
@@ -3279,6 +3909,37 @@ class Boltz1Layout:
 
 
 @dataclass(kw_only=True, eq=False)
+class Boltz1StructureTarget:
+    r"""
+    Complete pre-crop structure truth for Boltz-1 training.
+
+    Local symmetry groups name rows on the current atom axis; all coordinate
+    values live in the complete target pool.
+
+    Args:
+        coordinates: Complete-assembly coordinates with shape ``(B, T, 3)``.
+        coordinate_mask: Resolved complete-assembly mask with shape ``(B, T)``.
+        atom_index: Current atom-to-pool mapping with shape ``(B, A)`` and
+            ``-1`` padding.
+        chain_span: Half-open pool chain spans with shape ``(B, C, 2)``.
+        chain_equivalence_index: Entity-and-layout equivalence ids with
+            shape ``(B, C)``.
+        symmetry_atom_index: Current-axis atoms in each local symmetry
+            group with shape ``(B, G, W)`` and ``-1`` padding.
+        symmetry_permutation: Complete local permutations with shape
+            ``(B, G, P, W)`` and ``-1`` padding.
+    """
+
+    coordinates: Tensor
+    coordinate_mask: Tensor
+    atom_index: Tensor
+    chain_span: Tensor
+    chain_equivalence_index: Tensor
+    symmetry_atom_index: Tensor
+    symmetry_permutation: Tensor
+
+
+@dataclass(kw_only=True, eq=False)
 class Boltz1Input:
     r"""
     Input tensors consumed by [`Boltz1Model`][].
@@ -3300,9 +3961,9 @@ class Boltz1Input:
         atom_mask: `[B, M]` per-atom validity mask.
         reference_positions: `[B, M, 3]` reference (template) atom positions.
         reference_space_id: `[B, M]` per-atom reference-space identifier for window gating.
-        representative_atom_mask: `[B, M]` mask of representative atoms per token.
         atom_token_index: `[B, M]` token index of each atom.
-        token_to_rep_atom: `[B, N]` representative-atom index per token.
+        token_center_atom_index: `[B, N]` center-atom index per token.
+        token_distogram_atom_index: `[B, N]` distogram-atom index per token.
         residue_type_features: `[B, N, vocab_size]` residue-type one-hot features.
         msa_profile: `[B, N, vocab_size]` MSA profile feature.
         deletion_mean: `[B, N]` mean-deletion feature.
@@ -3321,10 +3982,7 @@ class Boltz1Input:
         connected_chain_index: `[B, 2, K]` chain pairs joined by assembly bonds.
         connected_atom_index: `[B, 2, K]` atom pairs joined by assembly bonds.
         symmetric_chain_index: `[B, 2, Q]` same-entity chain-copy pairs.
-        target_positions: Optional `[B, M, 3]` ground-truth atom positions.
-        target_mask: Optional `[B, M]` ground-truth validity mask.
-        frame_atom_index: Optional `[B, N, 3]` three-atom frame indices per token.
-        frame_mask: Optional `[B, N]` frame validity mask.
+        frame_atom_index: `[B, N, 3]` canonical polymer frame indices per token.
         cyclic_period: Optional `[B, N]` cyclic-period feature for relative positions.
         msa_tokens: Optional `[B, S, N]` MSA token grid.
         has_deletion: Optional `[B, S, N]` per-MSA deletion-present flag.
@@ -3347,9 +4005,9 @@ class Boltz1Input:
     atom_mask: Tensor
     reference_positions: Tensor
     reference_space_id: Tensor
-    representative_atom_mask: Tensor
     atom_token_index: Tensor
-    token_to_rep_atom: Tensor
+    token_center_atom_index: Tensor
+    token_distogram_atom_index: Tensor
     residue_type_features: Tensor
     msa_profile: Tensor
     deletion_mean: Tensor
@@ -3368,10 +4026,7 @@ class Boltz1Input:
     connected_chain_index: Tensor
     connected_atom_index: Tensor
     symmetric_chain_index: Tensor
-    target_positions: Tensor | None = None
-    target_mask: Tensor | None = None
-    frame_atom_index: Tensor | None = None
-    frame_mask: Tensor | None = None
+    frame_atom_index: Tensor
     cyclic_period: Tensor | None = None
     msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
@@ -3401,12 +4056,12 @@ class Boltz1Output:
     Predictions from one Boltz-1 training denoising pass.
 
     Args:
-        coordinates: Denoised atom coordinates with shape ``(B*S, A, 3)`` in
+        coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
             angstroms.
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
         augmented_target_coordinates: Training targets after rigid augmentation,
-            with shape ``(B*S, A, 3)`` in angstroms.
-        noise_level: Training noise standard deviations with shape ``(B*S,)`` in
+            with shape ``(B, S, A, 3)`` in angstroms.
+        noise_level: Training noise standard deviations with shape ``(B, S)`` in
             angstroms.
     """
 
@@ -3414,6 +4069,29 @@ class Boltz1Output:
     distogram_logits: Tensor
     augmented_target_coordinates: Tensor
     noise_level: Tensor
+
+
+@dataclass(kw_only=True, eq=False)
+class Boltz1ConfidenceOutput:
+    r"""
+    Raw differentiable Boltz-1 confidence predictions.
+
+    Args:
+        coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)``.
+        distogram_logits: Detached trunk distogram logits with shape
+            ``(B, N, N, D)``.
+        plddt_logits: Per-token pLDDT logits with shape ``(B, S, N, D_p)``.
+        pae_logits: Optional PAE logits with shape ``(B, S, N, N, D_a)``.
+        pde_logits: PDE logits with shape ``(B, S, N, N, D_d)``.
+        resolved_logits: Per-token resolved logits with shape ``(B, S, N, 2)``.
+    """
+
+    coordinates: Tensor
+    distogram_logits: Tensor
+    plddt_logits: Tensor
+    pae_logits: Tensor | None
+    pde_logits: Tensor
+    resolved_logits: Tensor
 
 
 @dataclass(kw_only=True, eq=False)
