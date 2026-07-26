@@ -10,6 +10,7 @@ from torch import Tensor, nn
 
 from .adaptive_norm import AdaptiveLayerNorm
 from .attention.multihead import GatedMultiheadAttention
+from .backend import LayerNorm
 from .transition import ConditionedTransition
 
 
@@ -24,6 +25,8 @@ class ConditionedTransformerEncoder(nn.Module):
         num_attention_heads: int,
         hidden_size: int = 384,
         conditioning_size: int | None = None,
+        post_layer_norm: bool = False,
+        use_qk_norm: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -34,6 +37,8 @@ class ConditionedTransformerEncoder(nn.Module):
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
+                post_layer_norm,
+                use_qk_norm,
                 backend,
             )
             for _ in range(num_blocks)
@@ -169,6 +174,8 @@ class ConditionedTransformerEncoderBlock(nn.Module):
         hidden_size: int,
         conditioning_size: int,
         num_attention_heads: int,
+        post_layer_norm: bool = False,
+        use_qk_norm: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -178,6 +185,7 @@ class ConditionedTransformerEncoderBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             query_bias=True,
             gating=True,
+            use_qk_norm=use_qk_norm,
             backend=backend,
         )
         self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
@@ -186,6 +194,7 @@ class ConditionedTransformerEncoderBlock(nn.Module):
             conditioning_size,
             backend=backend,
         )
+        self.post_norm = LayerNorm(hidden_size, backend=backend) if post_layer_norm else nn.Identity()
         self.sigmoid = nn.Sigmoid()
 
     def forward(
@@ -208,7 +217,8 @@ class ConditionedTransformerEncoderBlock(nn.Module):
             output_gate_projection=self.output_gate_projection,
             sigmoid=self.sigmoid,
         )
-        return hidden + self.transition(hidden, conditioning)
+        hidden = hidden + self.transition(hidden, conditioning)
+        return self.post_norm(hidden)
 
 
 class DenoisingTransformerEncoderBlock(nn.Module):

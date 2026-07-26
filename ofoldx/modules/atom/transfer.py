@@ -15,13 +15,7 @@ from ..backend import token_to_atom_broadcast as dispatch_token_to_atom_broadcas
 from .window import LocalAtomWindowing
 
 
-def scatter_mean_to_tokens(
-    atom_hidden: Tensor,
-    atom_to_token: Tensor,
-    num_tokens: int,
-    atom_mask: Tensor | None = None,
-    backend: str = "auto",
-) -> Tensor:
+class AtomToTokenMean(nn.Module):
     r"""
     Mean-pool per-atom features to tokens by scattering on the atom->token index.
 
@@ -29,28 +23,49 @@ def scatter_mean_to_tokens(
     arbitrary leading dimensions are supported by ``_expand_atom_axis``.
 
     Args:
-        atom_hidden: ``[..., N_atom, C]`` atom features.
-        atom_to_token: ``[..., N_atom]`` token index for each atom.
-        num_tokens: Number of output tokens.
-        atom_mask: Optional ``[..., N_atom]`` valid-atom mask.
         backend: Which backend to run; see [`backend`][ofoldx.modules.backend].
-
-    Returns:
-        ``[..., N_token, C]`` token features; tokens with no atoms stay zero.
     """
 
-    atom_to_token = _expand_atom_axis(atom_to_token, tuple(atom_hidden.shape[:-2]))
-    if atom_mask is not None:
-        atom_mask = _expand_atom_axis(atom_mask, tuple(atom_hidden.shape[:-2]))
+    def __init__(self, backend: str = "auto") -> None:
+        super().__init__()
+        self.backend = resolve_config_backend(
+            backend,
+            supported=("oops", "eager"),
+            public_default="eager",
+        )
 
-    return dispatch_atom_to_token_mean(
-        atom_hidden,
-        atom_to_token,
-        num_tokens=num_tokens,
-        atom_mask=atom_mask,
-        eps=1.0,
-        backend=backend,
-    )
+    def forward(
+        self,
+        atom_hidden: Tensor,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        atom_mask: Tensor | None = None,
+    ) -> Tensor:
+        r"""
+        Aggregate atom features onto their tokens.
+
+        Args:
+            atom_hidden: ``[..., N_atom, C]`` atom features.
+            atom_to_token: ``[..., N_atom]`` token index for each atom.
+            num_tokens: Number of output tokens.
+            atom_mask: Optional ``[..., N_atom]`` valid-atom mask.
+
+        Returns:
+            ``[..., N_token, C]`` token features; tokens with no atoms stay zero.
+        """
+
+        atom_to_token = _expand_atom_axis(atom_to_token, tuple(atom_hidden.shape[:-2]))
+        if atom_mask is not None:
+            atom_mask = _expand_atom_axis(atom_mask, tuple(atom_hidden.shape[:-2]))
+
+        return dispatch_atom_to_token_mean(
+            atom_hidden,
+            atom_to_token,
+            num_tokens=num_tokens,
+            atom_mask=atom_mask,
+            eps=1.0,
+            backend=self.backend,
+        )
 
 
 def dense_mean_to_tokens(

@@ -298,6 +298,7 @@ def triangle_attention(
     can_flash = (
         resolved == "oops"
         and projection.gating
+        and not projection.use_qk_norm
         and projection.output_projection.bias is None
         and projection.gate_projection.bias is None
     )

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 
 from torch import Tensor, nn
 
-from ..backend import resolve_config_backend
+from ..backend import LayerNorm, resolve_config_backend
 from ..backend.attention import gated_multihead_attention
 from ..backend.attention import projected_attention as dispatch_projected_attention
 
@@ -36,6 +36,7 @@ class GatedMultiheadAttention(nn.Module):
         gating: Whether to apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate bias when ``gate_bias`` is set.
+        use_qk_norm: Whether to normalize each projected query/key head.
         backend: Operator provider; attention uses SDPA as its default
             PyTorch implementation.
     """
@@ -53,6 +54,7 @@ class GatedMultiheadAttention(nn.Module):
         gating: bool = True,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
+        use_qk_norm: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
@@ -69,6 +71,8 @@ class GatedMultiheadAttention(nn.Module):
             gating=gating,
             gate_bias=gate_bias,
             gate_bias_init=gate_bias_init,
+            use_qk_norm=use_qk_norm,
+            backend=backend,
         )
 
     def forward(
@@ -207,6 +211,8 @@ class MultiheadAttentionProjection(nn.Module):
         gating: Whether to build and apply the sigmoid output gate.
         gate_bias: Whether the gate projection carries a learnable bias.
         gate_bias_init: Initial value for the gate projection bias when ``gate_bias`` is enabled.
+        use_qk_norm: Whether to normalize each projected query/key head.
+        backend: Operator provider used by the optional query/key normalizations.
 
     Raises:
         ValueError: If ``head_dim`` is not given and ``hidden_size`` is not divisible by
@@ -226,6 +232,8 @@ class MultiheadAttentionProjection(nn.Module):
         gating: bool = True,
         gate_bias: bool = False,
         gate_bias_init: float = 0.0,
+        use_qk_norm: bool = False,
+        backend: str = "auto",
     ) -> None:
         super().__init__()
         if head_dim is None and hidden_size % num_attention_heads != 0:
@@ -241,6 +249,7 @@ class MultiheadAttentionProjection(nn.Module):
         self.value_size = hidden_size if value_size is None else value_size
         self.inner_size = self.head_dim * self.num_attention_heads
         self.gating = gating
+        self.use_qk_norm = use_qk_norm
 
         if query_bias:
             self.query_projection = nn.Linear(self.query_size, self.inner_size)
@@ -248,6 +257,9 @@ class MultiheadAttentionProjection(nn.Module):
             self.query_projection = nn.Linear(self.query_size, self.inner_size, bias=False)
         self.key_projection = nn.Linear(self.key_size, self.inner_size, bias=False)
         self.value_projection = nn.Linear(self.value_size, self.inner_size, bias=False)
+        if use_qk_norm:
+            self.query_norm = LayerNorm(self.head_dim, backend=backend)
+            self.key_norm = LayerNorm(self.head_dim, backend=backend)
         self.output_projection = nn.Linear(self.inner_size, hidden_size, bias=output_bias)
         if self.gating:
             self.gate_projection = nn.Linear(self.query_size, self.inner_size, bias=gate_bias)
@@ -273,6 +285,9 @@ class MultiheadAttentionProjection(nn.Module):
         query_projection = self.query_projection(query).view(*query.shape[:-1], self.num_attention_heads, self.head_dim)
         key_projection = self.key_projection(key).view(*key.shape[:-1], self.num_attention_heads, self.head_dim)
         value_projection = self.value_projection(value).view(*value.shape[:-1], self.num_attention_heads, self.head_dim)
+        if self.use_qk_norm:
+            query_projection = self.query_norm(query_projection)
+            key_projection = self.key_norm(key_projection)
         query_projection = query_projection.transpose(-2, -3) / scale
         key_projection = key_projection.transpose(-2, -3)
         value_projection = value_projection.transpose(-2, -3)
@@ -298,6 +313,9 @@ class MultiheadAttentionProjection(nn.Module):
         query_projection = self.query_projection(query).view(*query.shape[:-1], self.num_attention_heads, self.head_dim)
         key_projection = self.key_projection(key).view(*key.shape[:-1], self.num_attention_heads, self.head_dim)
         value_projection = self.value_projection(value).view(*value.shape[:-1], self.num_attention_heads, self.head_dim)
+        if self.use_qk_norm:
+            query_projection = self.query_norm(query_projection)
+            key_projection = self.key_norm(key_projection)
         return (
             query_projection.transpose(-2, -3),
             key_projection.transpose(-2, -3),

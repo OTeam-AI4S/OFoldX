@@ -1,5 +1,5 @@
 r"""
-Coordinate-denoising networks.
+Coordinate-denoising components.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from ..transition import Transition
 
 class CoordinateDenoiser(nn.Module):
     r"""
-    Predict denoised atom coordinates with EDM preconditioning.
+    Predict denoised coordinates with the normalized-key diffusion-module equation.
 
     Args:
         num_encoder_blocks: Number of token-refiner attention blocks.
@@ -46,7 +46,7 @@ class CoordinateDenoiser(nn.Module):
         num_atom_decoder_attention_heads: Number of attention heads per atom-decoder block.
         num_query_atoms: Query window size for local atom attention.
         num_key_atoms: Key window size for local atom attention.
-        backend: Backend selector passed to the attention/transition operators.
+        backend: Backend selector passed to the attention and transition operators.
     """
 
     def __init__(
@@ -113,51 +113,38 @@ class CoordinateDenoiser(nn.Module):
         )
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        num_valid_atoms: int | None = None,
     ) -> LocalAtomGeometry:
         r"""
-        Build local atom-pair geometry using the denoising atom-encoder window layout.
-
-        Args:
-            reference_positions: Centered reference coordinates with shape
-                ``[..., N_atom, 3]``.
-            reference_space_id: Reference-space index with shape ``[..., N_atom]``.
-            num_valid_atoms: Number of real atoms; enables clamped key windows containing only real atoms.
-
-        Returns:
-            Geometry and masks aligned to the atom encoder's local windows.
+        Build local atom-pair geometry using the denoising atom-encoder windows.
         """
 
-        return self.atom_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+        return self.atom_encoder.build_local_geometry(
+            reference_positions,
+            reference_space_id,
+            num_valid_atoms,
+        )
 
     def predict_coordinate_update(self, inputs: CoordinateDenoisingInput) -> Tensor:
         r"""
-        Predict the raw per-atom coordinate update, before EDM output preconditioning.
-
-        Args:
-            inputs: Denoising input whose coordinate and noise tensors share a
-                sample axis.
-
-        Returns:
-            Coordinate update with shape ``[..., N_sample, N_atom, 3]``.
+        Predict the raw coordinate update from preconditioned noisy coordinates.
         """
 
         denoising_single, denoising_pair = self.conditioner(
             inputs.noise_level,
             token_embedding=inputs.token_embedding,
-            single=inputs.single,
-            pair=inputs.pair,
+            single=inputs.conditioning_single,
+            pair=inputs.conditioning_pair,
             relative_features=inputs.relative_features,
         )
-
-        target_prefix = tuple(denoising_single.shape[:-2])
-        single = _broadcast_prefix(inputs.single, target_prefix, tail_dims=2)
-        denoising_pair = _broadcast_prefix(denoising_pair, target_prefix, tail_dims=3)
-        atom_encoder_output, token_hidden, atom_mask = self.token_refiner(
+        atom_output, token_hidden = self.token_refiner(
             self.atom_encoder,
             atom_features=inputs.atom_features,
             atom_to_token=inputs.atom_to_token,
-            single=single,
+            single=inputs.single,
             denoising_single=denoising_single,
             denoising_pair=denoising_pair,
             reference_positions=inputs.reference_positions,
@@ -167,59 +154,46 @@ class CoordinateDenoiser(nn.Module):
             noisy_coords=inputs.noisy_coords,
             local_geometry=inputs.local_geometry,
         )
-        num_valid_atoms = None if inputs.local_geometry is None else inputs.local_geometry.window_info.num_valid_atoms
         return self.atom_decoder(
             atom_to_token=inputs.atom_to_token,
             token_hidden=token_hidden,
-            atom_query=atom_encoder_output.atom_query,
-            atom_context=atom_encoder_output.atom_context,
-            atom_mask=atom_mask,
-            attention_layout="dense" if inputs.local_geometry is None else "local",
-            num_valid_atoms=num_valid_atoms,
+            atom_query=atom_output.atom_query,
+            atom_context=atom_output.atom_context,
+            atom_mask=None,
+            attention_layout="local",
+            num_valid_atoms=inputs.local_geometry.window_info.num_valid_atoms,
         )
 
     def forward(self, inputs: CoordinateDenoisingInput) -> Tensor:
         r"""
-        Denoise atom coordinates.
-
-        Args:
-            inputs: Atom, token, noise-level, and noisy-coordinate inputs.
-
-        Returns:
-            Denoised coordinates with shape ``[..., N_atom, 3]`` or
-            ``[..., N_sample, N_atom, 3]``, matching the input's sample-axis layout.
+        Denoise coordinates with explicit batch, sample, atom, and xyz axes.
         """
-
-        dtype = inputs.atom_features.dtype
-
-        noisy_coords = inputs.noisy_coords
-        squeeze_sample_axis = noisy_coords.dim() == inputs.atom_features.dim()
-        if squeeze_sample_axis:
-            noisy_coords = noisy_coords.unsqueeze(-3)
-
-        scaled_noisy_coords = self.preconditioner.scale_noisy_coords(noisy_coords, inputs.noise_level)
 
         scaled_inputs = CoordinateDenoisingInput(
             atom_features=inputs.atom_features,
             atom_to_token=inputs.atom_to_token,
             token_embedding=inputs.token_embedding,
             single=inputs.single,
-            pair=inputs.pair,
+            conditioning_single=inputs.conditioning_single,
+            conditioning_pair=inputs.conditioning_pair,
             relative_features=inputs.relative_features,
             noise_level=inputs.noise_level,
             reference_positions=inputs.reference_positions,
             reference_charges=inputs.reference_charges,
             reference_mask=inputs.reference_mask,
-            atom_mask=inputs.atom_mask.to(dtype=dtype),
-            noisy_coords=scaled_noisy_coords,
+            atom_mask=inputs.atom_mask.to(dtype=inputs.atom_features.dtype),
+            noisy_coords=self.preconditioner.scale_noisy_coords(
+                inputs.noisy_coords,
+                inputs.noise_level,
+            ),
             local_geometry=inputs.local_geometry,
         )
         coordinate_update = self.predict_coordinate_update(scaled_inputs)
-
-        denoised_coords = self.preconditioner.combine_update(noisy_coords, inputs.noise_level, coordinate_update)
-        if squeeze_sample_axis and denoised_coords.shape[-3] == 1:
-            denoised_coords = denoised_coords.squeeze(-3)
-        return denoised_coords
+        return self.preconditioner.combine_update(
+            inputs.noisy_coords,
+            inputs.noise_level,
+            coordinate_update,
+        )
 
 
 class DenoisingConditioner(nn.Module):
@@ -360,8 +334,8 @@ class DenoisingTokenRefiner(nn.Module):
         reference_mask: Tensor,
         atom_mask: Tensor,
         noisy_coords: Tensor,
-        local_geometry: LocalAtomGeometry | None,
-    ) -> tuple[AtomToTokenOutput, Tensor, Tensor | None]:
+        local_geometry: LocalAtomGeometry,
+    ) -> tuple[AtomToTokenOutput, Tensor]:
         r"""
         Encode atoms, refine the token states, and return the decoder inputs.
 
@@ -377,12 +351,11 @@ class DenoisingTokenRefiner(nn.Module):
             reference_mask: Boolean mask for atoms with valid reference conformers.
             atom_mask: Boolean atom validity mask.
             noisy_coords: Noisy atom coordinates to refine.
-            local_geometry: Optional local atom-pair geometry.
+            local_geometry: Local atom-window geometry.
 
         Returns:
-            The atom-encoder output, refined token states with trailing shape
-            ``(N_token, token_hidden_size)``, and the decoder atom mask. The mask
-            is ``None`` for local-window attention.
+            The atom-encoder output and refined token states with trailing shape
+            ``(N_token, token_hidden_size)``.
         """
 
         target_prefix = tuple(denoising_single.shape[:-2])
@@ -392,49 +365,27 @@ class DenoisingTokenRefiner(nn.Module):
             _broadcast_prefix(denoising_pair, target_prefix, tail_dims=3), tail_dims=3
         )
 
-        decoder_atom_mask: Tensor | None
-        restore_prefix: tuple[int, ...] | None
-        if local_geometry is None:
-            atom_mask = _flatten_broadcast(atom_mask, target_prefix, tail_dims=1)
-            atom_encoder_output = atom_encoder(
-                atom_features=_flatten_broadcast(atom_features, target_prefix, tail_dims=2),
-                reference_positions=_flatten_broadcast(reference_positions, target_prefix, tail_dims=2),
-                reference_charges=torch.arcsinh(_flatten_broadcast(reference_charges, target_prefix, tail_dims=2)),
-                reference_mask=_flatten_broadcast(reference_mask, target_prefix, tail_dims=1),
-                single=_flatten_broadcast(single, target_prefix, tail_dims=2),
-                pair=flat_denoising_pair,
-                noisy_coords=_flatten_broadcast(noisy_coords, target_prefix, tail_dims=2),
-                atom_mask=atom_mask,
-                atom_to_token=_flatten_broadcast(atom_to_token, target_prefix, tail_dims=1),
-                num_tokens=num_tokens,
-            )
-            decoder_atom_mask = atom_mask
-            restore_prefix = None
-        else:
-            local_geometry = _broadcast_local_geometry(local_geometry, target_prefix)
-            atom_encoder_output = atom_encoder(
-                atom_features=_broadcast_prefix(atom_features, target_prefix, tail_dims=2),
-                reference_positions=_broadcast_prefix(reference_positions, target_prefix, tail_dims=2),
-                reference_charges=torch.arcsinh(_broadcast_prefix(reference_charges, target_prefix, tail_dims=2)),
-                reference_mask=_broadcast_prefix(reference_mask, target_prefix, tail_dims=1),
-                single=_broadcast_prefix(single, target_prefix, tail_dims=2),
-                pair=_broadcast_prefix(denoising_pair, target_prefix, tail_dims=3),
-                noisy_coords=noisy_coords,
-                atom_mask=_broadcast_prefix(atom_mask, target_prefix, tail_dims=1),
-                atom_to_token=_broadcast_prefix(atom_to_token, target_prefix, tail_dims=1),
-                num_tokens=num_tokens,
-                local_geometry=local_geometry,
-            )
-            decoder_atom_mask = None
-            restore_prefix = target_prefix
+        local_geometry = _broadcast_local_geometry(local_geometry, target_prefix)
+        atom_encoder_output = atom_encoder(
+            atom_features=_broadcast_prefix(atom_features, target_prefix, tail_dims=2),
+            reference_positions=_broadcast_prefix(reference_positions, target_prefix, tail_dims=2),
+            reference_charges=torch.arcsinh(_broadcast_prefix(reference_charges, target_prefix, tail_dims=2)),
+            reference_mask=_broadcast_prefix(reference_mask, target_prefix, tail_dims=1),
+            single=_broadcast_prefix(single, target_prefix, tail_dims=2),
+            pair=_broadcast_prefix(denoising_pair, target_prefix, tail_dims=3),
+            noisy_coords=noisy_coords,
+            atom_mask=_broadcast_prefix(atom_mask, target_prefix, tail_dims=1),
+            atom_to_token=_broadcast_prefix(atom_to_token, target_prefix, tail_dims=1),
+            num_tokens=num_tokens,
+            local_geometry=local_geometry,
+        )
 
         token_hidden = _flatten_prefix(atom_encoder_output.token_hidden, tail_dims=2)
         token_hidden = token_hidden + self.single_to_token_projection(self.single_norm(flat_denoising_single))
         token_hidden = self.token_encoder(token_hidden, flat_denoising_single, flat_denoising_pair)
         token_hidden = self.token_norm(token_hidden)
-        if restore_prefix is not None:
-            token_hidden = token_hidden.reshape(*restore_prefix, *token_hidden.shape[-2:])
-        return atom_encoder_output, token_hidden, decoder_atom_mask
+        token_hidden = token_hidden.reshape(*target_prefix, *token_hidden.shape[-2:])
+        return atom_encoder_output, token_hidden
 
 
 def _broadcast_prefix(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims: int) -> Tensor:
@@ -478,25 +429,6 @@ def _flatten_prefix(tensor: Tensor, tail_dims: int) -> Tensor:
     """
 
     return tensor.reshape(-1, *tensor.shape[-tail_dims:])
-
-
-def _flatten_broadcast(tensor: Tensor, target_prefix: tuple[int, ...], tail_dims: int) -> Tensor:
-    r"""
-    Broadcast the prefix to ``target_prefix`` then flatten it into a single batch axis.
-
-    Composes `_broadcast_prefix` and `_flatten_prefix`; used to fold a broadcast sample
-    axis into the batch so every sample becomes an independent atom graph.
-
-    Args:
-        tensor: The tensor to broadcast and flatten.
-        target_prefix: Desired leading-dimension shape before flattening.
-        tail_dims: Number of trailing payload dimensions to preserve.
-
-    Returns:
-        A view of shape ``(prod(target_prefix), *tail_shape)``.
-    """
-
-    return _flatten_prefix(_broadcast_prefix(tensor, target_prefix, tail_dims), tail_dims)
 
 
 def _broadcast_local_geometry(geometry: LocalAtomGeometry, target_prefix: tuple[int, ...]) -> LocalAtomGeometry:

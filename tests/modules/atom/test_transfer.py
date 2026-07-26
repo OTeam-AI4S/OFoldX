@@ -6,28 +6,44 @@ import pytest
 import torch
 
 from ofoldx.modules.atom import (
+    AtomToTokenMean,
     TokenPairToAtomPairBroadcast,
     TokenPairToLocalAtomPairBroadcast,
     TokenToAtomBroadcast,
 )
-from ofoldx.modules.atom.transfer import scatter_mean_to_tokens
 
 if TYPE_CHECKING:
     from torch import Tensor
 
 
-@pytest.mark.parametrize("extra_prefix", [(), (1,)])
-def test_atom_token_transfer(extra_prefix: tuple[int, ...]) -> None:
+def test_atom_to_token_mean() -> None:
     # masked-out atom 1 drops from both sum and count, so token 0 = [1,2]/1, token 1 = ([5,10]+[7,14])/2.
-    atom_hidden = torch.tensor([[[1.0, 2.0], [3.0, 6.0], [5.0, 10.0], [7.0, 14.0]]])
+    atom_hidden = (
+        torch.tensor(
+            [[[1.0, 2.0], [3.0, 6.0], [5.0, 10.0], [7.0, 14.0]]],
+        )
+        .unsqueeze(1)
+        .repeat(1, 2, 1, 1)
+        .requires_grad_()
+    )
     atom_to_token = torch.tensor([[0, 0, 1, 1]])
     atom_mask = torch.tensor([[True, False, True, True]])
 
-    expected = torch.tensor([[[1.0, 2.0], [6.0, 12.0], [0.0, 0.0]]])
+    expected = torch.tensor([[[[1.0, 2.0], [6.0, 12.0], [0.0, 0.0]]]]).repeat(1, 2, 1, 1)
 
-    token_hidden = scatter_mean_to_tokens(atom_hidden, atom_to_token, 3, atom_mask)
+    token_hidden = AtomToTokenMean()(atom_hidden, atom_to_token, 3, atom_mask)
     torch.testing.assert_close(token_hidden, expected, rtol=0.0, atol=0.0)
+    token_hidden.sum().backward()
+    torch.testing.assert_close(
+        atom_hidden.grad,
+        torch.tensor([[[[1.0, 1.0], [0.0, 0.0], [0.5, 0.5], [0.5, 0.5]]]]).repeat(1, 2, 1, 1),
+        rtol=0.0,
+        atol=0.0,
+    )
 
+
+@pytest.mark.parametrize("extra_prefix", [(), (1,)])
+def test_token_to_atom_broadcast(extra_prefix: tuple[int, ...]) -> None:
     # token -> atom broadcast gathers each atom's token row, here through an arbitrary leading dim
     token_hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]).reshape(1, *extra_prefix, 3, 2)
     atom_to_token = torch.tensor([[2, 0, 1, 1]])

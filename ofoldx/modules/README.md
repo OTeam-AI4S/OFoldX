@@ -10,8 +10,7 @@ concrete graph and may split family-private implementation across ordinary files
 stays with that family. Operators with more than one implementation are routed through `modules/backend`.
 Their PyTorch implementation defines semantics. `auto` selects OOps when it is
 available and compatible with the tensors. An explicit provider uses its kernels
-where implemented and the canonical PyTorch operator for the rest of the graph. See
-[`DESIGN.md`](../../DESIGN.md) for the full contract.
+where implemented and the canonical PyTorch operator for the rest of the graph.
 
 ## Contents
 

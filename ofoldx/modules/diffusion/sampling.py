@@ -31,10 +31,14 @@ class CoordinateDenoiseContext:
         reference_mask: Reference-coordinate mask with shape ``[..., N_atom]``.
         atom_mask: Atom validity mask with shape ``[..., N_atom]``.
         token_embedding: Token embeddings with shape ``[..., N_token, C_token]``.
-        single: Single representation with shape ``[..., N_token, C_single]``.
-        pair: Pair representation with shape ``[..., N_token, N_token, C_pair]``.
+        single: Trunk single representation used by the atom path, with shape
+            ``[..., N_token, C_single]``.
+        conditioning_single: Single representation supplied to diffusion
+            conditioning, with shape ``[..., N_token, C_single]``.
+        conditioning_pair: Pair representation supplied to diffusion
+            conditioning, with shape ``[..., N_token, N_token, C_pair]``.
         relative_features: Relative-position feature bundle.
-        local_geometry: Optional local atom-pair geometry.
+        local_geometry: Local atom-window geometry.
     """
 
     atom_features: Tensor
@@ -45,9 +49,10 @@ class CoordinateDenoiseContext:
     atom_mask: Tensor
     token_embedding: Tensor
     single: Tensor
-    pair: Tensor
+    conditioning_single: Tensor
+    conditioning_pair: Tensor
     relative_features: RelativePositionBuckets
-    local_geometry: LocalAtomGeometry | None = None
+    local_geometry: LocalAtomGeometry
 
     @property
     def batch_shape(self) -> torch.Size:
@@ -93,7 +98,11 @@ class CoordinateDenoiseContext:
 
         return self.atom_to_token.size(-1)
 
-    def to_denoising_input(self, noisy_coords: Tensor, noise_level: Tensor) -> CoordinateDenoisingInput:
+    def to_denoising_input(
+        self,
+        noisy_coords: Tensor,
+        noise_level: Tensor,
+    ) -> CoordinateDenoisingInput:
         r"""
         Combine this context with one step's noisy coordinates and noise level.
 
@@ -101,7 +110,6 @@ class CoordinateDenoiseContext:
             noisy_coords: Noisy coordinates with shape
                 ``[..., N_sample, N_atom, 3]``.
             noise_level: Noise levels with shape ``[..., N_sample]``.
-
         Returns:
             A denoising input carrying the context and step-specific tensors.
         """
@@ -111,7 +119,8 @@ class CoordinateDenoiseContext:
             atom_to_token=self.atom_to_token,
             token_embedding=self.token_embedding,
             single=self.single,
-            pair=self.pair,
+            conditioning_single=self.conditioning_single,
+            conditioning_pair=self.conditioning_pair,
             relative_features=self.relative_features,
             noise_level=noise_level,
             reference_positions=self.reference_positions,

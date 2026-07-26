@@ -4,18 +4,33 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ofoldx.modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean, TrianglePairUpdateStack
+from ofoldx.modules.trunk.msa import (
+    MsaPairWeightedAveraging,
+    MsaTrunk,
+    OuterProductMean,
+    PostProjectionOuterProductMean,
+    TrianglePairUpdateStack,
+)
 
 
-@pytest.mark.parametrize("divide_before_projection", [False, True])
-def test_outer_product_mean(divide_before_projection: bool) -> None:
+@pytest.mark.parametrize(
+    ("module_type", "normalize_before_projection", "denominator_epsilon"),
+    [
+        pytest.param(OuterProductMean, True, 0.0, id="pre-projection"),
+        pytest.param(PostProjectionOuterProductMean, False, 1e-3, id="post-projection"),
+    ],
+)
+def test_outer_product_mean_equation(
+    module_type: type[OuterProductMean] | type[PostProjectionOuterProductMean],
+    normalize_before_projection: bool,
+    denominator_epsilon: float,
+) -> None:
     torch.manual_seed(7)
-    module = OuterProductMean(
+    module = module_type(
         msa_size=4,
         hidden_size=2,
         pair_size=5,
         backend="eager",
-        divide_before_projection=divide_before_projection,
     )
     with torch.no_grad():  # non-zero bias so the divide/project branches place it differently
         module.output_projection.bias.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4, 0.5]))
@@ -36,14 +51,54 @@ def test_outer_product_mean(divide_before_projection: bool) -> None:
     outer = torch.einsum("bsia,bsjc->bijac", left, right).reshape(batch, residues, residues, -1)
     count = torch.einsum("bsi,bsj->bij", keep[..., 0], keep[..., 0])[..., None]
     out_w, out_b = module.output_projection.weight, module.output_projection.bias
-    if divide_before_projection:
+    if normalize_before_projection:
         expected = F.linear(outer / count.clamp(min=1), out_w, out_b)
     else:
-        expected = F.linear(outer, out_w, out_b) / (count + module.eps)
+        expected = F.linear(outer, out_w, out_b) / (count + denominator_epsilon)
 
-    assert output.shape == (1, 3, 3, 5)
-    assert output.std() > 0.1  # non-degenerate, not a constant bias field
     torch.testing.assert_close(output, expected)
+
+
+def test_msa_trunk_one_block_runs_only_final_pair_update() -> None:
+    torch.manual_seed(11)
+    trunk = MsaTrunk(
+        msa_size=4,
+        pair_size=4,
+        msa_feature_size=5,
+        token_feature_size=3,
+        num_blocks=1,
+        outer_product_hidden_size=2,
+        triangle_multiplication_hidden_size=4,
+        triangle_attention_hidden_size=2,
+        num_triangle_attention_heads=2,
+        msa_dropout=0.0,
+        pair_dropout=0.0,
+        backend="eager",
+    )
+    msa_features = torch.randn(1, 2, 3, 5)
+    token_embedding = torch.randn(1, 3, 3)
+    pair = torch.randn(1, 3, 3, 4)
+    msa_mask = torch.ones(1, 2, 3, dtype=torch.bool)
+    pair_mask = torch.ones(1, 3, 3, dtype=torch.bool)
+    projected_msa = trunk.msa_projection(msa_features) + trunk.token_projection(token_embedding).unsqueeze(1)
+    assert trunk.final_pair_update is not None
+    expected_pair = trunk.final_pair_update(
+        projected_msa,
+        pair,
+        msa_mask=msa_mask,
+        pair_mask=pair_mask,
+    )
+
+    msa, updated_pair = trunk(
+        msa_features,
+        pair,
+        token_embedding,
+        msa_mask=msa_mask,
+        pair_mask=pair_mask,
+    )
+
+    torch.testing.assert_close(msa, projected_msa)
+    torch.testing.assert_close(updated_pair, expected_pair)
 
 
 def test_pair_weighted_average() -> None:
@@ -70,8 +125,6 @@ def test_pair_weighted_average() -> None:
     gated = averaged * torch.sigmoid(F.linear(normalized, module.gate_projection.weight))
     expected = F.linear(gated, module.output_projection.weight)
 
-    assert output.shape == (1, 2, 3, 4)
-    assert output.abs().max() > 1e-3  # real signal, not the all-zero degenerate case
     torch.testing.assert_close(output, expected)
 
 
@@ -86,8 +139,10 @@ def test_triangle_pair_update_stack() -> None:
         dropout=0.0,
         backend="eager",
     )
+    expected = pair
+    for block in stack.blocks:
+        expected = block(expected)
 
     output = stack(pair)
 
-    assert output.shape == pair.shape
-    assert not torch.equal(output, pair)
+    torch.testing.assert_close(output, expected)

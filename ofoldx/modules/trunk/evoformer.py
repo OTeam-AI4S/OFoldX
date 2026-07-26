@@ -10,8 +10,8 @@ from torch import Tensor, nn
 
 from ..attention import GatedMultiheadAttention, TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
-from ..dropout import RowwiseDropout
-from .msa import OuterProductMean
+from ..dropout import StructuredDropout
+from .msa import PostProjectionOuterProductMean
 
 
 class EvoformerStack(nn.Module):
@@ -520,7 +520,7 @@ class EvoformerMsaBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
-        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
         r"""
@@ -570,7 +570,7 @@ class ExtraMsaTrackBlock(nn.Module):
             num_attention_heads=num_attention_heads,
         )
         self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
-        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
         msa = msa + self.rowwise_dropout(
@@ -631,7 +631,7 @@ class EvoformerPairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = RowwiseDropout(dropout)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         r"""
@@ -651,9 +651,8 @@ class EvoformerPairBlock(nn.Module):
         # TriangleAttention preserves the input residue-axis orientation. Ending-node attention
         # therefore transposes the pair and mask residue axes around the call, then restores them.
         end_pair_mask = pair_mask.transpose(-2, -1)
-        pair = pair + self.rowwise_dropout(
-            self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask).transpose(-3, -2),
-        )
+        ending_update = self.triangle_attention_ending_node(pair.transpose(-3, -2), end_pair_mask)
+        pair = pair + self.rowwise_dropout(ending_update).transpose(-3, -2)
         return pair + self.transition(pair, pair_mask)
 
 
@@ -904,7 +903,7 @@ class EvoformerTransition(nn.Module):
         return output * mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
-class EvoformerOuterProductMean(OuterProductMean):
+class EvoformerOuterProductMean(PostProjectionOuterProductMean):
     r"""
     Evoformer outer-product mean with biased left and right MSA projections.
 
@@ -933,7 +932,6 @@ class EvoformerOuterProductMean(OuterProductMean):
             hidden_size=hidden_size,
             pair_size=pair_size,
             eps=eps,
-            divide_before_projection=False,
             backend=backend,
         )
         self.left_projection = nn.Linear(msa_size, hidden_size)

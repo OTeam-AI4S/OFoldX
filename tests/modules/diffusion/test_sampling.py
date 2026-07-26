@@ -5,6 +5,7 @@ from typing import Literal
 import pytest
 import torch
 
+from ofoldx.modules.atom import LocalAtomGeometryBuilder
 from ofoldx.modules.diffusion import (
     CoordinateDenoiseContext,
     CoordinateDenoisingInput,
@@ -15,16 +16,20 @@ from ofoldx.modules.embedding.position import generate_relative_position_feature
 
 
 def _make_context(batch_size: int = 1) -> CoordinateDenoiseContext:
+    reference_positions = torch.zeros(batch_size, 5, 3)
+    single = torch.zeros(batch_size, 3, 6)
+    pair = torch.zeros(batch_size, 3, 3, 4)
     return CoordinateDenoiseContext(
         atom_features=torch.zeros(batch_size, 5, 5),
         atom_to_token=torch.tensor([[0, 0, 1, 2, 2]]).expand(batch_size, -1),
-        reference_positions=torch.zeros(batch_size, 5, 3),
+        reference_positions=reference_positions,
         reference_charges=torch.zeros(batch_size, 5, 1),
         reference_mask=torch.ones(batch_size, 5, dtype=torch.bool),
         atom_mask=torch.ones(batch_size, 5, dtype=torch.bool),
         token_embedding=torch.zeros(batch_size, 3, 8),
-        single=torch.zeros(batch_size, 3, 6),
-        pair=torch.zeros(batch_size, 3, 3, 4),
+        single=single,
+        conditioning_single=single,
+        conditioning_pair=pair,
         relative_features=generate_relative_position_features(
             residue_index=torch.arange(3).expand(batch_size, -1),
             chain_index=torch.zeros(batch_size, 3, dtype=torch.long),
@@ -32,6 +37,10 @@ def _make_context(batch_size: int = 1) -> CoordinateDenoiseContext:
             symmetry_index=torch.zeros(batch_size, 3, dtype=torch.long),
             token_index=torch.arange(3).expand(batch_size, -1),
             dtype=torch.float32,
+        ),
+        local_geometry=LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)(
+            reference_positions,
+            torch.zeros(batch_size, 5, dtype=torch.long),
         ),
     )
 

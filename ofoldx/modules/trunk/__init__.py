@@ -10,5 +10,5 @@ from .evoformer import (
     OuterProductFirstEvoformerStack,
     OuterProductFirstExtraMsaEvoformerStack,
 )
-from .msa import CategoricalMsaTrunk, FinalMsaPairBlock, MsaTrunk, TrianglePairUpdateStack
+from .msa import FinalMsaPairUpdate, MsaTrunk, TrianglePairUpdateStack
 from .pairformer import PairformerBlock, PairformerStack

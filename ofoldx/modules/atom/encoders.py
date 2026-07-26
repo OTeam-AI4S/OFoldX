@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..backend import LayerNorm, resolve_config_backend
+from ..backend import LayerNorm
 from ..transformer import (
     AtomCrossAttentionTransformer,
     ConditionedTransformerEncoder,
@@ -20,11 +20,11 @@ from ..transformer import (
 from .context import AtomContext, AtomToTokenOutput
 from .pair_encoding import encode_atom_pair
 from .transfer import (
+    AtomToTokenMean,
     TokenPairToAtomPairBroadcast,
     TokenPairToLocalAtomPairBroadcast,
     TokenToAtomBroadcast,
     dense_mean_to_tokens,
-    scatter_mean_to_tokens,
 )
 from .window import LocalAtomGeometry, LocalAtomGeometryBuilder, gather_key_windows
 
@@ -68,11 +68,6 @@ class AtomToTokenEncoderBase(nn.Module):
         atom_self_attention: AtomSelfAttention,
     ) -> None:
         super().__init__()
-        self.backend = resolve_config_backend(
-            backend,
-            supported=("oops", "eager"),
-            public_default="eager",
-        )
         self.atom_conditioner = AtomConditioner(atom_feature_size=atom_feature_size, atom_hidden_size=atom_hidden_size)
         self.atom_pair_encoder = AtomPairEncoder(
             atom_hidden_size=atom_hidden_size,
@@ -83,6 +78,7 @@ class AtomToTokenEncoderBase(nn.Module):
         self.atom_self_attention = atom_self_attention
         self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
         self.relu = nn.ReLU()
+        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
     def build_local_geometry(
         self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
@@ -138,12 +134,11 @@ class AtomToTokenEncoderBase(nn.Module):
         """
 
         token_hidden = self.relu(self.token_projection(atom_query))
-        token_hidden = scatter_mean_to_tokens(
+        token_hidden = self.atom_to_token_mean(
             token_hidden,
             atom_to_token,
             num_tokens,
             atom_mask,
-            backend=self.backend,
         )
         return AtomToTokenOutput(token_hidden=token_hidden, atom_query=atom_query, atom_context=atom_context)
 
@@ -1037,9 +1032,13 @@ class PackedDenoisingAtomToTokenEncoder(nn.Module):
         num_key_atoms: int = 128,
         num_blocks: int = 3,
         num_attention_heads: int = 4,
+        transformer_size: int | None = None,
+        post_layer_norm: bool = False,
+        use_qk_norm: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
+        transformer_size = 2 * token_hidden_size if transformer_size is None else transformer_size
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
         self.atom_transformer = PackedAtomAttention(
             ConditionedTransformerEncoder(
@@ -1047,12 +1046,14 @@ class PackedDenoisingAtomToTokenEncoder(nn.Module):
                 num_attention_heads=num_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
+                post_layer_norm=post_layer_norm,
+                use_qk_norm=use_qk_norm,
                 backend=backend,
             ),
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
         )
-        self.token_projection = nn.Linear(atom_hidden_size, 2 * token_hidden_size, bias=False)
+        self.token_projection = nn.Linear(atom_hidden_size, transformer_size, bias=False)
         self.token_activation = nn.ReLU()
 
     def forward(
@@ -1111,16 +1112,20 @@ class PackedTokenToAtomDecoder(nn.Module):
         num_key_atoms: int = 128,
         num_blocks: int = 3,
         num_attention_heads: int = 4,
+        transformer_size: int | None = None,
+        use_qk_norm: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.token_projection = nn.Linear(2 * token_hidden_size, atom_hidden_size, bias=False)
+        transformer_size = 2 * token_hidden_size if transformer_size is None else transformer_size
+        self.token_projection = nn.Linear(transformer_size, atom_hidden_size, bias=False)
         self.atom_transformer = PackedAtomAttention(
             ConditionedTransformerEncoder(
                 num_blocks=num_blocks,
                 num_attention_heads=num_attention_heads,
                 hidden_size=atom_hidden_size,
                 conditioning_size=atom_hidden_size,
+                use_qk_norm=use_qk_norm,
                 backend=backend,
             ),
             num_query_atoms=num_query_atoms,
