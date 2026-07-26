@@ -323,7 +323,9 @@ def convert_rfdiffusion_checkpoint(
     )
     for name, array in rfdiffusion_schedule(schedule_source).items():
         state[f"igso3_{name}"] = torch.as_tensor(array, dtype=torch.float64)
+    state["igso3_schedule_present"] = torch.tensor(True, dtype=torch.bool)
     model.load_state_dict(state, strict=True, assign=True)
+    model.eval()
     return model
 
 

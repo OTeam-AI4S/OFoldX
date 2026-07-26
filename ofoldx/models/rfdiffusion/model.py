@@ -141,16 +141,33 @@ class RfDiffusionModel(Model):
         # lookup table before the model repository is saved.
         for name, shape in _IGSO3_FIELDS:
             self.register_buffer(f"igso3_{name}", torch.zeros(shape, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "igso3_schedule_present",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
         self.post_init()
 
-    def _igso3_schedule(self) -> dict[str, np.ndarray]:
+    def _igso3_schedule(self) -> dict[str, np.ndarray] | None:
         r"""
-        Return the model-baked IGSO(3) lookup table as the sampler's schedule dict.
+        Return the populated IGSO(3) lookup table, if one was converted.
         """
 
-        return {name: getattr(self, f"igso3_{name}").detach().cpu().numpy() for name, _ in _IGSO3_FIELDS}
+        if not bool(self.igso3_schedule_present):
+            return None
+        return {
+            name: getattr(self, f"igso3_{name}").detach().to(device="cpu", dtype=torch.float64).numpy()
+            for name, _ in _IGSO3_FIELDS
+        }
 
-    def forward(self, input: RfDiffusionInput) -> RfDiffusionOutput:
+    def forward(
+        self,
+        input: RfDiffusionInput,
+        *,
+        previous_single: Tensor | None = None,
+        previous_pair: Tensor | None = None,
+        previous_state: Tensor | None = None,
+    ) -> RfDiffusionOutput:
         r"""
         Run one differentiable RFdiffusion denoising pass.
 
@@ -160,6 +177,12 @@ class RfDiffusionModel(Model):
         Args:
             input: Processed input containing noisy atom coordinates with shape
                 ``(B, N, A, 3)`` in angstroms and one diffusion timestep per batch item.
+            previous_single: Recycled single representation with shape
+                ``(B, N, C_single)``, or `None` to start from zeros.
+            previous_pair: Recycled pair representation with shape
+                ``(B, N, N, C_pair)``, or `None` to start from zeros.
+            previous_state: Recycled structure-state representation with shape
+                ``(B, N, C_state)``, or `None` to start from zeros.
 
         Returns:
             An [`RfDiffusionOutput`][] containing final backbone coordinates with shape
@@ -175,20 +198,7 @@ class RfDiffusionModel(Model):
             template_coordinates,
             template_torsion_features,
         ) = self._features(input)
-        (
-            single,
-            pair,
-            backbone_coordinates,
-            state,
-            torsion_angles,
-            sequence_logits,
-            plddt_fraction,
-            geometry_logits,
-            plddt_logits,
-            resolved_logits,
-            backbone_trajectory,
-            torsion_trajectory,
-        ) = self.denoiser(
+        denoiser_output = self.denoiser(
             latent_msa,
             full_msa,
             input.residue_type_features,
@@ -198,29 +208,29 @@ class RfDiffusionModel(Model):
             template_pair_features=template_pair_features,
             template_coordinates=template_coordinates,
             template_torsion_features=template_torsion_features,
-            previous_msa=None,
-            previous_pair=None,
-            previous_state=None,
+            previous_msa=previous_single,
+            previous_pair=previous_pair,
+            previous_state=previous_state,
             fixed_structure_mask=input.fixed_structure_mask,
             cyclic_mask=input.cyclic_mask,
         )
-        distance_logits, omega_logits, theta_logits, phi_logits = geometry_logits
+        geometry_logits = denoiser_output.geometry_logits
         return RfDiffusionOutput(
-            single=single,
-            pair=pair,
-            backbone_coordinates=backbone_coordinates,
-            state=state,
-            torsion_angles=torsion_angles,
-            sequence_logits=sequence_logits,
-            plddt_fraction=plddt_fraction,
-            distance_logits=distance_logits.movedim(1, -1),
-            omega_logits=omega_logits.movedim(1, -1),
-            theta_logits=theta_logits.movedim(1, -1),
-            phi_logits=phi_logits.movedim(1, -1),
-            plddt_logits=plddt_logits.movedim(1, -1),
-            resolved_log_odds=resolved_logits,
-            backbone_trajectory=backbone_trajectory,
-            torsion_trajectory=torsion_trajectory,
+            single=denoiser_output.single,
+            pair=denoiser_output.pair,
+            backbone_coordinates=denoiser_output.backbone_coordinates,
+            state=denoiser_output.state,
+            torsion_angles=denoiser_output.torsion_angles,
+            sequence_logits=denoiser_output.sequence_logits,
+            plddt_fraction=denoiser_output.plddt_fraction,
+            distance_logits=geometry_logits.distance_logits.movedim(1, -1),
+            omega_logits=geometry_logits.omega_logits.movedim(1, -1),
+            theta_logits=geometry_logits.theta_logits.movedim(1, -1),
+            phi_logits=geometry_logits.phi_logits.movedim(1, -1),
+            plddt_logits=denoiser_output.plddt_logits.movedim(1, -1),
+            resolved_log_odds=denoiser_output.resolved_log_odds,
+            backbone_trajectory=denoiser_output.backbone_trajectory,
+            torsion_trajectory=denoiser_output.torsion_trajectory,
         )
 
     def _features(
@@ -345,8 +355,8 @@ class RfDiffusionModel(Model):
                 ``None`` uses ``noise_scale_frame``.
             frame_noise_schedule: Frame-noise schedule, ``"constant"`` or ``"linear"``.
             align_motif: Whether to align each sampled structure to fixed motif residues.
-            return_trajectory: Whether to retain all reverse steps internally during
-                sampling. Trajectories are not included in the returned result.
+            return_trajectory: Whether each candidate includes its reverse-diffusion
+                trajectory.
             symmetry_recenter: Whether to recenter symmetry units before radial placement.
             symmetry_radius_angstrom: Radial placement distance in angstroms.
             guidance_scale: Multiplier for differentiable geometric-condition guidance.
@@ -396,6 +406,7 @@ class RfDiffusionModel(Model):
             ),
             prepared,
             align_motif=align_motif,
+            return_trajectory=return_trajectory,
         )
 
 
@@ -493,20 +504,7 @@ class RfDiffusionDenoiser(nn.Module):
         previous_state: Tensor | None = None,
         fixed_structure_mask: Tensor | None = None,
         cyclic_mask: Tensor | None = None,
-    ) -> tuple[
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        tuple[Tensor, Tensor, Tensor, Tensor],
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-    ]:
+    ) -> _RfDiffusionDenoiserOutput:
         batch_size, _, length = latent_msa.shape[:3]
         latent_msa, pair, state = self.msa_embeddings(
             latent_msa,
@@ -548,7 +546,7 @@ class RfDiffusionDenoiser(nn.Module):
         elif fixed_structure_mask.ndim == 1:
             fixed_structure_mask = fixed_structure_mask.unsqueeze(0).expand(batch_size, -1)
         frozen_mask = fixed_structure_mask if self.freeze_track_motif else torch.zeros_like(fixed_structure_mask)
-        msa, pair, rotations, translations, alpha_s, state = self.trunk(
+        trunk_output = self.trunk(
             residue_type_features,
             latent_msa,
             full_msa,
@@ -561,27 +559,34 @@ class RfDiffusionDenoiser(nn.Module):
         )
 
         local = coords[:, :, :3] - coords[:, :, 1].unsqueeze(-2)
-        backbone_trajectory = torch.einsum("sblij,blaj->sblai", rotations, local)
-        backbone_trajectory = backbone_trajectory + translations.unsqueeze(-2)
+        backbone_trajectory = torch.einsum(
+            "sblij,blaj->sblai",
+            trunk_output.rotation_trajectory,
+            local,
+        )
+        backbone_trajectory = backbone_trajectory + trunk_output.translation_trajectory.unsqueeze(-2)
         final_coords = backbone_trajectory[-1]
 
-        distance_logits = self.pairwise_geometry_head(pair)
-        logits_aa = self.masked_token_head(msa)
-        lddt_logits = self.predicted_lddt_head(state)
-        resolved_logits = self.experimentally_resolved_head(msa[:, 0], state)
-        return (
-            msa[:, 0],
-            pair,
-            final_coords,
-            state,
-            alpha_s[-1],
-            logits_aa.permute(0, 2, 1),
-            _plddt_expectation(lddt_logits),
-            distance_logits,
-            lddt_logits,
-            resolved_logits,
-            backbone_trajectory,
-            alpha_s,
+        geometry_logits = self.pairwise_geometry_head(trunk_output.pair)
+        sequence_logits = self.masked_token_head(trunk_output.msa)
+        plddt_logits = self.predicted_lddt_head(trunk_output.state)
+        resolved_log_odds = self.experimentally_resolved_head(
+            trunk_output.msa[:, 0],
+            trunk_output.state,
+        )
+        return _RfDiffusionDenoiserOutput(
+            single=trunk_output.msa[:, 0],
+            pair=trunk_output.pair,
+            backbone_coordinates=final_coords,
+            state=trunk_output.state,
+            torsion_angles=trunk_output.torsion_trajectory[-1],
+            sequence_logits=sequence_logits.permute(0, 2, 1),
+            plddt_fraction=_plddt_expectation(plddt_logits),
+            geometry_logits=geometry_logits,
+            plddt_logits=plddt_logits,
+            resolved_log_odds=resolved_log_odds,
+            backbone_trajectory=backbone_trajectory,
+            torsion_trajectory=trunk_output.torsion_trajectory,
         )
 
 
@@ -933,7 +938,7 @@ class RfDiffusionTrunk(nn.Module):
         residue_index: Tensor,
         cyclic_mask: Tensor | None = None,
         fixed_structure_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> _RfDiffusionTrunkOutput:
         fixed_structure_mask = (
             torch.zeros_like(residue_index, dtype=torch.bool) if fixed_structure_mask is None else fixed_structure_mask
         )
@@ -944,13 +949,13 @@ class RfDiffusionTrunk(nn.Module):
 
         rotation_steps: list[Tensor] = []
         translation_steps: list[Tensor] = []
-        alpha_steps: list[Tensor] = []
+        torsion_steps: list[Tensor] = []
 
         for block in self.extra_blocks:
             rotations = rotations.detach()
             translations = translations.detach()
             coords = _apply_frames(rotations, translations, local_coords)
-            full_msa, pair, rotations, translations, state, alpha = block(
+            block_output = block(
                 full_msa,
                 pair,
                 rotations,
@@ -961,15 +966,20 @@ class RfDiffusionTrunk(nn.Module):
                 fixed_structure_mask=fixed_structure_mask,
                 cyclic_mask=cyclic_mask,
             )
+            full_msa = block_output.msa
+            pair = block_output.pair
+            rotations = block_output.rotations
+            translations = block_output.translations
+            state = block_output.state
             rotation_steps.append(rotations)
             translation_steps.append(translations)
-            alpha_steps.append(alpha)
+            torsion_steps.append(block_output.torsion_angles)
 
         for block in self.main_blocks:
             rotations = rotations.detach()
             translations = translations.detach()
             coords = _apply_frames(rotations, translations, local_coords)
-            msa, pair, rotations, translations, state, alpha = block(
+            block_output = block(
                 msa,
                 pair,
                 rotations,
@@ -980,16 +990,21 @@ class RfDiffusionTrunk(nn.Module):
                 fixed_structure_mask=fixed_structure_mask,
                 cyclic_mask=cyclic_mask,
             )
+            msa = block_output.msa
+            pair = block_output.pair
+            rotations = block_output.rotations
+            translations = block_output.translations
+            state = block_output.state
             rotation_steps.append(rotations)
             translation_steps.append(translations)
-            alpha_steps.append(alpha)
+            torsion_steps.append(block_output.torsion_angles)
 
         state = self.state_output_projection(state)
         for _ in range(self.num_refinement_blocks):
             rotations = rotations.detach()
             translations = translations.detach()
             coords = _apply_frames(rotations, translations, local_coords)
-            rotations, translations, state, alpha = self.refinement_update(
+            structure_output = self.refinement_update(
                 msa,
                 pair,
                 rotations,
@@ -1001,17 +1016,20 @@ class RfDiffusionTrunk(nn.Module):
                 fixed_structure_mask=fixed_structure_mask,
                 cyclic_mask=cyclic_mask,
             )
+            rotations = structure_output.rotations
+            translations = structure_output.translations
+            state = structure_output.state
             rotation_steps.append(rotations)
             translation_steps.append(translations)
-            alpha_steps.append(alpha)
+            torsion_steps.append(structure_output.torsion_angles)
 
-        return (
-            msa,
-            pair,
-            torch.stack(rotation_steps, dim=0),
-            torch.stack(translation_steps, dim=0),
-            torch.stack(alpha_steps, dim=0),
-            state,
+        return _RfDiffusionTrunkOutput(
+            msa=msa,
+            pair=pair,
+            rotation_trajectory=torch.stack(rotation_steps, dim=0),
+            translation_trajectory=torch.stack(translation_steps, dim=0),
+            torsion_trajectory=torch.stack(torsion_steps, dim=0),
+            state=state,
         )
 
 
@@ -1068,12 +1086,12 @@ class RfDiffusionExtraTrunkBlock(nn.Module):
         residue_index: Tensor,
         fixed_structure_mask: Tensor,
         cyclic_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> _RfDiffusionTrunkBlockOutput:
         radial_features = _backbone_ca_distogram(coords)
         msa = self.msa_block(msa, pair, radial_features, state)
         pair = pair + self.outer_product_mean(msa)
         pair = self.pair_block(pair, radial_features)
-        rotations, translations, state, alpha = self.structure_update(
+        structure_output = self.structure_update(
             msa,
             pair,
             input_rotations,
@@ -1085,7 +1103,14 @@ class RfDiffusionExtraTrunkBlock(nn.Module):
             cyclic_mask=cyclic_mask,
             top_k=0,
         )
-        return msa, pair, rotations, translations, state, alpha
+        return _RfDiffusionTrunkBlockOutput(
+            msa=msa,
+            pair=pair,
+            rotations=structure_output.rotations,
+            translations=structure_output.translations,
+            state=structure_output.state,
+            torsion_angles=structure_output.torsion_angles,
+        )
 
 
 class RfDiffusionTrunkBlock(nn.Module):
@@ -1141,12 +1166,12 @@ class RfDiffusionTrunkBlock(nn.Module):
         residue_index: Tensor,
         fixed_structure_mask: Tensor,
         cyclic_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> _RfDiffusionTrunkBlockOutput:
         radial_features = _backbone_ca_distogram(coords)
         msa = self.msa_block(msa, pair, radial_features, state)
         pair = pair + self.outer_product_mean(msa)
         pair = self.pair_block(pair, radial_features)
-        rotations, translations, state, alpha = self.structure_update(
+        structure_output = self.structure_update(
             msa,
             pair,
             input_rotations,
@@ -1158,7 +1183,14 @@ class RfDiffusionTrunkBlock(nn.Module):
             cyclic_mask=cyclic_mask,
             top_k=0,
         )
-        return msa, pair, rotations, translations, state, alpha
+        return _RfDiffusionTrunkBlockOutput(
+            msa=msa,
+            pair=pair,
+            rotations=structure_output.rotations,
+            translations=structure_output.translations,
+            state=structure_output.state,
+            torsion_angles=structure_output.torsion_angles,
+        )
 
 
 class RfDiffusionRelativePositionEmbedding(nn.Module):
@@ -1216,7 +1248,7 @@ class RfDiffusionMsaBlock(nn.Module):
         self.row_attention = RfDiffusionMsaRowAttentionWithPairBias(
             msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
-        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
+        self.row_dropout = StructuredDropout(dropout, broadcast_dims=1)
         self.column_attention = RfDiffusionMsaColumnAttention(
             msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
@@ -1264,7 +1296,7 @@ class RfDiffusionExtraMsaBlock(nn.Module):
         self.row_attention = RfDiffusionMsaRowAttentionWithPairBias(
             msa_size=msa_size, pair_size=pair_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
-        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
+        self.row_dropout = StructuredDropout(dropout, broadcast_dims=1)
         self.column_attention = RfDiffusionMsaColumnGlobalAttention(
             msa_size=msa_size, num_attention_heads=num_attention_heads, head_dim=hidden_size
         )
@@ -1309,11 +1341,11 @@ class RfDiffusionPairBlock(nn.Module):
         self.row_attention = RfDiffusionPairAxialAttention(
             pair_size, pair_size, num_attention_heads, hidden_size, is_row=True
         )
-        self.row_dropout = StructuredDropout(dropout, broadcast_dim=1)
+        self.row_dropout = StructuredDropout(dropout, broadcast_dims=1)
         self.column_attention = RfDiffusionPairAxialAttention(
             pair_size, pair_size, num_attention_heads, hidden_size, is_row=False
         )
-        self.column_dropout = StructuredDropout(dropout, broadcast_dim=2)
+        self.column_dropout = StructuredDropout(dropout, broadcast_dims=2)
         self.transition = RfDiffusionTransition(pair_size, 2)
         self.reset_parameters()
 
@@ -1345,8 +1377,6 @@ class RfDiffusionOuterProductMean(OuterProductMean):
             msa_size=msa_size,
             hidden_size=hidden_size,
             pair_size=pair_size,
-            eps=0.0,
-            divide_before_projection=True,
         )
         self.left_projection = nn.Linear(msa_size, hidden_size)
         self.right_projection = nn.Linear(msa_size, hidden_size)
@@ -1413,7 +1443,7 @@ class RfDiffusionStructureUpdate(nn.Module):
         fixed_structure_mask: Tensor | None,
         cyclic_mask: Tensor | None = None,
         top_k: int = 64,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> _RfDiffusionStructureUpdateOutput:
         batch_size, _, length = msa.shape[:3]
         fixed_structure_mask = (
             torch.zeros_like(residue_index, dtype=torch.bool) if fixed_structure_mask is None else fixed_structure_mask
@@ -1447,8 +1477,13 @@ class RfDiffusionStructureUpdate(nn.Module):
         delta_rotations = _quaternion_update_matrix(rotation_vector, device=coords.device)
         rotations = einsum("bnij,bnjk->bnik", delta_rotations, input_rotations)
         translations = translations + input_translations
-        alpha = self.torsion_head(msa[:, 0], state)
-        return rotations, translations, state, alpha
+        torsion_angles = self.torsion_head(msa[:, 0], state)
+        return _RfDiffusionStructureUpdateOutput(
+            rotations=rotations,
+            translations=translations,
+            state=state,
+            torsion_angles=torsion_angles,
+        )
 
 
 class RfDiffusionTransition(nn.Module):
@@ -2448,18 +2483,18 @@ class RfDiffusionPairwiseGeometryHead(nn.Module):
     def forward(
         self,
         pair: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _RfDiffusionGeometryLogits:
         theta_logits, phi_logits = self.asymmetric_projection(pair).split((_THETA_BINS, _PHI_BINS), dim=-1)
 
         symmetric_logits = self.symmetric_projection(pair)
         symmetric_logits = symmetric_logits + symmetric_logits.transpose(1, 2)
-        dist_logits, omega_logits = symmetric_logits.split((_DISTANCE_BINS, _OMEGA_BINS), dim=-1)
+        distance_logits, omega_logits = symmetric_logits.split((_DISTANCE_BINS, _OMEGA_BINS), dim=-1)
 
-        return (
-            _channel_first(dist_logits),
-            _channel_first(omega_logits),
-            _channel_first(theta_logits),
-            _channel_first(phi_logits),
+        return _RfDiffusionGeometryLogits(
+            distance_logits=_channel_first(distance_logits),
+            omega_logits=_channel_first(omega_logits),
+            theta_logits=_channel_first(theta_logits),
+            phi_logits=_channel_first(phi_logits),
         )
 
 
@@ -2700,7 +2735,7 @@ class RfDiffusionIgso3Diffuser:
         generator: torch.Generator | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if torch.is_tensor(coords):
-            coords_np = coords.detach().cpu().numpy()
+            coords_np = coords.detach().to(device="cpu", dtype=torch.float64).numpy()
         else:
             coords_np = coords
         t_values = np.arange(self.num_timesteps) + 1 if t_list is None else np.asarray(t_list, dtype=np.int64)
@@ -2709,8 +2744,8 @@ class RfDiffusionIgso3Diffuser:
         Ca = torch.from_numpy(coords_np[None, :, 1])
         C = torch.from_numpy(coords_np[None, :, 2])
         R_true, Ca_true = rigid_from_three_points(N, Ca, C)
-        R_true_np = R_true[0].detach().cpu().numpy()
-        Ca_np = Ca_true[0].detach().cpu().numpy()
+        R_true_np = R_true[0].detach().to(device="cpu", dtype=torch.float64).numpy()
+        Ca_np = Ca_true[0].detach().to(device="cpu", dtype=torch.float64).numpy()
         sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
         if diffusion_mask is not None:
             mask_np = (
@@ -2978,7 +3013,7 @@ class RfDiffusionSampler:
         final_step: int | None = None,
         generator: torch.Generator | None = None,
         return_trajectory: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> _RfDiffusionSample:
         active_steps = (
             self.config.diffuser.num_timesteps if num_sampling_steps is None else integer_index(num_sampling_steps)
         )
@@ -3036,7 +3071,10 @@ class RfDiffusionSampler:
             raise ValueError("final_step must be between 1 and the starting timestep")
         residue_type_features = original_sequence.clone()
         residue_type_features[~mask_sequence.squeeze(0)] = RFDIFFUSION_MASK_TOKEN_ID
-        residue_type_features = _one_hot_sequence(residue_type_features)
+        residue_type_features = _one_hot_sequence(
+            residue_type_features,
+            dtype=input.residue_type_features.dtype,
+        )
         diffused, _clean = diffuser.diffuse_pose(
             initial_coords,
             atom_mask,
@@ -3114,7 +3152,9 @@ class RfDiffusionSampler:
                 fixed_structure_mask=diffusion_mask,
                 cyclic_mask=cyclic_mask,
             )
-            predicted_backbone, torsion_angles, plddt = output[2], output[4], output[6]
+            predicted_backbone = output.backbone_coordinates
+            torsion_angles = output.torsion_angles
+            plddt = output.plddt_fraction
             sequence_tokens = denoiser_residue_type_features.argmax(dim=-1)
             _frames, predicted_all_atom_coordinates = self.all_atom_reconstruction(
                 sequence_tokens, predicted_backbone, torsion_angles
@@ -3176,13 +3216,13 @@ class RfDiffusionSampler:
             plddt_values = final_plddt[None]
             denoised_values = (final_denoised_coordinates + center)[None]
             next_coordinates_values = (final_next_coordinates + center)[None]
-        return (
-            final_denoised_coordinates + center,
-            residue_type_features.argmax(dim=-1),
-            timestep_values,
-            plddt_values,
-            denoised_values,
-            next_coordinates_values,
+        return _RfDiffusionSample(
+            coordinates=final_denoised_coordinates + center,
+            sequence_tokens=residue_type_features.argmax(dim=-1),
+            timesteps=timestep_values,
+            plddt_fraction=plddt_values,
+            predicted_clean_coordinates=denoised_values,
+            next_step_coordinates=next_coordinates_values,
         )
 
     def _preprocess(
@@ -3217,9 +3257,7 @@ class RfDiffusionSampler:
         time_feature = residue_type_features.new_zeros((length,))
         time_feature[fixed_structure_mask.squeeze(0)] = 1
         time_feature[~fixed_structure_mask.squeeze(0)] = 1 - timestep / diffuser.num_timesteps
-        template_single_features = torch.cat(
-            (template_single_features, time_feature[None, None, :, None]), dim=-1
-        ).float()
+        template_single_features = torch.cat((template_single_features, time_feature[None, None, :, None]), dim=-1)
 
         working_coordinates = template_coordinates.clone()
         if self.config.preprocess.sidechain_input:
@@ -3263,10 +3301,20 @@ class RfDiffusionSampler:
 
         if self.config.preprocess.template_single_feature_size == 28:
             template_single_features = torch.cat(
-                (template_single_features, secondary_structure[None, None].float()), dim=-1
+                (
+                    template_single_features,
+                    secondary_structure[None, None].to(dtype=residue_type_features.dtype),
+                ),
+                dim=-1,
             )
         if self.config.preprocess.template_pair_feature_size == 47:
-            template_pair_features = torch.cat((template_pair_features, block_adjacency[None, None].float()), dim=-1)
+            template_pair_features = torch.cat(
+                (
+                    template_pair_features,
+                    block_adjacency[None, None].to(dtype=template_pair_features.dtype),
+                ),
+                dim=-1,
+            )
 
         return (
             latent_msa_features,
@@ -3710,6 +3758,7 @@ class RfDiffusionGuidance:
                     attraction_strength=substrate_condition.attraction_strength,
                     repulsion_slope=substrate_condition.repulsion_slope,
                     repulsion_cutoff=substrate_condition.repulsion_cutoff_angstrom,
+                    nearest_only_repulsion=substrate_condition.nearest_only_repulsion,
                 )
                 potential = potential + weight * interaction
             else:
@@ -4114,7 +4163,9 @@ def _initial_frames(coords: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """
 
     batch_size, length = coords.shape[:2]
-    rotations = torch.eye(3, device=coords.device).reshape(1, 1, 3, 3).expand(batch_size, length, -1, -1)
+    rotations = (
+        torch.eye(3, device=coords.device, dtype=coords.dtype).reshape(1, 1, 3, 3).expand(batch_size, length, -1, -1)
+    )
     translations = coords[:, :, 1]
     local_coords = coords - translations.unsqueeze(-2)
     return rotations, translations, local_coords
@@ -4534,8 +4585,12 @@ def _next_frames(
     rotations_t, Ca_t = rigid_from_three_points(
         noisy_coords[None, :, 0], noisy_coords[None, :, 1], noisy_coords[None, :, 2]
     )
-    R_0_np = Rotation.from_matrix(rotations_0.squeeze(0).detach().cpu().numpy()).as_matrix()
-    R_t_np = Rotation.from_matrix(rotations_t.squeeze(0).detach().cpu().numpy()).as_matrix()
+    R_0_np = Rotation.from_matrix(
+        rotations_0.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
+    ).as_matrix()
+    R_t_np = Rotation.from_matrix(
+        rotations_t.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
+    ).as_matrix()
     length = R_t_np.shape[0]
     transitions = np.broadcast_to(np.eye(3), (length, 3, 3)).copy()
     mask_cpu = diffusion_mask.detach().cpu().bool()
@@ -4558,10 +4613,10 @@ def _next_frames(
     else:
         raise ValueError(f"unsupported SO(3) diffusion type {so3_type!r}")
     transitions = transitions[:, None]
-    ca_t_np = Ca_t.squeeze(0).detach().cpu().numpy()
+    ca_t_np = Ca_t.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
+    noisy_coords_np = noisy_coords[:, :3].detach().to(device="cpu", dtype=torch.float64).numpy()
     next_coords = (
-        np.einsum("lrij,laj->lrai", transitions, noisy_coords[:, :3].detach().cpu().numpy() - ca_t_np[:, None])
-        + ca_t_np[:, None, None]
+        np.einsum("lrij,laj->lrai", transitions, noisy_coords_np - ca_t_np[:, None]) + ca_t_np[:, None, None]
     ).squeeze(1)
     return torch.as_tensor(next_coords, dtype=noisy_coords.dtype, device=noisy_coords.device)
 
@@ -4652,19 +4707,25 @@ _PAIR_MAX_DISTANCE = 20.0
 _PAIR_DISTANCE_BINS = 36
 
 
-def _one_hot_sequence(seq: Tensor, *, num_classes: int = 22) -> Tensor:
+def _one_hot_sequence(
+    seq: Tensor,
+    *,
+    num_classes: int = 22,
+    dtype: torch.dtype,
+) -> Tensor:
     r"""
     Encode RFdiffusion residue IDs as one-hot residue-type features.
 
     Args:
         seq: Residue ids `[L]`.
         num_classes: Number of classes (residue vocabulary size).
+        dtype: Floating dtype of the encoded features.
 
     Returns:
         One-hot residue-type features `[L, num_classes]`.
     """
 
-    return F.one_hot(seq.long(), num_classes=num_classes).float()
+    return F.one_hot(seq.long(), num_classes=num_classes).to(dtype=dtype)
 
 
 def _beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tensor:
@@ -4825,7 +4886,7 @@ def _distance_one_hot(
         device=distance.device,
     )
     bins = torch.bucketize(distance.contiguous(), boundaries).long()
-    return F.one_hot(bins, num_classes=num_bins + 1).float()
+    return F.one_hot(bins, num_classes=num_bins + 1).to(dtype=distance.dtype)
 
 
 def _template_pair_features(
@@ -4862,7 +4923,14 @@ def _template_pair_features(
     )
     orientation = torch.cat((torch.sin(pair_geometry[..., 1:]), torch.cos(pair_geometry[..., 1:])), dim=-1) * mask
     valid = ~torch.isnan(pair_geometry[..., 0])
-    template_pair_features = torch.cat((distance, orientation, valid.unsqueeze(-1).float()), dim=-1)
+    template_pair_features = torch.cat(
+        (
+            distance,
+            orientation,
+            valid.unsqueeze(-1).to(dtype=pair_geometry.dtype),
+        ),
+        dim=-1,
+    )
     return torch.nan_to_num(template_pair_features, nan=0.0)
 
 
@@ -5055,7 +5123,7 @@ def _template_torsion_features(template_coordinates: Tensor, seq: Tensor) -> Ten
         template_coordinates.reshape(B * T, length, template_coordinates.shape[-2], 3), seq_flat
     )
     alpha = alpha.reshape(B, T, length, 10, 2)
-    alpha_mask = alpha_mask.reshape(B, T, length, 10, 1).float()
+    alpha_mask = alpha_mask.reshape(B, T, length, 10, 1).to(dtype=alpha.dtype)
     return torch.cat((alpha, alpha_mask), dim=-1).reshape(B, T, length, 30)
 
 
@@ -5448,18 +5516,17 @@ def _resolved_placement_condition(layout: RfDiffusionLayout) -> RfDiffusionPlace
 
 
 def _decode_design(
-    samples: Iterable[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]],
+    samples: Iterable[_RfDiffusionSample],
     inputs: list[RfDiffusionInput],
     *,
     align_motif: bool,
+    return_trajectory: bool,
 ) -> RfDiffusionDesignResult:
     # RFdiffusion is coordinate-producing and variable-topology. Each sample carries the decoded
     # Structure and per-sample values in RfDiffusionDesignCandidate/RfDiffusionDesignResult.
-    # Diffusion internals (timesteps, denoised coordinates, and next-step coordinates) are not exposed here.
     candidates: list[RfDiffusionDesignCandidate] = []
     for sample, input in zip(samples, inputs, strict=True):
-        raw_coordinates, sequence, _timesteps, self_consistency_plddt, _px0, _xt_minus_1 = sample
-        coordinates = raw_coordinates.clone()
+        coordinates = sample.coordinates.clone()
         fixed = input.fixed_structure_mask[0].to(device=coordinates.device, dtype=torch.bool)
         if bool(fixed.any()):
             reference = input.noisy_coordinates[0].to(device=coordinates.device, dtype=coordinates.dtype)
@@ -5469,19 +5536,19 @@ def _decode_design(
         layout = input.layout
         candidate, _identity_map, residue_map = _decode_structure(
             coordinates,
-            sequence,
+            sample.sequence_tokens,
             input.fixed_sequence_mask[0],
             layout,
         )
         hard_condition_outcomes = _hard_condition_outcomes(candidate, layout, residue_map)
         _require_hard_conditions(layout, hard_condition_outcomes)
-        # self_consistency_plddt is [steps, L]; the final step is the per-residue design pLDDT,
+        # sample.plddt_fraction is [steps, L]; the final step is the per-residue design pLDDT,
         # aligned row-for-row to the output residues (residue_map keys are the ComponentReference
         # / SymbolicResidueSite identities, its values the realized output ComponentReferences).
         # The expectation lies on (0, 1] (bins linspace(1/num_bins, 1, num_bins)); the
         # Decode multiplies by 100 so the exported `plddt` value uses its 0-100 scale. This
         # mapping is applied only during decode and does not change the sampler or denoiser.
-        plddt = self_consistency_plddt[-1].detach().to(device="cpu", dtype=torch.float32).numpy() * 100.0
+        plddt = sample.plddt_fraction[-1].detach().to(device="cpu", dtype=torch.float32).numpy() * 100.0
         plddt_axis = tuple(residue_map[reference] for reference in layout.output_residues)
         # Use the shared grouped placement_map as the per-candidate output identity. It is
         # reconstructed losslessly from output_residues and residue_map, with
@@ -5505,6 +5572,16 @@ def _decode_design(
                     )
                 },
                 metrics={"plddt": Metric(values=plddt, axis=plddt_axis, unit="0-100")},
+                trajectory=(
+                    RfDiffusionTrajectory(
+                        timesteps=sample.timesteps,
+                        plddt_fraction=sample.plddt_fraction,
+                        predicted_clean_coordinates=sample.predicted_clean_coordinates,
+                        next_step_coordinates=sample.next_step_coordinates,
+                    )
+                    if return_trajectory
+                    else None
+                ),
             )
         )
     return RfDiffusionDesignResult(candidates=tuple(candidates))
@@ -6165,6 +6242,68 @@ def _all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(eq=False)
+class _RfDiffusionStructureUpdateOutput:
+    rotations: Tensor
+    translations: Tensor
+    state: Tensor
+    torsion_angles: Tensor
+
+
+@dataclass(eq=False)
+class _RfDiffusionTrunkBlockOutput:
+    msa: Tensor
+    pair: Tensor
+    rotations: Tensor
+    translations: Tensor
+    state: Tensor
+    torsion_angles: Tensor
+
+
+@dataclass(eq=False)
+class _RfDiffusionTrunkOutput:
+    msa: Tensor
+    pair: Tensor
+    rotation_trajectory: Tensor
+    translation_trajectory: Tensor
+    torsion_trajectory: Tensor
+    state: Tensor
+
+
+@dataclass(eq=False)
+class _RfDiffusionGeometryLogits:
+    distance_logits: Tensor
+    omega_logits: Tensor
+    theta_logits: Tensor
+    phi_logits: Tensor
+
+
+@dataclass(eq=False)
+class _RfDiffusionDenoiserOutput:
+    single: Tensor
+    pair: Tensor
+    backbone_coordinates: Tensor
+    state: Tensor
+    torsion_angles: Tensor
+    sequence_logits: Tensor
+    plddt_fraction: Tensor
+    geometry_logits: _RfDiffusionGeometryLogits
+    plddt_logits: Tensor
+    resolved_log_odds: Tensor
+    backbone_trajectory: Tensor
+    torsion_trajectory: Tensor
+
+
+@dataclass(eq=False)
+class _RfDiffusionSample:
+    coordinates: Tensor
+    sequence_tokens: Tensor
+    timesteps: Tensor
+    plddt_fraction: Tensor
+    predicted_clean_coordinates: Tensor
+    next_step_coordinates: Tensor
+
+
 @dataclass(frozen=True)
 class RfDiffusionLayout:
     r"""
@@ -6297,6 +6436,26 @@ class RfDiffusionOutput:
 
 
 @dataclass(eq=False)
+class RfDiffusionTrajectory:
+    r"""
+    One RFdiffusion reverse-sampling trajectory.
+
+    Args:
+        timesteps: Descending diffusion timesteps with shape ``(S,)``.
+        plddt_fraction: Per-step, per-residue pLDDT fractions with shape ``(S, L)``.
+        predicted_clean_coordinates: Predicted-clean ``pX0`` atom coordinates with
+            shape ``(S, L, A, 3)`` in angstroms.
+        next_step_coordinates: Next-step ``Xt-1`` atom coordinates with shape
+            ``(S, L, A, 3)`` in angstroms.
+    """
+
+    timesteps: Tensor
+    plddt_fraction: Tensor
+    predicted_clean_coordinates: Tensor
+    next_step_coordinates: Tensor
+
+
+@dataclass(eq=False)
 class RfDiffusionDesignCandidate:
     r"""
     One RFdiffusion sample and its aligned scientific values.
@@ -6306,12 +6465,14 @@ class RfDiffusionDesignCandidate:
         placement_map: Realized component occurrences for every placement.
         scores: Scalar scores keyed by stable scientific names.
         metrics: One-axis metrics keyed by stable scientific names.
+        trajectory: Reverse-sampling trajectory when requested.
     """
 
     structure: Structure
     placement_map: PlacementMap = field(default_factory=dict)
     scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
+    trajectory: RfDiffusionTrajectory | None = None
 
 
 @dataclass(eq=False)
@@ -6450,6 +6611,8 @@ class RfDiffusionSubstrateInteraction:
         attraction_strength: Attractive-potential multiplier.
         repulsion_slope: Slope of the short-range repulsion.
         repulsion_cutoff_angstrom: Repulsion cutoff distance in angstroms.
+        nearest_only_repulsion: Whether repulsion uses only each residue's nearest
+            substrate atom instead of every residue--substrate atom pair.
         weight: Optional overall potential weight.
     """
 
@@ -6460,6 +6623,7 @@ class RfDiffusionSubstrateInteraction:
     attraction_strength: float
     repulsion_slope: float
     repulsion_cutoff_angstrom: float = 5.0
+    nearest_only_repulsion: bool = True
     weight: float | None = None
 
 

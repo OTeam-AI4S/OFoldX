@@ -51,7 +51,6 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
-        exclude: ^ofoldx/models/rfdiffusion/rfdiffusion_schedule\.npz$
       - id: check-ast
       - id: check-builtin-literals
       - id: check-case-conflict

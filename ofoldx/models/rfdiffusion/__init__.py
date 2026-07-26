@@ -34,18 +34,19 @@ from .model import (
     RfDiffusionReferenceCoordinates,
     RfDiffusionSecondaryStructure,
     RfDiffusionSubstrateInteraction,
+    RfDiffusionTrajectory,
     rfdiffusion_residue_token_id,
 )
 from .pipeline import RfDiffusionPipeline
 from .processor import RfDiffusionProcessor, from_contig_string, to_contig_string
 
 _MODELS.register(
-    "ofoldx.rfdiffusion",
+    "rfdiffusion",
     model=RfDiffusionModel,
     processor=RfDiffusionProcessor,
 )
 
 _PIPELINES.register(
-    "ofoldx.rfdiffusion",
+    "rfdiffusion",
     pipeline=RfDiffusionPipeline,
 )

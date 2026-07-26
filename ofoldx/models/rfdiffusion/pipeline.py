@@ -40,6 +40,8 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
     Protein backbone design pipeline for RFdiffusion.
     """
 
+    model_architecture = "rfdiffusion"
+
     def design(
         self,
         input: MolecularSystem | Structure | str | PathLike[str] | None = None,
@@ -60,7 +62,6 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
         ] = (),
         inpaint_sequence: Sequence[ComponentReference] = (),
         length: tuple[int, int] | None = None,
-        timestep: int = 50,
         num_candidates: int = 1,
         num_sampling_steps: int | None = None,
         final_step: int = 1,
@@ -92,9 +93,6 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             inpaint_sequence: Existing residue occurrences whose identities are masked.
             length: Inclusive lower and upper bounds for total generated length across
                 generated segments, excluding retained receptor spans.
-            timestep: Diffusion timestep stored in the processed input. This value applies
-                to direct ``forward`` calls; reverse sampling is controlled by
-                ``num_sampling_steps`` and ``partial_steps``.
             num_candidates: Number of independently sampled backbone candidates.
             num_sampling_steps: Number of active reverse-diffusion timesteps. ``None``
                 uses the model configuration.
@@ -110,8 +108,8 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
                 ``None`` uses ``noise_scale_frame``.
             frame_noise_schedule: Frame-noise schedule, ``"constant"`` or ``"linear"``.
             align_motif: Whether to align each sampled structure to fixed motif residues.
-            return_trajectory: Whether to retain all reverse steps internally during
-                sampling. Trajectories are not included in the returned result.
+            return_trajectory: Whether each candidate includes its reverse-diffusion
+                trajectory.
             symmetry_recenter: Whether to recenter symmetry units before radial placement.
             symmetry_radius_angstrom: Radial placement distance in angstroms.
             guidance_scale: Multiplier for differentiable geometric-condition guidance.
@@ -135,7 +133,6 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             conditions=conditions,
             inpaint_sequence=inpaint_sequence,
             length=length,
-            timestep=timestep,
         )
         generator = resolve_generator(seed, generator, device=batch.noisy_coordinates.device)
         return self.model.design(
