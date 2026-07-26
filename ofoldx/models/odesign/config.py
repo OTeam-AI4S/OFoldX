@@ -4,6 +4,8 @@ Persistent configuration for the ODesign architecture and its Processor.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from chanfig import Config
 
 
@@ -126,11 +128,26 @@ class ODesignConfig(Config):
 
 class ODesignProcessorConfig(Config):
     r"""
-    Configure ODesign receptor processing.
+    Configure one polymer-backbone ODesign artifact.
 
     Args:
+        generated_modality: Generated backbone chemistry. ``"protein"`` selects
+            protein segments; ``"nucleic_acid"`` selects DNA and RNA segments.
         receptor_mode: ``"rigid"`` fixes existing receptor heavy atoms; ``"flex"``
             regenerates them except where reference-coordinate conditions fix atoms.
     """
 
-    receptor_mode: str = "flex"  # "rigid" | "flex" (str, not Literal: chanfig validates fields via isinstance)
+    generated_modality: Literal["protein", "nucleic_acid"] = "protein"
+    receptor_mode: Literal["rigid", "flex"] = "flex"
+
+
+class ODesignLigandProcessorConfig(Config):
+    r"""
+    Configure the provisional-atom Processor for the ligand-rigid artifact.
+
+    Args:
+        receptor_mode: ``"rigid"`` fixes observed context heavy atoms; ``"flex"``
+            regenerates them except where reference-coordinate conditions fix atoms.
+    """
+
+    receptor_mode: Literal["rigid", "flex"] = "rigid"

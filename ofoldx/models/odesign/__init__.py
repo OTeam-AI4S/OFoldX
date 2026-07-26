@@ -10,6 +10,7 @@ from .config import (
     ODesignConfig,
     ODesignConstraintEmbeddingsConfig,
     ODesignDenoiserConfig,
+    ODesignLigandProcessorConfig,
     ODesignPairwiseConfig,
     ODesignProcessorConfig,
     ODesignTrunkConfig,
@@ -17,23 +18,54 @@ from .config import (
 from .model import (
     ODesignDesignedResidue,
     ODesignFixedResidue,
+    ODesignGeneratedAtoms,
     ODesignInput,
+    ODesignLigandBackbone,
+    ODesignLigandInput,
+    ODesignLigandLayout,
     ODesignModel,
+    ODesignNucleicAcidIdentity,
     ODesignOutput,
     ODesignPlacements,
+    ODesignProvisionalAtomSlot,
+    ODesignRawOutput,
     ODesignReferenceCoordinates,
     ODesignResidueSpec,
     ODesignSamplingOutput,
+    ODesignStructureTarget,
+    realize_nucleic_acid_identity,
 )
-from .pipeline import ODesignDesignCandidate, ODesignDesignResult, ODesignPipeline
-from .processor import ODesignProcessor, from_design_mask, to_design_mask
+from .pipeline import (
+    ODesignLigandDesignCandidate,
+    ODesignLigandDesignResult,
+    ODesignLigandPipeline,
+    ODesignNucleicAcidPipeline,
+    ODesignPolymerChainPrediction,
+    ODesignPolymerDesignCandidate,
+    ODesignPolymerDesignResult,
+    ODesignProteinPipeline,
+)
+from .processor import ODesignLigandProcessor, ODesignProcessor, from_design_mask, to_design_mask
 
 _MODELS.register(
-    "ofoldx.odesign",
+    "odesign",
     model=ODesignModel,
     processor=ODesignProcessor,
 )
+_MODELS.register(
+    "odesign_ligand",
+    model=ODesignModel,
+    processor=ODesignLigandProcessor,
+)
 _PIPELINES.register(
-    "ofoldx.odesign",
-    pipeline=ODesignPipeline,
+    "odesign_protein",
+    pipeline=ODesignProteinPipeline,
+)
+_PIPELINES.register(
+    "odesign_nucleic_acid",
+    pipeline=ODesignNucleicAcidPipeline,
+)
+_PIPELINES.register(
+    "odesign_ligand",
+    pipeline=ODesignLigandPipeline,
 )

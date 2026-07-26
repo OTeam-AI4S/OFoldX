@@ -5,18 +5,17 @@ ODesign structure-generation model and tensor interfaces.
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Generic, Literal, TypeVar
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
 from ...data.bonds import SymbolicBond
 from ...data.conditions import Hotspot
-from ...data.evidence import MSA, MSACollection
 
 # ODesign's spatial and placement records drive the hard-condition checks below.
 from ...data.molecular import (
@@ -39,13 +38,17 @@ from ...modules.atom import (
 )
 from ...modules.backend import LayerNorm
 from ...modules.denoiser import CoordinateDenoiser
-from ...modules.diffusion import CoordinateDenoiseContext, CoordinateEdmSampler
+from ...modules.diffusion import (
+    CoordinateDenoiseContext,
+    CoordinateEdmSampler,
+)
 from ...modules.embedding import (
     RelativePositionBuckets,
     RelativePositionEmbedder,
     generate_relative_position_features,
 )
 from ...modules.functional import pair_mask_from_token_mask
+from ...modules.geometry import uniform_random_rotation
 from ...modules.head import DistogramHead
 from ...modules.trunk import MsaTrunk, PairformerStack, TrianglePairUpdateStack
 from .config import ODesignConfig
@@ -143,16 +146,124 @@ class ODesignModel(Model):
     def forward(
         self,
         input: ODesignInput,
+        target: ODesignStructureTarget,
+        *,
+        num_samples: int = 1,
+        synchronize_noise_levels: bool = False,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        recycling_steps: int | None = None,
+        use_conditioning: bool = True,
+        generator: torch.Generator | None = None,
+    ) -> ODesignOutput:
+        r"""
+        Denoise randomly corrupted target coordinates.
+
+        ``B`` is batch size, ``S`` is the coordinate-sample axis, ``N`` is token
+        count, and ``A`` is atom count.
+
+        Args:
+            input: Processed structure-design input.
+            target: Structure coordinates and their mapping onto the Model atom axis.
+            num_samples: Number ``S`` of independently corrupted copies per input.
+            synchronize_noise_levels: Whether samples from one input item share one
+                noise level.
+            coordinate_augmentation: Whether to rotate and translate the centered
+                target independently for each sample.
+            augmentation_translation_scale: Standard deviation of augmentation
+                translations in angstroms.
+            noise_log_mean: Mean of the log-normal noise distribution.
+            noise_log_std: Standard deviation of the log-normal noise distribution.
+            recycling_steps: Number of trunk recycling passes. ``None`` uses the
+                configured value.
+            use_conditioning: Whether trunk single and pair values condition the
+                coordinate denoiser.
+            generator: Optional generator for rigid augmentation, noise levels, and
+                coordinate noise.
+
+        Returns:
+            Denoised coordinates in the Target's original frame with shape
+            ``(B, S, A, 3)``, noise levels with shape ``(B, S)``, and pairwise
+            logits computed once from the trunk.
+        """
+
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if steps < 1:
+            raise ValueError("recycling_steps must be positive")
+        trunk = self._run_trunk(input, recycling_steps=steps)
+        target_coordinates, target_mask = _gather_odesign_structure_target(target, input)
+        target_coordinates = target_coordinates.to(input.atom_features)
+        target_mask = target_mask.to(device=target_coordinates.device)
+        batch_size = target_coordinates.shape[0]
+        augmented_target_coordinates, augmentation_transform = _augment_odesign_target(
+            target_coordinates,
+            target_mask,
+            num_samples=num_samples,
+            augmentation=coordinate_augmentation,
+            translation_scale=augmentation_translation_scale,
+            generator=generator,
+        )
+        noise_count = batch_size if synchronize_noise_levels else batch_size * num_samples
+        normal = torch.empty(
+            noise_count,
+            device=target_coordinates.device,
+            dtype=target_coordinates.dtype,
+        ).normal_(generator=generator)
+        noise_level = (
+            self.coordinate_denoiser.preconditioner.sigma_data * (noise_log_mean + noise_log_std * normal).exp()
+        )
+        if synchronize_noise_levels:
+            noise_level = noise_level.repeat_interleave(num_samples)
+        noise_level = noise_level.reshape(batch_size, num_samples)
+        coordinate_noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        fixed_coordinate_mask = target_mask & input.fixed_coordinate_mask.bool()
+        fixed_coordinate_mask = fixed_coordinate_mask.unsqueeze(-2).expand(-1, num_samples, -1)
+        coordinate_noise = coordinate_noise.masked_fill(fixed_coordinate_mask.unsqueeze(-1), 0)
+        noisy_coordinates = augmented_target_coordinates + noise_level[..., None, None] * coordinate_noise
+        raw_output = self._denoise_from_trunk(
+            input,
+            trunk,
+            noisy_coordinates=noisy_coordinates,
+            noise_level=noise_level,
+            use_conditioning=use_conditioning,
+        )
+        augmented_coordinates = torch.where(
+            fixed_coordinate_mask.unsqueeze(-1),
+            augmented_target_coordinates,
+            raw_output.coordinates,
+        )
+        coordinates = _reverse_odesign_augmentation(
+            augmented_coordinates,
+            augmentation_transform,
+        )
+        coordinates = torch.where(
+            fixed_coordinate_mask.unsqueeze(-1),
+            target_coordinates.unsqueeze(-3).expand(-1, num_samples, -1, -1),
+            coordinates,
+        )
+        return ODesignOutput(
+            coordinates=coordinates,
+            distogram_logits=raw_output.distogram_logits,
+            token_bond_type_logits=raw_output.token_bond_type_logits,
+            noise_level=noise_level,
+        )
+
+    def denoise(
+        self,
+        input: ODesignInput,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
         recycling_steps: int | None = None,
-    ) -> ODesignOutput:
+        use_conditioning: bool = True,
+    ) -> ODesignRawOutput:
         r"""
         Denoise atom coordinates at specified EDM noise levels.
-
-        ``B`` is batch size, ``S`` is the coordinate-sample axis, ``N`` is token
-        count, and ``A`` is atom count.
 
         Args:
             input: Processed structure-design input.
@@ -161,48 +272,23 @@ class ODesignModel(Model):
             noise_level: Diffusion noise levels with shape ``(B, S)``.
             recycling_steps: Number of trunk recycling passes. ``None`` uses the
                 configured value.
+            use_conditioning: Whether trunk single and pair values condition the
+                coordinate denoiser.
 
         Returns:
-            An [`ODesignOutput`][] with denoised ``coordinates`` of shape
-            ``(B, S, A, 3)``, ``distogram_logits`` of shape ``(B, N, N, D)``, and
-            ``token_bond_type_logits`` of shape ``(B, N, N, D_b)``.
+            Denoised coordinates and pairwise logits.
         """
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if steps < 1:
             raise ValueError("recycling_steps must be positive")
         trunk = self._run_trunk(input, recycling_steps=steps)
-        context = self._denoise_context(input, trunk)
-
-        def denoise(noisy_chunk: Tensor, noise_chunk: Tensor) -> Tensor:
-            return self.coordinate_denoiser(
-                context.to_denoising_input(
-                    noisy_coords=noisy_chunk,
-                    noise_level=noise_chunk,
-                )
-            )
-
-        coordinate_chunks = []
-        for noisy_chunk, noise_chunk in zip(
-            noisy_coordinates.split(4, dim=-3),
-            noise_level.split(4, dim=-1),
-        ):
-            if self.training and torch.is_grad_enabled():
-                coordinate_chunks.append(
-                    checkpoint(
-                        denoise,
-                        noisy_chunk,
-                        noise_chunk,
-                        use_reentrant=False,
-                    )
-                )
-            else:
-                coordinate_chunks.append(denoise(noisy_chunk, noise_chunk))
-        coordinates = torch.cat(coordinate_chunks, dim=-3)
-        return ODesignOutput(
-            coordinates=coordinates,
-            distogram_logits=self.distogram_head(trunk.pair),
-            token_bond_type_logits=self.token_bond_type_head(trunk.pair),
+        return self._denoise_from_trunk(
+            input,
+            trunk,
+            noisy_coordinates=noisy_coordinates,
+            noise_level=noise_level,
+            use_conditioning=use_conditioning,
         )
 
     @torch.inference_mode()
@@ -234,6 +320,8 @@ class ODesignModel(Model):
             Backbone structures in sampling order. Coordinates are in angstroms.
         """
 
+        if isinstance(input, ODesignLigandInput):
+            raise TypeError("ODesignModel.design accepts polymer layouts; use design_ligand for provisional slots")
         output = self.sample(
             input,
             num_samples=num_candidates,
@@ -250,6 +338,59 @@ class ODesignModel(Model):
         for structure in structures:
             _require_hard_conditions(structure, input)
         return structures
+
+    @torch.inference_mode()
+    def design_ligand(
+        self,
+        input: ODesignLigandInput,
+        *,
+        num_candidates: int = 1,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+        num_sampling_steps: int = 200,
+        partial_diffusion_snr: float | None = None,
+    ) -> tuple[ODesignLigandBackbone, ...]:
+        r"""
+        Generate provisional ligand-atom backbone candidates.
+
+        Generated atom slots remain separate from the canonical context system.
+        Their predicted coordinates and pairwise bond logits do not establish a
+        molecule or chemical connectivity.
+
+        Args:
+            input: Processed ligand-backbone input with a realized slot count.
+            num_candidates: Number of backbone candidates.
+            generator: Random generator used by coordinate sampling.
+            recycling_steps: Number of trunk recycling passes. ``None`` uses the
+                configured value.
+            num_sampling_steps: Number of coordinate-diffusion steps.
+            partial_diffusion_snr: Signal-to-noise ratio for partial diffusion from
+                ``input.observed_positions``. ``None`` starts from noise.
+
+        Returns:
+            Provisional ligand backbones in sampling order.
+        """
+
+        output = self.sample(
+            input,
+            num_samples=num_candidates,
+            recycling_steps=recycling_steps,
+            num_sampling_steps=num_sampling_steps,
+            num_model_seeds=1,
+            partial_diffusion_snr=partial_diffusion_snr,
+            generator=generator,
+        )
+        candidates = tuple(
+            _ligand_backbone_from_coordinates(
+                output.coordinates[0, 0, index],
+                output.token_bond_type_logits[0, 0],
+                input.layout,
+            )
+            for index in range(num_candidates)
+        )
+        for candidate in candidates:
+            _require_ligand_hard_conditions(candidate, input)
+        return candidates
 
     @torch.inference_mode()
     def sample(
@@ -307,7 +448,6 @@ class ODesignModel(Model):
                     context=self._denoise_context(input, trunk),
                     num_samples=num_samples,
                     num_sampling_steps=num_sampling_steps,
-                    sample_chunk_size=1,
                     initial_coords=input.observed_positions if partial_diffusion else None,
                     condition_coords=input.observed_positions,
                     condition_mask=input.fixed_coordinate_mask,
@@ -319,6 +459,32 @@ class ODesignModel(Model):
             coordinates=torch.stack(coordinates),
             distogram_logits=torch.stack(distograms),
             token_bond_type_logits=torch.stack(bond_logits),
+        )
+
+    def _denoise_from_trunk(
+        self,
+        input: ODesignInput,
+        trunk: _ODesignTrunkOutput,
+        *,
+        noisy_coordinates: Tensor,
+        noise_level: Tensor,
+        use_conditioning: bool,
+    ) -> ODesignRawOutput:
+        context = self._denoise_context(
+            input,
+            trunk,
+            use_conditioning=use_conditioning,
+        )
+        coordinates = self.coordinate_denoiser(
+            context.to_denoising_input(
+                noisy_coords=noisy_coordinates,
+                noise_level=noise_level,
+            )
+        )
+        return ODesignRawOutput(
+            coordinates=coordinates,
+            distogram_logits=self.distogram_head(trunk.pair),
+            token_bond_type_logits=self.token_bond_type_head(trunk.pair),
         )
 
     def _run_trunk(
@@ -398,7 +564,11 @@ class ODesignModel(Model):
         self,
         input: ODesignInput,
         trunk: _ODesignTrunkOutput,
+        *,
+        use_conditioning: bool = True,
     ) -> CoordinateDenoiseContext:
+        conditioning_single = trunk.single if use_conditioning else 0 * trunk.single
+        conditioning_pair = trunk.pair if use_conditioning else 0 * trunk.pair
         return CoordinateDenoiseContext(
             atom_features=input.atom_features,
             atom_to_token=input.atom_to_token,
@@ -408,7 +578,8 @@ class ODesignModel(Model):
             atom_mask=input.atom_mask,
             token_embedding=trunk.token_embedding,
             single=trunk.single,
-            pair=trunk.pair,
+            conditioning_single=conditioning_single,
+            conditioning_pair=conditioning_pair,
             relative_features=trunk.relative_features,
             local_geometry=self.coordinate_denoiser.build_local_geometry(
                 input.reference_positions,
@@ -531,21 +702,137 @@ class ODesignTokenBondTypeHead(nn.Module):
         return self.output_projection(self.input_projection(pair))
 
 
+def _gather_odesign_structure_target(
+    target: ODesignStructureTarget,
+    input: ODesignInput,
+) -> tuple[Tensor, Tensor]:
+    atom_index = target.atom_index.long()
+    valid = atom_index >= 0
+    gather_index = atom_index.clamp_min(0)
+    coordinates = target.coordinates.gather(
+        1,
+        gather_index.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    coordinate_mask = target.coordinate_mask.gather(1, gather_index)
+    coordinate_mask = coordinate_mask & valid & input.atom_mask.bool()
+    coordinates = coordinates.masked_fill(~coordinate_mask.unsqueeze(-1), 0)
+    return coordinates, coordinate_mask
+
+
+def _augment_odesign_target(
+    coordinates: Tensor,
+    coordinate_mask: Tensor,
+    *,
+    num_samples: int,
+    augmentation: bool,
+    translation_scale: float,
+    generator: torch.Generator | None,
+) -> tuple[Tensor, tuple[Tensor | None, Tensor, Tensor]]:
+    mask = coordinate_mask.unsqueeze(-1).to(dtype=coordinates.dtype)
+    center = (coordinates * mask).sum(dim=-2, keepdim=True) / mask.sum(
+        dim=-2,
+        keepdim=True,
+    ).clamp_min(1e-12)
+    centered = (coordinates - center).unsqueeze(-3).expand(-1, num_samples, -1, -1)
+    batch_size = coordinates.shape[0]
+    rotation: Tensor | None
+    if augmentation:
+        rotation = uniform_random_rotation(
+            batch_size * num_samples,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
+            generator=generator,
+        ).reshape(batch_size, num_samples, 3, 3)
+        translation = translation_scale * torch.empty(
+            batch_size,
+            num_samples,
+            3,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
+        ).normal_(generator=generator)
+        augmented = torch.einsum("bsad,bsde->bsae", centered, rotation)
+        augmented = augmented + translation.unsqueeze(-2)
+    else:
+        rotation = None
+        translation = torch.zeros(
+            batch_size,
+            num_samples,
+            3,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
+        )
+        augmented = centered
+    augmented = augmented * mask.unsqueeze(-3)
+    return augmented, (rotation, translation, center)
+
+
+def _reverse_odesign_augmentation(
+    coordinates: Tensor,
+    transform: tuple[Tensor | None, Tensor, Tensor],
+) -> Tensor:
+    rotation, translation, center = transform
+    coordinates = coordinates - translation.unsqueeze(-2)
+    if rotation is not None:
+        coordinates = torch.einsum(
+            "bsad,bsde->bsae",
+            coordinates,
+            rotation.transpose(-1, -2),
+        )
+    return coordinates + center.unsqueeze(-3)
+
+
 def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> Structure:
+    return _structure_from_atom_coordinates(coordinates, layout.system, layout.atom_sites)
+
+
+def _structure_from_atom_coordinates(
+    coordinates: Tensor,
+    system: MolecularSystem,
+    atom_sites: tuple[AtomSite, ...],
+) -> Structure:
     values = coordinates.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
-    sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
+    sites = tuple(site for site, atom in system.iter_atoms() if atom.element != "H")
     site_index = {site: index for index, site in enumerate(sites)}
     complete = np.zeros((len(sites), 3), dtype=np.float32)
     coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
-    for predicted_index, site in enumerate(layout.atom_sites):
+    for predicted_index, site in enumerate(atom_sites):
         output_index = site_index[site]
         complete[output_index] = values[predicted_index]
         coordinate_mask[output_index] = True
     return Structure(
-        system=layout.system,
+        system=system,
         sites=sites,
         coordinates=complete,
         coordinate_mask=coordinate_mask,
+    )
+
+
+def _ligand_backbone_from_coordinates(
+    coordinates: Tensor,
+    token_bond_type_logits: Tensor,
+    layout: ODesignLigandLayout,
+) -> ODesignLigandBackbone:
+    context_atom_count = len(layout.context_atom_sites)
+    context_system = layout.context_system
+    context = (
+        _structure_from_atom_coordinates(
+            coordinates[:context_atom_count],
+            context_system,
+            layout.context_atom_sites,
+        )
+        if context_system is not None and layout.context_atom_sites
+        else None
+    )
+    slot_coordinates = (
+        coordinates[context_atom_count:].detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    )
+    bond_logits = token_bond_type_logits.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    return ODesignLigandBackbone(
+        context=context,
+        context_token_sites=layout.context_token_sites,
+        slots=layout.slots,
+        coordinates=slot_coordinates,
+        token_bond_type_logits=bond_logits,
     )
 
 
@@ -571,15 +858,46 @@ def _require_hard_conditions(structure: Structure, input: ODesignInput) -> None:
         )
         predicted = np.stack([coordinates[site] for site in sites])
         target = np.stack([reference[site] for site in sites])
-        predicted_centered = predicted - predicted.mean(axis=0)
-        target_centered = target - target.mean(axis=0)
-        left, _, right = np.linalg.svd(predicted_centered.T @ target_centered)
-        if np.linalg.det(left @ right) < 0:
-            left[:, -1] *= -1
-        aligned = predicted_centered @ (left @ right) + target.mean(axis=0)
-        distances = np.linalg.norm(aligned - target, axis=-1)
-        if float(distances.max()) > condition.tolerance_angstrom:
+        if _maximum_aligned_distance(predicted, target) > condition.tolerance_angstrom:
             raise RuntimeError(f"ODesign candidate violated hard conditions[{index}]")
+
+
+def _require_ligand_hard_conditions(
+    candidate: ODesignLigandBackbone,
+    input: ODesignLigandInput,
+) -> None:
+    if not any(
+        isinstance(condition, ODesignReferenceCoordinates) and condition.intent == "hard"
+        for condition in input.layout.conditions
+    ):
+        return
+
+    context = candidate.context
+    if context is None:
+        raise RuntimeError("ODesign ligand candidate omitted conditioned context coordinates")
+    coordinates = {site: context.coordinates[index] for index, site in enumerate(context.sites)}
+    reference = {
+        site: input.observed_positions[0, index].detach().to(device="cpu", dtype=torch.float32).numpy()
+        for index, site in enumerate(input.layout.context_atom_sites)
+    }
+    for index, condition in enumerate(input.layout.conditions):
+        if not isinstance(condition, ODesignReferenceCoordinates) or condition.intent != "hard":
+            continue
+        sites = tuple(input.layout.source_atom_map[site] for site in condition.sites)
+        predicted = np.stack([coordinates[site] for site in sites])
+        target = np.stack([reference[site] for site in sites])
+        if _maximum_aligned_distance(predicted, target) > condition.tolerance_angstrom:
+            raise RuntimeError(f"ODesign ligand candidate violated hard conditions[{index}]")
+
+
+def _maximum_aligned_distance(predicted: np.ndarray, target: np.ndarray) -> float:
+    predicted_centered = predicted - predicted.mean(axis=0)
+    target_centered = target - target.mean(axis=0)
+    left, _, right = np.linalg.svd(predicted_centered.T @ target_centered)
+    if np.linalg.det(left @ right) < 0:
+        left[:, -1] *= -1
+    aligned = predicted_centered @ (left @ right) + target.mean(axis=0)
+    return float(np.linalg.norm(aligned - target, axis=-1).max())
 
 
 def _resolve_residue(
@@ -620,6 +938,101 @@ class _ODesignTrunkOutput:
     single: Tensor
     pair: Tensor
     relative_features: RelativePositionBuckets
+
+
+@dataclass(frozen=True)
+class ODesignGeneratedAtoms:
+    r"""
+    Declare one caller-owned range of provisional ligand atom slots.
+
+    Args:
+        request_id: Caller identity retained by every realized slot.
+        min_atoms: Minimum number of generated atom slots.
+        max_atoms: Maximum number of generated atom slots.
+    """
+
+    request_id: str
+    min_atoms: int
+    max_atoms: int
+
+
+@dataclass(frozen=True)
+class ODesignProvisionalAtomSlot:
+    r"""
+    Stable identity for one generated ligand atom before chemical realization.
+
+    Args:
+        request_id: Identity of the caller's generated-atom request.
+        slot_index: Zero-based position within that request.
+    """
+
+    request_id: str
+    slot_index: int
+
+
+@dataclass(frozen=True)
+class ODesignNucleicAcidIdentity:
+    r"""
+    Canonical identity and base-anchor mapping for one predicted nucleotide.
+
+    Args:
+        polymer_type: DNA or RNA chemistry.
+        symbol: Predicted one-letter nucleotide symbol.
+        placeholder_component_id: Generic ODesign backbone component being replaced.
+        component_id: Canonical predicted component identifier.
+        base_anchor_atom_id: Canonical atom corresponding to placeholder atom ``N``.
+    """
+
+    polymer_type: Literal["dna", "rna"]
+    symbol: str
+    placeholder_component_id: Literal["DN", "N"]
+    component_id: str
+    base_anchor_atom_id: Literal["N1", "N9"]
+
+    def atom_id(self, placeholder_atom_id: str) -> str:
+        r"""
+        Map one placeholder-backbone atom name to the canonical component.
+        """
+
+        return self.base_anchor_atom_id if placeholder_atom_id == "N" else placeholder_atom_id
+
+
+_NUCLEIC_ACID_IDENTITIES: dict[
+    tuple[Literal["dna", "rna"], str],
+    tuple[Literal["DN", "N"], str, Literal["N1", "N9"]],
+] = {
+    ("dna", "A"): ("DN", "DA", "N9"),
+    ("dna", "C"): ("DN", "DC", "N1"),
+    ("dna", "G"): ("DN", "DG", "N9"),
+    ("dna", "T"): ("DN", "DT", "N1"),
+    ("rna", "A"): ("N", "A", "N9"),
+    ("rna", "C"): ("N", "C", "N1"),
+    ("rna", "G"): ("N", "G", "N9"),
+    ("rna", "U"): ("N", "U", "N1"),
+}
+
+
+def realize_nucleic_acid_identity(
+    polymer_type: Literal["dna", "rna"],
+    symbol: str,
+) -> ODesignNucleicAcidIdentity:
+    r"""
+    Resolve an OInvFold nucleotide prediction against an ODesign placeholder.
+
+    No identity is inferred before a DNA- or RNA-specific symbol is supplied.
+    """
+
+    placeholder_component_id, component_id, base_anchor_atom_id = _NUCLEIC_ACID_IDENTITIES[
+        polymer_type,
+        symbol,
+    ]
+    return ODesignNucleicAcidIdentity(
+        polymer_type=polymer_type,
+        symbol=symbol,
+        placeholder_component_id=placeholder_component_id,
+        component_id=component_id,
+        base_anchor_atom_id=base_anchor_atom_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -704,11 +1117,31 @@ class ODesignLayout:
     instance_of: dict[str, str] = field(default_factory=dict)
     source_residue_map: dict[tuple[str, int], tuple[str, int]] = field(default_factory=dict)
     source_atom_map: dict[AtomSite, AtomSite] = field(default_factory=dict)
-    msa: MSA | MSACollection | None = None
+
+
+@dataclass(eq=False)
+class ODesignLigandLayout:
+    r"""
+    Canonical context and provisional identities aligned to ligand tensor axes.
+
+    Context token groups precede generated slots on the token axis. Context atom
+    sites precede generated slots on the atom axis.
+    """
+
+    context_system: MolecularSystem | None
+    context_token_sites: tuple[tuple[AtomSite, ...], ...]
+    context_atom_sites: tuple[AtomSite, ...]
+    generated_atoms: ODesignGeneratedAtoms
+    slots: tuple[ODesignProvisionalAtomSlot, ...]
+    conditions: tuple[Hotspot | ODesignReferenceCoordinates, ...]
+    source_atom_map: dict[AtomSite, AtomSite] = field(default_factory=dict)
+
+
+_ODesignLayoutT = TypeVar("_ODesignLayoutT", ODesignLayout, ODesignLigandLayout)
 
 
 @dataclass(kw_only=True, eq=False)
-class ODesignInput:
+class ODesignInput(Generic[_ODesignLayoutT]):
     r"""
     Tensor and molecular-layout input for ODesign.
 
@@ -765,13 +1198,37 @@ class ODesignInput:
     constraint_distogram: Tensor
     msa_features: Tensor
     msa_mask: Tensor
-    layout: ODesignLayout
+    layout: _ODesignLayoutT
+
+
+@dataclass(kw_only=True, eq=False)
+class ODesignLigandInput(ODesignInput[ODesignLigandLayout]):
+    r"""
+    ODesign tensor input with a separate provisional ligand layout.
+    """
 
 
 @dataclass(eq=False)
-class ODesignOutput:
+class ODesignStructureTarget:
     r"""
-    Predictions from one ODesign denoising call.
+    Structure coordinates mapped onto an ODesign Model atom axis.
+
+    Args:
+        coordinates: Target coordinate pool with shape ``(B, T, 3)``.
+        coordinate_mask: Valid-coordinate mask with shape ``(B, T)``.
+        atom_index: Target-pool index for every Model atom with shape ``(B, A)``;
+            ``-1`` marks atoms absent from the target.
+    """
+
+    coordinates: Tensor
+    coordinate_mask: Tensor
+    atom_index: Tensor
+
+
+@dataclass(eq=False)
+class ODesignRawOutput:
+    r"""
+    Predictions from one explicit ODesign denoising call.
 
     Args:
         coordinates: Denoised atom coordinates with shape ``(B, S, A, 3)`` in
@@ -784,6 +1241,23 @@ class ODesignOutput:
     coordinates: Tensor
     distogram_logits: Tensor
     token_bond_type_logits: Tensor
+
+
+@dataclass(eq=False)
+class ODesignOutput(ODesignRawOutput):
+    r"""
+    Predictions from stochastic target corruption and denoising.
+
+    Args:
+        coordinates: Denoised atom coordinates in the Target's original frame,
+            with shape ``(B, S, A, 3)``.
+        distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
+        token_bond_type_logits: Token-pair bond-type logits with shape
+            ``(B, N, N, D_b)``.
+        noise_level: Sampled EDM noise levels with shape ``(B, S)``.
+    """
+
+    noise_level: Tensor
 
 
 @dataclass(eq=False)
@@ -803,3 +1277,30 @@ class ODesignSamplingOutput:
     coordinates: Tensor
     distogram_logits: Tensor
     token_bond_type_logits: Tensor
+
+
+@dataclass(eq=False)
+class ODesignLigandBackbone:
+    r"""
+    Decoded ODesign ligand backbone before atom identities and bonds are resolved.
+
+    ``token_bond_type_logits`` is aligned first to ``context_token_sites`` and then
+    to the singleton tokens represented by ``slots``. It is evidence about
+    connectivity, not a realized bond graph.
+
+    Args:
+        context: Predicted coordinates over the canonical context system.
+        context_token_sites: Canonical atom groups on the leading token axis.
+        slots: Ordered provisional generated-atom identities.
+        coordinates: Slot coordinates with shape ``(L, 3)`` in angstroms.
+        token_bond_type_logits: Full token-pair bond logits with shape
+            ``(N, N, D_b)``.
+        bonds: Unresolved generated chemical connectivity.
+    """
+
+    context: Structure | None
+    context_token_sites: tuple[tuple[AtomSite, ...], ...]
+    slots: tuple[ODesignProvisionalAtomSlot, ...]
+    coordinates: np.ndarray
+    token_bond_type_logits: np.ndarray
+    bonds: None = None

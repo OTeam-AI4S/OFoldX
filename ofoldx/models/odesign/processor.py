@@ -47,15 +47,20 @@ from ...data.placement import resolve as _resolve_site
 from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...processor import Processor
-from .config import ODesignProcessorConfig
+from .config import ODesignLigandProcessorConfig, ODesignProcessorConfig
 from .model import (
     ODesignDesignedResidue,
     ODesignFixedResidue,
+    ODesignGeneratedAtoms,
     ODesignInput,
     ODesignLayout,
+    ODesignLigandInput,
+    ODesignLigandLayout,
     ODesignPlacements,
+    ODesignProvisionalAtomSlot,
     ODesignReferenceCoordinates,
     ODesignResidueSpec,
+    ODesignStructureTarget,
 )
 
 _CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
@@ -164,6 +169,17 @@ class _ODesignPlan:
     cyclic_links: frozenset[frozenset[AtomSite]]
 
 
+@dataclass(eq=False)
+class _ODesignLigandPlan:
+    context_system: MolecularSystem | None
+    source_structure: Structure | None
+    context_atom_sites: tuple[AtomSite, ...]
+    generated_atoms: ODesignGeneratedAtoms
+    conditions: tuple[Hotspot | ODesignReferenceCoordinates, ...]
+    source_residue_map: dict[tuple[str, int], tuple[str, int]]
+    source_atom_map: dict[AtomSite, AtomSite]
+
+
 class ODesignProcessor(Processor):
     r"""
     Convert supported structure-design inputs into `ODesignInput`.
@@ -216,7 +232,6 @@ class ODesignProcessor(Processor):
         placement: ODesignPlacements | None = None,
         msa: MSA | MSACollection | None = None,
         conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
-        receptor_mode: str | None = None,
     ) -> ODesignInput:
         r"""
         Build model inputs for one structure-design problem.
@@ -226,9 +241,6 @@ class ODesignProcessor(Processor):
             placement: Optional topology of existing and generated molecular segments.
             msa: Optional canonical MSA evidence.
             conditions: Hotspot, symbolic-bond, and reference-coordinate conditions.
-            receptor_mode: Receptor treatment for this call. ``"rigid"`` fixes existing
-                receptor heavy atoms; ``"flex"`` regenerates them except where reference
-                coordinates explicitly fix atoms. ``None`` uses the processor configuration.
 
         Returns:
             An [`ODesignInput`][] with batch size one and aligned token, atom, MSA,
@@ -236,7 +248,62 @@ class ODesignProcessor(Processor):
         """
 
         plan = self._plan(input, placement, conditions)
-        return self._lower(plan, msa, receptor_mode)
+        return self._lower(plan, msa)
+
+    def process_training(
+        self,
+        input: MolecularSystem | Structure | None,
+        target: Structure,
+        *,
+        placement: ODesignPlacements | None = None,
+        msa: MSA | MSACollection | None = None,
+        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
+    ) -> tuple[ODesignInput, ODesignStructureTarget]:
+        r"""
+        Lower one design problem and its separate structure target.
+
+        Existing input atoms are matched through the placement's source-to-output
+        identity map. Generated output atoms match target sites directly.
+
+        Args:
+            input: Optional canonical context system or structure visible to the
+                Model.
+            target: Canonical target Structure whose coordinate rows form the
+                complete target pool.
+            placement: Optional topology of existing and generated molecular
+                segments.
+            msa: Optional canonical MSA evidence.
+            conditions: Hotspot, symbolic-bond, and reference-coordinate
+                conditions.
+
+        Returns:
+            The ordinary Model input and a separate target-to-atom-axis mapping.
+        """
+
+        plan = self._plan(input, placement, conditions)
+        model_input = self._lower(plan, msa)
+        target_row = {site: index for index, site in enumerate(target.sites)}
+        source_by_output = {output_site: source_site for source_site, output_site in plan.source_atom_map.items()}
+        atom_index = []
+        for output_site in plan.atom_sites:
+            row = target_row.get(output_site)
+            if row is None:
+                source_site = source_by_output.get(output_site)
+                if source_site is not None:
+                    row = target_row.get(source_site)
+            atom_index.append(-1 if row is None else row)
+        structure_target = ODesignStructureTarget(
+            coordinates=torch.from_numpy(target.coordinates.copy())
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.dtype),
+            coordinate_mask=torch.from_numpy(target.coordinate_mask.copy()).unsqueeze(0).to(self.device),
+            atom_index=torch.tensor(
+                atom_index,
+                dtype=torch.int64,
+                device=self.device,
+            ).unsqueeze(0),
+        )
+        return model_input, structure_target
 
     def _plan(
         self,
@@ -267,6 +334,18 @@ class ODesignProcessor(Processor):
             for placement_id, part in chain.items()
             if isinstance(part, GeneratedSegment)
         }
+        generated_polymer_types = {segment.polymer_type for segment in segments.values()}
+        if self.config.generated_modality == "protein":
+            allowed_polymer_types = {"protein"}
+        elif self.config.generated_modality == "nucleic_acid":
+            allowed_polymer_types = {"dna", "rna"}
+        else:
+            raise ValueError(f"unknown ODesign generated_modality: {self.config.generated_modality!r}")
+        if not generated_polymer_types <= allowed_polymer_types:
+            raise ValueError(
+                f"ODesign {self.config.generated_modality} artifact cannot generate "
+                f"{sorted(generated_polymer_types - allowed_polymer_types)!r}"
+            )
         for condition in condition_values:
             if not isinstance(condition, Hotspot):
                 continue
@@ -347,7 +426,6 @@ class ODesignProcessor(Processor):
         self,
         plan: _ODesignPlan,
         msa: MSA | MSACollection | None,
-        receptor_mode: str | None,
     ) -> ODesignInput:
         system = plan.system
         structure = plan.source_structure
@@ -461,14 +539,14 @@ class ODesignProcessor(Processor):
         # that are actually observed (a receptor without coordinates cannot be pinned). "flex"
         # regenerates the receptor and leaves this untouched, so only explicit hard
         # ODesignReferenceCoordinates pin atoms.
-        mode = self.config.receptor_mode if receptor_mode is None else receptor_mode
+        mode = self.config.receptor_mode
         if mode == "rigid":
             for atom_index, site in enumerate(sites):
                 is_generated = (site.instance_id, site.component_index) in generated_residues
                 if not is_generated and bool(observed_mask[atom_index]):
                     fixed_coordinate_mask[atom_index] = True
         elif mode != "flex":
-            raise ValueError(f"unknown receptor_mode: {mode!r}")
+            raise ValueError(f"unknown ODesign receptor_mode: {mode!r}")
 
         msa_features, msa_mask, profile, deletion_mean = _msa_features(
             msa_value,
@@ -554,7 +632,376 @@ class ODesignProcessor(Processor):
                 instance_of=instance_of,
                 source_residue_map=source_residue_map,
                 source_atom_map=source_atom_map,
-                msa=msa_value,
+            ),
+        )
+
+
+class ODesignLigandProcessor(Processor):
+    r"""
+    Lower canonical context and provisional ligand slots for ODesign.
+
+    Generated slots are tensor identities only. They are never inserted into the
+    context [`MolecularSystem`][] or represented by [`AtomSite`][].
+
+    Args:
+        config: Ligand-artifact input-processing options.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
+
+    config_class = ODesignLigandProcessorConfig
+    config: ODesignLigandProcessorConfig
+
+    def __init__(
+        self,
+        config: ODesignLigandProcessorConfig | None = None,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        config = ODesignLigandProcessorConfig() if config is None else config
+        self.config = config
+        super().__init__(device=device, dtype=dtype)
+
+    def realize_atoms(
+        self,
+        input: ODesignLigandInput,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> ODesignLigandInput:
+        r"""
+        Sample the generated-atom range and retain its leading stable slots.
+        """
+
+        generated_atoms = input.layout.generated_atoms
+        if generated_atoms.min_atoms == generated_atoms.max_atoms:
+            return input
+        num_atoms = int(
+            torch.randint(
+                generated_atoms.min_atoms,
+                generated_atoms.max_atoms + 1,
+                (),
+                device=input.reference_positions.device,
+                generator=generator,
+            )
+        )
+        return _realize_ligand_atoms(input, num_atoms)
+
+    def __call__(
+        self,
+        input: MolecularSystem | Structure | None,
+        *,
+        generated_atoms: ODesignGeneratedAtoms,
+        msa: MSA | MSACollection | None = None,
+        conditions: Sequence[Hotspot | ODesignReferenceCoordinates] = (),
+    ) -> ODesignLigandInput:
+        r"""
+        Build one ligand-backbone input without fabricating generated chemistry.
+
+        Args:
+            input: Optional canonical context system or structure.
+            generated_atoms: Caller-owned provisional atom range.
+            msa: Optional canonical MSA evidence for polymer context.
+            conditions: Context hotspots and reference-coordinate conditions.
+
+        Returns:
+            Tensor input whose context axes precede stable generated-atom slots.
+        """
+
+        return self._lower(self._plan(input, generated_atoms, conditions), msa)
+
+    def _plan(
+        self,
+        input: MolecularSystem | Structure | None,
+        generated_atoms: ODesignGeneratedAtoms,
+        conditions: Sequence[Hotspot | ODesignReferenceCoordinates],
+    ) -> _ODesignLigandPlan:
+        if generated_atoms.min_atoms < 0 or generated_atoms.max_atoms < generated_atoms.min_atoms:
+            raise ValueError("generated atom range must satisfy 0 <= min_atoms <= max_atoms")
+
+        condition_values = tuple(conditions)
+        for condition in condition_values:
+            if not isinstance(condition, (Hotspot, ODesignReferenceCoordinates)):
+                raise TypeError(f"ODesign ligand generation cannot consume {type(condition).__name__}")
+
+        structure: Structure | None
+        system: MolecularSystem | None
+        if isinstance(input, Structure):
+            structure = input
+            system = input.system
+        else:
+            structure = None
+            system = input
+        sites = () if system is None else _sites_with_reference_coordinates(system)
+        source_residue_map = (
+            {}
+            if system is None
+            else {
+                (instance_id, component_index): (instance_id, component_index)
+                for instance_id, entity_id in system.instances.items()
+                if isinstance(entity := system.entities[entity_id], PolymerSequence)
+                for component_index in range(len(entity))
+            }
+        )
+        source_atom_map = {site: site for site in sites}
+
+        for condition in condition_values:
+            if isinstance(condition, ODesignReferenceCoordinates):
+                if any(site not in source_atom_map for site in condition.sites):
+                    raise ValueError("ligand reference-coordinate conditions require canonical context atoms")
+                continue
+            for reference in condition.residues:
+                if isinstance(reference, AtomSite):
+                    if reference not in source_atom_map:
+                        raise ValueError("ligand hotspots require canonical context atoms")
+                    continue
+                if not isinstance(reference, tuple) or system is None:
+                    raise ValueError("ligand hotspots cannot refer to provisional generated atoms")
+                entity = system.entities[system.instances[reference[0]]]
+                if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+                    raise ValueError("non-protein ligand hotspots require exact atom references")
+
+        return _ODesignLigandPlan(
+            context_system=system,
+            source_structure=structure,
+            context_atom_sites=sites,
+            generated_atoms=generated_atoms,
+            conditions=condition_values,
+            source_residue_map=source_residue_map,
+            source_atom_map=source_atom_map,
+        )
+
+    def _lower(
+        self,
+        plan: _ODesignLigandPlan,
+        msa: MSA | MSACollection | None,
+    ) -> ODesignLigandInput:
+        system = plan.context_system
+        structure = plan.source_structure
+        context_sites = plan.context_atom_sites
+        num_slots = plan.generated_atoms.max_atoms
+        slots = tuple(
+            ODesignProvisionalAtomSlot(plan.generated_atoms.request_id, slot_index) for slot_index in range(num_slots)
+        )
+        if not context_sites and not slots:
+            raise ValueError("ODesign requires at least one context atom or generated atom slot")
+
+        if system is None:
+            context_token_sites: tuple[tuple[AtomSite, ...], ...] = ()
+            token_residues: tuple[tuple[str, int] | None, ...] = ()
+            token_entities: tuple[PolymerSequence | Molecule, ...] = ()
+        else:
+            context_token_sites, token_residues, token_entities = _build_tokens(system, context_sites)
+        num_context_tokens = len(context_token_sites)
+        num_tokens = num_context_tokens + num_slots
+        site_to_token = {site: token_index for token_index, group in enumerate(context_token_sites) for site in group}
+        site_to_atom = {site: index for index, site in enumerate(context_sites)}
+
+        observed_positions = torch.zeros(len(context_sites) + num_slots, 3, dtype=torch.float32)
+        observed_mask = torch.zeros(len(context_sites) + num_slots, dtype=torch.bool)
+        if structure is not None:
+            observed = {site: index for index, site in enumerate(structure.sites)}
+            for atom_index, site in enumerate(context_sites):
+                source_index = observed.get(site)
+                if source_index is None or not bool(structure.coordinate_mask[source_index]):
+                    continue
+                observed_positions[atom_index] = torch.from_numpy(structure.coordinates[source_index].copy())
+                observed_mask[atom_index] = True
+
+        reference_positions = torch.zeros_like(observed_positions)
+        reference_spaces: dict[tuple[str, int], int] = {}
+        reference_space_id = []
+        for atom_index, site in enumerate(context_sites):
+            component = cast(MolecularSystem, system).component((site.instance_id, site.component_index))
+            coordinates = component.reference_coordinates
+            atoms = component.atoms
+            if not coordinates:
+                raise ValueError(f"ODesign requires reference coordinates for component {component.component_id!r}")
+            coordinate = coordinates[next(index for index, atom in enumerate(atoms) if atom.atom_id == site.atom_id)]
+            if coordinate is None:
+                raise ValueError(
+                    f"ODesign requires a reference coordinate for component "
+                    f"{component.component_id!r} atom {site.atom_id!r}"
+                )
+            reference_positions[atom_index] = torch.tensor(coordinate)
+            reference_space = (site.instance_id, site.component_index)
+            if reference_space not in reference_spaces:
+                reference_spaces[reference_space] = len(reference_spaces)
+            reference_space_id.append(reference_spaces[reference_space])
+        context_reference_positions = reference_positions[: len(context_sites)]
+        context_reference_space_id = torch.tensor(reference_space_id, dtype=torch.int64)
+        for space_id in range(len(reference_spaces)):
+            space_mask = context_reference_space_id == space_id
+            context_reference_positions[space_mask] -= context_reference_positions[space_mask].mean(dim=0)
+        reference_space_id.extend([len(reference_spaces)] * num_slots)
+        reference_space_id_tensor = torch.tensor(reference_space_id, dtype=torch.int64)
+        reference_mask = torch.ones(len(context_sites) + num_slots, dtype=torch.bool)
+
+        hotspot = (
+            _hotspot_tokens(
+                plan.conditions,
+                {},
+                {},
+                plan.source_residue_map,
+                plan.source_atom_map,
+                site_to_token,
+            )
+            if context_token_sites
+            else torch.zeros(0, dtype=torch.bool)
+        )
+        hotspot = torch.cat([hotspot, torch.zeros(num_slots, dtype=torch.bool)])
+
+        fixed_coordinate_mask = torch.zeros(len(context_sites) + num_slots, dtype=torch.bool)
+        constraint_coordinate_mask = torch.zeros(len(context_sites) + num_slots, dtype=torch.bool)
+        for condition in plan.conditions:
+            if not isinstance(condition, ODesignReferenceCoordinates):
+                continue
+            for source_site in condition.sites:
+                site = plan.source_atom_map[source_site]
+                atom_index = site_to_atom[site]
+                constraint_coordinate_mask[atom_index] = True
+                if condition.intent == "hard":
+                    fixed_coordinate_mask[atom_index] = True
+                elif condition.intent != "soft":
+                    raise ValueError(f"unknown ODesignReferenceCoordinates intent: {condition.intent!r}")
+        if bool((constraint_coordinate_mask & ~observed_mask).any()):
+            raise ValueError("ODesignReferenceCoordinates must refer to observed input coordinates")
+        if self.config.receptor_mode == "rigid":
+            fixed_coordinate_mask[: len(context_sites)] |= observed_mask[: len(context_sites)]
+        elif self.config.receptor_mode != "flex":
+            raise ValueError(f"unknown ODesign ligand receptor_mode: {self.config.receptor_mode!r}")
+
+        if system is None:
+            if msa is not None:
+                raise ValueError("MSA evidence requires canonical polymer context")
+            msa_value = None
+            context_msa_features = torch.zeros(1, 0, 34)
+            context_msa_mask = torch.ones(1, 0, dtype=torch.bool)
+            context_profile = torch.zeros(0, 32)
+            context_deletion_mean = torch.zeros(0)
+        else:
+            msa_value = _validate_msa(msa, system)
+            (
+                context_msa_features,
+                context_msa_mask,
+                context_profile,
+                context_deletion_mean,
+            ) = _msa_features(
+                msa_value,
+                system,
+                token_residues,
+                token_entities,
+                set(),
+            )
+        msa_depth = context_msa_features.shape[0]
+        slot_msa_features = torch.zeros(msa_depth, num_slots, 34)
+        slot_msa_features[..., 31] = 1.0
+        msa_features = torch.cat([context_msa_features, slot_msa_features], dim=1)
+        msa_mask = torch.cat(
+            [context_msa_mask, torch.ones(msa_depth, num_slots, dtype=torch.bool)],
+            dim=1,
+        )
+        slot_profile = torch.zeros(num_slots, 32)
+        slot_profile[:, 31] = 1.0
+        profile = torch.cat([context_profile, slot_profile])
+        deletion_mean = torch.cat([context_deletion_mean, torch.zeros(num_slots)])
+
+        token_features = torch.zeros(num_tokens, 453, dtype=torch.float32)
+        for token_index, (residue, entity) in enumerate(zip(token_residues, token_entities)):
+            component_id = (
+                "-L" if residue is None else cast(PolymerSequence, entity).components[residue[1]].component_id
+            )
+            token_features[token_index, 384 + _RESIDUE_TYPE_INDEX.get(component_id, 20)] = 1.0
+        token_features[num_context_tokens:, 384 + _RESIDUE_TYPE_INDEX["-L"]] = 1.0
+        token_features[:, 419 : 419 + 32] = profile
+        token_features[:, 451] = deletion_mean
+        token_features[:, 452] = hotspot.float()
+
+        context_atom_features = (
+            _atom_features(system, context_sites, torch.ones(len(context_sites), dtype=torch.bool))
+            if system is not None
+            else torch.zeros(0, 386)
+        )
+        atom_features = torch.cat([context_atom_features, _ligand_slot_atom_features(num_slots)])
+        atom_to_token = torch.tensor(
+            [site_to_token[site] for site in context_sites] + list(range(num_context_tokens, num_tokens)),
+            dtype=torch.int64,
+        )
+
+        token_bonds = torch.zeros(num_tokens, num_tokens, dtype=torch.float32)
+        if system is not None:
+            token_bonds[:num_context_tokens, :num_context_tokens] = _build_token_bonds(
+                system,
+                context_token_sites,
+                site_to_token,
+                excluded=frozenset(),
+            )
+        constraint_distogram = torch.zeros(num_tokens, num_tokens, 1)
+        if system is not None and context_token_sites:
+            constraint_distogram[:num_context_tokens, :num_context_tokens] = _constraint_distogram(
+                system,
+                context_sites,
+                site_to_token,
+                observed_positions[: len(context_sites)],
+                constraint_coordinate_mask[: len(context_sites)],
+            )
+
+        if system is None:
+            chain_index = entity_index = symmetry_index = residue_index = torch.zeros(0, dtype=torch.int64)
+            generated_chain_index = 0
+            generated_entity_index = 0
+        else:
+            chain_index, entity_index, symmetry_index, residue_index = _build_token_indices(
+                system,
+                context_token_sites,
+                token_residues,
+                token_entities,
+            )
+            generated_chain_index = len(system.instances)
+            generated_entity_index = len(dict.fromkeys(system.instances.values()))
+        chain_index = torch.cat([chain_index, torch.full((num_slots,), generated_chain_index, dtype=torch.int64)])
+        entity_index = torch.cat([entity_index, torch.full((num_slots,), generated_entity_index, dtype=torch.int64)])
+        symmetry_index = torch.cat([symmetry_index, torch.zeros(num_slots, dtype=torch.int64)])
+        residue_index = torch.cat([residue_index, torch.zeros(num_slots, dtype=torch.int64)])
+
+        context_charges = [system.atom(site).formal_charge for site in context_sites] if system is not None else []
+        return ODesignLigandInput(
+            token_mask=torch.ones(1, num_tokens, dtype=torch.bool, device=self.device),
+            residue_index=residue_index.unsqueeze(0).to(self.device),
+            chain_index=chain_index.unsqueeze(0).to(self.device),
+            entity_index=entity_index.unsqueeze(0).to(self.device),
+            symmetry_index=symmetry_index.unsqueeze(0).to(self.device),
+            token_index=torch.arange(num_tokens, dtype=torch.int64, device=self.device).unsqueeze(0),
+            cyclic_period=torch.zeros(1, num_tokens, dtype=torch.int64, device=self.device),
+            token_features=token_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            token_bonds=token_bonds.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            atom_features=atom_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            atom_to_token=atom_to_token.unsqueeze(0).to(self.device),
+            atom_mask=torch.ones(1, len(context_sites) + num_slots, dtype=torch.bool, device=self.device),
+            reference_positions=reference_positions.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            reference_space_id=reference_space_id_tensor.unsqueeze(0).to(self.device),
+            reference_mask=reference_mask.unsqueeze(0).to(self.device),
+            reference_charges=torch.tensor(
+                [*context_charges, *([0] * num_slots)],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            .unsqueeze(0)
+            .unsqueeze(-1),
+            observed_positions=observed_positions.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            observed_mask=observed_mask.unsqueeze(0).to(self.device),
+            fixed_coordinate_mask=fixed_coordinate_mask.unsqueeze(0).to(self.device),
+            constraint_distogram=constraint_distogram.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            msa_features=msa_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
+            msa_mask=msa_mask.unsqueeze(0).to(self.device),
+            layout=ODesignLigandLayout(
+                context_system=system,
+                context_token_sites=context_token_sites,
+                context_atom_sites=context_sites,
+                generated_atoms=plan.generated_atoms,
+                slots=slots,
+                conditions=plan.conditions,
+                source_atom_map=plan.source_atom_map,
             ),
         )
 
@@ -1333,6 +1780,52 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
     )
 
 
+def _realize_ligand_atoms(
+    input: ODesignLigandInput,
+    num_atoms: int,
+) -> ODesignLigandInput:
+    num_context_atoms = len(input.layout.context_atom_sites)
+    num_context_tokens = len(input.layout.context_token_sites)
+    atom_count = num_context_atoms + num_atoms
+    token_count = num_context_tokens + num_atoms
+    generated_atoms = replace(
+        input.layout.generated_atoms,
+        min_atoms=num_atoms,
+        max_atoms=num_atoms,
+    )
+    layout = replace(
+        input.layout,
+        generated_atoms=generated_atoms,
+        slots=input.layout.slots[:num_atoms],
+    )
+    return replace(
+        input,
+        token_mask=input.token_mask[:, :token_count],
+        residue_index=input.residue_index[:, :token_count],
+        chain_index=input.chain_index[:, :token_count],
+        entity_index=input.entity_index[:, :token_count],
+        symmetry_index=input.symmetry_index[:, :token_count],
+        token_index=input.token_index[:, :token_count],
+        cyclic_period=input.cyclic_period[:, :token_count],
+        token_features=input.token_features[:, :token_count],
+        token_bonds=input.token_bonds[:, :token_count, :token_count],
+        atom_features=input.atom_features[:, :atom_count],
+        atom_to_token=input.atom_to_token[:, :atom_count],
+        atom_mask=input.atom_mask[:, :atom_count],
+        reference_positions=input.reference_positions[:, :atom_count],
+        reference_space_id=input.reference_space_id[:, :atom_count],
+        reference_mask=input.reference_mask[:, :atom_count],
+        reference_charges=input.reference_charges[:, :atom_count],
+        observed_positions=input.observed_positions[:, :atom_count],
+        observed_mask=input.observed_mask[:, :atom_count],
+        fixed_coordinate_mask=input.fixed_coordinate_mask[:, :atom_count],
+        constraint_distogram=input.constraint_distogram[:, :token_count, :token_count],
+        msa_features=input.msa_features[:, :, :token_count],
+        msa_mask=input.msa_mask[:, :, :token_count],
+        layout=layout,
+    )
+
+
 def _build_tokens(
     system: MolecularSystem,
     sites: tuple[AtomSite, ...],
@@ -1495,6 +1988,23 @@ def _atom_features(system: MolecularSystem, sites: tuple[AtomSite, ...], referen
                 raise ValueError(f"ODesign cannot encode atom-name character {character!r}")
             characters[atom_index, char_index, value] = 1.0
     return torch.cat([reference_mask.float().unsqueeze(-1), element, characters.flatten(-2)], dim=-1)
+
+
+def _ligand_slot_atom_features(num_slots: int) -> Tensor:
+    r"""
+    Encode valid zero-reference atoms with released element/name mask features.
+    """
+
+    features = torch.zeros(num_slots, 386)
+    features[:, 0] = 1.0
+    element_offset = 1
+    element_mask_index = 128
+    features[:, element_offset + element_mask_index] = 1.0
+    character_offset = 1 + 129
+    features[:, character_offset + (ord("-") - 32)] = 1.0
+    for char_index in range(1, 4):
+        features[:, character_offset + char_index * 64] = 1.0
+    return features
 
 
 def _hotspot_tokens(

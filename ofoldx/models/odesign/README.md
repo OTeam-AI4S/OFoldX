@@ -1,9 +1,13 @@
 ---
 language:
   - protein
+  - dna
+  - rna
 tags:
   - Biology
   - Protein Design
+  - Nucleic Acid Design
+  - Ligand Design
   - Biomolecular Structure
   - Diffusion
 license: agpl-3.0
@@ -13,8 +17,8 @@ pipeline_tag: other
 
 # ODesign
 
-Native PyTorch implementation of the ODesign all-atom biomolecular interaction
-design model and its released protein sequence-assignment composition.
+Native PyTorch implementation of the four released ODesign backbone artifacts
+and their protein, nucleic-acid, and ligand OInvFold compositions.
 
 ## Disclaimer
 
@@ -28,20 +32,33 @@ model card.
 ODesign is an all-atom diffusion model for designing biomolecular interactions.
 It combines atom-level chemical features, MSA information, geometric
 constraints, and recycled Pairformer representations before an EDM denoiser
-generates coordinates. Distogram and bond heads provide additional supervision
-over the designed assembly. The released protein workflow assigns sequences to
-generated backbones with ProteinMPNN or LigandMPNN.
+generates coordinates. Distogram and bond heads retain additional predictions
+over the designed assembly. OFoldX composes each backbone artifact with the
+released OInvFold model appropriate to its generated chemistry.
 
-### Variants
+### Released Artifacts
 
-- **[oteam/odesign-flex](https://huggingface.co/oteam/odesign-flex)**: Flexible-receptor interaction design.
-- **[oteam/odesign-rigid](https://huggingface.co/oteam/odesign-rigid)**: Rigid-receptor interaction design.
+The converter exposes four exact artifact selectors:
 
-### Model Specification
+- `protein-flex` uses `ODesignModel` with a protein/flexible
+  `ODesignProcessor`, then `ODesignProteinPipeline` assigns generated chains with
+  a protein `OInvFoldPolymerPipeline`.
+- `protein-rigid` uses the same model graph with a protein/rigid Processor and
+  the same protein OInvFold composition.
+- `nucleic-acid-rigid` uses the same model graph with a nucleic-acid/rigid
+  Processor. `ODesignNucleicAcidPipeline` routes each generated chain to its
+  exact DNA or RNA OInvFold child and realizes canonical nucleotide identities.
+- `ligand-rigid` uses `ODesignModel` with `ODesignLigandProcessor`.
+  `ODesignLigandPipeline` sends the generated coordinate slots to an
+  `OInvFoldLigandPipeline` for element assignment.
 
-| Pairformer Blocks | MSA Blocks | Single Size | Pair Size | Denoiser Token Blocks | Num Parameters (M) | FLOPs (G) |
-| ----------------- | ---------- | ----------- | --------- | --------------------- | ------------------ | --------- |
-| 48                | 4          | 384         | 128       | 24                    | 355.648            | 1260.502  |
+Receptor mode and generated modality are persisted Processor facts, not runtime
+model-topology switches. Protein, DNA, and RNA candidates become canonical
+`Structure` values after OInvFold assignment. Ligand generation is deliberately
+provisional: candidates retain ordered slot identities, coordinates, predicted
+elements, probabilities, and ODesign bond logits, but their bonds, formal
+charges, and component identity remain unresolved. OFoldX does not fabricate a
+canonical molecule from those predictions.
 
 ### Links
 
@@ -60,15 +77,54 @@ library. Install it with pip:
 pip install ofoldx
 ```
 
-### Biomolecular Design
+### Polymer Design
 
-Use the high-level `design` API:
+Use the concrete Pipeline because placement and seed/backbone/sequence axes are
+family-specific:
 
 ```python
 import ofoldx
+from ofoldx.data import GeneratedSegment
+from ofoldx.models.odesign import ODesignPlacements
 
-output = ofoldx.design("target.cif", model="oteam/odesign-flex")
+pipeline = ofoldx.pipeline(
+    "design",
+    model="/path/to/converted-odesign-protein-flex",
+)
+placement = ODesignPlacements(
+    {"designed_chain": {"design": GeneratedSegment("protein", 100, 100)}}
+)
+output = pipeline.design(
+    None,
+    placement=placement,
+    num_backbones=2,
+)
 ```
+
+The nucleic-acid Pipeline uses the same placement form with `"dna"` or `"rna"`
+generated segments.
+
+### Provisional Ligand Design
+
+Ligand artifacts take an explicit generated-atom request:
+
+```python
+import ofoldx
+from ofoldx.models.odesign import ODesignGeneratedAtoms
+
+pipeline = ofoldx.pipeline(
+    "design",
+    model="/path/to/converted-odesign-ligand-rigid",
+)
+output = pipeline.design(
+    "target.cif",
+    generated_atoms=ODesignGeneratedAtoms("ligand", 8, 16),
+)
+```
+
+The returned ligand slots are not a chemically complete molecule until an
+external chemical-realization step resolves connectivity, charge, and component
+identity.
 
 ## Training Details
 
@@ -81,7 +137,7 @@ upstream training corpus and data construction.
 
 OFoldX preserves the released inference graph and exposes the differentiable
 one-step denoiser. It does not add an OFoldX-specific training objective to the
-model. Rigid and flexible receptor behavior is a conditioning difference rather
+model. Rigid and flexible receptor behavior is Processor conditioning rather
 than a separate architecture.
 
 ## Citation
