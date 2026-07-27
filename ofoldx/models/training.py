@@ -23,10 +23,11 @@ A family declares:
 
 The objective trains only the parameters on the loss path; a model's auxiliary heads (distogram, confidence,
 B-factor), sampling-only modules, and (input-conditionally) template embedders receive no gradient. The
-Runner runs DDP with ``static_graph=True``, which learns the used/unused parameter set from the first
-iteration's autograd hooks -- so unused modules are handled without the family enumerating them, and without
-the fragility of a freeze list. This assumes the used/unused set is constant across steps (a homogeneous
-training set), which holds once the non-groundable variants are excluded.
+Runner runs DDP with ``find_unused_parameters=True``: it locates the un-gradiented parameters by walking the
+forward return value, which the families' ``tensorclass`` outputs let it traverse -- so unused modules are
+handled without the family enumerating them, and without the fragility of a freeze list. Unlike
+``static_graph``, it re-checks each step, so it also tolerates a data-dependent used/unused set (e.g. a
+template embedder exercised only when a batch carries templates).
 """
 
 from __future__ import annotations

@@ -136,9 +136,14 @@ class Runner(dl.Runner):
                 f"the OFoldX Runner supports only the plain Torch/DDP stack ({_SUPPORTED_STACK!r}); got "
                 f"{stack!r}. Graph and parallel stacks require their own steps."
             )
+        # A repository run pins its resolved commit into the config *before* ``super().__init__`` derives the
+        # run identity (DanLing freezes ``workspace``/``name`` there and hashes the config for ``id``). Pinning
+        # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
+        # matches the snapshot actually loaded.
+        repository = self._prepare_repository(config) if config.model.get("pretrained") else None
         super().__init__(config)
 
-        self.spec, self.model, self.processor = self._build()
+        self.spec, self.model, self.processor = self._build(repository)
         self.criterion = self.spec.criterion(self.model, self.processor)
         self.collate_fn = self.spec.collate
         # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
@@ -152,12 +157,12 @@ class Runner(dl.Runner):
 
     # -- construction --------------------------------------------------------
 
-    def _build(self) -> tuple[_TrainingSpec, Model, Processor]:
+    def _build(self, repository: Any = None) -> tuple[_TrainingSpec, Model, Processor]:
         r"""Resolve the architecture, confirm it is trainable *before* building/loading, then instantiate."""
 
         model_config = self.config.model
         if model_config.pretrained:
-            return self._build_from_repository(model_config)
+            return self._build_from_repository(model_config, repository)
         registration = MODELS.lookup_model(model_config["name"])
         spec = _training_spec(registration.id)  # fail fast before building the model
         overrides = {
@@ -190,16 +195,17 @@ class Runner(dl.Runner):
             )
         return processor(config_class(**{**shared, **overrides}))
 
-    def _build_from_repository(self, model_config: Mapping[str, Any]) -> tuple[_TrainingSpec, Model, Processor]:
+    def _prepare_repository(self, config: RunnerConfig) -> Any:
         r"""
-        Load a Model/Processor pair from one repository snapshot: decide architecture + trainability and
-        validate the Processor metadata from the snapshot *before* the expensive weight download, then pin
-        the resolved commit so a mutable Hub id resumes reproducibly.
+        Resolve the repository's exact commit and pin it into the config *before* DanLing freezes the run
+        identity, rejecting overrides a published pair cannot honor. Runs only for a repository run and
+        returns the resolved repository so ``_build_from_repository`` reuses it without a second resolution.
         """
 
-        from ..hub import PROCESSOR_METADATA, load_model, load_processor, model_values, resolve_repository
+        from ..hub import PROCESSOR_METADATA, resolve_repository
 
-        if dict(self.config.processor):
+        model_config = config.model
+        if dict(config.processor):
             raise ValueError("a repository loads its Processor with the published config; drop the processor overrides")
         model_overrides = sorted(k for k in model_config if k not in ("name", "pretrained", "revision"))
         if model_overrides:
@@ -211,6 +217,21 @@ class Runner(dl.Runner):
             revision=model_config.get("revision"),
             allow_patterns=PROCESSOR_METADATA,
         )
+        if repository.commit:
+            config.model.revision = repository.commit  # pin the exact snapshot BEFORE the identity is frozen
+        return repository
+
+    def _build_from_repository(
+        self, model_config: Mapping[str, Any], repository: Any
+    ) -> tuple[_TrainingSpec, Model, Processor]:
+        r"""
+        Load a Model/Processor pair from the already-resolved repository snapshot: decide architecture +
+        trainability and validate the Processor metadata from the snapshot *before* the expensive weight
+        download. ``_prepare_repository`` has already resolved the snapshot and pinned its commit.
+        """
+
+        from ..hub import load_model, load_processor, model_values
+
         metadata_registration, _values = model_values(repository.path)
         architecture = metadata_registration.id
         if model_config["name"] and model_config["name"] != architecture:
@@ -223,8 +244,6 @@ class Runner(dl.Runner):
         # ``load_model`` hydrates the full weights.
         processor = load_processor(repository)
         model = load_model(repository)
-        if repository.commit:
-            self.config.model.revision = repository.commit  # pin the exact snapshot for resume
         return spec, model, processor
 
     def build_datasets(self) -> dict[str, Any]:
@@ -292,6 +311,7 @@ class Runner(dl.Runner):
             model.eval()
         return super().evaluate_step(data)
 
+    @torch.inference_mode()
     def infer_step(self, data: Any) -> list[Any]:
         r"""
         Run the family's inference entry point and return its output(s) on the CPU.
@@ -301,12 +321,18 @@ class Runner(dl.Runner):
         plain forward for the sequence families, ``model.sample`` for the diffusion families (whose training
         forward needs a target that inference does not have) -- on the model-visible input, then moves the
         output off the accelerator so a long inference pass does not accumulate whole dataclasses on device.
+
+        Decorated with ``@torch.inference_mode()`` like DanLing's default ``infer_step`` (this override
+        replaces it, so it must restore the guard) -- otherwise the forward would build and retain an
+        autograd graph for the whole pass. The model is ``unwrap``-ed first: under DDP ``self.model`` is a
+        ``DistributedDataParallel`` wrapper that proxies ``forward`` but not custom methods like ``sample``.
         """
 
         data = self.to_device(data)
         model = self.ema or self.model
         if model is None:
             raise ValueError("cannot run infer_step: model is not initialized")
+        model = self.unwrap(model)  # reach the family's own inference entry point (e.g. ``sample``) under DDP
         if model.training:
             model.eval()
         inputs = data["input"] if isinstance(data, Mapping) else data
