@@ -1,37 +1,54 @@
 r"""
 Training, evaluation, and inference runner for the trainable model families.
 
-The Runner is config-only and special-cases no family: it resolves an architecture (fresh from
-``model.name`` or loaded from ``model.pretrained``), looks up its explicit builder in
-[`ofoldx.runners.families`][ofoldx.runners.families], and wires the Model, Processor, objective, and
-collate. Adding a trainable family is a `families` entry, not a Runner change.
+The Runner special-cases no family and adds almost nothing to DanLing. It resolves an architecture
+(fresh from ``model.name`` or loaded from ``model.pretrained``), builds the Model and a config-consistent
+Processor, and discovers the family's training contract *by convention*: the family package exports a
+DanLing-shaped ``criterion(pred, target) -> loss`` and a ``collate`` that produces DanLing's
+``{"input", "target", "loss_normalizer"}`` batch. Everything else -- forward, criterion, the
+per-token loss normalizer, backward, accumulation -- is DanLing's own ``train_step``. A family with no
+``criterion`` is simply not trainable.
 
-V1 targets the plain Torch/DDP stack only. The step methods below override DanLing's, so the Graph and
-parallel stacks -- which supply their own step implementations -- are rejected rather than silently
-half-supported.
+V1 targets the plain Torch/DDP stack; the only overrides below are a train/eval **mode** guard, because
+DanLing never toggles module ``train()``/``eval()`` and repository models load in ``eval()``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import importlib
+from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 import danling as dl
-import torch
 from danling.runners.config import normalize_stack_name
-from danling.runners.utils import RunnerMode
 from torch import Tensor
 
 from ..model import Model
-from ..models.registry import MODELS
+from ..models.registry import BUILTIN_MODULES, MODELS, ModelRegistration
 from ..processor import Processor
 from .config import RunnerConfig
-from .families import Collate, Objective, build_fresh, require_trainable, wire_loaded
 from .registry import RUNNERS
 
-#: The only DanLing stack whose train/evaluate/infer steps this Runner implements.
+#: The only DanLing stack whose steps this Runner supports.
 _SUPPORTED_STACK = "ddp"
+
+Criterion = Callable[[Any, Any], Tensor]
+Collate = Callable[[list[Any]], Any]
+
+
+def _training_contract(architecture: str) -> tuple[Criterion, Collate]:
+    r"""
+    Discover a family's training contract from its package (``criterion`` + ``collate``).
+    """
+
+    module = importlib.import_module(BUILTIN_MODULES[architecture])
+    if not hasattr(module, "criterion"):
+        raise ValueError(
+            f"architecture {architecture!r} is not trainable: {BUILTIN_MODULES[architecture]} exports no "
+            "`criterion(pred, target) -> loss`"
+        )
+    return module.criterion, module.collate
 
 
 @RUNNERS.register("ofoldx", default=True)
@@ -46,56 +63,66 @@ class Runner(dl.Runner):
     config: RunnerConfig
     model: Model
     processor: Processor
-    objective: Objective
-    collate_fn: Collate
 
     def __init__(self, config: RunnerConfig | Mapping[str, Any]) -> None:
         if not isinstance(config, RunnerConfig):
             config = RunnerConfig(config)
-        # Boot (runs ``post`` validation + finalizes) BEFORE DanLing consumes workspace/logging/checkpoint.
+        # Boot (runs ``post`` + finalizes) BEFORE DanLing consumes workspace/logging/checkpoint.
         config.boot()
         stack = normalize_stack_name(config.get("stack", "auto"))
         if stack != _SUPPORTED_STACK:
             raise ValueError(
                 f"the OFoldX Runner supports only the plain Torch/DDP stack ({_SUPPORTED_STACK!r}); got "
-                f"{stack!r}. Graph and parallel stacks require their own train/evaluate/infer steps, which "
-                "this Runner overrides."
+                f"{stack!r}. Graph and parallel stacks require their own steps."
             )
         super().__init__(config)
 
-        self.model, self.processor, self.objective, self.collate_fn = self._build()
+        self.model, self.processor, self.criterion, self.collate_fn = self._build()
+        self.model.train()  # repository models load in eval(); DanLing never toggles module mode
         self.datasets.update(self.build_datasets())
 
     # -- construction --------------------------------------------------------
 
-    def _build(self) -> tuple[Model, Processor, Objective, Collate]:
+    def _build(self) -> tuple[Model, Processor, Criterion, Collate]:
         r"""
-        Resolve the architecture and build a consistent Model, Processor, objective, and collate.
+        Resolve the architecture, confirm it is trainable *before* building/loading, then instantiate.
         """
 
         model_config = self.config.model
-        processor_overrides = self.config.processor
         if model_config.pretrained:
-            return self._build_from_repository(model_config, processor_overrides)
-        architecture = MODELS.lookup_model(model_config.name).id
-        return build_fresh(architecture, model_config, processor_overrides)
+            return self._build_from_repository(model_config)
+        registration = MODELS.lookup_model(model_config["name"])
+        criterion, collate = _training_contract(registration.id)  # fail fast before building the model
+        overrides = {key: value for key, value in model_config.items() if key not in ("name", "pretrained")}
+        model = registration.model(registration.model_config(**overrides))
+        processor = self._build_processor(registration, model)
+        return model, processor, criterion, collate
 
-    def _build_from_repository(
-        self,
-        model_config: Mapping[str, Any],
-        processor_overrides: Mapping[str, Any],
-    ) -> tuple[Model, Processor, Objective, Collate]:
+    def _build_processor(self, registration: ModelRegistration, model: Model) -> Processor:
         r"""
-        Load a Model/Processor pair from one repository snapshot, rejecting before any weights download.
+        Build the paired Processor: thread the keys it genuinely shares with the Model config (e.g.
+        ``ca_only``) from the Model, so one setting drives both, then apply processor-only overrides.
+        A configuration-free Processor takes neither.
+        """
+
+        processor = cast("Callable[..., Processor]", registration.processor)
+        config_class = registration.processor.config_class
+        if config_class is None:
+            return processor()
+        shared = {key: model.config[key] for key in config_class() if key in model.config}
+        return processor(config_class(**{**shared, **dict(self.config.processor)}))
+
+    def _build_from_repository(self, model_config: Mapping[str, Any]) -> tuple[Model, Processor, Criterion, Collate]:
+        r"""
+        Load a Model/Processor pair from one repository snapshot, deciding architecture + trainability
+        from the metadata before any weights download.
         """
 
         from ..hub import PROCESSOR_METADATA, load_model, load_processor, model_values, resolve_repository
 
         # ``PROCESSOR_METADATA`` covers both ``model.json`` and ``processor.json``, so one resolution
-        # feeds both loaders and the metadata check below.
+        # feeds both loaders and the metadata check.
         repository = resolve_repository(model_config["pretrained"], allow_patterns=PROCESSOR_METADATA)
-        # Decide from the metadata snapshot -- before downloading/loading weights -- whether this
-        # architecture is trainable and matches any requested ``model.name``.
         metadata_registration, _values = model_values(repository.path)
         architecture = metadata_registration.id
         if model_config["name"] and model_config["name"] != architecture:
@@ -103,14 +130,10 @@ class Runner(dl.Runner):
                 f"config `model.name` {model_config['name']!r} does not match the repository architecture "
                 f"{architecture!r}"
             )
-        require_trainable(architecture)
-
+        criterion, collate = _training_contract(architecture)  # fail fast before downloading weights
         model = load_model(repository)
         processor = load_processor(repository)
-        # Bind the objective/collate by the exact loaded Model/Processor pair.
-        registration = MODELS.for_pair(model, processor)
-        objective, collate = wire_loaded(registration.id, processor)
-        return model, processor, objective, collate
+        return model, processor, criterion, collate
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
@@ -129,7 +152,7 @@ class Runner(dl.Runner):
 
     def to_device(self, data: Any) -> Any:
         r"""
-        Move tensors in a nested batch to the runner device.
+        Move tensors in a nested batch (including family Input dataclasses) to the runner device.
         """
 
         if is_dataclass(data) and not isinstance(data, type):
@@ -148,57 +171,15 @@ class Runner(dl.Runner):
             return tuple(self.to_device(value) for value in data)
         return super().to_device(data)
 
-    # -- steps ---------------------------------------------------------------
+    # -- steps: DanLing's defaults, plus a train/eval mode guard --------------
 
-    def train_step(self, data: Any) -> tuple[Any, Tensor]:
-        r"""
-        Run one optimization step.
-        """
+    def train_step(self, data: Any) -> tuple[Any, Tensor | None]:
+        if not self.model.training:
+            self.model.train()
+        return super().train_step(data)
 
-        data = self.to_device(data)
-        # Repository models are loaded in eval() and DanLing never toggles module train/eval mode, so
-        # set it here or dropout/other train-time layers would stay off during training.
-        self.model.train()
-        with self.train_context():
-            output, loss = self.objective(self.model, data)
-            self.backward(loss)
-            self.step()
-        return output, loss
-
-    def evaluate_step(self, data: Any) -> tuple[Any, Tensor]:
-        r"""
-        Evaluate one batch without parameter updates.
-        """
-
-        data = self.to_device(data)
+    def evaluate_step(self, data: Any) -> tuple[Any, Tensor | None]:
         model = self.ema or self.model
-        model.eval()
-        with self.infer_context():
-            output, loss = self.objective(model, data)
-        return output, loss
-
-    def infer_step(self, data: Any) -> Any:
-        r"""
-        Run one model forward pass without gradients.
-        """
-
-        data = self.to_device(data)
-        model = self.ema or self.model
-        model.eval()
-        with self.infer_context():
-            return model(**data) if isinstance(data, Mapping) else model(data)
-
-    @torch.inference_mode()
-    def infer(self, split: str = "infer") -> list[Any]:
-        r"""
-        Run forward inference over one configured split.
-
-        Raises:
-            KeyError: If ``split`` has no dataloader.
-        """
-
-        self.mode = RunnerMode.infer
-        self.split = split
-        model = self.ema or self.model
-        model.eval()
-        return [self.infer_step(data) for data in self.dataloaders[split]]
+        if model.training:
+            model.eval()
+        return super().evaluate_step(data)

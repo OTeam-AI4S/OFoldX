@@ -4,6 +4,8 @@ NA-MPNN training objectives.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -89,3 +91,41 @@ def smoothed_loss(
         + rna_rows * rna_set * (weight / (_RNA_RESIDUE_TYPE_SPAN[1] - _RNA_RESIDUE_TYPE_SPAN[0]))
     )
     return -((target + smoothing) * log_probabilities).sum(dim=-1)
+
+
+def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1, shared_nucleic_tokens: bool = True) -> Tensor:
+    r"""
+    DanLing-shaped NA-MPNN loss: polymer-specific label-smoothed cross entropy over designable residues.
+
+    ``shared_nucleic_tokens`` must match how the paired Processor tokenized RNA (default ``True``).
+    """
+
+    log_probabilities = F.log_softmax(pred.logits, dim=-1)
+    per_residue = smoothed_loss(
+        target.sequence_tokens,
+        log_probabilities,
+        target.polymer_type_index,
+        weight=label_smoothing,
+        shared_nucleic_tokens=shared_nucleic_tokens,
+    )
+    mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
+    return (per_residue * mask).sum() / mask.sum()
+
+
+def loss_tokens(target: Any) -> int:
+    r"""Local count of designable residues -- DanLing's per-token loss normalizer."""
+
+    return int((target.residue_mask & target.design_positions).sum())
+
+
+def collate(batch: list[Any]) -> dict[str, Any]:
+    r"""
+    Collate to DanLing's ``{"input", "target", "loss_normalizer"}`` batch. ``pair_logit_bias`` is
+    residue-aligned on two axes; ``sequence_tokens`` pad with the NA-MPNN padding id.
+    """
+
+    from ...modules.collate import pad_and_collate
+    from .model import NA_MPNN_PADDING_TOKEN_ID
+
+    batched = pad_and_collate(batch, token_pad_id=NA_MPNN_PADDING_TOKEN_ID, pair_bias_fields={"pair_logit_bias"})
+    return {"input": batched, "target": batched, "loss_normalizer": loss_tokens(batched)}

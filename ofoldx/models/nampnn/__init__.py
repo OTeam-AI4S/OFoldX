@@ -24,7 +24,7 @@ from .model import (
     NaMpnnOutput,
     NaMpnnSamplingOutput,
 )
-from .objectives import nll_loss, smoothed_loss
+from .objectives import collate, criterion, nll_loss, smoothed_loss
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
