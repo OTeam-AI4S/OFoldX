@@ -25,6 +25,12 @@ class MpnnPackerConfig(Config):
         coordinate_noise: Training-time Gaussian coordinate-noise standard deviation.
         lower_bound: Lower distance bound for context radial-basis expansion.
         upper_bound: Upper distance bound for context radial-basis expansion.
+
+    Examples:
+        >>> from ofoldx.models.mpnn_packer import MpnnPackerConfig
+        >>> config = MpnnPackerConfig()
+        >>> config.num_mix
+        3
     """
 
     hidden_size: int = 128

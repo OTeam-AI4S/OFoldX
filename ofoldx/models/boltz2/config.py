@@ -247,6 +247,12 @@ class Boltz2Config(Config):
         denoiser: Learned coordinate-denoiser sub-config.
         sampler: EDM-sampler sub-config.
         confidence: Pairformer confidence-module sub-config.
+
+    Examples:
+        >>> from ofoldx.models.boltz2 import Boltz2Config
+        >>> config = Boltz2Config(recycling_steps=2)
+        >>> config.recycling_steps
+        2
     """
 
     single_size: int = 384
@@ -282,6 +288,12 @@ class Boltz2AffinityConfig(Boltz2Config):
         predict_bfactor: Whether to build the inherited B-factor head; fixed to ``False`` for affinity.
         recycling_steps: Number of trunk recycling passes; overridden to six for affinity.
         affinity_heads: Two affinity-head configs in ensemble order.
+
+    Examples:
+        >>> from ofoldx.models.boltz2 import Boltz2AffinityConfig
+        >>> config = Boltz2AffinityConfig()
+        >>> config.recycling_steps
+        6
     """
 
     use_templates: bool = False

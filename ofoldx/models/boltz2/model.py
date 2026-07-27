@@ -68,6 +68,75 @@ class Boltz2Model(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import MolecularSystem, PolymerSequence
+        >>> from ofoldx.models.boltz2 import Boltz2Config, Boltz2Model, Boltz2Processor
+        >>> sequence = PolymerSequence.from_one_letter("G")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> input = Boltz2Processor()(system)
+        >>> config = Boltz2Config(
+        ...     {
+        ...         "single_size": 8,
+        ...         "pair_size": 8,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "num_distogram_bins": 4,
+        ...         "fourier_embedding_size": 8,
+        ...         "recycling_steps": 1,
+        ...         "input_embeddings": {
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_encoder_attention_heads": 1,
+        ...         },
+        ...         "trunk": {
+        ...             "num_pairformer_blocks": 1, "num_pair_attention_heads": 1,
+        ...             "num_msa_blocks": 1, "msa_size": 8, "msa_head_dim": 4,
+        ...             "num_msa_attention_heads": 1, "outer_product_hidden_size": 4,
+        ...             "msa_triangle_attention_hidden_size": 4,
+        ...             "num_msa_triangle_attention_heads": 1,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1,
+        ...             "pair_dropout": 0.0, "msa_dropout": 0.0, "msa_pair_dropout": 0.0,
+        ...         },
+        ...         "template": {
+        ...             "hidden_size": 8, "num_blocks": 1, "num_distogram_bins": 4,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1, "dropout": 0.0,
+        ...         },
+        ...         "denoiser": {
+        ...             "num_token_encoder_blocks": 1,
+        ...             "num_token_encoder_attention_heads": 1,
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_decoder_blocks": 1,
+        ...             "num_atom_attention_heads": 1,
+        ...             "atom_hidden_size": 8,
+        ...             "atom_pair_hidden_size": 4,
+        ...             "num_query_atoms": 4,
+        ...             "num_key_atoms": 4,
+        ...             "num_conditioning_transitions": 1,
+        ...         },
+        ...         "confidence": {
+        ...             "num_pairformer_blocks": 1, "num_pair_attention_heads": 1,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1,
+        ...             "num_distogram_bins": 4, "num_plddt_bins": 4,
+        ...             "num_pae_bins": 4, "num_pde_bins": 4,
+        ...             "pair_dropout": 0.0,
+        ...         },
+        ...     }
+        ... )
+        >>> model = Boltz2Model(config).eval()
+        >>> with torch.inference_mode():
+        ...     coordinates = model.sample(
+        ...         input,
+        ...         num_samples=1,
+        ...         num_sampling_steps=2,
+        ...         recycling_steps=1,
+        ...         contact_guidance=False,
+        ...     )
+        >>> tuple(coordinates.shape)
+        (1, 1, 32, 3)
     """
 
     config_class = Boltz2Config
@@ -354,6 +423,39 @@ class Boltz2Model(Model):
             input,
             coordinates,
         )
+
+    def representations(
+        self,
+        input: Boltz2Input,
+        *,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Boltz2Representations:
+        r"""
+        Return the final single and pair trunk representations.
+
+        Args:
+            input: Model features with token axis length ``N``.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
+            generator: Optional generator advanced by MSA row sampling.
+
+        Returns:
+            Single representations with shape ``(B, N, C_single)`` and pair
+            representations with shape ``(B, N, N, C_pair)``. Gradients are
+            retained when autograd is enabled.
+        """
+
+        representations = self._run_trunk(
+            input,
+            recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
+        )
+        return Boltz2Representations(single=representations.single, pair=representations.pair)
 
     def sample(
         self,
@@ -865,6 +967,113 @@ class Boltz2AffinityModel(Boltz2Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import (
+        ...     ChemicalAtom,
+        ...     ChemicalComponent,
+        ...     MolecularSystem,
+        ...     Molecule,
+        ...     PolymerSequence,
+        ...     get_component,
+        ... )
+        >>> from ofoldx.models.boltz2 import (
+        ...     Boltz2AffinityConfig,
+        ...     Boltz2AffinityHeadConfig,
+        ...     Boltz2AffinityModel,
+        ...     Boltz2AffinityProcessor,
+        ... )
+        >>> protein = PolymerSequence("protein", (get_component("GLY"),))
+        >>> ligand = Molecule(
+        ...     (
+        ...         ChemicalComponent(
+        ...             "LIG",
+        ...             (ChemicalAtom("C1", "C"),),
+        ...             frozenset(),
+        ...             reference_coordinates=((0.0, 0.0, 0.0),),
+        ...         ),
+        ...     )
+        ... )
+        >>> system = MolecularSystem(
+        ...     {"protein": protein, "ligand": ligand},
+        ...     {"A": "protein", "L": "ligand"},
+        ... )
+        >>> input = Boltz2AffinityProcessor()(system)
+        >>> config = Boltz2AffinityConfig(
+        ...     {
+        ...         "single_size": 8,
+        ...         "pair_size": 8,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "num_distogram_bins": 4,
+        ...         "fourier_embedding_size": 8,
+        ...         "recycling_steps": 1,
+        ...         "input_embeddings": {
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_encoder_attention_heads": 1,
+        ...         },
+        ...         "trunk": {
+        ...             "num_pairformer_blocks": 1, "num_pair_attention_heads": 1,
+        ...             "num_msa_blocks": 1, "msa_size": 8, "msa_head_dim": 4,
+        ...             "num_msa_attention_heads": 1, "outer_product_hidden_size": 4,
+        ...             "msa_triangle_attention_hidden_size": 4,
+        ...             "num_msa_triangle_attention_heads": 1,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1,
+        ...             "pair_dropout": 0.0, "msa_dropout": 0.0, "msa_pair_dropout": 0.0,
+        ...         },
+        ...         "denoiser": {
+        ...             "num_token_encoder_blocks": 1,
+        ...             "num_token_encoder_attention_heads": 1,
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_decoder_blocks": 1,
+        ...             "num_atom_attention_heads": 1,
+        ...             "atom_hidden_size": 8,
+        ...             "atom_pair_hidden_size": 4,
+        ...             "num_query_atoms": 4,
+        ...             "num_key_atoms": 4,
+        ...             "num_conditioning_transitions": 1,
+        ...         },
+        ...         "confidence": {
+        ...             "num_pairformer_blocks": 1, "num_pair_attention_heads": 1,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1,
+        ...             "num_distogram_bins": 4, "num_plddt_bins": 4,
+        ...             "num_pae_bins": 4, "num_pde_bins": 4,
+        ...             "pair_dropout": 0.0,
+        ...         },
+        ...         "affinity_heads": (
+        ...             Boltz2AffinityHeadConfig({
+        ...                 "num_pair_update_blocks": 1,
+        ...                 "num_distogram_bins": 4,
+        ...                 "num_conditioning_transitions": 1,
+        ...                 "triangle_attention_hidden_size": 4,
+        ...                 "num_triangle_attention_heads": 1,
+        ...                 "dropout": 0.0,
+        ...             }),
+        ...             Boltz2AffinityHeadConfig({
+        ...                 "num_pair_update_blocks": 1,
+        ...                 "num_distogram_bins": 4,
+        ...                 "num_conditioning_transitions": 1,
+        ...                 "triangle_attention_hidden_size": 4,
+        ...                 "num_triangle_attention_heads": 1,
+        ...                 "dropout": 0.0,
+        ...             }),
+        ...         ),
+        ...     }
+        ... )
+        >>> model = Boltz2AffinityModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     score = model.affinity(
+        ...         input,
+        ...         torch.zeros(1, 1, input.atom_mask.shape[-1], 3),
+        ...         recycling_steps=1,
+        ...     )
+        >>> tuple(score.affinity_pred_value.shape)
+        (1, 1, 1)
+        >>> tuple(score.affinity_probability_binary.shape)
+        (1, 1, 1)
     """
 
     config_class = Boltz2AffinityConfig
@@ -3011,8 +3220,9 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     into a ``FoldResult``.
 
     Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
-    sample, and lifts the confidence head's per-token pLDDT/resolved metrics, token-pair PAE/PDE, and the
-    per-sample pTM/ipTM ranking scores onto values aligned to the layout's token axis.
+    sample, and lifts the confidence head's per-token pLDDT/resolved metrics,
+    token-pair PAE/PDE, and the per-sample complex/design confidence scores onto
+    values aligned to the layout's token axis.
     """
 
     layout = cast(Boltz2Layout, input.layout)
@@ -3048,8 +3258,26 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     # Interface confidence uses iPTM unless every iPTM value is zero, in which case it falls back to pTM.
     # The confidence score combines that interface term with complex pLDDT on the 0-1 scale.
     complex_plddt = output.complex_plddt[0].float().cpu()
+    complex_iplddt = output.complex_iplddt[0].float().cpu()
+    complex_pde = output.complex_pde[0].float().cpu()
+    complex_ipde = output.complex_ipde[0].float().cpu()
     interface = ptm if torch.allclose(iptm, torch.zeros_like(iptm)) else iptm
     confidence_score = (4.0 * complex_plddt + interface) / 5.0
+    has_design = bool(input.design_mask[0].any())
+    design_scores = {
+        "design_to_target_iptm": output.design_to_target_iptm[0].float().cpu(),
+        "design_residue_iptm": output.design_residue_iptm[0].float().cpu(),
+        "design_iptm": output.design_iptm[0].float().cpu(),
+        "design_iiptm": output.design_iiptm[0].float().cpu(),
+        "target_ptm": output.target_ptm[0].float().cpu(),
+        "design_ptm": output.design_ptm[0].float().cpu(),
+        "interaction_pae": output.interaction_pae[0].float().cpu(),
+        "min_interaction_pae": output.min_interaction_pae[0].float().cpu(),
+        "min_design_to_target_pae": output.min_design_to_target_pae[0].float().cpu(),
+        "design_ipsae_min": output.design_ipsae_min[0].float().cpu(),
+        "design_to_target_ipsae": output.design_to_target_ipsae[0].float().cpu(),
+        "target_to_design_ipsae": output.target_to_design_ipsae[0].float().cpu(),
+    }
 
     predictions: list[FoldPrediction] = []
     for sample_index in range(num_samples):
@@ -3063,17 +3291,35 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
             coordinates=complete_coordinates,
             coordinate_mask=coordinate_mask,
         )
+        scores = {
+            "plddt": Score(float(complex_plddt[sample_index]) * 100.0, preferred="higher"),
+            "ptm": Score(float(ptm[sample_index]), preferred="higher"),
+            "iptm": Score(float(iptm[sample_index]), preferred="higher"),
+            "ligand_iptm": Score(float(ligand_iptm[sample_index]), preferred="higher"),
+            "protein_iptm": Score(float(protein_iptm[sample_index]), preferred="higher"),
+            "confidence_score": Score(float(confidence_score[sample_index]), preferred="higher"),
+            "complex_iplddt": Score(float(complex_iplddt[sample_index]), preferred="higher"),
+            "complex_pde": Score(float(complex_pde[sample_index]), unit="angstrom", preferred="lower"),
+            "complex_ipde": Score(float(complex_ipde[sample_index]), unit="angstrom", preferred="lower"),
+        }
+        if has_design:
+            for name, values in design_scores.items():
+                if name in {
+                    "interaction_pae",
+                    "min_interaction_pae",
+                    "min_design_to_target_pae",
+                }:
+                    scores[name] = Score(
+                        float(values[sample_index]),
+                        unit="angstrom",
+                        preferred="lower",
+                    )
+                else:
+                    scores[name] = Score(float(values[sample_index]), preferred="higher")
         predictions.append(
             FoldPrediction(
                 structure=structure,
-                scores={
-                    "plddt": Score(float(complex_plddt[sample_index]) * 100.0, preferred="higher"),
-                    "ptm": Score(float(ptm[sample_index]), preferred="higher"),
-                    "iptm": Score(float(iptm[sample_index]), preferred="higher"),
-                    "ligand_iptm": Score(float(ligand_iptm[sample_index]), preferred="higher"),
-                    "protein_iptm": Score(float(protein_iptm[sample_index]), preferred="higher"),
-                    "confidence_score": Score(float(confidence_score[sample_index]), preferred="higher"),
-                },
+                scores=scores,
                 metrics={
                     "plddt": Metric(values=plddt_fraction[sample_index].numpy() * 100.0, axis=token_axis),
                     "resolved_probability": Metric(values=resolved_probability[sample_index].numpy(), axis=token_axis),
@@ -3168,10 +3414,31 @@ def _boltz2_confidence_values(
         dtype=token_pair_mask.dtype,
     )
     token_pair_mask = token_pair_mask * (1 - diagonal)
-    token_pair_mask = token_pair_mask * predicted_contact
-    complex_pde = (pde * token_pair_mask).sum(dim=(-2, -1)) / token_pair_mask.sum(dim=(-2, -1))
-    interface_pair_mask = token_pair_mask * different_chain
+    contact_pair_mask = token_pair_mask * predicted_contact
+    complex_pde = (pde * contact_pair_mask).sum(dim=(-2, -1)) / contact_pair_mask.sum(dim=(-2, -1))
+    interface_pair_mask = contact_pair_mask * different_chain
     complex_ipde = (pde * interface_pair_mask).sum(dim=(-2, -1)) / interface_pair_mask.sum(dim=(-2, -1)).add(1e-5)
+
+    design_mask = input.design_mask[:, None].to(device=coordinates.device, dtype=torch.bool)
+    chain_design_mask = input.chain_design_mask[:, None].to(device=coordinates.device, dtype=torch.bool)
+    target_mask = ~chain_design_mask
+    chain_design_target_mask = token_pair_mask.bool() & (
+        (chain_design_mask.unsqueeze(-1) & target_mask.unsqueeze(-2))
+        | (target_mask.unsqueeze(-1) & chain_design_mask.unsqueeze(-2))
+    )
+    min_interaction_pae = pae.masked_fill(~chain_design_target_mask, 100000.0).amin(dim=(-2, -1))
+    design_target_mask = token_pair_mask.bool() & (
+        (design_mask.unsqueeze(-1) & target_mask.unsqueeze(-2))
+        | (target_mask.unsqueeze(-1) & design_mask.unsqueeze(-2))
+    )
+    interaction_pae = (pae * design_target_mask).sum(dim=(-2, -1)) / design_target_mask.sum(dim=(-2, -1)).add(1e-5)
+    min_design_to_target_pae = pae.masked_fill(~design_target_mask, 100000.0).amin(dim=(-2, -1))
+    has_design = design_mask.any(dim=-1)
+    min_design_to_target_pae = torch.where(
+        has_design,
+        min_design_to_target_pae,
+        min_design_to_target_pae.new_full(min_design_to_target_pae.shape, torch.nan),
+    )
 
     ptm_scores = _boltz2_ptm_scores(
         pae_logits.flatten(0, 1),
@@ -3192,6 +3459,18 @@ def _boltz2_confidence_values(
         "iptm": ptm_scores["iptm"].reshape(batch_size, num_samples),
         "ligand_iptm": ptm_scores["ligand_iptm"].reshape(batch_size, num_samples),
         "protein_iptm": ptm_scores["protein_iptm"].reshape(batch_size, num_samples),
+        "design_to_target_iptm": ptm_scores["design_to_target_iptm"].reshape(batch_size, num_samples),
+        "design_residue_iptm": ptm_scores["design_residue_iptm"].reshape(batch_size, num_samples),
+        "design_iptm": ptm_scores["design_iptm"].reshape(batch_size, num_samples),
+        "design_iiptm": ptm_scores["design_iiptm"].reshape(batch_size, num_samples),
+        "target_ptm": ptm_scores["target_ptm"].reshape(batch_size, num_samples),
+        "design_ptm": ptm_scores["design_ptm"].reshape(batch_size, num_samples),
+        "interaction_pae": interaction_pae,
+        "min_interaction_pae": min_interaction_pae,
+        "min_design_to_target_pae": min_design_to_target_pae,
+        "design_ipsae_min": ptm_scores["design_ipsae_min"].reshape(batch_size, num_samples),
+        "design_to_target_ipsae": ptm_scores["design_to_target_ipsae"].reshape(batch_size, num_samples),
+        "target_to_design_ipsae": ptm_scores["target_to_design_ipsae"].reshape(batch_size, num_samples),
         "pair_chains_iptm": ptm_scores["pair_chains_iptm"].reshape(
             batch_size,
             num_samples,
@@ -3246,6 +3525,29 @@ def _boltz2_ptm_scores(
         is_ligand[:, :, None] * is_protein[:, None, :] + is_protein[:, :, None] * is_ligand[:, None, :]
     )
     protein_mask = pair_mask_iptm * (is_protein[:, :, None] * is_protein[:, None, :])
+
+    design_mask = input.design_mask.bool()
+    has_design = design_mask.any(dim=-1, keepdim=True)
+    chain_design_mask = torch.where(has_design, input.chain_design_mask.bool(), design_mask)
+    target_mask = ~chain_design_mask
+    design_mask = design_mask.repeat_interleave(multiplicity, 0)
+    chain_design_mask = chain_design_mask.repeat_interleave(multiplicity, 0)
+    target_mask = target_mask.repeat_interleave(multiplicity, 0)
+    design_iptm_mask = pair_mask_ptm * (
+        (chain_design_mask[:, :, None] & target_mask[:, None, :])
+        | (target_mask[:, :, None] & chain_design_mask[:, None, :])
+    ).to(pae_logits)
+    design_to_target_iptm_mask = pair_mask_ptm * (
+        (design_mask[:, :, None] & target_mask[:, None, :]) | (target_mask[:, :, None] & design_mask[:, None, :])
+    ).to(pae_logits)
+    design_residue_iptm_mask = (
+        pair_mask_ptm
+        * (chain_index[:, :, None] != chain_index[:, None, :]).to(pae_logits)
+        * (design_mask[:, :, None].to(pae_logits) + design_mask[:, None, :].to(pae_logits)).clamp(max=1)
+    )
+    design_ptm_mask = pair_mask_ptm * (chain_design_mask[:, :, None] & chain_design_mask[:, None, :]).to(pae_logits)
+    target_ptm_mask = pair_mask_ptm * (target_mask[:, :, None] & target_mask[:, None, :]).to(pae_logits)
+
     num_chains = int(input.chain_index.max().item()) + 1
     pair_chains_iptm = tm_expected.new_zeros(
         tm_expected.shape[0],
@@ -3263,13 +3565,112 @@ def _boltz2_ptm_scores(
             )
             pair_chains_iptm[:, chain_a, chain_b] = aggregate(chain_pair_mask)
 
+    interaction_mask = _boltz2_design_interaction_mask(
+        coordinates,
+        input=input,
+        multiplicity=multiplicity,
+        chain_design_mask=chain_design_mask,
+    )
+    design_iiptm_mask = pair_mask_ptm * (
+        (interaction_mask[:, :, None] & target_mask[:, None, :])
+        | (target_mask[:, :, None] & interaction_mask[:, None, :])
+    ).to(pae_logits)
+
+    expected_pae = (pae_logits.softmax(dim=-1) * pae_value).sum(dim=-1)
+    design_to_target_ipsae = _boltz2_ipsae_score(
+        chain_design_mask,
+        target_mask,
+        expected_pae,
+        frame_mask,
+        token_mask,
+    )
+    target_to_design_ipsae = _boltz2_ipsae_score(
+        target_mask,
+        chain_design_mask,
+        expected_pae,
+        frame_mask,
+        token_mask,
+    )
+
     return {
         "ptm": aggregate(pair_mask_ptm),
         "iptm": aggregate(pair_mask_iptm),
         "ligand_iptm": aggregate(ligand_mask),
         "protein_iptm": aggregate(protein_mask),
+        "design_to_target_iptm": aggregate(design_to_target_iptm_mask),
+        "design_residue_iptm": aggregate(design_residue_iptm_mask),
+        "design_iptm": aggregate(design_iptm_mask),
+        "design_iiptm": aggregate(design_iiptm_mask),
+        "target_ptm": aggregate(target_ptm_mask),
+        "design_ptm": aggregate(design_ptm_mask),
+        "design_ipsae_min": torch.minimum(design_to_target_ipsae, target_to_design_ipsae),
+        "design_to_target_ipsae": design_to_target_ipsae,
+        "target_to_design_ipsae": target_to_design_ipsae,
         "pair_chains_iptm": pair_chains_iptm,
     }
+
+
+def _boltz2_design_interaction_mask(
+    coordinates: Tensor,
+    *,
+    input: Boltz2Input,
+    multiplicity: int,
+    chain_design_mask: Tensor,
+) -> Tensor:
+    r"""
+    Select design tokens with at least one atom within 8 Å of any target atom.
+    """
+
+    atom_to_token = input.atom_to_token.repeat_interleave(multiplicity, 0).long()
+    atom_mask = input.atom_mask.repeat_interleave(multiplicity, 0).bool()
+    atom_chain_design_mask = chain_design_mask.gather(1, atom_to_token) & atom_mask
+    interaction_mask = chain_design_mask.new_zeros(chain_design_mask.shape)
+    for sample_index in range(coordinates.shape[0]):
+        design_atoms = atom_chain_design_mask[sample_index]
+        target_atoms = atom_mask[sample_index] & ~design_atoms
+        if design_atoms.any() and target_atoms.any():
+            interacting_atoms = (
+                torch.cdist(
+                    coordinates[sample_index, design_atoms],
+                    coordinates[sample_index, target_atoms],
+                ).amin(dim=-1)
+                < 8
+            )
+            interacting_tokens = atom_to_token[sample_index, design_atoms][interacting_atoms]
+            interaction_mask[sample_index].scatter_(
+                0,
+                interacting_tokens,
+                torch.ones_like(interacting_tokens, dtype=torch.bool),
+            )
+    return interaction_mask
+
+
+def _boltz2_ipsae_score(
+    source_mask: Tensor,
+    target_mask: Tensor,
+    pae: Tensor,
+    frame_mask: Tensor,
+    token_mask: Tensor,
+    cutoff: float = 15.0,
+) -> Tensor:
+    r"""
+    Compute the directional iPSAE score.
+    """
+
+    pair_mask = (
+        frame_mask.unsqueeze(-1)
+        * token_mask.unsqueeze(-2)
+        * token_mask.unsqueeze(-1)
+        * source_mask.unsqueeze(-1).to(pae)
+        * target_mask.unsqueeze(-2).to(pae)
+    )
+    valid_pae = (pae < cutoff).to(pae) * pair_mask
+    num_valid = valid_pae.sum(dim=-1)
+    d0 = 1.24 * (num_valid.clamp(min=19) - 15).pow(1.0 / 3.0) - 1.8
+    d0 = d0.clamp(min=1.0)
+    terms = 1.0 / (1.0 + (pae / d0.unsqueeze(-1)).square())
+    per_source = (terms * valid_pae).sum(dim=-1) / (num_valid + 1e-5)
+    return (per_source * source_mask.to(per_source)).max(dim=-1).values
 
 
 def _boltz2_predicted_frame_mask(
@@ -3284,9 +3685,13 @@ def _boltz2_predicted_frame_mask(
 
     if input.frame_atom_index is None:
         raise ValueError("Boltz-2 confidence requires token frame atom indices")
-    frame_index = input.frame_atom_index.repeat_interleave(multiplicity, 0).to(
-        device=coordinates.device,
-        dtype=torch.long,
+    frame_index = (
+        input.frame_atom_index.repeat_interleave(multiplicity, 0)
+        .to(
+            device=coordinates.device,
+            dtype=torch.long,
+        )
+        .clone()
     )
     molecule_type = input.molecule_type.to(device=coordinates.device)
     chain_index = input.chain_index.to(device=coordinates.device)
@@ -4739,6 +5144,10 @@ class Boltz2Input:
         connected_atom_index: Atom pairs joined by assembly bonds.
         symmetric_chain_index: Same-entity chain-copy pairs.
         molecule_type: Molecule type ids in the model vocabulary.
+        design_mask: Boolean mask selecting the exact canonical component
+            occurrences designed by the calling protocol, with shape ``(B, N)``.
+        chain_design_mask: Boolean mask selecting complete chains in the
+            covalently connected design component, with shape ``(B, N)``.
         frame_atom_index: Optional frame atom indices for frame-aligned losses.
         method_feature: Optional experimental-method ids.
         modified: Optional modified-residue flags.
@@ -4810,6 +5219,8 @@ class Boltz2Input:
     connected_atom_index: Tensor
     symmetric_chain_index: Tensor
     molecule_type: Tensor
+    design_mask: Tensor
+    chain_design_mask: Tensor
     frame_atom_index: Tensor | None = None
     method_feature: Tensor | None = None
     modified: Tensor | None = None
@@ -4848,6 +5259,20 @@ class _Boltz2TrunkOutput:
     pair: Tensor
     distogram_logits: Tensor
     relative_position_encoding: Tensor
+
+
+@dataclass(kw_only=True, eq=False)
+class Boltz2Representations:
+    r"""
+    Raw Boltz-2 trunk representations surfaced by ``Boltz2Model.representations``.
+
+    Args:
+        single: Trunk single representation `[B, N, single_size]`.
+        pair: Trunk pair representation `[B, N, N, pair_size]`.
+    """
+
+    single: Tensor
+    pair: Tensor
 
 
 @dataclass(eq=False)
@@ -4928,6 +5353,27 @@ class Boltz2ConfidenceOutput:
         protein_iptm: Protein-protein predicted TM score with shape ``(B, S)``.
         pair_chains_iptm: Ordered chain-pair predicted TM scores with shape
             ``(B, S, C, C)``.
+        design_to_target_iptm: Exact designed-component to target predicted TM
+            score with shape ``(B, S)``.
+        design_residue_iptm: Predicted TM score between exact designed residues
+            and tokens in other chains, with shape ``(B, S)``.
+        design_iptm: Predicted TM score between the covalently propagated design
+            component and target, with shape ``(B, S)``.
+        design_iiptm: Predicted TM score between target and the spatially
+            interacting part of the design component, with shape ``(B, S)``.
+        target_ptm: Target-only predicted TM score with shape ``(B, S)``.
+        design_ptm: Design-component-only predicted TM score with shape
+            ``(B, S)``.
+        interaction_pae: Mean expected PAE between exact designed components
+            and target, with shape ``(B, S)``.
+        min_interaction_pae: Minimum expected PAE between the covalently
+            propagated design component and target, with shape ``(B, S)``.
+        min_design_to_target_pae: Minimum expected PAE between exact designed
+            components and target, with shape ``(B, S)``.
+        design_ipsae_min: Minimum of the two directional design/target iPSAE
+            scores with shape ``(B, S)``.
+        design_to_target_ipsae: Design-to-target iPSAE with shape ``(B, S)``.
+        target_to_design_ipsae: Target-to-design iPSAE with shape ``(B, S)``.
     """
 
     coordinates: Tensor
@@ -4950,3 +5396,15 @@ class Boltz2ConfidenceOutput:
     ligand_iptm: Tensor
     protein_iptm: Tensor
     pair_chains_iptm: Tensor
+    design_to_target_iptm: Tensor
+    design_residue_iptm: Tensor
+    design_iptm: Tensor
+    design_iiptm: Tensor
+    target_ptm: Tensor
+    design_ptm: Tensor
+    interaction_pae: Tensor
+    min_interaction_pae: Tensor
+    min_design_to_target_pae: Tensor
+    design_ipsae_min: Tensor
+    design_to_target_ipsae: Tensor
+    target_to_design_ipsae: Tensor

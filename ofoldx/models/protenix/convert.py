@@ -42,6 +42,7 @@ _TEMPLATE_VARIANTS = frozenset(
         "protenix-v2",
     }
 )
+_STRUCTURE_CONDITION_VARIANT = "protenix_mini_tmpl_v0.5.0"
 _INERT_V05_TEMPLATE_KEYS = frozenset(
     {
         "template_embedder.linear_no_bias_z.weight",
@@ -209,7 +210,7 @@ def translate_esm_state(model: nn.Module, reference_state: Mapping[str, Tensor])
     )
 
 
-def convert_protenix_checkpoint(
+def convert_protenix_model(
     checkpoint_path: str | Path,
     *,
     variant: ProtenixVariant,
@@ -228,12 +229,20 @@ def convert_protenix_checkpoint(
         dtype: Optional floating-point dtype for converted weights.
 
     Returns:
-        The converted, strict-loaded `ProtenixModel`. Use `save_protenix_checkpoint` to persist the paired
+        The converted, strict-loaded `ProtenixModel`. Use `convert_protenix_checkpoint` to persist the paired
         model/processor repository locally or on the Hub.
     """
 
-    from .config import ProtenixConfig, ProtenixConstraintConfig
-    from .model import ProtenixConstraintModel, ProtenixModel
+    from .config import (
+        ProtenixConfig,
+        ProtenixConstraintConfig,
+        ProtenixStructureConditionConfig,
+    )
+    from .model import (
+        ProtenixConstraintModel,
+        ProtenixModel,
+        ProtenixStructureConditionModel,
+    )
 
     needs_esm = variant in _ESM_VARIANTS
     if needs_esm and esm_checkpoint_path is None:
@@ -246,6 +255,8 @@ def convert_protenix_checkpoint(
     with torch.device("meta"):
         if variant == "protenix_base_constraint_v0.5.0":
             model = ProtenixConstraintModel(cast(ProtenixConstraintConfig, config))
+        elif variant == _STRUCTURE_CONDITION_VARIANT:
+            model = ProtenixStructureConditionModel(cast(ProtenixStructureConditionConfig, config))
         else:
             model = ProtenixModel(config)
     reference_state = load_reference_state(Path(checkpoint_path))
@@ -266,7 +277,7 @@ def convert_protenix_checkpoint(
     return model
 
 
-def save_protenix_checkpoint(
+def convert_protenix_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -287,21 +298,38 @@ def save_protenix_checkpoint(
     ``repo_id``.
     """
 
-    from .model import ProtenixConstraintModel
-    from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline, ProtenixTemplatePipeline
-    from .processor import ProtenixConstraintProcessor, ProtenixProcessor, ProtenixTemplateProcessor
+    from .model import ProtenixConstraintModel, ProtenixStructureConditionModel
+    from .pipeline import (
+        ProtenixConstraintPipeline,
+        ProtenixPipeline,
+        ProtenixStructureConditionPipeline,
+        ProtenixTemplatePipeline,
+    )
+    from .processor import (
+        ProtenixConstraintProcessor,
+        ProtenixProcessor,
+        ProtenixStructureConditionProcessor,
+        ProtenixTemplateProcessor,
+    )
 
-    model = convert_protenix_checkpoint(
+    model = convert_protenix_model(
         Path(checkpoint_path).expanduser(),
         variant=variant,
         esm_checkpoint_path=None if esm_checkpoint_path is None else Path(esm_checkpoint_path).expanduser(),
         dtype=dtype,
     )
-    pipeline: ProtenixPipeline | ProtenixTemplatePipeline | ProtenixConstraintPipeline
+    pipeline: (
+        ProtenixPipeline | ProtenixTemplatePipeline | ProtenixStructureConditionPipeline | ProtenixConstraintPipeline
+    )
     if variant == "protenix_base_constraint_v0.5.0":
         pipeline = ProtenixConstraintPipeline(
             model=cast(ProtenixConstraintModel, model),
             processor=ProtenixConstraintProcessor(dtype=dtype),
+        )
+    elif variant == _STRUCTURE_CONDITION_VARIANT:
+        pipeline = ProtenixStructureConditionPipeline(
+            model=cast(ProtenixStructureConditionModel, model),
+            processor=ProtenixStructureConditionProcessor(dtype=dtype),
         )
     elif variant in _TEMPLATE_VARIANTS:
         pipeline = ProtenixTemplatePipeline(
@@ -349,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    save_protenix_checkpoint(
+    convert_protenix_checkpoint(
         args.checkpoint,
         args.output_dir,
         variant=args.variant,
@@ -402,6 +430,20 @@ def _esm_reference_key(model_key: str) -> _ReferenceKey:
 
 
 def _protenix_reference_key(model_key: str, *, msa_final_block: int) -> _ReferenceKey:
+    if model_key.startswith("noisy_structure_embedder."):
+        return _replace_many(
+            model_key,
+            {
+                ".lower_bins": ".bins",
+                ".structure_projection.": ".linear_struct.",
+                ".pair_norm.": ".layernorm_z.",
+                ".pair_projection.": ".linear_z.",
+                ".transition.input_norm.": ".transition_out.layernorm1.",
+                ".transition.feed_forward.gate_projection.": ".transition_out.linear_no_bias_a.",
+                ".transition.feed_forward.value_projection.": ".transition_out.linear_no_bias_b.",
+                ".transition.feed_forward.output_projection.": ".transition_out.linear_no_bias.",
+            },
+        )
     if model_key.startswith("msa_trunk.final_pair_update."):
         model_key = f"msa_trunk.blocks.{msa_final_block}." + model_key.removeprefix("msa_trunk.final_pair_update.")
     if model_key.startswith("constraint_embeddings."):

@@ -40,6 +40,77 @@ class EsmFold2Model(Model):
         config: Model architecture and inference configuration.
         esmc: Frozen ESMC language-model trunk. ``None`` initializes one from
             ``config.esmc``.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence, get_component
+        >>> from ofoldx.models.esmfold2 import EsmFold2Config, EsmFold2Model, EsmFold2Processor
+        >>> sequence = PolymerSequence("protein", (get_component("GLY"),))
+        >>> input = EsmFold2Processor()(sequence)
+        >>> config = EsmFold2Config(
+        ...     {
+        ...         "single_size": 16,
+        ...         "pair_size": 16,
+        ...         "recycling_steps": 1,
+        ...         "input_embeddings": {
+        ...             "input_size": 75,
+        ...             "atom_encoder": {
+        ...                 "atom_hidden_size": 8,
+        ...                 "token_hidden_size": 8,
+        ...                 "num_blocks": 1,
+        ...                 "num_attention_heads": 1,
+        ...                 "sliding_window_size": 8,
+        ...                 "num_spatial_rope_pairs_per_axis": 1,
+        ...                 "num_reference_space_rope_pairs": 1,
+        ...             },
+        ...         },
+        ...         "esmc": {
+        ...             "hidden_size": 8,
+        ...             "num_hidden_layers": 1,
+        ...             "num_attention_heads": 1,
+        ...             "intermediate_size": 16,
+        ...             "max_position_embeddings": 16,
+        ...         },
+        ...         "language_model_encoder": {"enabled": False, "dropout": 0.0},
+        ...         "msa_encoder": {"enabled": False},
+        ...         "folding_trunk": {"num_blocks": 1},
+        ...         "parcae": {"num_coda_blocks": 0},
+        ...         "diffusion_structure_head": {
+        ...             "num_distogram_bins": 4,
+        ...             "denoiser": {
+        ...                 "atom_hidden_size": 8,
+        ...                 "token_hidden_size": 8,
+        ...                 "pair_size": 16,
+        ...                 "input_size": 75,
+        ...                 "fourier_embedding_size": 8,
+        ...                 "num_atom_blocks": 1,
+        ...                 "num_atom_attention_heads": 1,
+        ...                 "num_token_encoder_blocks": 1,
+        ...                 "num_token_encoder_attention_heads": 1,
+        ...             },
+        ...         },
+        ...         "confidence": {
+        ...             "num_plddt_bins": 4,
+        ...             "num_pde_bins": 4,
+        ...             "num_pae_bins": 4,
+        ...             "num_distogram_bins": 4,
+        ...             "folding_trunk": {"num_blocks": 1},
+        ...         },
+        ...     }
+        ... )
+        >>> coordinates = torch.zeros_like(input.reference_positions).unsqueeze(1)
+        >>> model = EsmFold2Model(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(
+        ...         input,
+        ...         noisy_coordinates=coordinates,
+        ...         noise_level=torch.ones(1, 1),
+        ...         msa_subsample_at_inference=False,
+        ...     )
+        >>> tuple(output.coordinates.shape)
+        (1, 1, 32, 3)
+        >>> tuple(output.distogram_logits.shape)
+        (1, 1, 1, 4)
     """
 
     config_class = EsmFold2Config
@@ -979,14 +1050,83 @@ class EsmFold2ExperimentalModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
-        esmc: Frozen ESMC trunk or masked-language model. The masked-language-model
-            head is required when binder design uses a nonzero language-model weight.
+        esmc: Frozen ESMC masked-language model. ``None`` initializes the complete
+            child graph from ``config.esmc``.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence, get_component
+        >>> from ofoldx.models.esmfold2 import (
+        ...     EsmFold2ExperimentalConfig,
+        ...     EsmFold2ExperimentalModel,
+        ...     EsmFold2ExperimentalProcessor,
+        ... )
+        >>> sequence = PolymerSequence("protein", (get_component("GLY"),))
+        >>> input = EsmFold2ExperimentalProcessor()(sequence)
+        >>> config = EsmFold2ExperimentalConfig(
+        ...     {
+        ...         "single_size": 16,
+        ...         "pair_size": 16,
+        ...         "recycling_steps": 1,
+        ...         "input_embeddings": {
+        ...             "input_size": 75,
+        ...             "atom_encoder": {
+        ...                 "atom_hidden_size": 8,
+        ...                 "token_hidden_size": 8,
+        ...                 "num_blocks": 1,
+        ...                 "num_attention_heads": 1,
+        ...                 "sliding_window_size": 8,
+        ...                 "num_spatial_rope_pairs_per_axis": 1,
+        ...                 "num_reference_space_rope_pairs": 1,
+        ...             },
+        ...         },
+        ...         "esmc": {
+        ...             "hidden_size": 8,
+        ...             "num_hidden_layers": 1,
+        ...             "num_attention_heads": 1,
+        ...             "intermediate_size": 16,
+        ...             "max_position_embeddings": 16,
+        ...         },
+        ...         "msa_encoder": {"enabled": False},
+        ...         "folding_trunk": {"num_blocks": 1},
+        ...         "diffusion_structure_head": {
+        ...             "num_distogram_bins": 4,
+        ...             "denoiser": {
+        ...                 "atom_hidden_size": 8,
+        ...                 "token_hidden_size": 8,
+        ...                 "pair_size": 16,
+        ...                 "input_size": 75,
+        ...                 "fourier_embedding_size": 8,
+        ...                 "num_atom_blocks": 1,
+        ...                 "num_atom_attention_heads": 1,
+        ...                 "num_token_encoder_blocks": 1,
+        ...                 "num_token_encoder_attention_heads": 1,
+        ...             },
+        ...         },
+        ...         "confidence": {
+        ...             "num_plddt_bins": 4,
+        ...             "num_pae_bins": 4,
+        ...             "num_distogram_bins": 4,
+        ...             "folding_trunk": {"num_blocks": 1},
+        ...         },
+        ...     }
+        ... )
+        >>> model = EsmFold2ExperimentalModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     logits = model(input, recycling_steps=1)
+        >>> tuple(logits.shape)
+        (1, 1, 1, 4)
     """
 
     config_class = EsmFold2ExperimentalConfig
     config: EsmFold2ExperimentalConfig
 
-    def __init__(self, config: EsmFold2ExperimentalConfig | None = None, *, esmc: EsmCModel | None = None) -> None:
+    def __init__(
+        self,
+        config: EsmFold2ExperimentalConfig | None = None,
+        *,
+        esmc: EsmCForMaskedLM | None = None,
+    ) -> None:
         config = EsmFold2ExperimentalConfig() if config is None else config
         super().__init__(config)
         self._recycling_steps = config.recycling_steps
@@ -1009,10 +1149,17 @@ class EsmFold2ExperimentalModel(Model):
         )
         self.bond_projection = nn.Linear(1, pair_size, bias=False)
 
-        self.esmc: EsmCModel | None = None
-        self.esmc_lm_head: nn.Module | None = None
-        if esmc is not None:
-            self.load_esmc(esmc)
+        if esmc is None:
+            esmc = EsmCForMaskedLM(EsmCConfig(**dict(config.esmc.dict())))
+        lm_head = esmc.lm_head
+        # The head's forward reads ``lm_head.bias`` directly; keep that canonical
+        # parameter and remove only the duplicate Linear registration.
+        lm_head.decoder.bias = None
+        lm_head.requires_grad_(False)
+        self.esmc_lm_head = lm_head.eval()
+        trunk = esmc.model
+        trunk.requires_grad_(False)
+        self.esmc = trunk.eval()
         self.language_model_pair_encoder = EsmFold2LanguageModelPairEncoder(
             pair_size,
             config.esmc.hidden_size,
@@ -1056,28 +1203,6 @@ class EsmFold2ExperimentalModel(Model):
             EsmFold2ExperimentalConfidenceHead(config) if config.confidence.enabled else None
         )
         self.post_init()
-
-    def load_esmc(self, esmc: EsmCModel | EsmCForMaskedLM) -> EsmCModel:
-        r"""
-        Attach a frozen ESMC model.
-
-        Args:
-            esmc: ESMC trunk or masked-language model. For a masked-language model, the
-                trunk supplies folding features and the language-model head remains
-                available to binder-design objectives.
-
-        Returns:
-            The attached ESMC trunk in evaluation mode.
-        """
-
-        if isinstance(esmc, EsmCForMaskedLM):
-            lm_head = esmc.lm_head
-            lm_head.requires_grad_(False)
-            self.esmc_lm_head = lm_head.eval()
-            esmc = esmc.model
-        esmc.requires_grad_(False)
-        self.esmc = esmc.eval()
-        return self.esmc
 
     def configure_language_model_dropout(self, dropout: float, *, force_during_inference: bool = True) -> None:
         r"""
@@ -1189,8 +1314,6 @@ class EsmFold2ExperimentalModel(Model):
 
         esmc_hidden_states = input.esmc_hidden_states
         if esmc_hidden_states is None:
-            if self.esmc is None:
-                raise RuntimeError("ESMFold2 experimental requires an attached ESMC (call load_esmc)")
             if input.language_model_tokens is None or input.language_model_mask is None or input.token_to_esmc is None:
                 raise RuntimeError("ESMFold2 experimental requires ESMC inputs or esmc_hidden_states")
             with torch.no_grad():
@@ -1267,7 +1390,7 @@ class EsmFold2ExperimentalModel(Model):
         input: EsmFold2Input,
         trunk: _EsmFold2ExperimentalTrunkOutput,
         *,
-        num_diffusion_samples: int,
+        num_samples: int,
         num_sampling_steps: int | None,
         max_inference_sigma: float | None,
         noise_scale: float | None,
@@ -1286,7 +1409,7 @@ class EsmFold2ExperimentalModel(Model):
             reference_space_id=input.reference_space_id,
             atom_to_token=trunk.atom_to_token,
             token_mask=input.token_mask,
-            num_diffusion_samples=num_diffusion_samples,
+            num_diffusion_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             max_inference_sigma=max_inference_sigma,
             noise_scale=noise_scale,
@@ -1294,9 +1417,11 @@ class EsmFold2ExperimentalModel(Model):
             return_atom_representations=False,
             generator=generator,
         )
+        coordinates = cast(Tensor, structure_output["coordinates"])
+        batch_size = input.token_mask.shape[0]
         return EsmFold2ExperimentalSample(
             distogram_logits=trunk.distogram_logits,
-            coordinates=cast(Tensor, structure_output["coordinates"]),
+            coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
         )
 
     def _confidence_from_trunk(
@@ -1304,8 +1429,6 @@ class EsmFold2ExperimentalModel(Model):
         input: EsmFold2Input,
         trunk: _EsmFold2ExperimentalTrunkOutput,
         sample: EsmFold2ExperimentalSample,
-        *,
-        num_diffusion_samples: int,
     ) -> EsmFold2ExperimentalConfidence:
         confidence_head = self.confidence_head
         if confidence_head is None:
@@ -1325,7 +1448,6 @@ class EsmFold2ExperimentalModel(Model):
             molecule_type=input.molecule_type,
             relative_position_encoding=trunk.relative_position_encoding,
             token_bonds_encoding=trunk.token_bonds_encoding,
-            num_diffusion_samples=num_diffusion_samples,
         )
 
     def forward(
@@ -1335,7 +1457,6 @@ class EsmFold2ExperimentalModel(Model):
         residue_type_probabilities: Tensor | None = None,
         recycling_steps: int | None = None,
         language_model_mask_probability: float = 0.0,
-        seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
@@ -1352,17 +1473,11 @@ class EsmFold2ExperimentalModel(Model):
                 configured value.
             language_model_mask_probability: Probability of masking each nonspecial
                 language-model token.
-            seed: Integer seed, mutually exclusive with ``generator``.
-            generator: PyTorch random generator, mutually exclusive with ``seed``.
+            generator: Caller-owned PyTorch random generator.
 
         Returns:
             Distogram logits with shape ``(B, N, N, D)``.
         """
-
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
-        if generator is None and seed is not None:
-            generator = torch.Generator(device=input.reference_positions.device).manual_seed(seed)
 
         trunk = self._encode_and_trunk(
             input,
@@ -1379,13 +1494,12 @@ class EsmFold2ExperimentalModel(Model):
         *,
         residue_type_probabilities: Tensor | None = None,
         recycling_steps: int | None = None,
-        num_diffusion_samples: int | None = None,
+        num_samples: int = 1,
         num_sampling_steps: int | None = None,
         language_model_mask_probability: float = 0.0,
         max_inference_sigma: float | None = 256.0,
         noise_scale: float | None = None,
         step_scale: float | None = None,
-        seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> EsmFold2ExperimentalSample:
         r"""
@@ -1397,7 +1511,7 @@ class EsmFold2ExperimentalModel(Model):
                 shape ``(B, N, 33)``.
             recycling_steps: Number of recurrent trunk passes. ``None`` uses the
                 configured value.
-            num_diffusion_samples: Number of coordinate samples. ``None`` means one.
+            num_samples: Number of coordinate samples.
             num_sampling_steps: Number of diffusion sampling steps. ``None`` uses the
                 configured value.
             language_model_mask_probability: Probability of masking each nonspecial
@@ -1406,18 +1520,11 @@ class EsmFold2ExperimentalModel(Model):
                 keeps the full schedule.
             noise_scale: Sampler noise multiplier. ``None`` uses the configured value.
             step_scale: Sampler step-size multiplier. ``None`` uses the configured value.
-            seed: Integer seed, mutually exclusive with ``generator``.
-            generator: PyTorch random generator, mutually exclusive with ``seed``.
+            generator: Caller-owned PyTorch random generator.
 
         Returns:
             Distogram logits and sampled atom coordinates.
         """
-
-        num_samples = 1 if num_diffusion_samples is None else num_diffusion_samples
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
-        if generator is None and seed is not None:
-            generator = torch.Generator(device=input.reference_positions.device).manual_seed(seed)
 
         trunk = self._encode_and_trunk(
             input,
@@ -1429,7 +1536,7 @@ class EsmFold2ExperimentalModel(Model):
         return self._sample_from_trunk(
             input,
             trunk,
-            num_diffusion_samples=num_samples,
+            num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             max_inference_sigma=max_inference_sigma,
             noise_scale=noise_scale,
@@ -1443,13 +1550,12 @@ class EsmFold2ExperimentalModel(Model):
         *,
         residue_type_probabilities: Tensor | None = None,
         recycling_steps: int | None = None,
-        num_diffusion_samples: int | None = None,
+        num_samples: int = 1,
         num_sampling_steps: int | None = None,
         language_model_mask_probability: float = 0.0,
         max_inference_sigma: float | None = 256.0,
         noise_scale: float | None = None,
         step_scale: float | None = None,
-        seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> EsmFold2ExperimentalPrediction:
         r"""
@@ -1461,7 +1567,7 @@ class EsmFold2ExperimentalModel(Model):
                 shape ``(B, N, 33)``.
             recycling_steps: Number of recurrent trunk passes. ``None`` uses the
                 configured value.
-            num_diffusion_samples: Number of coordinate samples. ``None`` means one.
+            num_samples: Number of coordinate samples.
             num_sampling_steps: Number of diffusion sampling steps. ``None`` uses the
                 configured value.
             language_model_mask_probability: Probability of masking each nonspecial
@@ -1470,18 +1576,11 @@ class EsmFold2ExperimentalModel(Model):
                 keeps the full schedule.
             noise_scale: Sampler noise multiplier. ``None`` uses the configured value.
             step_scale: Sampler step-size multiplier. ``None`` uses the configured value.
-            seed: Integer seed, mutually exclusive with ``generator``.
-            generator: PyTorch random generator, mutually exclusive with ``seed``.
+            generator: Caller-owned PyTorch random generator.
 
         Returns:
-            One coordinate sample carrier and its fixed confidence values.
+            A coordinate-sample carrier and its fixed confidence values.
         """
-
-        num_samples = 1 if num_diffusion_samples is None else num_diffusion_samples
-        if seed is not None and generator is not None:
-            raise ValueError("seed and generator are mutually exclusive")
-        if generator is None and seed is not None:
-            generator = torch.Generator(device=input.reference_positions.device).manual_seed(seed)
 
         trunk = self._encode_and_trunk(
             input,
@@ -1493,7 +1592,7 @@ class EsmFold2ExperimentalModel(Model):
         sample = self._sample_from_trunk(
             input,
             trunk,
-            num_diffusion_samples=num_samples,
+            num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
             max_inference_sigma=max_inference_sigma,
             noise_scale=noise_scale,
@@ -1504,7 +1603,6 @@ class EsmFold2ExperimentalModel(Model):
             input,
             trunk,
             sample,
-            num_diffusion_samples=num_samples,
         )
         return EsmFold2ExperimentalPrediction(sample=sample, confidence=confidence)
 
@@ -3411,7 +3509,14 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         if second_coordinates is not None:
             second_coordinates = torch.einsum("bmd,bds->bms", second_coordinates, rotation)
 
-        translation = torch.randn_like(coordinates[:, 0:1, :], generator=generator)
+        translation = torch.randn(
+            coordinates.shape[0],
+            1,
+            coordinates.shape[-1],
+            dtype=coordinates.dtype,
+            device=coordinates.device,
+            generator=generator,
+        )
         coordinates = coordinates + translation
         if second_coordinates is not None:
             second_coordinates = second_coordinates + translation
@@ -3539,7 +3644,13 @@ class EsmFold2DiffusionStructureHead(nn.Module):
             current_noise = float(current_noise_level.item())
             augmented_noise = current_noise * (1.0 + float(churn_rate.item()))
             churn_noise_std = applied_noise_scale * max(augmented_noise**2 - current_noise**2, 0.0) ** 0.5
-            noisy_coordinates = coordinates + churn_noise_std * torch.randn_like(coordinates, generator=generator)
+            churn_noise = torch.randn(
+                coordinates.shape,
+                dtype=coordinates.dtype,
+                device=coordinates.device,
+                generator=generator,
+            )
+            noisy_coordinates = coordinates + churn_noise_std * churn_noise
 
             is_last_step = step_index == num_steps - 1
             request_atom_representations = return_atom_representations and (
@@ -3893,8 +4004,8 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         self.pae_projection = nn.Linear(pair_size, confidence_config.num_pae_bins, bias=False)
 
     @staticmethod
-    def _repeat_batch(x: Tensor, num_diffusion_samples: int) -> Tensor:
-        return x if num_diffusion_samples == 1 else x.repeat_interleave(num_diffusion_samples, 0)
+    def _repeat_batch(x: Tensor, num_samples: int) -> Tensor:
+        return x if num_samples == 1 else x.repeat_interleave(num_samples, 0)
 
     def forward(
         self,
@@ -3909,8 +4020,9 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         molecule_type: Tensor,
         relative_position_encoding: Tensor,
         token_bonds_encoding: Tensor,
-        num_diffusion_samples: int = 1,
     ) -> EsmFold2ExperimentalConfidence:
+        batch_size, num_samples = coordinates.shape[:2]
+        coordinates = coordinates.flatten(0, 1)
         normalized_single_inputs = self.input_norm(single_inputs)
 
         base_pair = self.pair_norm(pair)
@@ -3922,12 +4034,12 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             * self.right_product_projection(normalized_single_inputs)[:, None, :, :]
         )
 
-        pair = self._repeat_batch(base_pair, num_diffusion_samples)
-        expanded_atom_to_token = self._repeat_batch(atom_to_token, num_diffusion_samples)
-        expanded_atom_mask = self._repeat_batch(atom_mask, num_diffusion_samples)
-        expanded_representative_atom_index = self._repeat_batch(distogram_atom_index, num_diffusion_samples).long()
-        expanded_token_mask = self._repeat_batch(token_mask, num_diffusion_samples)
-        batch_size = pair.shape[0]
+        pair = self._repeat_batch(base_pair, num_samples)
+        expanded_atom_to_token = self._repeat_batch(atom_to_token, num_samples)
+        expanded_atom_mask = self._repeat_batch(atom_mask, num_samples)
+        expanded_representative_atom_index = self._repeat_batch(distogram_atom_index, num_samples).long()
+        expanded_token_mask = self._repeat_batch(token_mask, num_samples)
+        flat_batch_size = pair.shape[0]
 
         representative_coordinates = _gather_representative_atom_coordinates(
             coordinates,
@@ -3960,8 +4072,8 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         plddt_per_atom = _categorical_mean(plddt_logits, start=0.0, end=1.0)
 
         num_tokens = single.shape[1]
-        plddt_sum = torch.zeros(batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
-        atom_count = torch.zeros(batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
+        plddt_sum = torch.zeros(flat_batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
+        atom_count = torch.zeros(flat_batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
         plddt_atom_mask = atom_mask_float.to(plddt_per_atom.dtype)
         plddt_sum.scatter_add_(1, expanded_atom_to_token, plddt_per_atom * plddt_atom_mask)
         atom_count.scatter_add_(1, expanded_atom_to_token, plddt_atom_mask)
@@ -3971,8 +4083,8 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             atom_mask_float.sum(dim=-1) + torch.finfo(atom_mask_float.dtype).tiny
         )
 
-        expanded_type = self._repeat_batch(molecule_type, num_diffusion_samples)
-        expanded_chain_index = self._repeat_batch(chain_index, num_diffusion_samples)
+        expanded_type = self._repeat_batch(molecule_type, num_samples)
+        expanded_chain_index = self._repeat_batch(chain_index, num_samples)
         is_ligand = (expanded_type == _NONPOLYMER_ID).float()
         inter_chain = (expanded_chain_index.unsqueeze(-1) != expanded_chain_index.unsqueeze(-2)).float()
         near_contact = (representative_distances < 8).float()
@@ -4023,7 +4135,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         max_chain_index = int(expanded_chain_index.max().item())
         num_chains = max_chain_index + 1
         chain_pair_iptm = torch.zeros(
-            batch_size,
+            flat_batch_size,
             num_chains,
             num_chains,
             device=tm_expected.device,
@@ -4039,18 +4151,21 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
                     dim=(-1, -2)
                 ) / denominator
 
+        def unflatten(value: Tensor) -> Tensor:
+            return value.reshape(batch_size, num_samples, *value.shape[1:])
+
         return EsmFold2ExperimentalConfidence(
-            plddt_logits=plddt_logits,
-            plddt=plddt,
-            plddt_per_atom=plddt_per_atom,
-            plddt_ca=plddt_ca,
-            mean_plddt=mean_plddt,
-            complex_iplddt=complex_iplddt,
-            pae_logits=pae_logits,
-            pae=pae,
-            ptm=ptm,
-            iptm=iptm,
-            chain_pair_iptm=chain_pair_iptm,
+            plddt_logits=unflatten(plddt_logits),
+            plddt=unflatten(plddt),
+            plddt_per_atom=unflatten(plddt_per_atom),
+            plddt_ca=unflatten(plddt_ca),
+            mean_plddt=unflatten(mean_plddt),
+            complex_iplddt=unflatten(complex_iplddt),
+            pae_logits=unflatten(pae_logits),
+            pae=unflatten(pae),
+            ptm=unflatten(ptm),
+            iptm=unflatten(iptm),
+            chain_pair_iptm=unflatten(chain_pair_iptm),
         )
 
 
@@ -4500,7 +4615,7 @@ class EsmFold2ExperimentalSample:
 
     Args:
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
-        coordinates: Sampled atom coordinates with shape ``(B * S, A, 3)`` in
+        coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)`` in
             angstroms.
     """
 
@@ -4514,18 +4629,25 @@ class EsmFold2ExperimentalConfidence:
     Fixed confidence values for one experimental ESMFold2 sample carrier.
 
     Args:
-        plddt_logits: Per-atom pLDDT logits.
-        plddt: Per-token pLDDT values on the native ``0--1`` scale.
-        plddt_per_atom: Per-atom pLDDT values on the native ``0--1`` scale.
-        plddt_ca: Representative-atom pLDDT values on the native ``0--1`` scale.
-        mean_plddt: Mean pLDDT values on the native ``0--1`` scale.
-        complex_iplddt: Interface-weighted complex pLDDT values on the native
+        plddt_logits: Per-atom pLDDT logits with shape ``(B, S, A, D_plddt)``.
+        plddt: Per-token pLDDT values with shape ``(B, S, N)`` on the native
             ``0--1`` scale.
-        pae_logits: Token-pair predicted-aligned-error logits.
-        pae: Token-pair predicted aligned errors in angstroms.
-        ptm: Predicted TM scores.
-        iptm: Interface predicted TM scores.
-        chain_pair_iptm: Directed chain-pair interface predicted TM scores.
+        plddt_per_atom: Per-atom pLDDT values with shape ``(B, S, A)`` on the
+            native ``0--1`` scale.
+        plddt_ca: Representative-atom pLDDT values with shape ``(B, S, N)`` on
+            the native ``0--1`` scale.
+        mean_plddt: Mean pLDDT values with shape ``(B, S)`` on the native
+            ``0--1`` scale.
+        complex_iplddt: Interface-weighted complex pLDDT values on the native
+            ``0--1`` scale with shape ``(B, S)``.
+        pae_logits: Token-pair predicted-aligned-error logits with shape
+            ``(B, S, N, N, D_pae)``.
+        pae: Token-pair predicted aligned errors in angstroms with shape
+            ``(B, S, N, N)``.
+        ptm: Predicted TM scores with shape ``(B, S)``.
+        iptm: Interface predicted TM scores with shape ``(B, S)``.
+        chain_pair_iptm: Directed chain-pair interface predicted TM scores with
+            shape ``(B, S, C, C)``.
     """
 
     plddt_logits: Tensor

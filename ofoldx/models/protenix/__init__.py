@@ -12,6 +12,7 @@ from .config import (
     ProtenixConstraintProcessorConfig,
     ProtenixEsmConfig,
     ProtenixProcessorConfig,
+    ProtenixStructureConditionConfig,
     ProtenixTemplateConfig,
     ProtenixTrunkConfig,
     ProtenixVariant,
@@ -30,6 +31,7 @@ from .model import (
     ProtenixLinearBondPotential,
     ProtenixLinearBondTerm,
     ProtenixModel,
+    ProtenixNoisyStructureEmbedder,
     ProtenixOutput,
     ProtenixPairwiseDistancePotential,
     ProtenixPairwiseDistanceTerm,
@@ -39,6 +41,7 @@ from .model import (
     ProtenixRawOutput,
     ProtenixStereoBondPotential,
     ProtenixStereoBondTerm,
+    ProtenixStructureConditionModel,
     ProtenixStructureTarget,
     ProtenixTemplateFeatures,
     ProtenixTfgFeatures,
@@ -48,8 +51,18 @@ from .model import (
     ProtenixVinaStericPotential,
     ProtenixVinaStericTerm,
 )
-from .pipeline import ProtenixConstraintPipeline, ProtenixPipeline, ProtenixTemplatePipeline
-from .processor import ProtenixConstraintProcessor, ProtenixProcessor, ProtenixTemplateProcessor
+from .pipeline import (
+    ProtenixConstraintPipeline,
+    ProtenixPipeline,
+    ProtenixStructureConditionPipeline,
+    ProtenixTemplatePipeline,
+)
+from .processor import (
+    ProtenixConstraintProcessor,
+    ProtenixProcessor,
+    ProtenixStructureConditionProcessor,
+    ProtenixTemplateProcessor,
+)
 
 _MODELS.register(
     "protenix",
@@ -60,6 +73,11 @@ _MODELS.register(
     "protenix_template",
     model=ProtenixModel,
     processor=ProtenixTemplateProcessor,
+)
+_MODELS.register(
+    "protenix_structure_condition",
+    model=ProtenixStructureConditionModel,
+    processor=ProtenixStructureConditionProcessor,
 )
 _MODELS.register(
     "protenix_constraint",
@@ -73,6 +91,10 @@ _PIPELINES.register(
 _PIPELINES.register(
     "protenix_template",
     pipeline=ProtenixTemplatePipeline,
+)
+_PIPELINES.register(
+    "protenix_structure_condition",
+    pipeline=ProtenixStructureConditionPipeline,
 )
 _PIPELINES.register(
     "protenix_constraint",

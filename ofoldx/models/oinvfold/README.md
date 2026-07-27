@@ -144,6 +144,9 @@ OFoldX preserves the checkpoint-backed encoder corruption and the polymer
 teacher-forced autoregressive computation as raw Model operations. It does not
 claim an OInvFold training pipeline or objective because the exact upstream
 tree publishes neither; consult the upstream project for training data.
+Polymer and ligand `encode`/`forward`, and the polymer autoregressive operation,
+accept one optional `torch.Generator` that controls every per-block graph
+corruption draw.
 
 ## Citation
 

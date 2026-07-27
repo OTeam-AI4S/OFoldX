@@ -531,8 +531,13 @@ class AlphaFold2Config(Config):
         structure_module: Invariant-point-attention structure and sidechain module.
         heads: Monomer distogram, masked-MSA, PAE/pTM, pLDDT, and resolved heads.
         msa: Model-owned stochastic MSA realization configuration.
-        recycling_steps: Number of complete recycling passes.
+        recycling_steps: Total network passes, including the final pass.
         num_ensembles: Number of independently embedded and trunk-processed representations to average.
+
+    Examples:
+        >>> config = AlphaFold2Config({"num_ensembles": 8})
+        >>> config.num_ensembles
+        8
     """
 
     input_embeddings: AlphaFold2InputEmbeddingsConfig = AlphaFold2InputEmbeddingsConfig()
@@ -547,6 +552,32 @@ class AlphaFold2Config(Config):
     num_ensembles: int = 1
 
 
+class AlphaFold2InitialGuessConfig(AlphaFold2Config):
+    r"""
+    Configure the released monomer/pTM initial-guess graph used by PXDesign.
+
+    The parameter topology is identical to [`AlphaFold2Config`][]. The distinct
+    model contract seeds the first recycled atom37 ``prev_pos`` state from an
+    input structure and masks target--binder template pair features. It does not
+    initialize Structure Module frames. Its released query-only inference path
+    does not apply stochastic masked-MSA corruption.
+
+    Examples:
+        >>> config = AlphaFold2InitialGuessConfig()
+        >>> config.recycling_steps, config.msa.masked_msa_enabled
+        (4, False)
+    """
+
+    msa: AlphaFold2MsaConfig = AlphaFold2MsaConfig(
+        {
+            "max_msa_clusters": 1,
+            "max_extra_msa": 0,
+            "resample_msa_in_recycling": False,
+            "masked_msa_enabled": False,
+        }
+    )
+
+
 class AlphaFold2MultimerConfig(Config):
     r"""
     Configure the complete AlphaFold-Multimer graph.
@@ -559,8 +590,15 @@ class AlphaFold2MultimerConfig(Config):
         structure_module: Structure module with the multimer translation scale.
         heads: Multimer heads including ipTM ranking and chain-center parameters.
         msa: Model-owned stochastic multimer MSA realization configuration.
-        recycling_steps: Number of complete recycling passes.
+        recycling_steps: Total network passes, including the final pass.
+        recycle_early_stop_tolerance: Masked CA distance-matrix convergence
+            tolerance. Negative values disable early stopping.
         num_ensembles: Number of independently embedded and trunk-processed representations to average.
+
+    Examples:
+        >>> config = AlphaFold2MultimerConfig()
+        >>> config.recycle_early_stop_tolerance
+        0.5
     """
 
     input_embeddings: AlphaFold2MultimerInputEmbeddingsConfig = AlphaFold2MultimerInputEmbeddingsConfig()
@@ -574,6 +612,7 @@ class AlphaFold2MultimerConfig(Config):
     msa: AlphaFold2MultimerMsaConfig = AlphaFold2MultimerMsaConfig()
 
     recycling_steps: int = 21
+    recycle_early_stop_tolerance: float = 0.5
     num_ensembles: int = 1
 
 

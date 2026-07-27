@@ -1,5 +1,5 @@
 r"""
-Protenix default and constraint structure predictors.
+Protenix default, structure-conditioned, and constraint predictors.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation
 from ...modules.head import AtomConfidenceProjector, DistogramHead, expected_plddt, tm_bin_weights
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
+from ...modules.transition import Transition
 from ...modules.trunk import MsaTrunk, PairformerStack
 from ...modules.trunk.msa import TrianglePairUpdateBlock
 from ...results import (
@@ -54,7 +55,11 @@ from ...results import (
     PairMetric,
     Score,
 )
-from .config import ProtenixConfig, ProtenixConstraintConfig
+from .config import (
+    ProtenixConfig,
+    ProtenixConstraintConfig,
+    ProtenixStructureConditionConfig,
+)
 
 
 class ProtenixModel(Model):
@@ -67,6 +72,78 @@ class ProtenixModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence
+        >>> from ofoldx.models.protenix import (
+        ...     ProtenixConfig,
+        ...     ProtenixModel,
+        ...     ProtenixProcessor,
+        ... )
+        >>> config = ProtenixConfig({
+        ...     "single_size": 8,
+        ...     "pair_size": 8,
+        ...     "trunk": {
+        ...         "msa_size": 8,
+        ...         "num_msa_blocks": 1,
+        ...         "msa_outer_product_hidden_size": 4,
+        ...         "num_msa_attention_heads": 1,
+        ...         "msa_triangle_multiplication_hidden_size": 4,
+        ...         "msa_triangle_attention_hidden_size": 4,
+        ...         "num_msa_triangle_attention_heads": 1,
+        ...         "msa_expansion": 2,
+        ...         "num_pairformer_blocks": 1,
+        ...         "pairformer_triangle_multiplication_hidden_size": 4,
+        ...         "pairformer_triangle_attention_hidden_size": 4,
+        ...         "num_pairformer_triangle_attention_heads": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "pairformer_expansion": 2,
+        ...         "pairformer_dropout": 0.0,
+        ...         "msa_dropout": 0.0,
+        ...         "pair_dropout": 0.0,
+        ...     },
+        ...     "recycling_steps": 1,
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_token_encoder_attention_heads": 1,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "token_hidden_size": 8,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_encoder_attention_heads": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...         "num_atom_decoder_attention_heads": 1,
+        ...         "num_query_atoms": 4,
+        ...         "num_key_atoms": 4,
+        ...     },
+        ...     "distogram": {"num_bins": 4},
+        ...     "confidence": {
+        ...         "num_plddt_bins": 4,
+        ...         "num_pae_bins": 4,
+        ...         "num_pde_bins": 4,
+        ...         "max_atoms_per_token": 8,
+        ...         "num_blocks": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "triangle_multiplication_hidden_size": 4,
+        ...         "triangle_attention_hidden_size": 4,
+        ...         "num_triangle_attention_heads": 1,
+        ...     },
+        ... })
+        >>> inputs = ProtenixProcessor()(PolymerSequence.from_one_letter("A"))
+        >>> atom_count = inputs.atom_features.shape[1]
+        >>> model = ProtenixModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model.denoise(
+        ...         inputs,
+        ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
+        ...         noise_level=torch.ones(1, 1),
+        ...         recycling_steps=1,
+        ...     )
+        >>> tuple(output.coordinates.shape) == (1, 1, atom_count, 3)
+        True
+        >>> output.distogram_logits.shape[-1]
+        4
     """
 
     config_class = ProtenixConfig
@@ -418,6 +495,8 @@ class ProtenixModel(Model):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> ProtenixRawOutput:
         r"""
@@ -432,6 +511,8 @@ class ProtenixModel(Model):
                 the configured value.
             num_sampling_steps: Number of diffusion transitions. ``None`` uses the
                 configured value.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the configured value.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the configured value.
             tfg_guidance: Optional training-free chemical guidance.
 
         Returns:
@@ -475,6 +556,8 @@ class ProtenixModel(Model):
             reference_positions=reference_positions,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             generator=generator,
             tfg_potential=tfg_potential,
         )
@@ -489,6 +572,8 @@ class ProtenixModel(Model):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
@@ -504,6 +589,8 @@ class ProtenixModel(Model):
                 the configured value.
             num_sampling_steps: Number of diffusion transitions. ``None`` uses the
                 configured value.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the configured value.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the configured value.
             tfg_guidance: Training-free chemical guidance. ``None`` disables
                 guidance; ``ProtenixTfgGuidance()`` uses the released enabled
                 defaults.
@@ -526,6 +613,8 @@ class ProtenixModel(Model):
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             tfg_guidance=tfg_guidance,
         )
         num_samples = output.coordinates.shape[-3]
@@ -955,6 +1044,8 @@ class ProtenixModel(Model):
         reference_positions: Tensor,
         num_samples: int,
         num_sampling_steps: int,
+        churn_rate: float | None,
+        step_scale: float | None,
         generator: torch.Generator | None,
         tfg_potential: ProtenixTfgPotential | None,
     ) -> Tensor:
@@ -972,6 +1063,8 @@ class ProtenixModel(Model):
                 context=context,
                 num_samples=num_samples,
                 num_sampling_steps=num_sampling_steps,
+                churn_rate=churn_rate,
+                step_scale=step_scale,
                 generator=generator,
                 potential=tfg_potential,
             )
@@ -980,6 +1073,8 @@ class ProtenixModel(Model):
             context=context,
             num_samples=num_samples,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             generator=generator,
         )
 
@@ -989,6 +1084,8 @@ class ProtenixModel(Model):
         context: CoordinateDenoiseContext,
         num_samples: int,
         num_sampling_steps: int,
+        churn_rate: float | None,
+        step_scale: float | None,
         generator: torch.Generator | None,
         potential: ProtenixTfgPotential,
     ) -> Tensor:
@@ -999,6 +1096,8 @@ class ProtenixModel(Model):
         """
 
         guidance = potential.guidance
+        churn_rate = self.coordinate_sampler.churn_rate if churn_rate is None else churn_rate
+        step_scale = self.coordinate_sampler.step_scale if step_scale is None else step_scale
         noise_schedule = self.coordinate_sampler.scheduler(
             num_sampling_steps=num_sampling_steps,
             device=context.device,
@@ -1021,7 +1120,7 @@ class ProtenixModel(Model):
             ).squeeze(dim=-3)
             churn = torch.where(
                 sigma_next > self.coordinate_sampler.min_churn_noise_level,
-                sigma_next.new_tensor(self.coordinate_sampler.churn_rate),
+                sigma_next.new_tensor(churn_rate),
                 sigma_next.new_zeros(()),
             )
             sigma_hat = sigma_previous * (churn + 1)
@@ -1099,7 +1198,7 @@ class ProtenixModel(Model):
                 # the ordinary sampler's optional second (Heun) denoising call.
                 derivative = (guided_coordinates - denoised_coordinates) / noise_level[..., None, None]
                 next_coordinates = guided_coordinates + (
-                    self.coordinate_sampler.step_scale * (sigma_next - noise_level)[..., None, None] * derivative
+                    step_scale * (sigma_next - noise_level)[..., None, None] * derivative
                 )
                 if outer_index + 1 < guidance.outer_steps:
                     outer_noise = torch.empty_like(next_coordinates).normal_(generator=generator)
@@ -1132,12 +1231,243 @@ class ProtenixModel(Model):
         return torch.randperm(num_rows, device=device, generator=generator)[:count]
 
 
+class ProtenixStructureConditionModel(ProtenixModel):
+    r"""
+    Predict structures with the released Protenix mini structure condition.
+
+    The structure update is a real part of this graph and is applied before the
+    MSA path on every recycling pass.
+
+    Args:
+        config: Structure-conditioned model architecture and inference
+            configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.protenix import (
+        ...     ProtenixStructureConditionConfig,
+        ...     ProtenixStructureConditionModel,
+        ...     ProtenixStructureConditionProcessor,
+        ... )
+        >>> sequence = PolymerSequence.from_one_letter("G")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> sites = tuple(AtomSite("A", 0, atom) for atom in ("N", "CA", "C", "O"))
+        >>> structure = Structure(
+        ...     system,
+        ...     sites,
+        ...     np.asarray(
+        ...         [[-1., 0., 0.], [0., 0., 0.], [1., 1., 0.], [1., 2., 0.]],
+        ...         dtype=np.float32,
+        ...     ),
+        ...     np.ones(len(sites), dtype=np.bool_),
+        ... )
+        >>> input = ProtenixStructureConditionProcessor()(
+        ...     structure,
+        ...     structure_condition=structure,
+        ... )
+        >>> atom_count = input.atom_features.shape[1]
+        >>> config = ProtenixStructureConditionConfig({
+        ...     "single_size": 8,
+        ...     "pair_size": 8,
+        ...     "trunk": {
+        ...         "msa_size": 8,
+        ...         "num_msa_blocks": 1,
+        ...         "msa_outer_product_hidden_size": 4,
+        ...         "num_msa_attention_heads": 1,
+        ...         "msa_triangle_multiplication_hidden_size": 4,
+        ...         "msa_triangle_attention_hidden_size": 4,
+        ...         "num_msa_triangle_attention_heads": 1,
+        ...         "msa_expansion": 2,
+        ...         "num_pairformer_blocks": 1,
+        ...         "pairformer_triangle_multiplication_hidden_size": 4,
+        ...         "pairformer_triangle_attention_hidden_size": 4,
+        ...         "num_pairformer_triangle_attention_heads": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "pairformer_expansion": 2,
+        ...         "pairformer_dropout": 0.0,
+        ...         "msa_dropout": 0.0,
+        ...         "pair_dropout": 0.0,
+        ...     },
+        ...     "recycling_steps": 1,
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_token_encoder_attention_heads": 1,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "token_hidden_size": 8,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_encoder_attention_heads": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...         "num_atom_decoder_attention_heads": 1,
+        ...         "num_query_atoms": 4,
+        ...         "num_key_atoms": 4,
+        ...     },
+        ...     "distogram": {"num_bins": 4},
+        ...     "confidence": {
+        ...         "num_plddt_bins": 4,
+        ...         "num_pae_bins": 4,
+        ...         "num_pde_bins": 4,
+        ...         "max_atoms_per_token": 8,
+        ...         "num_blocks": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "triangle_multiplication_hidden_size": 4,
+        ...         "triangle_attention_hidden_size": 4,
+        ...         "num_triangle_attention_heads": 1,
+        ...     },
+        ... })
+        >>> model = ProtenixStructureConditionModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model.denoise(
+        ...         input,
+        ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
+        ...         noise_level=torch.ones(1, 1),
+        ...         recycling_steps=1,
+        ...     )
+        >>> tuple(output.coordinates.shape) == (1, 1, atom_count, 3)
+        True
+        >>> output.distogram_logits.shape[-1]
+        4
+    """
+
+    config_class = ProtenixStructureConditionConfig
+    config: ProtenixStructureConditionConfig
+
+    def __init__(self, config: ProtenixStructureConditionConfig | None = None) -> None:
+        config = ProtenixStructureConditionConfig() if config is None else config
+        super().__init__(config)
+        self.noisy_structure_embedder = ProtenixNoisyStructureEmbedder(config.pair_size)
+        nn.init.zeros_(self.noisy_structure_embedder.transition.feed_forward.output_projection.weight)
+        self._set_backend(self.backend)
+
+    def _run_recycling(
+        self,
+        input: ProtenixInput,
+        token_embedding: Tensor,
+        single_init: Tensor,
+        pair_init: Tensor,
+        pair_mask: Tensor,
+        recycling_steps: int,
+        *,
+        msa_indices: tuple[Tensor, ...] | None,
+    ) -> tuple[Tensor, Tensor]:
+        r"""
+        Run the fixed structure-conditioned recycling loop.
+        """
+
+        single = torch.zeros_like(single_init)
+        pair = torch.zeros_like(pair_init)
+        for cycle in range(recycling_steps):
+            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
+            with torch.set_grad_enabled(grad_enabled):
+                pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
+                pair = pair + self.noisy_structure_embedder(
+                    pair,
+                    input.structure_rep_positions,
+                    input.structure_rep_mask,
+                )
+                if self.template_embedder is not None:
+                    pair = pair + self.template_embedder(
+                        pair,
+                        cast(ProtenixTemplateFeatures, input.template_features),
+                        same_chain_mask=input.chain_index[..., :, None] == input.chain_index[..., None, :],
+                        pair_mask=pair_mask,
+                    )
+                indices = None if msa_indices is None else msa_indices[cycle]
+                _, pair = self.msa_trunk(
+                    self._msa_features(input, indices),
+                    pair,
+                    token_embedding,
+                    pair_mask=pair_mask,
+                )
+                single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
+                single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
+        return single, pair
+
+
 class ProtenixConstraintModel(ProtenixModel):
     r"""
     Predict constrained biomolecular complex structures with Protenix.
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence
+        >>> from ofoldx.models.protenix import (
+        ...     ProtenixConstraintConfig,
+        ...     ProtenixConstraintModel,
+        ...     ProtenixConstraintProcessor,
+        ...     ProtenixTokenContact,
+        ... )
+        >>> config = ProtenixConstraintConfig({
+        ...     "single_size": 8,
+        ...     "pair_size": 8,
+        ...     "trunk": {
+        ...         "msa_size": 8,
+        ...         "num_msa_blocks": 1,
+        ...         "msa_outer_product_hidden_size": 4,
+        ...         "num_msa_attention_heads": 1,
+        ...         "msa_triangle_multiplication_hidden_size": 4,
+        ...         "msa_triangle_attention_hidden_size": 4,
+        ...         "num_msa_triangle_attention_heads": 1,
+        ...         "msa_expansion": 2,
+        ...         "num_pairformer_blocks": 1,
+        ...         "pairformer_triangle_multiplication_hidden_size": 4,
+        ...         "pairformer_triangle_attention_hidden_size": 4,
+        ...         "num_pairformer_triangle_attention_heads": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "pairformer_expansion": 2,
+        ...         "pairformer_dropout": 0.0,
+        ...         "msa_dropout": 0.0,
+        ...         "pair_dropout": 0.0,
+        ...     },
+        ...     "recycling_steps": 1,
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_token_encoder_attention_heads": 1,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "token_hidden_size": 8,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_encoder_attention_heads": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...         "num_atom_decoder_attention_heads": 1,
+        ...         "num_query_atoms": 4,
+        ...         "num_key_atoms": 4,
+        ...     },
+        ...     "distogram": {"num_bins": 4},
+        ...     "confidence": {
+        ...         "num_plddt_bins": 4,
+        ...         "num_pae_bins": 4,
+        ...         "num_pde_bins": 4,
+        ...         "max_atoms_per_token": 8,
+        ...         "num_blocks": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "triangle_multiplication_hidden_size": 4,
+        ...         "triangle_attention_hidden_size": 4,
+        ...         "num_triangle_attention_heads": 1,
+        ...     },
+        ... })
+        >>> inputs = ProtenixConstraintProcessor()(
+        ...     PolymerSequence.from_one_letter("AC"),
+        ...     token_contacts=(ProtenixTokenContact(("A", 0), ("A", 1), 8.0),),
+        ... )
+        >>> atom_count = inputs.atom_features.shape[1]
+        >>> model = ProtenixConstraintModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model.denoise(
+        ...         inputs,
+        ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
+        ...         noise_level=torch.ones(1, 1),
+        ...         recycling_steps=1,
+        ...     )
+        >>> tuple(output.coordinates.shape) == (1, 1, atom_count, 3)
+        True
+        >>> output.distogram_logits.shape[-1]
+        4
     """
 
     config_class = ProtenixConstraintConfig
@@ -1145,6 +1475,102 @@ class ProtenixConstraintModel(ProtenixModel):
 
     def __init__(self, config: ProtenixConstraintConfig | None = None) -> None:
         super().__init__(ProtenixConstraintConfig() if config is None else config)
+
+
+class ProtenixNoisyStructureEmbedder(nn.Module):
+    r"""
+    Embed representative-atom distances and the current Protenix pair state.
+
+    Args:
+        pair_size: Width of the trunk pair representation. The released graph
+            splits it into two equal projected halves.
+        min_distance: First strict-open distance-bin lower edge in angstroms.
+        max_distance: Last finite distance-bin lower edge in angstroms.
+        num_bins: Number of strict-open distance bins.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        min_distance: float = 3.25,
+        max_distance: float = 50.75,
+        num_bins: int = 39,
+    ) -> None:
+        super().__init__()
+        if pair_size % 2:
+            raise ValueError("Protenix noisy structure embedding requires an even pair_size")
+        half_size = pair_size // 2
+        lower_bins = torch.linspace(min_distance, max_distance, num_bins)
+        upper_bins = torch.cat((lower_bins[1:], lower_bins.new_tensor([1e6])))
+        self.lower_bins = nn.Parameter(lower_bins, requires_grad=False)
+        self.upper_bins = nn.Parameter(upper_bins, requires_grad=False)
+        self.structure_projection = nn.Linear(num_bins + 1, half_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size)
+        self.pair_projection = nn.Linear(pair_size, half_size, bias=False)
+        self.transition = Transition(pair_size, expansion=2)
+
+    def forward(
+        self,
+        pair: Tensor,
+        structure_rep_positions: Tensor,
+        structure_rep_mask: Tensor,
+        *,
+        add_noise: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        r"""
+        Return one structure-conditioned pair update.
+
+        Args:
+            pair: Current pair state with shape ``(..., N, N, C_pair)``.
+            structure_rep_positions: Representative coordinates with shape
+                ``(..., N, 3)`` in angstroms.
+            structure_rep_mask: Valid-coordinate mask with shape ``(..., N)``.
+            add_noise: Standard deviation of optional Gaussian distance noise
+                in angstroms.
+            generator: Random generator used for the optional distance noise.
+
+        Returns:
+            Pair update with the same shape as ``pair``. Examples without any
+            valid structure coordinate receive exactly zero.
+        """
+
+        distance = torch.cdist(
+            structure_rep_positions.to(torch.float32),
+            structure_rep_positions.to(torch.float32),
+        ).unsqueeze(-1)
+        if add_noise > 0.0:
+            distance = (
+                distance
+                + torch.randn(
+                    distance.shape,
+                    device=distance.device,
+                    dtype=distance.dtype,
+                    generator=generator,
+                )
+                * add_noise
+            )
+        valid_pair = (structure_rep_mask.bool().unsqueeze(-1) & structure_rep_mask.bool().unsqueeze(-2)).unsqueeze(-1)
+        distance_bins = ((distance > self.lower_bins.to(distance)) & (distance < self.upper_bins.to(distance))).to(
+            dtype=pair.dtype
+        )
+        structure_features = torch.cat(
+            (
+                distance_bins * valid_pair.to(dtype=pair.dtype),
+                valid_pair.to(dtype=pair.dtype),
+            ),
+            dim=-1,
+        )
+        hidden = torch.cat(
+            (
+                self.pair_projection(self.pair_norm(pair)),
+                self.structure_projection(structure_features),
+            ),
+            dim=-1,
+        )
+        update = self.transition(hidden)
+        has_valid_input = valid_pair.any(dim=(-3, -2, -1), keepdim=True)
+        return update * has_valid_input.to(dtype=update.dtype)
 
 
 class ProtenixInputEmbeddings(nn.Module):
@@ -3880,6 +4306,10 @@ class ProtenixInput:
             ``(B, N, N, 2)`` in angstroms.
         substructure: Substructure-condition features with shape
             ``(B, N, N, 4)``.
+        structure_rep_positions: Explicit representative-token structure
+            coordinates with shape ``(B, N, 3)`` in angstroms.
+        structure_rep_mask: Valid explicit structure-coordinate mask with shape
+            ``(B, N)``.
         template_features: Optional fixed-four template features for base v1 and v2.
         tfg_features: Optional static geometry prepared for training-free guidance.
         system: Molecular system represented by the tensors.
@@ -3915,6 +4345,8 @@ class ProtenixInput:
     token_contact: Tensor
     atom_contact: Tensor
     substructure: Tensor
+    structure_rep_positions: Tensor
+    structure_rep_mask: Tensor
     template_features: ProtenixTemplateFeatures | None
     tfg_features: ProtenixTfgFeatures | None
     system: MolecularSystem

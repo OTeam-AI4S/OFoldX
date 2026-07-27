@@ -105,6 +105,12 @@ class AlphaFold3Config(Config):
         distogram: Distogram head configuration.
         confidence: Confidence head with single-representation clamping disabled for AlphaFold 3.
         rank_metric_eps: Denominator epsilon for the contact-weighted PAE ranking metric.
+
+    Examples:
+        >>> from ofoldx.models.alphafold3 import AlphaFold3Config
+        >>> config = AlphaFold3Config(recycling_steps=3)
+        >>> config.recycling_steps
+        3
     """
 
     token_feature_size: int = 447

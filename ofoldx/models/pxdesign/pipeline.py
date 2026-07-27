@@ -417,11 +417,7 @@ class PxDesignPipeline(CompositePipeline):
                     candidate.chosen_source = "original"
                     candidate.chosen_structure = candidate.sequence_structure
 
-        ranked_indices = (
-            _rank_preview(candidates)
-            if mode == "preview"
-            else _rank_extended(candidates)
-        )
+        ranked_indices = _rank_preview(candidates) if mode == "preview" else _rank_extended(candidates)
         for rank, candidate_index in enumerate(ranked_indices, start=1):
             candidates[candidate_index].rank = rank
 
@@ -504,9 +500,7 @@ class PxDesignPipeline(CompositePipeline):
             "af2_binder_mean_plddt": af2_complex.scores["binder_mean_plddt"],
             "af2_iptm": af2_complex.scores["iptm"],
             "af2_interface_pae": af2_complex.scores["interface_pae"],
-            "af2_normalized_interface_pae": af2_complex.scores[
-                "normalized_interface_pae"
-            ],
+            "af2_normalized_interface_pae": af2_complex.scores["normalized_interface_pae"],
             "af2_bound_unbound_binder_rmsd": Score(
                 bound_unbound_rmsd,
                 unit="angstrom",
@@ -528,17 +522,8 @@ class PxDesignPipeline(CompositePipeline):
         interface_pae = scores["af2_interface_pae"].value
         normalized_interface_pae = scores["af2_normalized_interface_pae"].value
         filters = PxDesignFilterResult(
-            af2_easy=(
-                plddt > 0.8
-                and iptm > 0.5
-                and normalized_interface_pae < 0.35
-                and bound_unbound_rmsd < 3.5
-            ),
-            af2_strict=(
-                plddt > 0.9
-                and interface_pae < 7.0
-                and binder_design_rmsd < 1.5
-            ),
+            af2_easy=(plddt > 0.8 and iptm > 0.5 and normalized_interface_pae < 0.35 and bound_unbound_rmsd < 3.5),
+            af2_strict=(plddt > 0.9 and interface_pae < 7.0 and binder_design_rmsd < 1.5),
             complex_rmsd=af2_complex_rmsd < 4.0,
         )
 
@@ -579,20 +564,10 @@ class PxDesignPipeline(CompositePipeline):
                 protenix_strict=protenix_strict,
             )
 
-        bucket = (
-            _preview_bucket(filters)
-            if mode == "preview"
-            else _extended_bucket(filters)
-        )
+        bucket = _preview_bucket(filters) if mode == "preview" else _extended_bucket(filters)
         pass_af2 = bucket < 5 if mode == "preview" else bucket in (1, 2, 3, 4, 7, 8)
-        chosen_source: Literal["original", "af2", "protenix"] = (
-            "af2" if pass_af2 else "original"
-        )
-        chosen_structure = (
-            af2_complex.structure
-            if chosen_source == "af2"
-            else sequence_structure
-        )
+        chosen_source: Literal["original", "af2", "protenix"] = "af2" if pass_af2 else "original"
+        chosen_structure = af2_complex.structure if chosen_source == "af2" else sequence_structure
         return PxDesignCandidate(
             original_backbone=original_backbone,
             sequence_structure=sequence_structure,
@@ -733,10 +708,7 @@ def _rank_extended(candidates: list[PxDesignCandidate]) -> tuple[int, ...]:
         ),
     )
     af2_rank = {index: rank for rank, index in enumerate(af2_order, start=1)}
-    protenix_rank = {
-        index: rank
-        for rank, index in enumerate(protenix_order, start=1)
-    }
+    protenix_rank = {index: rank for rank, index in enumerate(protenix_order, start=1)}
     failed.sort(
         key=lambda index: (
             0.5 * af2_rank[index] + 0.5 * protenix_rank[index],
@@ -852,21 +824,14 @@ def _substructure(
         for instance_id, entity_id in structure.system.instances.items()
         if instance_id in selected
     }
-    entities = {
-        entity_id: structure.system.entities[entity_id]
-        for entity_id in dict.fromkeys(instances.values())
-    }
+    entities = {entity_id: structure.system.entities[entity_id] for entity_id in dict.fromkeys(instances.values())}
     bonds = frozenset(
         bond
         for bond in structure.system.bonds
         if bond.site_a.instance_id in selected and bond.site_b.instance_id in selected
     )
     system = MolecularSystem(entities, instances, bonds)
-    rows = [
-        row
-        for row, site in enumerate(structure.sites)
-        if site.instance_id in selected
-    ]
+    rows = [row for row, site in enumerate(structure.sites) if site.instance_id in selected]
     indices = np.asarray(rows, dtype=np.int64)
     return Structure(
         system=system,
@@ -879,9 +844,7 @@ def _substructure(
             None
             if structure.residue_numbers is None
             else {
-                reference: number
-                for reference, number in structure.residue_numbers.items()
-                if reference[0] in selected
+                reference: number for reference, number in structure.residue_numbers.items() if reference[0] in selected
             }
         ),
     )
@@ -892,11 +855,7 @@ def _structure_with_system(
     system: MolecularSystem,
 ) -> Structure:
     valid = {site for site, _ in system.iter_atoms()}
-    rows = [
-        row
-        for row, site in enumerate(structure.sites)
-        if site in valid
-    ]
+    rows = [row for row, site in enumerate(structure.sites) if site in valid]
     indices = np.asarray(rows, dtype=np.int64)
     return Structure(
         system=system,
@@ -922,11 +881,7 @@ def _full_complex(
     instances[binder_instance_id] = binder_entity_id
     system = MolecularSystem(entities, instances, full_target.system.bonds)
 
-    binder_rows = [
-        row
-        for row, site in enumerate(design.sites)
-        if site.instance_id == binder_instance_id
-    ]
+    binder_rows = [row for row, site in enumerate(design.sites) if site.instance_id == binder_instance_id]
     sites = (
         *full_target.sites,
         *(design.sites[row] for row in binder_rows),
@@ -958,11 +913,7 @@ def _condition_structure(
     target_instance_ids: tuple[str, ...],
 ) -> Structure:
     target = set(target_instance_ids)
-    rows = [
-        row
-        for row, site in enumerate(structure.sites)
-        if site.instance_id in target
-    ]
+    rows = [row for row, site in enumerate(structure.sites) if site.instance_id in target]
     indices = np.asarray(rows, dtype=np.int64)
     return Structure(
         system=structure.system,
@@ -1030,9 +981,7 @@ def _identical_sequence_chain_assignment(
     identity.
     """
 
-    prediction_sequences, prediction_coordinates = _protein_chain_data(
-        prediction
-    )
+    prediction_sequences, prediction_coordinates = _protein_chain_data(prediction)
     reference_sequences, reference_coordinates = _protein_chain_data(reference)
 
     prediction_groups: dict[str, list[int]] = defaultdict(list)
@@ -1042,18 +991,10 @@ def _identical_sequence_chain_assignment(
     for index, sequence in enumerate(reference_sequences):
         reference_groups[sequence].append(index)
 
-    prediction_group_sizes = {
-        sequence: len(indices)
-        for sequence, indices in prediction_groups.items()
-    }
-    reference_group_sizes = {
-        sequence: len(indices)
-        for sequence, indices in reference_groups.items()
-    }
+    prediction_group_sizes = {sequence: len(indices) for sequence, indices in prediction_groups.items()}
+    reference_group_sizes = {sequence: len(indices) for sequence, indices in reference_groups.items()}
     if prediction_group_sizes != reference_group_sizes:
-        raise ValueError(
-            "PXDesign complex RMSD requires matching protein sequence groups"
-        )
+        raise ValueError("PXDesign complex RMSD requires matching protein sequence groups")
 
     best_rmsd = float("inf")
     best_assignment: tuple[int, ...] | None = None
@@ -1074,33 +1015,23 @@ def _identical_sequence_chain_assignment(
             count = len(prediction_sequences)
             cost = np.full((count, count), 1e9, dtype=np.float64)
             for prediction_index, coordinates in enumerate(prediction_coordinates):
-                for reference_index in reference_groups[
-                    prediction_sequences[prediction_index]
-                ]:
+                for reference_index in reference_groups[prediction_sequences[prediction_index]]:
                     prediction_pair, reference_pair = _common_ca_coordinates(
                         coordinates,
                         reference_coordinates[reference_index],
                     )
                     if len(prediction_pair) == 0:
                         continue
-                    transformed = (
-                        (prediction_pair - prediction_center) @ rotation
-                        + reference_center
-                    )
+                    transformed = (prediction_pair - prediction_center) @ rotation + reference_center
                     difference = transformed - reference_pair
                     cost[prediction_index, reference_index] = float(
-                        np.sqrt(
-                            np.square(difference).sum()
-                            / len(difference)
-                        )
+                        np.sqrt(np.square(difference).sum() / len(difference))
                     )
 
             cost[prediction_anchor, :] = 1e9
             cost[:, reference_anchor] = 1e9
             cost[prediction_anchor, reference_anchor] = 0.0
-            prediction_assignment, reference_assignment = linear_sum_assignment(
-                cost
-            )
+            prediction_assignment, reference_assignment = linear_sum_assignment(cost)
 
             sum_squared = 0.0
             num_coordinates = 0
@@ -1115,11 +1046,7 @@ def _identical_sequence_chain_assignment(
                 )
                 if len(prediction_pair) == 0:
                     continue
-                transformed = (
-                    (prediction_pair - prediction_center)
-                    @ rotation
-                    + reference_center
-                )
+                transformed = (prediction_pair - prediction_center) @ rotation + reference_center
                 difference = transformed - reference_pair
                 sum_squared += float(np.square(difference).sum())
                 num_coordinates += len(difference)
@@ -1135,9 +1062,7 @@ def _identical_sequence_chain_assignment(
                     assignment[int(prediction_index)] = int(reference_index)
                 best_assignment = tuple(assignment)
     if best_assignment is None:
-        raise RuntimeError(
-            "PXDesign found no valid identical-sequence chain assignment"
-        )
+        raise RuntimeError("PXDesign found no valid identical-sequence chain assignment")
     return best_assignment, best_rmsd
 
 
@@ -1152,10 +1077,7 @@ def _protein_chain_data(
         if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
             continue
         sequences.append(
-            "".join(
-                AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X")
-                for component in entity.components
-            )
+            "".join(AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components)
         )
         chain_coordinates: dict[int, np.ndarray] = {}
         for component_index in range(len(entity)):
@@ -1222,11 +1144,7 @@ def _coordinate_rmsd(
         prediction_coordinates,
         reference_coordinates,
     )
-    difference = (
-        (prediction_coordinates - prediction_center) @ rotation
-        + reference_center
-        - reference_coordinates
-    )
+    difference = (prediction_coordinates - prediction_center) @ rotation + reference_center - reference_coordinates
     return float(np.sqrt(np.square(difference).sum(axis=-1).mean()))
 
 
@@ -1237,16 +1155,12 @@ def _fit_ca_transform(
     if prediction_coordinates.shape != reference_coordinates.shape:
         raise ValueError("PXDesign RMSD requires paired CA coordinate arrays")
     if len(prediction_coordinates) < 3:
-        raise ValueError(
-            "PXDesign RMSD requires at least three paired CA coordinates"
-        )
+        raise ValueError("PXDesign RMSD requires at least three paired CA coordinates")
     prediction_center = prediction_coordinates.mean(axis=0)
     reference_center = reference_coordinates.mean(axis=0)
     prediction_centered = prediction_coordinates - prediction_center
     reference_centered = reference_coordinates - reference_center
-    left, _, right = np.linalg.svd(
-        prediction_centered.T @ reference_centered
-    )
+    left, _, right = np.linalg.svd(prediction_centered.T @ reference_centered)
     correction = np.eye(3)
     correction[-1, -1] = np.linalg.det(left @ right)
     rotation = left @ correction @ right
@@ -1297,14 +1211,6 @@ def _protenix_decision(
             preferred="lower",
         ),
     }
-    basic = (
-        binder_iptm > 0.8
-        and binder_ptm > 0.8
-        and complex_rmsd < 2.5
-    )
-    strict = (
-        binder_iptm > 0.85
-        and binder_ptm > 0.88
-        and complex_rmsd < 2.5
-    )
+    basic = binder_iptm > 0.8 and binder_ptm > 0.8 and complex_rmsd < 2.5
+    strict = binder_iptm > 0.85 and binder_ptm > 0.88 and complex_rmsd < 2.5
     return scores, basic, strict

@@ -16,11 +16,11 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from .config import AlphaFold2Config
+from .config import AlphaFold2Config, AlphaFold2InitialGuessConfig
 from .converters import deepmind, openfold
-from .model import AlphaFold2Model, AlphaFold2MultimerModel
+from .model import AlphaFold2InitialGuessModel, AlphaFold2Model, AlphaFold2MultimerModel
 from .multimer_processor import AlphaFold2MultimerProcessor
-from .processor import AlphaFold2Processor
+from .processor import AlphaFold2InitialGuessProcessor, AlphaFold2Processor
 
 _DTYPES = {
     "float32": torch.float32,
@@ -92,12 +92,25 @@ def _convert_openfold_checkpoint(
     return model
 
 
-def convert_alphafold2_checkpoint(
+def _own_parameter_storage(model: AlphaFold2Model) -> None:
+    r"""
+    Give every converted parameter independent contiguous storage for safetensors.
+    """
+
+    owned = {
+        name: tensor.detach().clone(memory_format=torch.contiguous_format)
+        for name, tensor in model.state_dict().items()
+    }
+    model.load_state_dict(owned, strict=True, assign=True)
+
+
+def convert_alphafold2_model(
     checkpoint_path: str | PathLike[str],
     *,
     source: str = "deepmind",
     model_name: str | None = None,
     dtype: torch.dtype | None = None,
+    casp14: bool = False,
 ) -> AlphaFold2Model:
     r"""
     Strict-load an AlphaFold 2 checkpoint into its native in-memory Model.
@@ -107,6 +120,8 @@ def convert_alphafold2_checkpoint(
         source: Checkpoint source format. Supported values are ``"deepmind"`` and ``"openfold"``.
         model_name: Optional source-specific model id.
         dtype: Optional dtype for floating-point converted tensors.
+        casp14: Whether to use the released CASP14 eight-ensemble monomer
+            configuration.
 
     Returns:
         A strict-loaded AlphaFold2Model.
@@ -114,25 +129,65 @@ def convert_alphafold2_checkpoint(
 
     source = source.lower()
     if source == "deepmind":
-        return deepmind.convert_deepmind_alphafold2_checkpoint(
+        model = deepmind.convert_deepmind_alphafold2_checkpoint(
             checkpoint_path,
             model_name=model_name,
             dtype=dtype,
         )
-    if source == "openfold":
+    elif source == "openfold":
         if model_name is not None:
             raise ValueError("model_name selects a DeepMind NPZ member and is not valid for OpenFold checkpoints")
-        return _convert_openfold_checkpoint(checkpoint_path, dtype=dtype)
-    raise ValueError(f"unsupported AlphaFold 2 checkpoint source {source!r}; expected 'deepmind' or 'openfold'")
+        model = _convert_openfold_checkpoint(checkpoint_path, dtype=dtype)
+    else:
+        raise ValueError(f"unsupported AlphaFold 2 checkpoint source {source!r}; expected 'deepmind' or 'openfold'")
+    if casp14:
+        if isinstance(model, AlphaFold2MultimerModel):
+            raise ValueError("the CASP14 eight-ensemble configuration applies only to AlphaFold 2 monomer models")
+        model.config.num_ensembles = 8
+        model.num_ensembles = 8
+    return model
 
 
-def save_alphafold2_checkpoint(
+def convert_alphafold2_initial_guess_model(
+    checkpoint_path: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+) -> AlphaFold2InitialGuessModel:
+    r"""
+    Strict-load the released ``model_1_ptm`` weights into the initial-guess graph.
+
+    The target module has the ordinary pTM parameter topology. Its distinct
+    Config, Input, Processor, and Pipeline encode the first-recycle coordinate
+    state and target--binder template-pair equation without adding a mode to
+    [`AlphaFold2Model`][].
+
+    Args:
+        checkpoint_path: Official DeepMind NPZ, params directory, or parameter tar.
+        dtype: Optional dtype for floating-point converted tensors.
+
+    Returns:
+        A strict-loaded initial-guess model.
+    """
+
+    source_model = deepmind.convert_deepmind_alphafold2_checkpoint(
+        checkpoint_path,
+        model_name="model_1_ptm",
+        dtype=dtype,
+    )
+    with torch.device("meta"):
+        model = AlphaFold2InitialGuessModel(AlphaFold2InitialGuessConfig())
+    model.load_state_dict(source_model.state_dict(), strict=True, assign=True)
+    return model
+
+
+def convert_alphafold2_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
     source: str = "deepmind",
     model_name: str | None = None,
     dtype: torch.dtype | None = None,
+    casp14: bool = False,
     repo_id: str | None = None,
     token: str | None = None,
     private: bool = False,
@@ -141,7 +196,7 @@ def save_alphafold2_checkpoint(
     Convert an AlphaFold 2 checkpoint and write a standard OFoldX repository.
 
     Strict-loads the checkpoint via
-    [`convert_alphafold2_checkpoint`][ofoldx.models.alphafold2.convert.convert_alphafold2_checkpoint],
+    [`convert_alphafold2_model`][ofoldx.models.alphafold2.convert.convert_alphafold2_model],
     pairs the resulting model with the processor selected by the checkpoint variant (the monomer/monomer-pTM
     [`AlphaFold2Processor`][], or the [`AlphaFold2MultimerProcessor`][] when the selected
     ``model_*_multimer`` archive yields an [`AlphaFold2MultimerModel`][]), and writes a
@@ -150,23 +205,20 @@ def save_alphafold2_checkpoint(
 
     Saving is local-only by default. When ``repo_id`` is given the fully written repository is also
     uploaded to that Hub repo; no organization or token is assumed and nothing is published without
-    an explicit ``repo_id``.
+    an explicit ``repo_id``. ``casp14=True`` persists eight input ensembles on a
+    monomer configuration.
     """
 
-    model = convert_alphafold2_checkpoint(
+    model = convert_alphafold2_model(
         checkpoint_path,
         source=source,
         model_name=model_name,
         dtype=dtype,
+        casp14=casp14,
     )
-    # The source converters reshape/transpose released tensors into the native tree, so some
-    # parameters are views that alias (or do not cover) their storage. Reassign each as its own
-    # contiguous clone: safetensors refuses to serialize storage-aliasing tensors on save.
-    owned = {
-        name: tensor.detach().clone(memory_format=torch.contiguous_format)
-        for name, tensor in model.state_dict().items()
-    }
-    model.load_state_dict(owned, strict=True, assign=True)
+    # The source converters reshape/transpose released tensors into views whose
+    # storage safetensors cannot serialize directly.
+    _own_parameter_storage(model)
     from .pipeline import AlphaFold2MultimerPipeline, AlphaFold2Pipeline
 
     pipeline: AlphaFold2Pipeline | AlphaFold2MultimerPipeline
@@ -188,6 +240,144 @@ def save_alphafold2_checkpoint(
     )
 
 
+def convert_alphafold2_casp14_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert the fixed five official CASP14 checkpoints into one repository.
+
+    ``checkpoint_path`` must contain the official DeepMind ``model_1`` through
+    ``model_5`` parameter members. Each Model retains the ordinary
+    ``alphafold2`` architecture and persists the released eight-input-ensemble
+    configuration.
+
+    Args:
+        checkpoint_path: Official DeepMind parameter directory or tar containing
+            ``model_1`` through ``model_5``.
+        output_dir: Local composite repository.
+        dtype: Optional dtype for floating-point converted tensors.
+        repo_id: Optional Hub repository to upload after the local write.
+        token: Optional Hugging Face token.
+        private: Whether a newly created Hub repository is private.
+    """
+
+    from .pipeline import AlphaFold2Casp14Pipeline, AlphaFold2Pipeline
+
+    model_1 = convert_alphafold2_model(
+        checkpoint_path,
+        source="deepmind",
+        model_name="model_1",
+        dtype=dtype,
+        casp14=True,
+    )
+    model_2 = convert_alphafold2_model(
+        checkpoint_path,
+        source="deepmind",
+        model_name="model_2",
+        dtype=dtype,
+        casp14=True,
+    )
+    model_3 = convert_alphafold2_model(
+        checkpoint_path,
+        source="deepmind",
+        model_name="model_3",
+        dtype=dtype,
+        casp14=True,
+    )
+    model_4 = convert_alphafold2_model(
+        checkpoint_path,
+        source="deepmind",
+        model_name="model_4",
+        dtype=dtype,
+        casp14=True,
+    )
+    model_5 = convert_alphafold2_model(
+        checkpoint_path,
+        source="deepmind",
+        model_name="model_5",
+        dtype=dtype,
+        casp14=True,
+    )
+    _own_parameter_storage(model_1)
+    _own_parameter_storage(model_2)
+    _own_parameter_storage(model_3)
+    _own_parameter_storage(model_4)
+    _own_parameter_storage(model_5)
+
+    AlphaFold2Casp14Pipeline(
+        model_1=AlphaFold2Pipeline(
+            model=model_1,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+        model_2=AlphaFold2Pipeline(
+            model=model_2,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+        model_3=AlphaFold2Pipeline(
+            model=model_3,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+        model_4=AlphaFold2Pipeline(
+            model=model_4,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+        model_5=AlphaFold2Pipeline(
+            model=model_5,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def convert_alphafold2_initial_guess_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert the released AF2-IG pTM checkpoint into its distinct repository pair.
+
+    Args:
+        checkpoint_path: Official DeepMind NPZ, params directory, or parameter tar.
+        output_dir: Local output repository.
+        dtype: Optional floating-point checkpoint dtype.
+        repo_id: Optional Hub repository to upload after the local write.
+        token: Optional Hugging Face token.
+        private: Whether a newly created Hub repository is private.
+    """
+
+    from .pipeline import AlphaFold2InitialGuessPipeline
+
+    model = convert_alphafold2_initial_guess_model(
+        checkpoint_path,
+        dtype=dtype,
+    )
+    _own_parameter_storage(model)
+    AlphaFold2InitialGuessPipeline(
+        model=model,
+        processor=AlphaFold2InitialGuessProcessor(dtype=dtype),
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     r"""
     Run alphafold2 checkpoint conversion from the command line.
@@ -202,6 +392,22 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="DeepMind NPZ member name (e.g. model_1, model_1_multimer_v3)",
     )
+    route = parser.add_mutually_exclusive_group()
+    route.add_argument(
+        "--casp14",
+        action="store_true",
+        help="persist the released eight-input-ensemble monomer configuration",
+    )
+    route.add_argument(
+        "--casp14-five-model",
+        action="store_true",
+        help="convert the fixed official model_1 through model_5 CASP14 composite",
+    )
+    route.add_argument(
+        "--initial-guess",
+        action="store_true",
+        help="convert the fixed model_1_ptm initial-guess pair",
+    )
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
     parser.add_argument(
         "--repo-id",
@@ -211,12 +417,41 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    save_alphafold2_checkpoint(
+    if args.initial_guess:
+        if args.source != "deepmind":
+            parser.error("--initial-guess requires --source deepmind")
+        if args.model_name is not None:
+            parser.error("--model-name is not valid with --initial-guess")
+        convert_alphafold2_initial_guess_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+        return
+    if args.casp14_five_model:
+        if args.source != "deepmind":
+            parser.error("--casp14-five-model requires --source deepmind")
+        if args.model_name is not None:
+            parser.error("--model-name is not valid with --casp14-five-model")
+        convert_alphafold2_casp14_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+        return
+    convert_alphafold2_checkpoint(
         args.checkpoint,
         args.output_dir,
         source=args.source,
         model_name=args.model_name,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
+        casp14=args.casp14,
         repo_id=args.repo_id,
         token=args.token,
         private=args.private,

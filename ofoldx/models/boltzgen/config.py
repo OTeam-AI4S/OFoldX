@@ -327,6 +327,11 @@ class BoltzGenConfig(Config):
         denoiser: EDM score-network configuration.
         sampler: Reverse-diffusion schedule configuration.
         design: Structure-design modules, including token-distance conditioning.
+
+    Examples:
+        >>> config = BoltzGenConfig(recycling_steps=2)
+        >>> config.recycling_steps
+        2
     """
 
     single_size: int = 384
@@ -396,6 +401,11 @@ class BoltzGenConfidenceConfig(BoltzGenConfig):
 
     The inherited fields construct the exact BoltzGen structure trunk and sampler.
     ``confidence`` owns only the independently live confidence-head axes.
+
+    Examples:
+        >>> config = BoltzGenConfidenceConfig()
+        >>> config.confidence.num_pairformer_blocks
+        8
     """
 
     confidence: BoltzGenConfidenceHeadConfig = BoltzGenConfidenceHeadConfig()
@@ -412,6 +422,11 @@ class BoltzGenInverseFoldingConfig(Config):
         atom_feature_size: Width of raw atom features.
         input_embeddings: Atom and token input embedding configuration.
         inverse_folding: Inverse-folding atom encoder and residue graph configuration.
+
+    Examples:
+        >>> config = BoltzGenInverseFoldingConfig(single_size=256)
+        >>> config.single_size
+        256
     """
 
     single_size: int = 384

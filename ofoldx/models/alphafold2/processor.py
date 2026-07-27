@@ -14,9 +14,10 @@ from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
 from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...modules import residue_constants
+from ...modules.mpnn import virtual_beta_carbon
 from ...processor import Processor
 from .config import AlphaFold2ProcessorConfig
-from .model import AlphaFold2Input, AlphaFold2Layout
+from .model import AlphaFold2InitialGuessInput, AlphaFold2Input, AlphaFold2Layout
 
 RESIDUE_TYPE_INDEX_BY_COMPONENT = {
     residue_constants.AMINO_ACID_ONE_TO_THREE[letter]: index
@@ -135,6 +136,195 @@ class AlphaFold2Processor(Processor):
             device=self.device,
             dtype=self.dtype,
         )
+
+
+class AlphaFold2InitialGuessProcessor(Processor):
+    r"""
+    Lower an in-memory target--binder structure to AF2 initial-guess features.
+
+    The released path uses the pTM monomer graph over concatenated protein
+    chains, query-only MSA features, input atom37 coordinates as the first
+    recycled ``prev_pos`` state, and one all-GAP backbone/CB template whose
+    target--binder pair features are masked by the Model. Residue indices retain
+    every physical chain break, while the asymmetric-unit index groups all
+    target chains separately from the binder. It does not initialize Structure
+    Module frames.
+
+    Args:
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(device=device, dtype=dtype)
+
+    def __call__(
+        self,
+        input: Structure,
+        *,
+        binder_instance_id: str,
+    ) -> AlphaFold2InitialGuessInput:
+        r"""
+        Prepare the released target--binder pTM evaluation input.
+
+        Args:
+            input: In-memory structure containing the target and designed binder.
+            binder_instance_id: Exact protein instance to treat as the binder.
+
+        Returns:
+            Concatenated monomer/pTM features in target-then-binder order.
+        """
+
+        binder_entity_id = input.system.instances[binder_instance_id]
+        binder = input.system.entities[binder_entity_id]
+        if not isinstance(binder, PolymerSequence) or binder.polymer_type != "protein":
+            raise ValueError("AlphaFold 2 initial guess requires a protein binder instance")
+        target_chains = tuple(
+            (instance_id, entity)
+            for instance_id, entity_id in input.system.instances.items()
+            if instance_id != binder_instance_id
+            and isinstance(entity := input.system.entities[entity_id], PolymerSequence)
+            and entity.polymer_type == "protein"
+        )
+        if not target_chains:
+            raise ValueError("AlphaFold 2 initial guess requires at least one protein target instance")
+        chains = (*target_chains, (binder_instance_id, binder))
+        if any(len(chain) == 0 for _, chain in chains):
+            raise ValueError("AlphaFold 2 initial guess requires nonempty protein chains")
+
+        components = tuple(component for _, chain in chains for component in chain.components)
+        concatenated = PolymerSequence("protein", components)
+        synthetic = MolecularSystem(
+            entities={"complex": concatenated},
+            instances={"complex": "complex"},
+        )
+        base = _prepare_alphafold2_features(
+            synthetic,
+            target=concatenated,
+            instance_id="complex",
+            target_entity_id="complex",
+            msa=None,
+            templates=(),
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        residue_sites = tuple(
+            (instance_id, component_index) for instance_id, chain in chains for component_index in range(len(chain))
+        )
+        residue_indices: list[int] = []
+        next_index = 0
+        for _, chain in chains:
+            residue_indices.extend(range(next_index, next_index + len(chain)))
+            next_index = residue_indices[-1] + 50
+        chain_indices = [int(instance_id == binder_instance_id) for instance_id, _ in residue_sites]
+
+        observed = {site: row for row, site in enumerate(input.sites)}
+        positions = torch.zeros(
+            len(residue_sites),
+            residue_constants.atom_type_num,
+            3,
+            dtype=torch.float32,
+        )
+        atom_mask = torch.zeros(
+            len(residue_sites),
+            residue_constants.atom_type_num,
+            dtype=torch.float32,
+        )
+        for residue_index, (instance_id, component_index) in enumerate(residue_sites):
+            for atom_id, atom_index in residue_constants.atom_order.items():
+                row = observed.get(AtomSite(instance_id, component_index, atom_id))
+                if row is None or not input.coordinate_mask[row]:
+                    continue
+                positions[residue_index, atom_index] = torch.from_numpy(input.coordinates[row].copy())
+                atom_mask[residue_index, atom_index] = 1.0
+
+        n = residue_constants.atom_order["N"]
+        ca = residue_constants.atom_order["CA"]
+        c = residue_constants.atom_order["C"]
+        cb = residue_constants.atom_order["CB"]
+        reconstruct_cb = (
+            atom_mask[:, n].bool() & atom_mask[:, ca].bool() & atom_mask[:, c].bool() & ~atom_mask[:, cb].bool()
+        )
+        positions[reconstruct_cb, cb] = virtual_beta_carbon(
+            positions[reconstruct_cb, n],
+            positions[reconstruct_cb, ca],
+            positions[reconstruct_cb, c],
+        )
+        atom_mask[reconstruct_cb, cb] = 1.0
+
+        template_residue_type_ids = torch.full(
+            (1, len(residue_sites)),
+            GAP_RESIDUE_TYPE_INDEX,
+            dtype=torch.long,
+        )
+        template_positions = positions.unsqueeze(0)
+        template_atom_mask = atom_mask.clone()
+        template_atom_mask[:, 5:] = 0.0
+        template_atom_mask = template_atom_mask.unsqueeze(0)
+        torsion = torch.zeros(1, len(residue_sites), 7, 2)
+        alternative_torsion = torch.zeros_like(torsion)
+        torsion_mask = torch.zeros(1, len(residue_sites), 7)
+
+        values = dict(vars(base))
+        values.update(
+            residue_index=torch.tensor(
+                residue_indices,
+                dtype=torch.long,
+                device=self.device,
+            ).unsqueeze(0),
+            template_mask=torch.ones(
+                1,
+                1,
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            template_residue_type_ids=template_residue_type_ids.to(self.device).unsqueeze(0),
+            template_all_atom_positions=template_positions.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            template_all_atom_mask=template_atom_mask.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            template_torsion_angles_sin_cos=torsion.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            template_alternative_torsion_angles_sin_cos=alternative_torsion.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            template_torsion_angles_mask=torsion_mask.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            layout=AlphaFold2Layout(
+                system=input.system,
+                residue_sites=residue_sites,
+            ),
+            initial_recycling_positions=positions.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            chain_index=torch.tensor(
+                chain_indices,
+                dtype=torch.long,
+                device=self.device,
+            ).unsqueeze(0),
+            binder_mask=torch.tensor(
+                [instance_id == binder_instance_id for instance_id, _ in residue_sites],
+                dtype=torch.bool,
+                device=self.device,
+            ).unsqueeze(0),
+        )
+        return AlphaFold2InitialGuessInput(**values)
 
 
 def monomer_system_from_sequences(

@@ -943,7 +943,7 @@ def boltz2_config_from_checkpoint(
     return config
 
 
-def convert_boltz2_checkpoint(
+def convert_boltz2_model(
     checkpoint_path: str | PathLike[str],
     *,
     config: Boltz2Config | None = None,
@@ -962,7 +962,7 @@ def convert_boltz2_checkpoint(
     return model
 
 
-def convert_boltz2_affinity_checkpoint(
+def convert_boltz2_affinity_model(
     checkpoint_path: str | PathLike[str],
     *,
     config: Boltz2AffinityConfig | None = None,
@@ -1002,7 +1002,7 @@ def _cast_floating_tensors(
     }
 
 
-def save_boltz2_checkpoint(
+def convert_boltz2_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -1016,7 +1016,7 @@ def save_boltz2_checkpoint(
     Convert a Boltz-2 structure-prediction checkpoint and write a standard OFoldX repository.
 
     Strict-loads the checkpoint via
-    [`convert_boltz2_checkpoint`][ofoldx.models.boltz2.convert.convert_boltz2_checkpoint], pairs the
+    [`convert_boltz2_model`][ofoldx.models.boltz2.convert.convert_boltz2_model], pairs the
     model with the config-less [`Boltz2Processor`][], and writes a self-contained ``model.json`` /
     ``processor.json`` / safetensors repository marked with the exact [`Boltz2Pipeline`][].
     The Processor repository metadata records its floating-point dtype even though it has no
@@ -1028,7 +1028,7 @@ def save_boltz2_checkpoint(
 
     from .pipeline import Boltz2Pipeline
 
-    model = convert_boltz2_checkpoint(checkpoint_path, config=config, dtype=dtype)
+    model = convert_boltz2_model(checkpoint_path, config=config, dtype=dtype)
     Boltz2Pipeline(model=model, processor=Boltz2Processor(dtype=dtype)).save(
         output_dir,
         repo_id=repo_id,
@@ -1037,7 +1037,7 @@ def save_boltz2_checkpoint(
     )
 
 
-def save_boltz2_affinity_checkpoint(
+def convert_boltz2_affinity_checkpoint(
     affinity_checkpoint_path: str | PathLike[str],
     structure_checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
@@ -1065,12 +1065,12 @@ def save_boltz2_affinity_checkpoint(
 
     from .pipeline import Boltz2AffinityPipeline
 
-    affinity_model = convert_boltz2_affinity_checkpoint(
+    affinity_model = convert_boltz2_affinity_model(
         affinity_checkpoint_path,
         config=affinity_config,
         dtype=dtype,
     )
-    structure_model = convert_boltz2_checkpoint(
+    structure_model = convert_boltz2_model(
         structure_checkpoint_path,
         config=structure_config,
         dtype=dtype,
@@ -1116,7 +1116,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
     if args.command == "fold":
-        save_boltz2_checkpoint(
+        convert_boltz2_checkpoint(
             args.checkpoint,
             args.output_dir,
             dtype=dtype,
@@ -1125,7 +1125,7 @@ def main(argv: list[str] | None = None) -> None:
             private=args.private,
         )
     else:
-        save_boltz2_affinity_checkpoint(
+        convert_boltz2_affinity_checkpoint(
             args.affinity_checkpoint,
             args.structure_checkpoint,
             args.output_dir,

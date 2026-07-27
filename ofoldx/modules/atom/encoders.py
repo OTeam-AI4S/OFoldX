@@ -13,9 +13,9 @@ from torch import Tensor, nn
 
 from ..backend import LayerNorm
 from ..transformer import (
-    AtomCrossAttentionTransformer,
+    AtomCrossAttentionTransformerEncoder,
     ConditionedTransformerEncoder,
-    NormalizedKeyAtomCrossAttentionTransformer,
+    NormalizedKeyAtomCrossAttentionTransformerEncoder,
 )
 from .context import AtomContext, AtomToTokenOutput
 from .pair_encoding import encode_atom_pair
@@ -1198,7 +1198,7 @@ class AtomSelfAttention(nn.Module):
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
         self.atom_attention = PackedAtomAttention(
-            AtomCrossAttentionTransformer(
+            AtomCrossAttentionTransformerEncoder(
                 num_blocks=num_blocks,
                 num_attention_heads=num_attention_heads,
                 hidden_size=atom_hidden_size,
@@ -1270,7 +1270,7 @@ class NormalizedKeyAtomSelfAttention(AtomSelfAttention):
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
         )
         self.atom_attention = PackedAtomAttention(
-            NormalizedKeyAtomCrossAttentionTransformer(
+            NormalizedKeyAtomCrossAttentionTransformerEncoder(
                 num_blocks=num_blocks,
                 num_attention_heads=num_attention_heads,
                 hidden_size=atom_hidden_size,

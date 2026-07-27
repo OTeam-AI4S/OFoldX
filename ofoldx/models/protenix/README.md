@@ -19,7 +19,7 @@ pipeline_tag: other
 
 Protenix is OFoldX's AlphaFold 3-shaped all-atom structure-prediction family for
 proteins, nucleic acids, small molecules, and their complexes. OFoldX exposes
-all nine released checkpoint variants through three exact
+all ten released checkpoint variants through four exact
 Model/Processor/Pipeline pairs.
 
 ## Disclaimer
@@ -49,6 +49,7 @@ variant from a filename or tensor shape:
 - `protenix_base_default_v0.5.0`
 - `protenix_base_constraint_v0.5.0`
 - `protenix_mini_default_v0.5.0`
+- `protenix_mini_tmpl_v0.5.0`
 - `protenix_tiny_default_v0.5.0`
 - `protenix_mini_esm_v0.5.0`
 - `protenix_mini_ism_v0.5.0`
@@ -58,11 +59,12 @@ variant from a filename or tensor shape:
 
 The variants map to ordinary registered pairs:
 
-| Pair                               | Model, Processor, Pipeline                                                             | Released variants                                                     |
-| ---------------------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Default (`protenix`)               | `ProtenixModel`, `ProtenixProcessor`, `ProtenixPipeline`                               | base default v0.5, mini default, tiny default, mini ESM, and mini ISM |
-| Template (`protenix_template`)     | `ProtenixModel`, `ProtenixTemplateProcessor`, `ProtenixTemplatePipeline`               | both base v1 releases and `protenix-v2`                               |
-| Constraint (`protenix_constraint`) | `ProtenixConstraintModel`, `ProtenixConstraintProcessor`, `ProtenixConstraintPipeline` | base constraint v0.5                                                  |
+| Pair                                                 | Model, Processor, Pipeline                                                                                     | Released variants                                                     |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Default (`protenix`)                                 | `ProtenixModel`, `ProtenixProcessor`, `ProtenixPipeline`                                                       | base default v0.5, mini default, tiny default, mini ESM, and mini ISM |
+| Template (`protenix_template`)                       | `ProtenixModel`, `ProtenixTemplateProcessor`, `ProtenixTemplatePipeline`                                       | both base v1 releases and `protenix-v2`                               |
+| Structure condition (`protenix_structure_condition`) | `ProtenixStructureConditionModel`, `ProtenixStructureConditionProcessor`, `ProtenixStructureConditionPipeline` | mini template v0.5                                                    |
+| Constraint (`protenix_constraint`)                   | `ProtenixConstraintModel`, `ProtenixConstraintProcessor`, `ProtenixConstraintPipeline`                         | base constraint v0.5                                                  |
 
 The two v1 releases share one graph and differ in weights. Mini ESM and mini ISM
 also share one graph and package their selected ESM2 companion weights inside the
@@ -71,6 +73,13 @@ paths. The constraint pair exposes atom-contact, token-contact, and pocket
 controls. Its fourth learned branch accepts a `Structure` through
 `substructure=` and digitizes resolved token-center distances into the released
 four-channel representation.
+
+The mini template checkpoint is not an ordinary template model. Its distinct
+pair accepts `structure_condition=` as an in-memory `Structure`, aligns resolved
+representative-atom coordinates to the model token axis, and applies the
+checkpoint's noisy-structure pair update on every recycling pass.
+Direct `ProtenixNoisyStructureEmbedder` callers may enable its released
+`add_noise` distance perturbation and supply a `torch.Generator` for that draw.
 
 ### Links
 
@@ -106,7 +115,9 @@ Template variants additionally accept `templates=`. Constraint repositories
 route to `ProtenixConstraintPipeline`, whose concrete `fold` method accepts
 `atom_contacts`, `token_contacts`, and `pocket`. Direct
 `ProtenixConstraintProcessor` use additionally accepts the released
-`substructure` coordinate condition.
+`substructure` coordinate condition. Every concrete Protenix Pipeline accepts
+per-call `recycling_steps`, `num_sampling_steps`, `churn_rate`, and
+`step_scale`; `None` uses the converted checkpoint configuration.
 
 Training-free chemical guidance is a sampling-time operation. Pass the released
 enabled configuration explicitly:

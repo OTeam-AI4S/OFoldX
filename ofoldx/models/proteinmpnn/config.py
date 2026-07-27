@@ -18,6 +18,12 @@ class ProteinMpnnConfig(Config):
         num_neighbors: Number of nearest neighbors in each residue graph.
         dropout: Dropout probability in encoder and decoder blocks.
         ca_only: Whether to build the CA-only graph instead of the backbone graph.
+
+    Examples:
+        >>> from ofoldx.models.proteinmpnn import ProteinMpnnConfig
+        >>> config = ProteinMpnnConfig(ca_only=True)
+        >>> config.ca_only
+        True
     """
 
     hidden_size: int = 128

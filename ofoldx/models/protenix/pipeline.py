@@ -22,12 +22,14 @@ from .model import (
     ProtenixConstraintModel,
     ProtenixModel,
     ProtenixPocket,
+    ProtenixStructureConditionModel,
     ProtenixTfgGuidance,
     ProtenixTokenContact,
 )
 from .processor import (
     ProtenixConstraintProcessor,
     ProtenixProcessor,
+    ProtenixStructureConditionProcessor,
     ProtenixTemplateProcessor,
     molecular_system_from_input,
     molecular_system_from_named_sequences,
@@ -53,6 +55,8 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
@@ -70,6 +74,8 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the Model configuration.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the Model configuration.
             tfg_guidance: Training-free chemical guidance. ``None`` disables it;
                 ``ProtenixTfgGuidance()`` uses the released enabled defaults.
 
@@ -93,6 +99,8 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             tfg_guidance=tfg_guidance,
         )
 
@@ -115,6 +123,8 @@ class ProtenixTemplatePipeline(PairedPipeline[ProtenixModel, ProtenixTemplatePro
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
@@ -132,6 +142,8 @@ class ProtenixTemplatePipeline(PairedPipeline[ProtenixModel, ProtenixTemplatePro
                 Mutually exclusive with ``seed``.
             recycling_steps: Number of representation recycling iterations.
             num_sampling_steps: Number of diffusion steps.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the Model configuration.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the Model configuration.
             tfg_guidance: Training-free chemical guidance. ``None`` disables it;
                 ``ProtenixTfgGuidance()`` uses the released enabled defaults.
 
@@ -155,6 +167,78 @@ class ProtenixTemplatePipeline(PairedPipeline[ProtenixModel, ProtenixTemplatePro
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
+            tfg_guidance=tfg_guidance,
+        )
+
+
+class ProtenixStructureConditionPipeline(
+    PairedPipeline[ProtenixStructureConditionModel, ProtenixStructureConditionProcessor]
+):
+    r"""
+    Structure-conditioned prediction pipeline for Protenix mini template.
+    """
+
+    model_architecture = "protenix_structure_condition"
+
+    def fold(
+        self,
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        *,
+        structure_condition: Structure | None = None,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        num_samples: int | None = None,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+        num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = None,
+    ) -> FoldResult:
+        r"""
+        Predict structures using an explicit in-memory coordinate condition.
+
+        Args:
+            input: Inline sequence, FASTA or structure path, polymer sequence
+                collection, molecular system, or structure topology.
+            structure_condition: Optional in-memory Structure aligned by exact
+                atom occurrence to the input assembly.
+            msa: Optional MSA value, collection, or alignment path.
+            num_samples: Number of structure predictions. ``None`` uses five.
+            seed: Optional seed for preprocessing, MSA subsampling, and
+                coordinate diffusion. Mutually exclusive with ``generator``.
+            generator: Optional generator advanced by preprocessing and folding.
+                Mutually exclusive with ``seed``.
+            recycling_steps: Number of representation recycling iterations.
+            num_sampling_steps: Number of diffusion transitions.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the Model configuration.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the Model configuration.
+            tfg_guidance: Optional training-free chemical guidance.
+
+        Returns:
+            Generation-ordered structure predictions.
+        """
+
+        generator = resolve_generator(seed, generator, device=self.processor.device)
+        canonical_input = _canonical_input(input)
+        system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
+        model_input = self.processor(
+            canonical_input,
+            structure_condition=structure_condition,
+            msa=_canonical_msa(msa, system),
+            tfg_guidance=tfg_guidance,
+            generator=generator,
+        )
+        return self.model.fold(
+            model_input,
+            num_samples=num_samples,
+            generator=generator,
+            recycling_steps=recycling_steps,
+            num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             tfg_guidance=tfg_guidance,
         )
 
@@ -179,6 +263,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
         generator: torch.Generator | None = None,
         recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
     ) -> FoldResult:
         r"""
@@ -199,6 +285,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             recycling_steps: Number of representation recycling iterations. ``None`` uses the
                 Model configuration.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
+            churn_rate: Per-call extra-noise fraction. ``None`` uses the Model configuration.
+            step_scale: Per-call solver-step multiplier. ``None`` uses the Model configuration.
             tfg_guidance: Training-free chemical guidance. ``None`` disables it;
                 ``ProtenixTfgGuidance()`` uses the released enabled defaults.
 
@@ -225,6 +313,8 @@ class ProtenixConstraintPipeline(PairedPipeline[ProtenixConstraintModel, Proteni
             generator=generator,
             recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
+            churn_rate=churn_rate,
+            step_scale=step_scale,
             tfg_guidance=tfg_guidance,
         )
 

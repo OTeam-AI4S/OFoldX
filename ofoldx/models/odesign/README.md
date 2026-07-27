@@ -18,7 +18,7 @@ pipeline_tag: other
 # ODesign
 
 Native PyTorch implementation of the four released ODesign backbone artifacts
-and their protein, nucleic-acid, and ligand OInvFold compositions.
+and their released ProteinMPNN, LigandMPNN, gRNAde, and OInvFold compositions.
 
 ## Disclaimer
 
@@ -33,28 +33,35 @@ ODesign is an all-atom diffusion model for designing biomolecular interactions.
 It combines atom-level chemical features, MSA information, geometric
 constraints, and recycled Pairformer representations before an EDM denoiser
 generates coordinates. Distogram and bond heads retain additional predictions
-over the designed assembly. OFoldX composes each backbone artifact with the
-released OInvFold model appropriate to its generated chemistry.
+over the designed assembly. OFoldX composes protein backbones with ProteinMPNN
+or LigandMPNN according to realized atom context, RNA with gRNAde, and DNA or
+generated ligand atoms with their released OInvFold models.
 
 ### Released Artifacts
 
-The converter exposes four exact artifact selectors:
+The converter exposes four official artifact selectors:
 
 - `protein-flex` uses `ODesignModel` with a protein/flexible
-  `ODesignProcessor`, then `ODesignProteinPipeline` assigns generated chains with
-  a protein `OInvFoldPolymerPipeline`.
+  `ODesignProcessor`, then `ODesignProteinPipeline` selects ProteinMPNN for
+  protein-only assemblies and LigandMPNN when ligand atom context is present.
 - `protein-rigid` uses the same model graph with a protein/rigid Processor and
-  the same protein OInvFold composition.
+  the same released MPNN selection.
 - `nucleic-acid-rigid` uses the same model graph with a nucleic-acid/rigid
   Processor. `ODesignNucleicAcidPipeline` routes each generated chain to its
-  exact DNA or RNA OInvFold child and realizes canonical nucleotide identities.
+  exact DNA OInvFold or RNA gRNAde child and realizes canonical nucleotide
+  identities.
 - `ligand-rigid` uses `ODesignModel` with `ODesignLigandProcessor`.
   `ODesignLigandPipeline` sends the generated coordinate slots to an
   `OInvFoldLigandPipeline` for element assignment.
 
 Receptor mode and generated modality are persisted Processor facts, not runtime
 model-topology switches. Protein, DNA, and RNA candidates become canonical
-`Structure` values after OInvFold assignment. Ligand generation is deliberately
+`Structure` values after inverse folding. Explicit
+`ODesignOInvFoldProteinPipeline` and `ODesignOInvFoldRnaPipeline` classes retain
+the previously completed OInvFold alternatives without presenting them as the
+official ODesign routes. Their converter selectors are
+`oinvfold-protein-flex`, `oinvfold-protein-rigid`, and
+`oinvfold-rna-rigid`. Ligand generation is deliberately
 provisional: candidates retain ordered slot identities, coordinates, predicted
 elements, probabilities, and ODesign bond logits, but their bonds, formal
 charges, and component identity remain unresolved. OFoldX does not fabricate a

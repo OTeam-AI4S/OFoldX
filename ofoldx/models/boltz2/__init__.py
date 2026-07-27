@@ -27,6 +27,7 @@ from .model import (
     Boltz2Model,
     Boltz2Output,
     Boltz2Pocket,
+    Boltz2Representations,
     Boltz2StructureTarget,
     Boltz2Template,
 )

@@ -301,6 +301,8 @@ class Boltz2Processor(Processor):
         *,
         msa: MSA | MSACollection | None = None,
         templates: Sequence[Template | Boltz2Template] = (),
+        design: Sequence[ComponentReference] = (),
+        self_template: Sequence[ComponentReference] = (),
         contacts: Sequence[Boltz2Contact] = (),
         pockets: Sequence[Boltz2Pocket] = (),
         method: str = "x-ray diffraction",
@@ -313,6 +315,9 @@ class Boltz2Processor(Processor):
             input: Molecular system or structure.
             msa: Optional MSA value or collection.
             templates: Structural protein templates with canonical residue alignments.
+            design: Component occurrences designed by the calling protocol.
+            self_template: Component occurrences whose input coordinates form one
+                direct self-template.
             contacts: Learned pairwise contact conditions.
             pockets: Learned binder-to-pocket conditions.
             method: Experimental method used by the learned method embedding.
@@ -340,6 +345,8 @@ class Boltz2Processor(Processor):
             structure=structure,
             msa=msa,
             templates=templates,
+            design=design,
+            self_template=self_template,
             contacts=contacts,
             pockets=pockets,
             method=method,
@@ -354,6 +361,8 @@ class Boltz2Processor(Processor):
         *,
         msa: MSA | MSACollection | None = None,
         templates: Sequence[Template | Boltz2Template] = (),
+        design: Sequence[ComponentReference] = (),
+        self_template: Sequence[ComponentReference] = (),
         contacts: Sequence[Boltz2Contact] = (),
         pockets: Sequence[Boltz2Pocket] = (),
         method: str = "x-ray diffraction",
@@ -367,6 +376,8 @@ class Boltz2Processor(Processor):
             input,
             msa=msa,
             templates=templates,
+            design=design,
+            self_template=self_template,
             contacts=contacts,
             pockets=pockets,
             method=method,
@@ -621,6 +632,8 @@ def _prepare_boltz2_affinity_features(
         "contact_threshold": contact_threshold,
         **contact_values,
         "molecule_type": molecule_types,
+        "design_mask": torch.zeros(token_count, dtype=torch.bool),
+        "chain_design_mask": torch.zeros(token_count, dtype=torch.bool),
         **physical_potential_values,
         "frame_atom_index": frame_atom_index,
         "method_feature": torch.full((token_count,), _METHOD_TYPES[method.lower()], dtype=torch.long),
@@ -656,6 +669,8 @@ def _prepare_boltz2_structure_features(
     structure: Structure | None,
     msa: MSA | MSACollection | None,
     templates: Sequence[Template | Boltz2Template],
+    design: Sequence[ComponentReference],
+    self_template: Sequence[ComponentReference],
     contacts: Sequence[Boltz2Contact],
     pockets: Sequence[Boltz2Pocket],
     method: str,
@@ -836,6 +851,12 @@ def _prepare_boltz2_structure_features(
         dtype=torch.long,
     )
     token_bonds, type_bonds = _token_bond_features(system, site_to_token, token_count)
+    design_mask = _component_token_mask(system, tokens, design)
+    chain_design_mask = _chain_design_mask(
+        design_mask,
+        torch.tensor([cast(int, token["chain_index"]) for token in tokens]),
+        token_bonds,
+    )
     physical_potential_values = _physical_potential_features(
         system,
         site_to_atom,
@@ -849,6 +870,19 @@ def _prepare_boltz2_structure_features(
     contact_conditioning = contact_values.pop("contact_conditioning")
     contact_threshold = contact_values.pop("contact_threshold")
     template_values = _template_features(system, tokens, templates)
+    if self_template:
+        if structure is None:
+            raise ValueError("Boltz-2 self-template components require a Structure")
+        self_template_values = _self_template_features(
+            structure,
+            tokens,
+            self_template,
+        )
+        template_values = (
+            {name: torch.cat((template_values[name], value), dim=0) for name, value in self_template_values.items()}
+            if template_values
+            else self_template_values
+        )
     msa_values = _msa_features(msa, tokens, system)
     molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
     residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
@@ -886,6 +920,8 @@ def _prepare_boltz2_structure_features(
         "contact_threshold": contact_threshold,
         **contact_values,
         "molecule_type": molecule_types,
+        "design_mask": design_mask,
+        "chain_design_mask": chain_design_mask,
         **physical_potential_values,
         "frame_atom_index": frame_atom_index,
         "method_feature": torch.full((token_count,), _METHOD_TYPES[method.lower()], dtype=torch.long),
@@ -1698,6 +1734,93 @@ def _template_features(
     }
 
 
+def _self_template_features(
+    structure: Structure,
+    tokens: list[dict[str, object]],
+    references: Sequence[ComponentReference],
+) -> dict[str, Tensor]:
+    r"""
+    Lower one direct coordinate template over an explicit canonical component subset.
+
+    Every selected component expands to all of its token rows. This keeps
+    atomized molecules and non-protein polymers in the template rather than
+    forcing them through polymer-alignment-only ``Template`` evidence.
+    """
+
+    selected = _component_token_mask(structure.system, tokens, references)
+    token_count = len(tokens)
+    residue_type = torch.zeros(token_count, dtype=torch.long)
+    frame_rotations = torch.eye(3).expand(token_count, -1, -1).clone()
+    frame_rotations[~selected] = 0
+    frame_translations = torch.zeros(token_count, 3)
+    frame_mask = torch.zeros(token_count)
+    beta_carbon_positions = torch.zeros(token_count, 3)
+    alpha_carbon_positions = torch.zeros(token_count, 3)
+    beta_carbon_mask = torch.zeros(token_count)
+    template_mask = selected.float()
+    visibility = selected.float()
+    coordinate_index = {site: atom_index for atom_index, site in enumerate(structure.sites)}
+
+    for token_index, token in enumerate(tokens):
+        if not bool(selected[token_index]):
+            continue
+        residue_type[token_index] = cast(int, token["residue_type"])
+        center, center_present = _template_atom(
+            structure,
+            coordinate_index,
+            cast(AtomSite, token["center_site"]),
+        )
+        if center_present:
+            alpha_carbon_positions[token_index] = center
+        distogram, distogram_present = _template_atom(
+            structure,
+            coordinate_index,
+            cast(AtomSite, token["distogram_site"]),
+        )
+        if distogram_present:
+            beta_carbon_positions[token_index] = distogram
+            beta_carbon_mask[token_index] = 1
+
+        if cast(int, token["molecule_type"]) != _MOLECULE_TYPES["protein"]:
+            continue
+        nitrogen_site, alpha_site, carbon_site = cast(
+            tuple[AtomSite, AtomSite, AtomSite],
+            token["frame_sites"],
+        )
+        if len({nitrogen_site, alpha_site, carbon_site}) != 3:
+            continue
+        nitrogen, nitrogen_present = _template_atom(structure, coordinate_index, nitrogen_site)
+        alpha_carbon, alpha_carbon_present = _template_atom(structure, coordinate_index, alpha_site)
+        carbon, carbon_present = _template_atom(structure, coordinate_index, carbon_site)
+        if nitrogen_present and alpha_carbon_present and carbon_present:
+            first = carbon - alpha_carbon
+            first_axis = first / (torch.linalg.vector_norm(first) + 1e-10)
+            second = nitrogen - alpha_carbon
+            second = second - first_axis * torch.dot(first_axis, second)
+            second_axis = second / (torch.linalg.vector_norm(second) + 1e-10)
+            third_axis = torch.linalg.cross(first_axis, second_axis)
+            frame_rotations[token_index] = torch.stack(
+                (first_axis, second_axis, third_axis),
+                dim=-1,
+            )
+            frame_translations[token_index] = alpha_carbon
+            frame_mask[token_index] = 1
+
+    return {
+        "template_residue_type_features": torch.nn.functional.one_hot(residue_type, 33).unsqueeze(0),
+        "template_frame_rotations": frame_rotations.unsqueeze(0),
+        "template_frame_translations": frame_translations.unsqueeze(0),
+        "template_frame_mask": frame_mask.unsqueeze(0),
+        "template_beta_carbon_positions": beta_carbon_positions.unsqueeze(0),
+        "template_alpha_carbon_positions": alpha_carbon_positions.unsqueeze(0),
+        "template_beta_carbon_mask": beta_carbon_mask.unsqueeze(0),
+        "template_mask": template_mask.unsqueeze(0),
+        "template_visibility_index": visibility.unsqueeze(0),
+        "template_force": torch.zeros(1, dtype=torch.bool),
+        "template_force_threshold": torch.full((1,), float("inf")),
+    }
+
+
 def _template_atom(
     structure: Structure,
     coordinate_index: dict[AtomSite, int],
@@ -1707,6 +1830,54 @@ def _template_atom(
     if index is None or not bool(structure.coordinate_mask[index]):
         return torch.zeros(3), False
     return torch.from_numpy(structure.coordinates[index].copy()).to(dtype=torch.float32), True
+
+
+def _component_token_mask(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    references: Sequence[ComponentReference],
+) -> Tensor:
+    r"""
+    Expand canonical component occurrences to their complete token rows.
+    """
+
+    selected = frozenset(references)
+    for reference in selected:
+        system.component(reference)
+
+    rows: list[bool] = []
+    for token in tokens:
+        component_index = cast(int | None, token["monomer_index"])
+        if component_index is None:
+            component_index = cast(tuple[AtomSite, ...], token["atom_sites"])[0].component_index
+        rows.append((cast(str, token["instance_id"]), component_index) in selected)
+    return torch.tensor(rows, dtype=torch.bool)
+
+
+def _chain_design_mask(
+    design_mask: Tensor,
+    chain_index: Tensor,
+    token_bonds: Tensor,
+) -> Tensor:
+    r"""
+    Propagate design membership over whole chains and covalently linked chains.
+    """
+
+    connections: dict[int, set[int]] = {int(chain): set() for chain in torch.unique(chain_index).tolist()}
+    for source, target in torch.nonzero(token_bonds, as_tuple=False).tolist():
+        source_chain = int(chain_index[source])
+        target_chain = int(chain_index[target])
+        connections[source_chain].add(target_chain)
+        connections[target_chain].add(source_chain)
+
+    selected = {int(chain) for chain in chain_index[design_mask].tolist()}
+    pending = list(selected)
+    while pending:
+        chain = pending.pop()
+        for connected in connections[chain] - selected:
+            selected.add(connected)
+            pending.append(connected)
+    return torch.tensor([int(chain) in selected for chain in chain_index], dtype=torch.bool)
 
 
 def _affinity_crop(tokens: list[dict[str, object]], *, structure: Structure | None) -> list[int]:

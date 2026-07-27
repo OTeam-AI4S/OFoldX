@@ -396,7 +396,7 @@ def synthetic_batch(preset: Preset, config: Any, device: torch.device) -> Any:
     n_atoms = preset.n_atoms
     atom_to_token = torch.arange(n_atoms, device=device, dtype=torch.long).remainder(n_tokens)
     atom_to_token = atom_to_token.expand(batch_size, n_atoms).clone()
-    rep_mask, atom_token_index, token_to_rep_atom = confidence_atom_fields(atom_to_token[0], n_tokens)
+    _, atom_token_index, token_to_rep_atom = confidence_atom_fields(atom_to_token[0], n_tokens)
 
     token_features = torch.randn(batch_size, n_tokens, config.token_feature_size, device=device) * 0.02
     atom_features = torch.randn(batch_size, n_atoms, config.atom_feature_size, device=device) * 0.02
@@ -418,10 +418,11 @@ def synthetic_batch(preset: Preset, config: Any, device: torch.device) -> Any:
         reference_mask=reference_mask,
         reference_charges=torch.zeros(batch_size, n_atoms, 1, device=device),
         reference_space_id=torch.arange(n_atoms, device=device, dtype=torch.long).expand(batch_size, n_atoms).clone(),
-        representative_atom_mask=rep_mask.to(device=device),
         atom_token_index=atom_token_index.to(device=device),
         token_to_rep_atom=token_to_rep_atom.to(device=device).expand(batch_size, n_tokens).clone(),
         token_bonds=torch.zeros(batch_size, n_tokens, n_tokens, device=device),
+        msa_features=torch.zeros(batch_size, 1, n_tokens, 34, device=device),
+        msa_mask=torch.ones(batch_size, 1, n_tokens, device=device),
     )
 
 

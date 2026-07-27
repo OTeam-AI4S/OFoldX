@@ -50,6 +50,52 @@ class LigandMpnnModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import (
+        ...     AtomSite, ChemicalAtom, ChemicalComponent, MolecularSystem,
+        ...     Molecule, PolymerSequence, Structure,
+        ... )
+        >>> from ofoldx.models.ligandmpnn import (
+        ...     LigandMpnnConfig, LigandMpnnModel, LigandMpnnProcessor,
+        ...     LigandMpnnProcessorConfig,
+        ... )
+        >>> sequence = PolymerSequence.from_one_letter("A")
+        >>> ligand = Molecule((ChemicalComponent(
+        ...     "LIG", (ChemicalAtom("C1", "C"),), frozenset(),
+        ...     reference_coordinates=((0.0, 0.0, 0.0),),
+        ... ),))
+        >>> system = MolecularSystem(
+        ...     {"protein": sequence, "ligand": ligand},
+        ...     {"A": "protein", "L": "ligand"},
+        ... )
+        >>> sites = tuple(
+        ...     [AtomSite("A", 0, atom) for atom in ("N", "CA", "C", "O")]
+        ...     + [AtomSite("L", 0, "C1")]
+        ... )
+        >>> coordinates = np.array(
+        ...     [
+        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0],
+        ...         [1.0, 1.0, 0.0], [0.0, 3.0, 0.0],
+        ...     ],
+        ...     dtype=np.float32,
+        ... )
+        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> input = LigandMpnnProcessor(
+        ...     LigandMpnnProcessorConfig({"num_context_atoms": 1})
+        ... )(structure)
+        >>> config = LigandMpnnConfig(
+        ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_decoder_blocks": 1,
+        ...      "num_neighbors": 1, "dropout": 0.0}
+        ... )
+        >>> model = LigandMpnnModel(config)
+        >>> output = model(input, decoding_ranks=torch.zeros_like(input.sequence_tokens))
+        >>> output.logits.shape
+        torch.Size([1, 1, 21])
+        >>> output.decoding_ranks.tolist()
+        [[0]]
     """
 
     config_class = LigandMpnnConfig

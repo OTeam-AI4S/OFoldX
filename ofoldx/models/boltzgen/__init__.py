@@ -1,11 +1,60 @@
 r"""
-BoltzGen structure-design, confidence, and inverse-folding implementations.
+BoltzGen structure design, inverse folding, analysis, and released composition.
 """
 
 from __future__ import annotations
 
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
+from .analysis import (
+    AnalysisValue,
+    BoltzGenConditionedVendiScores,
+    BoltzGenDiversityAggregate,
+    BoltzGenDiversityMetrics,
+    BoltzGenDiversityResult,
+    BoltzGenDiversitySample,
+    BoltzGenStructureVendiScores,
+    CandidateFilter,
+    CandidateRanking,
+    FoldseekClusteringOperation,
+    FoldseekMatch,
+    FoldseekNoveltyOperation,
+    Liability,
+    LiabilityModality,
+    NoncovalentContacts,
+    PeptideType,
+    TargetDeltaSasa,
+    aligned_rmsd,
+    amino_acid_fractions,
+    analyze_diversity,
+    assign_secondary_structure,
+    binding_site_adherence,
+    binding_site_adherence_curve,
+    candidate_filter_results,
+    count_noncovalent_contacts,
+    deduplicate_sequences,
+    foldseek_clusters,
+    foldseek_novelty,
+    greedy_diversity_selection,
+    largest_hydrophobic_patch_area,
+    lddt,
+    liability_metrics,
+    rank_candidates,
+    secondary_structure_agreement,
+    secondary_structure_fractions,
+    sequence_hydrophobicity,
+    sequence_identity,
+    sequence_liabilities,
+    sequence_recovery,
+    sequence_vendi_score,
+    structure_coordinates,
+    structure_design_lddt,
+    structure_rmsd_metrics,
+    structure_tm_scores,
+    structure_vendi_scores,
+    target_delta_sasa,
+    vendi_score,
+)
 from .config import (
     BoltzGenConfidenceConfig,
     BoltzGenConfidenceHeadConfig,
@@ -21,12 +70,10 @@ from .config import (
 )
 from .model import (
     BoltzGenBinding,
-    BoltzGenConfidenceDesignOutput,
     BoltzGenConfidenceModel,
     BoltzGenConfidenceOutput,
     BoltzGenCovalentBond,
     BoltzGenDesignMask,
-    BoltzGenDesignOutput,
     BoltzGenDirectionalContact,
     BoltzGenInput,
     BoltzGenInverseFoldingDesignOutput,
@@ -37,6 +84,8 @@ from .model import (
     BoltzGenOutput,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
+    BoltzGenSampleOutput,
+    BoltzGenSampleWithConfidenceOutput,
     BoltzGenSchema,
     BoltzGenSecondaryStructure,
     BoltzGenStructureGroup,
@@ -61,7 +110,16 @@ from .objectives import (
     resolved_loss,
     smooth_lddt_loss,
 )
-from .pipeline import BoltzGenDesignCandidate, BoltzGenDesignResult, BoltzGenPipeline
+from .pipeline import (
+    BoltzGenCandidateAnalysis,
+    BoltzGenDesignCandidate,
+    BoltzGenDesignCheckpoint,
+    BoltzGenDesignedChainAnalysis,
+    BoltzGenDesignResult,
+    BoltzGenFilterOutcome,
+    BoltzGenPipeline,
+    BoltzGenProtocol,
+)
 from .processor import (
     BoltzGenInverseFoldingProcessor,
     BoltzGenProcessor,

@@ -218,6 +218,8 @@ class CoordinateEdmSampler(nn.Module):
         condition_coords: Tensor | None = None,
         condition_mask: Tensor | None = None,
         max_noise_level: float | None = None,
+        churn_rate: float | None = None,
+        step_scale: float | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
@@ -238,6 +240,8 @@ class CoordinateEdmSampler(nn.Module):
             condition_mask: Optional ``[..., N_atom]`` mask selecting coordinates
                 to pin from ``condition_coords``.
             max_noise_level: Optional per-call initial scheduler noise override.
+            churn_rate: Optional per-call extra-noise fraction.
+            step_scale: Optional per-call solver-step multiplier.
             generator: Optional RNG for reproducible sampling.
 
         Returns:
@@ -254,6 +258,8 @@ class CoordinateEdmSampler(nn.Module):
             condition_coords=condition_coords,
             condition_mask=condition_mask,
             max_noise_level=max_noise_level,
+            churn_rate=self.churn_rate if churn_rate is None else churn_rate,
+            step_scale=self.step_scale if step_scale is None else step_scale,
             generator=generator,
         )
 
@@ -269,6 +275,8 @@ class CoordinateEdmSampler(nn.Module):
         condition_coords: Tensor | None,
         condition_mask: Tensor | None,
         max_noise_level: float | None,
+        churn_rate: float,
+        step_scale: float,
         generator: torch.Generator | None,
     ) -> Tensor:
         r"""
@@ -284,6 +292,8 @@ class CoordinateEdmSampler(nn.Module):
             condition_coords: Optional fixed coordinates pinned after each step.
             condition_mask: Optional atom mask selecting fixed coordinates.
             max_noise_level: Optional per-call initial scheduler noise override.
+            churn_rate: Extra-noise fraction for this call.
+            step_scale: Solver-step multiplier for this call.
             generator: Optional RNG.
         Returns:
             Sampled coordinates.
@@ -375,6 +385,8 @@ class CoordinateEdmSampler(nn.Module):
                     condition_coords=step_condition_coords,
                     condition_mask=condition_mask,
                     is_terminal=step_index == num_transitions - 1,
+                    churn_rate=churn_rate,
+                    step_scale=step_scale,
                 )
                 if condition_mask is not None and step_condition_coords is not None:
                     coords = self._apply_condition(coords, step_condition_coords, condition_mask)
@@ -505,6 +517,8 @@ class CoordinateEdmSampler(nn.Module):
         condition_coords: Tensor | None = None,
         condition_mask: Tensor | None = None,
         is_terminal: bool = False,
+        churn_rate: float,
+        step_scale: float,
     ) -> Tensor:
         r"""
         Run one EDM coordinate update from ``sigma_prev`` to ``sigma_next``.
@@ -522,6 +536,8 @@ class CoordinateEdmSampler(nn.Module):
             condition_coords: Optional coords to keep fixed during denoising, already in the current frame.
             condition_mask: Optional atom mask selecting the fixed coords.
             is_terminal: If ``True``, skip the Heun correction even for the Heun solver.
+            churn_rate: Extra-noise fraction for this call.
+            step_scale: Solver-step multiplier for this call.
 
         Returns:
             Updated coords of shape `[..., N_sample, N_atom, 3]`.
@@ -529,7 +545,7 @@ class CoordinateEdmSampler(nn.Module):
 
         churn = torch.where(
             sigma_next > self.min_churn_noise_level,
-            sigma_next.new_tensor(self.churn_rate),
+            sigma_next.new_tensor(churn_rate),
             sigma_next.new_zeros(()),
         )
         sigma_hat = sigma_prev * (churn + 1)
@@ -559,7 +575,7 @@ class CoordinateEdmSampler(nn.Module):
 
         delta = self._derivative(noisy_coords, denoised_coords, noise_level)
         dt = sigma_next - sigma_hat
-        coords_next = noisy_coords + self.step_scale * dt[..., None, None] * delta
+        coords_next = noisy_coords + step_scale * dt[..., None, None] * delta
         if condition_mask is not None and condition_coords is not None:
             coords_next = self._apply_condition(coords_next, condition_coords, condition_mask)
         if self.solver == "euler" or is_terminal:
@@ -575,7 +591,7 @@ class CoordinateEdmSampler(nn.Module):
             noise_level=next_noise_level,
         )
         next_delta = self._derivative(coords_next, next_denoised_coords, next_noise_level)
-        coords_next = noisy_coords + self.step_scale * dt[..., None, None] * 0.5 * (delta + next_delta)
+        coords_next = noisy_coords + step_scale * dt[..., None, None] * 0.5 * (delta + next_delta)
         if condition_mask is not None and condition_coords is not None:
             coords_next = self._apply_condition(coords_next, condition_coords, condition_mask)
         return coords_next

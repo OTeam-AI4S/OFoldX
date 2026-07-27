@@ -145,6 +145,12 @@ class RfDiffusionConfig(Config):
         denoiser: RoseTTAFold denoiser architecture.
         diffuser: Forward-diffusion process.
         preprocess: Denoiser input feature schema.
+
+    Examples:
+        >>> from ofoldx.models.rfdiffusion import RfDiffusionConfig
+        >>> config = RfDiffusionConfig()
+        >>> config.diffuser.num_timesteps
+        50
     """
 
     denoiser: RfDiffusionDenoiserConfig = RfDiffusionDenoiserConfig()

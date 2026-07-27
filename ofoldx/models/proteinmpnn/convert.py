@@ -24,6 +24,57 @@ from .model import ProteinMpnnModel
 CA_EDGE_INPUT_WIDTH = 167
 
 
+def convert_proteinmpnn_model(
+    checkpoint_path: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None = None,
+    expected_noise_level: float | None = None,
+) -> ProteinMpnnModel:
+    r"""
+    Strict-load one released ProteinMPNN checkpoint into its native Model.
+
+    Args:
+        checkpoint_path: Released ProteinMPNN checkpoint.
+        dtype: Optional floating-point dtype for converted weights.
+        expected_noise_level: Optional released training-noise identity required
+            by a fixed composite model.
+
+    Returns:
+        The converted Model. Repository writers pair it with a Processor whose
+        ``ca_only`` setting comes from the converted Config.
+    """
+
+    checkpoint = torch.load(
+        Path(checkpoint_path).expanduser(),
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    if expected_noise_level is not None and float(checkpoint["noise_level"]) != expected_noise_level:
+        raise ValueError(
+            "ProteinMPNN checkpoint training noise does not match the fixed "
+            f"composition: expected {expected_noise_level}, "
+            f"got {checkpoint['noise_level']}"
+        )
+    state_dict = checkpoint["model_state_dict"]
+    config = ProteinMpnnConfig(
+        hidden_size=state_dict["W_s.weight"].shape[1],
+        num_encoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
+        num_decoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
+        num_neighbors=checkpoint["num_edges"],
+        ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
+    )
+    converted = convert_proteinmpnn_state_dict(state_dict)
+    if dtype is not None:
+        converted = {
+            key: value.to(dtype=dtype) if value.is_floating_point() else value for key, value in converted.items()
+        }
+    model = ProteinMpnnModel(config)
+    model.load_state_dict(converted, strict=True, assign=True)
+    model.eval()
+    return model
+
+
 def convert_proteinmpnn_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
@@ -43,23 +94,8 @@ def convert_proteinmpnn_checkpoint(
     from .pipeline import ProteinMpnnPipeline
     from .processor import ProteinMpnnProcessor
 
-    checkpoint = torch.load(
-        Path(checkpoint_path).expanduser(),
-        map_location="cpu",
-        weights_only=True,
-        mmap=True,
-    )
-    state_dict = checkpoint["model_state_dict"]
-    config = ProteinMpnnConfig(
-        hidden_size=state_dict["W_s.weight"].shape[1],
-        num_encoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("encoder_layers.")}),
-        num_decoder_blocks=len({int(key.split(".", 2)[1]) for key in state_dict if key.startswith("decoder_layers.")}),
-        num_neighbors=checkpoint["num_edges"],
-        ca_only=state_dict["features.edge_embedding.weight"].shape[1] == CA_EDGE_INPUT_WIDTH,
-    )
-    model = ProteinMpnnModel(config)
-    model.load_state_dict(convert_proteinmpnn_state_dict(state_dict), strict=True, assign=True)
-    processor = ProteinMpnnProcessor(ProteinMpnnProcessorConfig(ca_only=config.ca_only))
+    model = convert_proteinmpnn_model(checkpoint_path)
+    processor = ProteinMpnnProcessor(ProteinMpnnProcessorConfig(ca_only=model.config.ca_only))
     ProteinMpnnPipeline(model=model, processor=processor).save(
         output_dir,
         repo_id=repo_id,

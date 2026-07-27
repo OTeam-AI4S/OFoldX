@@ -12,7 +12,9 @@ pipeline_tag: other
 # AlphaFold 2
 
 Native PyTorch implementation of AlphaFold 2 monomer, monomer-pTM, and
-AlphaFold-Multimer for OFoldX.
+AlphaFold-Multimer for OFoldX, including the released five-model CASP14
+eight-ensemble protocol and the monomer/pTM initial-guess evaluator used by
+PXDesign.
 
 ## Disclaimer
 
@@ -36,7 +38,17 @@ complexes.
 ### Variants
 
 - **[oteam/alphafold2](https://huggingface.co/oteam/alphafold2)**: AlphaFold 2 monomer model with pLDDT confidence.
+- **CASP14 five-model Pipeline**: The fixed released `model_1` through
+  `model_5` monomer ensemble. Every checkpoint uses eight input ensembles; one
+  shared processed input is evaluated sequentially, all samples are
+  stable-ranked by mean pLDDT, and the concrete Pipeline owns optional Amber
+  relaxation of none, the best prediction, or all predictions.
 - **[oteam/alphafold2-ptm](https://huggingface.co/oteam/alphafold2-ptm)**: Monomer model with predicted aligned error and pTM confidence.
+- **AF2 initial guess**: Distinct monomer/pTM Model--Processor--Pipeline pair
+  using `model_1_ptm` weights. It seeds the first recycled atom37 `prev_pos`
+  state from an in-memory target--binder structure without initializing
+  Structure Module frames. Its all-GAP template retains backbone/CB geometry
+  for every chain and masks target--binder template pair features.
 - **[oteam/alphafold2-multimer](https://huggingface.co/oteam/alphafold2-multimer)**: AlphaFold-Multimer for multi-chain protein complexes.
 
 ### Model Specification
@@ -74,6 +86,57 @@ import ofoldx
 
 output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/alphafold2")
 ```
+
+Convert the official parameter directory or tar into the fixed composite:
+
+```bash
+python -m ofoldx.models.alphafold2.convert \
+  /path/to/official/params /path/to/alphafold2-casp14 \
+  --casp14-five-model
+```
+
+The repository stores `model_1` at the root and `model_2` through `model_5` in
+matching fixed subdirectories. Each remains an ordinary AlphaFold 2
+Model--Processor pair. Load the composite through the same high-level API:
+
+```python
+pipeline = ofoldx.pipeline("fold", model="/path/to/alphafold2-casp14")
+result = pipeline.fold(
+    "MKTAYIAKQRQISFVKSHFSRQ",
+    num_samples=1,
+    models_to_relax="best",
+    platform="CPU",
+)
+best = result.best
+```
+
+`result.ranked` retains every prediction, its official checkpoint name,
+zero-based sample index, and any Amber relaxation result. Equal mean-pLDDT
+values retain checkpoint and sample generation order.
+
+The initial-guess variant consumes a sequence-assigned target--binder
+`Structure` and an explicit binder instance:
+
+```bash
+python -m ofoldx.models.alphafold2.convert \
+  /path/to/official/params /path/to/alphafold2-initial-guess \
+  --initial-guess
+```
+
+```python
+initial_guess_pipeline = ofoldx.pipeline(
+    "fold",
+    model="/path/to/alphafold2-initial-guess",
+)
+result = initial_guess_pipeline.fold(
+    structure,
+    binder_instance_id="binder",
+    num_recycles=3,
+)
+```
+
+Amber relaxation also remains an independently callable family operation over a
+decoded structure.
 
 ## Training Details
 

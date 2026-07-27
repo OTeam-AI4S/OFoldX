@@ -6,41 +6,28 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field, replace
 from functools import cache
 from os import PathLike
 from pathlib import Path
 from typing import cast
 
-import chanfig
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing_extensions import Self
 
-from ...artifacts import save_model
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import AMINO_ACID_THREE_TO_ONE, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...hub import (
-    MIRROR_REPOSITORY,
-    PROCESSOR_METADATA,
-    hydrate_weights,
-    load_registered_model,
-    load_registered_processor,
-    model_values,
-    resolve_repository,
-    upload_repository,
-)
 from ...io import read_fasta_records, read_msa
-from ...pipelines import PIPELINES, PairedPipeline, resolve_generator
+from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
 from ...references import classify_reference
-from ...results import FoldResult, Metric, PairMetric, Score
+from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from ...results.values import best
 from .model import (
     EsmFold2ExperimentalModel,
-    EsmFold2ExperimentalSample,
+    EsmFold2ExperimentalPrediction,
     EsmFold2Input,
     EsmFold2Model,
     compute_esmc_masked_lm_logits,
@@ -90,21 +77,15 @@ _LOSS_WEIGHTS = {"intra_contact": 0.5, "inter_contact": 0.5, "glob": 0.2}
 _LEARNING_RATE = 0.1
 _TEMPERATURE_MIN = 1e-2
 
-# ESMC pseudo-perplexity regularizer mask-sampling constants. The gradient weight blending
-# this masked-LM prior into the structure objective is stored in
-# ``EsmFold2ExperimentalConfig.language_model_weight`` and is not selected per call.
+# ESMC pseudo-perplexity regularizer mask-sampling constants.
 _ESMC_MASK_FRACTION = 0.15
 _LM_MASK_PASSES = 4
 _LM_LOSS_CHUNK = 128
-_ESMC_METADATA = (
-    "config.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
-    "vocab.txt",
-)
-_DESIGN_REPOSITORY_METADATA = (*PROCESSOR_METADATA, *(f"esmc/{filename}" for filename in _ESMC_METADATA))
-_DESIGN_REPOSITORY_MIRROR = (*MIRROR_REPOSITORY, *_DESIGN_REPOSITORY_METADATA)
+
+_FAST_CHECKPOINT = "ESMFold2-Experimental-Fast"
+_FAST_CUTOFF2025_CHECKPOINT = "ESMFold2-Experimental-Fast-Cutoff2025"
+_EXPERIMENTAL_CHECKPOINT = "ESMFold2-Experimental"
+_EXPERIMENTAL_CUTOFF2025_CHECKPOINT = "ESMFold2-Experimental-Cutoff2025"
 
 
 class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
@@ -193,484 +174,128 @@ class EsmFold2Pipeline(PairedPipeline[EsmFold2Model, EsmFold2Processor]):
         )
 
 
-class EsmFold2DesignPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2ExperimentalProcessor]):
+class EsmFold2ExperimentalPipeline(PairedPipeline[EsmFold2ExperimentalModel, EsmFold2ExperimentalProcessor]):
     r"""
-    Binder sequence design pipeline for experimental ESMFold 2.
+    Independently callable experimental ESMFold2 Model--Processor pair.
     """
 
     model_architecture = "esmfold2_experimental"
 
-    @classmethod
-    def from_repository(
-        cls,
-        repository: str | PathLike[str],
-        *,
-        revision: str | None = None,
-        token: str | None = None,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> Self:
-        r"""
-        Load the design Pipeline and its ESMC masked-LM child.
-
-        Args:
-            repository: Local directory or Hub repository id.
-            revision: Optional Hub revision.
-            token: Optional Hub authentication token.
-            device: Device for the loaded Models and Processor.
-            dtype: Floating-point dtype for loaded Models and Processor.
-
-        Returns:
-            An ``EsmFold2DesignPipeline`` with the masked-LM child attached.
-        """
-
-        from multimolecule import AutoTokenizer, EsmCConfig, EsmCForMaskedLM, ProteinTokenizer
-        from transformers import AutoConfig, AutoModelForMaskedLM
-
-        metadata_repository = resolve_repository(
-            repository,
-            revision=revision,
-            allow_patterns=_DESIGN_REPOSITORY_METADATA,
-            token=token,
-        )
-        registration, values = model_values(metadata_repository.path)
-        if registration.id != cls.model_architecture:
-            raise ValueError(
-                f"{cls.__name__} requires architecture {cls.model_architecture!r}; "
-                f"repository declares {registration.id!r}"
-            )
-        config = registration.model_config(values)
-        with torch.device("meta"):
-            model = registration.model(config)
-        processor = load_registered_processor(
-            metadata_repository,
-            registration,
-            device=device,
-            dtype=dtype,
-        )
-
-        esmc_metadata = metadata_repository.path / "esmc"
-        esmc_config = AutoConfig.from_pretrained(esmc_metadata, local_files_only=True)
-        if type(esmc_config) is not EsmCConfig:
-            raise ValueError(f"{cls.__name__} requires an ESMC child; repository declares {esmc_config.model_type!r}")
-        tokenizer = cast(
-            ProteinTokenizer,
-            AutoTokenizer.from_pretrained(
-                esmc_metadata,
-                config=esmc_config,
-                local_files_only=True,
-            ),
-        )
-        with torch.device("meta"):
-            esmc_graph = AutoModelForMaskedLM.from_config(esmc_config)
-        del esmc_graph
-
-        root_repository = hydrate_weights(metadata_repository, token=token)
-        model = load_registered_model(
-            root_repository,
-            model,
-            device=device,
-            dtype=dtype,
-        )
-        if metadata_repository.repository is None:
-            esmc = cast(
-                EsmCForMaskedLM,
-                AutoModelForMaskedLM.from_pretrained(
-                    metadata_repository.path / "esmc",
-                    config=esmc_config,
-                    local_files_only=True,
-                    dtype=dtype,
-                ),
-            )
-        else:
-            esmc = cast(
-                EsmCForMaskedLM,
-                AutoModelForMaskedLM.from_pretrained(
-                    metadata_repository.repository,
-                    revision=metadata_repository.commit,
-                    subfolder="esmc",
-                    token=token,
-                    config=esmc_config,
-                    dtype=dtype,
-                ),
-            )
-        if device is not None:
-            esmc.to(device=device)
-        experimental_processor = cast(EsmFold2ExperimentalProcessor, processor)
-        experimental_processor.tokenizer = tokenizer
-        experimental_model = cast(EsmFold2ExperimentalModel, model)
-        experimental_model.load_esmc(esmc)
-        return cls(
-            model=experimental_model,
-            processor=experimental_processor,
-        )
-
-    def save(
+    @torch.inference_mode()
+    def fold(
         self,
-        directory: str | PathLike[str],
+        input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
         *,
-        max_shard_size: int | str = "5GB",
-        repo_id: str | None = None,
-        token: str | None = None,
-        private: bool = False,
-        commit_message: str | None = None,
-    ) -> None:
-        r"""
-        Save the experimental design pair, ESMC child, and tokenizer.
-
-        Args:
-            directory: Local repository directory.
-            max_shard_size: Maximum size of each model-weight shard.
-            repo_id: Optional Hub repository receiving the saved directory.
-            token: Optional Hub authentication token.
-            private: Whether a newly created Hub repository is private.
-            commit_message: Optional Hub commit message.
-        """
-
-        from huggingface_hub import save_torch_state_dict
-
-        pipeline_id = PIPELINES.id_for(type(self))
-        if pipeline_id is None:
-            raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
-        self._validate_pair(self.model, self.processor)
-        esmc = self.model.esmc
-        lm_head = self.model.esmc_lm_head
-        if esmc is None or lm_head is None:
-            raise RuntimeError("saving ESMFold2 design requires an attached EsmCForMaskedLM")
-
-        destination = Path(directory).expanduser()
-        self.model.esmc = None
-        self.model.esmc_lm_head = None
-        try:
-            save_model(
-                destination,
-                model=self.model,
-                processor=self.processor,
-                max_shard_size=max_shard_size,
-            )
-        finally:
-            self.model.esmc = esmc
-            self.model.esmc_lm_head = lm_head
-
-        esmc_destination = destination / "esmc"
-        esmc_destination.mkdir(parents=True, exist_ok=True)
-        for filename in _ESMC_METADATA:
-            (esmc_destination / filename).unlink(missing_ok=True)
-        esmc.config.save_pretrained(esmc_destination)
-        esmc_state = {f"model.{name}": value for name, value in esmc.state_dict().items()}
-        esmc_state.update({f"lm_head.{name}": value for name, value in lm_head.state_dict().items()})
-        save_torch_state_dict(
-            esmc_state,
-            esmc_destination,
-            filename_pattern="model{suffix}.safetensors",
-            max_shard_size=max_shard_size,
-            safe_serialization=True,
-        )
-        self.processor.tokenizer.save_pretrained(esmc_destination)
-        chanfig.NestedDict({"pipeline": pipeline_id}).dump(destination / "pipeline.json")
-
-        if repo_id is not None:
-            upload_repository(
-                destination,
-                repo_id,
-                token=token,
-                private=private,
-                commit_message=commit_message,
-                delete_patterns=_DESIGN_REPOSITORY_MIRROR,
-            )
-
-    def design(
-        self,
-        input: str | PathLike[str] | Structure | MolecularSystem,
-        *,
-        binder_length: int,
-        binder_prompt: str | None = None,
-        num_candidates: int = 1,
-        num_optimization_steps: int = 150,
-        remove_cysteines: bool = True,
+        msa: MSA | MSACollection | str | PathLike[str] | None = None,
+        num_samples: int = 1,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> EsmFold2DesignResult:
+        recycling_steps: int | None = None,
+        num_sampling_steps: int | None = None,
+        language_model_mask_probability: float = 0.0,
+        max_inference_sigma: float | None = 256.0,
+        noise_scale: float | None = None,
+        step_scale: float | None = None,
+    ) -> FoldResult:
         r"""
-        Design and refold binder candidates against one single-chain protein target.
+        Fold one system with an independently saved experimental pair.
 
         Args:
-            input: One-letter sequence, FASTA path, ``Structure``, or ``MolecularSystem``
-                resolving to one protein chain.
-            binder_length: Number of residues in each designed binder.
-            binder_prompt: Optional prompt of length ``binder_length``. One-letter amino acids
-                fix positions and ``'#'`` marks mutable positions; ``None`` makes every position
-                mutable. ``antibody_cdr_prompt`` can construct a CDR-only prompt.
-            num_candidates: Number of independently optimized and refolded candidates.
-            num_optimization_steps: Gradient optimization steps per candidate.
-            remove_cysteines: Whether to exclude cysteine from mutable positions.
-            seed: Optional integer seed, mutually exclusive with ``generator``.
-            generator: Optional PyTorch random generator, mutually exclusive with ``seed``.
+            input: Sequence text, FASTA path, one or more protein sequences,
+                molecular system, or structure topology.
+            msa: Optional MSA evidence or alignment path. Fast checkpoints reject
+                this argument.
+            num_samples: Number of coordinate samples and returned predictions.
+            seed: Integer seed, mutually exclusive with ``generator``.
+            generator: PyTorch random generator, mutually exclusive with ``seed``.
+            recycling_steps: Number of recurrent trunk passes. ``None`` uses the
+                configured value.
+            num_sampling_steps: Number of diffusion sampling steps. ``None`` uses
+                the configured value.
+            language_model_mask_probability: Probability of masking each nonspecial
+                language-model token.
+            max_inference_sigma: Largest diffusion sigma included in sampling.
+                ``None`` keeps the full schedule.
+            noise_scale: Sampler noise multiplier. ``None`` uses the configured value.
+            step_scale: Sampler step-size multiplier. ``None`` uses the configured value.
 
         Returns:
-            An ``EsmFold2DesignResult`` containing the generation-ordered folded candidates.
-
-        Notes:
-            Optimization updates soft residue logits at mutable positions, retains each
-            candidate's best distogram-ipTM proxy, and refolds the resulting discrete sequence.
-            The optional masked-LM gradient uses the Model's ``language_model_weight``; a nonzero
-            weight requires an attached masked-LM head.
+            A [`FoldResult`][ofoldx.results.FoldResult] containing structures and
+            the confidence values published by the experimental head.
         """
 
-        if binder_length <= 0:
-            raise ValueError("binder_length must be positive")
-        if num_candidates <= 0:
-            raise ValueError("num_candidates must be positive")
-        if num_optimization_steps <= 0:
-            raise ValueError("num_optimization_steps must be positive")
-        prompt = _MUTABLE_TOKEN * binder_length if binder_prompt is None else binder_prompt
-        if len(prompt) != binder_length:
-            raise ValueError("binder_prompt length must equal binder_length")
-
-        model = self.model
-        # The sequence-prior weight is fixed by the Model configuration rather than inferred from
-        # the input or prompt.
-        language_model_weight = model.config.language_model_weight
-        if language_model_weight != 0 and model.esmc_lm_head is None:
-            raise RuntimeError("binder design with a nonzero language_model_weight requires an EsmCForMaskedLM")
-        processor = self.processor
-        base_generator = resolve_generator(seed, generator, device=model.left_pair_projection.weight.device)
-        with _frozen_eval(model):
-            return self._run_design(
-                model=model,
-                processor=processor,
-                input=input,
-                prompt=prompt,
-                binder_length=binder_length,
-                num_candidates=num_candidates,
-                num_optimization_steps=num_optimization_steps,
-                remove_cysteines=remove_cysteines,
-                language_model_weight=language_model_weight,
-                generator=base_generator,
-            )
-
-    def _run_design(
-        self,
-        *,
-        model: EsmFold2ExperimentalModel,
-        processor: EsmFold2ExperimentalProcessor,
-        input: str | PathLike[str] | Structure | MolecularSystem,
-        prompt: str,
-        binder_length: int,
-        num_candidates: int,
-        num_optimization_steps: int,
-        remove_cysteines: bool,
-        language_model_weight: float,
-        generator: torch.Generator | None,
-    ) -> EsmFold2DesignResult:
-        device = model.left_pair_projection.weight.device
-
-        target_sequence = _target_one_letter(input)
-        target_length = len(target_sequence)
-        target_batch = processor(PolymerSequence.from_one_letter(target_sequence))
-        target_residue_type_features = (
-            F.one_hot(target_batch.residue_type_ids.long(), num_classes=33).float().to(device)
-        )
-
-        candidates: list[EsmFold2DesignCandidate] = []
-        for _ in range(num_candidates):
-            logits, gradient_mask = self._initial_logits(prompt, remove_cysteines, generator, device)
-            best_sequence = ""
-            best_proxy = -math.inf
-
-            optimizer = torch.optim.SGD([logits], lr=_LEARNING_RATE)
-            for step in range(num_optimization_steps):
-                t = (step + 1) / num_optimization_steps
-                temperature = _TEMPERATURE_MIN + (1 - _TEMPERATURE_MIN) * 0.5 * (1 + math.cos(math.pi * t))
-
-                optimizer.zero_grad()
-                design = F.softmax(logits / temperature, dim=-1)
-                binder_sequence = "".join(_INDEX_TO_AMINO_ACID[int(i)] for i in design.argmax(dim=-1)[0])
-                batch = processor(
-                    [
-                        PolymerSequence.from_one_letter(target_sequence),
-                        PolymerSequence.from_one_letter(binder_sequence),
-                    ]
-                )
-                residue_type_probabilities = torch.cat([target_residue_type_features, F.pad(design, (2, 11))], dim=1)
-
-                distogram = model.forward(
-                    batch,
-                    residue_type_probabilities=residue_type_probabilities,
-                    recycling_steps=2,
-                    generator=generator,
-                ).float()
-                losses = _structure_losses(distogram, binder_length)
-                structure_grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
-                combined_grad = _normalized_gradient(structure_grad, gradient_mask)
-
-                # Add the ESMC pseudo-perplexity regularizer whenever a masked-LM head is attached.
-                # Each gradient is length-normalized over mutable positions before summation.
-                if model.esmc_lm_head is not None:
-                    design_lm = F.softmax(logits / temperature, dim=-1)
-                    score_mask = gradient_mask.sum(dim=-1) > 0
-                    plm_loss = _esmc_pseudo_perplexity_nll(
-                        model,
-                        design_lm,
-                        score_mask,
-                        generator=generator,
-                    )
-                    plm_grad = torch.autograd.grad(plm_loss.mean(), logits)[0]
-                    plm_term = _normalized_gradient(plm_grad, gradient_mask)
-                    combined_grad = combined_grad + language_model_weight * plm_term
-
-                logits.grad = combined_grad
-                for group in optimizer.param_groups:
-                    group["lr"] = _LEARNING_RATE * temperature
-                optimizer.step()
-
-                proxy = _distogram_iptm_proxy(distogram.detach(), target_length, binder_length)
-                if step == 0 or proxy > best_proxy:
-                    best_proxy = proxy
-                    best_sequence = binder_sequence
-
-            candidates.append(
-                self._refold(
-                    processor,
-                    model,
-                    target_sequence,
-                    best_sequence,
-                    target_length,
-                    generator,
-                )
-            )
-
-        return EsmFold2DesignResult(candidates=tuple(candidates))
-
-    def _initial_logits(
-        self,
-        prompt: str,
-        remove_cysteines: bool,
-        generator: torch.Generator | None,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        r"""
-        Seed soft-sequence logits and the mutable-position gradient mask from the prompt.
-        """
-
-        length = len(prompt)
-        noise = 0.01 * torch.randn(
-            1,
-            length,
-            _AA_DIMS,
+        if msa is not None and not self.processor.config.msa_conditioning:
+            raise ValueError("this ESMFold2 checkpoint is the single-sequence Fast variant")
+        system = _fold_system(input)
+        msa = _fold_msa(msa, system)
+        generator = resolve_generator(seed, generator, device=self.processor.device)
+        processed = self.processor(system, msa=msa)
+        prediction = self.model.sample_with_confidence(
+            processed,
+            recycling_steps=recycling_steps,
+            num_samples=num_samples,
+            num_sampling_steps=num_sampling_steps,
+            language_model_mask_probability=language_model_mask_probability,
+            max_inference_sigma=max_inference_sigma,
+            noise_scale=noise_scale,
+            step_scale=step_scale,
             generator=generator,
-            device=device,
         )
-        logits = torch.zeros(1, length, _AA_DIMS, device=device)
-        mask = torch.ones(1, length, _AA_DIMS, device=device)
-        for i, symbol in enumerate(prompt):
-            if symbol == _MUTABLE_TOKEN:
-                logits[:, i, :] = noise[:, i, :]
-                if remove_cysteines:
-                    logits[:, i, _CYSTEINE_INDEX] = -1e6
-                    mask[:, i, _CYSTEINE_INDEX] = 0.0
-            else:
-                if symbol not in _AMINO_ACID_TO_INDEX:
-                    raise ValueError(f"binder_prompt symbol {symbol!r} is not a standard amino acid or '#'")
-                logits[:, i, _AMINO_ACID_TO_INDEX[symbol]] = 10.0
-                mask[:, i, :] = 0.0
-        return logits.requires_grad_(True), mask
 
-    def _refold(
-        self,
-        processor: EsmFold2ExperimentalProcessor,
-        model: EsmFold2ExperimentalModel,
-        target_sequence: str,
-        binder_sequence: str,
-        target_length: int,
-        generator: torch.Generator | None,
-    ) -> EsmFold2DesignCandidate:
-        r"""
-        Discretely refold one designed target|binder complex into a scored candidate.
-        """
-
-        batch = processor(
-            [
-                PolymerSequence.from_one_letter(target_sequence),
-                PolymerSequence.from_one_letter(binder_sequence),
-            ]
-        )
-        with torch.no_grad():
-            prediction = model.sample_with_confidence(
-                batch,
-                recycling_steps=None,
-                num_diffusion_samples=1,
-                generator=generator,
+        return FoldResult(
+            predictions=tuple(
+                _experimental_fold_prediction(
+                    processed,
+                    prediction,
+                    batch_index=0,
+                    sample_index=sample_index,
+                )
+                for sample_index in range(num_samples)
             )
-        sample = prediction.sample
-        confidence = prediction.confidence
-        structure = self._structure(batch, sample)
-        binder_length = len(binder_sequence)
-        proxy = _distogram_iptm_proxy(sample.distogram_logits.float(), target_length, binder_length)
-        scores = {
-            "iptm": Score(float(confidence.iptm[0].item()), preferred="higher"),
-            "ptm": Score(float(confidence.ptm[0].item()), preferred="higher"),
-            "mean_plddt": Score(float(confidence.mean_plddt[0].item()) * 100.0, preferred="higher"),
-            "complex_iplddt": Score(
-                float(confidence.complex_iplddt[0].item()) * 100.0,
-                preferred="higher",
-            ),
-            "distogram_iptm_proxy": Score(proxy, preferred="higher"),
-        }
-        layout = batch.layout
-        atom_count = len(layout.atom_sites)
-        metrics = {
-            "plddt": Metric(
-                values=confidence.plddt[0].float().cpu().numpy() * 100.0,
-                axis=layout.token_sites,
-            ),
-            "plddt_per_atom": Metric(
-                values=confidence.plddt_per_atom[0, :atom_count].float().cpu().numpy() * 100.0,
-                axis=layout.atom_sites,
-            ),
-            "plddt_ca": Metric(
-                values=confidence.plddt_ca[0].float().cpu().numpy() * 100.0,
-                axis=layout.token_sites,
-            ),
-        }
-        chain_axis = tuple(layout.system.instances)
-        pair_metrics = {
-            "pae": PairMetric(
-                values=confidence.pae[0].float().cpu().numpy(),
-                row_axis=layout.token_sites,
-                column_axis=layout.token_sites,
-                unit="angstrom",
-            ),
-            "chain_pair_iptm": PairMetric(
-                values=confidence.chain_pair_iptm[0].float().cpu().numpy(),
-                row_axis=chain_axis,
-                column_axis=chain_axis,
-            ),
-        }
-        return EsmFold2DesignCandidate(structure=structure, scores=scores, metrics=metrics, pair_metrics=pair_metrics)
-
-    @staticmethod
-    def _structure(input: EsmFold2Input, sample: EsmFold2ExperimentalSample) -> Structure:
-        r"""
-        Scatter model atoms onto the complete non-hydrogen sites of the target|binder system.
-        """
-
-        layout = input.layout
-        atom_count = len(layout.atom_sites)
-        raw_coordinates = sample.coordinates[0, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
-        coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-        coordinates[model_to_complete] = raw_coordinates
-        coordinate_mask[model_to_complete] = True
-        return Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
         )
+
+
+@dataclass(frozen=True)
+class EsmFold2DesignStep:
+    r"""
+    One candidate's scientific values from one inversion optimization step.
+
+    Args:
+        temperature: Softmax temperature for this step.
+        inversion_checkpoint: Released inversion checkpoint selected for this step.
+        intra_contact_loss: Binder intra-contact term.
+        inter_contact_loss: Target--binder contact term.
+        globularity_loss: Binder globularity term.
+        pseudoperplexity_loss: ESMC pseudo-perplexity term.
+        total_loss: Reported structure-plus-pseudo-perplexity loss.
+    """
+
+    temperature: float
+    inversion_checkpoint: str
+    intra_contact_loss: float
+    inter_contact_loss: float
+    globularity_loss: float
+    pseudoperplexity_loss: float
+    total_loss: float
+
+
+@dataclass(eq=False)
+class EsmFold2CriticEvaluation:
+    r"""
+    One coherent released-critic evaluation of a designed sequence.
+
+    Args:
+        checkpoint: Exact released critic checkpoint role.
+        prediction: Structure and all aligned decoded confidence values from one fold.
+        distogram_iptm_proxy: Whole-binder distogram interface proxy.
+        cdr_distogram_iptm_proxy: Antibody CDR-only proxy, or ``None`` for
+            non-antibody design.
+    """
+
+    checkpoint: str
+    prediction: FoldPrediction
+    distogram_iptm_proxy: float
+    cdr_distogram_iptm_proxy: float | None
 
 
 @dataclass(eq=False)
@@ -679,13 +304,47 @@ class EsmFold2DesignCandidate:
     One folded target-binder complex and its aligned scientific values.
 
     Args:
-        structure: Folded target-binder complex.
+        sequence: Selected binder amino-acid sequence.
+        structure: Experimental-Cutoff2025 target-binder complex used for selection.
+        final_logits: Final optimized binder logits with shape ``(L, 20)``.
+        best_iptm: Highest actual low-temperature inversion iPTM.
+        trajectory: Complete scientific optimization trajectory.
+        inversion_checkpoint: Released inversion checkpoint that produced
+            ``inversion_prediction`` and ``best_iptm``.
+        inversion_prediction: Coherent structure and confidence values from the
+            inversion step attaining ``best_iptm``.
+        inversion_distogram_iptm_proxy: Distogram interface proxy aligned to
+            ``inversion_prediction``.
+        critic_evaluations: Fixed hero and executed scaling evaluations.
+        is_antibody: Whether the released antibody-specific filter and proxy
+            semantics apply.
+        isoelectric_point: Bjellqvist isoelectric point used by the released filter.
+        passes_isoelectric_point_filter: Whether the candidate passes selection's
+            non-antibody pI gate.
+        hero_mean_iptm: Mean actual iPTM from the four fixed hero critics.
+        scaling_mean_iptm_proxy: Mean fixed scaling-ensemble proxy, or zero when
+            scaling evaluation was skipped.
+        selection_score: Equal-weight hero/scaling selection score.
         scores: Scalar scores keyed by stable scientific names.
         metrics: One-axis metrics keyed by stable scientific names.
         pair_metrics: Two-axis metrics keyed by stable scientific names.
     """
 
+    sequence: str
     structure: Structure
+    final_logits: torch.Tensor
+    best_iptm: float
+    trajectory: tuple[EsmFold2DesignStep, ...]
+    inversion_checkpoint: str
+    inversion_prediction: FoldPrediction
+    inversion_distogram_iptm_proxy: float
+    critic_evaluations: tuple[EsmFold2CriticEvaluation, ...] = ()
+    is_antibody: bool = False
+    isoelectric_point: float | None = None
+    passes_isoelectric_point_filter: bool = False
+    hero_mean_iptm: float | None = None
+    scaling_mean_iptm_proxy: float | None = None
+    selection_score: float | None = None
     scores: dict[str, Score] = field(default_factory=dict)
     metrics: dict[str, Metric] = field(default_factory=dict)
     pair_metrics: dict[str, PairMetric] = field(default_factory=dict)
@@ -698,9 +357,20 @@ class EsmFold2DesignResult:
 
     Args:
         candidates: Folded target-binder complexes in generation order.
+        selected_indices: Stable descending-score indices of the at most 84
+            candidates passing the released filter.
     """
 
     candidates: tuple[EsmFold2DesignCandidate, ...]
+    selected_indices: tuple[int, ...]
+
+    @property
+    def selected(self) -> tuple[EsmFold2DesignCandidate, ...]:
+        r"""
+        Return selected candidates in stable descending score order.
+        """
+
+        return tuple(self.candidates[index] for index in self.selected_indices)
 
     def best(self, score: str) -> EsmFold2DesignCandidate:
         r"""
@@ -714,6 +384,809 @@ class EsmFold2DesignResult:
         """
 
         return best(self.candidates, score)
+
+
+class EsmFold2DesignPipeline(CompositePipeline):
+    r"""
+    Complete released ESMFold2 binder-design composition.
+    """
+
+    pair_layout = (
+        CompositePair("", "esmfold2_experimental", "fast", None, wrap=EsmFold2ExperimentalPipeline),
+        CompositePair(
+            "fast_cutoff2025",
+            "esmfold2_experimental",
+            "fast_cutoff2025",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "experimental",
+            "esmfold2_experimental",
+            "experimental",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "experimental_cutoff2025",
+            "esmfold2_experimental",
+            "experimental_cutoff2025",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base300m_step250k",
+            "esmfold2_experimental",
+            "base300m_step250k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base300m_step500k",
+            "esmfold2_experimental",
+            "base300m_step500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base300m_step750k",
+            "esmfold2_experimental",
+            "base300m_step750k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base300m_step1000k",
+            "esmfold2_experimental",
+            "base300m_step1000k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base300m_step1500k",
+            "esmfold2_experimental",
+            "base300m_step1500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base600m_step250k",
+            "esmfold2_experimental",
+            "base600m_step250k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base600m_step500k",
+            "esmfold2_experimental",
+            "base600m_step500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base600m_step750k",
+            "esmfold2_experimental",
+            "base600m_step750k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base600m_step1000k",
+            "esmfold2_experimental",
+            "base600m_step1000k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base600m_step1500k",
+            "esmfold2_experimental",
+            "base600m_step1500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base6b_step250k",
+            "esmfold2_experimental",
+            "base6b_step250k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base6b_step500k",
+            "esmfold2_experimental",
+            "base6b_step500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base6b_step750k",
+            "esmfold2_experimental",
+            "base6b_step750k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base6b_step1000k",
+            "esmfold2_experimental",
+            "base6b_step1000k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+        CompositePair(
+            "scaling/base6b_step1500k",
+            "esmfold2_experimental",
+            "base6b_step1500k",
+            None,
+            wrap=EsmFold2ExperimentalPipeline,
+        ),
+    )
+
+    def __init__(
+        self,
+        *,
+        fast: EsmFold2ExperimentalPipeline,
+        fast_cutoff2025: EsmFold2ExperimentalPipeline,
+        experimental: EsmFold2ExperimentalPipeline,
+        experimental_cutoff2025: EsmFold2ExperimentalPipeline,
+        base300m_step250k: EsmFold2ExperimentalPipeline,
+        base300m_step500k: EsmFold2ExperimentalPipeline,
+        base300m_step750k: EsmFold2ExperimentalPipeline,
+        base300m_step1000k: EsmFold2ExperimentalPipeline,
+        base300m_step1500k: EsmFold2ExperimentalPipeline,
+        base600m_step250k: EsmFold2ExperimentalPipeline,
+        base600m_step500k: EsmFold2ExperimentalPipeline,
+        base600m_step750k: EsmFold2ExperimentalPipeline,
+        base600m_step1000k: EsmFold2ExperimentalPipeline,
+        base600m_step1500k: EsmFold2ExperimentalPipeline,
+        base6b_step250k: EsmFold2ExperimentalPipeline,
+        base6b_step500k: EsmFold2ExperimentalPipeline,
+        base6b_step750k: EsmFold2ExperimentalPipeline,
+        base6b_step1000k: EsmFold2ExperimentalPipeline,
+        base6b_step1500k: EsmFold2ExperimentalPipeline,
+    ) -> None:
+        self.fast = fast
+        self.fast_cutoff2025 = fast_cutoff2025
+        self.experimental = experimental
+        self.experimental_cutoff2025 = experimental_cutoff2025
+        self.base300m_step250k = base300m_step250k
+        self.base300m_step500k = base300m_step500k
+        self.base300m_step750k = base300m_step750k
+        self.base300m_step1000k = base300m_step1000k
+        self.base300m_step1500k = base300m_step1500k
+        self.base600m_step250k = base600m_step250k
+        self.base600m_step500k = base600m_step500k
+        self.base600m_step750k = base600m_step750k
+        self.base600m_step1000k = base600m_step1000k
+        self.base600m_step1500k = base600m_step1500k
+        self.base6b_step250k = base6b_step250k
+        self.base6b_step500k = base6b_step500k
+        self.base6b_step750k = base6b_step750k
+        self.base6b_step1000k = base6b_step1000k
+        self.base6b_step1500k = base6b_step1500k
+        self._validate_components()
+
+    def design(
+        self,
+        input: str | PathLike[str] | Structure | MolecularSystem,
+        *,
+        binder_length: int,
+        binder_prompt: str | None = None,
+        num_candidates: int = 1,
+        num_optimization_steps: int = 150,
+        is_antibody: bool = False,
+        use_scaling_critics: bool = True,
+        language_model_weight: float | None = None,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> EsmFold2DesignResult:
+        r"""
+        Run the released inversion, critic-evaluation, filtering, and selection protocol.
+
+        Args:
+            input: One-letter sequence, FASTA path, ``Structure``, or
+                ``MolecularSystem`` resolving to one protein chain.
+            binder_length: Number of residues in each designed binder.
+            binder_prompt: Optional prompt of length ``binder_length``. One-letter
+                amino acids fix positions and ``'#'`` marks mutable positions;
+                ``None`` makes every position mutable.
+            num_candidates: Number of jointly optimized binder candidates.
+            num_optimization_steps: Number of soft-sequence optimization steps.
+            is_antibody: Whether the prompt is an antibody design.
+            use_scaling_critics: Whether to execute the fixed fifteen-checkpoint
+                scaling ensemble. All fifteen pairs remain required by the repository.
+            language_model_weight: ESMC gradient coefficient. ``None`` selects
+                ``0.05`` for antibodies and ``0.15`` otherwise.
+            seed: Optional integer seed, mutually exclusive with ``generator``.
+            generator: Optional caller-owned generator advanced by checkpoint
+                selection, model stochasticity, diffusion, and ESMC masking.
+
+        Returns:
+            Every generated design, its critic evaluations and scores, and the
+            stable indices of at most 84 selected designs.
+        """
+
+        if binder_length <= 0:
+            raise ValueError("binder_length must be positive")
+        if num_candidates <= 0:
+            raise ValueError("num_candidates must be positive")
+        if num_optimization_steps <= 0:
+            raise ValueError("num_optimization_steps must be positive")
+        prompt = _MUTABLE_TOKEN * binder_length if binder_prompt is None else binder_prompt
+        if len(prompt) != binder_length:
+            raise ValueError("binder_prompt length must equal binder_length")
+
+        coefficient = (0.05 if is_antibody else 0.15) if language_model_weight is None else language_model_weight
+        inversion_pairs = (
+            (_FAST_CHECKPOINT, self.fast),
+            (_FAST_CUTOFF2025_CHECKPOINT, self.fast_cutoff2025),
+        )
+        hero_critics = (
+            (_FAST_CHECKPOINT, self.fast),
+            (_FAST_CUTOFF2025_CHECKPOINT, self.fast_cutoff2025),
+            (_EXPERIMENTAL_CHECKPOINT, self.experimental),
+            (_EXPERIMENTAL_CUTOFF2025_CHECKPOINT, self.experimental_cutoff2025),
+        )
+        scaling_critics = (
+            ("ESMFold2-Experimental-Fast-base300M-step250k", self.base300m_step250k),
+            ("ESMFold2-Experimental-Fast-base300M-step500k", self.base300m_step500k),
+            ("ESMFold2-Experimental-Fast-base300M-step750k", self.base300m_step750k),
+            ("ESMFold2-Experimental-Fast-base300M-step1000k", self.base300m_step1000k),
+            ("ESMFold2-Experimental-Fast-base300M-step1500k", self.base300m_step1500k),
+            ("ESMFold2-Experimental-Fast-base600M-step250k", self.base600m_step250k),
+            ("ESMFold2-Experimental-Fast-base600M-step500k", self.base600m_step500k),
+            ("ESMFold2-Experimental-Fast-base600M-step750k", self.base600m_step750k),
+            ("ESMFold2-Experimental-Fast-base600M-step1000k", self.base600m_step1000k),
+            ("ESMFold2-Experimental-Fast-base600M-step1500k", self.base600m_step1500k),
+            ("ESMFold2-Experimental-Fast-base6B-step250k", self.base6b_step250k),
+            ("ESMFold2-Experimental-Fast-base6B-step500k", self.base6b_step500k),
+            ("ESMFold2-Experimental-Fast-base6B-step750k", self.base6b_step750k),
+            ("ESMFold2-Experimental-Fast-base6B-step1000k", self.base6b_step1000k),
+            ("ESMFold2-Experimental-Fast-base6B-step1500k", self.base6b_step1500k),
+        )
+        target_sequence = _target_one_letter(input)
+        device = self.fast.model.left_pair_projection.weight.device
+        generator = resolve_generator(seed, generator, device=device)
+        active_scaling_critics = scaling_critics if use_scaling_critics else ()
+        active_critics = hero_critics + active_scaling_critics
+        models = tuple(pipeline.model for _, pipeline in active_critics)
+        dropout_state = tuple((model.language_model_dropout, model.force_language_model_dropout) for model in models)
+        try:
+            for _, pipeline in inversion_pairs:
+                model = pipeline.model
+                model.configure_language_model_dropout(0.5, force_during_inference=True)
+            with _frozen_eval(self.fast.model), _frozen_eval(self.fast_cutoff2025.model):
+                candidates = self._run_design(
+                    pairs=inversion_pairs,
+                    target_sequence=target_sequence,
+                    prompt=prompt,
+                    binder_length=binder_length,
+                    num_candidates=num_candidates,
+                    num_optimization_steps=num_optimization_steps,
+                    language_model_weight=coefficient,
+                    generator=generator,
+                )
+            for model in models:
+                model.configure_language_model_dropout(0.25, force_during_inference=True)
+            with ExitStack() as stack:
+                for _, pipeline in active_critics:
+                    stack.enter_context(_frozen_eval(pipeline.model))
+                return self._score_candidates(
+                    candidates,
+                    target_sequence=target_sequence,
+                    is_antibody=is_antibody,
+                    hero_critics=hero_critics,
+                    scaling_critics=active_scaling_critics,
+                    generator=generator,
+                )
+        finally:
+            for model, (dropout, force) in zip(models, dropout_state):
+                model.configure_language_model_dropout(dropout, force_during_inference=force)
+
+    def _score_candidates(
+        self,
+        candidates: tuple[EsmFold2DesignCandidate, ...],
+        *,
+        target_sequence: str,
+        is_antibody: bool,
+        hero_critics: tuple[tuple[str, EsmFold2ExperimentalPipeline], ...],
+        scaling_critics: tuple[tuple[str, EsmFold2ExperimentalPipeline], ...],
+        generator: torch.Generator | None,
+    ) -> EsmFold2DesignResult:
+        target_length = len(target_sequence)
+        evaluations: list[list[EsmFold2CriticEvaluation]] = [[] for _ in candidates]
+        for checkpoint, pipeline in hero_critics + scaling_critics:
+            individual_inputs = tuple(
+                pipeline.processor(
+                    [
+                        PolymerSequence.from_one_letter(target_sequence),
+                        PolymerSequence.from_one_letter(candidate.sequence),
+                    ]
+                )
+                for candidate in candidates
+            )
+            batch = _stack_design_inputs(individual_inputs)
+            with torch.inference_mode():
+                prediction = pipeline.model.sample_with_confidence(
+                    batch,
+                    recycling_steps=4,
+                    num_samples=1,
+                    num_sampling_steps=200,
+                    language_model_mask_probability=0.0,
+                    generator=generator,
+                )
+                for candidate_index, candidate in enumerate(candidates):
+                    distogram = prediction.sample.distogram_logits[candidate_index].float()
+                    evaluations[candidate_index].append(
+                        EsmFold2CriticEvaluation(
+                            checkpoint=checkpoint,
+                            prediction=_experimental_fold_prediction(
+                                individual_inputs[candidate_index],
+                                prediction,
+                                batch_index=candidate_index,
+                                sample_index=0,
+                            ),
+                            distogram_iptm_proxy=_distogram_iptm_proxy(
+                                distogram,
+                                target_length,
+                                len(candidate.sequence),
+                            ),
+                            cdr_distogram_iptm_proxy=(
+                                cdr_distogram_iptm_proxy(
+                                    distogram,
+                                    target_length,
+                                    candidate.sequence,
+                                )
+                                if is_antibody
+                                else None
+                            ),
+                        )
+                    )
+
+        scored: list[EsmFold2DesignCandidate] = []
+        num_hero_critics = len(hero_critics)
+        for candidate, candidate_evaluations in zip(candidates, evaluations):
+            hero_evaluations = candidate_evaluations[:num_hero_critics]
+            scaling_evaluations = candidate_evaluations[num_hero_critics:]
+            hero_mean_iptm = (
+                sum(evaluation.prediction.scores["iptm"].value for evaluation in hero_evaluations) / num_hero_critics
+            )
+            if scaling_evaluations:
+                if is_antibody:
+                    scaling_mean_proxy = sum(
+                        cast(float, evaluation.cdr_distogram_iptm_proxy) for evaluation in scaling_evaluations
+                    ) / len(scaling_evaluations)
+                else:
+                    scaling_mean_proxy = sum(
+                        evaluation.distogram_iptm_proxy for evaluation in scaling_evaluations
+                    ) / len(scaling_evaluations)
+            else:
+                scaling_mean_proxy = 0.0
+            selection_score = 0.5 * hero_mean_iptm + 0.5 * scaling_mean_proxy
+            isoelectric_point = _isoelectric_point(candidate.sequence)
+            passes_filter = is_antibody or isoelectric_point < 6.0
+            selected_evaluation = next(
+                evaluation
+                for evaluation in hero_evaluations
+                if evaluation.checkpoint == _EXPERIMENTAL_CUTOFF2025_CHECKPOINT
+            )
+            selected_prediction = selected_evaluation.prediction
+            scores = {
+                **selected_prediction.scores,
+                "best_inversion_iptm": Score(candidate.best_iptm, preferred="higher"),
+                "inversion_distogram_iptm_proxy": Score(
+                    candidate.inversion_distogram_iptm_proxy,
+                    preferred="higher",
+                ),
+                "isoelectric_point": Score(isoelectric_point, unit="pH", preferred="lower"),
+                "hero_mean_iptm": Score(hero_mean_iptm, preferred="higher"),
+                "scaling_mean_iptm_proxy": Score(scaling_mean_proxy, preferred="higher"),
+                "selection_score": Score(selection_score, preferred="higher"),
+            }
+            scored.append(
+                replace(
+                    candidate,
+                    structure=selected_prediction.structure,
+                    critic_evaluations=tuple(candidate_evaluations),
+                    is_antibody=is_antibody,
+                    isoelectric_point=isoelectric_point,
+                    passes_isoelectric_point_filter=passes_filter,
+                    hero_mean_iptm=hero_mean_iptm,
+                    scaling_mean_iptm_proxy=scaling_mean_proxy,
+                    selection_score=selection_score,
+                    scores=scores,
+                    metrics=selected_prediction.metrics,
+                    pair_metrics=selected_prediction.pair_metrics,
+                )
+            )
+
+        eligible = [index for index, candidate in enumerate(scored) if candidate.passes_isoelectric_point_filter]
+        selected_indices = tuple(
+            sorted(
+                eligible,
+                key=lambda index: cast(float, scored[index].selection_score),
+                reverse=True,
+            )[:84]
+        )
+        return EsmFold2DesignResult(
+            candidates=tuple(scored),
+            selected_indices=selected_indices,
+        )
+
+    def _run_design(
+        self,
+        *,
+        pairs: tuple[
+            tuple[str, EsmFold2ExperimentalPipeline],
+            tuple[str, EsmFold2ExperimentalPipeline],
+        ],
+        target_sequence: str,
+        prompt: str,
+        binder_length: int,
+        num_candidates: int,
+        num_optimization_steps: int,
+        language_model_weight: float,
+        generator: torch.Generator | None,
+    ) -> tuple[EsmFold2DesignCandidate, ...]:
+        device = pairs[0][1].model.left_pair_projection.weight.device
+        target_length = len(target_sequence)
+        logits, gradient_mask = self._initial_logits(
+            prompt,
+            num_candidates,
+            generator,
+            device,
+        )
+        optimizer = torch.optim.SGD([logits], lr=_LEARNING_RATE)
+        trajectories: list[list[EsmFold2DesignStep]] = [[] for _ in range(num_candidates)]
+        best_iptm = [-math.inf] * num_candidates
+        selected: list[EsmFold2DesignCandidate | None] = [None] * num_candidates
+
+        for step in range(num_optimization_steps):
+            choice = int(torch.randint(len(pairs), (), device=device, generator=generator).item())
+            checkpoint, pipeline = pairs[choice]
+            model = pipeline.model
+            processor = pipeline.processor
+            t = (step + 1) / num_optimization_steps
+            temperature = _TEMPERATURE_MIN + (1 - _TEMPERATURE_MIN) * 0.5 * (1 + math.cos(math.pi * t))
+
+            optimizer.zero_grad()
+            design = F.softmax(logits / temperature, dim=-1)
+            binder_sequences = tuple(
+                "".join(_INDEX_TO_AMINO_ACID[int(index)] for index in row) for row in design.argmax(dim=-1)
+            )
+            individual_inputs = tuple(
+                processor(
+                    [
+                        PolymerSequence.from_one_letter(target_sequence),
+                        PolymerSequence.from_one_letter(binder_sequence),
+                    ]
+                )
+                for binder_sequence in binder_sequences
+            )
+            batch = _stack_design_inputs(individual_inputs)
+            residue_type_probabilities = torch.cat(
+                [
+                    F.one_hot(
+                        batch.residue_type_ids[:, :target_length].long(),
+                        num_classes=33,
+                    ).float(),
+                    F.pad(design, (2, 11)),
+                ],
+                dim=1,
+            )
+
+            prediction: EsmFold2ExperimentalPrediction | None = None
+            if temperature < 0.05:
+                prediction = model.sample_with_confidence(
+                    batch,
+                    residue_type_probabilities=residue_type_probabilities,
+                    recycling_steps=2,
+                    num_samples=1,
+                    num_sampling_steps=50,
+                    generator=generator,
+                )
+                distogram = prediction.sample.distogram_logits.float()
+            else:
+                sample = model.sample(
+                    batch,
+                    residue_type_probabilities=residue_type_probabilities,
+                    recycling_steps=2,
+                    num_samples=1,
+                    num_sampling_steps=1,
+                    generator=generator,
+                )
+                distogram = sample.distogram_logits.float()
+
+            losses = _structure_losses(distogram, binder_length)
+            structure_grad = torch.autograd.grad(losses["total"].mean(), logits)[0]
+            design_lm = F.softmax(logits / temperature, dim=-1)
+            plm_loss = _esmc_pseudo_perplexity_nll(
+                model,
+                design_lm,
+                gradient_mask.sum(dim=-1) > 0,
+                generator=generator,
+            )
+            plm_grad = torch.autograd.grad(plm_loss.mean(), logits)[0]
+            logits.grad = _normalized_gradient(structure_grad, gradient_mask) + language_model_weight * (
+                _normalized_gradient(plm_grad, gradient_mask)
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = _LEARNING_RATE * temperature
+            optimizer.step()
+
+            reported_total = losses["total"] + plm_loss
+            for candidate_index in range(num_candidates):
+                trajectories[candidate_index].append(
+                    EsmFold2DesignStep(
+                        temperature=temperature,
+                        inversion_checkpoint=checkpoint,
+                        intra_contact_loss=float(losses["intra_contact"][candidate_index].detach().cpu()),
+                        inter_contact_loss=float(losses["inter_contact"][candidate_index].detach().cpu()),
+                        globularity_loss=float(losses["glob"][candidate_index].detach().cpu()),
+                        pseudoperplexity_loss=float(plm_loss[candidate_index].detach().cpu()),
+                        total_loss=float(reported_total[candidate_index].detach().cpu()),
+                    )
+                )
+
+            if prediction is not None:
+                for candidate_index, binder_sequence in enumerate(binder_sequences):
+                    iptm = float(prediction.confidence.iptm[candidate_index, 0].detach().cpu())
+                    if iptm > best_iptm[candidate_index]:
+                        best_iptm[candidate_index] = iptm
+                        selected[candidate_index] = self._decode_candidate(
+                            individual_inputs[candidate_index],
+                            prediction,
+                            candidate_index,
+                            target_length,
+                            checkpoint,
+                            binder_sequence,
+                            iptm,
+                            logits[candidate_index].detach().cpu(),
+                            tuple(trajectories[candidate_index]),
+                        )
+
+        candidates: list[EsmFold2DesignCandidate] = []
+        for candidate_index, candidate in enumerate(selected):
+            assert candidate is not None
+            candidate.final_logits = logits[candidate_index].detach().cpu()
+            candidate.trajectory = tuple(trajectories[candidate_index])
+            candidates.append(candidate)
+        return tuple(candidates)
+
+    @staticmethod
+    def _initial_logits(
+        prompt: str,
+        num_candidates: int,
+        generator: torch.Generator | None,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        length = len(prompt)
+        if all(symbol == _MUTABLE_TOKEN for symbol in prompt):
+            logits = 0.01 * torch.randn(
+                num_candidates,
+                length,
+                _AA_DIMS,
+                generator=generator,
+                device=device,
+            )
+            logits[:, :, _CYSTEINE_INDEX] = -1e6
+        else:
+            logits = torch.zeros(num_candidates, length, _AA_DIMS, device=device)
+            for index, symbol in enumerate(prompt):
+                if symbol == _MUTABLE_TOKEN:
+                    logits[:, index, :] = 0.01 * torch.randn(
+                        num_candidates,
+                        _AA_DIMS,
+                        generator=generator,
+                        device=device,
+                    )
+                    logits[:, index, _CYSTEINE_INDEX] = -1e6
+                else:
+                    if symbol not in _AMINO_ACID_TO_INDEX:
+                        raise ValueError(f"binder_prompt symbol {symbol!r} is not a standard amino acid or '#'")
+                    logits[:, index, _AMINO_ACID_TO_INDEX[symbol]] = 10.0
+
+        mask = torch.ones(num_candidates, length, _AA_DIMS, device=device)
+        for index, symbol in enumerate(prompt):
+            if symbol != _MUTABLE_TOKEN:
+                mask[:, index, :] = 0.0
+        mask[:, :, _CYSTEINE_INDEX] = 0.0
+        return logits.requires_grad_(True), mask
+
+    def _decode_candidate(
+        self,
+        input: EsmFold2Input,
+        prediction: EsmFold2ExperimentalPrediction,
+        batch_index: int,
+        target_length: int,
+        inversion_checkpoint: str,
+        binder_sequence: str,
+        iptm: float,
+        final_logits: torch.Tensor,
+        trajectory: tuple[EsmFold2DesignStep, ...],
+    ) -> EsmFold2DesignCandidate:
+        sample = prediction.sample
+        inversion_prediction = _experimental_fold_prediction(
+            input,
+            prediction,
+            batch_index=batch_index,
+            sample_index=0,
+        )
+        proxy = _distogram_iptm_proxy(
+            sample.distogram_logits[batch_index].float(),
+            target_length,
+            len(binder_sequence),
+        )
+        scores = {
+            **inversion_prediction.scores,
+            "distogram_iptm_proxy": Score(proxy, preferred="higher"),
+        }
+        return EsmFold2DesignCandidate(
+            sequence=binder_sequence,
+            structure=inversion_prediction.structure,
+            final_logits=final_logits,
+            best_iptm=iptm,
+            trajectory=trajectory,
+            inversion_checkpoint=inversion_checkpoint,
+            inversion_prediction=inversion_prediction,
+            inversion_distogram_iptm_proxy=proxy,
+            scores=scores,
+            metrics=inversion_prediction.metrics,
+            pair_metrics=inversion_prediction.pair_metrics,
+        )
+
+
+def _experimental_fold_prediction(
+    input: EsmFold2Input,
+    prediction: EsmFold2ExperimentalPrediction,
+    *,
+    batch_index: int,
+    sample_index: int,
+) -> FoldPrediction:
+    layout = input.layout
+    atom_count = len(layout.atom_sites)
+    raw_coordinates = (
+        prediction.sample.coordinates[batch_index, sample_index, :atom_count]
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .numpy()
+    )
+    complete_sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
+    complete_index = {site: index for index, site in enumerate(complete_sites)}
+    model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
+    coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
+    coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
+    coordinates[model_to_complete] = raw_coordinates
+    coordinate_mask[model_to_complete] = True
+    confidence = prediction.confidence
+    return FoldPrediction(
+        structure=Structure(
+            system=layout.system,
+            sites=complete_sites,
+            coordinates=coordinates,
+            coordinate_mask=coordinate_mask,
+        ),
+        scores={
+            "ptm": Score(
+                float(confidence.ptm[batch_index, sample_index].detach().cpu()),
+                preferred="higher",
+            ),
+            "iptm": Score(
+                float(confidence.iptm[batch_index, sample_index].detach().cpu()),
+                preferred="higher",
+            ),
+            "mean_plddt": Score(
+                float(confidence.mean_plddt[batch_index, sample_index].detach().cpu()) * 100.0,
+                preferred="higher",
+            ),
+            "complex_iplddt": Score(
+                float(confidence.complex_iplddt[batch_index, sample_index].detach().cpu()) * 100.0,
+                preferred="higher",
+            ),
+        },
+        metrics={
+            "plddt": Metric(
+                values=confidence.plddt[batch_index, sample_index].detach().float().cpu().numpy() * 100.0,
+                axis=layout.token_sites,
+            ),
+            "plddt_per_atom": Metric(
+                values=confidence.plddt_per_atom[batch_index, sample_index, :atom_count].detach().float().cpu().numpy()
+                * 100.0,
+                axis=layout.atom_sites,
+            ),
+            "plddt_ca": Metric(
+                values=confidence.plddt_ca[batch_index, sample_index].detach().float().cpu().numpy() * 100.0,
+                axis=layout.token_sites,
+            ),
+        },
+        pair_metrics={
+            "pae": PairMetric(
+                values=confidence.pae[batch_index, sample_index].detach().float().cpu().numpy(),
+                row_axis=layout.token_sites,
+                column_axis=layout.token_sites,
+                unit="angstrom",
+            ),
+            "chain_pair_iptm": PairMetric(
+                values=confidence.chain_pair_iptm[batch_index, sample_index].detach().float().cpu().numpy(),
+                row_axis=tuple(layout.system.instances),
+                column_axis=tuple(layout.system.instances),
+            ),
+        },
+    )
+
+
+def _stack_design_inputs(inputs: tuple[EsmFold2Input, ...]) -> EsmFold2Input:
+    r"""
+    Stack same-length target--binder inputs while retaining each candidate's atom padding.
+    """
+
+    max_atoms = max(value.atom_mask.shape[1] for value in inputs)
+
+    def stack(name: str) -> torch.Tensor:
+        return torch.cat([cast(torch.Tensor, getattr(value, name)) for value in inputs], dim=0)
+
+    def stack_optional(name: str) -> torch.Tensor | None:
+        values = [getattr(value, name) for value in inputs]
+        if values[0] is None:
+            return None
+        return torch.cat([cast(torch.Tensor, value) for value in values], dim=0)
+
+    def stack_atoms(name: str) -> torch.Tensor:
+        values: list[torch.Tensor] = []
+        for input in inputs:
+            value = cast(torch.Tensor, getattr(input, name))
+            padding = max_atoms - value.shape[1]
+            if padding:
+                value = torch.cat(
+                    [
+                        value,
+                        value.new_zeros(value.shape[0], padding, *value.shape[2:]),
+                    ],
+                    dim=1,
+                )
+            values.append(value)
+        return torch.cat(values, dim=0)
+
+    language_model_tokens = [cast(torch.Tensor, value.language_model_tokens) for value in inputs]
+    language_model_masks = [cast(torch.Tensor, value.language_model_mask) for value in inputs]
+    token_to_esmc: list[torch.Tensor] = []
+    offset = 0
+    for value, tokens in zip(inputs, language_model_tokens):
+        mapping = cast(torch.Tensor, value.token_to_esmc)
+        has_esmc = value.token_has_esmc
+        token_to_esmc.append(torch.where(has_esmc, mapping + offset, mapping))
+        offset += tokens.numel()
+
+    first = inputs[0]
+    return replace(
+        first,
+        token_index=stack("token_index"),
+        residue_index=stack("residue_index"),
+        chain_index=stack("chain_index"),
+        symmetry_index=stack("symmetry_index"),
+        entity_index=stack("entity_index"),
+        molecule_type=stack("molecule_type"),
+        residue_type_ids=stack("residue_type_ids"),
+        token_bonds=stack("token_bonds"),
+        token_mask=stack("token_mask"),
+        reference_positions=stack_atoms("reference_positions"),
+        reference_elements=stack_atoms("reference_elements"),
+        reference_charges=stack_atoms("reference_charges"),
+        reference_atom_name_characters=stack_atoms("reference_atom_name_characters"),
+        reference_space_id=stack_atoms("reference_space_id"),
+        atom_mask=stack_atoms("atom_mask"),
+        atom_to_token=stack_atoms("atom_to_token"),
+        distogram_atom_index=stack("distogram_atom_index"),
+        token_has_esmc=stack("token_has_esmc"),
+        deletion_mean=stack_optional("deletion_mean"),
+        msa_tokens=stack_optional("msa_tokens"),
+        has_deletion=stack_optional("has_deletion"),
+        deletion_value=stack_optional("deletion_value"),
+        msa_mask=stack_optional("msa_mask"),
+        language_model_tokens=torch.cat(language_model_tokens, dim=0),
+        language_model_mask=torch.cat(language_model_masks, dim=0),
+        token_to_esmc=torch.cat(token_to_esmc, dim=0),
+        esmc_hidden_states=stack_optional("esmc_hidden_states"),
+    )
 
 
 @contextmanager
@@ -793,10 +1266,13 @@ def _target_one_letter(input: str | PathLike[str] | Structure | MolecularSystem)
     elif isinstance(input, MolecularSystem):
         system = input
     if system is not None:
-        entities = [entity for entity in system.entities.values() if isinstance(entity, PolymerSequence)]
-        proteins = [entity for entity in entities if entity.polymer_type == "protein"]
+        proteins: list[PolymerSequence] = []
+        for entity_key in system.instances.values():
+            entity = system.entities[entity_key]
+            if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
+                proteins.append(entity)
         if len(proteins) != 1:
-            raise NotImplementedError("ESMFold2 design targets one single-chain protein target")
+            raise ValueError("ESMFold2 design requires one single-chain protein target")
         return "".join(AMINO_ACID_THREE_TO_ONE[component.component_id] for component in proteins[0].components)
 
     classified = classify_reference(cast(str | PathLike[str], input))
@@ -806,6 +1282,52 @@ def _target_one_letter(input: str | PathLike[str] | Structure | MolecularSystem)
             raise ValueError("ESMFold2 design requires exactly one target FASTA record")
         return records[0].sequence.strip().upper()
     return str(classified).strip().upper()
+
+
+def _isoelectric_point(sequence: str) -> float:
+    r"""
+    Calculate the Bjellqvist isoelectric point used by Biopython 1.87.
+    """
+
+    positive_pks = {"Nterm": 7.5, "K": 10.0, "R": 12.0, "H": 5.98}
+    negative_pks = {"Cterm": 3.55, "D": 4.05, "E": 4.45, "C": 9.0, "Y": 10.0}
+    n_terminal_pks = {
+        "A": 7.59,
+        "M": 7.0,
+        "S": 6.93,
+        "P": 8.36,
+        "T": 6.82,
+        "V": 7.44,
+        "E": 7.7,
+    }
+    c_terminal_pks = {"D": 4.55, "E": 4.75}
+    if sequence[0] in n_terminal_pks:
+        positive_pks["Nterm"] = n_terminal_pks[sequence[0]]
+    if sequence[-1] in c_terminal_pks:
+        negative_pks["Cterm"] = c_terminal_pks[sequence[-1]]
+
+    charged_content = {
+        amino_acid: float(sequence.count(amino_acid)) for amino_acid in ("K", "R", "H", "D", "E", "C", "Y")
+    }
+    charged_content["Nterm"] = 1.0
+    charged_content["Cterm"] = 1.0
+
+    minimum = 4.05
+    maximum = 12.0
+    ph = 7.775
+    while maximum - minimum > 0.0001:
+        positive_charge = sum(
+            charged_content[amino_acid] / (10 ** (ph - pk) + 1.0) for amino_acid, pk in positive_pks.items()
+        )
+        negative_charge = sum(
+            charged_content[amino_acid] / (10 ** (pk - ph) + 1.0) for amino_acid, pk in negative_pks.items()
+        )
+        if positive_charge - negative_charge > 0.0:
+            minimum = ph
+        else:
+            maximum = ph
+        ph = (minimum + maximum) / 2
+    return ph
 
 
 @cache
@@ -888,8 +1410,6 @@ def _esmc_pseudo_perplexity_nll(
     device = design.device
     esmc = model.esmc
     lm_head = model.esmc_lm_head
-    if esmc is None or lm_head is None:
-        raise RuntimeError("ESMC pseudo-perplexity regulariser requires an attached ESMC masked-LM head")
     esmc_config = model.config.esmc
     vocabulary_size = esmc_config.vocab_size
     embed_dtype = esmc.get_input_embeddings().weight.dtype
@@ -949,6 +1469,7 @@ def _esmc_pseudo_perplexity_nll(
     language_model_mask = torch.ones(
         masked_sequences.shape[0],
         masked_sequences.shape[1],
+        dtype=torch.bool,
         device=device,
     )
     logit_chunks: list[torch.Tensor] = []

@@ -66,6 +66,44 @@ OINVFOLD_LIGAND_ELEMENTS = (
 class OInvFoldPolymerModel(Model):
     r"""
     OInvFold inverse folding for protein, DNA, or RNA backbones.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.oinvfold import (
+        ...     OInvFoldPolymerConfig,
+        ...     OInvFoldPolymerModel,
+        ...     OInvFoldPolymerProcessor,
+        ... )
+        >>> sequence = PolymerSequence.from_one_letter("AC")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> sites = tuple(
+        ...     AtomSite("A", residue, atom)
+        ...     for residue in range(2)
+        ...     for atom in ("N", "CA", "C", "O")
+        ... )
+        >>> coordinates = np.array(
+        ...     [
+        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0],
+        ...         [2.8, 0.0, 0.0], [3.8, 0.0, 0.0], [4.8, 0.5, 0.0], [4.8, 1.0, 0.0],
+        ...     ],
+        ...     dtype=np.float32,
+        ... )
+        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> input = OInvFoldPolymerProcessor()(structure)
+        >>> config = OInvFoldPolymerConfig(
+        ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_virtual_embeddings": 3,
+        ...      "num_virtual_atoms": 2, "num_attention_heads": 1, "num_geometric_layers": 1,
+        ...      "num_edge_layers": 1, "decoder_hidden_size": 8}
+        ... )
+        >>> model = OInvFoldPolymerModel(config)
+        >>> with torch.inference_mode():
+        ...     output = model(input, mask_probability=0.0)
+        >>> output.logits.shape
+        torch.Size([2, 25])
+        >>> output.log_probabilities.shape == output.logits.shape
+        True
     """
 
     config_class = OInvFoldPolymerConfig
@@ -124,9 +162,16 @@ class OInvFoldPolymerModel(Model):
         input: OInvFoldPolymerInput,
         *,
         mask_probability: float = 0.1,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
         Encode one polymer graph, applying the released corruption in training mode.
+
+        Args:
+            input: Processed polymer graph.
+            mask_probability: Fraction of node and edge rows replaced in each
+                encoder block while training.
+            generator: Random generator used for graph corruption.
         """
 
         return _encode_graph(
@@ -136,6 +181,7 @@ class OInvFoldPolymerModel(Model):
             self.virtual_embedding,
             self.encoder,
             mask_probability,
+            generator,
         )
 
     def forward(
@@ -143,8 +189,13 @@ class OInvFoldPolymerModel(Model):
         input: OInvFoldPolymerInput,
         *,
         mask_probability: float = 0.1,
+        generator: torch.Generator | None = None,
     ) -> OInvFoldOutput:
-        node = self.encode(input, mask_probability=mask_probability)
+        node = self.encode(
+            input,
+            mask_probability=mask_probability,
+            generator=generator,
+        )
         return self.decoder(node)
 
     def autoregressive_probabilities(
@@ -152,15 +203,26 @@ class OInvFoldPolymerModel(Model):
         input: OInvFoldPolymerInput,
         *,
         mask_probability: float = 0.1,
+        generator: torch.Generator | None = None,
     ) -> OInvFoldOutput:
         r"""
         Predict polymer identities with the released teacher-forced causal decoder.
+
+        Args:
+            input: Processed polymer graph with canonical sequence tokens.
+            mask_probability: Fraction of node and edge rows replaced in each
+                encoder block while training.
+            generator: Random generator used for graph corruption.
         """
 
         sequence_tokens = input.sequence_tokens
         if sequence_tokens is None:
             raise ValueError("OInvFold autoregressive decoding requires canonical sequence tokens")
-        node = self.encode(input, mask_probability=mask_probability)
+        node = self.encode(
+            input,
+            mask_probability=mask_probability,
+            generator=generator,
+        )
         segment_start = torch.ones_like(input.chain_index, dtype=torch.bool)
         segment_start[1:] = (input.graph.batch_index[1:] != input.graph.batch_index[:-1]) | (
             input.chain_index[1:] != input.chain_index[:-1]
@@ -194,6 +256,36 @@ class OInvFoldPolymerModel(Model):
 class OInvFoldLigandModel(Model):
     r"""
     OInvFold atom-element assignment for a coordinate-defined ligand graph.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.models.oinvfold import (
+        ...     OInvFoldLigandConfig,
+        ...     OInvFoldLigandModel,
+        ...     OInvFoldLigandProcessor,
+        ...     OInvFoldLigandSlots,
+        ... )
+        >>> slots = OInvFoldLigandSlots(
+        ...     slot_ids=("atom_0", "atom_1", "atom_2"),
+        ...     coordinates=np.array(
+        ...         [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.2, 1.3, 0.0]],
+        ...         dtype=np.float32,
+        ...     ),
+        ... )
+        >>> input = OInvFoldLigandProcessor()(slots)
+        >>> config = OInvFoldLigandConfig(
+        ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_virtual_embeddings": 3,
+        ...      "num_virtual_atoms": 2, "num_attention_heads": 1, "num_geometric_layers": 1,
+        ...      "num_edge_layers": 1}
+        ... )
+        >>> model = OInvFoldLigandModel(config)
+        >>> with torch.inference_mode():
+        ...     output = model(input, mask_probability=0.0)
+        >>> output.logits.shape
+        torch.Size([3, 37])
+        >>> output.log_probabilities.shape == output.logits.shape
+        True
     """
 
     config_class = OInvFoldLigandConfig
@@ -243,9 +335,16 @@ class OInvFoldLigandModel(Model):
         input: OInvFoldLigandInput,
         *,
         mask_probability: float = 0.1,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         r"""
         Encode one ligand graph, applying the released corruption in training mode.
+
+        Args:
+            input: Processed ligand graph.
+            mask_probability: Fraction of node and edge rows replaced in each
+                encoder block while training.
+            generator: Random generator used for graph corruption.
         """
 
         return _encode_graph(
@@ -255,6 +354,7 @@ class OInvFoldLigandModel(Model):
             self.virtual_embedding,
             self.encoder,
             mask_probability,
+            generator,
         )
 
     def forward(
@@ -262,8 +362,13 @@ class OInvFoldLigandModel(Model):
         input: OInvFoldLigandInput,
         *,
         mask_probability: float = 0.1,
+        generator: torch.Generator | None = None,
     ) -> OInvFoldOutput:
-        node = self.encode(input, mask_probability=mask_probability)
+        node = self.encode(
+            input,
+            mask_probability=mask_probability,
+            generator=generator,
+        )
         output = self.decoder(node)
         if input.vocabulary_logit_mask is None:
             return output
@@ -316,6 +421,7 @@ class OInvFoldEncoder(nn.Module):
         batch_index: Tensor,
         num_real_nodes: int,
         mask_probability: float,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         outputs = []
         for block in self.blocks:
@@ -328,6 +434,7 @@ class OInvFoldEncoder(nn.Module):
                 edge_index,
                 batch_index,
                 mask_probability,
+                generator,
             )
             outputs.append(node[:num_real_nodes])
         stacked = torch.stack(outputs, dim=1)
@@ -375,6 +482,7 @@ class OInvFoldEncoderBlock(nn.Module):
         edge_index: Tensor,
         batch_index: Tensor,
         mask_probability: float,
+        generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
         if self.training:
             node = node.clone()
@@ -382,10 +490,12 @@ class OInvFoldEncoderBlock(nn.Module):
             node_indices = torch.randperm(
                 node.shape[0],
                 device=node.device,
+                generator=generator,
             )[: int(node.shape[0] * mask_probability)]
             edge_indices = torch.randperm(
                 edge.shape[0],
                 device=edge.device,
+                generator=generator,
             )[: int(edge.shape[0] * mask_probability)]
             node[node_indices] = self.mask_token.weight[0]
             edge[edge_indices] = self.mask_token.weight[1]
@@ -872,6 +982,7 @@ def _encode_graph(
     virtual_embedding: nn.Module,
     encoder: OInvFoldEncoder,
     mask_probability: float,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     num_real_nodes = graph.node_features.shape[0]
     node = node_embedding(graph.node_features)
@@ -888,6 +999,7 @@ def _encode_graph(
         torch.cat((graph.batch_index, graph.global_batch_index), dim=0),
         num_real_nodes,
         mask_probability,
+        generator,
     )
 
 

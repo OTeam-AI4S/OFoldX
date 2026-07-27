@@ -9,7 +9,7 @@ import re
 from collections.abc import Callable, Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import torch
 from torch import Tensor, nn
@@ -58,7 +58,7 @@ def translate_pxdesign_state(
     return {key: value.to(dtype=dtype) if value.is_floating_point() else value for key, value in converted.items()}
 
 
-def convert_pxdesign_checkpoint(
+def convert_pxdesign_model(
     checkpoint_path: str | PathLike[str],
     *,
     map_location: str | torch.device = "cpu",
@@ -78,7 +78,7 @@ def convert_pxdesign_checkpoint(
     return model
 
 
-def save_pxdesign_checkpoint(
+def convert_pxdesign_backbone_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -89,26 +89,163 @@ def save_pxdesign_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert a PxDesign checkpoint and write a routable OFoldX repository.
+    Convert a PXDesign-d checkpoint and write its independent backbone repository.
 
     Strict-loads the checkpoint via
-    [`convert_pxdesign_checkpoint`][ofoldx.models.pxdesign.convert.convert_pxdesign_checkpoint], pairs
+    [`convert_pxdesign_model`][ofoldx.models.pxdesign.convert.convert_pxdesign_model], pairs
     it with [`PxDesignProcessor`][], and saves the registered
-    [`PxDesignPipeline`][]. Its one-field marker routes
-    ``pipeline("design", model=dir)`` to that concrete Pipeline, which returns the
-    coordinate-producing ``PxDesignDesignResult``.
+    [`PxDesignBackbonePipeline`][]. The complete released operation is converted
+    separately with [`convert_pxdesign_checkpoint`][] because it owns six fixed
+    model--processor pairs.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the repository — marker
     included. No organization or token is assumed and nothing is published without an explicit
     ``repo_id``.
     """
 
-    from .pipeline import PxDesignPipeline
+    from .pipeline import PxDesignBackbonePipeline
     from .processor import PxDesignProcessor
 
-    model = convert_pxdesign_checkpoint(checkpoint_path, map_location=map_location, dtype=dtype)
+    model = convert_pxdesign_model(checkpoint_path, map_location=map_location, dtype=dtype)
     processor_dtype = model.condition_embeddings.input_projection.weight.dtype
-    PxDesignPipeline(model=model, processor=PxDesignProcessor(dtype=processor_dtype)).save(
+    PxDesignBackbonePipeline(model=model, processor=PxDesignProcessor(dtype=processor_dtype)).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def convert_pxdesign_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    proteinmpnn_checkpoint_path: str | PathLike[str],
+    alphafold2_checkpoint_path: str | PathLike[str],
+    protenix_checkpoint_path: str | PathLike[str],
+    protenix_structure_checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    map_location: str | torch.device = "cpu",
+    dtype: torch.dtype | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert and write the released fixed six-pair PXDesign repository.
+
+    Args:
+        checkpoint_path: Released PXDesign-d checkpoint.
+        proteinmpnn_checkpoint_path: Released ProteinMPNN ``v_48_020`` checkpoint.
+        alphafold2_checkpoint_path: Official AlphaFold parameters containing
+            ``model_1_ptm``. The fixed complex and binder pairs use the same
+            released weights with their distinct Model graphs.
+        protenix_checkpoint_path: ``protenix_base_default_v0.5.0`` checkpoint.
+        protenix_structure_checkpoint_path:
+            ``protenix_mini_tmpl_v0.5.0`` checkpoint.
+        output_dir: Destination composite repository.
+        map_location: Device mapping used to load the PXDesign-d checkpoint.
+        dtype: Optional common floating-point dtype.
+        repo_id: Optional destination Hub repository.
+        token: Optional Hub token for destination upload.
+        private: Whether a newly created destination repository is private.
+    """
+
+    from ..alphafold2.convert import (
+        _own_parameter_storage,
+        convert_alphafold2_initial_guess_model,
+        convert_alphafold2_model,
+    )
+    from ..alphafold2.pipeline import (
+        AlphaFold2InitialGuessPipeline,
+        AlphaFold2Pipeline,
+    )
+    from ..alphafold2.processor import (
+        AlphaFold2InitialGuessProcessor,
+        AlphaFold2Processor,
+    )
+    from ..proteinmpnn.config import ProteinMpnnProcessorConfig
+    from ..proteinmpnn.convert import convert_proteinmpnn_model
+    from ..proteinmpnn.pipeline import ProteinMpnnPipeline
+    from ..proteinmpnn.processor import ProteinMpnnProcessor
+    from ..protenix.convert import convert_protenix_model
+    from ..protenix.model import ProtenixStructureConditionModel
+    from ..protenix.pipeline import (
+        ProtenixPipeline,
+        ProtenixStructureConditionPipeline,
+    )
+    from ..protenix.processor import (
+        ProtenixProcessor,
+        ProtenixStructureConditionProcessor,
+    )
+    from .pipeline import PxDesignBackbonePipeline, PxDesignPipeline
+    from .processor import PxDesignProcessor
+
+    backbone_model = convert_pxdesign_model(
+        checkpoint_path,
+        map_location=map_location,
+        dtype=dtype,
+    )
+    proteinmpnn_model = convert_proteinmpnn_model(
+        proteinmpnn_checkpoint_path,
+        dtype=dtype,
+        expected_noise_level=0.2,
+    )
+    af2_complex_model = convert_alphafold2_initial_guess_model(
+        alphafold2_checkpoint_path,
+        dtype=dtype,
+    )
+    af2_binder_model = convert_alphafold2_model(
+        alphafold2_checkpoint_path,
+        model_name="model_1_ptm",
+        dtype=dtype,
+    )
+    _own_parameter_storage(af2_complex_model)
+    _own_parameter_storage(af2_binder_model)
+    protenix_model = convert_protenix_model(
+        Path(protenix_checkpoint_path),
+        variant="protenix_base_default_v0.5.0",
+        dtype=dtype,
+    )
+    protenix_structure_model = cast(
+        ProtenixStructureConditionModel,
+        convert_protenix_model(
+            Path(protenix_structure_checkpoint_path),
+            variant="protenix_mini_tmpl_v0.5.0",
+            dtype=dtype,
+        ),
+    )
+    backbone_dtype = backbone_model.condition_embeddings.input_projection.weight.dtype
+    PxDesignPipeline(
+        backbone=PxDesignBackbonePipeline(
+            model=backbone_model,
+            processor=PxDesignProcessor(dtype=backbone_dtype),
+        ),
+        proteinmpnn=ProteinMpnnPipeline(
+            model=proteinmpnn_model,
+            processor=ProteinMpnnProcessor(
+                ProteinMpnnProcessorConfig(
+                    ca_only=proteinmpnn_model.config.ca_only,
+                ),
+                dtype=dtype,
+            ),
+        ),
+        af2_complex=AlphaFold2InitialGuessPipeline(
+            model=af2_complex_model,
+            processor=AlphaFold2InitialGuessProcessor(dtype=dtype),
+        ),
+        af2_binder=AlphaFold2Pipeline(
+            model=af2_binder_model,
+            processor=AlphaFold2Processor(dtype=dtype),
+        ),
+        protenix=ProtenixPipeline(
+            model=protenix_model,
+            processor=ProtenixProcessor(dtype=dtype),
+        ),
+        protenix_structure=ProtenixStructureConditionPipeline(
+            model=protenix_structure_model,
+            processor=ProtenixStructureConditionProcessor(dtype=dtype),
+        ),
+    ).save(
         output_dir,
         repo_id=repo_id,
         token=token,
@@ -118,29 +255,106 @@ def save_pxdesign_checkpoint(
 
 def main(argv: list[str] | None = None) -> None:
     r"""
-    Run pxdesign checkpoint conversion from the command line.
+    Convert the independent backbone pair or complete fixed PXDesign composition.
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path, help="released PxDesign checkpoint (e.g. pxdesign_v0.1.0.pt)")
-    parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
-    parser.add_argument(
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    backbone = commands.add_parser(
+        "backbone",
+        help="convert only the independently callable PXDesign-d pair",
+    )
+    backbone.add_argument(
+        "checkpoint",
+        type=Path,
+        help="released PXDesign-d checkpoint (e.g. pxdesign_v0.1.0.pt)",
+    )
+    backbone.add_argument("output_dir", type=Path)
+    backbone.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    backbone.add_argument(
         "--repo-id",
         default=None,
         help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
     )
-    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
-    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
-    args = parser.parse_args(argv)
-    save_pxdesign_checkpoint(
-        args.checkpoint,
-        args.output_dir,
-        dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
-        repo_id=args.repo_id,
-        token=args.token,
-        private=args.private,
+    backbone.add_argument(
+        "--token",
+        default=None,
+        help="optional Hugging Face token for --repo-id",
     )
+    backbone.add_argument(
+        "--private",
+        action="store_true",
+        help="create the --repo-id repo as private",
+    )
+
+    complete = commands.add_parser(
+        "complete",
+        help="convert the released fixed six-pair Preview/Extended composition",
+    )
+    complete.add_argument("checkpoint", type=Path, help="released PXDesign-d checkpoint")
+    complete.add_argument(
+        "proteinmpnn_checkpoint",
+        type=Path,
+        help="released ProteinMPNN v_48_020 checkpoint",
+    )
+    complete.add_argument(
+        "alphafold2_checkpoint",
+        type=Path,
+        help="official AlphaFold parameters containing model_1_ptm",
+    )
+    complete.add_argument(
+        "protenix_checkpoint",
+        type=Path,
+        help="protenix_base_default_v0.5.0 checkpoint",
+    )
+    complete.add_argument(
+        "protenix_structure_checkpoint",
+        type=Path,
+        help="protenix_mini_tmpl_v0.5.0 checkpoint",
+    )
+    complete.add_argument("output_dir", type=Path)
+    complete.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
+    complete.add_argument(
+        "--repo-id",
+        default=None,
+        help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
+    )
+    complete.add_argument(
+        "--token",
+        default=None,
+        help="optional Hugging Face token for --repo-id",
+    )
+    complete.add_argument(
+        "--private",
+        action="store_true",
+        help="create the --repo-id repo as private",
+    )
+
+    args = parser.parse_args(argv)
+    dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
+    if args.command == "backbone":
+        convert_pxdesign_backbone_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+    else:
+        convert_pxdesign_checkpoint(
+            args.checkpoint,
+            args.proteinmpnn_checkpoint,
+            args.alphafold2_checkpoint,
+            args.protenix_checkpoint,
+            args.protenix_structure_checkpoint,
+            args.output_dir,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
 
 
 def _extract_reference_state(checkpoint_or_state_dict: Mapping[str, Any]) -> dict[str, Tensor]:

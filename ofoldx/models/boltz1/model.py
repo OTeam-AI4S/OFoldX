@@ -66,6 +66,68 @@ class Boltz1Model(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import MolecularSystem, PolymerSequence
+        >>> from ofoldx.models.boltz1 import Boltz1Config, Boltz1Model, Boltz1Processor
+        >>> sequence = PolymerSequence.from_one_letter("G")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> input = Boltz1Processor()(system)
+        >>> config = Boltz1Config(
+        ...     {
+        ...         "single_size": 8,
+        ...         "pair_size": 8,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "num_distogram_bins": 4,
+        ...         "fourier_embedding_size": 8,
+        ...         "recycling_steps": 1,
+        ...         "input_embeddings": {
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_encoder_attention_heads": 1,
+        ...         },
+        ...         "trunk": {
+        ...             "num_pairformer_blocks": 1,
+        ...             "num_pair_attention_heads": 1,
+        ...             "num_msa_blocks": 1,
+        ...             "msa_size": 8,
+        ...             "msa_head_dim": 4,
+        ...             "num_msa_attention_heads": 1,
+        ...             "outer_product_hidden_size": 4,
+        ...             "msa_triangle_attention_hidden_size": 4,
+        ...             "num_msa_triangle_attention_heads": 1,
+        ...             "triangle_attention_hidden_size": 4,
+        ...             "num_triangle_attention_heads": 1,
+        ...             "pair_dropout": 0.0,
+        ...             "msa_dropout": 0.0,
+        ...             "msa_pair_dropout": 0.0,
+        ...         },
+        ...         "denoiser": {
+        ...             "num_token_encoder_blocks": 1,
+        ...             "num_token_encoder_attention_heads": 1,
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_decoder_blocks": 1,
+        ...             "num_atom_attention_heads": 1,
+        ...             "atom_hidden_size": 8,
+        ...             "atom_pair_hidden_size": 4,
+        ...             "num_query_atoms": 4,
+        ...             "num_key_atoms": 4,
+        ...             "num_conditioning_transitions": 1,
+        ...         },
+        ...         "confidence": {
+        ...             "num_distogram_bins": 4, "num_plddt_bins": 4,
+        ...             "num_pae_bins": 4, "num_pde_bins": 4,
+        ...         },
+        ...     }
+        ... )
+        >>> model = Boltz1Model(config).eval()
+        >>> with torch.inference_mode():
+        ...     coordinates = model.sample(
+        ...         input, num_samples=1, num_sampling_steps=1, recycling_steps=1,
+        ...     )
+        >>> tuple(coordinates.shape)
+        (1, 1, 32, 3)
     """
 
     config_class = Boltz1Config
@@ -382,7 +444,7 @@ class Boltz1Model(Model):
         generator: torch.Generator | None = None,
     ) -> Boltz1ConfidenceOutput:
         r"""
-        Sample coordinates and return raw confidence logits with explicit sample axes.
+        Sample coordinates and return confidence logits and values with explicit sample axes.
 
         The score-network and coordinate trajectory are detached. When configured,
         the diffusion token accumulator remains differentiable into the confidence
@@ -402,80 +464,8 @@ class Boltz1Model(Model):
             step_scale=step_scale,
             num_samples=num_samples,
             generator=generator,
-            compute_confidence_scores=False,
         )
-        return Boltz1ConfidenceOutput(
-            coordinates=output.coordinates,
-            distogram_logits=output.distogram_logits,
-            plddt_logits=cast(Tensor, output.plddt_logits),
-            pae_logits=output.pae_logits,
-            pde_logits=cast(Tensor, output.pde_logits),
-            resolved_logits=cast(Tensor, output.resolved_logits),
-        )
-
-    @torch.inference_mode()
-    def fold(
-        self,
-        input: Boltz1Input,
-        *,
-        num_samples: int = 1,
-        generator: torch.Generator | None = None,
-        recycling_steps: int | None = None,
-        msa_max_depth: int | None = None,
-        num_sampling_steps: int | None = None,
-        step_scale: float | None = None,
-        use_potentials: bool = False,
-        steering_args: Mapping[str, object] | None = None,
-    ) -> FoldResult:
-        r"""
-        Predict structures for one molecular system with Boltz 1.
-
-        Args:
-            input: Processor output for one system, with batch size ``B = 1`` and
-                molecular identities aligned to its atom and token axes.
-            num_samples: Number of coordinate samples.
-            generator: Optional generator for MSA row sampling, initial
-                coordinates, churn noise, rigid augmentations, and
-                potential-guided resampling.
-            recycling_steps: Number of trunk recycling iterations. ``None`` uses
-                the configured value.
-            msa_max_depth: Optional MSA rows sampled independently for every
-                MSA-module invocation. ``None`` retains every processed row.
-            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
-                configured value.
-            step_scale: Optional scale on each reverse-diffusion Euler update.
-            use_potentials: Whether to enable physical-potential guidance.
-            steering_args: Optional guidance and particle-sampling settings.
-
-        Returns:
-            One generation-ordered prediction per sample. Structure, PAE, and PDE
-            values are in angstroms; pLDDT is on the ``0--100`` scale.
-
-        Raises:
-            ValueError: If ``num_samples`` is not positive, the batch contains
-                more than one system, or molecular identities are absent.
-        """
-
-        num_samples = operator.index(num_samples)
-        if num_samples < 1:
-            raise ValueError("num_samples must be positive")
-        if input.token_mask.shape[0] != 1:
-            raise ValueError("Boltz1Model.fold accepts one molecular system per call")
-        if input.layout is None:
-            raise ValueError("Boltz1Model.fold requires the canonical layout produced by its Processor")
-
-        output = self._predict(
-            input,
-            recycling_steps=recycling_steps,
-            msa_max_depth=msa_max_depth,
-            num_sampling_steps=num_sampling_steps,
-            step_scale=step_scale,
-            num_samples=num_samples,
-            generator=generator,
-            use_potentials=use_potentials,
-            steering_args=steering_args,
-        )
-        return _decode_boltz1_fold_result(output, input)
+        return cast(Boltz1ConfidenceOutput, output.confidence)
 
     def representations(
         self,
@@ -510,6 +500,173 @@ class Boltz1Model(Model):
         )
         return Boltz1Representations(single=representations.single, pair=representations.pair)
 
+    def sample(
+        self,
+        input: Boltz1Input,
+        *,
+        num_samples: int = 1,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        use_potentials: bool = False,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        r"""
+        Sample raw atom coordinates with explicit ``(B, S, A, 3)`` axes.
+
+        Args:
+            input: Model-visible structure and evidence features.
+            num_samples: Number of coordinate samples.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses
+                the configured value.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
+            use_potentials: Enable the released Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Energy-log-weight scale used for particle
+                resampling.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
+            generator: Optional generator for MSA row sampling, initial
+                coordinates, churn noise, rigid augmentations, and
+                potential-guided resampling.
+
+        Returns:
+            Sampled atom coordinates with shape ``(B, S, A, 3)``.
+        """
+
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        with torch.no_grad():
+            representations = self._run_trunk(
+                input,
+                recycling_steps=recycling_steps,
+                msa_max_depth=msa_max_depth,
+                generator=generator,
+            )
+        coordinates, _ = self._sample_diffusion(
+            representations,
+            input,
+            num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            num_samples=num_samples,
+            generator=generator,
+            return_token_repr=False,
+            use_potentials=use_potentials,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
+        )
+        return _unflatten_sample_axis(
+            coordinates,
+            input.token_mask.shape[0],
+            num_samples,
+        )
+
+    @torch.inference_mode()
+    def fold(
+        self,
+        input: Boltz1Input,
+        *,
+        num_samples: int = 1,
+        generator: torch.Generator | None = None,
+        recycling_steps: int | None = None,
+        msa_max_depth: int | None = None,
+        num_sampling_steps: int | None = None,
+        step_scale: float | None = None,
+        use_potentials: bool = False,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
+    ) -> FoldResult:
+        r"""
+        Predict structures for one molecular system with Boltz 1.
+
+        Args:
+            input: Processor output for one system, with batch size ``B = 1`` and
+                molecular identities aligned to its atom and token axes.
+            num_samples: Number of coordinate samples.
+            generator: Optional generator for MSA row sampling, initial
+                coordinates, churn noise, rigid augmentations, and
+                potential-guided resampling.
+            recycling_steps: Number of trunk recycling iterations. ``None`` uses
+                the configured value.
+            msa_max_depth: Optional MSA rows sampled independently for every
+                MSA-module invocation. ``None`` retains every processed row.
+            num_sampling_steps: Number of diffusion transitions. ``None`` uses the
+                configured value.
+            step_scale: Optional scale on each reverse-diffusion Euler update.
+            use_potentials: Enable the released Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Energy-log-weight scale used for particle
+                resampling.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
+
+        Returns:
+            One generation-ordered prediction per sample. Structure, PAE, and PDE
+            values are in angstroms; pLDDT is on the ``0--100`` scale.
+
+        Raises:
+            ValueError: If ``num_samples`` is not positive, the batch contains
+                more than one system, or molecular identities are absent.
+        """
+
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        if input.token_mask.shape[0] != 1:
+            raise ValueError("Boltz1Model.fold accepts one molecular system per call")
+        if input.layout is None:
+            raise ValueError("Boltz1Model.fold requires the canonical layout produced by its Processor")
+
+        output = self._predict(
+            input,
+            recycling_steps=recycling_steps,
+            msa_max_depth=msa_max_depth,
+            num_sampling_steps=num_sampling_steps,
+            step_scale=step_scale,
+            num_samples=num_samples,
+            generator=generator,
+            use_potentials=use_potentials,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
+        )
+        return _decode_boltz1_fold_result(output, input)
+
     def _predict(
         self,
         input: Boltz1Input,
@@ -521,8 +678,12 @@ class Boltz1Model(Model):
         num_samples: int = 1,
         generator: torch.Generator | None = None,
         use_potentials: bool = False,
-        steering_args: Mapping[str, object] | None = None,
-        compute_confidence_scores: bool = True,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
     ) -> _Boltz1FoldOutput:
         r"""
         Run the trunk and sampler and return the full Boltz-1 output.
@@ -541,14 +702,23 @@ class Boltz1Model(Model):
             step_scale: Optional scale on each reverse-diffusion Euler update.
             num_samples: Number of reverse-diffusion samples to draw per input.
             generator: Optional RNG for reproducible sampling noise.
-            use_potentials: Whether to enable Boltz-1x physical-potential steering.
-            steering_args: Optional overrides merged onto the configured steering flags.
-            compute_confidence_scores: Whether to derive inference metrics from logits.
+            use_potentials: Enable the released Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Energy-log-weight scale used for particle
+                resampling.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
 
         Returns:
             A [`_Boltz1FoldOutput`][ofoldx.models.boltz1.model._Boltz1FoldOutput]
-            with sampled coordinates, distogram logits, optional confidence
-            logits, and optional derived ranking scores.
+            with sampled coordinates, distogram logits, and optional typed
+            confidence predictions.
 
         """
 
@@ -566,61 +736,66 @@ class Boltz1Model(Model):
             step_scale=step_scale,
             num_samples=num_samples,
             generator=generator,
+            return_token_repr=self.confidence_head is not None and self.config.confidence.use_single_diffusion,
             use_potentials=use_potentials,
-            steering_args=steering_args,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
         )
         batch_size = representations.single.shape[0]
-        confidence_logits: dict[str, Tensor | None] = {
-            "plddt_logits": None,
-            "pae_logits": None,
-            "pde_logits": None,
-            "resolved_logits": None,
-        }
-        confidence_scores: dict[str, Tensor] | None = None
+        coordinates = _unflatten_sample_axis(
+            diffusion_coords.detach(),
+            batch_size,
+            num_samples,
+        )
+        distogram_logits = representations.distogram_logits.detach()
+        confidence_output: Boltz1ConfidenceOutput | None = None
         confidence_head = self.confidence_head
         if confidence_head is not None:
-            confidence = confidence_head(
+            confidence_values = confidence_head(
                 representations.single_inputs.detach(),
                 representations.single.detach(),
                 representations.pair.detach(),
                 diffusion_coords.detach(),
                 input=input,
-                pred_distogram_logits=representations.distogram_logits.detach(),
+                pred_distogram_logits=distogram_logits,
                 single_diffusion=diffusion_token_repr,
                 multiplicity=num_samples,
                 msa_max_depth=msa_max_depth,
                 generator=generator,
-                compute_scores=compute_confidence_scores,
             )
-            confidence_logits = {
-                name: confidence.get(name) for name in ("plddt_logits", "pae_logits", "pde_logits", "resolved_logits")
+            confidence_values = {
+                name: _unflatten_sample_axis(value, batch_size, num_samples)
+                for name, value in confidence_values.items()
             }
-            if compute_confidence_scores:
-                confidence_scores = {
-                    name: _unflatten_sample_axis(value, batch_size, num_samples)
-                    for name, value in confidence.items()
-                    if name not in confidence_logits
-                }
+            confidence_output = Boltz1ConfidenceOutput(
+                coordinates=coordinates,
+                distogram_logits=distogram_logits,
+                plddt_logits=confidence_values["plddt_logits"],
+                pde_logits=confidence_values["pde_logits"],
+                resolved_logits=confidence_values["resolved_logits"],
+                plddt=confidence_values["plddt"],
+                pde=confidence_values["pde"],
+                complex_plddt=confidence_values["complex_plddt"],
+                complex_iplddt=confidence_values["complex_iplddt"],
+                complex_pde=confidence_values["complex_pde"],
+                complex_ipde=confidence_values["complex_ipde"],
+                confidence_score=confidence_values["confidence_score"],
+                pae_logits=confidence_values.get("pae_logits"),
+                pae=confidence_values.get("pae"),
+                ptm=confidence_values.get("ptm"),
+                iptm=confidence_values.get("iptm"),
+                ligand_iptm=confidence_values.get("ligand_iptm"),
+                protein_iptm=confidence_values.get("protein_iptm"),
+                chain_pair_iptm=confidence_values.get("chain_pair_iptm"),
+            )
         return _Boltz1FoldOutput(
-            coordinates=_unflatten_sample_axis(
-                diffusion_coords.detach(),
-                batch_size,
-                num_samples,
-            ),
-            distogram_logits=representations.distogram_logits.detach(),
-            plddt_logits=_unflatten_optional_sample_axis(
-                cast(Tensor | None, confidence_logits["plddt_logits"]), batch_size, num_samples
-            ),
-            pae_logits=_unflatten_optional_sample_axis(
-                cast(Tensor | None, confidence_logits["pae_logits"]), batch_size, num_samples
-            ),
-            pde_logits=_unflatten_optional_sample_axis(
-                cast(Tensor | None, confidence_logits["pde_logits"]), batch_size, num_samples
-            ),
-            resolved_logits=_unflatten_optional_sample_axis(
-                cast(Tensor | None, confidence_logits["resolved_logits"]), batch_size, num_samples
-            ),
-            confidence_scores=confidence_scores,
+            coordinates=coordinates,
+            distogram_logits=distogram_logits,
+            confidence=confidence_output,
         )
 
     def _run_trunk(
@@ -745,8 +920,14 @@ class Boltz1Model(Model):
         step_scale: float | None,
         num_samples: int,
         generator: torch.Generator | None,
+        return_token_repr: bool,
         use_potentials: bool = False,
-        steering_args: Mapping[str, object] | None = None,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
     ) -> tuple[Tensor, Tensor | None]:
         r"""
         Precompute the diffusion conditioning and run the EDM sampler.
@@ -759,8 +940,20 @@ class Boltz1Model(Model):
             step_scale: Optional scale on each reverse-diffusion Euler update.
             num_samples: Number of samples (sampler ``multiplicity``).
             generator: Optional RNG for reproducible sampling noise.
-            use_potentials: Whether to enable Boltz-1x physical-potential steering.
-            steering_args: Optional overrides merged onto the configured steering flags.
+            return_token_repr: Whether to accumulate diffusion token features
+                for the confidence head.
+            use_potentials: Enable the released Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Energy-log-weight scale used for particle
+                resampling.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
 
         Returns:
             Sampled coords and, when confidence single-diffusion is enabled, the accumulated token representation.
@@ -771,17 +964,6 @@ class Boltz1Model(Model):
                 representations,
                 input,
             )
-        steering = {} if steering_args is None else dict(steering_args)
-        if use_potentials:
-            steering["fk_steering"] = True
-            steering["physical_guidance_update"] = True
-        steering.setdefault("physical_guidance_update", False)
-        steering.setdefault("fk_steering", False)
-        steering.setdefault("num_particles", 3)
-        steering.setdefault("fk_lambda", 4.0)
-        steering.setdefault("fk_resampling_interval", 3)
-        steering.setdefault("num_gd_steps", 16)
-        return_token_repr = self.confidence_head is not None and self.config.confidence.use_single_diffusion
         sample = self.coordinate_diffusion._sample(
             input.atom_mask,
             num_sampling_steps=num_sampling_steps,
@@ -789,7 +971,12 @@ class Boltz1Model(Model):
             multiplicity=num_samples,
             generator=generator,
             return_token_repr=return_token_repr,
-            steering_args=steering,
+            feynman_kac=feynman_kac or use_potentials,
+            physical_guidance=physical_guidance or use_potentials,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
             single_inputs=representations.single_inputs,
             single_trunk=representations.single,
             conditioning=conditioning,
@@ -1188,6 +1375,7 @@ class Boltz1TrianglePairUpdateStack(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             Boltz1TrianglePairUpdateBlock(
                 pair_size=pair_size,
@@ -1787,22 +1975,21 @@ class Boltz1CoordinateDiffusion(nn.Module):
         multiplicity: int = 1,
         generator: torch.Generator | None = None,
         return_token_repr: bool = False,
-        steering_args: Mapping[str, object],
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
         **conditioning: object,
     ) -> Tensor | tuple[Tensor, Tensor]:
         single_trunk = cast(Tensor, conditioning["single_trunk"])
         device, dtype = single_trunk.device, single_trunk.dtype
         step_scale = self.step_scale if step_scale is None else step_scale
         feats = cast(dict[str, Tensor] | None, conditioning.pop("feats", None))
-        steering = dict(steering_args)
-        potentials = (
-            _boltz1_potentials(steering)
-            if bool(steering["fk_steering"] or steering["physical_guidance_update"])
-            else ()
-        )
-        num_particles = int(cast(float | int | str, steering["num_particles"]))
+        potentials = _boltz1_potentials(physical_guidance) if feynman_kac or physical_guidance else ()
         requested_multiplicity = multiplicity
-        effective_multiplicity = multiplicity * num_particles if bool(steering["fk_steering"]) else multiplicity
+        effective_multiplicity = multiplicity * num_particles if feynman_kac else multiplicity
         base_atom_mask = atom_mask
         expanded_atom_mask = atom_mask.repeat_interleave(effective_multiplicity, 0)
         shape = (*expanded_atom_mask.shape, 3)
@@ -1817,14 +2004,14 @@ class Boltz1CoordinateDiffusion(nn.Module):
             return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
         coords = sigmas[0] * randn()
-        if bool(steering["fk_steering"]):
+        if feynman_kac:
             num_groups = atom_mask.shape[0] * requested_multiplicity
             energy_traj = torch.empty((expanded_atom_mask.shape[0], 0), device=device, dtype=dtype)
             resample_weights = torch.ones(num_groups, num_particles, device=device, dtype=dtype)
         else:
             energy_traj = torch.empty((0, 0), device=device, dtype=dtype)
             resample_weights = torch.empty((0, 0), device=device, dtype=dtype)
-        if bool(steering["physical_guidance_update"]):
+        if physical_guidance:
             scaled_guidance_update = torch.zeros(shape, dtype=dtype, device=device)
         else:
             scaled_guidance_update = None
@@ -1881,9 +2068,8 @@ class Boltz1CoordinateDiffusion(nn.Module):
             else:
                 denoised = cast(Tensor, denoised_out)
 
-            should_resample = bool(steering["fk_steering"]) and (
-                (index % int(cast(float | int | str, steering["fk_resampling_interval"])) == 0 and noise_var > 0)
-                or index == len(sigmas) - 2
+            should_resample = feynman_kac and (
+                (index % feynman_kac_resampling_interval == 0 and noise_var > 0) or index == len(sigmas) - 2
             )
             if should_resample:
                 energy = torch.zeros(denoised.shape[0], device=device, dtype=denoised.dtype)
@@ -1904,15 +2090,13 @@ class Boltz1CoordinateDiffusion(nn.Module):
                 else:
                     ll_difference = torch.zeros_like(energy)
                 resample_weights = torch.softmax(
-                    (ll_difference + float(cast(float | int | str, steering["fk_lambda"])) * log_g).reshape(
-                        -1, num_particles
-                    ),
+                    (ll_difference + feynman_kac_lambda * log_g).reshape(-1, num_particles),
                     dim=1,
                 )
 
-            if bool(steering["physical_guidance_update"]) and index < len(sigmas) - 2:
+            if physical_guidance and index < len(sigmas) - 2:
                 guidance_update = torch.zeros_like(denoised)
-                for guidance_step in range(int(cast(float | int | str, steering["num_gd_steps"]))):
+                for guidance_step in range(num_guidance_steps):
                     energy_gradient = torch.zeros_like(denoised)
                     for potential in potentials:
                         parameters = potential.compute_parameters(steering_t)
@@ -1946,19 +2130,20 @@ class Boltz1CoordinateDiffusion(nn.Module):
                     token_a = token_a[resample_indices]
                 if index == len(sigmas) - 2:
                     effective_multiplicity = requested_multiplicity
-            output_token_feature_update = self.output_token_feature_update
-            if output_token_feature_update is not None:
-                if token_repr is None:
-                    token_repr = torch.zeros_like(cast(Tensor, token_a))
-                token_a = cast(Tensor, token_a)
-                sigma = torch.full((token_a.shape[0],), sigma_hat, device=token_a.device, dtype=token_a.dtype)
-                token_repr = output_token_feature_update(
-                    noise_level=self.preconditioner.c_noise(sigma),
-                    accumulated=token_repr,
-                    next_repr=token_a,
-                )
-            elif token_a is not None:
-                token_repr = token_a
+            if return_token_repr:
+                output_token_feature_update = self.output_token_feature_update
+                if output_token_feature_update is not None:
+                    if token_repr is None:
+                        token_repr = torch.zeros_like(cast(Tensor, token_a))
+                    token_a = cast(Tensor, token_a)
+                    sigma = torch.full((token_a.shape[0],), sigma_hat, device=token_a.device, dtype=token_a.dtype)
+                    token_repr = output_token_feature_update(
+                        noise_level=self.preconditioner.c_noise(sigma),
+                        accumulated=token_repr,
+                        next_repr=token_a,
+                    )
+                elif token_a is not None:
+                    token_repr = token_a
             if self.alignment_reverse_diff:
                 noisy = weighted_rigid_align(
                     source=noisy,
@@ -2236,7 +2421,6 @@ class _Boltz1ConfidenceHead(nn.Module):
         multiplicity: int = 1,
         msa_max_depth: int | None = None,
         generator: torch.Generator | None = None,
-        compute_scores: bool = True,
     ) -> dict[str, Tensor]:
         single_inputs, single, pair = self._prepare_representations(single_inputs, single, pair, input=input)
 
@@ -2284,19 +2468,18 @@ class _Boltz1ConfidenceHead(nn.Module):
             generator=generator,
         )
         logits = self.output_head(single, pair)
-        if compute_scores:
-            logits.update(
-                _boltz1_confidence_scores(
-                    logits,
-                    distances=distances,
-                    input=input,
-                    pred_distogram_logits=pred_distogram_logits,
-                    coordinates=coordinates,
-                    multiplicity=multiplicity,
-                    ranking_plddt_weight=self.ranking_plddt_weight,
-                    ranking_ptm_weight=self.ranking_ptm_weight,
-                )
+        logits.update(
+            _boltz1_confidence_scores(
+                logits,
+                distances=distances,
+                input=input,
+                pred_distogram_logits=pred_distogram_logits,
+                coordinates=coordinates,
+                multiplicity=multiplicity,
+                ranking_plddt_weight=self.ranking_plddt_weight,
+                ranking_ptm_weight=self.ranking_ptm_weight,
             )
+        )
         return logits
 
     def _prepare_representations(
@@ -3143,18 +3326,18 @@ class Boltz1PlanarBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBotto
         return improper_index, (torch.ones_like(upper_bounds), None, upper_bounds), None
 
 
-def _boltz1_potentials(steering_args: Mapping[str, object]) -> tuple[Boltz1Potential, ...]:
+def _boltz1_potentials(physical_guidance: bool) -> tuple[Boltz1Potential, ...]:
     r"""
     Instantiate the physical-potential set with its scheduled guidance and resampling weights.
 
     Args:
-        steering_args: The normalized steering flags; ``physical_guidance_update`` toggles the guidance weights on.
+        physical_guidance: Whether to enable the guidance weights.
 
     Returns:
         The tuple of configured Boltz-1x potentials.
     """
 
-    guidance_weight = 1.0 if bool(steering_args["physical_guidance_update"]) else 0.0
+    guidance_weight = 1.0 if physical_guidance else 0.0
     return (
         Boltz1SymmetricChainComPotential(
             {
@@ -3708,7 +3891,8 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
     scores onto values aligned to the layout's token axis.
 
     Args:
-        output: The raw folding output (sampled coords, confidence logits, derived ranking scores).
+        output: The raw folding output with sampled coordinates and optional
+            typed confidence predictions.
         input: The Boltz-1 input batch whose ``layout`` names the aligned molecular identities.
 
     Returns:
@@ -3726,31 +3910,31 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
     coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
     num_samples = coordinates.shape[0]
     token_axis = layout.token_sites
+    confidence = output.confidence
 
-    scores = output.confidence_scores or {}
-
-    def per_sample(name: str) -> np.ndarray | None:
-        value = scores.get(name)
+    def per_sample(value: Tensor | None) -> np.ndarray | None:
         return None if value is None else value[0].to(device="cpu", dtype=torch.float32).numpy()
 
-    plddt = per_sample("plddt")
-    pae = per_sample("pae")
-    pde = per_sample("pde")
-    complex_plddt = per_sample("complex_plddt")
-    complex_iplddt = per_sample("complex_iplddt")
-    complex_pde = per_sample("complex_pde")
-    complex_ipde = per_sample("complex_ipde")
-    confidence_score = per_sample("confidence_score")
-    ptm = per_sample("ptm")
-    iptm = per_sample("iptm")
-    ligand_iptm = per_sample("ligand_iptm")
-    protein_iptm = per_sample("protein_iptm")
-    chain_pair_iptm = per_sample("chain_pair_iptm")
+    plddt = per_sample(None if confidence is None else confidence.plddt)
+    pae = per_sample(None if confidence is None else confidence.pae)
+    pde = per_sample(None if confidence is None else confidence.pde)
+    complex_plddt = per_sample(None if confidence is None else confidence.complex_plddt)
+    complex_iplddt = per_sample(None if confidence is None else confidence.complex_iplddt)
+    complex_pde = per_sample(None if confidence is None else confidence.complex_pde)
+    complex_ipde = per_sample(None if confidence is None else confidence.complex_ipde)
+    confidence_score = per_sample(None if confidence is None else confidence.confidence_score)
+    ptm = per_sample(None if confidence is None else confidence.ptm)
+    iptm = per_sample(None if confidence is None else confidence.iptm)
+    ligand_iptm = per_sample(None if confidence is None else confidence.ligand_iptm)
+    protein_iptm = per_sample(None if confidence is None else confidence.protein_iptm)
+    chain_pair_iptm = per_sample(None if confidence is None else confidence.chain_pair_iptm)
     chain_axis = tuple(layout.system.instances.keys())
 
     resolved_probability: np.ndarray | None = None
-    if output.resolved_logits is not None:
-        resolved_probability = output.resolved_logits[0, :, :token_count].float().softmax(dim=-1)[..., 1].cpu().numpy()
+    if confidence is not None:
+        resolved_probability = (
+            confidence.resolved_logits[0, :, :token_count].float().softmax(dim=-1)[..., 1].cpu().numpy()
+        )
 
     predictions: list[FoldPrediction] = []
     for sample_index in range(num_samples):
@@ -3837,23 +4021,6 @@ def _gather_boltz1_structure_target(
     mask = mask & valid & input.atom_mask.bool()
     coordinates = coordinates.masked_fill(~mask.unsqueeze(-1), 0)
     return coordinates, mask
-
-
-def _unflatten_optional_sample_axis(tensor: Tensor | None, batch_size: int, multiplicity: int) -> Tensor | None:
-    r"""
-    Unflatten the leading sample axis of an optional tensor, passing ``None`` through unchanged.
-
-    Args:
-        tensor: The tensor to reshape, or ``None``.
-        batch_size: The batch size.
-        multiplicity: The number of samples per input.
-    Returns:
-        The reshaped tensor, or ``None``.
-    """
-
-    if tensor is None:
-        return None
-    return _unflatten_sample_axis(tensor, batch_size, multiplicity)
 
 
 def _unflatten_sample_axis(tensor: Tensor, batch_size: int, multiplicity: int) -> Tensor:
@@ -4074,24 +4241,54 @@ class Boltz1Output:
 @dataclass(kw_only=True, eq=False)
 class Boltz1ConfidenceOutput:
     r"""
-    Raw differentiable Boltz-1 confidence predictions.
+    Raw Boltz-1 confidence predictions and their official derived values.
 
     Args:
         coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)``.
         distogram_logits: Detached trunk distogram logits with shape
             ``(B, N, N, D)``.
         plddt_logits: Per-token pLDDT logits with shape ``(B, S, N, D_p)``.
-        pae_logits: Optional PAE logits with shape ``(B, S, N, N, D_a)``.
         pde_logits: PDE logits with shape ``(B, S, N, N, D_d)``.
         resolved_logits: Per-token resolved logits with shape ``(B, S, N, 2)``.
+        plddt: Expected per-token pLDDT fractions with shape ``(B, S, N)``.
+        pde: Expected PDE values with shape ``(B, S, N, N)``.
+        complex_plddt: Mean complex pLDDT with shape ``(B, S)``.
+        complex_iplddt: Interface-weighted pLDDT with shape ``(B, S)``.
+        complex_pde: Distogram-contact-weighted PDE with shape ``(B, S)``.
+        complex_ipde: Interface distogram-contact-weighted PDE with shape
+            ``(B, S)``.
+        confidence_score: Ranking confidence with shape ``(B, S)``.
+        pae_logits: Optional PAE logits with shape ``(B, S, N, N, D_a)``.
+        pae: Optional expected PAE values with shape ``(B, S, N, N)``.
+        ptm: Optional predicted TM score with shape ``(B, S)``.
+        iptm: Optional interface predicted TM score with shape ``(B, S)``.
+        ligand_iptm: Optional protein-ligand predicted TM score with shape
+            ``(B, S)``.
+        protein_iptm: Optional protein-protein predicted TM score with shape
+            ``(B, S)``.
+        chain_pair_iptm: Optional ordered chain-pair predicted TM scores with
+            shape ``(B, S, C, C)``.
     """
 
     coordinates: Tensor
     distogram_logits: Tensor
     plddt_logits: Tensor
-    pae_logits: Tensor | None
     pde_logits: Tensor
     resolved_logits: Tensor
+    plddt: Tensor
+    pde: Tensor
+    complex_plddt: Tensor
+    complex_iplddt: Tensor
+    complex_pde: Tensor
+    complex_ipde: Tensor
+    confidence_score: Tensor
+    pae_logits: Tensor | None = None
+    pae: Tensor | None = None
+    ptm: Tensor | None = None
+    iptm: Tensor | None = None
+    ligand_iptm: Tensor | None = None
+    protein_iptm: Tensor | None = None
+    chain_pair_iptm: Tensor | None = None
 
 
 @dataclass(kw_only=True, eq=False)
@@ -4103,20 +4300,13 @@ class _Boltz1FoldOutput:
         coordinates: Sampled atom coordinates with shape ``(B, S, A, 3)`` in
             angstroms.
         distogram_logits: Token-pair distance logits with shape ``(B, N, N, D)``.
-        plddt_logits: Optional confidence logits with shape ``(B, S, N, D_plddt)``.
-        pae_logits: Optional aligned-error logits with shape ``(B, S, N, N, D_pae)``.
-        pde_logits: Optional distance-error logits with shape ``(B, S, N, N, D_pde)``.
-        resolved_logits: Optional resolved-state logits with shape ``(B, S, N, 2)``.
-        confidence_scores: Optional per-sample confidence and ranking tensors.
+        confidence: Typed confidence predictions when the checkpoint contains a
+            confidence head.
     """
 
     coordinates: Tensor
     distogram_logits: Tensor
-    plddt_logits: Tensor | None
-    pae_logits: Tensor | None
-    pde_logits: Tensor | None
-    resolved_logits: Tensor | None
-    confidence_scores: dict[str, Tensor] | None
+    confidence: Boltz1ConfidenceOutput | None
 
 
 @dataclass(kw_only=True, eq=False)

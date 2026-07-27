@@ -10,10 +10,10 @@ import re
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from multimolecule import AutoModel, AutoTokenizer, EsmCForMaskedLM, EsmCModel, ProteinTokenizer
+from multimolecule import AutoModel, EsmCForMaskedLM, EsmCModel
 from safetensors.torch import load_file
 from torch import Tensor
 from transformers import AutoModelForMaskedLM
@@ -29,7 +29,12 @@ from .config import (
 from .model import EsmFold2ExperimentalModel, EsmFold2Model
 from .processor import EsmFold2ExperimentalProcessor, EsmFold2Processor
 
+if TYPE_CHECKING:
+    from .pipeline import EsmFold2ExperimentalPipeline
+
 _DEFAULT_ESMC_REPOSITORY = "multimolecule/esmc-6b"
+_DEFAULT_ESMC_300M_REPOSITORY = "multimolecule/esmc-300m"
+_DEFAULT_ESMC_600M_REPOSITORY = "multimolecule/esmc-600m"
 _BIOHUB_STATE_PREFIXES = (
     ("inputs_embedder.", "input_embeddings."),
     ("rel_pos.", "relative_position_embedder."),
@@ -598,9 +603,8 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     Build an [`EsmFold2ExperimentalConfig`][ofoldx.models.esmfold2.EsmFold2ExperimentalConfig]
     from a ``type="experimental"`` recurrent-graph checkpoint ``config.json``.
 
-    Every graph dimension is read from the checkpoint (the Fast inversion model ships 24
-    trunk blocks with the MSA encoder disabled; the MSA-conditioned critic ships 48 blocks);
-    nothing is guessed.
+    Every graph dimension is read from the checkpoint; nothing is guessed from a
+    repository name.
     """
 
     if raw_config.get("model_type") != "esmfold2" or raw_config.get("type") != "experimental":
@@ -616,11 +620,8 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     config.language_model_dropout = raw_config.get("lm_dropout", 0.0)
     config.force_language_model_dropout = raw_config.get("force_lm_dropout_during_inference", False)
 
-    # ESMC trunk width/depth the folding head projects from
-    # (``EsmFold2LanguageModelPairEncoder``
-    # base_z_linear/base_z_combine): read from the checkpoint so the smaller scaling-study
-    # trunks strict-load. The 6B checkpoints ship 2560/80 (the defaults); the 300M/600M
-    # scaling critics ship 960/30 and 1152/36.
+    # ESMC trunk width/depth consumed by the folding head's language-model
+    # projection are checkpoint graph dimensions, not repository defaults.
     config.esmc.hidden_size = raw_config.get("lm_d_model", config.esmc.hidden_size)
     config.esmc.num_hidden_layers = raw_config.get("lm_num_layers", config.esmc.num_hidden_layers)
 
@@ -688,10 +689,10 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     return config
 
 
-def load_experimental_esmfold2(
+def convert_esmfold2_experimental_model(
     checkpoint_or_repo: str | PathLike[str],
     *,
-    esmc: EsmCModel | EsmCForMaskedLM | None = None,
+    esmc: EsmCForMaskedLM,
     config_path: str | PathLike[str] | None = None,
     cache_dir: str | PathLike[str] | None = None,
     local_files_only: bool = False,
@@ -700,9 +701,9 @@ def load_experimental_esmfold2(
     r"""
     Strict-load a ``type="experimental"`` recurrent ESMFold2 head into an OFoldX model.
 
-    The MultiMolecule ESMC child is loaded separately (the head safetensors does not carry
-    it): the head strict-loads first with ``esmc=None`` and the optional ``esmc`` is attached
-    afterwards via [`load_esmc`][ofoldx.models.esmfold2.EsmFold2ExperimentalModel.load_esmc].
+    The Biohub head safetensors does not carry ESMC. This converter combines the
+    supplied complete masked-language model with the released head into one
+    directly runnable OFoldX Model.
     """
 
     checkpoint_path, resolved_config_path = resolve_esmfold2_source(
@@ -714,17 +715,28 @@ def load_experimental_esmfold2(
     )
     raw_config = json.loads(resolved_config_path.read_text(encoding="utf-8"))
     config = experimental_config_from_biohub(raw_config)
-    model = EsmFold2ExperimentalModel(config, esmc=None)
+    config.esmc = EsmFold2EsmCConfig({name: getattr(esmc.config, name) for name in EsmFold2EsmCConfig().dict()})
+    model = EsmFold2ExperimentalModel(config, esmc=esmc)
     head_state = load_esmfold2_state_dict(checkpoint_path)
     for name in _BIOHUB_UNUSED_STATE_KEYS:
         head_state.pop(name, None)
-    model.load_state_dict(head_state, strict=True)
-    if esmc is not None:
-        model.load_esmc(esmc)
+    incompatible = model.load_state_dict(head_state, strict=False)
+    expected_missing = {
+        *(f"esmc.{name}" for name in model.esmc.state_dict()),
+        *(f"esmc_lm_head.{name}" for name in model.esmc_lm_head.state_dict()),
+    }
+    missing = set(incompatible.missing_keys)
+    if missing != expected_missing or incompatible.unexpected_keys:
+        missing_head = sorted(missing - expected_missing)
+        unexpected = sorted(incompatible.unexpected_keys)
+        raise RuntimeError(
+            "experimental ESMFold2 checkpoint does not match the released head; "
+            f"missing_head={missing_head!r}, unexpected={unexpected!r}"
+        )
     return model
 
 
-def save_experimental_esmfold2_checkpoint(
+def convert_esmfold2_experimental_checkpoint(
     checkpoint_or_repo: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -738,24 +750,306 @@ def save_experimental_esmfold2_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert an experimental ESMFold2 head into a self-contained family artifact.
+    Convert one experimental ESMFold2 head into an ordinary complete pair.
 
-    Strict-loads the ``type="experimental"`` recurrent head via
-    [`load_experimental_esmfold2`][ofoldx.models.esmfold2.convert.load_experimental_esmfold2] with
-    ``esmc=None`` so the root state dict remains exactly the experimental head. The selected
-    MultiMolecule ESMC masked-LM model and tokenizer are attached to the concrete
-    [`EsmFold2DesignPipeline`][], whose save contract persists them under ``esmc/`` and
-    writes the ``esmfold2_design`` root marker only after the complete artifact.
-    The resulting repository is routed through
-    ``ofoldx.pipeline("design", model=...)``, which delegates loading to
-    [`EsmFold2DesignPipeline.from_repository`][].
+    Combines the ``type="experimental"`` recurrent head with the selected
+    MultiMolecule ESMC masked-language model in one complete root Model, then
+    writes an independently callable ``esmfold2_experimental`` repository.
 
     Saving is local-only by default; passing ``repo_id`` additionally uploads the complete
     artifact. No organization or token is assumed and nothing is published without an
     explicit ``repo_id``.
     """
 
+    pipeline = _convert_esmfold2_experimental_pair(
+        checkpoint_or_repo,
+        esmc_source=esmc_source,
+        config_path=config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    pipeline.save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def convert_esmfold2_design_checkpoints(
+    fast_checkpoint_or_repo: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    fast_cutoff2025_checkpoint_or_repo: str | PathLike[str],
+    experimental_checkpoint_or_repo: str | PathLike[str],
+    experimental_cutoff2025_checkpoint_or_repo: str | PathLike[str],
+    base300m_step250k_checkpoint_or_repo: str | PathLike[str],
+    base300m_step500k_checkpoint_or_repo: str | PathLike[str],
+    base300m_step750k_checkpoint_or_repo: str | PathLike[str],
+    base300m_step1000k_checkpoint_or_repo: str | PathLike[str],
+    base300m_step1500k_checkpoint_or_repo: str | PathLike[str],
+    base600m_step250k_checkpoint_or_repo: str | PathLike[str],
+    base600m_step500k_checkpoint_or_repo: str | PathLike[str],
+    base600m_step750k_checkpoint_or_repo: str | PathLike[str],
+    base600m_step1000k_checkpoint_or_repo: str | PathLike[str],
+    base600m_step1500k_checkpoint_or_repo: str | PathLike[str],
+    base6b_step250k_checkpoint_or_repo: str | PathLike[str],
+    base6b_step500k_checkpoint_or_repo: str | PathLike[str],
+    base6b_step750k_checkpoint_or_repo: str | PathLike[str],
+    base6b_step1000k_checkpoint_or_repo: str | PathLike[str],
+    base6b_step1500k_checkpoint_or_repo: str | PathLike[str],
+    esmc_300m_source: str | PathLike[str] = _DEFAULT_ESMC_300M_REPOSITORY,
+    esmc_600m_source: str | PathLike[str] = _DEFAULT_ESMC_600M_REPOSITORY,
+    esmc_6b_source: str | PathLike[str] = _DEFAULT_ESMC_REPOSITORY,
+    fast_config_path: str | PathLike[str] | None = None,
+    fast_cutoff2025_config_path: str | PathLike[str] | None = None,
+    experimental_config_path: str | PathLike[str] | None = None,
+    experimental_cutoff2025_config_path: str | PathLike[str] | None = None,
+    base300m_step250k_config_path: str | PathLike[str] | None = None,
+    base300m_step500k_config_path: str | PathLike[str] | None = None,
+    base300m_step750k_config_path: str | PathLike[str] | None = None,
+    base300m_step1000k_config_path: str | PathLike[str] | None = None,
+    base300m_step1500k_config_path: str | PathLike[str] | None = None,
+    base600m_step250k_config_path: str | PathLike[str] | None = None,
+    base600m_step500k_config_path: str | PathLike[str] | None = None,
+    base600m_step750k_config_path: str | PathLike[str] | None = None,
+    base600m_step1000k_config_path: str | PathLike[str] | None = None,
+    base600m_step1500k_config_path: str | PathLike[str] | None = None,
+    base6b_step250k_config_path: str | PathLike[str] | None = None,
+    base6b_step500k_config_path: str | PathLike[str] | None = None,
+    base6b_step750k_config_path: str | PathLike[str] | None = None,
+    base6b_step1000k_config_path: str | PathLike[str] | None = None,
+    base6b_step1500k_config_path: str | PathLike[str] | None = None,
+    dtype: torch.dtype | None = None,
+    cache_dir: str | PathLike[str] | None = None,
+    local_files_only: bool = False,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Write the released fixed nineteen-pair ESMFold2 binder-design repository.
+
+    The two inversion roles are reused among four hero roles, alongside fifteen
+    scaling roles. Every checkpoint role is an explicit argument, and every
+    head is combined with its matching complete frozen ESMC trunk and
+    masked-language-model head before the ordinary composite writer runs.
+    """
+
     from .pipeline import EsmFold2DesignPipeline
+
+    fast = _convert_esmfold2_experimental_pair(
+        fast_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=fast_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    fast_cutoff2025 = _convert_esmfold2_experimental_pair(
+        fast_cutoff2025_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=fast_cutoff2025_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    experimental = _convert_esmfold2_experimental_pair(
+        experimental_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=experimental_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    experimental_cutoff2025 = _convert_esmfold2_experimental_pair(
+        experimental_cutoff2025_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=experimental_cutoff2025_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base300m_step250k = _convert_esmfold2_experimental_pair(
+        base300m_step250k_checkpoint_or_repo,
+        esmc_source=esmc_300m_source,
+        config_path=base300m_step250k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base300m_step500k = _convert_esmfold2_experimental_pair(
+        base300m_step500k_checkpoint_or_repo,
+        esmc_source=esmc_300m_source,
+        config_path=base300m_step500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base300m_step750k = _convert_esmfold2_experimental_pair(
+        base300m_step750k_checkpoint_or_repo,
+        esmc_source=esmc_300m_source,
+        config_path=base300m_step750k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base300m_step1000k = _convert_esmfold2_experimental_pair(
+        base300m_step1000k_checkpoint_or_repo,
+        esmc_source=esmc_300m_source,
+        config_path=base300m_step1000k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base300m_step1500k = _convert_esmfold2_experimental_pair(
+        base300m_step1500k_checkpoint_or_repo,
+        esmc_source=esmc_300m_source,
+        config_path=base300m_step1500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base600m_step250k = _convert_esmfold2_experimental_pair(
+        base600m_step250k_checkpoint_or_repo,
+        esmc_source=esmc_600m_source,
+        config_path=base600m_step250k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base600m_step500k = _convert_esmfold2_experimental_pair(
+        base600m_step500k_checkpoint_or_repo,
+        esmc_source=esmc_600m_source,
+        config_path=base600m_step500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base600m_step750k = _convert_esmfold2_experimental_pair(
+        base600m_step750k_checkpoint_or_repo,
+        esmc_source=esmc_600m_source,
+        config_path=base600m_step750k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base600m_step1000k = _convert_esmfold2_experimental_pair(
+        base600m_step1000k_checkpoint_or_repo,
+        esmc_source=esmc_600m_source,
+        config_path=base600m_step1000k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base600m_step1500k = _convert_esmfold2_experimental_pair(
+        base600m_step1500k_checkpoint_or_repo,
+        esmc_source=esmc_600m_source,
+        config_path=base600m_step1500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base6b_step250k = _convert_esmfold2_experimental_pair(
+        base6b_step250k_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=base6b_step250k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base6b_step500k = _convert_esmfold2_experimental_pair(
+        base6b_step500k_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=base6b_step500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base6b_step750k = _convert_esmfold2_experimental_pair(
+        base6b_step750k_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=base6b_step750k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base6b_step1000k = _convert_esmfold2_experimental_pair(
+        base6b_step1000k_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=base6b_step1000k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    base6b_step1500k = _convert_esmfold2_experimental_pair(
+        base6b_step1500k_checkpoint_or_repo,
+        esmc_source=esmc_6b_source,
+        config_path=base6b_step1500k_config_path,
+        dtype=dtype,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        token=token,
+    )
+    EsmFold2DesignPipeline(
+        fast=fast,
+        fast_cutoff2025=fast_cutoff2025,
+        experimental=experimental,
+        experimental_cutoff2025=experimental_cutoff2025,
+        base300m_step250k=base300m_step250k,
+        base300m_step500k=base300m_step500k,
+        base300m_step750k=base300m_step750k,
+        base300m_step1000k=base300m_step1000k,
+        base300m_step1500k=base300m_step1500k,
+        base600m_step250k=base600m_step250k,
+        base600m_step500k=base600m_step500k,
+        base600m_step750k=base600m_step750k,
+        base600m_step1000k=base600m_step1000k,
+        base600m_step1500k=base600m_step1500k,
+        base6b_step250k=base6b_step250k,
+        base6b_step500k=base6b_step500k,
+        base6b_step750k=base6b_step750k,
+        base6b_step1000k=base6b_step1000k,
+        base6b_step1500k=base6b_step1500k,
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def _convert_esmfold2_experimental_pair(
+    checkpoint_or_repo: str | PathLike[str],
+    *,
+    esmc_source: str | PathLike[str],
+    config_path: str | PathLike[str] | None,
+    dtype: torch.dtype | None,
+    cache_dir: str | PathLike[str] | None,
+    local_files_only: bool,
+    token: str | None,
+) -> EsmFold2ExperimentalPipeline:
+    from .pipeline import EsmFold2ExperimentalPipeline
 
     esmc = cast(
         EsmCForMaskedLM,
@@ -767,15 +1061,9 @@ def save_experimental_esmfold2_checkpoint(
             token=token,
         ),
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        esmc_source,
-        cache_dir=None if cache_dir is None else str(cache_dir),
-        local_files_only=local_files_only,
-        token=token,
-    )
-    model = load_experimental_esmfold2(
+    model = convert_esmfold2_experimental_model(
         checkpoint_or_repo,
-        esmc=None,
+        esmc=esmc,
         config_path=config_path,
         cache_dir=cache_dir,
         local_files_only=local_files_only,
@@ -783,18 +1071,11 @@ def save_experimental_esmfold2_checkpoint(
     )
     if dtype is not None:
         model.to(dtype=dtype)
-    model.load_esmc(esmc)
     processor = EsmFold2ExperimentalProcessor(
         EsmFold2ExperimentalProcessorConfig({"msa_conditioning": model.config.use_msa_features}),
         dtype=dtype,
     )
-    processor.tokenizer = cast(ProteinTokenizer, tokenizer)
-    EsmFold2DesignPipeline(model=model, processor=processor).save(
-        output_dir,
-        repo_id=repo_id,
-        token=token,
-        private=private,
-    )
+    return EsmFold2ExperimentalPipeline(model=model, processor=processor)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -805,8 +1086,71 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint_or_repo", help="Head checkpoint or Hub repo, e.g. biohub/ESMFold2")
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--esmc", default=_DEFAULT_ESMC_REPOSITORY, help="MultiMolecule ESMC repository")
+    parser.add_argument("--esmc", default=_DEFAULT_ESMC_REPOSITORY, help="MultiMolecule 6B ESMC repository")
+    parser.add_argument(
+        "--esmc-300m",
+        default=_DEFAULT_ESMC_300M_REPOSITORY,
+        help="MultiMolecule 300M ESMC repository",
+    )
+    parser.add_argument(
+        "--esmc-600m",
+        default=_DEFAULT_ESMC_600M_REPOSITORY,
+        help="MultiMolecule 600M ESMC repository",
+    )
     parser.add_argument("--config", type=Path, default=None, help="Optional upstream config.json")
+    parser.add_argument(
+        "--fast-cutoff2025",
+        default=None,
+        help="Fast-Cutoff2025 inversion head required by --experimental",
+    )
+    parser.add_argument(
+        "--fast-cutoff2025-config",
+        type=Path,
+        default=None,
+        help="Optional Fast-Cutoff2025 upstream config.json",
+    )
+    parser.add_argument(
+        "--experimental-checkpoint",
+        default=None,
+        help="Experimental hero-critic head required by --experimental",
+    )
+    parser.add_argument(
+        "--experimental-cutoff2025",
+        default=None,
+        help="Experimental-Cutoff2025 hero-critic head required by --experimental",
+    )
+    parser.add_argument("--base300m-step250k", default=None)
+    parser.add_argument("--base300m-step500k", default=None)
+    parser.add_argument("--base300m-step750k", default=None)
+    parser.add_argument("--base300m-step1000k", default=None)
+    parser.add_argument("--base300m-step1500k", default=None)
+    parser.add_argument("--base600m-step250k", default=None)
+    parser.add_argument("--base600m-step500k", default=None)
+    parser.add_argument("--base600m-step750k", default=None)
+    parser.add_argument("--base600m-step1000k", default=None)
+    parser.add_argument("--base600m-step1500k", default=None)
+    parser.add_argument("--base6b-step250k", default=None)
+    parser.add_argument("--base6b-step500k", default=None)
+    parser.add_argument("--base6b-step750k", default=None)
+    parser.add_argument("--base6b-step1000k", default=None)
+    parser.add_argument("--base6b-step1500k", default=None)
+    parser.add_argument("--experimental-checkpoint-config", type=Path, default=None)
+    parser.add_argument("--experimental-cutoff2025-config", type=Path, default=None)
+    parser.add_argument("--base300m-step250k-config", type=Path, default=None)
+    parser.add_argument("--base300m-step500k-config", type=Path, default=None)
+    parser.add_argument("--base300m-step750k-config", type=Path, default=None)
+    parser.add_argument("--base300m-step1000k-config", type=Path, default=None)
+    parser.add_argument("--base300m-step1500k-config", type=Path, default=None)
+    parser.add_argument("--base600m-step250k-config", type=Path, default=None)
+    parser.add_argument("--base600m-step500k-config", type=Path, default=None)
+    parser.add_argument("--base600m-step750k-config", type=Path, default=None)
+    parser.add_argument("--base600m-step1000k-config", type=Path, default=None)
+    parser.add_argument("--base600m-step1500k-config", type=Path, default=None)
+    parser.add_argument("--base6b-step250k-config", type=Path, default=None)
+    parser.add_argument("--base6b-step500k-config", type=Path, default=None)
+    parser.add_argument("--base6b-step750k-config", type=Path, default=None)
+    parser.add_argument("--base6b-step1000k-config", type=Path, default=None)
+    parser.add_argument("--base6b-step1500k-config", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
@@ -820,17 +1164,77 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--experimental",
         action="store_true",
-        help="convert the type='experimental' recurrent binder-inversion head (design pipeline); "
-        "persists the selected ESMC model and tokenizer with the head",
+        help="write the complete fixed nineteen-pair binder-design repository",
     )
     args = parser.parse_args(argv)
     dtype = None if args.dtype == "keep" else _DTYPES[args.dtype]
     if args.experimental:
-        save_experimental_esmfold2_checkpoint(
+        required_roles = (
+            ("--fast-cutoff2025", args.fast_cutoff2025),
+            ("--experimental-checkpoint", args.experimental_checkpoint),
+            ("--experimental-cutoff2025", args.experimental_cutoff2025),
+            ("--base300m-step250k", args.base300m_step250k),
+            ("--base300m-step500k", args.base300m_step500k),
+            ("--base300m-step750k", args.base300m_step750k),
+            ("--base300m-step1000k", args.base300m_step1000k),
+            ("--base300m-step1500k", args.base300m_step1500k),
+            ("--base600m-step250k", args.base600m_step250k),
+            ("--base600m-step500k", args.base600m_step500k),
+            ("--base600m-step750k", args.base600m_step750k),
+            ("--base600m-step1000k", args.base600m_step1000k),
+            ("--base600m-step1500k", args.base600m_step1500k),
+            ("--base6b-step250k", args.base6b_step250k),
+            ("--base6b-step500k", args.base6b_step500k),
+            ("--base6b-step750k", args.base6b_step750k),
+            ("--base6b-step1000k", args.base6b_step1000k),
+            ("--base6b-step1500k", args.base6b_step1500k),
+        )
+        missing_roles = [flag for flag, value in required_roles if value is None]
+        if missing_roles:
+            parser.error("--experimental requires " + ", ".join(missing_roles))
+        convert_esmfold2_design_checkpoints(
             args.checkpoint_or_repo,
             args.output_dir,
-            esmc_source=args.esmc,
-            config_path=args.config,
+            fast_cutoff2025_checkpoint_or_repo=args.fast_cutoff2025,
+            experimental_checkpoint_or_repo=args.experimental_checkpoint,
+            experimental_cutoff2025_checkpoint_or_repo=args.experimental_cutoff2025,
+            base300m_step250k_checkpoint_or_repo=args.base300m_step250k,
+            base300m_step500k_checkpoint_or_repo=args.base300m_step500k,
+            base300m_step750k_checkpoint_or_repo=args.base300m_step750k,
+            base300m_step1000k_checkpoint_or_repo=args.base300m_step1000k,
+            base300m_step1500k_checkpoint_or_repo=args.base300m_step1500k,
+            base600m_step250k_checkpoint_or_repo=args.base600m_step250k,
+            base600m_step500k_checkpoint_or_repo=args.base600m_step500k,
+            base600m_step750k_checkpoint_or_repo=args.base600m_step750k,
+            base600m_step1000k_checkpoint_or_repo=args.base600m_step1000k,
+            base600m_step1500k_checkpoint_or_repo=args.base600m_step1500k,
+            base6b_step250k_checkpoint_or_repo=args.base6b_step250k,
+            base6b_step500k_checkpoint_or_repo=args.base6b_step500k,
+            base6b_step750k_checkpoint_or_repo=args.base6b_step750k,
+            base6b_step1000k_checkpoint_or_repo=args.base6b_step1000k,
+            base6b_step1500k_checkpoint_or_repo=args.base6b_step1500k,
+            esmc_300m_source=args.esmc_300m,
+            esmc_600m_source=args.esmc_600m,
+            esmc_6b_source=args.esmc,
+            fast_config_path=args.config,
+            fast_cutoff2025_config_path=args.fast_cutoff2025_config,
+            experimental_config_path=args.experimental_checkpoint_config,
+            experimental_cutoff2025_config_path=args.experimental_cutoff2025_config,
+            base300m_step250k_config_path=args.base300m_step250k_config,
+            base300m_step500k_config_path=args.base300m_step500k_config,
+            base300m_step750k_config_path=args.base300m_step750k_config,
+            base300m_step1000k_config_path=args.base300m_step1000k_config,
+            base300m_step1500k_config_path=args.base300m_step1500k_config,
+            base600m_step250k_config_path=args.base600m_step250k_config,
+            base600m_step500k_config_path=args.base600m_step500k_config,
+            base600m_step750k_config_path=args.base600m_step750k_config,
+            base600m_step1000k_config_path=args.base600m_step1000k_config,
+            base600m_step1500k_config_path=args.base600m_step1500k_config,
+            base6b_step250k_config_path=args.base6b_step250k_config,
+            base6b_step500k_config_path=args.base6b_step500k_config,
+            base6b_step750k_config_path=args.base6b_step750k_config,
+            base6b_step1000k_config_path=args.base6b_step1000k_config,
+            base6b_step1500k_config_path=args.base6b_step1500k_config,
             dtype=dtype,
             cache_dir=args.cache_dir,
             local_files_only=args.local_files_only,

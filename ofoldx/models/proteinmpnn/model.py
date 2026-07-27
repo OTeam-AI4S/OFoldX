@@ -51,6 +51,37 @@ class ProteinMpnnModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.proteinmpnn import ProteinMpnnConfig, ProteinMpnnModel, ProteinMpnnProcessor
+        >>> sequence = PolymerSequence.from_one_letter("A")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> sites = tuple(
+        ...     AtomSite("A", residue, atom)
+        ...     for residue in range(1)
+        ...     for atom in ("N", "CA", "C", "O")
+        ... )
+        >>> coordinates = np.array(
+        ...     [
+        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0],
+        ...     ],
+        ...     dtype=np.float32,
+        ... )
+        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> input = ProteinMpnnProcessor()(structure)
+        >>> config = ProteinMpnnConfig(
+        ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_decoder_blocks": 1,
+        ...      "num_neighbors": 1, "dropout": 0.0}
+        ... )
+        >>> model = ProteinMpnnModel(config)
+        >>> output = model(input, decoding_ranks=torch.zeros_like(input.sequence_tokens))
+        >>> output.logits.shape
+        torch.Size([1, 1, 21])
+        >>> output.decoding_ranks.tolist()
+        [[0]]
     """
 
     config_class = ProteinMpnnConfig

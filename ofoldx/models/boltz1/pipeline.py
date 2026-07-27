@@ -4,7 +4,6 @@ Boltz-1 folding Pipeline.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
 
@@ -42,7 +41,12 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         num_sampling_steps: int | None = None,
         step_scale: float | None = None,
         use_potentials: bool = False,
-        steering_args: Mapping[str, object] | None = None,
+        feynman_kac: bool = False,
+        physical_guidance: bool = False,
+        num_particles: int = 3,
+        feynman_kac_lambda: float = 4.0,
+        feynman_kac_resampling_interval: int = 3,
+        num_guidance_steps: int = 20,
     ) -> FoldResult:
         r"""
         Predict structures for one molecular system with Boltz 1.
@@ -63,8 +67,18 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
             max_msa_rows: Optional cap applied only while reading an MSA path.
             num_sampling_steps: Number of diffusion steps. ``None`` uses the Model configuration.
             step_scale: Optional scale on each reverse-diffusion Euler update.
-            use_potentials: Whether to apply configured physical-potential guidance.
-            steering_args: Optional potential-guidance controls.
+            use_potentials: Enable the released Feynman--Kac and
+                physical-guidance preset.
+            feynman_kac: Whether to use particle resampling.
+            physical_guidance: Whether to apply physical-potential gradients.
+            num_particles: Number of particles per requested sample under
+                Feynman--Kac steering.
+            feynman_kac_lambda: Energy-log-weight scale used for particle
+                resampling.
+            feynman_kac_resampling_interval: Reverse-diffusion step interval
+                between particle resampling operations.
+            num_guidance_steps: Gradient updates applied at each guided
+                reverse-diffusion step.
 
         Returns:
             Generation-ordered structure predictions. Structure, PAE, and PDE values
@@ -94,5 +108,10 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
             num_sampling_steps=num_sampling_steps,
             step_scale=step_scale,
             use_potentials=use_potentials,
-            steering_args=steering_args,
+            feynman_kac=feynman_kac,
+            physical_guidance=physical_guidance,
+            num_particles=num_particles,
+            feynman_kac_lambda=feynman_kac_lambda,
+            feynman_kac_resampling_interval=feynman_kac_resampling_interval,
+            num_guidance_steps=num_guidance_steps,
         )

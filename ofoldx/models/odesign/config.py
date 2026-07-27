@@ -112,6 +112,12 @@ class ODesignConfig(Config):
         recycling_steps: Number of trunk recycling passes.
         denoiser: All-atom EDM denoiser architecture.
         pairwise: Distogram and bond-reconstruction head configuration.
+
+    Examples:
+        >>> from ofoldx.models.odesign import ODesignConfig
+        >>> config = ODesignConfig(recycling_steps=2)
+        >>> config.recycling_steps
+        2
     """
 
     token_feature_size: int = 453

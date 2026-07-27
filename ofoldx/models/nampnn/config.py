@@ -24,6 +24,12 @@ class NaMpnnConfig(Config):
         num_polymer_types: Number of polymer-type node categories.
         num_atom_types: Number of explicit atom slots consumed by the feature encoder.
         include_predicted_na_n: Whether to append the idealized nucleobase N feature.
+
+    Examples:
+        >>> from ofoldx.models.nampnn import NaMpnnConfig
+        >>> config = NaMpnnConfig()
+        >>> config.vocab_size
+        33
     """
 
     vocab_size: int = 33

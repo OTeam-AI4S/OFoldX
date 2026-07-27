@@ -17,6 +17,12 @@ class LigandMpnnConfig(Config):
         num_decoder_blocks: Number of autoregressive decoder blocks.
         num_neighbors: Number of nearest neighbors in each residue graph.
         dropout: Dropout probability in encoder and decoder blocks.
+
+    Examples:
+        >>> from ofoldx.models.ligandmpnn import LigandMpnnConfig
+        >>> config = LigandMpnnConfig()
+        >>> config.num_neighbors
+        32
     """
 
     hidden_size: int = 128

@@ -279,6 +279,7 @@ class ProtenixProcessor(Processor):
         pocket: ProtenixPocket | None = None,
         substructure: Structure | None = None,
         substructure_coordinate_noise_scale: float = 0.0,
+        structure_condition: Structure | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
         generator: torch.Generator | None = None,
     ) -> ProtenixInput:
@@ -300,6 +301,7 @@ class ProtenixProcessor(Processor):
             pocket=pocket,
             substructure=substructure,
             substructure_coordinate_noise_scale=substructure_coordinate_noise_scale,
+            structure_condition=structure_condition,
             tfg_guidance=tfg_guidance,
             generator=generator,
             max_msa_rows=self.config.max_msa_rows,
@@ -383,6 +385,79 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
         system: MolecularSystem,
     ) -> MSA | MSACollection | None:
         return _normalize_template_msa(msa, system)
+
+
+class ProtenixStructureConditionProcessor(ProtenixProcessor):
+    r"""
+    Convert a molecular assembly and an explicit coordinate condition into
+    structure-conditioned Protenix inputs.
+
+    Args:
+        config: Feature limits and reference-position options.
+        device: Device for produced tensors.
+        dtype: Floating-point dtype for produced tensors.
+    """
+
+    def __call__(
+        self,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        *,
+        structure_condition: Structure | None = None,
+        msa: MSA | MSACollection | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = None,
+        generator: torch.Generator | None = None,
+    ) -> ProtenixInput:
+        r"""
+        Prepare the released representative-atom structure condition.
+
+        Args:
+            input: One or more ``PolymerSequence`` values, ``MolecularSystem``,
+                or ``Structure``. A primary Structure still contributes topology
+                only.
+            structure_condition: Optional in-memory coordinates matched to the
+                input's representative token atoms.
+            msa: Optional protein MSA evidence.
+            tfg_guidance: Optional training-free guidance whose static molecular
+                geometry should be prepared.
+            generator: Optional generator for reference-position augmentation.
+
+        Returns:
+            Batched Protenix tensors with representative coordinates and their
+            validity mask aligned to the token axis.
+        """
+
+        return self._lower(
+            input,
+            msa=msa,
+            structure_condition=structure_condition,
+            tfg_guidance=tfg_guidance,
+            generator=generator,
+        )
+
+    def process_training(
+        self,
+        input: Structure,
+        *,
+        structure_condition: Structure | None = None,
+        msa: MSA | MSACollection | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
+        r"""
+        Lower structure-conditioned input and separate complete coordinate truth.
+        """
+
+        processed = self(
+            input,
+            structure_condition=structure_condition,
+            msa=msa,
+            generator=generator,
+        )
+        return processed, _structure_target(
+            input,
+            processed,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
 
 class ProtenixConstraintProcessor(ProtenixProcessor):
@@ -742,6 +817,7 @@ def _features(
     pocket: ProtenixPocket | None,
     substructure: Structure | None,
     substructure_coordinate_noise_scale: float,
+    structure_condition: Structure | None,
     tfg_guidance: ProtenixTfgGuidance | None,
     generator: torch.Generator | None,
     max_msa_rows: int,
@@ -840,6 +916,10 @@ def _features(
     token_to_rep_atom = torch.tensor(
         [site_to_atom[cast(AtomSite, token["representative"])] for token in tokens], dtype=torch.long
     )
+    structure_rep_positions, structure_rep_mask = _structure_condition_features(
+        structure_condition,
+        tokens,
+    )
     template_features = (
         None
         if templates is None
@@ -905,6 +985,8 @@ def _features(
         token_contact=floating(token_contact_feature),
         atom_contact=floating(atom_contact_feature),
         substructure=floating(substructure_feature),
+        structure_rep_positions=floating(structure_rep_positions),
+        structure_rep_mask=integer(structure_rep_mask),
         template_features=template_features,
         tfg_features=tfg_features,
         system=system,
@@ -1426,6 +1508,30 @@ def _esm_features(
 def _model_atom_names(atom_sites: tuple[AtomSite, ...]) -> tuple[str, ...]:
     # Preserve canonical atom IDs; SMILES imports assign element-number IDs during construction.
     return tuple(site.atom_id for site in atom_sites)
+
+
+def _structure_condition_features(
+    structure: Structure | None,
+    tokens: list[dict[str, object]],
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Align resolved structure coordinates to the Protenix representative-token axis.
+    """
+
+    positions = torch.zeros(len(tokens), 3)
+    mask = torch.zeros(len(tokens), dtype=torch.bool)
+    if structure is None:
+        return positions, mask
+
+    coordinate_index = {
+        site: index for index, site in enumerate(structure.sites) if bool(structure.coordinate_mask[index])
+    }
+    for token_index, token in enumerate(tokens):
+        source_index = coordinate_index.get(cast(AtomSite, token["representative"]))
+        if source_index is not None:
+            positions[token_index] = torch.from_numpy(structure.coordinates[source_index].copy())
+            mask[token_index] = True
+    return positions, mask
 
 
 def _reference_features(

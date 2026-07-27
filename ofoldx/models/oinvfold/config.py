@@ -26,6 +26,12 @@ class OInvFoldPolymerConfig(Config):
         edge_feature_size: Width of lowered polymer edge features.
         vocabulary_size: Size of the unified protein/DNA/RNA vocabulary.
         decoder_hidden_size: Width of the polymer decoder transition.
+
+    Examples:
+        >>> from ofoldx.models.oinvfold import OInvFoldPolymerConfig
+        >>> config = OInvFoldPolymerConfig()
+        >>> config.vocabulary_size
+        25
     """
 
     hidden_size: int = 128
@@ -58,6 +64,12 @@ class OInvFoldLigandConfig(Config):
         node_feature_size: Width of lowered atom-node features.
         edge_feature_size: Width of lowered atom-edge features.
         vocabulary_size: Size of the released element vocabulary.
+
+    Examples:
+        >>> from ofoldx.models.oinvfold import OInvFoldLigandConfig
+        >>> config = OInvFoldLigandConfig()
+        >>> config.vocabulary_size
+        37
     """
 
     hidden_size: int = 128

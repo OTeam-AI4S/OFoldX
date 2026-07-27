@@ -35,6 +35,60 @@ class PxDesignModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import GeneratedSegment
+        >>> from ofoldx.models.pxdesign import (
+        ...     PxDesignConfig,
+        ...     PxDesignModel,
+        ...     PxDesignProcessor,
+        ... )
+        >>> input = PxDesignProcessor()(
+        ...     placement={"binder": {"binder": GeneratedSegment("protein", 1, 1)}}
+        ... )
+        >>> config = PxDesignConfig(
+        ...     {
+        ...         "single_size": 8,
+        ...         "pair_size": 8,
+        ...         "token_feature_size": 8,
+        ...         "num_template_bins": 4,
+        ...         "condition_embeddings": {
+        ...             "atom_hidden_size": 8,
+        ...             "atom_pair_hidden_size": 4,
+        ...             "token_hidden_size": 8,
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_encoder_attention_heads": 1,
+        ...             "num_query_atoms": 4,
+        ...             "num_key_atoms": 4,
+        ...         },
+        ...         "denoiser": {
+        ...             "token_hidden_size": 8,
+        ...             "atom_hidden_size": 8,
+        ...             "atom_pair_hidden_size": 4,
+        ...             "num_token_encoder_blocks": 1,
+        ...             "num_token_encoder_attention_heads": 1,
+        ...             "num_atom_encoder_blocks": 1,
+        ...             "num_atom_encoder_attention_heads": 1,
+        ...             "num_atom_decoder_blocks": 1,
+        ...             "num_atom_decoder_attention_heads": 1,
+        ...             "num_query_atoms": 4,
+        ...             "num_key_atoms": 4,
+        ...         },
+        ...     }
+        ... )
+        >>> model = PxDesignModel(config)
+        >>> noisy_coordinates = input.reference_positions[:, None]
+        >>> with torch.inference_mode():
+        ...     output = model(
+        ...         input,
+        ...         noisy_coordinates=noisy_coordinates,
+        ...         noise_level=torch.ones(1, 1),
+        ...     )
+        >>> output.coordinates.shape == noisy_coordinates.shape
+        True
+        >>> output.coordinates.shape[:2]
+        torch.Size([1, 1])
     """
 
     config_class = PxDesignConfig
@@ -150,7 +204,7 @@ class PxDesignModel(Model):
         generator: torch.Generator | None = None,
         num_sampling_steps: int = 400,
         sample_chunk_size: int | None = 10,
-    ) -> PxDesignDesignResult:
+    ) -> PxDesignBackboneResult:
         r"""
         Generate decoded target-binder backbone candidates.
 
@@ -164,7 +218,7 @@ class PxDesignModel(Model):
                 processes all candidates together.
 
         Returns:
-            A [`PxDesignDesignResult`][] containing ``num_candidates`` structures in
+            A [`PxDesignBackboneResult`][] containing ``num_candidates`` structures in
             sampling order. Structure coordinates are in angstroms.
         """
 
@@ -178,7 +232,7 @@ class PxDesignModel(Model):
             generator=generator,
         )
         candidates = tuple(
-            PxDesignDesignCandidate(
+            PxDesignBackboneCandidate(
                 structure=Structure(
                     system=input.layout.system,
                     sites=input.layout.sites,
@@ -189,7 +243,7 @@ class PxDesignModel(Model):
             for index in range(num_candidates)
         )
         # This model does not produce candidate-level confidence values.
-        return PxDesignDesignResult(candidates=candidates)
+        return PxDesignBackboneResult(candidates=candidates)
 
     def encode_condition(
         self,
@@ -592,7 +646,7 @@ class PxDesignOutput:
 
 
 @dataclass(eq=False)
-class PxDesignDesignCandidate:
+class PxDesignBackboneCandidate:
     r"""
     One coordinate-bearing target-binder backbone candidate.
 
@@ -605,7 +659,7 @@ class PxDesignDesignCandidate:
 
 
 @dataclass(eq=False)
-class PxDesignDesignResult:
+class PxDesignBackboneResult:
     r"""
     A generation-ordered collection of PxDesign candidates.
 
@@ -613,4 +667,4 @@ class PxDesignDesignResult:
         candidates: Candidates in generation order.
     """
 
-    candidates: tuple[PxDesignDesignCandidate, ...]
+    candidates: tuple[PxDesignBackboneCandidate, ...]

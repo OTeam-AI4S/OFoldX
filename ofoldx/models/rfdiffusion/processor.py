@@ -91,6 +91,8 @@ class RfDiffusionProcessor(Processor):
         *,
         placement: RfDiffusionPlacements | None = None,
         templates: Sequence[Template] = (),
+        secondary_structure: Tensor | None = None,
+        block_adjacency: Tensor | None = None,
         conditions: Sequence[
             AllowedResidueIdentities
             | Hotspot
@@ -114,6 +116,11 @@ class RfDiffusionProcessor(Processor):
             input: Optional context system or observed structure.
             placement: Topology containing existing spans and generated protein segments.
             templates: Zero or one structural template.
+            secondary_structure: Already-lowered fold-conditioning features with
+                shape ``(N, 4)``. Replaces the default or template-derived feature
+                before residue-level secondary-structure conditions are applied.
+            block_adjacency: Already-lowered fold-conditioning features with shape
+                ``(N, N, 3)``. Replaces the default or template-derived feature.
             conditions: Residue-identity, hotspot, geometry, symmetry, bond, and
                 interaction conditions.
             inpaint_sequence: Existing residue occurrences whose identities are masked.
@@ -190,10 +197,10 @@ class RfDiffusionProcessor(Processor):
                 if isinstance(part, GeneratedSegment):
                     if part.polymer_type != "protein":
                         raise ValueError("RFdiffusion generates protein backbones only")
-                    if template_values and part.min_length != part.max_length:
-                        raise ValueError(
-                            "RFdiffusion fold-conditioned Template evidence requires fixed generated lengths"
-                        )
+                    if (
+                        template_values or secondary_structure is not None or block_adjacency is not None
+                    ) and part.min_length != part.max_length:
+                        raise ValueError("RFdiffusion fold-conditioning evidence requires fixed generated lengths")
                     continue
                 if system is None:
                     raise ValueError("RFdiffusion ExistingSpan requires molecular input")
@@ -209,6 +216,10 @@ class RfDiffusionProcessor(Processor):
         # Keep the combined generated-length window distinct from the realized row count.
         combined_length = length
         output_length = len(output_residues)
+        if secondary_structure is not None and secondary_structure.shape != (output_length, 4):
+            raise ValueError(f"secondary_structure must have shape ({output_length}, 4)")
+        if block_adjacency is not None and block_adjacency.shape != (output_length, output_length, 3):
+            raise ValueError(f"block_adjacency must have shape ({output_length}, {output_length}, 3)")
         output_index = {reference: row for row, reference in enumerate(output_residues)}
         output_index.update(
             {alias: output_index[reference] for alias, reference in symbolic_residue_aliases(output_residues).items()}
@@ -414,13 +425,21 @@ class RfDiffusionProcessor(Processor):
                     "RfDiffusionReferenceCoordinates to define the substrate frame"
                 )
 
-        secondary_structure, block_adjacency = _fold_features(
-            template_values[0] if template_values else None,
-            system,
-            output_residues,
-            output_instances,
-        )
-        secondary_labels = secondary_structure.argmax(dim=-1)
+        if secondary_structure is None or block_adjacency is None:
+            default_secondary_structure, default_block_adjacency = _fold_features(
+                template_values[0] if template_values else None,
+                system,
+                output_residues,
+                output_instances,
+            )
+            fold_secondary_structure = (
+                default_secondary_structure if secondary_structure is None else secondary_structure
+            )
+            fold_block_adjacency = default_block_adjacency if block_adjacency is None else block_adjacency
+        else:
+            fold_secondary_structure = secondary_structure
+            fold_block_adjacency = block_adjacency
+        secondary_labels = fold_secondary_structure.argmax(dim=-1)
         label_by_kind = {"helix": 0, "strand": 1, "loop": 2}
         for condition in condition_values:
             if not isinstance(condition, RfDiffusionSecondaryStructure):
@@ -441,7 +460,7 @@ class RfDiffusionProcessor(Processor):
             label = label_by_kind[condition.kind]
             existing = secondary_labels[row_tensor]
             if bool(((existing != 3) & (existing != label)).any()):
-                raise ValueError("RfDiffusionSecondaryStructure contradicts template evidence")
+                raise ValueError("RfDiffusionSecondaryStructure contradicts fold-conditioning evidence")
             secondary_labels[row_tensor] = label
         secondary_structure = F.one_hot(secondary_labels, num_classes=4).to(torch.float32)
         residue_indices: list[int] = []
@@ -466,7 +485,7 @@ class RfDiffusionProcessor(Processor):
             hotspot_mask=hotspot.to(self.device).unsqueeze(0),
             cyclic_mask=cyclic_mask.to(self.device).unsqueeze(0),
             secondary_structure=secondary_structure.to(device=self.device, dtype=self.dtype).unsqueeze(0),
-            block_adjacency=block_adjacency.to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            block_adjacency=fold_block_adjacency.to(device=self.device, dtype=self.dtype).unsqueeze(0),
             timestep=torch.tensor([timestep], dtype=torch.int64, device=self.device),
             layout=RfDiffusionLayout(
                 system=system,

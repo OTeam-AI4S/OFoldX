@@ -1,10 +1,5 @@
 r"""
-Checkpoint converter: BoltzGen inverse-folding checkpoint -> OFoldX clean names.
-
-Routes the three top-level prefixes of ``boltzgen1_ifold.ckpt`` (input_embedder / inverse_folding_encoder /
-structure_module) to the matching OFoldX modules. The input embedder reuses the Boltz-2 atom converters;
-the encoder/decoder GNN blocks use the clean MLP/transition names. Unmapped keys raise, and the resulting
-state dictionary is suitable for strict loading.
+Checkpoint conversion for released BoltzGen structure design and inverse folding.
 """
 
 from __future__ import annotations
@@ -19,6 +14,9 @@ from typing import Any, cast
 import torch
 from torch import Tensor
 
+from ..boltz2.config import Boltz2AffinityConfig, Boltz2Config
+from ..boltz2.convert import convert_boltz2_affinity_model, convert_boltz2_model
+from ..boltz2.processor import Boltz2AffinityProcessor, Boltz2Processor
 from .config import BoltzGenConfidenceConfig, BoltzGenConfig, BoltzGenInverseFoldingConfig
 from .model import BoltzGenConfidenceModel, BoltzGenInverseFoldingModel, BoltzGenModel
 from .processor import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
@@ -1261,7 +1259,7 @@ def boltzgen_config_from_checkpoint(
     return config
 
 
-def convert_boltzgen_checkpoint(
+def convert_boltzgen_model(
     checkpoint_path: str | PathLike[str],
     *,
     config: BoltzGenConfig | BoltzGenConfidenceConfig | None = None,
@@ -1292,7 +1290,7 @@ def convert_boltzgen_checkpoint(
     return model
 
 
-def convert_boltzgen_ifold_checkpoint(
+def convert_boltzgen_inverse_folding_model(
     checkpoint_path: str | PathLike[str],
     *,
     config: BoltzGenInverseFoldingConfig | None = None,
@@ -1329,45 +1327,77 @@ def _cast_floating_tensors(
     }
 
 
-def save_boltzgen_pipeline(
-    design_checkpoint_path: str | PathLike[str],
-    ifold_checkpoint_path: str | PathLike[str],
+def convert_boltzgen_checkpoint(
+    diverse_checkpoint_path: str | PathLike[str],
+    adherence_checkpoint_path: str | PathLike[str],
+    inverse_folding_checkpoint_path: str | PathLike[str],
+    fold_checkpoint_path: str | PathLike[str],
+    affinity_checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
-    design_config: BoltzGenConfig | None = None,
+    diverse_config: BoltzGenConfig | None = None,
+    adherence_config: BoltzGenConfig | None = None,
     inverse_folding_config: BoltzGenInverseFoldingConfig | None = None,
+    fold_config: Boltz2Config | None = None,
+    affinity_config: Boltz2AffinityConfig | None = None,
     dtype: torch.dtype | None = None,
     repo_id: str | None = None,
     token: str | None = None,
     private: bool = False,
 ) -> None:
     r"""
-    Convert the BoltzGen design + inverse-fold checkpoints and write the composite repository.
+    Convert all five released BoltzGen checkpoint roles into one fixed repository.
 
-    The released BoltzGen design deliverable is a multi-pair [`BoltzGenPipeline`][]:
-    the structure-design pair owns the runnable root and the inverse-folding pair lives at the fixed
-    ``ifold/`` sub-directory. Neither pair is a standalone Pipeline, so this writes the composite
-    repository — both required pairs and
-    the one-field ``pipeline.json`` marker — via ``BoltzGenPipeline.save`` so ``pipeline(..., model=dir)``
-    routes it back through the multi-pair loader. The optional read-only boltz2 ``fold/`` / ``affinity/``
-    stages are injected at load time and are not vendored here.
-
-    Both designer Processors are config-less; their ``processor.json`` files record only the
-    floating-point dtype. Saving is local-only by default; passing ``repo_id`` additionally uploads
-    the composite repository.
+    The diverse structure designer owns the root. The adherence designer,
+    inverse-folding model, Boltz-2 folding model, and Boltz-2 affinity model live
+    at ``adherence/``, ``ifold/``, ``fold/``, and ``affinity/`` respectively.
+    Every pair is required by the concrete [`BoltzGenPipeline`][] lifecycle.
     """
 
     from .pipeline import BoltzGenPipeline
 
-    design_model = convert_boltzgen_checkpoint(design_checkpoint_path, config=design_config, dtype=dtype)
-    inverse_folding_model = convert_boltzgen_ifold_checkpoint(
-        ifold_checkpoint_path, config=inverse_folding_config, dtype=dtype
+    diverse_model = cast(
+        BoltzGenModel,
+        convert_boltzgen_model(
+            diverse_checkpoint_path,
+            config=diverse_config,
+            dtype=dtype,
+        ),
+    )
+    adherence_model = cast(
+        BoltzGenModel,
+        convert_boltzgen_model(
+            adherence_checkpoint_path,
+            config=adherence_config,
+            dtype=dtype,
+        ),
+    )
+    inverse_folding_model = convert_boltzgen_inverse_folding_model(
+        inverse_folding_checkpoint_path,
+        config=inverse_folding_config,
+        dtype=dtype,
+    )
+    fold_model = convert_boltz2_model(
+        fold_checkpoint_path,
+        config=fold_config,
+        dtype=dtype,
+    )
+    affinity_model = convert_boltz2_affinity_model(
+        affinity_checkpoint_path,
+        config=affinity_config,
+        dtype=dtype,
     )
     BoltzGenPipeline(
-        design_model=design_model,
-        design_processor=BoltzGenProcessor(dtype=dtype),
+        diverse_model=diverse_model,
+        diverse_processor=BoltzGenProcessor(dtype=dtype),
+        adherence_model=adherence_model,
+        adherence_processor=BoltzGenProcessor(dtype=dtype),
         inverse_folding_model=inverse_folding_model,
         inverse_folding_processor=BoltzGenInverseFoldingProcessor(dtype=dtype),
+        fold_model=fold_model,
+        fold_processor=Boltz2Processor(dtype=dtype),
+        affinity_model=affinity_model,
+        affinity_processor=Boltz2AffinityProcessor(dtype=dtype),
     ).save(
         output_dir,
         repo_id=repo_id,
@@ -1382,8 +1412,31 @@ def main(argv: list[str] | None = None) -> None:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("design_checkpoint", type=Path, help="released BoltzGen structure-design .ckpt")
-    parser.add_argument("ifold_checkpoint", type=Path, help="released BoltzGen inverse-folding .ckpt")
+    parser.add_argument(
+        "diverse_checkpoint",
+        type=Path,
+        help="released BoltzGen diverse-design .ckpt",
+    )
+    parser.add_argument(
+        "adherence_checkpoint",
+        type=Path,
+        help="released BoltzGen adherence-design .ckpt",
+    )
+    parser.add_argument(
+        "inverse_folding_checkpoint",
+        type=Path,
+        help="released BoltzGen inverse-folding .ckpt",
+    )
+    parser.add_argument(
+        "fold_checkpoint",
+        type=Path,
+        help="released Boltz-2 confidence/folding .ckpt",
+    )
+    parser.add_argument(
+        "affinity_checkpoint",
+        type=Path,
+        help="released Boltz-2 affinity .ckpt",
+    )
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--dtype", choices=("keep", *_DTYPES), default="keep")
     parser.add_argument(
@@ -1391,12 +1444,23 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="optional Hub repo id (e.g. owner/name) to publish to; local-only when omitted",
     )
-    parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
-    parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="optional Hugging Face token for --repo-id",
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="create the --repo-id repo as private",
+    )
     args = parser.parse_args(argv)
-    save_boltzgen_pipeline(
-        args.design_checkpoint,
-        args.ifold_checkpoint,
+    convert_boltzgen_checkpoint(
+        args.diverse_checkpoint,
+        args.adherence_checkpoint,
+        args.inverse_folding_checkpoint,
+        args.fold_checkpoint,
+        args.affinity_checkpoint,
         args.output_dir,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],
         repo_id=args.repo_id,

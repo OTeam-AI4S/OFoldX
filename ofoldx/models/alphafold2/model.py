@@ -449,9 +449,7 @@ class AlphaFold2Model(Model):
             fixed_ensemble = tuple(self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles))
         previous_positions, previous_msa_first_row, previous_pair = self._initial_recycling(input)
         early_stop_tolerance = (
-            self.config.recycle_early_stop_tolerance
-            if isinstance(self.config, AlphaFold2MultimerConfig)
-            else None
+            self.config.recycle_early_stop_tolerance if isinstance(self.config, AlphaFold2MultimerConfig) else None
         )
         stop_after_cycle = False
         for cycle in range(recycling_steps):
@@ -485,9 +483,7 @@ class AlphaFold2Model(Model):
                 previous_distances = torch.sqrt(
                     torch.square(previous_ca.unsqueeze(-2) - previous_ca.unsqueeze(-3)).sum(dim=-1)
                 )
-                next_distances = torch.sqrt(
-                    torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1)
-                )
+                next_distances = torch.sqrt(torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1))
                 squared_difference = torch.square(previous_distances - next_distances)
                 pair_mask = input.sequence_mask.unsqueeze(-1) * input.sequence_mask.unsqueeze(-2)
                 mean_squared_difference = (squared_difference * pair_mask).sum(dim=(-2, -1)) / (
@@ -827,9 +823,8 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         if self.template_embedder is None:
             return pair
         initial_guess_input = cast(AlphaFold2InitialGuessInput, input)
-        template_pair_mask = (
-            initial_guess_input.chain_index.unsqueeze(-1)
-            == initial_guess_input.chain_index.unsqueeze(-2)
+        template_pair_mask = initial_guess_input.chain_index.unsqueeze(-1) == initial_guess_input.chain_index.unsqueeze(
+            -2
         )
         return pair + self.template_embedder(
             pair,

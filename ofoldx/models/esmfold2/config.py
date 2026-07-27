@@ -253,6 +253,11 @@ class EsmFold2Config(Config):
     r"""
     Configure the complete ESMC and ESMFold2 folding graph.
 
+    Examples:
+        >>> config = EsmFold2Config({"recycling_steps": 2})
+        >>> config.recycling_steps
+        2
+
     Args:
         single_size: Width of the token representation.
         pair_size: Width of the pair representation.
@@ -327,6 +332,11 @@ class EsmFold2ExperimentalConfig(Config):
     r"""
     Configure the recurrent ``ESMFold2-Experimental-Fast`` binder-design graph.
 
+    Examples:
+        >>> config = EsmFold2ExperimentalConfig({"use_msa_features": True})
+        >>> config.use_msa_features
+        True
+
     Args:
         single_size: Width of the token representation.
         pair_size: Width of the pair representation.
@@ -336,7 +346,6 @@ class EsmFold2ExperimentalConfig(Config):
         use_msa_features: Whether to use MSA features during sequence inversion.
         language_model_dropout: Dropout probability on language-model representations.
         force_language_model_dropout: Whether to apply language-model dropout outside training mode.
-        language_model_weight: Weight of the ESMC sequence prior in binder-design objectives.
         input_embeddings: Token and sliding-window atom input embedding configuration.
         esmc: MultiMolecule ESMC language-model configuration.
         msa_encoder: MSA encoder, disabled by default with a 32-wide attention head.
@@ -353,10 +362,6 @@ class EsmFold2ExperimentalConfig(Config):
     use_msa_features: bool = False
     language_model_dropout: float = 0.0
     force_language_model_dropout: bool = False
-
-    # Weight of the masked-language-model sequence prior in the binder-design objective. Antibody-framework
-    # designs commonly use 0.05 so the structure objective dominates their short mutable loops.
-    language_model_weight: float = 0.15
 
     input_embeddings: EsmFold2InputEmbeddingsConfig = EsmFold2InputEmbeddingsConfig()
     esmc: EsmFold2EsmCConfig = EsmFold2EsmCConfig()

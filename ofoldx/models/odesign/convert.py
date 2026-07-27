@@ -23,7 +23,10 @@ from .model import ODesignModel
 from .processor import ODesignLigandProcessor, ODesignProcessor
 
 if TYPE_CHECKING:
+    from ..grnade import GrnadePipeline
+    from ..ligandmpnn import LigandMpnnPipeline
     from ..oinvfold import OInvFoldLigandPipeline, OInvFoldPolymerPipeline
+    from ..proteinmpnn import ProteinMpnnPipeline
 
 _ReferenceKey: TypeAlias = str | tuple[str, ...]
 _ReferenceValue: TypeAlias = Tensor | tuple[Tensor, ...]
@@ -190,7 +193,8 @@ def convert_odesign_protein_flex_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
-    sequence_designer: str | PathLike[str],
+    protein_designer: str | PathLike[str],
+    ligand_designer: str | PathLike[str],
     dtype: torch.dtype | None = None,
     config: ODesignConfig | None = None,
     repo_id: str | None = None,
@@ -198,13 +202,14 @@ def convert_odesign_protein_flex_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert the released protein-flex artifact with its protein OInvFold child.
+    Convert the released protein-flex artifact with both released MPNN children.
     """
 
     _convert_odesign_protein_checkpoint(
         checkpoint_path,
         output_dir,
-        sequence_designer=sequence_designer,
+        protein_designer=protein_designer,
+        ligand_designer=ligand_designer,
         receptor_mode="flex",
         dtype=dtype,
         config=config,
@@ -218,7 +223,8 @@ def convert_odesign_protein_rigid_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
-    sequence_designer: str | PathLike[str],
+    protein_designer: str | PathLike[str],
+    ligand_designer: str | PathLike[str],
     dtype: torch.dtype | None = None,
     config: ODesignConfig | None = None,
     repo_id: str | None = None,
@@ -226,13 +232,14 @@ def convert_odesign_protein_rigid_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert the released protein-rigid artifact with its protein OInvFold child.
+    Convert the released protein-rigid artifact with both released MPNN children.
     """
 
     _convert_odesign_protein_checkpoint(
         checkpoint_path,
         output_dir,
-        sequence_designer=sequence_designer,
+        protein_designer=protein_designer,
+        ligand_designer=ligand_designer,
         receptor_mode="rigid",
         dtype=dtype,
         config=config,
@@ -255,20 +262,19 @@ def convert_odesign_nucleic_acid_rigid_checkpoint(
     private: bool = False,
 ) -> None:
     r"""
-    Convert the released nucleic-acid-rigid artifact with DNA and RNA OInvFold children.
+    Convert the released nucleic-acid-rigid artifact with DNA OInvFold and RNA gRNAde.
     """
 
     from .pipeline import ODesignNucleicAcidPipeline
 
-    dna = _load_polymer_designer(
+    dna = _load_oinvfold_polymer_designer(
         dna_designer,
         modality="dna",
         dtype=dtype,
         token=token,
     )
-    rna = _load_polymer_designer(
+    rna = _load_grnade_designer(
         rna_designer,
-        modality="rna",
         dtype=dtype,
         token=token,
     )
@@ -309,7 +315,7 @@ def convert_odesign_ligand_rigid_checkpoint(
 
     from .pipeline import ODesignLigandPipeline
 
-    designer = _load_ligand_designer(
+    designer = _load_ligand_element_designer(
         element_designer,
         dtype=dtype,
         token=token,
@@ -330,7 +336,150 @@ def convert_odesign_ligand_rigid_checkpoint(
     )
 
 
+def convert_odesign_oinvfold_protein_flex_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    sequence_designer: str | PathLike[str],
+    dtype: torch.dtype | None = None,
+    config: ODesignConfig | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert the explicit protein-flex OInvFold alternative.
+    """
+
+    _convert_odesign_oinvfold_protein_checkpoint(
+        checkpoint_path,
+        output_dir,
+        sequence_designer=sequence_designer,
+        receptor_mode="flex",
+        dtype=dtype,
+        config=config,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def convert_odesign_oinvfold_protein_rigid_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    sequence_designer: str | PathLike[str],
+    dtype: torch.dtype | None = None,
+    config: ODesignConfig | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert the explicit protein-rigid OInvFold alternative.
+    """
+
+    _convert_odesign_oinvfold_protein_checkpoint(
+        checkpoint_path,
+        output_dir,
+        sequence_designer=sequence_designer,
+        receptor_mode="rigid",
+        dtype=dtype,
+        config=config,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def convert_odesign_oinvfold_rna_rigid_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    sequence_designer: str | PathLike[str],
+    dtype: torch.dtype | None = None,
+    config: ODesignConfig | None = None,
+    repo_id: str | None = None,
+    token: str | None = None,
+    private: bool = False,
+) -> None:
+    r"""
+    Convert the explicit RNA-rigid OInvFold alternative.
+    """
+
+    from .pipeline import ODesignOInvFoldRnaPipeline
+
+    designer = _load_oinvfold_polymer_designer(
+        sequence_designer,
+        modality="rna",
+        dtype=dtype,
+        token=token,
+    )
+    model = convert_odesign_model(checkpoint_path, dtype=dtype, config=config)
+    ODesignOInvFoldRnaPipeline(
+        model=model,
+        processor=ODesignProcessor(
+            ODesignProcessorConfig(
+                generated_modality="nucleic_acid",
+                receptor_mode="rigid",
+            ),
+            dtype=dtype,
+        ),
+        sequence_designer=designer,
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
 def _convert_odesign_protein_checkpoint(
+    checkpoint_path: str | PathLike[str],
+    output_dir: str | PathLike[str],
+    *,
+    protein_designer: str | PathLike[str],
+    ligand_designer: str | PathLike[str],
+    receptor_mode: Literal["rigid", "flex"],
+    dtype: torch.dtype | None,
+    config: ODesignConfig | None,
+    repo_id: str | None,
+    token: str | None,
+    private: bool,
+) -> None:
+    from .pipeline import ODesignProteinPipeline
+
+    protein = _load_protein_designer(
+        protein_designer,
+        dtype=dtype,
+        token=token,
+    )
+    ligand = _load_ligandmpnn_designer(
+        ligand_designer,
+        dtype=dtype,
+        token=token,
+    )
+    model = convert_odesign_model(checkpoint_path, dtype=dtype, config=config)
+    ODesignProteinPipeline(
+        model=model,
+        processor=ODesignProcessor(
+            ODesignProcessorConfig(
+                generated_modality="protein",
+                receptor_mode=receptor_mode,
+            ),
+            dtype=dtype,
+        ),
+        protein_designer=protein,
+        ligand_designer=ligand,
+    ).save(
+        output_dir,
+        repo_id=repo_id,
+        token=token,
+        private=private,
+    )
+
+
+def _convert_odesign_oinvfold_protein_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -342,16 +491,16 @@ def _convert_odesign_protein_checkpoint(
     token: str | None,
     private: bool,
 ) -> None:
-    from .pipeline import ODesignProteinPipeline
+    from .pipeline import ODesignOInvFoldProteinPipeline
 
-    designer = _load_polymer_designer(
+    designer = _load_oinvfold_polymer_designer(
         sequence_designer,
         modality="protein",
         dtype=dtype,
         token=token,
     )
     model = convert_odesign_model(checkpoint_path, dtype=dtype, config=config)
-    ODesignProteinPipeline(
+    ODesignOInvFoldProteinPipeline(
         model=model,
         processor=ODesignProcessor(
             ODesignProcessorConfig(
@@ -369,7 +518,7 @@ def _convert_odesign_protein_checkpoint(
     )
 
 
-def _load_polymer_designer(
+def _load_oinvfold_polymer_designer(
     repository: str | PathLike[str],
     *,
     modality: Literal["protein", "dna", "rna"],
@@ -386,7 +535,7 @@ def _load_polymer_designer(
         dtype=dtype,
     )
     if not isinstance(designer, OInvFoldPolymerPipeline):
-        raise TypeError("ODesign polymer artifacts require an OInvFold polymer child")
+        raise TypeError(f"ODesign {modality} compositions require an OInvFold polymer child")
     if designer.processor.config.modality != modality:
         raise ValueError(
             f"ODesign requires an OInvFold {modality} child, got " f"{designer.processor.config.modality!r}"
@@ -394,7 +543,67 @@ def _load_polymer_designer(
     return designer
 
 
-def _load_ligand_designer(
+def _load_protein_designer(
+    repository: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None,
+    token: str | None,
+) -> ProteinMpnnPipeline:
+    from ...api import pipeline
+    from ..proteinmpnn import ProteinMpnnPipeline
+
+    designer = pipeline(
+        "design",
+        model=repository,
+        token=token,
+        dtype=dtype,
+    )
+    if not isinstance(designer, ProteinMpnnPipeline):
+        raise TypeError("ODesign protein artifacts require a ProteinMPNN child")
+    return designer
+
+
+def _load_ligandmpnn_designer(
+    repository: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None,
+    token: str | None,
+) -> LigandMpnnPipeline:
+    from ...api import pipeline
+    from ..ligandmpnn import LigandMpnnPipeline
+
+    designer = pipeline(
+        "design",
+        model=repository,
+        token=token,
+        dtype=dtype,
+    )
+    if not isinstance(designer, LigandMpnnPipeline):
+        raise TypeError("ODesign protein artifacts require a LigandMPNN child")
+    return designer
+
+
+def _load_grnade_designer(
+    repository: str | PathLike[str],
+    *,
+    dtype: torch.dtype | None,
+    token: str | None,
+) -> GrnadePipeline:
+    from ...api import pipeline
+    from ..grnade import GrnadePipeline
+
+    designer = pipeline(
+        "design",
+        model=repository,
+        token=token,
+        dtype=dtype,
+    )
+    if not isinstance(designer, GrnadePipeline):
+        raise TypeError("ODesign nucleic-acid artifacts require a gRNAde RNA child")
+    return designer
+
+
+def _load_ligand_element_designer(
     repository: str | PathLike[str],
     *,
     dtype: torch.dtype | None,
@@ -858,6 +1067,28 @@ def main(argv: list[str] | None = None) -> None:
     )
     for artifact_parser in (protein_flex, protein_rigid):
         artifact_parser.add_argument(
+            "--protein-designer",
+            required=True,
+            help="converted ProteinMPNN repository",
+        )
+        artifact_parser.add_argument(
+            "--ligand-designer",
+            required=True,
+            help="converted LigandMPNN repository",
+        )
+
+    oinvfold_protein_flex = artifact_parsers.add_parser(
+        "oinvfold-protein-flex",
+        parents=(common,),
+        help="convert the explicit protein-flex OInvFold alternative",
+    )
+    oinvfold_protein_rigid = artifact_parsers.add_parser(
+        "oinvfold-protein-rigid",
+        parents=(common,),
+        help="convert the explicit protein-rigid OInvFold alternative",
+    )
+    for artifact_parser in (oinvfold_protein_flex, oinvfold_protein_rigid):
+        artifact_parser.add_argument(
             "--sequence-designer",
             required=True,
             help="converted protein OInvFold repository",
@@ -875,6 +1106,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     nucleic_acid_rigid.add_argument(
         "--rna-designer",
+        required=True,
+        help="converted gRNAde repository",
+    )
+
+    oinvfold_rna_rigid = artifact_parsers.add_parser(
+        "oinvfold-rna-rigid",
+        parents=(common,),
+        help="convert the explicit RNA-rigid OInvFold alternative",
+    )
+    oinvfold_rna_rigid.add_argument(
+        "--sequence-designer",
         required=True,
         help="converted RNA OInvFold repository",
     )
@@ -896,7 +1138,8 @@ def main(argv: list[str] | None = None) -> None:
         convert_odesign_protein_flex_checkpoint(
             args.checkpoint,
             args.output_dir,
-            sequence_designer=args.sequence_designer,
+            protein_designer=args.protein_designer,
+            ligand_designer=args.ligand_designer,
             dtype=dtype,
             repo_id=args.repo_id,
             token=args.token,
@@ -904,6 +1147,27 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.artifact == "protein-rigid":
         convert_odesign_protein_rigid_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            protein_designer=args.protein_designer,
+            ligand_designer=args.ligand_designer,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+    elif args.artifact == "oinvfold-protein-flex":
+        convert_odesign_oinvfold_protein_flex_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            sequence_designer=args.sequence_designer,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+    elif args.artifact == "oinvfold-protein-rigid":
+        convert_odesign_oinvfold_protein_rigid_checkpoint(
             args.checkpoint,
             args.output_dir,
             sequence_designer=args.sequence_designer,
@@ -918,6 +1182,16 @@ def main(argv: list[str] | None = None) -> None:
             args.output_dir,
             dna_designer=args.dna_designer,
             rna_designer=args.rna_designer,
+            dtype=dtype,
+            repo_id=args.repo_id,
+            token=args.token,
+            private=args.private,
+        )
+    elif args.artifact == "oinvfold-rna-rigid":
+        convert_odesign_oinvfold_rna_rigid_checkpoint(
+            args.checkpoint,
+            args.output_dir,
+            sequence_designer=args.sequence_designer,
             dtype=dtype,
             repo_id=args.repo_id,
             token=args.token,

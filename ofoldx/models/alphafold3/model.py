@@ -76,6 +76,62 @@ class AlphaFold3Model(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence
+        >>> from ofoldx.models.alphafold3 import AlphaFold3Config, AlphaFold3Model, AlphaFold3Processor
+        >>> config = AlphaFold3Config({
+        ...     "single_size": 16,
+        ...     "pair_size": 16,
+        ...     "template": {
+        ...         "hidden_size": 8,
+        ...         "num_blocks": 0,
+        ...         "triangle_attention_hidden_size": 4,
+        ...         "num_triangle_attention_heads": 1,
+        ...     },
+        ...     "trunk": {"num_pairformer_blocks": 1},
+        ...     "recycling_steps": 1,
+        ...     "msa_max_depth": 1,
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_token_encoder_attention_heads": 1,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "token_hidden_size": 16,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_encoder_attention_heads": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...         "num_atom_decoder_attention_heads": 1,
+        ...         "num_query_atoms": 4,
+        ...         "num_key_atoms": 4,
+        ...     },
+        ...     "distogram": {"num_bins": 4},
+        ...     "confidence": {
+        ...         "num_plddt_bins": 4,
+        ...         "num_pae_bins": 4,
+        ...         "num_pde_bins": 4,
+        ...         "max_atoms_per_token": 8,
+        ...         "num_blocks": 1,
+        ...         "num_pair_attention_heads": 1,
+        ...         "triangle_multiplication_hidden_size": 4,
+        ...         "triangle_attention_hidden_size": 4,
+        ...         "num_triangle_attention_heads": 1,
+        ...     },
+        ... })
+        >>> inputs = AlphaFold3Processor()(PolymerSequence.from_one_letter("A"))
+        >>> atom_count = inputs.atom_features.shape[1]
+        >>> model = AlphaFold3Model(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(
+        ...         inputs,
+        ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
+        ...         noise_level=torch.ones(1, 1),
+        ...     )
+        >>> tuple(output.coordinates.shape) == (1, 1, atom_count, 3)
+        True
+        >>> output.distogram_logits.shape[-1]
+        4
     """
 
     config_class = AlphaFold3Config
@@ -1304,67 +1360,6 @@ class AlphaFold3MsaTrunk(nn.Module):
         return msa, pair
 
 
-class AlphaFold3PairformerStack(PairformerStack):
-    r"""
-    Homogeneous stack of AlphaFold 3 Pairformer blocks.
-    """
-
-    def __init__(
-        self,
-        num_blocks: int = 48,
-        single_size: int = 384,
-        pair_size: int = 128,
-        triangle_multiplication_hidden_size: int = 128,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        num_pair_attention_heads: int = 16,
-        expansion: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.num_blocks = num_blocks
-        self.blocks = nn.ModuleList(
-            AlphaFold3PairformerBlock(
-                single_size=single_size,
-                pair_size=pair_size,
-                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
-                triangle_attention_hidden_size=triangle_attention_hidden_size,
-                num_triangle_attention_heads=num_triangle_attention_heads,
-                num_pair_attention_heads=num_pair_attention_heads,
-                expansion=expansion,
-                backend=backend,
-            )
-            for _ in range(num_blocks)
-        )
-
-
-class AlphaFold3MsaUpdateBlock(nn.Module):
-    r"""
-    AlphaFold 3 MSA update without structured dropout.
-    """
-
-    def __init__(
-        self,
-        msa_size: int = 64,
-        pair_size: int = 128,
-        num_attention_heads: int = 8,
-        expansion: int = 4,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.msa_pair_weighted_averaging = MsaPairWeightedAveraging(
-            msa_size=msa_size,
-            pair_size=pair_size,
-            num_attention_heads=num_attention_heads,
-            backend=backend,
-        )
-        self.transition = Transition(msa_size, expansion=expansion, backend=backend)
-
-    def forward(self, msa: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        msa = msa + self.msa_pair_weighted_averaging(msa, pair, pair_mask=pair_mask)
-        return msa + self.transition(msa)
-
-
 class AlphaFold3MsaPairBlock(MsaPairBlock):
     r"""
     Joint AlphaFold 3 MSA/pair block with the family-owned triangle-bias equation.
@@ -1448,6 +1443,67 @@ class AlphaFold3FinalMsaPairUpdate(nn.Module):
     ) -> Tensor:
         pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
         return self.triangle_pair_update(pair, pair_mask=pair_mask)
+
+
+class AlphaFold3MsaUpdateBlock(nn.Module):
+    r"""
+    AlphaFold 3 MSA update without structured dropout.
+    """
+
+    def __init__(
+        self,
+        msa_size: int = 64,
+        pair_size: int = 128,
+        num_attention_heads: int = 8,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.msa_pair_weighted_averaging = MsaPairWeightedAveraging(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            num_attention_heads=num_attention_heads,
+            backend=backend,
+        )
+        self.transition = Transition(msa_size, expansion=expansion, backend=backend)
+
+    def forward(self, msa: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        msa = msa + self.msa_pair_weighted_averaging(msa, pair, pair_mask=pair_mask)
+        return msa + self.transition(msa)
+
+
+class AlphaFold3PairformerStack(PairformerStack):
+    r"""
+    Homogeneous stack of AlphaFold 3 Pairformer blocks.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int = 48,
+        single_size: int = 384,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        num_pair_attention_heads: int = 16,
+        expansion: int = 4,
+        backend: str = "auto",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList(
+            AlphaFold3PairformerBlock(
+                single_size=single_size,
+                pair_size=pair_size,
+                triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+                triangle_attention_hidden_size=triangle_attention_hidden_size,
+                num_triangle_attention_heads=num_triangle_attention_heads,
+                num_pair_attention_heads=num_pair_attention_heads,
+                expansion=expansion,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
 
 
 class AlphaFold3PairformerBlock(PairformerBlock):

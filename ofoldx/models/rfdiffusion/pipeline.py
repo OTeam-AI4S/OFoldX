@@ -9,6 +9,7 @@ from os import PathLike
 from typing import Literal
 
 import torch
+from torch import Tensor
 
 # RFdiffusion represents requested covalent links directly as SymbolicBond values.
 from ...data.bonds import SymbolicBond
@@ -48,6 +49,8 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
         *,
         placement: RfDiffusionPlacements | None = None,
         templates: Sequence[Template] = (),
+        secondary_structure: Tensor | None = None,
+        block_adjacency: Tensor | None = None,
         conditions: Sequence[
             AllowedResidueIdentities
             | Hotspot
@@ -88,6 +91,11 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             input: Optional context system, observed structure, or local structure path.
             placement: Topology containing existing spans and generated protein segments.
             templates: Zero or one structural template.
+            secondary_structure: Already-lowered fold-conditioning features with
+                shape ``(N, 4)``. Replaces the default or template-derived feature
+                before residue-level secondary-structure conditions are applied.
+            block_adjacency: Already-lowered fold-conditioning features with shape
+                ``(N, N, 3)``. Replaces the default or template-derived feature.
             conditions: Residue-identity, hotspot, geometry, symmetry, bond, and
                 interaction conditions.
             inpaint_sequence: Existing residue occurrences whose identities are masked.
@@ -130,6 +138,8 @@ class RfDiffusionPipeline(PairedPipeline[RfDiffusionModel, RfDiffusionProcessor]
             input,
             placement=placement,
             templates=templates,
+            secondary_structure=secondary_structure,
+            block_adjacency=block_adjacency,
             conditions=conditions,
             inpaint_sequence=inpaint_sequence,
             length=length,

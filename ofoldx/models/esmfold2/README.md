@@ -28,15 +28,18 @@ ESMFold2 predicts all-atom biomolecular structures from ESMC representations and
 optional protein MSA evidence. A frozen ESMC language model supplies sequence
 representations, a recurrent folding trunk updates token and pair features, and
 a diffusion head generates coordinates before distogram and confidence heads
-score the result. Experimental variants reuse the folding model as a
-differentiable critic for protein binder sequence design.
+score the result. Experimental variants expose the differentiable inversion
+model used for protein binder sequence design.
 
 ### Variants
 
 - **[oteam/esmfold2](https://huggingface.co/oteam/esmfold2)**: Full 48-block folding model with optional MSA conditioning.
 - **[oteam/esmfold2-fast](https://huggingface.co/oteam/esmfold2-fast)**: Faster 24-block single-sequence folding model.
-- **[oteam/esmfold2-experimental](https://huggingface.co/oteam/esmfold2-experimental)**: Experimental MSA-conditioned model used for binder design and refolding.
+- **[oteam/esmfold2-experimental](https://huggingface.co/oteam/esmfold2-experimental)**: Complete binder-design artifact containing the fixed 19 Model--Processor pairs used by the released protocol.
 - **[oteam/esmfold2-experimental-fast](https://huggingface.co/oteam/esmfold2-experimental-fast)**: Experimental fast model used for binder sequence optimization.
+- **ESMFold2 experimental critics**: Experimental-Fast-Cutoff2025,
+  Experimental, Experimental-Cutoff2025, and the 15 released
+  `Fast-base{300M,600M,6B}-step{250,500,750,1000,1500}k` scaling checkpoints.
 
 ### Model Specification
 
@@ -76,8 +79,14 @@ output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/esmfold2")
 
 ### Binder Design
 
-The repository marker selects the experimental ESMFold2 design pipeline, whose
-class-owned loader restores its ESMC model and tokenizer.
+The repository marker selects the experimental ESMFold2 design Pipeline. Its
+root pair is Experimental-Fast. The other hero roles live at
+`fast_cutoff2025/`, `experimental/`, and `experimental_cutoff2025/`; the 15
+scaling roles live at
+`scaling/base{300m,600m,6b}_step{250k,500k,750k,1000k,1500k}/`. Every slot is
+required even when a call skips scaling-critic computation. Each saved Model
+owns its complete frozen ESMC trunk and masked-language-model head, so loading
+performs no hidden checkpoint download.
 
 ```python
 import ofoldx
@@ -85,6 +94,14 @@ import ofoldx
 pipeline = ofoldx.pipeline("design", model="oteam/esmfold2-experimental")
 output = pipeline.design("target.fasta", binder_length=80)
 ```
+
+The default call performs 150 inversion steps, retains each candidate's best
+actual low-temperature iPTM prediction, evaluates four hero and 15 scaling
+critics, applies the released non-antibody pI filter, and stably selects at most
+84 designs. `use_scaling_critics=False` skips only the 15 scaling evaluations;
+their score component becomes zero. `output.candidates` preserves every
+candidate and critic evaluation, while `output.selected` uses each selected
+candidate's coherent Experimental-Cutoff2025 structure and confidence values.
 
 ## Training Details
 
@@ -108,8 +125,9 @@ present it as a complete reproduction of the unpublished training pipeline.
 
 Binder design is inference-time optimization rather than model training.
 It performs gradient descent over soft binder-sequence logits under the
-released distogram contact objective and ESMC pseudo-perplexity regularizer,
-then refolds a discrete selected sequence.
+released distogram contact objective and ESMC pseudo-perplexity regularizer.
+Low-temperature coordinate samples are scored by actual iPTM, and each
+candidate retains its best observed sequence and structure.
 
 ## Citation
 

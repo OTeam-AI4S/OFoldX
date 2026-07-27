@@ -77,7 +77,9 @@ conformations and optional local non-protein atom context.
 
 The model predicts mixture distributions over side-chain chi angles and applies
 iterative coordinate refinement. OFoldX exposes a differentiable
-`forward` over an explicit atom14 state.
+`forward` over an explicit atom14 state. `encode` and `forward` accept a
+`torch.Generator` for configured training-time coordinate noise; `sample` and
+`pack` advance that same generator before torsion sampling.
 
 ## Citation
 

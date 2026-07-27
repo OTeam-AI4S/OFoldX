@@ -14,14 +14,20 @@ from .config import (
     PxDesignSamplerConfig,
 )
 from .model import (
-    PxDesignDesignCandidate,
-    PxDesignDesignResult,
+    PxDesignBackboneCandidate,
+    PxDesignBackboneResult,
     PxDesignInput,
     PxDesignLayout,
     PxDesignModel,
     PxDesignOutput,
 )
-from .pipeline import PxDesignPipeline
+from .pipeline import (
+    PxDesignBackbonePipeline,
+    PxDesignCandidate,
+    PxDesignFilterResult,
+    PxDesignPipeline,
+    PxDesignResult,
+)
 from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
 
 _MODELS.register(
@@ -30,6 +36,7 @@ _MODELS.register(
     processor=PxDesignProcessor,
 )
 _PIPELINES.register(
-    "pxdesign",
-    pipeline=PxDesignPipeline,
+    "pxdesign_backbone",
+    pipeline=PxDesignBackbonePipeline,
 )
+_PIPELINES.register("pxdesign", pipeline=PxDesignPipeline)

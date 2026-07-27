@@ -297,7 +297,7 @@ def convert_rfdiffusion_state_dict(
     }
 
 
-def convert_rfdiffusion_checkpoint(
+def convert_rfdiffusion_model(
     checkpoint: str | PathLike[str],
     *,
     schedule_source: str | PathLike[str],
@@ -329,7 +329,7 @@ def convert_rfdiffusion_checkpoint(
     return model
 
 
-def save_rfdiffusion_checkpoint(
+def convert_rfdiffusion_checkpoint(
     checkpoint: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -343,7 +343,7 @@ def save_rfdiffusion_checkpoint(
     Convert an RFdiffusion checkpoint and write a routable OFoldX repository.
 
     Strict-loads the checkpoint via
-    [`convert_rfdiffusion_checkpoint`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_checkpoint],
+    [`convert_rfdiffusion_model`][ofoldx.models.rfdiffusion.convert.convert_rfdiffusion_model],
     pairs it with [`RfDiffusionProcessor`][], and saves the registered
     [`RfDiffusionPipeline`][]. Its one-field marker routes
     ``pipeline("design", model=dir)`` to that concrete Pipeline.
@@ -356,7 +356,7 @@ def save_rfdiffusion_checkpoint(
     from .pipeline import RfDiffusionPipeline
     from .processor import RfDiffusionProcessor
 
-    model = convert_rfdiffusion_checkpoint(checkpoint, dtype=dtype, schedule_source=schedule_source)
+    model = convert_rfdiffusion_model(checkpoint, dtype=dtype, schedule_source=schedule_source)
     RfDiffusionPipeline(model=model, processor=RfDiffusionProcessor(dtype=dtype)).save(
         output_dir,
         repo_id=repo_id,
@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    save_rfdiffusion_checkpoint(
+    convert_rfdiffusion_checkpoint(
         args.checkpoint,
         args.output_dir,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],

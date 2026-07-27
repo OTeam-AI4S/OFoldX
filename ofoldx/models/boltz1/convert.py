@@ -765,7 +765,7 @@ def boltz1_config_from_checkpoint(checkpoint: Mapping[str, Any]) -> Boltz1Config
     return config
 
 
-def convert_boltz1_checkpoint(
+def convert_boltz1_model(
     checkpoint_path: str | PathLike[str],
     *,
     config: Boltz1Config | None = None,
@@ -1002,7 +1002,7 @@ def _prefix_index(index: str, items: list[tuple[str, Tensor]]) -> list[tuple[str
     return [(f"{index}.{key}", value) for key, value in items]
 
 
-def save_boltz1_checkpoint(
+def convert_boltz1_checkpoint(
     checkpoint_path: str | PathLike[str],
     output_dir: str | PathLike[str],
     *,
@@ -1016,7 +1016,7 @@ def save_boltz1_checkpoint(
     Convert a Boltz-1 ``.ckpt`` and write a standard OFoldX repository.
 
     Strict-loads the checkpoint via
-    [`convert_boltz1_checkpoint`][ofoldx.models.boltz1.convert.convert_boltz1_checkpoint], pairs
+    [`convert_boltz1_model`][ofoldx.models.boltz1.convert.convert_boltz1_model], pairs
     the model with the config-less [`Boltz1Processor`][], and writes a self-contained
     ``model.json`` / ``processor.json`` / safetensors repository marked with the exact
     [`Boltz1Pipeline`][]. The Processor repository metadata records its floating-point
@@ -1029,7 +1029,7 @@ def save_boltz1_checkpoint(
 
     from .pipeline import Boltz1Pipeline
 
-    model = convert_boltz1_checkpoint(checkpoint_path, config=config, dtype=dtype)
+    model = convert_boltz1_model(checkpoint_path, config=config, dtype=dtype)
     Boltz1Pipeline(model=model, processor=Boltz1Processor(dtype=dtype)).save(
         output_dir,
         repo_id=repo_id,
@@ -1055,7 +1055,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token", default=None, help="optional Hugging Face token for --repo-id")
     parser.add_argument("--private", action="store_true", help="create the --repo-id repo as private")
     args = parser.parse_args(argv)
-    save_boltz1_checkpoint(
+    convert_boltz1_checkpoint(
         args.checkpoint,
         args.output_dir,
         dtype=None if args.dtype == "keep" else _DTYPES[args.dtype],

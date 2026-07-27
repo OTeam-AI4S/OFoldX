@@ -194,6 +194,12 @@ class Boltz1Config(Config):
         denoiser: Nested EDM denoiser configuration.
         sampler: Nested reverse-diffusion sampler configuration.
         confidence: Nested confidence/ranking module configuration.
+
+    Examples:
+        >>> from ofoldx.models.boltz1 import Boltz1Config
+        >>> config = Boltz1Config(recycling_steps=2)
+        >>> config.recycling_steps
+        2
     """
 
     single_size: int = 384

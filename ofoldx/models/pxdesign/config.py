@@ -111,6 +111,12 @@ class PxDesignConfig(Config):
         condition_embeddings: Design-condition embedding architecture.
         denoiser: Coordinate denoiser architecture.
         sampler: EDM inference schedule.
+
+    Examples:
+        >>> from ofoldx.models.pxdesign import PxDesignConfig
+        >>> config = PxDesignConfig()
+        >>> config.single_size
+        384
     """
 
     single_size: int = 384

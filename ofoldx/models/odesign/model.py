@@ -63,6 +63,63 @@ class ODesignModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import GeneratedSegment
+        >>> from ofoldx.models.odesign import (
+        ...     ODesignConfig,
+        ...     ODesignModel,
+        ...     ODesignProcessor,
+        ...     ODesignPlacements,
+        ... )
+        >>> config = ODesignConfig({
+        ...     "single_size": 16,
+        ...     "pair_size": 8,
+        ...     "constraint_embeddings": {
+        ...         "hidden_size": 8, "num_blocks": 1,
+        ...         "num_distogram_bins": 4, "dropout": 0.0,
+        ...     },
+        ...     "trunk": {
+        ...         "num_msa_blocks": 1, "num_pairformer_blocks": 1,
+        ...         "pairformer_dropout": 0.0, "msa_dropout": 0.0, "pair_dropout": 0.0,
+        ...     },
+        ...     "recycling_steps": 1,
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_token_encoder_attention_heads": 1,
+        ...         "atom_hidden_size": 8,
+        ...         "atom_pair_hidden_size": 4,
+        ...         "token_hidden_size": 16,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_encoder_attention_heads": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...         "num_atom_decoder_attention_heads": 1,
+        ...         "num_query_atoms": 4,
+        ...         "num_key_atoms": 4,
+        ...     },
+        ...     "pairwise": {
+        ...         "num_distogram_bins": 4,
+        ...         "bond_hidden_size": 8,
+        ...     },
+        ... })
+        >>> placement = ODesignPlacements(
+        ...     {"design": {"binder": GeneratedSegment("protein", 1, 1)}}
+        ... )
+        >>> inputs = ODesignProcessor()(None, placement=placement)
+        >>> atom_count = inputs.atom_features.shape[1]
+        >>> model = ODesignModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model.denoise(
+        ...         inputs,
+        ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
+        ...         noise_level=torch.ones(1, 1),
+        ...         recycling_steps=1,
+        ...     )
+        >>> tuple(output.coordinates.shape) == (1, 1, atom_count, 3)
+        True
+        >>> output.distogram_logits.shape[-1]
+        4
     """
 
     config_class = ODesignConfig
@@ -423,9 +480,9 @@ class ODesignModel(Model):
 
         Returns:
             An [`ODesignSamplingOutput`][] with ``coordinates`` of shape
-            ``(K, B, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
-            ``(K, B, N, N, D)``, and ``token_bond_type_logits`` of shape
-            ``(K, B, N, N, D_b)``.
+            ``(B, K, S, A, 3)`` in angstroms, ``distogram_logits`` of shape
+            ``(B, K, N, N, D)``, and ``token_bond_type_logits`` of shape
+            ``(B, K, N, N, D_b)``.
         """
 
         steps = self._recycling_steps if recycling_steps is None else recycling_steps
@@ -456,9 +513,9 @@ class ODesignModel(Model):
                 )
             )
         return ODesignSamplingOutput(
-            coordinates=torch.stack(coordinates),
-            distogram_logits=torch.stack(distograms),
-            token_bond_type_logits=torch.stack(bond_logits),
+            coordinates=torch.stack(coordinates, dim=1),
+            distogram_logits=torch.stack(distograms, dim=1),
+            token_bond_type_logits=torch.stack(bond_logits, dim=1),
         )
 
     def _denoise_from_trunk(
@@ -1266,12 +1323,12 @@ class ODesignSamplingOutput:
     Predictions from one ODesign sampling call.
 
     Args:
-        coordinates: Sampled atom coordinates with shape ``(K, B, S, A, 3)`` in
+        coordinates: Sampled atom coordinates with shape ``(B, K, S, A, 3)`` in
             angstroms.
         distogram_logits: Token-pair distance logits with shape
-            ``(K, B, N, N, D)``.
+            ``(B, K, N, N, D)``.
         token_bond_type_logits: Token-pair bond-type logits with shape
-            ``(K, B, N, N, D_b)``.
+            ``(B, K, N, N, D_b)``.
     """
 
     coordinates: Tensor

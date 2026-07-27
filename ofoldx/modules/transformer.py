@@ -92,7 +92,7 @@ class DenoisingTransformerEncoder(nn.Module):
         return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
 
 
-class AtomCrossAttentionTransformer(nn.Module):
+class AtomCrossAttentionTransformerEncoder(nn.Module):
     r"""
     Atom cross-attention blocks whose key normalization starts from raw hidden states.
     """
@@ -108,7 +108,7 @@ class AtomCrossAttentionTransformer(nn.Module):
         super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
-            AtomCrossAttentionTransformerBlock(
+            AtomCrossAttentionTransformerEncoderBlock(
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
@@ -128,7 +128,7 @@ class AtomCrossAttentionTransformer(nn.Module):
         return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
 
 
-class NormalizedKeyAtomCrossAttentionTransformer(nn.Module):
+class NormalizedKeyAtomCrossAttentionTransformerEncoder(nn.Module):
     r"""
     Atom cross-attention blocks whose key normalization starts from normalized queries.
     """
@@ -144,7 +144,7 @@ class NormalizedKeyAtomCrossAttentionTransformer(nn.Module):
         super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
-            NormalizedKeyAtomCrossAttentionTransformerBlock(
+            NormalizedKeyAtomCrossAttentionTransformerEncoderBlock(
                 hidden_size,
                 conditioning_size,
                 num_attention_heads,
@@ -274,7 +274,7 @@ class DenoisingTransformerEncoderBlock(nn.Module):
         return hidden + self.transition(hidden, conditioning)
 
 
-class AtomCrossAttentionTransformerBlock(DenoisingTransformerEncoderBlock):
+class AtomCrossAttentionTransformerEncoderBlock(DenoisingTransformerEncoderBlock):
     r"""
     Double-product atom cross-attention with independently normalized raw keys.
     """
@@ -313,7 +313,7 @@ class AtomCrossAttentionTransformerBlock(DenoisingTransformerEncoderBlock):
         return hidden + self.transition(hidden, conditioning)
 
 
-class NormalizedKeyAtomCrossAttentionTransformerBlock(AtomCrossAttentionTransformerBlock):
+class NormalizedKeyAtomCrossAttentionTransformerEncoderBlock(AtomCrossAttentionTransformerEncoderBlock):
     r"""
     Double-product atom cross-attention whose key normalization starts from the query-normalized state.
     """

@@ -45,6 +45,45 @@ class MpnnPackerModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.mpnn_packer import (
+        ...     MpnnPackerConfig, MpnnPackerModel, MpnnPackerProcessor,
+        ...     MpnnPackerProcessorConfig,
+        ... )
+        >>> sequence = PolymerSequence.from_one_letter("R")
+        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> sites = tuple(
+        ...     AtomSite("A", residue, atom)
+        ...     for residue in range(1)
+        ...     for atom in ("N", "CA", "C", "O")
+        ... )
+        >>> coordinates = np.array(
+        ...     [
+        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0],
+        ...     ],
+        ...     dtype=np.float32,
+        ... )
+        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> input = MpnnPackerProcessor(
+        ...     MpnnPackerProcessorConfig({"num_context_atoms": 1})
+        ... )(structure)
+        >>> config = MpnnPackerConfig(
+        ...     {"hidden_size": 8, "edge_size": 8, "num_encoder_blocks": 1,
+        ...      "num_decoder_blocks": 1, "num_rbf": 2, "num_neighbors": 1,
+        ...      "num_context_atoms": 1, "num_mix": 1, "num_positional_embeddings": 4}
+        ... )
+        >>> model = MpnnPackerModel(config)
+        >>> with torch.inference_mode():
+        ...     output = model.sample(
+        ...         input, num_denoising_steps=1, num_torsion_samples=1,
+        ...         generator=torch.Generator().manual_seed(0),
+        ...     )
+        >>> output.atom14_coordinates.shape, output.mean.shape
+        (torch.Size([1, 1, 14, 3]), torch.Size([1, 1, 4, 1]))
     """
 
     config_class = MpnnPackerConfig
@@ -211,6 +250,7 @@ class MpnnPackerModel(Model):
         input: MpnnPackerInput,
         *,
         atom14_coordinates: Tensor,
+        generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Encode an atom14 state as residue graph representations.
@@ -218,6 +258,8 @@ class MpnnPackerModel(Model):
         Args:
             input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
             atom14_coordinates: Current atom14 coordinates with shape ``(B, L, 14, 3)``.
+            generator: Random generator used for configured training-time
+                coordinate noise.
 
         Returns:
             Node states with shape ``(B, L, H)``, edge states with shape
@@ -235,6 +277,7 @@ class MpnnPackerModel(Model):
                 context_coordinates=input.context_coordinates,
                 context_atomic_numbers=input.context_atomic_numbers,
                 context_mask=input.context_mask,
+                generator=generator,
             )
         )
         context = self.context_edge_embedding(context_nodes)
@@ -333,6 +376,7 @@ class MpnnPackerModel(Model):
         *,
         atom14_coordinates: Tensor,
         atom14_mask: Tensor,
+        generator: torch.Generator | None = None,
     ) -> MpnnPackerOutput:
         r"""
         Predict side-chain torsion mixtures for an atom14 state.
@@ -341,13 +385,19 @@ class MpnnPackerModel(Model):
             input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
             atom14_coordinates: Current atom14 coordinates with shape ``(B, L, 14, 3)``.
             atom14_mask: Valid-atom mask with shape ``(B, L, 14)``.
+            generator: Random generator used for configured training-time
+                coordinate noise.
 
         Returns:
             Mixture means, concentrations, and logits with shape
             ``(B, L, 4, num_mixtures)``.
         """
 
-        node_states, edge_states, neighbor_indices = self.encode(input, atom14_coordinates=atom14_coordinates)
+        node_states, edge_states, neighbor_indices = self.encode(
+            input,
+            atom14_coordinates=atom14_coordinates,
+            generator=generator,
+        )
         return self.decode(
             input,
             atom14_coordinates=atom14_coordinates,
@@ -373,7 +423,8 @@ class MpnnPackerModel(Model):
             input: MPNN Packer tensors with batch size ``B`` and ``L`` residues.
             num_denoising_steps: Number of iterative side-chain updates.
             num_torsion_samples: Number of torsion proposals evaluated per update.
-            generator: Random generator used for torsion sampling.
+            generator: Random generator used for configured coordinate noise and
+                torsion sampling.
 
         Returns:
             Packed atom14 coordinates and masks, sampled chi angles, their log
@@ -492,6 +543,7 @@ class MpnnPackerModel(Model):
         node_states, edge_states, neighbor_indices = self.encode(
             input,
             atom14_coordinates=atom14_coordinates,
+            generator=generator,
         )
         for _ in range(num_denoising_steps):
             output = self.decode(
@@ -569,7 +621,8 @@ class MpnnPackerModel(Model):
             num_samples: Number of packed structures to generate.
             num_denoising_steps: Number of iterative side-chain updates per sample.
             num_torsion_samples: Number of torsion proposals evaluated per update.
-            generator: Random generator used for torsion sampling.
+            generator: Random generator used for configured coordinate noise and
+                torsion sampling.
 
         Returns:
             Packed structure predictions in sampling order.
@@ -699,6 +752,7 @@ class MpnnPackerFeatureEncoder(nn.Module):
         context_coordinates: Tensor,
         context_atomic_numbers: Tensor,
         context_mask: Tensor,
+        generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
         Build residue-graph and atom-context encoder features.
@@ -712,6 +766,8 @@ class MpnnPackerFeatureEncoder(nn.Module):
             context_coordinates: Per-residue non-protein context coordinates ``[B, L, A, 3]``.
             context_atomic_numbers: Atomic numbers for the context coordinates ``[B, L, A]``.
             context_mask: Valid-context mask ``[B, L, A]``.
+            generator: Random generator used for configured training-time
+                coordinate noise.
 
         Returns:
             Residue nodes ``(B, L, H)``, residue edges ``(B, L, K, H)``,
@@ -722,7 +778,12 @@ class MpnnPackerFeatureEncoder(nn.Module):
 
         coordinates = atom14_coordinates
         if self.training and self.coordinate_noise > 0:
-            coordinates = coordinates + self.coordinate_noise * torch.randn_like(coordinates)
+            coordinates = coordinates + self.coordinate_noise * torch.randn(
+                coordinates.shape,
+                device=coordinates.device,
+                dtype=coordinates.dtype,
+                generator=generator,
+            )
         context_atomic_numbers = context_atomic_numbers.long()
 
         n, ca, c, o = (

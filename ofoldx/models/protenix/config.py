@@ -21,6 +21,7 @@ ProtenixVariant = Literal[
     "protenix_base_default_v0.5.0",
     "protenix_base_constraint_v0.5.0",
     "protenix_mini_default_v0.5.0",
+    "protenix_mini_tmpl_v0.5.0",
     "protenix_tiny_default_v0.5.0",
     "protenix_mini_esm_v0.5.0",
     "protenix_mini_ism_v0.5.0",
@@ -122,6 +123,12 @@ class ProtenixConfig(Config):
         sampler: Reverse-diffusion sampler configuration.
         distogram: Distogram head configuration.
         confidence: Confidence head configuration.
+
+    Examples:
+        >>> from ofoldx.models.protenix import ProtenixConfig
+        >>> config = ProtenixConfig(recycling_steps=4)
+        >>> config.recycling_steps
+        4
     """
 
     token_feature_size: int = 449
@@ -149,7 +156,7 @@ class ProtenixConfig(Config):
         by conversion.
 
         Args:
-            variant: One of the nine released Protenix checkpoint names.
+            variant: One of the ten released Protenix checkpoint names.
 
         Returns:
             The matching graph and inference configuration.
@@ -162,6 +169,8 @@ class ProtenixConfig(Config):
             return ProtenixConfig()
         if variant == "protenix_base_constraint_v0.5.0":
             return ProtenixConstraintConfig()
+        if variant == "protenix_mini_tmpl_v0.5.0":
+            return ProtenixStructureConditionConfig()
         if variant in {
             "protenix_mini_default_v0.5.0",
             "protenix_mini_esm_v0.5.0",
@@ -234,12 +243,49 @@ class ProtenixConfig(Config):
         raise ValueError(f"unknown Protenix checkpoint variant: {variant!r}")
 
 
+class ProtenixStructureConditionConfig(ProtenixConfig):
+    r"""
+    Configure the released structure-conditioned Protenix mini graph.
+
+    The graph adds a noisy-structure pair update on every recycling pass; it is
+    not an ordinary template or constraint variant.
+
+    Examples:
+        >>> from ofoldx.models.protenix import ProtenixStructureConditionConfig
+        >>> config = ProtenixStructureConditionConfig()
+        >>> config.recycling_steps, config.trunk.num_pairformer_blocks
+        (4, 16)
+    """
+
+    trunk: ProtenixTrunkConfig = ProtenixTrunkConfig(
+        num_msa_blocks=1,
+        num_pairformer_blocks=16,
+    )
+    recycling_steps: int = 4
+    denoiser: DenoiserConfig = DenoiserConfig(
+        num_token_encoder_blocks=8,
+        num_atom_encoder_blocks=1,
+        num_atom_decoder_blocks=1,
+    )
+    sampler: SamplerConfig = SamplerConfig(
+        num_sampling_steps=5,
+        churn_rate=0.0,
+        step_scale=1.0,
+    )
+
+
 class ProtenixConstraintConfig(ProtenixConfig):
     r"""
     Configure the four-branch Protenix constraint graph.
 
     Args:
         constraints: Whether to build the jointly trained four-branch constraint embedder; fixed to ``True`` here.
+
+    Examples:
+        >>> from ofoldx.models.protenix import ProtenixConstraintConfig
+        >>> config = ProtenixConstraintConfig()
+        >>> config.constraints
+        True
     """
 
     constraints: bool = True

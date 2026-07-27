@@ -169,20 +169,22 @@ class PxDesignProcessor(Processor):
                 raise ValueError("PXDesign target input must be declared by its PlacementSpec")
             declared_instances = set()
             for chain in existing_chains:
-                if len(chain) != 1:
-                    raise ValueError("PXDesign target PlacementSpec chains currently require one complete ExistingSpan")
-                span = chain[0]
-                source_entity = source.entities[source.instances[span.instance_id]]
+                instance_ids = {span.instance_id for span in chain}
+                if len(instance_ids) != 1:
+                    raise ValueError("each PXDesign target chain must crop one source instance")
+                instance_id = next(iter(instance_ids))
+                source_entity = source.entities[source.instances[instance_id]]
                 if not isinstance(source_entity, PolymerSequence):
                     raise ValueError("PXDesign target PlacementSpec chains must reference polymer instances")
-                entity = source_entity
-                if span.start != 0 or span.stop != len(entity):
-                    raise ValueError(
-                        "PXDesign target cropping requires canonical chain materialization before lowering"
-                    )
-                if span.instance_id in declared_instances:
+                for span in chain:
+                    if span.start < 0 or span.start >= span.stop or span.stop > len(source_entity):
+                        raise ValueError(
+                            f"PXDesign target crop [{span.start}, {span.stop}) is outside "
+                            f"source instance {instance_id!r}"
+                        )
+                if instance_id in declared_instances:
                     raise ValueError("a PXDesign target instance may appear only once in PlacementSpec")
-                declared_instances.add(span.instance_id)
+                declared_instances.add(instance_id)
 
         system, sites, generated_map, selected_residues = _materialize_problem(
             source,

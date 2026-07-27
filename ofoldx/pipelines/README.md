@@ -5,9 +5,9 @@ one `pipeline.json` marker naming its registered class; that class owns reposito
 loading, saving, placement, and its exact biological method signatures.
 
 `PairedPipeline` implements this lifecycle for one Model–Processor pair.
-`CompositePipeline` implements it for a concrete class's fixed named pairs. A family
-may override the lifecycle when its artifact owns another necessary child, as
-ESMFold2 design does for ESMC.
+`CompositePipeline` implements it for a concrete class's fixed named pairs. Every
+current family artifact uses one of these two ordinary lifecycles; complete child
+Models such as ESMFold2's ESMC-backed graph remain ordinary pair state.
 
 ```python
 import ofoldx

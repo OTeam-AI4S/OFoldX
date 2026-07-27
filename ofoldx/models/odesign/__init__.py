@@ -36,10 +36,14 @@ from .model import (
     realize_nucleic_acid_identity,
 )
 from .pipeline import (
+    ODesignGrnadeChainPrediction,
     ODesignLigandDesignCandidate,
     ODesignLigandDesignResult,
     ODesignLigandPipeline,
+    ODesignMpnnChainPrediction,
     ODesignNucleicAcidPipeline,
+    ODesignOInvFoldProteinPipeline,
+    ODesignOInvFoldRnaPipeline,
     ODesignPolymerChainPrediction,
     ODesignPolymerDesignCandidate,
     ODesignPolymerDesignResult,
@@ -68,4 +72,12 @@ _PIPELINES.register(
 _PIPELINES.register(
     "odesign_ligand",
     pipeline=ODesignLigandPipeline,
+)
+_PIPELINES.register(
+    "odesign_oinvfold_protein",
+    pipeline=ODesignOInvFoldProteinPipeline,
+)
+_PIPELINES.register(
+    "odesign_oinvfold_rna",
+    pipeline=ODesignOInvFoldRnaPipeline,
 )

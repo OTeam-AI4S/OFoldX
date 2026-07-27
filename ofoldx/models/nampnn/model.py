@@ -118,6 +118,44 @@ class NaMpnnModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.nampnn import NaMpnnConfig, NaMpnnModel, NaMpnnProcessor
+        >>> sequence = PolymerSequence.from_one_letter("A", polymer_type="rna")
+        >>> system = MolecularSystem({"rna": sequence}, {"A": "rna"})
+        >>> sites = tuple(
+        ...     AtomSite("A", 0, atom)
+        ...     for atom in (
+        ...         "OP1", "OP2", "P", "O5'", "C5'", "C4'",
+        ...         "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+        ...     )
+        ... )
+        >>> coordinates = np.array(
+        ...     [
+        ...         [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [0.0, 0.0, 0.0],
+        ...         [1.0, 0.0, 0.0], [2.0, 0.5, 0.0], [3.0, 0.0, 0.5],
+        ...         [3.5, 1.0, 0.0], [4.0, -0.5, 0.0], [5.0, 0.0, 0.0],
+        ...         [3.5, -1.5, 0.5], [4.0, -2.5, 0.0], [2.5, -1.0, 1.0],
+        ...     ],
+        ...     dtype=np.float32,
+        ... )
+        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> input = NaMpnnProcessor()(structure)
+        >>> config = NaMpnnConfig(
+        ...     {"hidden_size": 8, "feature_size": 8, "num_encoder_blocks": 1,
+        ...      "num_decoder_blocks": 1, "num_neighbors": 1, "dropout": 0.0,
+        ...      "num_positional_embeddings": 4, "num_rbf": 2,
+        ...      "include_predicted_na_n": False}
+        ... )
+        >>> model = NaMpnnModel(config)
+        >>> output = model(input, decoding_ranks=torch.zeros_like(input.sequence_tokens))
+        >>> output.logits.shape
+        torch.Size([1, 1, 33])
+        >>> output.decoding_ranks.tolist()
+        [[0]]
     """
 
     config_class = NaMpnnConfig

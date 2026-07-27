@@ -4,10 +4,7 @@ RFdiffusion denoiser, sampler, and public scientific modules.
 
 from __future__ import annotations
 
-import base64
-import io
 import math
-import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from operator import index as integer_index
@@ -101,6 +98,67 @@ class RfDiffusionModel(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from dataclasses import replace
+        >>> from ofoldx.data import GeneratedSegment
+        >>> from ofoldx.models.rfdiffusion import (
+        ...     RfDiffusionConfig,
+        ...     RfDiffusionModel,
+        ...     RfDiffusionPlacements,
+        ...     RfDiffusionProcessor,
+        ... )
+        >>> placement = RfDiffusionPlacements(
+        ...     {"chain": {"segment": GeneratedSegment("protein", 1, 1)}}
+        ... )
+        >>> input = RfDiffusionProcessor()(placement=placement, timestep=1)
+        >>> noisy_coordinates = torch.zeros_like(input.noisy_coordinates)
+        >>> noisy_coordinates[0, 0, :3] = torch.tensor(
+        ...     [[-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0]]
+        ... )
+        >>> input = replace(input, noisy_coordinates=noisy_coordinates)
+        >>> se3 = {
+        ...     "num_blocks": 1,
+        ...     "num_channels": 4,
+        ...     "num_degrees": 2,
+        ...     "num_attention_heads": 1,
+        ...     "div": 1,
+        ...     "l0_in_features": 4,
+        ...     "l0_out_features": 4,
+        ...     "l1_in_features": 3,
+        ...     "l1_out_features": 2,
+        ...     "num_edge_features": 4,
+        ... }
+        >>> config = RfDiffusionConfig(
+        ...     {
+        ...         "denoiser": {
+        ...             "num_extra_blocks": 0,
+        ...             "num_main_blocks": 1,
+        ...             "num_refinement_blocks": 0,
+        ...             "msa_size": 8,
+        ...             "full_msa_size": 8,
+        ...             "pair_size": 8,
+        ...             "template_size": 8,
+        ...             "num_msa_attention_heads": 1,
+        ...             "num_pair_attention_heads": 1,
+        ...             "num_template_attention_heads": 1,
+        ...             "hidden_size": 4,
+        ...             "template_hidden_size": 4,
+        ...             "dropout": 0.0,
+        ...             "trunk_se3": se3,
+        ...             "refinement_se3": se3,
+        ...         },
+        ...         "diffuser": {"num_timesteps": 1},
+        ...     }
+        ... )
+        >>> model = RfDiffusionModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(input)
+        >>> output.backbone_coordinates.shape
+        torch.Size([1, 1, 3, 3])
+        >>> output.sequence_logits.shape
+        torch.Size([1, 1, 21])
     """
 
     config_class = RfDiffusionConfig
@@ -2345,8 +2403,7 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        with torch.device("cpu"):
-            frame_indices, base_frame_transforms, base_frame_coordinates = _all_atom_kinematics()
+        frame_indices, base_frame_transforms, base_frame_coordinates = _RF_ATOM14_KINEMATICS
         self.register_buffer("frame_indices", frame_indices, persistent=False)
         self.register_buffer("base_frame_transforms", base_frame_transforms, persistent=False)
         self.register_buffer("base_frame_coordinates", base_frame_coordinates, persistent=False)
@@ -5051,7 +5108,7 @@ def _torsion_features(coords: Tensor, seq: Tensor) -> tuple[Tensor, Tensor]:
         features[:, :, 3 + chi_idx] = torch.where(aa_positions[..., None], chi, features[:, :, 3 + chi_idx])
         mask[:, :, 3 + chi_idx] |= aa_positions
 
-    _, _, reference_coords = _all_atom_kinematics()
+    _, _, reference_coords = _RF_ATOM14_KINEMATICS
     reference_coords = reference_coords.to(device=coords.device, dtype=coords.dtype)
     reference_nc = 0.5 * (reference_coords[:, 0, :3] + reference_coords[:, 2, :3])
     reference_ca = reference_coords[:, 1, :3]
@@ -6142,101 +6199,323 @@ def rfdiffusion_residue_token_id(residue_name: str) -> int:
     return RFDIFFUSION_RESIDUE_TYPE_INDEX.get(residue_name.upper(), RFDIFFUSION_UNKNOWN_TOKEN_ID)
 
 
-_RF_ALL_ATOM_KINEMATICS = (
-    "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"
+_RF_IDEAL_ATOM14_COORDINATES: tuple[
+    tuple[tuple[str, int, tuple[float, float, float]], ...],
+    ...,
+] = (
+    (  # ALA
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5289, -0.7734, -1.1991)),
+    ),
+    (  # ARG
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5042, -0.7698, -1.2118)),
+        ("CG", 4, (0.6396, 1.3794, 0.0)),
+        ("CD", 5, (0.5492, 1.3801, 0.0)),
+        ("NE", 6, (0.5423, 1.3491, 0.0)),
+        ("CZ", 7, (0.7650, 1.1090, 0.0)),
+        ("NH1", 7, (0.2012, 2.2965, 0.0)),
+        ("NH2", 7, (2.0824, 1.0030, 0.0)),
+    ),
+    (  # ASN
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5341, -0.7799, -1.1874)),
+        ("CG", 4, (0.5778, 1.3881, 0.0)),
+        ("OD1", 5, (0.6331, 1.0620, 0.0)),
+        ("ND2", 5, (0.5839, -1.1711, 0.0)),
+    ),
+    (  # ASP
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5162, -0.7757, -1.2144)),
+        ("CG", 4, (0.5926, 1.4028, 0.0)),
+        ("OD1", 5, (0.5746, 1.0629, 0.0)),
+        ("OD2", 5, (0.5738, -1.0627, 0.0)),
+    ),
+    (  # CYS
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5046, -0.7727, -1.2189)),
+        ("SG", 4, (0.7386, 1.6511, 0.0)),
+    ),
+    (  # GLN
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5226, -0.7776, -1.2109)),
+        ("CG", 4, (0.6225, 1.3857, 0.0)),
+        ("CD", 5, (0.5788, 1.4021, 0.0)),
+        ("OE1", 6, (0.6347, 1.0584, 0.0)),
+        ("NE2", 6, (0.5908, -1.1895, 0.0)),
+    ),
+    (  # GLU
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5197, -0.7737, -1.2137)),
+        ("CG", 4, (0.6287, 1.3862, 0.0)),
+        ("CD", 5, (0.5850, 1.3849, 0.0)),
+        ("OE1", 6, (0.5752, 1.0618, 0.0)),
+        ("OE2", 6, (0.5741, -1.0635, 0.0)),
+    ),
+    (  # GLY
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+    ),
+    (  # HIS
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5163, -0.7809, -1.2129)),
+        ("CG", 4, (0.6016, 1.3710, 0.0)),
+        ("ND1", 6, (-1.8631, -1.0722, 0.0)),
+        ("CD2", 5, (0.8918, -1.0184, 0.0)),
+        ("CE1", 5, (2.0299, 0.8564, 0.0)),
+        ("NE2", 6, (-1.8625, 1.0707, 0.0)),
+    ),
+    (  # ILE
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5140, -0.7885, -1.2184)),
+        ("CG1", 4, (0.5339, 1.4348, 0.0)),
+        ("CG2", 4, (0.5319, -0.7693, -1.1994)),
+        ("CD1", 5, (0.6106, 1.3829, 0.0)),
+    ),
+    (  # LEU
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.525, -0.0, -0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5175, -0.7692, -1.2220)),
+        ("CG", 4, (0.6652, 1.3823, 0.0)),
+        ("CD1", 5, (0.5083, 1.4353, 0.0)),
+        ("CD2", 5, (0.5079, -0.7600, 1.2163)),
+    ),
+    (  # LYS
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5259, -0.7785, -1.2069)),
+        ("CG", 4, (0.6291, 1.3869, 0.0)),
+        ("CD", 5, (0.5526, 1.4174, 0.0)),
+        ("CE", 6, (0.5544, 1.4170, 0.0)),
+        ("NZ", 7, (0.5566, 1.3801, 0.0)),
+    ),
+    (  # MET
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5331, -0.7727, -1.2048)),
+        ("CG", 4, (0.6298, 1.3858, 0.0)),
+        ("SD", 5, (0.6953, 1.6645, 0.0)),
+        ("CE", 6, (0.3383, 1.7581, 0.0)),
+    ),
+    (  # PHE
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5150, -0.7729, -1.2156)),
+        ("CG", 4, (0.6060, 1.3746, 0.0)),
+        ("CD1", 5, (0.7078, 1.1928, 0.0)),
+        ("CD2", 5, (0.7084, -1.1920, 0.0)),
+        ("CE1", 5, (2.0900, 1.1940, 0.0)),
+        ("CE2", 5, (2.0897, -1.1939, 0.0)),
+        ("CZ", 5, (2.7809, 0.0, 0.0)),
+    ),
+    (  # PRO
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5649, -0.5888, -1.2966)),
+        ("CG", 4, (0.3657, 1.4451, 0.0)),
+        ("CD", 5, (0.3744, 1.4582, 0.0)),
+    ),
+    (  # SER
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5146, -0.7595, -1.2073)),
+        ("OG", 4, (0.5021, 1.3081, 0.0)),
+    ),
+    (  # THR
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5172, -0.7952, -1.2130)),
+        ("OG1", 4, (0.4804, 1.3506, 0.0)),
+        ("CG2", 4, (0.5334, -0.7239, -1.2267)),
+    ),
+    (  # TRP
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5136, -0.7712, -1.2173)),
+        ("CG", 4, (0.5984, 1.3741, 0.0)),
+        ("CD1", 5, (0.8151, 1.0921, 0.0)),
+        ("CD2", 5, (0.8753, -1.1538, 0.0)),
+        ("NE1", 5, (2.1309, 0.7003, 0.0)),
+        ("CE2", 5, (2.1865, -0.6707, 0.0)),
+        ("CE3", 5, (0.6541, -2.5366, 0.0)),
+        ("CZ2", 5, (3.2813, -1.5205, 0.0)),
+        ("CZ3", 5, (1.7521, -3.3888, 0.0)),
+        ("CH2", 5, (3.0315, -2.8930, 0.0)),
+    ),
+    (  # TYR
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5305, -0.7799, -1.2051)),
+        ("CG", 4, (0.6104, 1.3840, 0.0)),
+        ("CD1", 5, (0.6936, 1.2013, 0.0)),
+        ("CD2", 5, (0.6934, -1.2011, 0.0)),
+        ("CE1", 5, (2.0751, 1.2013, 0.0)),
+        ("CE2", 5, (2.0748, -1.2011, 0.0)),
+        ("CZ", 5, (2.7648, 0.0, 0.0)),
+        ("OH", 5, (4.1408, 0.0, 0.0)),
+    ),
+    (  # VAL
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5105, -0.7712, -1.2317)),
+        ("CG1", 4, (0.5326, 1.4252, 0.0)),
+        ("CG2", 4, (0.5177, -0.7693, 1.2057)),
+    ),
+    (  # UNK
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5289, -0.7734, -1.1991)),
+    ),
+    (  # MAS
+        ("N", 0, (-0.5272, 1.3593, 0.0)),
+        ("CA", 0, (0.0, 0.0, 0.0)),
+        ("C", 0, (1.5233, 0.0, 0.0)),
+        ("O", 3, (0.6303, 1.0574, 0.0)),
+        ("CB", 8, (-0.5289, -0.7734, -1.1991)),
+    ),
 )
-_RF_ALL_ATOM_CACHE: tuple[Tensor, Tensor, Tensor] | None = None
 
 
-def _all_atom_kinematics() -> tuple[Tensor, Tensor, Tensor]:
-    r"""
-    Return the RFdiffusion residue-frame kinematics constants for atom14 reconstruction.
+def _rfdiffusion_base_frame(x_axis: Tensor, y_axis: Tensor) -> Tensor:
+    x_axis = x_axis / torch.linalg.norm(x_axis)
+    y_axis = y_axis - torch.dot(y_axis, x_axis) * x_axis
+    y_axis = y_axis / torch.linalg.norm(y_axis)
+    z_axis = torch.cross(x_axis, y_axis, dim=0)
+    z_axis = z_axis / torch.linalg.norm(z_axis)
+    return torch.stack((x_axis, y_axis, z_axis), dim=-1)
 
-    Decompresses and caches the embedded RoseTTAFold all-atom tables on first call, so subsequent calls are
-    free. The tables drive
-    [`RfDiffusionAllAtomReconstruction`][ofoldx.models.rfdiffusion.model.RfDiffusionAllAtomReconstruction] when
-    it rebuilds sidechain atoms from backbone frames and torsion angles.
 
-    Returns:
-        A tuple ``(frame_indices, base_frame_transforms, base_frame_coordinates)``: the per-atom frame indices
-        (``long``), the rigid transforms per torsion group (``float``), and the reference atom coords in each
-        base frame (``float``).
-    """
+def _build_rfdiffusion_atom14_kinematics() -> tuple[Tensor, Tensor, Tensor]:
+    residue_count = len(RFDIFFUSION_RESIDUE_TYPES)
+    frame_indices = torch.zeros((residue_count, 14), dtype=torch.long, device="cpu")
+    base_frame_coordinates = torch.ones((residue_count, 14, 4), dtype=torch.float32, device="cpu")
+    base_frame_transforms = torch.eye(4, dtype=torch.float32, device="cpu").repeat(residue_count, 7, 1, 1)
 
-    global _RF_ALL_ATOM_CACHE
-    if _RF_ALL_ATOM_CACHE is None:
-        payload = zlib.decompress(base64.b64decode(_RF_ALL_ATOM_KINEMATICS))
-        tensors = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
-        _RF_ALL_ATOM_CACHE = (
-            tensors["base_indices"].long(),
-            tensors["RTs_by_torsion"].float(),
-            tensors["xyzs_in_base_frame"].float(),
+    for residue_index, coordinates in enumerate(_RF_IDEAL_ATOM14_COORDINATES):
+        atom_names = RFDIFFUSION_ATOM14_NAMES[residue_index]
+        for atom_name, frame_index, position in coordinates:
+            atom_index = atom_names.index(atom_name)
+            frame_indices[residue_index, atom_index] = frame_index
+            base_frame_coordinates[residue_index, atom_index, :3] = base_frame_coordinates.new_tensor(position)
+
+        nitrogen = base_frame_coordinates[residue_index, atom_names.index("N"), :3]
+        alpha_carbon = base_frame_coordinates[residue_index, atom_names.index("CA"), :3]
+        carbon = base_frame_coordinates[residue_index, atom_names.index("C"), :3]
+        base_frame_transforms[residue_index, 1, :3, :3] = _rfdiffusion_base_frame(
+            nitrogen - alpha_carbon,
+            base_frame_coordinates.new_tensor((1.0, 0.0, 0.0)),
         )
-    return _RF_ALL_ATOM_CACHE
+        base_frame_transforms[residue_index, 1, :3, 3] = nitrogen
+        base_frame_transforms[residue_index, 2, :3, :3] = _rfdiffusion_base_frame(
+            carbon - alpha_carbon,
+            alpha_carbon - nitrogen,
+        )
+        base_frame_transforms[residue_index, 2, :3, 3] = carbon
+
+        for chi_index, chi_atoms in enumerate(_CHI_ATOM_NAMES[residue_index]):
+            if chi_atoms is None:
+                continue
+            atom_indices = tuple(atom_names.index(atom_name) for atom_name in chi_atoms[:3])
+            first, second, third = (base_frame_coordinates[residue_index, index, :3] for index in atom_indices)
+            if chi_index == 0:
+                rotation = _rfdiffusion_base_frame(third - second, first - second)
+            else:
+                rotation = _rfdiffusion_base_frame(
+                    third,
+                    base_frame_coordinates.new_tensor((-1.0, 0.0, 0.0)),
+                )
+            base_frame_transforms[residue_index, 3 + chi_index, :3, :3] = rotation
+            base_frame_transforms[residue_index, 3 + chi_index, :3, 3] = third
+
+    # These released protonation/ring-closure torsions do not add atom14 sites,
+    # but their frames remain observable in the reconstruction return value.
+    for residue_name, chi_index, frame_atoms, special_case in (
+        ("CYS", 1, ("CA", "CB", "SG"), False),
+        ("PRO", 2, ("CB", "CG", "CD"), False),
+        ("SER", 1, ("CA", "CB", "OG"), False),
+        ("THR", 1, ("CA", "CB", "OG1"), False),
+        ("TYR", 2, ("CE1", "CZ", "OH"), True),
+    ):
+        residue_index = RFDIFFUSION_RESIDUE_TYPE_INDEX[residue_name]
+        atom_names = RFDIFFUSION_ATOM14_NAMES[residue_index]
+        coordinates = base_frame_coordinates[residue_index]
+        first, second, third = (coordinates[atom_names.index(atom_name), :3] for atom_name in frame_atoms)
+        if special_case:
+            rotation = _rfdiffusion_base_frame(third - second, first - second)
+        else:
+            rotation = _rfdiffusion_base_frame(
+                third,
+                coordinates.new_tensor((-1.0, 0.0, 0.0)),
+            )
+        base_frame_transforms[residue_index, 3 + chi_index, :3, :3] = rotation
+        base_frame_transforms[residue_index, 3 + chi_index, :3, 3] = third
+
+    # HIS group 6 follows the released protonation pseudo-torsion. HE1 is not
+    # an atom14 output, but its ideal point defines the frame used by ND1/NE2.
+    histidine_index = RFDIFFUSION_RESIDUE_TYPE_INDEX["HIS"]
+    histidine_atoms = RFDIFFUSION_ATOM14_NAMES[histidine_index]
+    histidine_coordinates = base_frame_coordinates[histidine_index]
+    cd2 = histidine_coordinates[histidine_atoms.index("CD2"), :3]
+    ce1 = histidine_coordinates[histidine_atoms.index("CE1"), :3]
+    he1 = histidine_coordinates.new_tensor((2.8542, 1.5693, 0.0))
+    base_frame_transforms[histidine_index, 5, :3, :3] = _rfdiffusion_base_frame(he1 - ce1, cd2 - ce1)
+    base_frame_transforms[histidine_index, 5, :3, 3] = he1
+
+    return frame_indices, base_frame_transforms, base_frame_coordinates
 
 
+_RF_ATOM14_KINEMATICS = _build_rfdiffusion_atom14_kinematics()
 # ---------------------------------------------------------------------------
 # RFdiffusion tensor boundary and semantic layout.
 # ---------------------------------------------------------------------------

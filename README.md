@@ -31,22 +31,23 @@ cd OFoldX
 pip install -e .
 ```
 
-Run the current fixed-backbone design task directly:
+Design operations have family-specific scientific controls. Load the concrete
+Pipeline selected by the repository and call its exact interface:
 
 ```python
 import ofoldx
 from ofoldx.data import Structure
 
 structure: Structure = ...  # construct or obtain one canonical Structure
-result = ofoldx.design(structure, model="oteam/model-name")
-print(result.candidates[0].target)
+pipeline = ofoldx.pipeline("design", model="oteam/proteinmpnn")
+result = pipeline.design(structure)
+print(result.candidates[0].system)
 ```
 
-Load the concrete family Pipeline when you need its complete controls:
+The same concrete Pipeline exposes that family's complete controls:
 
 ```python
-pipeline = ofoldx.pipeline("design", model="oteam/model-name")
-result = pipeline.design(structure)
+result = pipeline.design(structure, num_candidates=4)
 ```
 
 Use the `Auto*` factories only when you need the raw registered pair:

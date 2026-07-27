@@ -33,9 +33,12 @@ from .model import (
     EsmFold2Output,
 )
 from .pipeline import (
+    EsmFold2CriticEvaluation,
     EsmFold2DesignCandidate,
     EsmFold2DesignPipeline,
     EsmFold2DesignResult,
+    EsmFold2DesignStep,
+    EsmFold2ExperimentalPipeline,
     EsmFold2Pipeline,
     cdr_distogram_iptm_proxy,
 )
@@ -62,6 +65,11 @@ _MODELS.register(
 _PIPELINES.register(
     "esmfold2",
     pipeline=EsmFold2Pipeline,
+)
+
+_PIPELINES.register(
+    "esmfold2_experimental",
+    pipeline=EsmFold2ExperimentalPipeline,
 )
 
 _PIPELINES.register(

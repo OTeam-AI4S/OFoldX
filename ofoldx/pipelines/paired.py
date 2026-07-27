@@ -12,7 +12,7 @@ import chanfig
 import torch
 from typing_extensions import Self
 
-from ..artifacts import save_model
+from ..artifacts import clear_model_subrepositories, save_model
 from ..hub import PROCESSOR_METADATA, load_model, load_processor, model_values, resolve_repository
 from ..model import Model
 from ..models.registry import MODELS
@@ -157,6 +157,7 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         if pipeline_id is None:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
         self._validate_pair(self.model, self.processor)
+        clear_model_subrepositories(directory)
         save_model(
             directory,
             model=self.model,
