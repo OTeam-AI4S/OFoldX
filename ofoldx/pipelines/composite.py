@@ -15,7 +15,7 @@ import chanfig
 import torch
 from typing_extensions import Self
 
-from ..artifacts import save_model
+from ..artifacts import clear_model_subrepositories, save_model
 from ..hub import (
     PROCESSOR_METADATA,
     ResolvedRepository,
@@ -41,7 +41,6 @@ class CompositePair(NamedTuple):
         model_attribute: Model or wrapped pipeline constructor attribute.
         processor_attribute: Processor attribute, or ``None`` for a wrapped pair.
         wrap: Optional pipeline class used to wrap a loaded pair.
-        required: Whether the pair must be present.
     """
 
     subdirectory: str
@@ -49,7 +48,6 @@ class CompositePair(NamedTuple):
     model_attribute: str
     processor_attribute: str | None
     wrap: type | None = None
-    required: bool = True
 
 
 def _pair_directory(root: Path, subdirectory: str) -> Path:
@@ -67,15 +65,13 @@ class CompositePipeline:
 
     pair_layout: tuple[CompositePair, ...]
 
-    def _composite_pair_source(self, pair: CompositePair) -> tuple[Model, Processor] | None:
+    def _composite_pair_source(self, pair: CompositePair) -> tuple[Model, Processor]:
         r"""
-        Return the ``(model, processor)`` a layout slot serializes, or ``None`` when absent.
+        Return the ``(model, processor)`` serialized by one fixed layout slot.
         """
 
         bound = getattr(self, pair.model_attribute)
         if pair.wrap is not None:
-            if bound is None:
-                return None
             if type(bound) is not pair.wrap:
                 location = pair.subdirectory or "root"
                 raise TypeError(
@@ -94,11 +90,6 @@ class CompositePipeline:
         processor_attribute = pair.processor_attribute
         assert processor_attribute is not None
         processor = getattr(self, processor_attribute)
-        if (bound is None) != (processor is None):
-            location = pair.subdirectory or "root"
-            raise ValueError(f"{location} model and processor must either both be present or both be absent")
-        if bound is None:
-            return None
         _require_pair_identity(
             f"{type(self).__name__} {pair.subdirectory or 'root'}",
             pair.architecture,
@@ -109,10 +100,7 @@ class CompositePipeline:
 
     def _validate_components(self) -> None:
         for pair in self.pair_layout:
-            source = self._composite_pair_source(pair)
-            if source is None and pair.required:
-                location = pair.subdirectory or "root"
-                raise ValueError(f"{type(self).__name__} requires the {location} pair")
+            self._composite_pair_source(pair)
 
     def to(
         self,
@@ -132,8 +120,6 @@ class CompositePipeline:
 
         for pair in self.pair_layout:
             source = self._composite_pair_source(pair)
-            if source is None:
-                continue
             if pair.wrap is not None:
                 getattr(self, pair.model_attribute).to(device=device, dtype=dtype)
                 continue
@@ -169,31 +155,19 @@ class CompositePipeline:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
 
         destination = Path(directory).expanduser()
-        self._validate_components()
 
-        # Resolve every slot's source first so a missing required pair aborts the save
-        # before the destination is mutated.
-        plan: list[tuple[CompositePair, Path, tuple[Model, Processor] | None]] = []
+        # Resolve every fixed slot before mutating the destination.
+        plan: list[tuple[CompositePair, Path, tuple[Model, Processor]]] = []
         for pair in self.pair_layout:
             pair_directory = _pair_directory(destination, pair.subdirectory)
             source = self._composite_pair_source(pair)
             plan.append((pair, pair_directory, source))
 
-        for pair, pair_directory, source in plan:
-            if source is None:
-                if pair.subdirectory:
-                    stale = pair_directory
-                    for filename in (
-                        "model.json",
-                        "processor.json",
-                        "pipeline.json",
-                        "model.safetensors",
-                        "model.safetensors.index.json",
-                    ):
-                        (stale / filename).unlink(missing_ok=True)
-                    for shard in stale.glob("model-*-of-*.safetensors"):
-                        shard.unlink()
-                continue
+        clear_model_subrepositories(
+            destination,
+            keep={pair_directory for pair, pair_directory, source in plan if pair.subdirectory},
+        )
+        for _pair, pair_directory, source in plan:
             model, processor = source
             save_model(
                 pair_directory,
@@ -228,8 +202,6 @@ class CompositePipeline:
         r"""
         Load every pair from one resolved repository snapshot.
 
-        Missing optional pairs are skipped; missing required pairs raise ``ValueError``.
-
         Args:
             repository: Local directory or Hub repository ID.
             revision: Optional Hub revision.
@@ -256,10 +228,8 @@ class CompositePipeline:
         for pair in cls.pair_layout:
             subrepository = ResolvedRepository(_pair_directory(resolved.path, pair.subdirectory))
             if not (subrepository.path / "model.json").exists():
-                if pair.required:
-                    location = pair.subdirectory or "root"
-                    raise ValueError(f"repository is missing the {location} pair required by {cls.__name__}")
-                continue
+                location = pair.subdirectory or "root"
+                raise ValueError(f"repository is missing the {location} pair required by {cls.__name__}")
             if not (subrepository.path / "processor.json").exists():
                 location = pair.subdirectory or "root"
                 raise ValueError(f"repository is missing processor.json for the {location} pair")

@@ -8,7 +8,7 @@ import math
 import operator
 from copy import copy
 from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 
 import numpy as np
 import torch
@@ -33,7 +33,12 @@ from ...modules.trunk.evoformer import (
     OuterProductFirstExtraMsaEvoformerStack,
 )
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
-from .config import AlphaFold2Config, AlphaFold2EvoformerConfig, AlphaFold2MultimerConfig
+from .config import (
+    AlphaFold2Config,
+    AlphaFold2EvoformerConfig,
+    AlphaFold2InitialGuessConfig,
+    AlphaFold2MultimerConfig,
+)
 
 
 class AlphaFold2Model(Model):
@@ -45,6 +50,64 @@ class AlphaFold2Model(Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence
+        >>> from ofoldx.models.alphafold2 import AlphaFold2Config, AlphaFold2Model, AlphaFold2Processor
+        >>> config = AlphaFold2Config({
+        ...     "template": {"enabled": False},
+        ...     "evoformer": {
+        ...         "num_blocks": 1,
+        ...         "num_extra_msa_blocks": 0,
+        ...         "msa_size": 8,
+        ...         "extra_msa_size": 8,
+        ...         "pair_size": 8,
+        ...         "single_size": 8,
+        ...         "block": {
+        ...             "msa_row_attention_with_pair_bias": {
+        ...                 "num_attention_heads": 1, "dropout": 0.0,
+        ...             },
+        ...             "msa_transition": {"expansion": 2},
+        ...             "outer_product_mean": {"hidden_size": 4},
+        ...             "triangle_multiplication_outgoing": {"hidden_size": 4},
+        ...             "triangle_attention_starting_node": {
+        ...                 "num_attention_heads": 1, "head_dim": 4, "dropout": 0.0,
+        ...             },
+        ...             "pair_transition": {"expansion": 2},
+        ...         },
+        ...     },
+        ...     "structure_module": {
+        ...         "dropout": 0.0,
+        ...         "hidden_size": 8,
+        ...         "num_attention_heads": 1,
+        ...         "num_blocks": 1,
+        ...         "num_transition_projections": 1,
+        ...         "num_point_qk": 1,
+        ...         "num_point_v": 1,
+        ...         "num_scalar_qk": 2,
+        ...         "num_scalar_v": 2,
+        ...         "sidechain": {"hidden_size": 8, "num_blocks": 1},
+        ...     },
+        ...     "heads": {
+        ...         "distogram": {"num_distogram_bins": 4},
+        ...         "predicted_aligned_error": {"enabled": False},
+        ...         "predicted_lddt": {"num_plddt_bins": 4, "hidden_size": 8},
+        ...     },
+        ...     "msa": {
+        ...         "max_msa_clusters": 1,
+        ...         "max_extra_msa": 0,
+        ...         "masked_msa_enabled": False,
+        ...         "resample_msa_in_recycling": False,
+        ...     },
+        ...     "recycling_steps": 1,
+        ... })
+        >>> inputs = AlphaFold2Processor()(PolymerSequence.from_one_letter("A"))
+        >>> model = AlphaFold2Model(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(inputs)
+        >>> tuple(output.final_atom_positions.shape), output.pae_logits is None
+        ((1, 1, 37, 3), True)
     """
 
     config_class = AlphaFold2Config
@@ -219,8 +282,8 @@ class AlphaFold2Model(Model):
         Args:
             input: Monomer or multimer features aligned to ``B`` systems and ``N``
                 residues.
-            recycling_steps: Number of recycling iterations. ``None`` uses the
-                configured value.
+            recycling_steps: Total network passes, including the final pass.
+                ``None`` uses the configured value.
             generator: Optional generator for stochastic MSA feature construction.
 
         Returns:
@@ -235,7 +298,7 @@ class AlphaFold2Model(Model):
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
 
-        msa, single, pair, structure, realized = self._run_recycling(
+        msa, single, pair, structure, realized, num_recycles = self._run_recycling(
             input, recycling_steps=recycling_steps, generator=generator
         )
         assert realized.msa_features is not None
@@ -264,6 +327,7 @@ class AlphaFold2Model(Model):
             plddt_logits=plddt_logits,
             pae_logits=pae_logits,
             resolved_logits=resolved_logits,
+            num_recycles=num_recycles,
         )
 
     @torch.inference_mode()
@@ -283,7 +347,8 @@ class AlphaFold2Model(Model):
             num_samples: Number of stochastic folding predictions to generate.
             generator: Optional generator for MSA sampling, masking, and cropping.
                 Each prediction draws an independent sub-generator.
-            recycling_steps: Number of recycling iterations. ``None`` uses the configured value.
+            recycling_steps: Total network passes, including the final pass.
+                ``None`` uses the configured value.
 
         Returns:
             One generation-ordered prediction per sample. Structure coordinates
@@ -376,13 +441,19 @@ class AlphaFold2Model(Model):
         *,
         recycling_steps: int,
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, _AlphaFold2InputT]:
+    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, _AlphaFold2InputT, int]:
         needs_realize = input.msa_features is None
         resample = needs_realize and self._resample_msa_in_recycling
         fixed_ensemble: tuple[_AlphaFold2InputT, ...] | None = None
         if needs_realize and not resample:
             fixed_ensemble = tuple(self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles))
         previous_positions, previous_msa_first_row, previous_pair = self._initial_recycling(input)
+        early_stop_tolerance = (
+            self.config.recycle_early_stop_tolerance
+            if isinstance(self.config, AlphaFold2MultimerConfig)
+            else None
+        )
+        stop_after_cycle = False
         for cycle in range(recycling_steps):
             if needs_realize:
                 if resample:
@@ -394,7 +465,8 @@ class AlphaFold2Model(Model):
                     cycle_inputs = fixed_ensemble
             else:
                 cycle_inputs = (input,) * self.num_ensembles
-            grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
+            final_cycle = stop_after_cycle or cycle == recycling_steps - 1
+            grad_enabled = torch.is_grad_enabled() and final_cycle
             with torch.set_grad_enabled(grad_enabled):
                 msa, single, pair, msa_first_row, cycle_input = self._run_ensemble(
                     cycle_inputs,
@@ -403,11 +475,30 @@ class AlphaFold2Model(Model):
                     previous_pair=previous_pair,
                 )
                 structure = self.structure_module(single, pair, cycle_input)
-            if cycle != recycling_steps - 1:
-                previous_positions = structure.final_atom_positions.detach()
-                previous_msa_first_row = msa_first_row.detach()
-                previous_pair = pair.detach()
-        return msa, single, pair, structure, cycle_input
+            if final_cycle:
+                break
+            next_positions = structure.final_atom_positions.detach()
+            if early_stop_tolerance is not None:
+                ca_index = residue_constants.atom_order["CA"]
+                previous_ca = previous_positions[..., ca_index, :]
+                next_ca = next_positions[..., ca_index, :]
+                previous_distances = torch.sqrt(
+                    torch.square(previous_ca.unsqueeze(-2) - previous_ca.unsqueeze(-3)).sum(dim=-1)
+                )
+                next_distances = torch.sqrt(
+                    torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1)
+                )
+                squared_difference = torch.square(previous_distances - next_distances)
+                pair_mask = input.sequence_mask.unsqueeze(-1) * input.sequence_mask.unsqueeze(-2)
+                mean_squared_difference = (squared_difference * pair_mask).sum(dim=(-2, -1)) / (
+                    pair_mask.sum(dim=(-2, -1)) + 1e-10
+                )
+                difference = torch.sqrt(mean_squared_difference + 1e-8)
+                stop_after_cycle = bool((difference <= early_stop_tolerance).all())
+            previous_positions = next_positions
+            previous_msa_first_row = msa_first_row.detach()
+            previous_pair = pair.detach()
+        return msa, single, pair, structure, cycle_input, cycle
 
     def _run_ensemble(
         self,
@@ -592,6 +683,162 @@ class AlphaFold2Model(Model):
         return pair + self.template_embedder(pair, input, pair_mask=pair_mask)
 
 
+class AlphaFold2InitialGuessModel(AlphaFold2Model):
+    r"""
+    Evaluate a target--binder complex with the AF2 monomer/pTM initial-guess equation.
+
+    The parameter graph is identical to [`AlphaFold2Model`][]. The first pass
+    recycles the input atom37 coordinates instead of zeros. This is ColabDesign's
+    ``use_initial_guess`` path; it does not initialize Structure Module frames
+    (the distinct ``use_initial_atom_pos`` path is disabled by PXDesign). The
+    all-GAP template retains backbone/CB geometry and masks pair features
+    between the target and binder asymmetric units.
+
+    Args:
+        config: Initial-guess model architecture and inference configuration.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.models.alphafold2 import (
+        ...     AlphaFold2InitialGuessConfig,
+        ...     AlphaFold2InitialGuessModel,
+        ...     AlphaFold2InitialGuessProcessor,
+        ... )
+        >>> sequence = PolymerSequence.from_one_letter("A")
+        >>> system = MolecularSystem(
+        ...     entities={"protein": sequence},
+        ...     instances={"target": "protein", "binder": "protein"},
+        ... )
+        >>> structure = Structure(
+        ...     system,
+        ...     (AtomSite("target", 0, "CA"),),
+        ...     np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        ...     np.ones(1, dtype=np.bool_),
+        ... )
+        >>> config = AlphaFold2InitialGuessConfig({
+        ...     "template": {"enabled": False},
+        ...     "evoformer": {
+        ...         "num_blocks": 0,
+        ...         "num_extra_msa_blocks": 0,
+        ...         "msa_size": 8,
+        ...         "extra_msa_size": 8,
+        ...         "pair_size": 8,
+        ...         "single_size": 8,
+        ...     },
+        ...     "structure_module": {
+        ...         "dropout": 0.0,
+        ...         "hidden_size": 8,
+        ...         "num_attention_heads": 1,
+        ...         "num_blocks": 1,
+        ...         "num_transition_projections": 1,
+        ...         "num_point_qk": 1,
+        ...         "num_point_v": 1,
+        ...         "num_scalar_qk": 2,
+        ...         "num_scalar_v": 2,
+        ...         "sidechain": {"hidden_size": 8, "num_blocks": 1},
+        ...     },
+        ...     "heads": {
+        ...         "distogram": {"num_distogram_bins": 4},
+        ...         "predicted_aligned_error": {"num_pae_bins": 4},
+        ...         "predicted_lddt": {"num_plddt_bins": 4, "hidden_size": 8},
+        ...     },
+        ...     "recycling_steps": 1,
+        ... })
+        >>> inputs = AlphaFold2InitialGuessProcessor()(structure, binder_instance_id="binder")
+        >>> model = AlphaFold2InitialGuessModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(inputs)
+        >>> tuple(output.final_atom_positions.shape), tuple(output.pae_logits.shape)
+        ((1, 2, 37, 3), (1, 2, 2, 4))
+    """
+
+    config_class = AlphaFold2InitialGuessConfig
+    config: AlphaFold2InitialGuessConfig
+
+    def __init__(self, config: AlphaFold2InitialGuessConfig | None = None) -> None:
+        super().__init__(AlphaFold2InitialGuessConfig() if config is None else config)
+
+    def _initial_recycling(
+        self,
+        input: _AlphaFold2RecyclingInput,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        _, previous_msa_first_row, previous_pair = super()._initial_recycling(input)
+        initial_guess_input = cast(AlphaFold2InitialGuessInput, input)
+        return initial_guess_input.initial_recycling_positions, previous_msa_first_row, previous_pair
+
+    def _decode_prediction(
+        self,
+        output: AlphaFold2Output,
+        input: AlphaFold2Input,
+    ) -> FoldPrediction:
+        prediction = super()._decode_prediction(output, input)
+        if output.pae_logits is None:
+            return prediction
+
+        initial_guess_input = cast(AlphaFold2InitialGuessInput, input)
+        binder_mask = initial_guess_input.binder_mask[0].bool()
+        target_mask = initial_guess_input.sequence_mask[0].bool() & ~binder_mask
+        interface_mask = binder_mask[:, None] & target_mask[None, :]
+        pae = prediction.pair_metrics["pae"].values
+        symmetric_pae = (pae + pae.T) / 2.0
+        raw_interface_pae = float(symmetric_pae[interface_mask.cpu().numpy()].mean())
+        binder_plddt = prediction.metrics["plddt"].values[binder_mask.cpu().numpy()]
+        chain_index = initial_guess_input.chain_index[0]
+        iptm = alphafold2_predicted_interface_tm_score(
+            output.pae_logits[0],
+            chain_index,
+            initial_guess_input.sequence_mask[0],
+            self.config,
+        )
+        binder_scope = frozenset(
+            residue
+            for residue, selected in zip(
+                initial_guess_input.layout.residue_sites,
+                binder_mask.cpu().numpy(),
+                strict=True,
+            )
+            if selected
+        )
+        prediction.scores["binder_mean_plddt"] = Score(
+            float(binder_plddt.mean()),
+            preferred="higher",
+            scope=binder_scope,
+        )
+        prediction.scores["iptm"] = Score(iptm, preferred="higher")
+        prediction.scores["interface_pae"] = Score(
+            raw_interface_pae,
+            unit="angstrom",
+            preferred="lower",
+        )
+        prediction.scores["normalized_interface_pae"] = Score(
+            raw_interface_pae / 31.0,
+            preferred="lower",
+        )
+        return prediction
+
+    def _add_template_embedding(
+        self,
+        pair: Tensor,
+        input: _AlphaFold2RecyclingInput,
+        pair_mask: Tensor,
+    ) -> Tensor:
+        if self.template_embedder is None:
+            return pair
+        initial_guess_input = cast(AlphaFold2InitialGuessInput, input)
+        template_pair_mask = (
+            initial_guess_input.chain_index.unsqueeze(-1)
+            == initial_guess_input.chain_index.unsqueeze(-2)
+        )
+        return pair + self.template_embedder(
+            pair,
+            initial_guess_input,
+            pair_mask=pair_mask,
+            template_pair_mask=template_pair_mask,
+        )
+
+
 class AlphaFold2MultimerModel(AlphaFold2Model):
     r"""
     Predict multimeric protein structures with AlphaFold-Multimer.
@@ -601,6 +848,69 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
 
     Args:
         config: Model architecture and inference configuration.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.data import PolymerSequence
+        >>> from ofoldx.models.alphafold2 import (
+        ...     AlphaFold2MultimerConfig,
+        ...     AlphaFold2MultimerModel,
+        ...     AlphaFold2MultimerProcessor,
+        ... )
+        >>> config = AlphaFold2MultimerConfig({
+        ...     "template": {"enabled": False},
+        ...     "evoformer": {
+        ...         "num_blocks": 1,
+        ...         "num_extra_msa_blocks": 0,
+        ...         "msa_size": 8,
+        ...         "extra_msa_size": 8,
+        ...         "pair_size": 8,
+        ...         "single_size": 8,
+        ...         "block": {
+        ...             "msa_row_attention_with_pair_bias": {
+        ...                 "num_attention_heads": 1, "dropout": 0.0,
+        ...             },
+        ...             "msa_transition": {"expansion": 2},
+        ...             "outer_product_mean": {"first": True, "hidden_size": 4},
+        ...             "triangle_multiplication_outgoing": {"hidden_size": 4},
+        ...             "triangle_attention_starting_node": {
+        ...                 "num_attention_heads": 1, "head_dim": 4, "dropout": 0.0,
+        ...             },
+        ...             "pair_transition": {"expansion": 2},
+        ...         },
+        ...     },
+        ...     "structure_module": {
+        ...         "dropout": 0.0,
+        ...         "hidden_size": 8,
+        ...         "num_attention_heads": 1,
+        ...         "num_blocks": 1,
+        ...         "num_transition_projections": 1,
+        ...         "num_point_qk": 1,
+        ...         "num_point_v": 1,
+        ...         "num_scalar_qk": 2,
+        ...         "num_scalar_v": 2,
+        ...         "sidechain": {"hidden_size": 8, "num_blocks": 1},
+        ...     },
+        ...     "heads": {
+        ...         "distogram": {"num_distogram_bins": 4},
+        ...         "predicted_aligned_error": {"num_pae_bins": 4},
+        ...         "predicted_lddt": {"num_plddt_bins": 4, "hidden_size": 8},
+        ...     },
+        ...     "msa": {
+        ...         "max_msa_clusters": 1,
+        ...         "max_extra_msa": 0,
+        ...         "masked_msa_enabled": False,
+        ...         "resample_msa_in_recycling": False,
+        ...     },
+        ...     "recycling_steps": 1,
+        ... })
+        >>> sequence = PolymerSequence.from_one_letter("A")
+        >>> inputs = AlphaFold2MultimerProcessor()([sequence, sequence])
+        >>> model = AlphaFold2MultimerModel(config).eval()
+        >>> with torch.inference_mode():
+        ...     output = model(inputs)
+        >>> tuple(output.final_atom_positions.shape), tuple(output.pae_logits.shape)
+        ((1, 2, 37, 3), (1, 2, 2, 4))
     """
 
     config_class = AlphaFold2MultimerConfig
@@ -809,7 +1119,8 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             num_samples: Number of stochastic folding predictions to generate.
             generator: Optional generator for MSA sampling, masking, and cropping.
                 Each prediction draws an independent sub-generator.
-            recycling_steps: Number of recycling iterations. ``None`` uses the configured value.
+            recycling_steps: Total network passes, including the final pass.
+                ``None`` uses the configured value.
 
         Returns:
             One generation-ordered prediction per sample. Structure coordinates
@@ -1161,9 +1472,20 @@ class AlphaFold2TemplateEmbedder(nn.Module):
             backend=backend,
         )
 
-    def forward(self, query_embedding: Tensor, input: AlphaFold2Input, *, pair_mask: Tensor) -> Tensor:
+    def forward(
+        self,
+        query_embedding: Tensor,
+        input: AlphaFold2Input,
+        *,
+        pair_mask: Tensor,
+        template_pair_mask: Tensor | None = None,
+    ) -> Tensor:
         template_batch = _template_batch(input)
-        template_pair = self.single_template_embedder(template_batch, pair_mask=pair_mask)
+        template_pair = self.single_template_embedder(
+            template_batch,
+            pair_mask=pair_mask,
+            template_pair_mask=template_pair_mask,
+        )
         batch_size, num_templates, num_tokens = template_pair.shape[:3]
         template_mask = template_batch.template_mask.to(dtype=query_embedding.dtype)
         has_template = template_mask.sum(dim=-1) > 0
@@ -1530,11 +1852,25 @@ class AlphaFold2SingleTemplateEmbedder(nn.Module):
         )
         self.output_norm = LayerNorm(template_size, backend=backend)
 
-    def forward(self, template_batch: AlphaFold2TemplateBatch, *, pair_mask: Tensor) -> Tensor:
-        features, template_pair_mask = self._features(template_batch)
+    def forward(
+        self,
+        template_batch: AlphaFold2TemplateBatch,
+        *,
+        pair_mask: Tensor,
+        template_pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        features, feature_pair_mask = self._features(template_batch)
         batch_size, num_templates, num_tokens = features.shape[:3]
         pair_mask = pair_mask[:, None].expand(batch_size, num_templates, num_tokens, num_tokens)
-        pair_mask = pair_mask * template_pair_mask
+        if template_pair_mask is not None:
+            template_pair_mask = template_pair_mask[:, None].expand(
+                batch_size,
+                num_templates,
+                num_tokens,
+                num_tokens,
+            )
+            features = features * template_pair_mask.unsqueeze(-1)
+        pair_mask = pair_mask * feature_pair_mask
 
         act = self.template_pair_projection(features).reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
         flat_pair_mask = pair_mask.reshape(batch_size * num_templates, num_tokens, num_tokens)
@@ -3149,7 +3485,10 @@ def _multimer_make_msa_features(
     )
 
 
-def _predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.ndarray:
+def _predicted_aligned_error(
+    logits: Tensor,
+    config: AlphaFold2Config | AlphaFold2MultimerConfig,
+) -> np.ndarray:
     r"""
     Return expected aligned error in Ångström for one AF2 example.
     """
@@ -3161,7 +3500,11 @@ def _predicted_aligned_error(logits: Tensor, config: AlphaFold2Config) -> np.nda
     return (logits.float().softmax(dim=-1) * centers).sum(dim=-1).cpu().numpy()
 
 
-def alphafold2_predicted_tm_score(logits: Tensor, sequence_mask: Tensor, config: AlphaFold2Config) -> float:
+def alphafold2_predicted_tm_score(
+    logits: Tensor,
+    sequence_mask: Tensor,
+    config: AlphaFold2Config | AlphaFold2MultimerConfig,
+) -> float:
     r"""
     Compute monomer pTM confidence from predicted-aligned-error logits.
 
@@ -3608,7 +3951,7 @@ def alphafold2_predicted_interface_tm_score(
     logits: Tensor,
     chain_index: Tensor,
     sequence_mask: Tensor,
-    config: AlphaFold2MultimerConfig,
+    config: AlphaFold2Config | AlphaFold2MultimerConfig,
 ) -> float:
     r"""
     Compute interface pTM (ipTM) from PAE logits over cross-chain pairs.
@@ -3617,7 +3960,7 @@ def alphafold2_predicted_interface_tm_score(
         logits: PAE logits for one assembly with shape ``(N, N, D)``.
         chain_index: Chain index for each residue with shape ``(N,)``.
         sequence_mask: Valid-residue mask with shape ``(N,)``.
-        config: AlphaFold-Multimer configuration defining the PAE bins.
+        config: AlphaFold 2 configuration defining the PAE bins.
 
     Returns:
         The scalar interface predicted TM score in ``[0, 1]``. Returns ``0`` when
@@ -3830,6 +4173,25 @@ class AlphaFold2Input:
     true_msa: Tensor | None = None
 
 
+@dataclass(kw_only=True, eq=False)
+class AlphaFold2InitialGuessInput(AlphaFold2Input):
+    r"""
+    Monomer/pTM features with an explicit first recycling coordinate state.
+
+    Args:
+        initial_recycling_positions: Generated complex atom37 coordinates used
+            only as the first recycled ``prev_pos`` state, with shape
+            ``(B, N, 37, 3)``.
+        chain_index: ColabDesign target/binder asymmetric-unit index with shape
+            ``(B, N)``. All target chains are zero and the binder is one.
+        binder_mask: Binder-residue mask with shape ``(B, N)``.
+    """
+
+    initial_recycling_positions: Tensor
+    chain_index: Tensor
+    binder_mask: Tensor
+
+
 @dataclass(eq=False)
 class AlphaFold2Output:
     r"""
@@ -3865,6 +4227,8 @@ class AlphaFold2Output:
         pae_logits: Optional predicted-aligned-error logits with shape
             ``(B, N, N, D_pae)``.
         resolved_logits: Atom37 resolved-state logits with shape ``(B, N, 37)``.
+        num_recycles: Number of preliminary recycling passes executed before the
+            unconditional final pass.
     """
 
     single: Tensor
@@ -3885,6 +4249,7 @@ class AlphaFold2Output:
     plddt_logits: Tensor
     pae_logits: Tensor | None
     resolved_logits: Tensor
+    num_recycles: int
 
 
 @dataclass(frozen=True)
