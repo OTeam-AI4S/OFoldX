@@ -47,8 +47,12 @@ class StructureDataset(Dataset):
         from ..io import read_structure
 
         # Records are structure-file paths; read each into a Structure (which every family
-        # Processor accepts) before lowering. Reading stays lazy -- one file per access.
-        return self.processor(read_structure(self.records[index]), **self.processor_kwargs)
+        # Processor accepts) before lowering. Reading stays lazy -- one file per access. A Processor
+        # that separates model-visible features from the truth exposes ``process_training`` (the
+        # diffusion families, which need both to noise the target); otherwise the Input carries its own
+        # target (the sequence families) and plain ``__call__`` suffices.
+        lower = getattr(self.processor, "process_training", self.processor)
+        return lower(read_structure(self.records[index]), **self.processor_kwargs)
 
 
 def _resolve_records(source: Any) -> list[str]:

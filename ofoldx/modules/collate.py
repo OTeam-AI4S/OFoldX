@@ -1,7 +1,9 @@
 r"""
-Shared batching helper for the MPNN-family training Inputs.
+Shared batching helpers for the training Inputs.
 
-This is pure padding logic parameterised by the family's pad token and its multi-residue-axis fields;
+``pad_and_collate``/``collate_single`` batch the MPNN-family sequence Inputs; ``collate_denoising`` batches
+the diffusion families' ``(input, target)`` pairs into DanLing's training batch. The first is pure padding
+logic parameterised by the family's pad token and its multi-residue-axis fields;
 each family wraps it into its own ``training_collate``. Most tensors are residue-aligned on axis 1;
 fields listed in ``pair_bias_fields`` (e.g. NA-MPNN ``pair_logit_bias`` of shape ``(B, L, V, L, V)``) are
 residue-aligned on axes 1 and 3. ``tied_group_ids`` indexes an autoregressive-unit tensor via
@@ -102,3 +104,22 @@ def collate_single(batch: list[Any]) -> Any:
     if len(batch) != 1:
         raise ValueError(f"this family trains at batch_size=1; got a batch of {len(batch)}")
     return batch[0]
+
+
+def collate_denoising(batch: list[Any]) -> dict[str, Any]:
+    r"""
+    Batch-size-1 collate for the diffusion structure families to DanLing's training batch.
+
+    Each item is a ``(model_input, model_target)`` pair from the Processor's ``process_training``. The
+    diffusion forward needs both (it noises the target internally), so ``input`` is the mapping
+    ``{"input", "target"}`` that DanLing splats as ``model(input=..., target=...)``; the same mapping is
+    the criterion's ``target`` (its ``input`` carries ``atom_mask``, its ``target`` the truth a fuller
+    per-family loss may need). Multi-structure training comes from gradient accumulation weighted by the
+    atom-count normalizer, not from padding heterogeneous atom tensors here.
+    """
+
+    if len(batch) != 1:
+        raise ValueError(f"the diffusion families train at batch_size=1; got a batch of {len(batch)}")
+    model_input, model_target = batch[0]
+    pair = {"input": model_input, "target": model_target}
+    return {"input": pair, "target": pair, "loss_normalizer": int(model_input.atom_mask.sum())}

@@ -15,7 +15,7 @@ DanLing never toggles module ``train()``/``eval()`` and repository models load i
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, cast
@@ -39,16 +39,24 @@ Collate = Callable[[list[Any]], Any]
 
 def _training_contract(architecture: str) -> tuple[Criterion, Collate]:
     r"""
-    Discover a family's training contract from its package (``criterion`` + ``collate``).
+    Discover a family's training contract from its ``objectives`` submodule (``criterion`` + ``collate``).
+
+    The submodule is the canonical, self-contained home of a family's training objective: adding a
+    trainable family is dropping in an ``objectives.py`` that exports a DanLing-shaped
+    ``criterion(pred, target) -> loss`` and a ``collate`` -- no package ``__init__`` change required. A
+    family with no ``objectives`` module (or one exporting no ``criterion``) is simply not trainable.
     """
 
-    module = importlib.import_module(BUILTIN_MODULES[architecture])
-    if not hasattr(module, "criterion"):
+    module_path = f"{BUILTIN_MODULES[architecture]}.objectives"
+    if importlib.util.find_spec(module_path) is None:
+        raise ValueError(f"architecture {architecture!r} is not trainable: no {module_path} module")
+    objectives = importlib.import_module(module_path)
+    if not hasattr(objectives, "criterion"):
         raise ValueError(
-            f"architecture {architecture!r} is not trainable: {BUILTIN_MODULES[architecture]} exports no "
+            f"architecture {architecture!r} is not trainable: {module_path} exports no "
             "`criterion(pred, target) -> loss`"
         )
-    return module.criterion, module.collate
+    return objectives.criterion, objectives.collate
 
 
 @RUNNERS.register("ofoldx", default=True)

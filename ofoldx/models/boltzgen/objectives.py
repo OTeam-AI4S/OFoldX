@@ -5,12 +5,13 @@ BoltzGen training objectives.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ...modules.collate import collate_denoising
 from ...modules.geometry import weighted_rigid_align
 from ...modules.head.tm import tm_length_scale
 from .model import (
@@ -631,6 +632,24 @@ def diffusion_loss(
         smooth_lddt_loss=smooth_lddt,
         bond_loss=bonds,
     )
+
+
+def criterion(pred: BoltzGenOutput, target: Any) -> Tensor:
+    r"""
+    DanLing-shaped BoltzGen training loss: BoltzGen's own grounded coordinate objective reduced to a
+    scalar.
+
+    Unlike the sibling diffusion families -- which share the bare EDM denoising core -- BoltzGen ships a
+    fuller published objective (rigid-aligned, type-weighted MSE plus smooth lDDT), so its criterion wraps
+    that. ``target`` is the ``{"input", "target"}`` mapping from
+    [`collate_denoising`][ofoldx.modules.collate.collate_denoising].
+    """
+
+    return diffusion_loss(pred, target["input"], target["target"]).loss.mean()
+
+
+#: BoltzGen trains at batch_size=1 like its sibling diffusion families -- see ``collate_denoising``.
+collate = collate_denoising
 
 
 def _weighted_center(
