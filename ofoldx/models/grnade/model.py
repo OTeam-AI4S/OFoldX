@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from tensordict import tensorclass
 from typing import cast
 
 import torch
@@ -79,7 +80,7 @@ class GrnadeOutput:
     log_probabilities: Tensor
 
 
-@dataclass(eq=False)
+@tensorclass
 class GrnadeSamplingOutput:
     r"""
     Autoregressively sampled RNA identities.
@@ -312,6 +313,7 @@ class GrnadeModel(Model):
             sequence_tokens=sequence_tokens,
             logits=logits,
             log_probabilities=F.log_softmax(logits, dim=-1),
+            batch_size=[num_samples],
         )
 
     def _encode(self, input: GrnadeInput) -> tuple[GvpValue, GvpValue]:

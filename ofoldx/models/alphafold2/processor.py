@@ -5,6 +5,7 @@ Prepare monomer protein, MSA, and template features for AlphaFold 2.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import fields
 
 import torch
 import torch.nn.functional as F
@@ -271,7 +272,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
         alternative_torsion = torch.zeros_like(torsion)
         torsion_mask = torch.zeros(1, len(residue_sites), 7)
 
-        values = dict(vars(base))
+        values = {field.name: getattr(base, field.name) for field in fields(base)}
         values.update(
             residue_index=torch.tensor(
                 residue_indices,
@@ -324,7 +325,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
                 device=self.device,
             ).unsqueeze(0),
         )
-        return AlphaFold2InitialGuessInput(**values)
+        return AlphaFold2InitialGuessInput(**values, batch_size=[1])
 
 
 def monomer_system_from_sequences(
@@ -512,6 +513,7 @@ def _prepare_alphafold2_features(
         ),
         template_residue_type_ids=template_residue_type_ids.to(device=device).unsqueeze(0),
         **placed,
+        batch_size=[1],
     )
 
 

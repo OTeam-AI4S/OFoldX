@@ -302,6 +302,7 @@ class ODesignProcessor(Processor):
                 dtype=torch.int64,
                 device=self.device,
             ).unsqueeze(0),
+            batch_size=[1],
         )
         return model_input, structure_target
 
@@ -633,6 +634,7 @@ class ODesignProcessor(Processor):
                 source_residue_map=source_residue_map,
                 source_atom_map=source_atom_map,
             ),
+            batch_size=[1],
         )
 
 
@@ -1003,6 +1005,7 @@ class ODesignLigandProcessor(Processor):
                 conditions=plan.conditions,
                 source_atom_map=plan.source_atom_map,
             ),
+            batch_size=[1],
         )
 
 
@@ -1752,8 +1755,7 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
         source_residue_map=source_residue_map,
         source_atom_map=source_atom_map,
     )
-    return replace(
-        input,
+    return input.replace(
         token_mask=input.token_mask.index_select(1, old_token_indices),
         residue_index=residue_index,
         chain_index=chain_index,
@@ -1798,8 +1800,7 @@ def _realize_ligand_atoms(
         generated_atoms=generated_atoms,
         slots=input.layout.slots[:num_atoms],
     )
-    return replace(
-        input,
+    return input.replace(
         token_mask=input.token_mask[:, :token_count],
         residue_index=input.residue_index[:, :token_count],
         chain_index=input.chain_index[:, :token_count],

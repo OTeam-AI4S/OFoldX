@@ -11,11 +11,11 @@ train.
 
 DanLing drives forward → criterion → loss-normalizer → backward → step. The Runner adds only what DanLing
 cannot know generically: a config-bound criterion, a train/eval **mode** guard (DanLing never toggles module
-mode, and repository models load in ``eval()``), DDP ``static_graph`` (so the modules the objective does not
-train -- auxiliary heads, sampling-only modules, unexercised conditioning embedders -- are handled without a
-freeze list; ``find_unused_parameters=True`` cannot help, as it traces unused parameters through the forward
-output and these models return dataclasses), a nested-dataclass ``to_device``, and an ``infer_step`` that
-runs the family's inference entry point on its dataclass output instead of DanLing's tensor-shaped default.
+mode, and repository models load in ``eval()``), DDP ``find_unused_parameters=True`` (the objective trains
+only the loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning
+embedders get no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them),
+a ``tensorclass``-native ``to_device``, and an ``infer_step`` that runs the family's inference entry point
+on its ``tensorclass`` output instead of DanLing's tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -28,7 +28,8 @@ from typing import Any, cast
 import danling as dl
 import torch
 from danling.runners.config import normalize_stack_name
-from torch import Tensor, nn
+from tensordict import is_tensorclass
+from torch import Tensor
 
 from ..model import Model
 from ..models.registry import BUILTIN_MODULES, MODELS, ModelRegistration
@@ -140,6 +141,12 @@ class Runner(dl.Runner):
         self.spec, self.model, self.processor = self._build()
         self.criterion = self.spec.criterion(self.model, self.processor)
         self.collate_fn = self.spec.collate
+        # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
+        # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters. The
+        # models now return ``tensorclass`` outputs, which DDP can walk, so ``find_unused_parameters=True``
+        # works (and re-checks each step, unlike ``static_graph``, so it also handles the data-dependent
+        # template case).
+        self.config.ddp.find_unused_parameters = True
         self.model.train()  # repository models load in eval(); DanLing never toggles module mode
         self.datasets.update(self.build_datasets())
 
@@ -220,22 +227,6 @@ class Runner(dl.Runner):
             self.config.model.revision = repository.commit  # pin the exact snapshot for resume
         return spec, model, processor
 
-    def materialize_model(self) -> None:
-        r"""
-        Materialize the model, then -- once DanLing has wrapped it in DDP -- enable ``static_graph``.
-
-        The objective trains only the loss-path parameters; a model's auxiliary heads (distogram,
-        confidence, B-factor), sampling-only modules, and the conditioning embedders a given training set
-        does not exercise get no gradient. ``static_graph`` learns that used/unused set from the first
-        iteration's autograd hooks, so DDP reduces correctly without freezing anything -- unlike
-        ``find_unused_parameters=True``, which finds unused parameters by walking the forward's return
-        value and cannot walk the models' dataclass outputs. It assumes the set is constant across steps.
-        """
-
-        super().materialize_model()
-        if isinstance(self.model, nn.parallel.DistributedDataParallel):
-            self.model._set_static_graph()
-
     def build_datasets(self) -> dict[str, Any]:
         r"""
         Build structure datasets for the configured splits, all lowered by the spec's lowering (diffusion
@@ -262,11 +253,14 @@ class Runner(dl.Runner):
 
     def _move(self, data: Any, device: torch.device) -> Any:
         r"""
-        Recursively move a nested structure to ``device``, descending through family Input/Target
-        dataclasses and their nested dataclass fields (e.g. ``ProtenixInput.template_features``), Mappings,
-        and sequences. Non-tensor leaves pass through unchanged.
+        Recursively move a nested structure to ``device``. Family Input/Output/Target are ``tensorclass``
+        instances -- moved with their native ``.to`` (which recurses into nested tensorclasses and keeps
+        ``batch_size``; ``dataclasses.replace`` would reset it). Mappings/sequences recurse; non-tensor
+        leaves pass through. The plain-dataclass branch remains for any non-tensorclass dataclass.
         """
 
+        if is_tensorclass(data):
+            return data.to(device)
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
                 field.name: self._move(value, device)

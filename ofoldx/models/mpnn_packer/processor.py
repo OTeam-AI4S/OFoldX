@@ -464,4 +464,5 @@ class MpnnPackerProcessor(Processor):
             pack_positions=torch.tensor(selected, device=self.device, dtype=torch.bool).unsqueeze(0),
             structure=structure,
             component_references=row_references,
+            batch_size=[1],
         )

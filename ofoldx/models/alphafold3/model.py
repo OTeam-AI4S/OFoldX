@@ -4,12 +4,12 @@ AlphaFold 3 top-level model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import (
@@ -614,6 +614,7 @@ class AlphaFold3Model(Model):
             pae_logits=pae_logits,
             pde_logits=pde_logits,
             resolved_logits=resolved_logits,
+            batch_size=[single.shape[0]],
         )
 
     def _denoise_context(
@@ -765,6 +766,7 @@ class AlphaFold3Model(Model):
             single=single,
             pair=pair,
             relative_features=relative_features,
+            batch_size=[single.shape[0]],
         )
 
     def _run_recycling(
@@ -791,6 +793,7 @@ class AlphaFold3Model(Model):
                 unit_vector=template_features.unit_vector.to(dtype=pair_init.dtype),
                 backbone_frame_mask=template_features.backbone_frame_mask.to(dtype=pair_init.dtype),
                 template_mask=template_features.template_mask,
+                batch_size=[template_features.distogram.shape[0]],
             )
         msa_features = input.msa_features.to(dtype=pair_init.dtype)
         msa_mask = input.msa_mask
@@ -2556,7 +2559,7 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
 
 
-@dataclass(eq=False)
+@tensorclass
 class TemplateFeatures:
     r"""
     Template features consumed by [`AlphaFold3TemplateEmbedder`][].
@@ -2581,7 +2584,7 @@ class TemplateFeatures:
     template_mask: Tensor | None = None
 
 
-@dataclass(frozen=True, kw_only=True, eq=False)
+@tensorclass(frozen=True)
 class _AlphaFold3TrunkOutput:
     r"""
     Named representations returned by the AlphaFold 3 recycling trunk.
@@ -2593,7 +2596,7 @@ class _AlphaFold3TrunkOutput:
     relative_features: RelativePositionBuckets
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class AlphaFold3Input:
     r"""
     Tensor and molecular-layout input for AlphaFold 3.
@@ -2654,7 +2657,7 @@ class AlphaFold3Input:
     token_sites: tuple[AtomSite | ComponentReference, ...] = ()
 
 
-@dataclass(eq=False)
+@tensorclass
 class AlphaFold3Output:
     r"""
     Predictions from one AlphaFold 3 denoising call.

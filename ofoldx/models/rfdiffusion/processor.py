@@ -497,6 +497,7 @@ class RfDiffusionProcessor(Processor):
                 output_instance_ids=output_instances,
                 combined_length=combined_length,
             ),
+            batch_size=[1],
         )
 
 

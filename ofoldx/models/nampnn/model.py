@@ -5,7 +5,7 @@ NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structure
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from tensordict import tensorclass
 
 import numpy as np
 import torch
@@ -240,6 +240,7 @@ class NaMpnnModel(Model):
             residue_logit_bias=repeat(input.residue_logit_bias),
             allowed_token_mask=repeat(input.allowed_token_mask),
             pair_logit_bias=repeat(input.pair_logit_bias),
+            batch_size=[input.atom_coordinates.shape[0] * count],
         )
 
     def _probability_result(
@@ -494,7 +495,7 @@ class NaMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return NaMpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
+        return NaMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
 
     @staticmethod
     def _training_ranks(
@@ -733,6 +734,7 @@ class NaMpnnModel(Model):
             log_probabilities=log_probabilities,
             sampling_probabilities=sampling_probabilities,
             decoding_ranks=ranks,
+            batch_size=[num_samples],
         )
 
     @staticmethod
@@ -975,6 +977,7 @@ class NaMpnnModel(Model):
             residue_logit_bias=input.residue_logit_bias,
             allowed_token_mask=input.allowed_token_mask,
             pair_logit_bias=input.pair_logit_bias,
+            batch_size=[input.atom_coordinates.shape[0]],
         )
         sampled = self.sample(
             fixed,
@@ -1188,7 +1191,7 @@ def _component_from_token(token: int, polymer_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(eq=False)
+@tensorclass
 class NaMpnnInput:
     r"""
     Inputs for NA-MPNN sequence design and scoring.
@@ -1245,7 +1248,7 @@ class NaMpnnInput:
     pair_logit_bias: Tensor | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class NaMpnnOutput:
     r"""
     Outputs from one NA-MPNN forward pass.
@@ -1277,7 +1280,7 @@ class NaMpnnOutput:
         return self.logits.softmax(dim=-1)
 
 
-@dataclass(eq=False)
+@tensorclass
 class NaMpnnSamplingOutput:
     r"""
     Outputs from NA-MPNN autoregressive sampling.

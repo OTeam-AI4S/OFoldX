@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass
+from tensordict import tensorclass
 
 import torch
 import torch.nn.functional as F
@@ -202,6 +202,7 @@ class LigandMpnnModel(Model):
             tied_weights=repeat(input.tied_weights),
             allowed_token_mask=repeat(input.allowed_token_mask),
             residue_logit_bias=repeat(input.residue_logit_bias),
+            batch_size=[input.backbone_coordinates.shape[0] * count],
         )
 
     def _probability_result(
@@ -442,7 +443,7 @@ class LigandMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return LigandMpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
+        return LigandMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
 
     def autoregressive_probabilities(
         self,
@@ -812,6 +813,7 @@ class LigandMpnnModel(Model):
             log_probabilities=result["log_probs"],
             sampling_probabilities=result["sampling_probs"],
             decoding_ranks=decoding_order_to_ranks(result["decoding_order"]),
+            batch_size=[num_samples],
         )
 
     def _sample_independent(
@@ -1410,7 +1412,7 @@ def _collapse_tied_order(
 # ---------------------------------------------------------------------------
 
 
-@dataclass(eq=False)
+@tensorclass
 class LigandMpnnInput:
     r"""
     Inputs for LigandMPNN sequence design and scoring.
@@ -1466,7 +1468,7 @@ class LigandMpnnInput:
     residue_logit_bias: Tensor | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class LigandMpnnOutput:
     r"""
     Outputs from one LigandMPNN forward pass.
@@ -1498,7 +1500,7 @@ class LigandMpnnOutput:
         return self.logits.softmax(dim=-1)
 
 
-@dataclass(eq=False)
+@tensorclass
 class LigandMpnnSamplingOutput:
     r"""
     Outputs from LigandMPNN autoregressive sampling.

@@ -592,6 +592,7 @@ def _structure_target(
         coordinates=torch.from_numpy(structure.coordinates.copy()).to(device=device, dtype=dtype).unsqueeze(0),
         coordinate_mask=torch.from_numpy(structure.coordinate_mask.copy()).to(device=device).unsqueeze(0),
         atom_index=atom_index.to(device=device).unsqueeze(0),
+        batch_size=[1],
     )
 
 
@@ -992,6 +993,7 @@ def _features(
         system=system,
         atom_sites=atom_sites,
         token_sites=tuple(cast(AtomSite | ComponentReference, token["site"]) for token in tokens),
+        batch_size=[1],
     )
 
 
@@ -1750,6 +1752,7 @@ def _template_to(
         residue_type_ids=features.residue_type_ids.to(device=device).unsqueeze(0),
         unit_vector=features.unit_vector.to(device=device, dtype=dtype).unsqueeze(0),
         backbone_frame_mask=features.backbone_frame_mask.to(device=device, dtype=dtype).unsqueeze(0),
+        batch_size=[1],
     )
 
 
@@ -1848,6 +1851,7 @@ def _template_features(
         residue_type_ids=residue_type_ids,
         unit_vector=unit_vector * backbone_mask_2d[..., None],
         backbone_frame_mask=backbone_mask_2d,
+        batch_size=[residue_type_ids.shape[0]],
     )
 
 
