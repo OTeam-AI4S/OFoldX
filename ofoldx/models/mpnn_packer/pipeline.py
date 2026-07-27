@@ -154,6 +154,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             pack_positions=torch.cat([item.pack_positions for item in inputs]),
             structure=inputs[0].structure,
             component_references=inputs[0].component_references,
+            batch_size=[len(inputs)],
         )
 
         predictions: list[list[PackPrediction]] = [[] for _ in inputs]

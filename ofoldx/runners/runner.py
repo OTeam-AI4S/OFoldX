@@ -73,6 +73,7 @@ class _TrainingSpec:
     collate: Collate
     lower: str
     infer: Infer
+    fresh_config: Callable[..., Any] | None
 
 
 def _training_spec(architecture: str) -> _TrainingSpec:
@@ -109,6 +110,7 @@ def _training_spec(architecture: str) -> _TrainingSpec:
         collate=build_collate(contract.collate_options),
         lower=lower,
         infer=infer,
+        fresh_config=contract.fresh_configs.get(architecture),
     )
 
 
@@ -168,7 +170,10 @@ class Runner(dl.Runner):
         overrides = {
             key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")
         }
-        model = registration.model(registration.model_config(**overrides))
+        # A variant whose canonical fresh graph differs from the base config default (e.g. protenix_template's
+        # template embedder) supplies its own config factory; otherwise the registered config_class applies.
+        build_config = spec.fresh_config or registration.model_config
+        model = registration.model(build_config(**overrides))
         processor = self._build_processor(registration, model)
         return spec, model, processor
 
@@ -274,12 +279,20 @@ class Runner(dl.Runner):
         r"""
         Recursively move a nested structure to ``device``. Family Input/Output/Target are ``tensorclass``
         instances -- moved with their native ``.to`` (which recurses into nested tensorclasses and keeps
-        ``batch_size``; ``dataclasses.replace`` would reset it). Mappings/sequences recurse; non-tensor
-        leaves pass through. The plain-dataclass branch remains for any non-tensorclass dataclass.
+        ``batch_size``; ``dataclasses.replace`` would reset it). ``.to`` cannot reach tensors held inside a
+        non-tensor dataclass field (e.g. Protenix's tfg/template feature bundles, whose index tensors are
+        unbatched so they cannot themselves be a tensorclass), so those are moved explicitly. Mappings/
+        sequences recurse; non-tensor leaves pass through. The plain-dataclass branch remains for any
+        non-tensorclass dataclass.
         """
 
         if is_tensorclass(data):
-            return data.to(device)
+            moved = data.to(device)
+            for field in fields(data):
+                value = getattr(data, field.name)
+                if is_dataclass(value) and not isinstance(value, type):
+                    setattr(moved, field.name, self._move(value, device))
+            return moved
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
                 field.name: self._move(value, device)
